@@ -1,6 +1,34 @@
-# BASE — Builder's Automated State Engine
+```
+  ██████╗  █████╗ ███████╗███████╗
+  ██╔══██╗██╔══██╗██╔════╝██╔════╝
+  ██████╔╝███████║███████╗█████╗
+  ██╔══██╗██╔══██║╚════██║██╔══╝
+  ██████╔╝██║  ██║███████║███████╗
+  ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝
 
-Workspace lifecycle management for Claude Code. Scaffold, audit, groom, and maintain AI builder workspaces. Manage structured data surfaces for persistent context injection.
+  Builder's Automated State Engine  ·  v2.3.0
+  Workspace orchestration for Claude Code
+
+  ✦ Data Surfaces    ✦ Drift Detection    ✦ Auto-Grooming
+  ✦ PAUL Satellites  ✦ MCP Integration    ✦ Session Hooks
+```
+
+<div align="center">
+
+[![npm](https://img.shields.io/npm/v/base-framework?color=00d8ff&label=npm&style=flat-square)](https://www.npmjs.com/package/base-framework)
+[![Node](https://img.shields.io/badge/node-%3E%3D16.7.0-brightgreen?style=flat-square)](https://nodejs.org)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-compatible-8b5cf6?style=flat-square)](https://claude.ai/code)
+
+</div>
+
+---
+
+## What is BASE?
+
+BASE keeps your Claude Code workspace from becoming a mess. It scaffolds structure, tracks workspace health, surfaces the right context automatically, and tells you when things go stale — so you spend time building, not maintaining.
+
+**The core pattern:** structured JSON files (data surfaces) + lightweight Python hooks that inject them into Claude's context every session. Claude always knows what's active, what's queued, and where satellites stand — without you having to say it.
 
 ---
 
@@ -10,52 +38,64 @@ Workspace lifecycle management for Claude Code. Scaffold, audit, groom, and main
 npx base-framework --global --workspace
 ```
 
-**Options:**
-
 | Flag | What it does |
 |------|-------------|
-| `--global` | Install commands and framework to `~/.claude` |
+| `--global` | Install commands + framework to `~/.claude` |
 | `--workspace` | Install workspace layer (`.base/`) in current directory |
 | `--local` | Install commands to `./.claude` instead of global |
 | `--config-dir <path>` | Custom Claude config directory |
-| `--workspace-dir <path>` | Install workspace layer at a specific path |
+| `--workspace-dir <path>` | Target a specific workspace path |
 
 **Common flows:**
 
 ```bash
-# Full install: global commands + current workspace
+# Full install — global commands + current workspace
 npx base-framework --global --workspace
 
-# Global commands only (then set up each workspace with /base:scaffold)
-npx base-framework --global
-
-# New workspace on existing global install
+# Already have global? Just wire a new workspace
 npx base-framework --workspace
+
+# Global only — set up each workspace later with /base:scaffold
+npx base-framework --global
 ```
 
 ---
 
 ## What Gets Installed
 
-### `--global` installs to `~/.claude/`:
-- `commands/base/` — Slash commands (`/base:surface-create`, etc.)
-- `skills/base/` — Skill entry point (`base.md`)
-- `base-framework/` — Task files, templates, context, frameworks
-- `base-framework/hooks/` — Session hooks (for scaffold to copy into new workspaces)
+```
+~/.claude/                          ← --global
+├── commands/base/                  11 slash commands
+├── skills/base/                    Entry point (base.md)
+└── base-framework/
+    ├── tasks/                      pulse, groom, audit, scaffold...
+    ├── templates/                  workspace.json, STATE.md, surfaces
+    ├── context/                    base-principles.md
+    ├── frameworks/                 audit-strategies.md
+    └── hooks/                      Session hooks (scaffold source)
 
-### `--workspace` installs to `./.base/` and `./.claude/`:
-- `.base/data/` — Data surface directory
-- `.base/hooks/` — Surface injection hooks
-- `.base/base-mcp/` — BASE MCP server (auto npm install)
-- `.base/carl-mcp/` — CARL MCP server (auto npm install)
-- `.claude/hooks/` — Session hooks (pulse, PSMM, satellite detection)
-- `.mcp.json` — MCP server registrations (merged)
+./.base/                            ← --workspace
+├── workspace.json                  Manifest: surfaces, satellites, groom config
+├── data/
+│   ├── active.json                 Active projects surface
+│   └── backlog.json                Backlog surface
+├── hooks/                          Surface injection hooks
+├── base-mcp/                       BASE MCP server
+└── carl-mcp/                       CARL MCP server
+
+./.claude/
+├── hooks/
+│   ├── base-pulse-check.py         Drift detection (every session)
+│   ├── psmm-injector.py            Per-session meta memory
+│   └── satellite-detection.py      PAUL project auto-registration
+└── settings.json                   Hook registrations (merged)
+```
 
 ---
 
 ## Commands
 
-After install, run `/base:scaffold` in Claude Code to complete workspace setup.
+After install, open Claude Code and run `/base:scaffold` to complete setup.
 
 | Command | Description |
 |---------|------------|
@@ -69,72 +109,60 @@ After install, run `/base:scaffold` in Claude Code to complete workspace setup.
 | `/base:carl-hygiene` | CARL domain maintenance |
 | `/base:surface create` | Create a new data surface (guided) |
 | `/base:surface convert` | Convert a markdown file to a data surface |
-| `/base:surface list` | Show all registered surfaces |
+| `/base:surface list` | Show all registered data surfaces |
 
 ---
 
 ## Data Surfaces
 
-Data surfaces are structured JSON files that get injected into Claude's context each session via lightweight Python hooks. Any data you want Claude to passively know about — active projects, backlog, contacts — can become a surface.
+The core primitive. A data surface is a structured JSON file + a Python hook that injects it into Claude's context every session. Any persistent data you want Claude to passively know about becomes a surface.
 
-BASE ships with two built-in surfaces:
+```
+workspace.json registers it → hook reads it → Claude knows it
+```
 
-- **active** — Current projects, status, blockers, deadlines
-- **backlog** — Future work queue, ideas, deferred items
+**Built-in surfaces:**
+- `active.json` — Current projects, status, blockers, deadlines
+- `backlog.json` — Future work queue, ideas, deferred items
 
-Create custom surfaces with `/base:surface create`.
+**Create your own:**
+```
+/base:surface create
+```
+Guided schema builder. Point it at any data you want surfaced — contacts, clients, API keys, anything. BASE generates the JSON schema, the hook, and wires it automatically.
 
 ---
 
-## Workspace Structure
+## PAUL Satellite Integration
 
-After install and scaffold:
+BASE auto-detects [PAUL](https://github.com/ChristopherKahler/paul) projects in your workspace. Every session, `satellite-detection.py` scans for `.paul/paul.json` files and registers any new projects in `workspace.json`. Weekly groom cycles check satellite health: stale loops, abandoned phases, overdue milestones.
 
-```
-your-workspace/
-├── .base/
-│   ├── workspace.json     # Manifest: surfaces, satellites, groom config
-│   ├── STATE.md           # Workspace health and drift score
-│   ├── data/
-│   │   ├── active.json    # Active projects surface
-│   │   ├── backlog.json   # Backlog surface
-│   │   └── *.json         # Custom surfaces
-│   ├── hooks/
-│   │   ├── _template.py   # Hook template for custom surfaces
-│   │   ├── active-hook.py
-│   │   └── backlog-hook.py
-│   ├── base-mcp/          # BASE MCP server
-│   └── carl-mcp/          # CARL MCP server
-└── .claude/
-    ├── hooks/
-    │   ├── base-pulse-check.py    # Drift detection (fires every session)
-    │   ├── psmm-injector.py       # Per-session meta memory
-    │   └── satellite-detection.py # PAUL project auto-registration
-    └── settings.json              # Hook registrations
-```
+No manual registration. It just works.
 
 ---
 
-## CARL & PAUL Integration
+## Ecosystem
 
-BASE is designed to work alongside [CARL](https://github.com/ChristopherKahler/carl) (dynamic rules engine) and [PAUL](https://github.com/ChristopherKahler/paul) (project orchestration).
+BASE is part of a three-layer workspace system:
 
-- **CARL** — Just-in-time rule injection based on user intent keywords
-- **PAUL** — Per-project plan/apply/unify loop. Satellite projects auto-register with BASE
-- **BASE** — Workspace lifecycle, surfaces, grooming
+| System | Role |
+|--------|------|
+| **BASE** | Workspace lifecycle — surfaces, grooming, drift detection |
+| **CARL** | Dynamic rules engine — just-in-time rule injection |
+| **PAUL** | Project orchestration — Plan → Apply → Unify loop |
 
-Each system is independent. Use one, some, or all.
+Each is independent. Use one, some, or all.
 
 ---
 
 ## Requirements
 
-- Node.js >= 16.7.0
-- Claude Code (claude.ai/code)
+- Node.js ≥ 16.7.0
+- [Claude Code](https://claude.ai/code)
 - Python 3 (for hooks)
 
 ---
 
 ## License
 
-MIT — Chris Kahler
+MIT — [Chris Kahler](https://github.com/ChristopherKahler)
