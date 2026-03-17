@@ -35,7 +35,7 @@ AI builders can maintain workspace health automatically, convert expensive @-men
 - [x] Data directory reorganization (.base/data/) — v2, Phase 1
 - [x] Hook template with best practices — v2, Phase 2
 - [x] BASE MCP server (generic surface CRUD) — v2, Phase 3
-- [ ] Active/Backlog JSON conversion (data surfaces) — v2
+- [x] Active/Backlog JSON conversion (data surfaces) — v2, Phase 4
 - [ ] Surface extensibility (/base:surface create/convert) — v2
 - [ ] Passive awareness behavioral directives — v2
 
@@ -111,7 +111,7 @@ AI builders can maintain workspace health automatically, convert expensive @-men
 
 | Metric | Target | Current | Status |
 |--------|--------|---------|--------|
-| Data surfaces operational | active + backlog converted | 0 surfaces | Not started |
+| Data surfaces operational | active + backlog converted | 2 surfaces (active: 12, backlog: 8) | Complete |
 | Hook injection latency | <500ms per surface | N/A | Not measured |
 | MCP tools working | All CRUD operations pass | carl-mcp + base-mcp (7 tools) | Partial |
 | Scaffold end-to-end | Creates full v2 structure | v1 scaffold only | Partial |
@@ -139,4 +139,4 @@ AI builders can maintain workspace health automatically, convert expensive @-men
 
 ---
 *PROJECT.md — Updated when requirements or context change*
-*Last updated: 2026-03-17 after Phase 3*
+*Last updated: 2026-03-17 after Phase 4*

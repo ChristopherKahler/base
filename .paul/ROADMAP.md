@@ -8,7 +8,7 @@ BASE v2 evolves from a workspace state tracker into a full workspace orchestrati
 
 **v2.0 Data Surfaces & Extensibility** (v2.0.0)
 Status: In progress
-Phases: 3 of 6 complete
+Phases: 4 of 6 complete
 
 ## Phases
 
@@ -17,7 +17,7 @@ Phases: 3 of 6 complete
 | 1 | Data Directory Reorganization | 1/1 | Complete | 2026-03-17 |
 | 2 | Hook Template & Contract | 1/1 | Complete | 2026-03-17 |
 | 3 | BASE MCP Server | 1/1 | Complete | 2026-03-17 |
-| 4 | Active + Backlog Surface Conversion | TBD | Not started | - |
+| 4 | Active + Backlog Surface Conversion | 1/1 | Complete | 2026-03-17 |
 | 5 | Surface Extensibility | TBD | Not started | - |
 | 6 | Scaffold v2 & Documentation | TBD | Not started | - |
 
