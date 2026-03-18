@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Hook: satellite-detection.py
-Purpose: Session-start hook that scans the workspace recursively for .paul/paul.json
-         files, cross-references registered satellites in workspace.json, and
+Purpose: Scans the workspace recursively for .paul/paul.json files,
+         cross-references registered satellites in workspace.json, and
          auto-registers any unregistered projects it finds.
-Triggers: UserPromptSubmit (session context)
+Triggers: SessionStart — runs once when Claude Code starts a session.
 Output: <base-satellites> block if new satellites registered, silent otherwise.
 """
 

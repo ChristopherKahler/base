@@ -125,17 +125,24 @@ Symlinks are ONLY offered when scaffold detects existing files at workspace root
 <step name="install_hooks">
 Install and register BASE session hooks.
 
-Session hooks: base-pulse-check.py, psmm-injector.py, satellite-detection.py
+**UserPromptSubmit hooks** (fire every prompt):
+- base-pulse-check.py — drift detection + groom reminders
+- psmm-injector.py — per-session meta memory injection
 
-For each session hook:
+**SessionStart hooks** (fire once when session begins):
+- satellite-detection.py — PAUL project auto-registration
+
+For each hook:
 1. Check if `.claude/hooks/{hook}` exists in workspace
 2. If not: copy from `~/.claude/base-framework/hooks/{hook}` (global install source)
    - If `~/.claude/base-framework/hooks/{hook}` doesn't exist either, warn:
      "BASE framework not globally installed. Run `npx base-framework --global` first, then re-run scaffold."
-3. Check project `.claude/settings.json` for hook registration in UserPromptSubmit array
-4. If not registered: add the hook path to settings.json UserPromptSubmit array
+3. Check project `.claude/settings.json` for hook registration:
+   - base-pulse-check.py and psmm-injector.py → register in `UserPromptSubmit` array
+   - satellite-detection.py → register in `SessionStart` array
+4. If not registered: add the hook path to the correct event array in settings.json
 
-Report: "Session hooks installed (pulse, PSMM injector, satellite detection). Workspace health will be monitored every session."
+Report: "Hooks installed (pulse + PSMM on every prompt, satellite detection on session start)."
 </step>
 
 <step name="first_groom">

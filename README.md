@@ -101,7 +101,7 @@ Every BASE command reads from this manifest. You configure it once during setup,
 
 BASE uses Claude Code's [hook system](https://docs.anthropic.com/en/docs/claude-code/hooks) to inject context automatically. There are two types:
 
-**Every prompt** — These fire on every message you send (`UserPromptSubmit`), keeping Claude's awareness current throughout the session:
+**Every prompt** (`UserPromptSubmit`) — Fire on every message you send, keeping Claude's awareness current throughout the session:
 
 | Hook | What It Does |
 |------|-------------|
@@ -109,11 +109,11 @@ BASE uses Claude Code's [hook system](https://docs.anthropic.com/en/docs/claude-
 | **PSMM injector** | Re-injects important session moments (decisions, corrections, insights) into Claude's context so they don't get buried in a long session. [Details below.](#per-session-meta-memory-psmm) |
 | **Surface hooks** | One per data surface (active, backlog, or custom). Reads the JSON, outputs a compact summary so Claude passively knows the current state |
 
-**Every prompt (once-effective)** — Fires every prompt but only acts when something changed:
+**Session start** (`SessionStart`) — Runs once when a Claude Code session begins:
 
 | Hook | What It Does |
 |------|-------------|
-| **PAUL project detection** | Scans your workspace for [PAUL](https://github.com/ChristopherKahler/paul) project files (`.paul/paul.json`), auto-registers new ones into `workspace.json`. Only writes when it finds something new. (More on PAUL below.) |
+| **PAUL project detection** | Scans your workspace for [PAUL](https://github.com/ChristopherKahler/paul) project files (`.paul/paul.json`) and auto-registers new ones into `workspace.json`. Only needs to run once — your project list doesn't change mid-session. (More on PAUL below.) |
 
 All hooks are lightweight Python — they read JSON files and output compact XML summaries. No network calls, no heavy dependencies, no noticeable latency. A hook that has nothing to report outputs nothing and exits silently.
 
@@ -178,10 +178,10 @@ npx @chrisai/base --global
 ├── base-mcp/                           MCP server for surface operations (CRUD)
 └── carl-mcp/                           MCP server for rules engine operations
 
-.claude/hooks/                          Prompt-level hooks (UserPromptSubmit)
-├── base-pulse-check.py                 Drift detection + groom reminders
-├── psmm-injector.py                    Per-session meta memory injection
-└── satellite-detection.py              Auto-discovers PAUL projects
+.claude/hooks/                          Registered in settings.json
+├── base-pulse-check.py                 [UserPromptSubmit] Drift + groom reminders
+├── psmm-injector.py                    [UserPromptSubmit] Session meta memory
+└── satellite-detection.py              [SessionStart] PAUL project discovery
 ```
 
 ---
