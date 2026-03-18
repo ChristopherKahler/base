@@ -260,7 +260,9 @@ When you create a new surface, the MCP server auto-discovers it from `workspace.
 
 [CARL](https://github.com/ChristopherKahler/carl) (Context Augmentation & Reinforcement Layer) is a dynamic rules engine for Claude Code. On its own, CARL stores behavioral rules in domain files — groups of rules that load automatically based on what you're doing. Say "check Skool" and CARL loads your Skool community rules. Start coding and it loads your development standards. The rules are just config files in `.carl/`.
 
-BASE ships CARL's MCP server, which gives Claude programmatic access to three powerful systems:
+**CARL is fully independent — it works without BASE, and BASE works without CARL.** But BASE bundles CARL's MCP server as an optional capability. If you use CARL, BASE gives it MCP superpowers (programmatic rule management, decision logging, session memory). If you don't use CARL, this MCP server sits idle and everything else in BASE works normally.
+
+When both are active, Claude gets programmatic access to three powerful systems:
 
 #### Dynamic Rules
 
@@ -425,11 +427,13 @@ BASE is one layer of a three-part system. Each tool is fully independent — use
 | **[CARL](https://github.com/ChristopherKahler/carl)** | Session-level behavioral rules | "What rules and context should Claude load for what I'm doing right now?" |
 | **[PAUL](https://github.com/ChristopherKahler/paul)** | Individual project builds | "What's the plan? What phase am I in? What's left?" |
 
-**How they connect:**
-- PAUL projects auto-register with BASE for workspace-level visibility
-- CARL's MCP server ships inside BASE for full rule management
-- BASE groom checks CARL rule health if configured
-- No circular dependencies — each system's state is independent
+**All three are fully independent.** No dependencies between them. Use one, two, or all three.
+
+**How they enhance each other when combined:**
+- **BASE + PAUL** — PAUL projects auto-register with BASE on session start, giving you workspace-level visibility across all your builds. BASE groom checks project health. PAUL handles the project. BASE handles the portfolio.
+- **BASE + CARL** — BASE bundles CARL's MCP server, upgrading CARL from config files to programmatic rule management, decision logging, and session memory. BASE groom can optionally check CARL rule health and surface staged proposals for review.
+- **CARL + PAUL** — Independent. Each operates in its own scope (session rules vs project builds).
+- **All three** — The full stack. BASE manages the workspace, CARL manages session behavior, PAUL manages project builds. Each layer does its job without stepping on the others.
 
 Think of it as layers:
 
@@ -443,7 +447,7 @@ Think of it as layers:
 └─────────────────────────────────┘
 ```
 
-You don't need all three. BASE works alone. But together, they turn Claude Code into something that manages your entire workspace — not just the file you're looking at.
+BASE works alone. CARL works alone. PAUL works alone. But together, they turn Claude Code from a per-session coding tool into a managed operating system for AI builders.
 
 ---
 
