@@ -12,6 +12,10 @@
 **Your AI builder operating system.**<br/>
 Turn Claude Code from a per-session tool into a workspace that remembers, maintains itself, and never goes stale.
 
+[The Problem](#the-problem-every-claude-code-user-hits) · [What BASE Does](#what-base-actually-does) · [How It Works](#how-it-works) · [Install](#install) · [What Gets Installed](#what-gets-installed) · [Maintenance Cycle](#the-maintenance-cycle) · [MCP Servers](#mcp-servers--claude-operates-on-your-data) · [BASE + PAUL](#multi-project-workspaces--base--paul) · [Custom Surfaces](#creating-custom-surfaces) · [Ecosystem](#the-ecosystem) · [Principles](#design-principles) · [Quick Start](#quick-start)
+
+**Ecosystem:** [CARL](https://github.com/ChristopherKahler/carl) · [PAUL](https://github.com/ChristopherKahler/paul) · [CC Strategic AI (Skool)](https://www.skool.com/cc-strategic-ai)
+
 </div>
 
 ---
