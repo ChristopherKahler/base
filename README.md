@@ -12,9 +12,7 @@
 **Your AI builder operating system.**<br/>
 Turn Claude Code from a per-session tool into a workspace that remembers, maintains itself, and never goes stale.
 
-[The Problem](#the-problem-every-claude-code-user-hits) · [What BASE Does](#what-base-actually-does) · [How It Works](#how-it-works) · [Install](#install) · [What Gets Installed](#what-gets-installed) · [Maintenance Cycle](#the-maintenance-cycle) · [MCP Servers](#mcp-servers--claude-operates-on-your-data) · [BASE + PAUL](#multi-project-workspaces--base--paul) · [Custom Surfaces](#creating-custom-surfaces) · [Ecosystem](#the-ecosystem) · [Principles](#design-principles) · [Quick Start](#quick-start)
-
-**Ecosystem:** [CARL](https://github.com/ChristopherKahler/carl) · [PAUL](https://github.com/ChristopherKahler/paul) · [CC Strategic AI (Skool)](https://www.skool.com/cc-strategic-ai)
+[The Problem](#the-problem-every-claude-code-user-hits) · [What BASE Does](#what-base-actually-does) · [How It Works](#how-it-works) · [Install](#install) · [What Gets Installed](#what-gets-installed) · [Maintenance Cycle](#the-maintenance-cycle) · [MCP Servers](#mcp-servers--claude-operates-on-your-data) · [BASE + PAUL](#multi-project-workspaces--base--paul) · [Custom Surfaces](#creating-custom-surfaces) · [Ecosystem](#ecosystem) · [Principles](#design-principles) · [Quick Start](#quick-start)
 
 </div>
 
@@ -421,17 +419,19 @@ Already have a markdown file with structured data? This command reads it, detect
 
 ---
 
-## The Ecosystem
+## Ecosystem
 
-BASE is one layer of a three-part system. Each tool is fully independent — use one, some, or all.
+BASE is part of a broader Claude Code extension ecosystem. Each tool is fully independent — use one, some, or all.
 
-| Tool | What It Manages | Core Question It Answers |
-|------|----------------|------------------------|
-| **BASE** | Your workspace as a whole | "What am I working on? What's stale? What needs attention?" |
-| **[CARL](https://github.com/ChristopherKahler/carl)** | Session-level behavioral rules | "What rules and context should Claude load for what I'm doing right now?" |
-| **[PAUL](https://github.com/ChristopherKahler/paul)** | Individual project builds | "What's the plan? What phase am I in? What's left?" |
+| System | What It Does | Link |
+|--------|-------------|------|
+| **AEGIS** | Multi-agent codebase auditing — diagnosis + controlled evolution | [GitHub](https://github.com/ChristopherKahler/aegis) |
+| **BASE** | Builder's Automated State Engine — workspace lifecycle, health tracking, drift prevention | You are here |
+| **CARL** | Context Augmentation & Reinforcement Layer — dynamic rules loaded JIT by intent | [GitHub](https://github.com/ChristopherKahler/carl) |
+| **PAUL** | Project orchestration — Plan, Apply, Unify Loop | [GitHub](https://github.com/ChristopherKahler/paul) |
+| **CC Strategic AI** | Skool community — courses, community, live support | [Skool](https://skool.com/cc-strategic-ai) |
 
-**All three are fully independent.** No dependencies between them. Use one, two, or all three.
+**All tools are fully independent.** No dependencies between them. Use one, some, or all.
 
 **How they enhance each other when combined:**
 - **BASE + PAUL** — PAUL projects auto-register with BASE on session start, giving you workspace-level visibility across all your builds. BASE groom checks project health. PAUL handles the project. BASE handles the portfolio.
