@@ -12,9 +12,39 @@
 **Your AI builder operating system.**<br/>
 Turn Claude Code from a per-session tool into a workspace that remembers, maintains itself, and never goes stale.
 
-[The Problem](#the-problem-every-claude-code-user-hits) · [What BASE Does](#what-base-actually-does) · [How It Works](#how-it-works) · [Install](#install) · [What Gets Installed](#what-gets-installed) · [Maintenance Cycle](#the-maintenance-cycle) · [MCP Servers](#mcp-servers--claude-operates-on-your-data) · [BASE + PAUL](#multi-project-workspaces--base--paul) · [Custom Surfaces](#creating-custom-surfaces) · [Ecosystem](#ecosystem) · [Principles](#design-principles) · [Quick Start](#quick-start)
 
 </div>
+
+---
+
+## Contents
+
+- [The Problem Every Claude Code User Hits](#the-problem-every-claude-code-user-hits)
+- [What BASE Actually Does](#what-base-actually-does)
+- [How It Works](#how-it-works)
+- [Install](#install)
+- [What Gets Installed](#what-gets-installed)
+- [The Maintenance Cycle](#the-maintenance-cycle)
+- [MCP Servers](#mcp-servers--claude-operates-on-your-data)
+- [Multi-Project Workspaces — BASE + PAUL](#multi-project-workspaces--base--paul)
+- [Creating Custom Surfaces](#creating-custom-surfaces)
+- [Ecosystem](#ecosystem)
+- [Design Principles](#design-principles)
+- [Quick Start](#quick-start)
+
+---
+
+## Ecosystem
+
+BASE is part of a broader Claude Code extension ecosystem:
+
+| System | What It Does | Link |
+|--------|-------------|------|
+| **AEGIS** | Multi-agent codebase auditing — diagnosis + controlled evolution | [GitHub](https://github.com/ChristopherKahler/aegis) |
+| **BASE** | Builder's Automated State Engine — workspace lifecycle, health tracking, drift prevention | You are here |
+| **CARL** | Context Augmentation & Reinforcement Layer — dynamic rules loaded JIT by intent | [GitHub](https://github.com/ChristopherKahler/carl) |
+| **PAUL** | Project orchestration — Plan, Apply, Unify Loop | [GitHub](https://github.com/ChristopherKahler/paul) |
+| **CC Strategic AI** | Skool community — courses, community, live support | [Skool](https://skool.com/cc-strategic-ai) |
 
 ---
 
@@ -416,42 +446,6 @@ Next session, Claude passively knows your client roster without you doing anythi
 ### `/base:surface convert`
 
 Already have a markdown file with structured data? This command reads it, detects the structure, proposes a JSON schema, migrates the content, and generates everything. Your old `@CLIENTS.md` file becomes a proper data surface with full MCP support.
-
----
-
-## Ecosystem
-
-BASE is part of a broader Claude Code extension ecosystem. Each tool is fully independent — use one, some, or all.
-
-| System | What It Does | Link |
-|--------|-------------|------|
-| **AEGIS** | Multi-agent codebase auditing — diagnosis + controlled evolution | [GitHub](https://github.com/ChristopherKahler/aegis) |
-| **BASE** | Builder's Automated State Engine — workspace lifecycle, health tracking, drift prevention | You are here |
-| **CARL** | Context Augmentation & Reinforcement Layer — dynamic rules loaded JIT by intent | [GitHub](https://github.com/ChristopherKahler/carl) |
-| **PAUL** | Project orchestration — Plan, Apply, Unify Loop | [GitHub](https://github.com/ChristopherKahler/paul) |
-| **CC Strategic AI** | Skool community — courses, community, live support | [Skool](https://skool.com/cc-strategic-ai) |
-
-**All tools are fully independent.** No dependencies between them. Use one, some, or all.
-
-**How they enhance each other when combined:**
-- **BASE + PAUL** — PAUL projects auto-register with BASE on session start, giving you workspace-level visibility across all your builds. BASE groom checks project health. PAUL handles the project. BASE handles the portfolio.
-- **BASE + CARL** — BASE bundles CARL's MCP server, upgrading CARL from config files to programmatic rule management, decision logging, and session memory. BASE groom can optionally check CARL rule health and surface staged proposals for review.
-- **CARL + PAUL** — Independent. Each operates in its own scope (session rules vs project builds).
-- **All three** — The full stack. BASE manages the workspace, CARL manages session behavior, PAUL manages project builds. Each layer does its job without stepping on the others.
-
-Think of it as layers:
-
-```
-┌─────────────────────────────────┐
-│  PAUL   (per-project lifecycle) │  Plan → Apply → Unify
-├─────────────────────────────────┤
-│  CARL   (per-session rules)     │  Load rules based on intent
-├─────────────────────────────────┤
-│  BASE   (workspace layer)       │  Surfaces, health, grooming
-└─────────────────────────────────┘
-```
-
-BASE works alone. CARL works alone. PAUL works alone. But together, they turn Claude Code from a per-session coding tool into a managed operating system for AI builders.
 
 ---
 
