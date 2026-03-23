@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "apex/entities.schema.json",
+  "title": "APEX Entities",
+  "description": "Graph layer for people and organizations with relational links to projects. Not a CRM — no contact info, just identity and relationships.",
+  "type": "object",
+  "required": ["version", "last_modified", "entities"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "last_modified": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "entities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/entity" }
+    }
+  },
+  "$defs": {
+    "entity": {
+      "type": "object",
+      "required": ["id", "name", "type", "created_at", "updated_at"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier. Convention: ENT-NNN",
+          "pattern": "^ENT-\\d{3,}$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["person", "organization"],
+          "description": "Entity type — person or organization only"
+        },
+        "role": {
+          "type": ["string", "null"],
+          "description": "Primary role or relationship context (e.g. 'owner', 'client', 'partner', 'contractor', 'team member', 'employer')",
+          "default": null
+        },
+        "relations": {
+          "type": "array",
+          "description": "Links to project items in projects.json",
+          "items": {
+            "type": "object",
+            "required": ["project_id", "relationship"],
+            "properties": {
+              "project_id": {
+                "type": "string",
+                "description": "ID from projects.json (INI-NNN, PRJ-NNN, or TSK-NNN)"
+              },
+              "relationship": {
+                "type": "string",
+                "description": "Nature of relationship (e.g. stakeholder, client, owner, partner, contractor, assignee)"
+              }
+            }
+          },
+          "default": []
+        },
+        "notes": {
+          "type": "array",
+          "description": "Timestamped notes about this entity",
+          "items": {
+            "type": "object",
+            "required": ["text", "timestamp"],
+            "properties": {
+              "text": { "type": "string" },
+              "timestamp": { "type": "string", "format": "date-time" }
+            }
+          },
+          "default": []
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

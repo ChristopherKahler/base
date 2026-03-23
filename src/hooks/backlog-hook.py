@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-BASE Hook: backlog-hook.py
-Surface: backlog (Future work queue, ideas, and deferred tasks)
-Source: .base/data/backlog.json
+BASE Hook v2: backlog-hook-v2.py
+Source: .base/data/projects.json (APEX unified project management)
 Output: <backlog-awareness> compact summary grouped by priority
+Filters: only items with status "backlog"
+
+Drop-in replacement for backlog-hook.py. Swap in settings.json when ready.
+Legacy backlog-hook.py reads from .base/data/backlog.json (unchanged).
 """
 
 import sys
@@ -15,13 +18,13 @@ SURFACE_NAME = "backlog"
 
 HOOK_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = HOOK_DIR.parent.parent
-DATA_FILE = WORKSPACE_ROOT / ".base" / "data" / f"{SURFACE_NAME}.json"
+DATA_FILE = WORKSPACE_ROOT / ".base" / "data" / "projects.json"
 
 BEHAVIOR_DIRECTIVE = f"""BEHAVIOR: This context is PASSIVE AWARENESS ONLY.
 Do NOT proactively mention these items unless:
   - User explicitly asks (e.g., "what's in the backlog?", "what's queued?")
   - A review_by date has passed AND user hasn't acknowledged it this session
-For details on any item, use base_get_item("{SURFACE_NAME}", id)."""
+For details on any item, use apex_get_project(id)."""
 
 PRIORITY_ORDER = ["high", "medium", "low"]
 
@@ -34,8 +37,8 @@ STALE_THRESHOLDS = {
 
 
 def days_since_update(item):
-    """Calculate days since last update. Uses 'updated' if present, else 'added'."""
-    ts = item.get("updated") or item.get("added")
+    """Calculate days since last update. Uses updated_at (ISO datetime)."""
+    ts = item.get("updated_at") or item.get("created_at")
     if not ts:
         return None
     try:
@@ -63,9 +66,14 @@ def main():
     if not items:
         sys.exit(0)
 
+    # Filter: only backlog items
+    backlog_items = [i for i in items if i.get("status") == "backlog"]
+    if not backlog_items:
+        sys.exit(0)
+
     # Group by priority
     groups = {}
-    for item in items:
+    for item in backlog_items:
         p = item.get("priority", "medium")
         groups.setdefault(p, []).append(item)
 
@@ -92,7 +100,7 @@ def main():
             lines.append(entry)
 
     if lines:
-        count = len(items)
+        count = len(backlog_items)
         summary = "\n".join(lines)
         print(f"""<{SURFACE_NAME}-awareness items="{count}">
 {summary}

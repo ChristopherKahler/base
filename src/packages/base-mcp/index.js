@@ -15,6 +15,11 @@ import { fileURLToPath } from 'url';
 
 // Tool group imports
 import { TOOLS as surfaceTools, handleTool as handleSurface } from './tools/surfaces.js';
+import { TOOLS as projectTools, handleTool as handleProject } from './tools/projects.js';
+import { TOOLS as stateTools, handleTool as handleState } from './tools/state.js';
+import { TOOLS as entityTools, handleTool as handleEntity } from './tools/entities.js';
+import { TOOLS as operatorTools, handleTool as handleOperator } from './tools/operator.js';
+import { TOOLS as psmmTools, handleTool as handlePsmm } from './tools/psmm.js';
 
 // ============================================================
 // CONFIGURATION
@@ -32,11 +37,16 @@ function debugLog(...args) {
 // TOOL REGISTRY
 // ============================================================
 
-const ALL_TOOLS = [...surfaceTools];
+const ALL_TOOLS = [...surfaceTools, ...projectTools, ...stateTools, ...entityTools, ...operatorTools, ...psmmTools];
 
 // Build handler lookup: tool name → handler function
 const TOOL_HANDLERS = {};
 for (const tool of surfaceTools) TOOL_HANDLERS[tool.name] = handleSurface;
+for (const tool of projectTools) TOOL_HANDLERS[tool.name] = handleProject;
+for (const tool of stateTools) TOOL_HANDLERS[tool.name] = handleState;
+for (const tool of entityTools) TOOL_HANDLERS[tool.name] = handleEntity;
+for (const tool of operatorTools) TOOL_HANDLERS[tool.name] = handleOperator;
+for (const tool of psmmTools) TOOL_HANDLERS[tool.name] = handlePsmm;
 
 // ============================================================
 // MCP SERVER
@@ -53,7 +63,8 @@ const server = new Server({
 
 debugLog('BASE MCP Server initialized');
 debugLog('Workspace:', WORKSPACE_PATH);
-debugLog('Surface tools:', surfaceTools.length);
+debugLog('Tool groups: surfaces (%d), projects (%d), state (%d), entities (%d), psmm (%d)',
+    surfaceTools.length, projectTools.length, stateTools.length, entityTools.length, psmmTools.length);
 debugLog('Total tools:', ALL_TOOLS.length);
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {

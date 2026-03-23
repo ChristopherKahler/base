@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "last_updated": null,
+  "hook_active": true,
+  "operator": {
+    "entity_id": null,
+    "name": null
+  },
+  "deep_why": {
+    "layers": [
+      {
+        "level": 1,
+        "question": "Why do you do what you do?",
+        "answer": null
+      },
+      {
+        "level": 2,
+        "question": "But why does that matter?",
+        "answer": null
+      },
+      {
+        "level": 3,
+        "question": "But why?",
+        "answer": null
+      },
+      {
+        "level": 4,
+        "question": "Why does that drive you more than anything else?",
+        "answer": null
+      },
+      {
+        "level": 5,
+        "question": "If everything else was stripped away, what's left?",
+        "answer": null
+      }
+    ],
+    "statement": null,
+    "completed_at": null
+  },
+  "north_star": {
+    "metric": null,
+    "timeframe": null,
+    "rationale": null,
+    "completed_at": null
+  },
+  "key_values": {
+    "values": [],
+    "completed_at": null
+  },
+  "elevator_pitch": {
+    "pitch": null,
+    "floors": {
+      "floor_1": null,
+      "floor_2": null,
+      "floor_3": null,
+      "floor_4": null
+    },
+    "completed_at": null
+  },
+  "surface_vision": {
+    "scenes": [],
+    "summary": null,
+    "completed_at": null
+  },
+  "extensions": {}
+}

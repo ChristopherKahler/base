@@ -102,10 +102,11 @@ if (hasHelp) {
       skills/base/         - Skill framework (tasks, templates, context)
 
     ${cyan}Workspace (--workspace):${reset}
-      .base/data/          - Data surface directory
-      .base/hooks/         - Surface injection hooks
+      .base/data/          - JSON data surfaces (active, backlog, projects, entities, state)
+      .base/hooks/         - All hooks (surface + session + command)
       .base/base-mcp/      - BASE MCP server (npm install auto-runs)
-      .base/carl-mcp/      - CARL MCP server (npm install auto-runs)
+      .base/workspace.json - Workspace manifest
+      .base/operator.json  - Operator profile (guided setup via /base:scaffold)
       .mcp.json            - MCP server registration (merged)
 `);
   process.exit(0);
@@ -139,6 +140,156 @@ function copyDir(srcDir, destDir) {
 }
 
 /**
+ * Write JSON file only if it doesn't already exist
+ */
+function writeJsonIfNew(filePath, data) {
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Detect v1/v2 artifacts that need migration.
+ * Returns array of { path, label, type } objects.
+ * Does NOT modify anything — detection only.
+ */
+function detectV1Artifacts(claudeDir, workspaceDir) {
+  const found = [];
+
+  if (workspaceDir) {
+    // carl-mcp in .base/ (no longer ships with BASE)
+    const carlMcpDir = path.join(workspaceDir, '.base', 'carl-mcp');
+    if (fs.existsSync(carlMcpDir)) {
+      found.push({
+        path: carlMcpDir,
+        label: '.base/carl-mcp/',
+        reason: 'CARL MCP no longer ships with BASE — install carl-core separately',
+        type: 'directory'
+      });
+    }
+
+    // Session hooks in .claude/hooks/ that moved to .base/hooks/
+    const movedHooks = ['base-pulse-check.py', 'psmm-injector.py', 'satellite-detection.py'];
+    const claudeHooksDir = path.join(workspaceDir, '.claude', 'hooks');
+    if (fs.existsSync(claudeHooksDir)) {
+      for (const hook of movedHooks) {
+        const hookPath = path.join(claudeHooksDir, hook);
+        if (fs.existsSync(hookPath)) {
+          found.push({
+            path: hookPath,
+            label: `.claude/hooks/${hook}`,
+            reason: 'Hooks now live in .base/hooks/ — duplicate here causes double-fire',
+            type: 'file'
+          });
+        }
+      }
+    }
+
+    // carl-mcp entry in .mcp.json
+    const mcpJsonPath = path.join(workspaceDir, '.mcp.json');
+    if (fs.existsSync(mcpJsonPath)) {
+      try {
+        const mcpConfig = JSON.parse(fs.readFileSync(mcpJsonPath, 'utf-8'));
+        if (mcpConfig.mcpServers && mcpConfig.mcpServers['carl-mcp']) {
+          found.push({
+            path: mcpJsonPath,
+            label: '.mcp.json → carl-mcp entry',
+            reason: 'CARL MCP no longer registered by BASE — install carl-core for CARL MCP',
+            type: 'mcp-entry'
+          });
+        }
+      } catch (e) { /* skip */ }
+    }
+  }
+
+  // Old markdown templates in base-framework/
+  if (claudeDir) {
+    const oldTemplates = ['active-md.md', 'backlog-md.md', 'state-md.md'];
+    const templatesDir = path.join(claudeDir, 'base-framework', 'templates');
+    if (fs.existsSync(templatesDir)) {
+      for (const tmpl of oldTemplates) {
+        const tmplPath = path.join(templatesDir, tmpl);
+        if (fs.existsSync(tmplPath)) {
+          found.push({
+            path: tmplPath,
+            label: `base-framework/templates/${tmpl}`,
+            reason: 'Replaced by JSON templates in v3 — no longer used by scaffold',
+            type: 'file'
+          });
+        }
+      }
+    }
+  }
+
+  return found;
+}
+
+/**
+ * Archive a single artifact (file or directory) to .base/_archive/upgrade-v3/
+ */
+function archiveArtifact(artifact, archiveDir) {
+  fs.mkdirSync(archiveDir, { recursive: true });
+
+  if (artifact.type === 'directory') {
+    const destName = path.basename(artifact.path);
+    const destPath = path.join(archiveDir, destName);
+    copyDir(artifact.path, destPath);
+    fs.rmSync(artifact.path, { recursive: true });
+  } else if (artifact.type === 'file') {
+    const destPath = path.join(archiveDir, path.basename(artifact.path));
+    fs.copyFileSync(artifact.path, destPath);
+    fs.unlinkSync(artifact.path);
+  } else if (artifact.type === 'mcp-entry') {
+    // For MCP entries, remove the key from JSON
+    const mcpConfig = JSON.parse(fs.readFileSync(artifact.path, 'utf-8'));
+    delete mcpConfig.mcpServers['carl-mcp'];
+    fs.writeFileSync(artifact.path, JSON.stringify(mcpConfig, null, 2));
+  }
+}
+
+/**
+ * Run upgrade cleanup interactively.
+ * Detects v1/v2 artifacts, warns the user, prompts for confirmation, archives.
+ * Returns a promise that resolves when cleanup is complete or skipped.
+ */
+function runUpgradeCleanup(claudeDir, workspaceDir) {
+  const artifacts = detectV1Artifacts(claudeDir, workspaceDir);
+  if (artifacts.length === 0) return Promise.resolve();
+
+  const baseDir = workspaceDir ? path.join(workspaceDir, '.base') : path.join(process.cwd(), '.base');
+  const archiveDir = path.join(baseDir, '_archive', 'upgrade-v3');
+
+  console.log(`  ${yellow}=== UPGRADE DETECTED ===${reset}`);
+  console.log(`  Found ${artifacts.length} artifact(s) from a previous BASE version:\n`);
+  for (const a of artifacts) {
+    console.log(`  ${yellow}!${reset} ${a.label}`);
+    console.log(`    ${dim}${a.reason}${reset}`);
+  }
+  console.log(`\n  ${dim}These will be archived to: ${archiveDir.replace(os.homedir(), '~')}${reset}`);
+  console.log(`  ${dim}Nothing is deleted — you can recover from the archive.${reset}\n`);
+
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(`  Archive these artifacts? ${dim}[Y/n]${reset}: `, (answer) => {
+      rl.close();
+      const proceed = !answer.trim() || answer.trim().toLowerCase() === 'y';
+      if (proceed) {
+        for (const a of artifacts) {
+          archiveArtifact(a, archiveDir);
+          console.log(`  ${green}archived${reset} ${a.label}`);
+        }
+        console.log('');
+      } else {
+        console.log(`  ${dim}Skipped cleanup. Old artifacts left in place.${reset}\n`);
+      }
+      resolve();
+    });
+  });
+}
+
+/**
  * Install commands and skill framework
  */
 function installCommands(isGlobal) {
@@ -157,7 +308,8 @@ function installCommands(isGlobal) {
   const commandsSrc = path.join(src, 'src', 'commands');
   const commandsDest = path.join(claudeDir, 'commands', 'base');
   copyDir(commandsSrc, commandsDest);
-  console.log(`  ${green}+${reset} commands/base/ (3 slash commands)`);
+  const commandCount = fs.readdirSync(commandsSrc).filter(f => f.endsWith('.md')).length;
+  console.log(`  ${green}+${reset} commands/base/ (${commandCount} slash commands)`);
 
   // Copy skill entry point
   const skillSrc = path.join(src, 'src', 'skill');
@@ -174,20 +326,17 @@ function installCommands(isGlobal) {
   const frameworkSrc = path.join(src, 'src', 'framework');
   const frameworkDest = path.join(claudeDir, 'base-framework');
   copyDir(frameworkSrc, frameworkDest);
-  console.log(`  ${green}+${reset} base-framework/ (tasks, templates, context, frameworks)`);
+  console.log(`  ${green}+${reset} base-framework/ (tasks, templates, context, frameworks, utils)`);
 
-  // Copy session hooks to global base-framework/hooks/ (source for scaffold)
-  const sessionHookNames = ['base-pulse-check.py', 'psmm-injector.py', 'satellite-detection.py'];
+  // Copy all hooks to base-framework/hooks/ (source for scaffold)
   const hooksFrameworkDest = path.join(claudeDir, 'base-framework', 'hooks');
   fs.mkdirSync(hooksFrameworkDest, { recursive: true });
   const hooksSrcDir = path.join(src, 'src', 'hooks');
-  for (const hookFile of sessionHookNames) {
-    const hookSrcPath = path.join(hooksSrcDir, hookFile);
-    if (fs.existsSync(hookSrcPath)) {
-      fs.copyFileSync(hookSrcPath, path.join(hooksFrameworkDest, hookFile));
-    }
+  const hookFiles = fs.readdirSync(hooksSrcDir).filter(f => f.endsWith('.py'));
+  for (const hookFile of hookFiles) {
+    fs.copyFileSync(path.join(hooksSrcDir, hookFile), path.join(hooksFrameworkDest, hookFile));
   }
-  console.log(`  ${green}+${reset} base-framework/hooks/ (session hooks for scaffold)`);
+  console.log(`  ${green}+${reset} base-framework/hooks/ (${hookFiles.length} hooks for scaffold)`);
 
   console.log(`\n  ${green}Commands installed.${reset}\n`);
 }
@@ -208,42 +357,69 @@ function installWorkspace() {
   console.log(`  ${green}+${reset} .base/data/`);
   console.log(`  ${green}+${reset} .base/hooks/`);
 
-  // Copy MCP servers
+  // Initialize JSON data surfaces (don't overwrite existing)
+  const dataSurfaces = {
+    'active.json': { items: [], last_updated: null },
+    'backlog.json': { items: [], last_updated: null },
+    'projects.json': { projects: [], last_updated: null },
+    'entities.json': { entities: [], last_updated: null },
+    'state.json': { drift_score: 0, areas: {}, last_groom: null, last_updated: null },
+    'psmm.json': { sessions: {} }
+  };
+  let surfaceCount = 0;
+  for (const [filename, data] of Object.entries(dataSurfaces)) {
+    if (writeJsonIfNew(path.join(baseDir, 'data', filename), data)) {
+      surfaceCount++;
+    }
+  }
+  if (surfaceCount > 0) {
+    console.log(`  ${green}+${reset} .base/data/ (${surfaceCount} JSON surfaces initialized)`);
+  } else {
+    console.log(`  ${dim}  .base/data/ (existing surfaces preserved)${reset}`);
+  }
+
+  // Copy workspace.json template (don't overwrite existing)
+  const workspaceJsonDest = path.join(baseDir, 'workspace.json');
+  if (!fs.existsSync(workspaceJsonDest)) {
+    const templateSrc = path.join(src, 'src', 'templates', 'workspace.json');
+    if (fs.existsSync(templateSrc)) {
+      const template = JSON.parse(fs.readFileSync(templateSrc, 'utf-8'));
+      template.workspace = path.basename(workspaceDir);
+      template.created = new Date().toISOString().split('T')[0];
+      fs.writeFileSync(workspaceJsonDest, JSON.stringify(template, null, 2));
+      console.log(`  ${green}+${reset} .base/workspace.json (manifest)`);
+    }
+  } else {
+    console.log(`  ${dim}  .base/workspace.json (existing manifest preserved)${reset}`);
+  }
+
+  // Copy operator.json template (don't overwrite existing)
+  const operatorJsonDest = path.join(baseDir, 'operator.json');
+  if (!fs.existsSync(operatorJsonDest)) {
+    const operatorSrc = path.join(src, 'src', 'templates', 'operator.json');
+    if (fs.existsSync(operatorSrc)) {
+      fs.copyFileSync(operatorSrc, operatorJsonDest);
+      console.log(`  ${green}+${reset} .base/operator.json (operator profile — complete via /base:scaffold)`);
+    }
+  } else {
+    console.log(`  ${dim}  .base/operator.json (existing profile preserved)${reset}`);
+  }
+
+  // Copy base-mcp
   const baseMcpSrc = path.join(src, 'src', 'packages', 'base-mcp');
   const baseMcpDest = path.join(baseDir, 'base-mcp');
   copyDir(baseMcpSrc, baseMcpDest);
   console.log(`  ${green}+${reset} .base/base-mcp/`);
 
-  const carlMcpSrc = path.join(src, 'src', 'packages', 'carl-mcp');
-  const carlMcpDest = path.join(baseDir, 'carl-mcp');
-  copyDir(carlMcpSrc, carlMcpDest);
-  console.log(`  ${green}+${reset} .base/carl-mcp/`);
-
-  // Copy all hooks from single src/hooks/ directory
-  // Surface hooks (_template, active-hook, backlog-hook) → .base/hooks/
-  // Session hooks (base-pulse-check, psmm-injector) → .claude/hooks/
+  // Copy all hooks to .base/hooks/
   const allHooksSrc = path.join(src, 'src', 'hooks');
-  const surfaceHooks = ['_template.py', 'active-hook.py', 'backlog-hook.py'];
-  const sessionHooks = ['base-pulse-check.py', 'psmm-injector.py', 'satellite-detection.py'];
-
-  const entries = fs.readdirSync(allHooksSrc);
-  for (const file of entries) {
-    const srcPath = path.join(allHooksSrc, file);
-    if (surfaceHooks.includes(file)) {
-      fs.copyFileSync(srcPath, path.join(baseDir, 'hooks', file));
-    } else if (sessionHooks.includes(file)) {
-      const claudeHooksDir = path.join(workspaceDir, '.claude', 'hooks');
-      fs.mkdirSync(claudeHooksDir, { recursive: true });
-      fs.copyFileSync(srcPath, path.join(claudeHooksDir, file));
-    } else {
-      // Unknown hooks default to .base/hooks/
-      fs.copyFileSync(srcPath, path.join(baseDir, 'hooks', file));
-    }
+  const hookEntries = fs.readdirSync(allHooksSrc).filter(f => f.endsWith('.py'));
+  for (const file of hookEntries) {
+    fs.copyFileSync(path.join(allHooksSrc, file), path.join(baseDir, 'hooks', file));
   }
-  console.log(`  ${green}+${reset} .base/hooks/ (${surfaceHooks.length} surface hooks)`);
-  console.log(`  ${green}+${reset} .claude/hooks/ (${sessionHooks.length} session hooks: pulse, PSMM, satellite)`);
+  console.log(`  ${green}+${reset} .base/hooks/ (${hookEntries.length} hooks)`);
 
-  // npm install for MCP servers
+  // npm install for base-mcp
   console.log(`\n  Installing MCP dependencies...`);
   try {
     execSync('npm install', { cwd: baseMcpDest, stdio: 'pipe' });
@@ -251,14 +427,8 @@ function installWorkspace() {
   } catch (e) {
     console.log(`  ${yellow}!${reset} base-mcp npm install failed — run manually in .base/base-mcp/`);
   }
-  try {
-    execSync('npm install', { cwd: carlMcpDest, stdio: 'pipe' });
-    console.log(`  ${green}+${reset} carl-mcp dependencies installed`);
-  } catch (e) {
-    console.log(`  ${yellow}!${reset} carl-mcp npm install failed — run manually in .base/carl-mcp/`);
-  }
 
-  // Merge MCP registrations into .mcp.json
+  // Merge MCP registration into .mcp.json
   const mcpJsonPath = path.join(workspaceDir, '.mcp.json');
   let mcpConfig = { mcpServers: {} };
   if (fs.existsSync(mcpJsonPath)) {
@@ -266,21 +436,16 @@ function installWorkspace() {
       mcpConfig = JSON.parse(fs.readFileSync(mcpJsonPath, 'utf-8'));
     } catch (e) { /* start fresh */ }
   }
-  mcpConfig.mcpServers['carl-mcp'] = {
-    type: 'stdio',
-    command: 'node',
-    args: ['./.base/carl-mcp/index.js']
-  };
   mcpConfig.mcpServers['base-mcp'] = {
     type: 'stdio',
     command: 'node',
     args: ['./.base/base-mcp/index.js']
   };
   fs.writeFileSync(mcpJsonPath, JSON.stringify(mcpConfig, null, 2));
-  console.log(`  ${green}+${reset} .mcp.json (carl-mcp + base-mcp registered)`);
+  console.log(`  ${green}+${reset} .mcp.json (base-mcp registered)`);
 
   console.log(`\n  ${green}Workspace layer installed.${reset}`);
-  console.log(`  Run ${cyan}/base:scaffold${reset} to complete workspace setup.\n`);
+  console.log(`  Run ${cyan}/base:scaffold${reset} to complete setup (hook wiring, operator profile).\n`);
 }
 
 /**
@@ -316,25 +481,43 @@ function promptLocation() {
       installCommands(true);
       installWorkspace();
     }
-    console.log(`  ${green}Done!${reset} Launch Claude Code and run ${cyan}/base:surface-list${reset}.\n`);
+    console.log(`  ${green}Done!${reset} Launch Claude Code and run ${cyan}/base:scaffold${reset} to complete setup.\n`);
   });
 }
 
 // Main
-if (hasHelp) {
-  // Already handled above
-} else if (hasGlobal || hasLocal || hasWorkspace) {
-  if (hasGlobal && hasLocal) {
-    console.error(`  ${yellow}Cannot specify both --global and --local${reset}`);
-    process.exit(1);
+async function main() {
+  if (hasHelp) {
+    return; // Already handled above
   }
-  if (hasGlobal || hasLocal) {
-    installCommands(hasGlobal);
+
+  if (hasGlobal || hasLocal || hasWorkspace) {
+    if (hasGlobal && hasLocal) {
+      console.error(`  ${yellow}Cannot specify both --global and --local${reset}`);
+      process.exit(1);
+    }
+
+    // Detect and offer cleanup of v1/v2 artifacts before installing
+    const configDir = expandTilde(explicitConfigDir) || expandTilde(process.env.CLAUDE_CONFIG_DIR);
+    const cleanupClaudeDir = (hasGlobal || hasLocal)
+      ? (hasGlobal ? (configDir || path.join(os.homedir(), '.claude')) : path.join(process.cwd(), '.claude'))
+      : null;
+    const cleanupWorkspaceDir = hasWorkspace
+      ? (expandTilde(explicitWorkspaceDir) || process.cwd())
+      : null;
+
+    await runUpgradeCleanup(cleanupClaudeDir, cleanupWorkspaceDir);
+
+    if (hasGlobal || hasLocal) {
+      installCommands(hasGlobal);
+    }
+    if (hasWorkspace) {
+      installWorkspace();
+    }
+    console.log(`  ${green}Done!${reset} Launch Claude Code and run ${cyan}/base:scaffold${reset} to complete setup.\n`);
+  } else {
+    promptLocation();
   }
-  if (hasWorkspace) {
-    installWorkspace();
-  }
-  console.log(`  ${green}Done!${reset} Launch Claude Code and run ${cyan}/base:surface-list${reset}.\n`);
-} else {
-  promptLocation();
 }
+
+main();

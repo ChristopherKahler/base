@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "apex/state.schema.json",
+  "title": "APEX Workspace State",
+  "description": "Workspace health, drift tracking, groom scheduling, and satellite registry. Replaces STATE.md with machine-readable state.",
+  "type": "object",
+  "required": ["version", "workspace", "groom", "drift", "areas"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "workspace": {
+      "type": "string",
+      "description": "Workspace name"
+    },
+    "last_modified": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "groom": {
+      "type": "object",
+      "required": ["cadence", "day", "last_groom", "next_groom_due"],
+      "properties": {
+        "cadence": { "type": "string", "enum": ["daily", "weekly", "bi-weekly", "monthly"] },
+        "day": { "type": ["string", "null"], "description": "Day of week for weekly cadence (e.g. friday)" },
+        "last_groom": { "type": ["string", "null"], "format": "date" },
+        "next_groom_due": { "type": ["string", "null"], "format": "date" }
+      }
+    },
+    "drift": {
+      "type": "object",
+      "required": ["score"],
+      "properties": {
+        "score": { "type": "integer", "minimum": 0, "description": "Composite drift score (0 = healthy)" },
+        "indicators": {
+          "type": "object",
+          "properties": {
+            "active_age_days": { "type": "integer", "description": "Days since ACTIVE/projects data last updated" },
+            "backlog_age_days": { "type": "integer", "description": "Days since BACKLOG data last updated" },
+            "backlog_past_review": { "type": "integer", "description": "Count of backlog items past review_by date" },
+            "orphaned_sessions": { "type": "integer", "description": "PSMM sessions with no recent activity" },
+            "untracked_root_files": { "type": "integer", "description": "Files in workspace root not in .gitignore or tracked" },
+            "stale_satellites": { "type": "integer", "description": "PAUL satellites with no recent activity" }
+          }
+        }
+      }
+    },
+    "areas": {
+      "type": "object",
+      "description": "Workspace areas with health tracking. Keys are area slugs.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["type", "description", "paths"],
+        "properties": {
+          "type": { "type": "string", "description": "Area type (e.g. working-memory, directory, config-cross-ref, system-layer)" },
+          "description": { "type": "string" },
+          "paths": { "type": "array", "items": { "type": "string" } },
+          "groom_schedule": { "type": "string", "enum": ["daily", "weekly", "bi-weekly", "monthly"] },
+          "last_touched": { "type": ["string", "null"], "format": "date" },
+          "groom_due": { "type": ["string", "null"], "format": "date" },
+          "status": { "type": "string", "enum": ["current", "stale", "critical"], "default": "current" },
+          "audit": {
+            "type": "object",
+            "properties": {
+              "strategy": { "type": "string", "description": "Audit strategy type (staleness, classify, cross-reference, dead-code, pipeline-status)" },
+              "config": { "type": "object", "description": "Strategy-specific configuration" }
+            }
+          }
+        }
+      }
+    },
+    "satellites": {
+      "type": "object",
+      "description": "PAUL project satellites. Keys are project slugs.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["path", "engine"],
+        "properties": {
+          "path": { "type": "string", "description": "Workspace-relative path to project" },
+          "engine": { "type": "string", "enum": ["paul"], "description": "Build orchestration engine" },
+          "state": { "type": "string", "description": "Path to STATE.md" },
+          "registered": { "type": "string", "format": "date" },
+          "groom_check": { "type": "boolean", "default": true },
+          "last_activity": { "type": ["string", "null"], "format": "date-time" }
+        }
+      }
+    },
+    "carl_hygiene": {
+      "type": "object",
+      "properties": {
+        "proactive": { "type": "boolean", "default": true },
+        "cadence": { "type": "string", "enum": ["weekly", "bi-weekly", "monthly"] },
+        "staleness_threshold_days": { "type": "integer", "default": 60 },
+        "max_rules_per_domain": { "type": "integer", "default": 15 },
+        "last_run": { "type": ["string", "null"], "format": "date" }
+      }
+    },
+    "last_audit": {
+      "type": ["object", "null"],
+      "properties": {
+        "date": { "type": "string", "format": "date" },
+        "phases": { "type": "integer" },
+        "outcome": { "type": "string" }
+      }
+    }
+  }
+}

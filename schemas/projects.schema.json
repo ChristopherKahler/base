@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "apex/projects.schema.json",
+  "title": "APEX Projects",
+  "description": "Unified project management schema for the APEX ecosystem. Supports Initiative > Project > Task hierarchy with flat categories, multi-user assignees, and PAUL satellite linkage.",
+  "type": "object",
+  "required": ["version", "workspace", "last_modified", "categories", "items"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "description": "Schema version for migration compatibility",
+      "const": 1
+    },
+    "workspace": {
+      "type": "string",
+      "description": "Workspace name"
+    },
+    "last_modified": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of last modification"
+    },
+    "categories": {
+      "type": "array",
+      "description": "User-defined flat category list. Workspaces define their own categories.",
+      "items": { "type": "string" },
+      "uniqueItems": true
+    },
+    "items": {
+      "type": "array",
+      "description": "All project items (initiatives, projects, tasks) in a flat array with parent_id for hierarchy",
+      "items": { "$ref": "#/$defs/item" }
+    },
+    "archived": {
+      "type": "array",
+      "description": "Completed or closed items preserved for history",
+      "items": { "$ref": "#/$defs/archived_item" }
+    }
+  },
+  "$defs": {
+    "item": {
+      "type": "object",
+      "required": ["id", "title", "type", "status", "priority", "created_at", "updated_at"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier. Convention: INI-NNN for initiatives, PRJ-NNN for projects, TSK-NNN for tasks",
+          "pattern": "^(INI|PRJ|TSK)-\\d{3,}$"
+        },
+        "title": {
+          "type": "string",
+          "description": "Human-readable item title"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["initiative", "project", "task"],
+          "description": "Hierarchy level"
+        },
+        "parent_id": {
+          "type": ["string", "null"],
+          "description": "ID of parent item. null for top-level initiatives. Initiative ID for projects. Project ID for tasks.",
+          "default": null
+        },
+        "status": {
+          "type": "string",
+          "enum": ["backlog", "todo", "in_progress", "blocked", "in_review", "completed", "deferred", "archived"],
+          "description": "Current work status"
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["urgent", "high", "medium", "low", "ongoing"],
+          "description": "Priority level"
+        },
+        "category": {
+          "type": ["string", "null"],
+          "description": "Flat category from the workspace categories list",
+          "default": null
+        },
+        "assignees": {
+          "type": "array",
+          "description": "Array of entity IDs (from entities.json) assigned to this item",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "start_date": {
+          "type": ["string", "null"],
+          "format": "date",
+          "description": "ISO date when work started or is planned to start",
+          "default": null
+        },
+        "due_date": {
+          "type": ["string", "null"],
+          "format": "date",
+          "description": "ISO date deadline",
+          "default": null
+        },
+        "review_by": {
+          "type": ["string", "null"],
+          "format": "date",
+          "description": "Hygiene review date — when to re-evaluate this item. Separate from due_date (hard deadline).",
+          "default": null
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp when item was created"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp of last update"
+        },
+        "location": {
+          "type": ["string", "null"],
+          "description": "Workspace-relative path to project directory",
+          "default": null
+        },
+        "blocked_by": {
+          "type": ["string", "null"],
+          "description": "Description of what's blocking this item",
+          "default": null
+        },
+        "next": {
+          "type": ["string", "null"],
+          "description": "Next action or step for this item",
+          "default": null
+        },
+        "notes": {
+          "type": "array",
+          "description": "Timestamped notes (from dashboard or Claude sessions)",
+          "items": {
+            "type": "object",
+            "required": ["text", "timestamp"],
+            "properties": {
+              "text": { "type": "string" },
+              "author": { "type": ["string", "null"], "default": null },
+              "timestamp": { "type": "string", "format": "date-time" }
+            }
+          },
+          "default": []
+        },
+        "tags": {
+          "type": "array",
+          "description": "Free-form tags for filtering and search",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "paul": {
+          "type": ["object", "null"],
+          "description": "PAUL satellite linkage. Present only for projects managed by PAUL.",
+          "properties": {
+            "is_paul_project": { "type": "boolean" },
+            "satellite_name": { "type": "string", "description": "Key in workspace.json satellites" },
+            "milestone": { "type": ["string", "null"], "description": "Current milestone name" },
+            "phase": { "type": ["string", "null"], "description": "Current phase name" },
+            "loop_position": { "type": ["string", "null"], "enum": ["IDLE", "PLAN", "APPLY", "UNIFY", null] },
+            "last_update": { "type": ["string", "null"], "format": "date-time" },
+            "total_phases": { "type": ["integer", "null"] },
+            "completed_phases": { "type": ["integer", "null"] },
+            "total_plans_completed": { "type": ["integer", "null"] },
+            "total_time_hours": { "type": ["number", "null"], "description": "Accumulated execution time" }
+          },
+          "default": null
+        },
+        "relations": {
+          "type": "array",
+          "description": "Relations to entities (stakeholders, clients, orgs)",
+          "items": {
+            "type": "object",
+            "required": ["entity_id", "relationship"],
+            "properties": {
+              "entity_id": { "type": "string", "description": "ID from entities.json" },
+              "relationship": { "type": "string", "description": "e.g. stakeholder, client, owner, partner, contractor" }
+            }
+          },
+          "default": []
+        },
+        "description": {
+          "type": ["string", "null"],
+          "description": "Extended description or context",
+          "default": null
+        },
+        "revenue": {
+          "type": ["object", "null"],
+          "description": "Revenue context for business-critical projects",
+          "properties": {
+            "type": { "type": "string", "enum": ["recurring", "one-time", "retainer", "w2", "none"] },
+            "amount": { "type": ["string", "null"], "description": "Human-readable amount" },
+            "notes": { "type": ["string", "null"], "description": "Brief revenue context" }
+          },
+          "default": null
+        },
+        "dependencies": {
+          "type": "array",
+          "description": "Cross-project dependencies (blocks, requires, informs)",
+          "items": {
+            "type": "object",
+            "required": ["project_id", "type"],
+            "properties": {
+              "project_id": { "type": "string", "description": "ID of the dependency project" },
+              "type": { "type": "string", "enum": ["blocks", "requires", "informs"], "description": "Dependency type" },
+              "notes": { "type": ["string", "null"] }
+            }
+          },
+          "default": []
+        }
+      }
+    },
+    "archived_item": {
+      "type": "object",
+      "required": ["id", "title", "outcome", "archived_at"],
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "outcome": { "type": "string", "description": "What happened — shipped, killed, absorbed, etc." },
+        "date": { "type": ["string", "null"], "format": "date", "description": "When the outcome occurred" },
+        "archived_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}

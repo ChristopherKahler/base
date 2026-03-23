@@ -23,10 +23,14 @@ Turn Claude Code from a per-session tool into a workspace that remembers, mainta
 - [What BASE Actually Does](#what-base-actually-does)
 - [How It Works](#how-it-works)
 - [Install](#install)
+- [Upgrading from v2](#upgrading-from-v2)
 - [What Gets Installed](#what-gets-installed)
 - [The Maintenance Cycle](#the-maintenance-cycle)
 - [Config Alignment](#config-alignment--claude-directory-audit)
-- [MCP Servers](#mcp-servers--claude-operates-on-your-data)
+- [MCP Server](#mcp-server--claude-operates-on-your-data)
+- [Operator Profile](#operator-profile--who-you-are-always-in-context)
+- [PSMM — Session Intelligence](#per-session-meta-memory-psmm--session-intelligence)
+- [Apex Insights](#apex-insights--workspace-analytics)
 - [Multi-Project Workspaces — BASE + PAUL](#multi-project-workspaces--base--paul)
 - [Creating Custom Surfaces](#creating-custom-surfaces)
 - [How the Ecosystem Fits Together](#how-the-ecosystem-fits-together)
@@ -111,12 +115,15 @@ A "data surface" is just a structured JSON file paired with a hook that injects 
 JSON file (your data)  →  Hook (reads + summarizes)  →  Claude knows it
 ```
 
-BASE ships with two built-in surfaces:
+BASE ships with five built-in surfaces:
 
 | Surface | What It Tracks |
 |---------|---------------|
 | **Active** | Current projects, tasks, blockers, deadlines, status |
 | **Backlog** | Future work, ideas, deferred items with review deadlines |
+| **Projects** | Unified project tracking with PAUL integration, categories, revenue |
+| **Entities** | People and organizations — contacts, stakeholders, collaborators |
+| **State** | Workspace health — drift score, area statuses, groom tracking |
 
 But you can create surfaces for anything — clients, contacts, content pipelines, API keys, whatever persistent data you want Claude to passively know about. The `/base:surface create` command walks you through it: define a schema, pick an injection format, and BASE generates the JSON file, the hook, and the wiring automatically.
 
@@ -141,7 +148,8 @@ BASE uses Claude Code's [hook system](https://docs.anthropic.com/en/docs/claude-
 | Hook | What It Does |
 |------|-------------|
 | **Pulse check** | Calculates workspace drift score, warns if grooming is overdue |
-| **PSMM injector** | Re-injects important session moments (decisions, corrections, insights) into Claude's context so they don't get buried in a long session. [Details below.](#per-session-meta-memory-psmm) |
+| **PSMM injector** | Re-injects important session moments (decisions, corrections, insights) into Claude's context so they don't get buried in a long session. [Details below.](#per-session-meta-memory-psmm--session-intelligence) |
+| **Operator** | Injects a compact identity summary from your operator profile — north star, values, vision — so Claude stays aligned with who you are and what you're building toward |
 | **Surface hooks** | One per data surface (active, backlog, or custom). Reads the JSON, outputs a compact summary so Claude passively knows the current state |
 
 **Session start** (`SessionStart`) — Runs once when a Claude Code session begins:
@@ -149,6 +157,12 @@ BASE uses Claude Code's [hook system](https://docs.anthropic.com/en/docs/claude-
 | Hook | What It Does |
 |------|-------------|
 | **PAUL project detection** | Scans your workspace for [PAUL](https://github.com/ChristopherKahler/paul) project files (`.paul/paul.json`) and auto-registers new ones into `workspace.json`. Only needs to run once — your project list doesn't change mid-session. (More on PAUL below.) |
+
+**On demand** — Invoked by specific commands, not auto-fired:
+
+| Hook | What It Does |
+|------|-------------|
+| **Apex insights** | Workspace analytics engine — velocity tracking, stall detection, blocking analysis, revenue exposure, dependency chains. Invoked by `/apex:insights`. |
 
 All hooks are lightweight Python — they read JSON files and output compact XML summaries. No network calls, no heavy dependencies, no noticeable latency. A hook that has nothing to report outputs nothing and exits silently.
 
@@ -186,38 +200,71 @@ npx @chrisai/base --global
 | `--config-dir <path>` | Custom Claude config directory |
 | `--workspace-dir <path>` | Target a specific workspace path |
 
+### Upgrading from v2
+
+If you're upgrading from BASE v2.x, the installer detects old artifacts and offers to archive them before proceeding. Nothing is deleted — everything moves to `.base/_archive/upgrade-v3/` where you can recover it if needed.
+
+| What Gets Archived | Why |
+|-------------------|-----|
+| `.base/carl-mcp/` | CARL MCP is no longer bundled with BASE. Install [carl-core](https://github.com/ChristopherKahler/carl) separately for CARL MCP tools. |
+| `.claude/hooks/base-pulse-check.py`, `psmm-injector.py`, `satellite-detection.py` | Session hooks moved to `.base/hooks/`. Old copies in `.claude/hooks/` cause double-fire. |
+| `.mcp.json` carl-mcp entry | Removed to prevent startup errors from missing server. |
+| `base-framework/templates/active-md.md`, `backlog-md.md`, `state-md.md` | Replaced by JSON templates. Scaffold no longer references these. |
+
+The upgrade prompt looks like this:
+```
+=== UPGRADE DETECTED ===
+Found 8 artifact(s) from a previous BASE version:
+
+! .base/carl-mcp/
+  CARL MCP no longer ships with BASE — install carl-core separately
+! .claude/hooks/base-pulse-check.py
+  Hooks now live in .base/hooks/ — duplicate here causes double-fire
+...
+
+These will be archived to: .base/_archive/upgrade-v3/
+Nothing is deleted — you can recover from the archive.
+
+Archive these artifacts? [Y/n]:
+```
+
+Answering `n` skips cleanup and installs v3 alongside existing artifacts. You can clean up manually later.
+
 ---
 
 ## What Gets Installed
 
 ```
 ~/.claude/                              Shared across all workspaces
-├── commands/base/                      12 slash commands
+├── commands/base/                      Slash commands (/base:pulse, /base:groom, etc.)
 ├── skills/base/                        Skill entry point + package sources
 └── base-framework/
     ├── tasks/                          How each command works (pulse, groom, audit...)
-    ├── templates/                      Schemas for workspace.json, STATE.md, surfaces
+    ├── templates/                      Schemas for workspace.json, surfaces
     ├── context/                        Core principles
     ├── frameworks/                     Audit strategies, config alignment, project registration
     ├── utils/                          Scanner utilities (scan-claude-dirs.py)
-    └── hooks/                          Session hook sources
+    └── hooks/                          All hook sources (for scaffold reference)
 
 .base/                                  Per-workspace
 ├── workspace.json                      The manifest — everything is registered here
+├── operator.json                       Operator profile — north star, values, vision, pitch
 ├── data/
 │   ├── active.json                     Active work surface
-│   └── backlog.json                    Backlog surface
+│   ├── backlog.json                    Backlog surface
+│   ├── projects.json                   Unified project tracking
+│   ├── entities.json                   People and organizations
+│   └── state.json                      Workspace health state
 ├── hooks/
 │   ├── _template.py                    Hook template for creating new surfaces
 │   ├── active-hook.py                  Injects active work into Claude's context
-│   └── backlog-hook.py                 Injects backlog into Claude's context
-├── base-mcp/                           MCP server for surface operations (CRUD)
-└── carl-mcp/                           MCP server for rules engine operations
-
-.claude/hooks/                          Registered in settings.json
-├── base-pulse-check.py                 [UserPromptSubmit] Drift + groom reminders
-├── psmm-injector.py                    [UserPromptSubmit] Session meta memory
-└── satellite-detection.py              [SessionStart] PAUL project discovery
+│   ├── backlog-hook.py                 Injects backlog into Claude's context
+│   ├── base-pulse-check.py             Drift score + groom reminders
+│   ├── psmm-injector.py                Session meta memory
+│   ├── satellite-detection.py          PAUL project auto-discovery
+│   ├── operator.py                     Operator identity context
+│   └── apex-insights.py                Workspace analytics (on-demand)
+└── base-mcp/                           MCP server for surface + project operations
 ```
 
 ---
@@ -308,13 +355,13 @@ The strategy is defined in a standalone framework file (`claude-config-alignment
 
 ---
 
-## MCP Servers — Claude Operates on Your Data
+## MCP Server — Claude Operates on Your Data
 
-BASE ships two MCP servers so Claude can read and write your workspace data through structured tool calls instead of raw file edits.
+BASE ships one MCP server so Claude can read and write your workspace data through structured tool calls instead of raw file edits.
 
-### BASE MCP — Works With Any Surface
+### BASE MCP — Surfaces, Projects, Entities, Operator, State
 
-A generic CRUD interface for all registered surfaces. Claude can add items, update status, archive old work, and search across everything:
+A unified interface for all workspace data. Claude can manage surfaces, track projects, maintain entities, read operator context, and check workspace state:
 
 | Tool | What It Does |
 |------|-------------|
@@ -326,15 +373,25 @@ A generic CRUD interface for all registered surfaces. Claude can add items, upda
 | `base_archive_item` | Move item to archive with timestamp |
 | `base_search` | Search across one or all surfaces by keyword |
 
+Additional tool modules for first-class data:
+
+| Module | Tools | What They Do |
+|--------|-------|-------------|
+| **Projects** | `base_get_projects`, `base_update_project` | Unified project tracking with PAUL integration |
+| **Entities** | `base_get_entities`, `base_add_entity`, `base_update_entity` | People and organization management |
+| **Operator** | `base_get_operator` | Read operator profile (north star, values, vision) |
+| **State** | `base_get_state`, `base_update_state` | Workspace health and drift tracking |
+| **PSMM** | `base_psmm_log`, `base_psmm_get`, `base_psmm_list`, `base_psmm_clean` | Per-session meta memory — log and manage session moments |
+
 When you create a new surface, the MCP server auto-discovers it from `workspace.json`. No code changes needed.
 
-### CARL MCP — Rules Engine + Decision Memory + Session Intelligence
+### CARL Integration
 
-[CARL](https://github.com/ChristopherKahler/carl) (Context Augmentation & Reinforcement Layer) is a dynamic rules engine for Claude Code. On its own, CARL stores behavioral rules in domain files — groups of rules that load automatically based on what you're doing. Say "check Skool" and CARL loads your Skool community rules. Start coding and it loads your development standards. The rules are just config files in `.carl/`.
+[CARL](https://github.com/ChristopherKahler/carl) (Context Augmentation & Reinforcement Layer) is a dynamic rules engine for Claude Code. It stores behavioral rules in domain files — groups of rules that load automatically based on what you're doing. Say "check Skool" and CARL loads your Skool community rules. Start coding and it loads your development standards. The rules are just config files in `.carl/`.
 
-**CARL is fully independent — it works without BASE, and BASE works without CARL.** But BASE bundles CARL's MCP server as an optional capability. If you use CARL, BASE gives it MCP superpowers (programmatic rule management, decision logging, session memory). If you don't use CARL, this MCP server sits idle and everything else in BASE works normally.
+**CARL is fully independent — it works without BASE, and BASE works without CARL.** CARL ships its own MCP server (`carl-mcp`) as part of the [carl-core](https://github.com/ChristopherKahler/carl) package. Install it separately if you want CARL's tools. If you use both, they complement each other — CARL handles rules and decisions, BASE handles workspace data and project tracking.
 
-When both are active, Claude gets programmatic access to three powerful systems:
+When CARL is installed alongside BASE, Claude gets programmatic access to three powerful systems (all provided by CARL's MCP, not BASE's):
 
 #### Dynamic Rules
 
@@ -357,21 +414,9 @@ CARL's decision logger fixes this. Decisions are stored per domain (e.g., `decis
 | `carl_log_decision` | Record a decision with domain, rationale, and recall keywords |
 | `carl_search_decisions` | Search across all domains when you need to find something specific |
 
-#### Per-Session Meta Memory (PSMM)
-
-Here's the problem with long Claude Code sessions: Claude's context window is huge (up to 1M tokens), but important moments — a design decision you made at minute 5, a correction at minute 20, a key insight at minute 45 — get buried under thousands of lines of tool output and code. By the time you're deep into the session, Claude has technically "seen" these moments but they've drifted so far back in context that they stop influencing behavior.
-
-PSMM fixes this. When something significant happens during a session — a decision, a correction, a context shift, a key insight — Claude logs it:
-
-| Tool | What It Does |
-|------|-------------|
-| `carl_psmm_log` | Log a session meta-memory entry (type: DECISION, CORRECTION, SHIFT, INSIGHT, COMMITMENT) |
-
-The PSMM hook re-injects these entries into Claude's context on every prompt. Important moments stay hot for the entire session, no matter how long it runs.
-
 #### The Rule Staging Pipeline
 
-This is where PSMM, decisions, and rules connect into a learning loop:
+This is where CARL connects to BASE's [PSMM](#per-session-meta-memory-psmm--session-intelligence) system. Session moments logged via PSMM can graduate into permanent CARL rules:
 
 1. **During a session** — Claude notices a pattern worth codifying (a correction you gave, a decision that should become policy, an insight about how you work)
 2. **Stage it** — `carl_stage_proposal` creates a draft rule in staging, not in your live rules
@@ -379,6 +424,65 @@ This is where PSMM, decisions, and rules connect into a learning loop:
 4. **Approved rules go live** — They become part of your CARL domains, loaded automatically in future sessions
 
 This means your AI assistant gets smarter over time — not by accumulating a massive prompt, but by distilling session learnings into clean, targeted rules. And because staging exists, nothing goes live without your review. The hygiene cycle (part of BASE's groom flow) prevents staged proposals from going stale — they get reviewed or they get killed.
+
+---
+
+## Operator Profile — Who You Are, Always in Context
+
+`operator.json` is a structured identity document that gives Claude persistent alignment with your goals, values, and vision. Instead of re-explaining who you are and what you're building toward each session, your operator profile loads automatically.
+
+The profile is built through a guided questionnaire (via `/base:scaffold`) that walks through five layers:
+
+| Section | What It Captures |
+|---------|-----------------|
+| **Deep Why** | Five increasingly deep questions about your motivation — not a mission statement, but the real reason you do what you do |
+| **North Star** | One measurable metric with a timeframe — the thing you're optimizing for right now |
+| **Key Values** | Rank-ordered values with concrete meanings — not platitudes, but actionable principles |
+| **Elevator Pitch** | A layered pitch (1-4 floors) that describes what you do at increasing depth |
+| **Surface Vision** | Concrete scenes of what success looks like — not abstract goals, but vivid snapshots |
+
+The operator hook injects a compact summary into every session. Claude doesn't quote it back to you — it just stays aligned. When you're making decisions, Claude's suggestions naturally reflect your north star and values without being asked.
+
+---
+
+## Per-Session Meta Memory (PSMM) — Session Intelligence
+
+Here's the problem with long Claude Code sessions: Claude's context window is huge (up to 1M tokens), but important moments — a design decision you made at minute 5, a correction at minute 20, a key insight at minute 45 — get buried under thousands of lines of tool output and code. By the time you're deep into the session, Claude has technically "seen" these moments but they've drifted so far back in context that they stop influencing behavior.
+
+PSMM fixes this. Both logging and injection are built into BASE:
+
+**Logging** — When something significant happens, Claude logs it via the BASE MCP:
+
+| Tool | What It Does |
+|------|-------------|
+| `base_psmm_log` | Log a session meta-memory entry (type: DECISION, CORRECTION, SHIFT, INSIGHT, COMMITMENT) |
+| `base_psmm_get` | Retrieve entries for a specific session |
+| `base_psmm_list` | List all sessions with entry counts |
+| `base_psmm_clean` | Remove stale session data |
+
+**Injection** — The PSMM hook re-injects the current session's entries into Claude's context on every prompt. Important moments stay hot for the entire session, no matter how long it runs.
+
+**Graduation** — When a session insight should become a permanent rule, it can be staged as a [CARL](https://github.com/ChristopherKahler/carl) rule proposal via `carl_stage_proposal`. This is the only point where PSMM connects to CARL — everything else is self-contained in BASE.
+
+No CARL required. PSMM works standalone as session memory. CARL adds the optional path from "session insight" to "permanent behavioral rule."
+
+---
+
+## Apex Insights — Workspace Analytics
+
+`/apex:insights` is your portfolio dashboard. It reads `projects.json` and `workspace.json` to compute:
+
+| Analysis | What It Shows |
+|----------|--------------|
+| **Velocity** | Projects sorted by plan age, phase progress, and loop position |
+| **Stall detection** | Projects with plan age > 14 days that aren't completed or deferred |
+| **Blocking analysis** | Groups blocked projects by blocker, flags revenue at risk |
+| **Cross-project dependencies** | Visualizes dependency chains between projects |
+| **Workload by category** | Active project count per category |
+| **Revenue exposure** | All revenue-tied projects with blocked flags |
+| **Pending handoffs** | PAUL satellites awaiting handoff processing |
+
+Use it during weekly groom cycles, when deciding what to work on next, before stakeholder updates, or whenever a project feels stalled.
 
 ---
 
@@ -429,7 +533,13 @@ BASE never modifies your projects. It only reads and reports. Each project manag
       "state": "apps/my-saas-app/.paul/STATE.md",
       "registered": "2026-03-15",
       "groom_check": true,
-      "last_activity": "2026-03-17T14:30:00-05:00"
+      "last_activity": "2026-03-17T14:30:00-05:00",
+      "phase_name": "Auth System",
+      "phase_number": 3,
+      "phase_status": "in_progress",
+      "loop_position": "APPLY",
+      "handoff": false,
+      "last_plan_completed_at": "2026-03-15T10:00:00-05:00"
     }
   }
 }
@@ -451,7 +561,7 @@ The project detection hook simply has nothing to find. Everything else operates 
 
 ## Creating Custom Surfaces
 
-The built-in `active` and `backlog` surfaces are starting points. The real power is creating surfaces for your specific needs.
+The five built-in surfaces cover common workspace needs. The real power is creating surfaces for your specific needs.
 
 ### `/base:surface create`
 
@@ -497,7 +607,8 @@ Already have a markdown file with structured data? This command reads it, detect
 ├─────────────────────────────────┤
 │  CARL   (per-session rules)     │  Load rules based on intent
 ├─────────────────────────────────┤
-│  BASE   (workspace layer)       │  Surfaces, health, grooming
+│  BASE   (workspace layer)       │  Surfaces, projects, analytics, health
+│         + Operator profile      │  Identity alignment across sessions
 └─────────────────────────────────┘
 ```
 
@@ -509,7 +620,7 @@ Together, they turn Claude Code from a per-session coding tool into a managed op
 <summary><strong>How they enhance each other when combined</strong></summary>
 
 - **BASE + PAUL** — PAUL projects auto-register with BASE on session start, giving you workspace-level visibility across all your builds. BASE groom checks project health. PAUL handles the project. BASE handles the portfolio.
-- **BASE + CARL** — BASE bundles CARL's MCP server, upgrading CARL from config files to programmatic rule management, decision logging, and session memory. BASE groom can optionally check CARL rule health and surface staged proposals for review.
+- **BASE + CARL** — CARL brings dynamic rules and decision memory. BASE brings workspace data and project tracking. Together, Claude has both behavioral guidance (CARL) and situational awareness (BASE). BASE groom can optionally check CARL rule health and surface staged proposals for review.
 - **CARL + PAUL** — Independent. Each operates in its own scope (session rules vs project builds).
 
 </details>
