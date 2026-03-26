@@ -11,7 +11,7 @@ Display all registered data surfaces with item counts and hook status.
 </objective>
 
 <execution_context>
-@.claude/skills/base/tasks/surface-list.md
+@~/.claude/base-framework/tasks/surface-list.md
 </execution_context>
 
 <context>
@@ -19,7 +19,7 @@ Display all registered data surfaces with item counts and hook status.
 </context>
 
 <process>
-Follow task: @.claude/skills/base/tasks/surface-list.md
+Follow task: @~/.claude/base-framework/tasks/surface-list.md
 </process>
 
 <success_criteria>

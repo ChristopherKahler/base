@@ -16,7 +16,7 @@ As an AI builder, I want a fast health check I can glance at, so that I know if 
 <step name="quick_check" priority="first">
 Read state and output one-liner.
 
-1. Read `.base/STATE.md`
+1. Read `.base/data/state.json`
 2. Calculate current drift score from timestamps
 3. Count overdue areas and past-due backlog items
 4. Output single line: "BASE: Drift {score} | {N} areas overdue | {N} backlog items past review-by | Last groom: {date}"

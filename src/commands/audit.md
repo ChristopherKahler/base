@@ -11,9 +11,9 @@ Deep workspace audit — comprehensive optimization across all areas with action
 </objective>
 
 <execution_context>
-@.claude/skills/base/tasks/audit.md
-@.claude/skills/base/context/base-principles.md
-@.claude/skills/base/frameworks/audit-strategies.md
+@~/.claude/base-framework/tasks/audit.md
+@~/.claude/base-framework/context/base-principles.md
+@~/.claude/base-framework/frameworks/audit-strategies.md
 </execution_context>
 
 <context>
@@ -23,7 +23,7 @@ $ARGUMENTS
 </context>
 
 <process>
-Follow task: @.claude/skills/base/tasks/audit.md
+Follow task: @~/.claude/base-framework/tasks/audit.md
 </process>
 
 <success_criteria>

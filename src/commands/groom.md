@@ -11,25 +11,25 @@ Structured weekly maintenance — review each workspace area, update statuses, a
 </objective>
 
 <execution_context>
-@.claude/skills/base/tasks/groom.md
-@.claude/skills/base/context/base-principles.md
-@.claude/skills/base/frameworks/audit-strategies.md
+@~/.claude/base-framework/tasks/groom.md
+@~/.claude/base-framework/context/base-principles.md
+@~/.claude/base-framework/frameworks/audit-strategies.md
 </execution_context>
 
 <context>
 $ARGUMENTS
 
 @.base/workspace.json
-@.base/STATE.md
+@.base/data/state.json
 </context>
 
 <process>
-Follow task: @.claude/skills/base/tasks/groom.md
+Follow task: @~/.claude/base-framework/tasks/groom.md
 </process>
 
 <success_criteria>
 - [ ] All workspace areas reviewed
 - [ ] Stale items addressed
-- [ ] STATE.md updated with groom results
+- [ ] state.json updated with groom results
 - [ ] Drift score recalculated
 </success_criteria>

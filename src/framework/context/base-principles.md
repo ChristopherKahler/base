@@ -23,8 +23,8 @@ Drift is the gap between documented state and actual state. Measured in days-ove
 
 | What | Default Cadence | Override |
 |------|----------------|---------|
-| ACTIVE.md | Every session or weekly | workspace.json |
-| BACKLOG.md | Weekly groom | workspace.json |
+| active.json | Every session or weekly | workspace.json |
+| backlog.json | Weekly groom | workspace.json |
 | Project directory | Monthly | workspace.json |
 | Tools/MCP | Monthly | workspace.json |
 | System layer | Monthly | workspace.json |
@@ -42,12 +42,12 @@ During groom: items past review-by surface as "decide or kill." Items past stale
 
 ## Graduation Flow
 
-Backlog items don't sit forever. They graduate to ACTIVE.md when the operator is ready to work on them.
+Backlog items don't sit forever. They graduate to active.json when the operator is ready to work on them.
 
 ```
 BACKLOG (waiting review)
-  → ACTIVE.md TASKS (standalone, bounded work items)
-  → ACTIVE.md PROJECT (complex work warranting its own project entry)
+  → active.json TASKS (standalone, bounded work items) via base_add_item MCP
+  → active.json PROJECT (complex work warranting its own project entry) via base_add_item MCP
   → DONE (closed with outcome + date)
 ```
 
@@ -55,17 +55,17 @@ BACKLOG (waiting review)
 
 **Graduation is never automatic.** The groom flow asks explicitly: "Ready to work on any backlog items?" The operator decides what graduates and where it lands.
 
-**Items can also move backward:** An ACTIVE task that loses priority can return to backlog. A project that stalls can move to DEFERRED. Nothing is permanent.
+**Items can also move backward:** An active task that loses priority can return to backlog. A project that stalls can move to DEFERRED. Nothing is permanent.
 
 ## Scaffold Modes
 
 BASE scaffold operates in two modes:
 
-- **Standard** (`/base:scaffold`) — Data layer only. Creates `.base/` with workspace.json, STATE.md, ROADMAP.md. Scans and tracks what exists. Framework-agnostic.
-- **Full** (`/base:scaffold --full`) — Data layer + operational templates. Creates ACTIVE.md, BACKLOG.md from templates. Offers CLAUDE.md audit. Sets up symlinks. The "batteries included" version for AI builders who want the full system.
+- **Standard** (`/base:scaffold`) — Data layer only. Creates `.base/` with workspace.json, `.base/data/state.json`, ROADMAP.md. Scans and tracks what exists. Framework-agnostic.
+- **Full** (`/base:scaffold --full`) — Data layer + data surfaces. Creates `.base/data/active.json`, `.base/data/backlog.json` from templates. Offers CLAUDE.md audit. The "batteries included" version for AI builders who want the full system.
 
 Standard mode works for any workspace. Full mode provides Chris's proven operational structure.
 
 ## File Location
 
-BASE operates strictly out of `.base/`. All state files (ACTIVE.md, BACKLOG.md, STATE.md, workspace.json, ROADMAP.md) live in `.base/`. Symlinks at workspace root are a **migration tool only** — offered when existing references (CLAUDE.md @mentions, hooks) would break. New installations never need symlinks. `.base/` is the canonical location.
+BASE operates strictly out of `.base/`. All data surfaces (active.json, backlog.json, state.json) live in `.base/data/`. Configuration (workspace.json) and documentation (ROADMAP.md) live in `.base/`. Data is accessed via MCP tools (`base_get_surface`, `base_add_item`, `base_update_item`). `.base/data/` is the canonical location for all structured data.

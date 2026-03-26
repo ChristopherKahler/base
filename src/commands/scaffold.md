@@ -12,9 +12,9 @@ Guided workspace setup — scan, configure, install BASE infrastructure. Optiona
 </objective>
 
 <execution_context>
-@.claude/skills/base/tasks/scaffold.md
-@.claude/skills/base/templates/workspace-json.md
-@.claude/skills/base/templates/state-md.md
+@~/.claude/base-framework/tasks/scaffold.md
+@~/.claude/base-framework/templates/workspace-json.md
+@~/.claude/base-framework/templates/workspace-json.md
 </execution_context>
 
 <context>
@@ -22,12 +22,12 @@ $ARGUMENTS
 </context>
 
 <process>
-Follow task: @.claude/skills/base/tasks/scaffold.md
+Follow task: @~/.claude/base-framework/tasks/scaffold.md
 </process>
 
 <success_criteria>
 - [ ] .base/ directory structure created
 - [ ] workspace.json generated from scan
-- [ ] STATE.md initialized
+- [ ] state.json initialized
 - [ ] Hooks and MCP servers installed (if --full)
 </success_criteria>

@@ -12,7 +12,7 @@ Convert an existing @-mentioned markdown file into a structured data surface. An
 </objective>
 
 <execution_context>
-@.claude/skills/base/tasks/surface-convert.md
+@~/.claude/base-framework/tasks/surface-convert.md
 @.base/hooks/_template.py
 </execution_context>
 
@@ -23,7 +23,7 @@ $ARGUMENTS
 </context>
 
 <process>
-Follow task: @.claude/skills/base/tasks/surface-convert.md
+Follow task: @~/.claude/base-framework/tasks/surface-convert.md
 </process>
 
 <success_criteria>

@@ -104,7 +104,7 @@ Process one domain at a time.
 Quick domain health check — guided Q&A.
 
 1. List all active domains with rule counts
-2. Cross-reference with `.base/ACTIVE.md` current projects:
+2. Cross-reference with `.base/data/active.json` current projects:
    - Any active projects missing a domain?
    - Any domains for inactive/completed projects?
 3. Check recall phrases:
@@ -131,7 +131,7 @@ Quick check on per-domain decision health.
 Record the hygiene session.
 
 1. Update `.base/workspace.json` → `carl_hygiene.last_run` to today's date
-2. Update `.base/STATE.md` → note CARL hygiene completed
+2. Update `.base/data/state.json` → note CARL hygiene completed
 3. Report:
    ```
    CARL Hygiene Complete
@@ -155,6 +155,6 @@ CARL domains reviewed and maintained. Staged proposals decided. Stale rules addr
 - [ ] Domain health check completed (rule counts, recall phrases)
 - [ ] Archived rules moved to .carl/archive/archived-rules.json
 - [ ] workspace.json carl_hygiene.last_run updated
-- [ ] STATE.md updated with hygiene completion
+- [ ] state.json updated with hygiene completion
 - [ ] Operator confirmed completion of each step
 </acceptance-criteria>

@@ -11,16 +11,16 @@ One-liner workspace health status — drift score and area summary.
 </objective>
 
 <execution_context>
-@.claude/skills/base/tasks/status.md
+@~/.claude/base-framework/tasks/status.md
 </execution_context>
 
 <context>
 @.base/workspace.json
-@.base/STATE.md
+@.base/data/state.json
 </context>
 
 <process>
-Follow task: @.claude/skills/base/tasks/status.md
+Follow task: @~/.claude/base-framework/tasks/status.md
 </process>
 
 <success_criteria>

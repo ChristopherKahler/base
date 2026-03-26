@@ -42,7 +42,7 @@ Strategies are documented in `@frameworks/audit-strategies.md`.
 <step name="record_audit">
 Record the audit results.
 
-1. Update `.base/STATE.md`
+1. Update `.base/data/state.json`
 2. Write audit record to `.base/audits/{YYYY-MM-DD}.md`
 3. Log to `.base/ROADMAP.md`
 4. Report final summary: phases completed, items changed, new drift score
@@ -59,6 +59,6 @@ Complete workspace audit with dynamic phases. All areas reviewed, changes execut
 - [ ] Each area audited using its configured strategy
 - [ ] Operator approved all changes before execution
 - [ ] Audit record written to audits/ directory
-- [ ] STATE.md updated
+- [ ] state.json updated
 - [ ] ROADMAP.md updated with audit entry
 </acceptance-criteria>

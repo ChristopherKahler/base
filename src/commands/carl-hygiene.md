@@ -11,7 +11,7 @@ CARL rule lifecycle management — review staleness, dedup, staging pipeline, do
 </objective>
 
 <execution_context>
-@.claude/skills/base/tasks/carl-hygiene.md
+@~/.claude/base-framework/tasks/carl-hygiene.md
 </execution_context>
 
 <context>
@@ -22,7 +22,7 @@ $ARGUMENTS
 </context>
 
 <process>
-Follow task: @.claude/skills/base/tasks/carl-hygiene.md
+Follow task: @~/.claude/base-framework/tasks/carl-hygiene.md
 </process>
 
 <success_criteria>

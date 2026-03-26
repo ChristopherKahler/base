@@ -19,7 +19,7 @@ As an AI builder, I want a guided workspace maintenance session, so that my cont
 Determine what needs grooming.
 
 1. Read `.base/workspace.json` manifest
-2. Read `.base/STATE.md` for last groom dates per area
+2. Read `.base/data/state.json` for last groom dates per area
 3. Identify which areas are due for grooming (past their cadence)
 4. Sort by staleness (most overdue first)
 5. Present: "Groom session starting. {N} areas due for review: {list}. Estimated time: {N*5} minutes."
@@ -28,9 +28,9 @@ Determine what needs grooming.
 </step>
 
 <step name="groom_active">
-Review ACTIVE.md — the working memory for projects and tasks.
+Review active.json — the working memory for projects and tasks.
 
-1. Read `.base/ACTIVE.md`
+1. Read `.base/data/active.json` (or use `base_get_surface("active")` MCP tool)
 2. Present summary: "{N} projects, {N} tasks, last updated {date}"
 3. For each project: "Still active? Status changed? Next action current?"
 4. For each task in TASKS section: "Done? Still in progress? Blocked?"
@@ -42,7 +42,7 @@ Voice-friendly: walk through one entry at a time, wait for response.
 </step>
 
 <step name="groom_backlog">
-Review BACKLOG.md — enforce time-based rules AND handle graduation.
+Review backlog.json — enforce time-based rules AND handle graduation.
 
 **Time-based enforcement:**
 1. For each item, check Added date against review-by threshold:
@@ -56,13 +56,13 @@ Review BACKLOG.md — enforce time-based rules AND handle graduation.
 **Graduation check:**
 5. For each remaining item, ask: "Ready to work on any of these?"
 6. If yes — determine destination:
-   - **As a TASK:** Item is bounded, standalone work. Move to ACTIVE.md → TASKS section.
-     Format: `### {Task Name}` with Status, Next, Blocked, Notes fields.
+   - **As a TASK:** Item is bounded, standalone work. Move to active.json via `base_add_item` MCP tool.
+     Include: name, status, next action, blocked, notes fields.
    - **As a PROJECT:** Item is complex enough to warrant its own project entry.
-     Move to ACTIVE.md under appropriate priority section with full project format.
+     Move to active.json via `base_add_item` MCP tool with full project format.
    - **Stay in backlog:** Not ready yet. Keep with updated review-by date.
-7. For graduated items: remove from BACKLOG.md, add to ACTIVE.md in correct section
-8. Update BACKLOG.md timestamp
+7. For graduated items: use `base_update_item` / `base_add_item` MCP tools to move between surfaces
+8. Update backlog.json via MCP
 
 **The graduation question is explicit every groom.** Items don't graduate silently — the operator decides.
 </step>
@@ -120,7 +120,7 @@ Review system layer areas (hooks, commands, skills, CARL).
 <step name="log_groom">
 Record the groom session.
 
-1. Update `.base/STATE.md` with new timestamps for all groomed areas
+1. Update `.base/data/state.json` with new timestamps for all groomed areas
 2. Reset drift score
 3. Write groom summary to `.base/grooming/{YYYY}-W{NN}.md`:
    ```markdown
@@ -134,7 +134,7 @@ Record the groom session.
    - {what changed}
 
    ## Graduated from Backlog
-   - {item} → ACTIVE.md TASKS / PROJECT
+   - {item} → active.json TASKS / PROJECT
 
    ## Archived / Killed
    - {item} (reason)
@@ -153,11 +153,11 @@ Updated workspace state. All due areas reviewed and current. Backlog time-based 
 
 <acceptance-criteria>
 - [ ] All overdue areas reviewed with operator
-- [ ] ACTIVE.md and BACKLOG.md timestamps updated
+- [ ] active.json and backlog.json updated
 - [ ] Backlog time-based rules enforced (review-by, staleness)
 - [ ] Graduation question asked explicitly for backlog items
-- [ ] Graduated items properly moved to ACTIVE.md (TASKS or PROJECT)
-- [ ] STATE.md updated with new groom date
+- [ ] Graduated items moved to active.json (TASKS or PROJECT)
+- [ ] state.json updated with new groom date
 - [ ] Groom summary written to grooming/ directory
 - [ ] Drift score reset to 0
 - [ ] Operator confirmed completion of each area

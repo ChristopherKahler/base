@@ -11,15 +11,15 @@ Show workspace evolution — grooming history, audits, major changes over time.
 </objective>
 
 <execution_context>
-@.claude/skills/base/tasks/history.md
+@~/.claude/base-framework/tasks/history.md
 </execution_context>
 
 <context>
-@.base/STATE.md
+@.base/data/state.json
 </context>
 
 <process>
-Follow task: @.claude/skills/base/tasks/history.md
+Follow task: @~/.claude/base-framework/tasks/history.md
 </process>
 
 <success_criteria>

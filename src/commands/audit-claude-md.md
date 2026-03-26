@@ -11,7 +11,7 @@ Audit the project's CLAUDE.md for completeness, accuracy, and alignment with wor
 </objective>
 
 <execution_context>
-@.claude/skills/base/tasks/audit-claude-md.md
+@~/.claude/base-framework/tasks/audit-claude-md.md
 </execution_context>
 
 <context>
@@ -21,7 +21,7 @@ $ARGUMENTS
 </context>
 
 <process>
-Follow task: @.claude/skills/base/tasks/audit-claude-md.md
+Follow task: @~/.claude/base-framework/tasks/audit-claude-md.md
 </process>
 
 <success_criteria>

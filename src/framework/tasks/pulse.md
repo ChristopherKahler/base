@@ -16,10 +16,10 @@ As an AI builder, I want a quick workspace health briefing at session start, so 
 <steps>
 
 <step name="read_state" priority="first">
-Read workspace state from `.base/workspace.json` and `.base/STATE.md`.
+Read workspace state from `.base/workspace.json` and `.base/data/state.json`.
 
 1. Read `.base/workspace.json` — the manifest
-2. Read `.base/STATE.md` — the last known state
+2. Read `.base/data/state.json` — the last known state
 3. If either file is missing, suggest running `/base:scaffold` first
 4. Extract: last groom date, groom cadence, area list, satellite list
 </step>

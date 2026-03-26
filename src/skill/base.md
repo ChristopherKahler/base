@@ -42,7 +42,7 @@ Workspace operations engineer. Knows the territory, tracks what's drifting, enfo
 
 ## Expertise
 - Workspace architecture and file organization
-- Context document lifecycle (data surfaces, ACTIVE.md, BACKLOG.md)
+- Context document lifecycle (data surfaces, active.json, backlog.json)
 - Tool and configuration management
 - Drift detection and prevention patterns
 - Claude Code ecosystem (PAUL, CARL, AEGIS, Skillsmith integration)
@@ -87,7 +87,6 @@ Workspace operations engineer. Knows the territory, tracks what's drifting, enfo
 
 ## Load on Demand
 - `@~/.claude/base-framework/templates/workspace-json.md` — When generating workspace.json
-- `@~/.claude/base-framework/templates/state-md.md` — When generating STATE.md
 - `@~/.claude/base-framework/frameworks/satellite-registration.md` — When handling PAUL project registration
 
 </routing>

@@ -5,7 +5,7 @@ Reusable audit strategies that can be applied to any workspace area. The workspa
 ## Strategies
 
 ### staleness
-**Applies to:** Working memory files (ACTIVE.md, BACKLOG.md, any tracked document)
+**Applies to:** Data surfaces (active.json, backlog.json, any tracked document)
 **What it does:** Check file modification timestamps against configured thresholds. Flag files past their groom cadence.
 **Config:**
 - `threshold_days` — days after which the file is considered stale

@@ -11,19 +11,19 @@ Workspace health briefing — drift score, stale areas, overdue grooming, quick 
 </objective>
 
 <execution_context>
-@.claude/skills/base/tasks/pulse.md
-@.claude/skills/base/context/base-principles.md
+@~/.claude/base-framework/tasks/pulse.md
+@~/.claude/base-framework/context/base-principles.md
 </execution_context>
 
 <context>
 $ARGUMENTS
 
 @.base/workspace.json
-@.base/STATE.md
+@.base/data/state.json
 </context>
 
 <process>
-Follow task: @.claude/skills/base/tasks/pulse.md
+Follow task: @~/.claude/base-framework/tasks/pulse.md
 </process>
 
 <success_criteria>
