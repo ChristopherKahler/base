@@ -274,10 +274,10 @@ Verify MCP server is wired.
 
 **CLAUDE.md audit:**
 1. Check if CLAUDE.md exists
-2. If exists: "Want me to audit your CLAUDE.md against BASE conventions?"
-   - If yes: route to `/base:audit-claude-md` task
-3. If doesn't exist: "Want me to generate a CLAUDE.md template for your workspace?"
-   - If yes: generate based on detected workspace structure
+2. If exists: "Want me to audit your CLAUDE.md against the CLAUDE.md Strategy?"
+   - If yes: route to `/base:audit-claude-md` (interactive, strategy-driven audit with CARL detection)
+3. If doesn't exist: "Want me to generate a CLAUDE.md from the strategy template?"
+   - If yes: use `@~/.claude/base-framework/templates/claudemd-template.md` as starting point, fill from detected workspace structure
 
 **First groom:**
 1. "Want to run an initial groom to establish baseline? This reviews each area once."
