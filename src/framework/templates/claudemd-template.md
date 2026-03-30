@@ -2,9 +2,9 @@
 
 Reference template for generating strategy-compliant CLAUDE.md files. Placeholders use `{PLACEHOLDER}` format. Comments use `<!-- -->` and must be removed in final output.
 
----
+***
 
-```markdown
+```Markdown
 # CLAUDE.md
 
 ## What
@@ -89,13 +89,14 @@ NEVER {WRONG_ACTION} — {RIGHT_ACTION}
 **{ACTION}?** → {INSTRUCTION}
 ```
 
----
+***
 
 ## Usage Notes
 
-- Target: under 100 lines in final output
-- Remove all `<!-- -->` comments before finalizing
-- Remove placeholder sections that don't apply (not every workspace needs Git Strategy or Systems)
-- The Where tree should reflect the ACTUAL filesystem, verified by scanning
-- Rules should be workspace-identity-level, not operational. If a rule only applies during specific work (e.g., "when writing tests..."), it belongs in a domain-specific rule system, not CLAUDE.md
-- `@` references point Claude to files it should read on demand — use for anything volatile or detailed
+* Target: under 100 lines in final output
+* Remove all `<!-- -->` comments before finalizing
+* Remove placeholder sections that don't apply (not every workspace needs Git Strategy or Systems)
+* The Where tree should reflect the ACTUAL filesystem, verified by scanning
+* Rules should be workspace-identity-level, not operational. If a rule only applies during specific work (e.g., "when writing tests..."), it belongs in a domain-specific rule system, not CLAUDE.md
+* `@` references point Claude to files it should read on demand — use for anything volatile or detailed
+

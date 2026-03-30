@@ -365,6 +365,12 @@ function installCommands(isGlobal) {
   const packagesDest = path.join(claudeDir, 'skills', 'base', 'packages');
   copyDir(packagesSrc, packagesDest);
 
+  // Copy MCP package to base-framework/packages/ (global source for scaffold)
+  const frameworkPackagesDest = path.join(claudeDir, 'base-framework', 'packages', 'base-mcp');
+  fs.mkdirSync(frameworkPackagesDest, { recursive: true });
+  copyDir(path.join(src, 'src', 'packages', 'base-mcp'), frameworkPackagesDest);
+  console.log(`  ${green}+${reset} base-framework/packages/base-mcp/ (global MCP source for scaffold)`);
+
   // Copy BASE framework (tasks, templates, context, frameworks)
   const frameworkSrc = path.join(src, 'src', 'framework');
   const frameworkDest = path.join(claudeDir, 'base-framework');

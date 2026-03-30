@@ -76,23 +76,27 @@ Create .base/ directory and generate JSON data surfaces.
    ├── workspace.json
    ├── operator.json
    ├── data/
-   │   ├── active.json
-   │   ├── backlog.json
    │   ├── projects.json
    │   ├── entities.json
-   │   └── state.json
+   │   ├── state.json
+   │   ├── psmm.json
+   │   └── staging.json
    ├── hooks/
    ├── base-mcp/
    ├── grooming/
+   ├── schemas/
    └── audits/
    ```
 2. Write workspace.json from guided configuration (with surfaces and carl_hygiene sections)
-3. Initialize JSON data surfaces with empty starter content (don't overwrite existing)
+3. Initialize JSON data surfaces with empty starter content (don't overwrite existing):
+   - projects.json — unified active work + backlog tracking
+   - entities.json — people, organizations, systems
+   - state.json — workspace health, drift, groom tracking
+   - psmm.json — per-session meta memory
+   - staging.json — proposed changes staging
 4. Copy operator.json template (don't overwrite existing)
 5. Register any detected satellite projects in workspace.json
 6. Report: "BASE data layer installed. {N} areas tracked, {N} satellites registered, {N} data surfaces initialized."
-
-**Legacy migration:** If ACTIVE.md or BACKLOG.md exist at workspace root, offer to convert them to JSON surfaces using `/base:surface convert`. Do not delete originals — let the user do that after verifying the conversion.
 </step>
 
 <step name="install_hooks">
@@ -256,17 +260,23 @@ Guide the operator through their profile setup.
 </step>
 
 <step name="install_mcp">
-Verify MCP server is wired.
+Install and wire the MCP server from the global BASE package.
 
-1. Check `.mcp.json` for base-mcp registration
-2. If not registered:
-   - Check if `.base/base-mcp/` exists with node_modules
-   - If no node_modules: run `npm install` in `.base/base-mcp/`
-   - Add registration to `.mcp.json`:
-     ```json
-     { "base-mcp": { "type": "stdio", "command": "node", "args": ["./.base/base-mcp/index.js"] } }
-     ```
-3. Report: "BASE MCP server registered. Claude can now manage your data surfaces through tool calls."
+The MCP server package lives globally at `~/.claude/base-framework/packages/base-mcp/`. Scaffold copies it into the workspace and wires it up.
+
+1. Check if `.base/base-mcp/index.js` exists in the workspace
+2. If NOT present:
+   a. Check if global source exists at `~/.claude/base-framework/packages/base-mcp/`
+   b. If global source missing: warn "BASE framework not globally installed. Run the installer first."
+   c. If global source exists: copy the entire `base-mcp/` directory to `.base/base-mcp/`
+   d. Run `npm install` in `.base/base-mcp/` to install dependencies
+3. If already present: check for `node_modules/`. If missing, run `npm install`.
+4. Check `.mcp.json` for base-mcp registration
+5. If not registered: add registration to `.mcp.json`:
+   ```json
+   { "base-mcp": { "type": "stdio", "command": "node", "args": ["./.base/base-mcp/index.js"] } }
+   ```
+6. Report: "BASE MCP server installed from global package and registered. Claude can now manage your data surfaces through tool calls."
 </step>
 
 <step name="full_mode_extras">
@@ -296,7 +306,7 @@ Fully configured BASE installation. Standard mode: data layer with JSON surfaces
 - [ ] Operator confirmed tracked areas and cadences
 - [ ] .base/ directory created with all required files
 - [ ] workspace.json generated from guided configuration
-- [ ] JSON data surfaces initialized (active, backlog, projects, entities, state)
+- [ ] JSON data surfaces initialized (projects, entities, state, psmm, staging)
 - [ ] operator.json created and profile questionnaire offered
 - [ ] Satellite projects detected and registered
 - [ ] All auto-fire hooks installed and registered in settings.json
