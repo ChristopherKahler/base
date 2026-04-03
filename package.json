@@ -1,6 +1,6 @@
 {
   "name": "@chrisai/base",
-  "version": "3.1.4",
+  "version": "3.1.5",
   "description": "Builder's Automated State Engine — workspace orchestration framework for Claude Code",
   "bin": {
     "base-framework": "bin/install.js"

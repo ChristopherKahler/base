@@ -104,8 +104,8 @@ Review system layer areas (hooks, commands, skills, CARL).
 2. Only flag if something clearly wrong
 3. Ask: "Any system changes to note?"
 4. If CARL hygiene is enabled (workspace.json `carl_hygiene.proactive: true`):
-   - Check `.carl/staging/` for pending proposals
-   - Check rule timestamps for staleness
+   - Use `carl_v2_get_staged` to check for pending proposals in carl.json
+   - Use `carl_v2_list_domains` to check rule counts and spot-check `last_reviewed` dates for staleness
    - Surface: "{N} staged proposals, {N} stale rules — run /base:carl-hygiene?"
 </step>
 

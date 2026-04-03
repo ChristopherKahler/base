@@ -1,11 +1,11 @@
 ---
 name: base:carl-hygiene
 description: CARL domain maintenance and rule review
-allowed-tools: [Read, Write, Edit, Glob, Grep, Bash, AskUserQuestion]
+allowed-tools: [Read, Write, Edit, Glob, Grep, Bash, AskUserQuestion, carl_v2_list_domains, carl_v2_get_domain, carl_v2_get_staged, carl_v2_approve_proposal, carl_v2_remove_rule, carl_v2_replace_rules, carl_v2_archive_decision]
 ---
 
 <objective>
-CARL rule lifecycle management — review staleness, dedup, staging pipeline, domain health.
+CARL rule lifecycle management — review staleness, staging pipeline, domain health.
 
 **When to use:** "carl hygiene", "review carl rules", "clean up carl".
 </objective>
@@ -17,7 +17,7 @@ CARL rule lifecycle management — review staleness, dedup, staging pipeline, do
 <context>
 $ARGUMENTS
 
-@.carl/manifest
+@.carl/carl.json
 @.base/workspace.json
 </context>
 

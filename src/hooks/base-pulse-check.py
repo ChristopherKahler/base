@@ -21,7 +21,8 @@ WORKSPACE_ROOT = HOOK_DIR.parent.parent
 BASE_DIR = WORKSPACE_ROOT / ".base"
 STATE_FILE = BASE_DIR / "data" / "state.json"
 PROJECTS_FILE = BASE_DIR / "data" / "projects.json"
-STAGING_FILE = BASE_DIR / "data" / "staging.json"
+CARL_DIR = WORKSPACE_ROOT / ".carl"
+CARL_JSON = CARL_DIR / "carl.json"
 
 
 def recalculate_drift(state):
@@ -193,11 +194,11 @@ def main():
         else:
             output_parts.append("CARL hygiene never run. Run /base:carl-hygiene when ready")
 
-        # Check staging proposals
-        if STAGING_FILE.exists():
+        # Check staging proposals in carl.json
+        if CARL_JSON.exists():
             try:
-                staging = json.loads(STAGING_FILE.read_text())
-                pending = [p for p in staging.get("proposals", []) if p.get("status") == "pending"]
+                carl_data = json.loads(CARL_JSON.read_text())
+                pending = [p for p in carl_data.get("staging", []) if p.get("status") == "pending"]
                 if pending:
                     output_parts[-1] += f" | {len(pending)} staged proposals pending"
             except (json.JSONDecodeError, OSError):
