@@ -74,6 +74,13 @@ pub fn load_domains(cwd: &Path) -> Vec<DomainDef> {
         domains = merge_domains(domains, file.domain);
     }
 
+    // Extension domains (Phase 22 — merged into normal pool, lowest priority)
+    let extensions = crate::extension::load_extensions();
+    for ext in &extensions {
+        let ext_domains = crate::extension::extension_domains_to_domain_defs(ext);
+        domains = merge_domains(domains, ext_domains);
+    }
+
     domains
 }
 

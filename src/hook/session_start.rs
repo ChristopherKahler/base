@@ -51,6 +51,9 @@ pub fn handle(config: &BaseConfig, cwd: &Path) -> Result<()> {
                 print!("\n{}", diagnostics.join("\n"));
             }
 
+            // Extension status injection (Phase 23)
+            inject_extension_status(config, cwd);
+
             return Ok(());
         }
     }
@@ -115,7 +118,83 @@ pub fn handle(config: &BaseConfig, cwd: &Path) -> Result<()> {
         print!("{}", diagnostics.join("\n"));
     }
 
+    // Extension status injection (Phase 23)
+    inject_extension_status(config, cwd);
+
     Ok(())
+}
+
+/// Inject extension status lines and run extension session-start SPARQL queries.
+/// Fail-open: malformed extensions, missing query files, and query errors all skip silently.
+fn inject_extension_status(config: &BaseConfig, cwd: &Path) {
+    let extensions = crate::extension::load_extensions();
+    if extensions.is_empty() {
+        return;
+    }
+
+    for ext in &extensions {
+        // Print inject template + run queries if session_start hook declared
+        if let Some(hooks) = &ext.hooks
+            && let Some(ss) = &hooks.session_start
+        {
+            if let Some(inject) = &ss.inject {
+                println!("{inject}");
+            }
+
+            // Run extension SPARQL queries
+            for query_rel_path in &ss.queries {
+                let query_path = if let Some(fw_dir) = &ext.framework_dir {
+                    let expanded = if fw_dir.starts_with("~/") {
+                        dirs::home_dir()
+                            .map(|h| h.join(&fw_dir[2..]))
+                            .unwrap_or_else(|| PathBuf::from(fw_dir))
+                    } else {
+                        PathBuf::from(fw_dir)
+                    };
+                    expanded.join(query_rel_path)
+                } else {
+                    PathBuf::from(query_rel_path)
+                };
+
+                let sparql = match std::fs::read_to_string(&query_path) {
+                    Ok(s) => s.replace("{{prefix}}", &config.namespace.prefix),
+                    Err(_) => {
+                        eprintln!(
+                            "base: ext:{} query file not found: {}",
+                            ext.name,
+                            query_path.display()
+                        );
+                        continue;
+                    }
+                };
+
+                // Load graph and run query
+                if let Some(store) = store::load_merged(cwd) {
+                    match store.query(&sparql) {
+                        Ok(oxigraph::sparql::QueryResults::Solutions(solutions)) => {
+                            let rows: Vec<_> = solutions.filter_map(|r| r.ok()).collect();
+                            if !rows.is_empty() {
+                                println!(
+                                    "<ext:{}-query>\n{} result(s) from {}\n</ext:{}-query>",
+                                    ext.name,
+                                    rows.len(),
+                                    query_rel_path,
+                                    ext.name
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "base: ext:{} query error in {}: {e}",
+                                ext.name, query_rel_path
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Check for updates and inject persistent banner if needed. Fail-open — never blocks session.

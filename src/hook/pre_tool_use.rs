@@ -156,6 +156,23 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             }
         }
 
+        // ─── Extension pre-tool triggers ────────────────────────
+        let extensions = crate::extension::load_extensions();
+        for ext in &extensions {
+            if let Some(hooks) = &ext.hooks
+                && let Some(pre) = &hooks.pre_tool
+            {
+                for trigger in &pre.triggers {
+                    for fp in &file_paths {
+                        let fp_str = fp.to_string_lossy();
+                        if trigger.paths.iter().any(|p| fp_str.contains(p.as_str())) {
+                            output.push_str(&format!("\n{}", trigger.inject));
+                        }
+                    }
+                }
+            }
+        }
+
         // Single save for the whole branch — only when something changed.
         if session_dirty
             && let Some(bd) = base_dir.as_deref() {

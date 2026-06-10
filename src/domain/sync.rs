@@ -93,8 +93,21 @@ fn sync_domain_list(
             .update(&domain_insert)
             .with_context(|| format!("Failed to insert domain '{}'", domain_def.name))?;
 
+        // Determine source marker: extension domains use "ext:{name}", others use "domains.toml"
+        let source_marker = if domain_def.name.starts_with("ext:") {
+            // "ext:outpost:content" → source = "ext:outpost"
+            domain_def
+                .name
+                .splitn(3, ':')
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(":")
+        } else {
+            "domains.toml".to_string()
+        };
+
         // Garbage-collect this domain's previously SYNCED rules before re-inserting.
-        // Scoped by {p}:source "domains.toml" — rules added via `base rule add`
+        // Scoped by {p}:source marker — rules added via `base rule add`
         // carry no source marker and MUST survive sync (I9).
         let rule_gc = format!(
             "{pfx}\n\
@@ -107,10 +120,11 @@ fn sync_domain_list(
              WHERE {{\n\
                GRAPH <{graph}> {{\n\
                  <{domain_iri}> {p}:hasRule ?rule .\n\
-                 ?rule {p}:source \"domains.toml\" ;\n\
+                 ?rule {p}:source \"{}\" ;\n\
                    ?rp ?ro .\n\
                }}\n\
-             }}"
+             }}",
+            crud::escape_sparql_literal(&source_marker),
         );
         store
             .update(&rule_gc)
@@ -126,11 +140,12 @@ fn sync_domain_list(
                      <{rule_iri}> rdf:type {p}:Rule ;\n\
                        {p}:ruleText \"{}\" ;\n\
                        {p}:priority \"{i}\" ;\n\
-                       {p}:source \"domains.toml\" .\n\
+                       {p}:source \"{}\" .\n\
                      <{domain_iri}> {p}:hasRule <{rule_iri}> .\n\
                    }}\n\
                  }}",
                 crud::escape_sparql_literal(rule_text),
+                crud::escape_sparql_literal(&source_marker),
             );
             store
                 .update(&rule_insert)

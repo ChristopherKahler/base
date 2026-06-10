@@ -70,6 +70,45 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             }
         }
 
+    // ─── Extension post-tool handlers ───────────────────────
+    let extensions = crate::extension::load_extensions();
+    for ext in &extensions {
+        if let Some(hooks) = &ext.hooks
+            && let Some(post) = &hooks.post_tool
+        {
+            for handler in &post.handlers {
+                for fp in &file_paths {
+                    let fp_str = fp.to_string_lossy();
+                    if fp_str.contains(&handler.pattern) {
+                        match handler.action.as_str() {
+                            "log" => {
+                                eprintln!(
+                                    "base: ext:{} post-tool: {} matched {}",
+                                    ext.name, handler.pattern, fp_str
+                                );
+                            }
+                            "reingest" => {
+                                // Phase 24 will implement actual reingest
+                                eprintln!(
+                                    "base: ext:{} reingest triggered for {} (stub — Phase 24)",
+                                    ext.name, handler.pattern
+                                );
+                            }
+                            "query" => {
+                                // Future: run a SPARQL query on match
+                                eprintln!(
+                                    "base: ext:{} query triggered for {} (stub — Phase 24)",
+                                    ext.name, handler.pattern
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(data)
 }
 
