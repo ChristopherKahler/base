@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use base::config::BaseConfig;
 use base::crud;
 use base::domain;
+use base::extension;
 use base::hook;
 
 #[derive(Parser)]
@@ -184,6 +185,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: OperatorAction,
     },
+    /// Manage extensions (list, validate, install, remove)
+    #[command(visible_alias = "ext")]
+    Extension {
+        #[command(subcommand)]
+        action: ExtensionAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -195,6 +202,27 @@ pub enum OperatorAction {
     },
     /// Show current operator profile
     Show,
+}
+
+#[derive(Subcommand)]
+pub enum ExtensionAction {
+    /// List all installed extensions
+    List,
+    /// Validate an extension manifest file
+    Validate {
+        /// Path to the TOML file to validate
+        path: String,
+    },
+    /// Install an extension (copy validated TOML to extensions/)
+    Install {
+        /// Path to the TOML file to install
+        path: String,
+    },
+    /// Remove an installed extension by name
+    Remove {
+        /// Extension name to remove
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -922,6 +950,133 @@ pub fn run() {
                 }
             }
             OperatorAction::Show => base::operator::show(),
+        },
+
+        // ─── Extension ────────────────────────────────────────
+        Some(Commands::Extension { action }) => match action {
+            ExtensionAction::List => {
+                let extensions = extension::load_extensions();
+                if extensions.is_empty() {
+                    println!("No extensions installed.");
+                    println!("  Directory: ~/.base-gbl/extensions/");
+                    println!("  Template:  ~/.base-gbl/extensions/_template.toml");
+                } else {
+                    println!("{:<20} {:<10} {:<6} DESCRIPTION", "NAME", "VERSION", "HOOKS");
+                    println!("{}", "─".repeat(70));
+                    for ext in &extensions {
+                        println!(
+                            "{:<20} {:<10} {:<6} {}",
+                            ext.name,
+                            ext.version,
+                            ext.hook_summary(),
+                            ext.description
+                        );
+                    }
+                    println!("\n{} extension(s) installed.", extensions.len());
+                }
+            }
+            ExtensionAction::Validate { path } => {
+                let p = std::path::Path::new(&path);
+                match extension::validate_extension(p) {
+                    Ok(ext) => {
+                        println!("✓ Valid extension: {} v{}", ext.name, ext.version);
+                        println!("  Description: {}", ext.description);
+                        println!("  Hooks: {}", ext.hook_summary());
+                    }
+                    Err(violations) => {
+                        eprintln!("✗ Validation failed for {path}:");
+                        for v in &violations {
+                            eprintln!("  - {v}");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+            ExtensionAction::Install { path } => {
+                let p = std::path::Path::new(&path);
+                match extension::validate_extension(p) {
+                    Ok(ext) => {
+                        let home = dirs::home_dir().expect("Cannot determine home directory");
+                        let ext_dir = home.join(".base-gbl").join("extensions");
+                        if let Err(e) = std::fs::create_dir_all(&ext_dir) {
+                            eprintln!("Failed to create extensions directory: {e}");
+                            std::process::exit(1);
+                        }
+                        let dest = ext_dir.join(format!("{}.toml", ext.name));
+
+                        // Check for existing version
+                        let old_version = if dest.exists() {
+                            std::fs::read_to_string(&dest)
+                                .ok()
+                                .and_then(|c| toml::from_str::<extension::ExtensionFile>(&c).ok())
+                                .map(|f| f.extension.version)
+                        } else {
+                            None
+                        };
+
+                        if let Err(e) = std::fs::copy(p, &dest) {
+                            eprintln!("Failed to install extension: {e}");
+                            std::process::exit(1);
+                        }
+
+                        if let Some(old_v) = old_version {
+                            println!(
+                                "✓ Updated {} (was v{}, now v{})",
+                                ext.name, old_v, ext.version
+                            );
+                        } else {
+                            println!("✓ Installed {} v{}", ext.name, ext.version);
+                        }
+                        println!("  → {}", dest.display());
+                    }
+                    Err(violations) => {
+                        eprintln!("✗ Cannot install — validation failed:");
+                        for v in &violations {
+                            eprintln!("  - {v}");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+            ExtensionAction::Remove { name } => {
+                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let ext_dir = home.join(".base-gbl").join("extensions");
+
+                if !ext_dir.is_dir() {
+                    eprintln!("Extension '{name}' not found (no extensions directory).");
+                    std::process::exit(1);
+                }
+
+                // Scan for matching extension by parsed name
+                let mut found = None;
+                if let Ok(entries) = std::fs::read_dir(&ext_dir) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|e| e == "toml")
+                            && path.file_name().is_some_and(|n| n != "_template.toml")
+                            && let Ok(content) = std::fs::read_to_string(&path)
+                            && let Ok(file) =
+                                toml::from_str::<extension::ExtensionFile>(&content)
+                            && file.extension.name == name
+                        {
+                            found = Some((path, file.extension.version));
+                            break;
+                        }
+                    }
+                }
+
+                if let Some((path, version)) = found {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        eprintln!("Failed to remove extension: {e}");
+                        std::process::exit(1);
+                    }
+                    println!("✓ Removed {name} v{version}");
+                    println!("  ← {}", path.display());
+                } else {
+                    eprintln!("Extension '{name}' not found.");
+                    std::process::exit(1);
+                }
+            }
         },
 
         None => eprintln!("No command provided. Run `base --help` for usage."),

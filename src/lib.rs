@@ -3,6 +3,7 @@ pub mod config;
 pub mod crud;
 pub mod dashboard;
 pub mod domain;
+pub mod extension;
 pub mod extract;
 pub mod hook;
 pub mod install;

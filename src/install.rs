@@ -328,6 +328,78 @@ rules = []
         println!("   Created docs/markdown-ontology-protocol.md");
     }
 
+    // extensions/ directory + _template.toml
+    let ext_dir = global_dir.join("extensions");
+    std::fs::create_dir_all(&ext_dir)?;
+    let template_path = ext_dir.join("_template.toml");
+    if !template_path.exists() {
+        std::fs::write(
+            &template_path,
+            r#"# BASE Extension Contract v1
+# ═══════════════════════════════════════════════════════════
+# Copy this file, rename to your extension name (e.g., outpost.toml),
+# fill in the sections you need, and place in this directory.
+#
+# BASE scans ~/.base-gbl/extensions/*.toml on every hook fire.
+# Files that parse = active. Delete or rename to disable.
+#
+# Only [extension] section is required. All [hooks.*] sections are optional.
+# Declare only the hooks your framework needs.
+#
+# Built by Chris Kahler · Chris AI Systems
+# Community: https://chrisai.cv/skool
+# ═══════════════════════════════════════════════════════════
+
+[extension]
+name = "my-extension"           # Required. Unique slug (lowercase, hyphens, no spaces).
+version = "0.1.0"              # Required. Semver.
+description = "One-line description of what this extension does"  # Required.
+# framework_dir = "~/.claude/my-framework/"    # Optional. Where framework files live.
+# state_dir = ".my-state/"                      # Optional. Workspace-relative state path.
+
+# ─── Session Start Hook ──────────────────────────────────
+# Runs once per session. Use for: status injection, state ingestion, summary queries.
+#
+# [hooks.session_start]
+# queries = ["queries/summary.sparql"]    # SPARQL files, relative to framework_dir
+# inject = "My Extension: {count} items"  # Template string, vars from query results
+#
+# [[hooks.session_start.ingest]]          # State files to pull into the graph
+# file = "data.json"                      # Relative to state_dir
+# entity = "MyEntity"                     # RDF entity type (ops:MyEntity)
+# strategy = "upsert"                     # "upsert" or "replace"
+
+# ─── User Prompt Hook ────────────────────────────────────
+# Domains merge into the normal domain pool. Get dedup, bracketing, matching for free.
+#
+# [[hooks.user_prompt.domains]]
+# name = "my-domain"
+# prompt_keywords = ["my-keyword", "another-keyword"]
+# file_keywords = [".my-state/"]
+# rules = ["Rule text injected when domain matches."]
+# # query = "my-query"         # Optional: SPARQL query file to run on match
+# # query_format = "table"     # Optional: "table" | "list" | "prose"
+
+# ─── Pre-Tool Hook ───────────────────────────────────────
+# File-path triggers for context injection before tool execution.
+#
+# [[hooks.pre_tool.triggers]]
+# paths = [".my-state/"]
+# inject = "This file is managed by My Extension."
+
+# ─── Post-Tool Hook ──────────────────────────────────────
+# React to file changes after tool execution.
+#
+# [[hooks.post_tool.handlers]]
+# pattern = "data.json"
+# action = "reingest"          # "reingest" | "log" | "query"
+"#,
+        )?;
+        println!("   Created extensions/ + _template.toml");
+    } else {
+        println!("   extensions/ exists, preserved");
+    }
+
     Ok(())
 }
 
