@@ -193,6 +193,22 @@ fn inject_extension_status(config: &BaseConfig, cwd: &Path) {
                     }
                 }
             }
+
+            // Run ingest for extensions with declared sources
+            if !ss.ingest.is_empty() {
+                match crate::extension::ingest::ingest_extension(ext, cwd, config) {
+                    Ok(stats) if stats.entities > 0 => {
+                        eprintln!(
+                            "base: ext:{} ingested {} entities from {} file(s)",
+                            ext.name, stats.entities, stats.files
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("base: ext:{} ingest error: {e}", ext.name);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }

@@ -88,11 +88,18 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
                                 );
                             }
                             "reingest" => {
-                                // Phase 24 will implement actual reingest
-                                eprintln!(
-                                    "base: ext:{} reingest triggered for {} (stub — Phase 24)",
-                                    ext.name, handler.pattern
-                                );
+                                match crate::extension::ingest::ingest_extension(ext, cwd, config) {
+                                    Ok(stats) if stats.entities > 0 => {
+                                        eprintln!(
+                                            "base: ext:{} reingest: {} entities from {} file(s)",
+                                            ext.name, stats.entities, stats.files
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!("base: ext:{} reingest error: {e}", ext.name);
+                                    }
+                                    _ => {}
+                                }
                             }
                             "query" => {
                                 // Future: run a SPARQL query on match
