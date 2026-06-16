@@ -441,6 +441,44 @@ Every panel reads from the same SPARQL-backed API. The same graph that powers yo
 
 **Fail open.** Every hook catches all errors, logs to stderr, exits 0 with empty stdout. If the graph is corrupt, if SPARQL fails, if the file doesn't exist - Claude keeps working. The system never blocks the prompt.
 
+## Extensions
+
+BASE supports declarative extensions that let frameworks plug into the context engine.
+Drop a TOML manifest in `~/.base-gbl/extensions/` and BASE wires it in automatically.
+
+### Quick start
+
+```bash
+# Copy the template
+cp ~/.base-gbl/extensions/_template.toml ~/.base-gbl/extensions/my-framework.toml
+
+# Edit to declare your hooks
+$EDITOR ~/.base-gbl/extensions/my-framework.toml
+
+# Manage extensions
+base extension list
+base extension validate my-framework.toml
+base extension install my-framework.toml
+base extension remove my-framework
+```
+
+### What extensions can do
+
+- **Session start** — inject status lines, run SPARQL queries, ingest JSON state files into the graph
+- **User prompt** — declare domains with keywords/rules that merge into the normal matching pool
+- **Pre-tool** — inject context when files in specific paths are accessed
+- **Post-tool** — react to file writes (reingest state, log events)
+
+### How it works
+
+Extensions are flat TOML files in `~/.base-gbl/extensions/`. Each file declares which hooks it binds to and what data it provides. BASE scans the directory on every hook fire — file exists = active, delete = disabled.
+
+Extension domains get `source = "ext:{name}"` markers in the graph for independent garbage collection. Ingested JSON state files become RDF entities queryable via SPARQL.
+
+### Extension contract
+
+See `~/.base-gbl/extensions/_template.toml` for the full contract specification with inline documentation.
+
 ## Stack
 
 | Layer | Tech |

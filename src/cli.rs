@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+use base::command;
 use base::config::BaseConfig;
 use base::crud;
 use base::domain;
@@ -191,6 +192,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: ExtensionAction,
     },
+    /// List and inspect star commands (*BLUNT, *AUDIT, etc.)
+    #[command(name = "commands", visible_alias = "cmd")]
+    Command {
+        #[command(subcommand)]
+        action: CommandAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -223,6 +230,12 @@ pub enum ExtensionAction {
         /// Extension name to remove
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum CommandAction {
+    /// List all configured star commands
+    List,
 }
 
 #[derive(Subcommand)]
@@ -1075,6 +1088,30 @@ pub fn run() {
                 } else {
                     eprintln!("Extension '{name}' not found.");
                     std::process::exit(1);
+                }
+            }
+        },
+
+        // ─── Commands (star commands) ─────────────────────────
+        Some(Commands::Command { action }) => match action {
+            CommandAction::List => {
+                let commands = command::load_commands(&cwd);
+                if commands.is_empty() {
+                    println!("No commands configured.");
+                    println!("  Add entries to ~/.base-gbl/commands.toml");
+                } else {
+                    println!("{:<16} {:<52} RULES", "COMMAND", "DESCRIPTION");
+                    println!("{}", "─".repeat(74));
+                    for cmd in &commands {
+                        let desc = if cmd.description.chars().count() > 50 {
+                            let truncated: String = cmd.description.chars().take(49).collect();
+                            format!("{truncated}…")
+                        } else {
+                            cmd.description.clone()
+                        };
+                        println!("*{:<15} {:<52} {}", cmd.name, desc, cmd.rules.len());
+                    }
+                    println!("\n{} command(s) available. Type *NAME in a prompt to activate.", commands.len());
                 }
             }
         },
