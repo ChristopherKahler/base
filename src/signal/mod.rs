@@ -1,5 +1,6 @@
 pub mod active_awareness;
 pub mod flow_resurface;
+pub mod memory;
 pub mod pulse;
 pub mod staleness;
 pub mod suppression;
@@ -37,6 +38,14 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
 
     let mut results: Vec<SignalResult> = Vec::new();
     let mut diagnostics: Vec<String> = Vec::new();
+
+    match memory::run(cwd, config) {
+        Ok(output) if !output.is_empty() => {
+            results.push(SignalResult { name: "memory".into(), priority: 0, output });
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("base: signal 'memory' failed: {e}"),
+    }
 
     match active_awareness::run(cwd, ns, sig) {
         Ok(output) if !output.is_empty() => {

@@ -48,7 +48,7 @@ pub fn parse_memory_content(content: &str) -> (String, String, String, String) {
 /// Infer a project slug from Claude's memory path.
 /// Path pattern: ~/.claude/projects/-home-user-workspace-apps-{project}/memory/slug.md
 /// Extracts the last meaningful segment from the project hash directory.
-fn infer_project_from_memory_path(file_path: &str) -> Option<String> {
+pub fn infer_project_from_memory_path(file_path: &str) -> Option<String> {
     // Split on /memory/ to get the directory part
     let dir_part = file_path.split("/memory/").next()?;
     // Get the last path component (the project hash dir)
@@ -68,7 +68,7 @@ fn infer_project_from_memory_path(file_path: &str) -> Option<String> {
 }
 
 /// Map Claude memory type to BASE note type.
-fn map_memory_type(claude_type: &str) -> &str {
+pub fn map_memory_type(claude_type: &str) -> &str {
     match claude_type {
         "feedback" => "correction",
         "user" | "project" | "reference" => "insight",
@@ -137,11 +137,10 @@ fn memory_write_intercept(
         None,
     ) {
         Ok(slug) => {
-            let mode_note = if blocked { " (flat file write blocked)" } else { " (flat file write also proceeds)" };
+            let mode_note = if blocked { "flat file BLOCKED" } else { "flat file also written" };
             Some((
                 format!(
-                    "Memory stored in BASE graph as note/{slug} (domain: {domain}, type: {base_type}){mode_note}. \
-                     Use `base recall --keyword \"...\"` to retrieve."
+                    "<memory-intercept>\nStored in BASE graph: note/{slug} (domain: {domain}, type: {base_type}, {mode_note})\n</memory-intercept>"
                 ),
                 blocked,
             ))

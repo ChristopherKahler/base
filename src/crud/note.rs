@@ -23,7 +23,7 @@ pub fn learn(
     let now = crud::now_iso();
     let p = &ns.prefix;
 
-    let escaped_text = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+    let escaped_text = crud::escape_sparql_literal(text);
 
     // Build relatedTo edges
     let mut edge_triples = String::new();

@@ -198,6 +198,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: CommandAction,
     },
+    /// Manage graph-backed memory (migrate flat files, purge)
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -236,6 +241,14 @@ pub enum ExtensionAction {
 pub enum CommandAction {
     /// List all configured star commands
     List,
+}
+
+#[derive(Subcommand)]
+pub enum MemoryAction {
+    /// List Claude's flat-file memories for review (name, type, description, path)
+    List,
+    /// Remove flat-file memories that have been confirmed in the graph
+    Purge,
 }
 
 #[derive(Subcommand)]
@@ -1113,6 +1126,153 @@ pub fn run() {
                     }
                     println!("\n{} command(s) available. Type *NAME in a prompt to activate.", commands.len());
                 }
+            }
+        },
+
+        // ─── Memory ────────────────────────────────────────
+        Some(Commands::Memory { action }) => match action {
+            MemoryAction::List => {
+                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let claude_projects = home.join(".claude").join("projects");
+                if !claude_projects.is_dir() {
+                    println!("No Claude projects directory found.");
+                    return;
+                }
+
+                let mut count = 0u32;
+                let Ok(project_dirs) = std::fs::read_dir(&claude_projects) else {
+                    eprintln!("Failed to read {}", claude_projects.display());
+                    return;
+                };
+
+                let mut entries: Vec<(String, String, String, String, String)> = Vec::new();
+
+                for entry in project_dirs.filter_map(|e| e.ok()) {
+                    let memory_dir = entry.path().join("memory");
+                    if !memory_dir.is_dir() {
+                        continue;
+                    }
+                    let project = hook::memory::infer_project_from_memory_path(
+                        &memory_dir.to_string_lossy(),
+                    ).unwrap_or_else(|| "unknown".into());
+
+                    let Ok(files) = std::fs::read_dir(&memory_dir) else { continue };
+                    for file_entry in files.filter_map(|e| e.ok()) {
+                        let path = file_entry.path();
+                        if path.extension().is_none_or(|e| e != "md") {
+                            continue;
+                        }
+                        if hook::memory::is_memory_index(&path) {
+                            continue;
+                        }
+
+                        let Ok(content) = std::fs::read_to_string(&path) else { continue };
+                        let (name, desc, note_type, _body) =
+                            hook::memory::parse_memory_content(&content);
+                        let base_type = hook::memory::map_memory_type(&note_type);
+
+                        let display_name = if !name.is_empty() {
+                            name
+                        } else {
+                            path.file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("unnamed")
+                                .to_string()
+                        };
+
+                        let short_desc: String = if !desc.is_empty() {
+                            desc.chars().take(60).collect()
+                        } else {
+                            "(no description)".into()
+                        };
+
+                        entries.push((
+                            project.clone(),
+                            base_type.to_string(),
+                            display_name,
+                            short_desc,
+                            path.to_string_lossy().to_string(),
+                        ));
+                        count += 1;
+                    }
+                }
+
+                entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+                let mut current_project = String::new();
+                for (project, note_type, name, desc, path) in &entries {
+                    if *project != current_project {
+                        if !current_project.is_empty() {
+                            println!();
+                        }
+                        println!("── {project} ──");
+                        current_project = project.clone();
+                    }
+                    println!("  [{note_type:<10}] {name}");
+                    println!("             {desc}");
+                    println!("             {path}");
+                }
+
+                println!("\n{count} memory file(s) across Claude's flat-file system.");
+                println!("To convert: base learn --text \"...\" --domain <domain> --type <type>");
+            }
+            MemoryAction::Purge => {
+                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let claude_projects = home.join(".claude").join("projects");
+                if !claude_projects.is_dir() {
+                    println!("No Claude projects directory found.");
+                    return;
+                }
+
+                let mut purged = 0u32;
+                let mut kept = 0u32;
+
+                let Ok(project_dirs) = std::fs::read_dir(&claude_projects) else {
+                    eprintln!("Failed to read {}", claude_projects.display());
+                    return;
+                };
+
+                for entry in project_dirs.filter_map(|e| e.ok()) {
+                    let memory_dir = entry.path().join("memory");
+                    if !memory_dir.is_dir() {
+                        continue;
+                    }
+                    let Ok(files) = std::fs::read_dir(&memory_dir) else { continue };
+                    for file_entry in files.filter_map(|e| e.ok()) {
+                        let path = file_entry.path();
+                        if path.extension().is_none_or(|e| e != "md") {
+                            continue;
+                        }
+                        if hook::memory::is_memory_index(&path) {
+                            continue;
+                        }
+
+                        let slug = path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .replace('-', " ");
+
+                        let graph_result = crud::note::recall_to_string(
+                            &cwd,
+                            &config.namespace,
+                            Some(&slug),
+                            None,
+                        );
+
+                        if !graph_result.is_empty() {
+                            if let Err(e) = std::fs::remove_file(&path) {
+                                eprintln!("  ✗ Failed to delete {}: {e}", path.display());
+                                kept += 1;
+                            } else {
+                                purged += 1;
+                            }
+                        } else {
+                            kept += 1;
+                        }
+                    }
+                }
+
+                println!("Memory purge complete: {purged} deleted, {kept} kept (no graph entry — run migrate first)");
             }
         },
 
