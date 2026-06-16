@@ -205,6 +205,7 @@ pub fn recall(
         println!("No results found.");
     } else {
         print!("{output}");
+        println!("\nTip: use `base learn --list` to see slugs for --remove/--update");
     }
     Ok(())
 }
@@ -304,5 +305,189 @@ pub fn mention(
 
     crud::load_and_mutate(cwd, ns, &sparql)?;
     Ok(new_count)
+}
+
+pub fn remove(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<bool> {
+    let p = &ns.prefix;
+    let iri = crud::build_iri(ns, "note", slug);
+    let ws_slug = crud::workspace_slug(cwd);
+    let graph = crud::workspace_graph_iri(ns, &ws_slug);
+
+    let check = format!(
+        "SELECT ?text WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:noteText ?text }} }}"
+    );
+
+    let (store, trig_path) = crud::load_workspace_store(cwd)?;
+    let full_check = format!("{}\n{}", crud::prefixes(ns), check);
+    let results = crate::store::query(&store, &full_check)?;
+    let exists = if let QueryResults::Solutions(mut sols) = results {
+        sols.next().is_some()
+    } else {
+        false
+    };
+
+    if !exists {
+        return Ok(false);
+    }
+
+    let delete = format!(
+        "{}\nDELETE WHERE {{ GRAPH <{graph}> {{ <{iri}> ?p ?o }} }}",
+        crud::prefixes(ns)
+    );
+    store.update(&delete)?;
+    crate::store::write_back(&store, &trig_path)?;
+    Ok(true)
+}
+
+pub fn update_text(cwd: &Path, ns: &NamespaceConfig, slug: &str, new_text: &str) -> Result<bool> {
+    let p = &ns.prefix;
+    let iri = crud::build_iri(ns, "note", slug);
+    let ws_slug = crud::workspace_slug(cwd);
+    let graph = crud::workspace_graph_iri(ns, &ws_slug);
+    let escaped = crud::escape_sparql_literal(new_text);
+
+    let (store, trig_path) = crud::load_workspace_store(cwd)?;
+
+    let check = format!(
+        "{}\nSELECT ?text WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:noteText ?text }} }}",
+        crud::prefixes(ns)
+    );
+    let results = crate::store::query(&store, &check)?;
+    let exists = if let QueryResults::Solutions(mut sols) = results {
+        sols.next().is_some()
+    } else {
+        false
+    };
+
+    if !exists {
+        return Ok(false);
+    }
+
+    let update = format!(
+        "{}\nDELETE {{ GRAPH <{graph}> {{ <{iri}> {p}:noteText ?old }} }}\n\
+         INSERT {{ GRAPH <{graph}> {{ <{iri}> {p}:noteText \"{escaped}\" }} }}\n\
+         WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:noteText ?old }} }}",
+        crud::prefixes(ns)
+    );
+    store.update(&update)?;
+    crate::store::write_back(&store, &trig_path)?;
+    Ok(true)
+}
+
+pub fn list_notes(cwd: &Path, ns: &NamespaceConfig, type_filter: Option<&str>, domain_filter: Option<&str>) -> Result<()> {
+    let p = &ns.prefix;
+
+    let mut filters = Vec::new();
+    if let Some(t) = type_filter {
+        let escaped = crud::escape_sparql_literal(t);
+        filters.push(format!("FILTER(?type = \"{escaped}\")"));
+    }
+    if let Some(d) = domain_filter {
+        let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(d));
+        filters.push(format!("?n {p}:relatedTo <{domain_iri}> ."));
+    }
+
+    let filter_block = filters.join("\n             ");
+
+    let uri = &ns.uri;
+    let sparql = format!(
+        "SELECT ?n ?type ?text WHERE {{\n\
+           GRAPH ?g {{\n\
+             ?n a {p}:Note ; {p}:noteText ?text ; {p}:noteType ?type ; {p}:status \"active\" .\n\
+             {filter_block}\n\
+           }}\n\
+         }}\n\
+         ORDER BY ?type"
+    );
+
+    let results = crud::load_and_query(cwd, ns, &sparql)?;
+    let QueryResults::Solutions(solutions) = results else {
+        println!("No notes found.");
+        return Ok(());
+    };
+
+    let note_prefix = format!("{uri}note/");
+    let rows: Vec<(String, String, String)> = solutions
+        .filter_map(|r| r.ok())
+        .map(|row| {
+            let slug = row.get("n").map(|t| match t {
+                oxigraph::model::Term::NamedNode(n) => {
+                    n.as_str().strip_prefix(&note_prefix).unwrap_or(n.as_str()).to_string()
+                }
+                other => other.to_string(),
+            }).unwrap_or_default();
+            let text = row.get("text").map(|t| match t {
+                oxigraph::model::Term::Literal(l) => l.value().to_string(),
+                other => other.to_string(),
+            }).unwrap_or_default();
+            let note_type = row.get("type").map(|t| match t {
+                oxigraph::model::Term::Literal(l) => l.value().to_string(),
+                other => other.to_string(),
+            }).unwrap_or_default();
+            (slug, note_type, text)
+        })
+        .collect();
+
+    if rows.is_empty() {
+        println!("No notes found.");
+        return Ok(());
+    }
+
+    for (slug, note_type, text) in &rows {
+        let short_text: String = text.chars().take(70).collect();
+        let text_display = if text.chars().count() > 70 { format!("{short_text}…") } else { short_text };
+        println!("[{note_type}] {text_display}");
+        println!("  slug: {slug}");
+        println!();
+    }
+    println!("{} note(s). Use --remove <slug> or --update <slug> --text \"...\" to manage.", rows.len());
+    Ok(())
+}
+
+pub fn recall_by_slug(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<()> {
+    let p = &ns.prefix;
+    let iri = crud::build_iri(ns, "note", slug);
+
+    let sparql = format!(
+        "SELECT ?text ?type ?created WHERE {{\n\
+           GRAPH ?g {{\n\
+             <{iri}> a {p}:Note ; {p}:noteText ?text ; {p}:noteType ?type .\n\
+             OPTIONAL {{ <{iri}> {p}:createdAt ?created }}\n\
+           }}\n\
+         }}"
+    );
+
+    let results = crud::load_and_query(cwd, ns, &sparql)?;
+    let QueryResults::Solutions(solutions) = results else {
+        println!("Not found: note/{slug}");
+        return Ok(());
+    };
+
+    let mut found = false;
+    for row in solutions.filter_map(|r| r.ok()) {
+        found = true;
+        let text = row.get("text").map(|t| match t {
+            oxigraph::model::Term::Literal(l) => l.value().to_string(),
+            other => other.to_string(),
+        }).unwrap_or_default();
+        let note_type = row.get("type").map(|t| match t {
+            oxigraph::model::Term::Literal(l) => l.value().to_string(),
+            other => other.to_string(),
+        }).unwrap_or_default();
+        let created = row.get("created").map(|t| match t {
+            oxigraph::model::Term::Literal(l) => l.value().to_string(),
+            other => other.to_string(),
+        }).unwrap_or_else(|| "-".into());
+
+        println!("note/{slug}");
+        println!("  Type: {note_type}");
+        println!("  Created: {created}");
+        println!("  Text: {text}");
+    }
+
+    if !found {
+        println!("Not found: note/{slug}");
+    }
+    Ok(())
 }
 

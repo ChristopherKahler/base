@@ -158,6 +158,91 @@ pub fn add_trigger(
     Ok(())
 }
 
+pub fn create_domain(
+    _cwd: &Path,
+    domain_name: &str,
+    keyword: Option<&str>,
+    path: Option<&str>,
+) -> anyhow::Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let toml_path = home.join(".base-gbl").join("domains.toml");
+    let mut file: DomainsFile = if toml_path.exists() {
+        toml::from_str(&std::fs::read_to_string(&toml_path)?)?
+    } else {
+        DomainsFile { domain: Vec::new() }
+    };
+
+    if file.domain.iter().any(|d| d.name.eq_ignore_ascii_case(domain_name)) {
+        anyhow::bail!("Domain '{domain_name}' already exists");
+    }
+
+    let mut kws = Vec::new();
+    if let Some(kw) = keyword { kws.push(kw.to_string()); }
+    let mut ps = Vec::new();
+    if let Some(p) = path { ps.push(p.to_string()); }
+
+    file.domain.push(DomainDef {
+        name: domain_name.to_string(),
+        mode: "triggered".to_string(),
+        prompt_keywords: kws,
+        file_keywords: Vec::new(),
+        paths: ps,
+        exclude: Vec::new(),
+        rules: Vec::new(),
+        query: None,
+        query_format: None,
+    });
+
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, &toml_path)?;
+    Ok(())
+}
+
+pub fn remove_domain(_cwd: &Path, domain_name: &str) -> anyhow::Result<bool> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let toml_path = home.join(".base-gbl").join("domains.toml");
+    if !toml_path.exists() { return Ok(false); }
+
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(&toml_path)?)?;
+    let before = file.domain.len();
+    file.domain.retain(|d| !d.name.eq_ignore_ascii_case(domain_name));
+    if file.domain.len() == before { return Ok(false); }
+
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, &toml_path)?;
+    Ok(true)
+}
+
+pub fn remove_trigger(
+    _cwd: &Path,
+    domain_name: &str,
+    keyword: Option<&str>,
+    path: Option<&str>,
+) -> anyhow::Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let toml_path = home.join(".base-gbl").join("domains.toml");
+    if !toml_path.exists() { anyhow::bail!("domains.toml not found"); }
+
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(&toml_path)?)?;
+    let domain = file.domain.iter_mut()
+        .find(|d| d.name.eq_ignore_ascii_case(domain_name))
+        .ok_or_else(|| anyhow::anyhow!("Domain '{domain_name}' not found"))?;
+
+    if let Some(kw) = keyword {
+        domain.prompt_keywords.retain(|k| k != kw);
+    }
+    if let Some(p) = path {
+        domain.paths.retain(|pp| pp != p);
+    }
+
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, &toml_path)?;
+    Ok(())
+}
+
 /// List all domains (for CLI output).
 pub fn list_domains(cwd: &Path) {
     let domains = load_domains(cwd);

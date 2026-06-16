@@ -18,8 +18,9 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // Must be FIRST — if we intercept, we may block the tool call (exit 2).
     if let Some((message, blocked)) = crate::hook::memory::handle_memory(config, cwd, event) {
         if blocked {
-            // Exit 2 = block the tool call. Stdout becomes feedback to Claude.
+            // Exit 2 = block the tool call. Stdout = reason shown to Claude.
             print!("{message}");
+            eprint!("{message}");
             std::process::exit(2);
         }
         // Not blocked: print enrichment and continue (dual-write mode)

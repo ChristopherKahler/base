@@ -55,7 +55,7 @@ fn memory_write_intercept_stores_to_graph() {
     assert!(result.is_some(), "Should intercept memory write");
 
     let (msg, blocked) = result.unwrap();
-    assert!(msg.contains("stored in BASE graph"), "Message: {msg}");
+    assert!(msg.contains("Stored in BASE graph"), "Message: {msg}");
     assert!(msg.contains("correction"), "feedback type should map to correction: {msg}");
     assert!(!blocked, "mode=both should not block");
 

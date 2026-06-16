@@ -98,7 +98,7 @@ pub enum Commands {
     },
     /// Graph-backed structured memory
     Learn {
-        /// The memory text to store (required unless --mention)
+        /// The memory text to store (required unless --mention, --remove, --update, or --list)
         #[arg(long)]
         text: Option<String>,
         /// Note type: insight, correction, decision, commitment, shift
@@ -119,8 +119,17 @@ pub enum Commands {
         /// Context for the mention
         #[arg(long)]
         context: Option<String>,
+        /// Remove a note by slug
+        #[arg(long)]
+        remove: Option<String>,
+        /// Update a note's text by slug (requires --text)
+        #[arg(long)]
+        update: Option<String>,
+        /// List all notes (optionally filter by --type or --domain)
+        #[arg(long)]
+        list: bool,
     },
-    /// Search notes by keyword and/or domain
+    /// Search notes by keyword, domain, or slug
     Recall {
         /// Search text in note content
         #[arg(long)]
@@ -128,6 +137,9 @@ pub enum Commands {
         /// Filter by linked domain
         #[arg(long)]
         domain: Option<String>,
+        /// Look up a specific note by slug
+        #[arg(long)]
+        slug: Option<String>,
     },
     /// Manage rules in the graph (add, list, remove)
     Rule {
@@ -203,6 +215,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: MemoryAction,
     },
+    /// Read and write base.toml configuration (dot-notation: section.key)
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -240,6 +257,44 @@ pub enum ExtensionAction {
 #[derive(Subcommand)]
 pub enum CommandAction {
     /// List all configured star commands
+    List,
+    /// Show details for a specific star command
+    Show {
+        /// Command name (case-insensitive, without *)
+        name: String,
+    },
+    /// Add a new star command to commands.toml
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        description: String,
+        /// Rules (repeatable)
+        #[arg(long)]
+        rule: Vec<String>,
+    },
+    /// Remove a star command from commands.toml
+    Remove {
+        /// Command name (case-insensitive)
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Get a config value (dot-notation: section.key)
+    Get {
+        /// Config key (e.g. memory.mode, signal.enabled, flow.resurface)
+        key: String,
+    },
+    /// Set a config value (dot-notation: section.key value)
+    Set {
+        /// Config key
+        key: String,
+        /// New value
+        value: String,
+    },
+    /// List all config values
     List,
 }
 
@@ -495,6 +550,29 @@ pub enum DomainAction {
         /// Path to carl.json for one-time decision migration
         #[arg(long)]
         carl: Option<String>,
+    },
+    /// Create a new domain in domains.toml
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        keyword: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Remove a domain from domains.toml
+    Remove {
+        /// Domain name (case-insensitive)
+        name: String,
+    },
+    /// Remove a keyword or path trigger from a domain
+    RemoveTrigger {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        keyword: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
     },
 }
 
@@ -809,6 +887,29 @@ pub fn run() {
                     Err(e) => eprintln!("Domain sync failed: {e}"),
                 }
             }
+            DomainAction::Create { name, keyword, path } => {
+                match domain::create_domain(&cwd, &name, keyword.as_deref(), path.as_deref()) {
+                    Ok(()) => println!("Domain '{name}' created"),
+                    Err(e) => eprintln!("Failed: {e}"),
+                }
+            }
+            DomainAction::Remove { name } => {
+                match domain::remove_domain(&cwd, &name) {
+                    Ok(true) => println!("Domain '{name}' removed"),
+                    Ok(false) => eprintln!("Domain '{name}' not found"),
+                    Err(e) => eprintln!("Failed: {e}"),
+                }
+            }
+            DomainAction::RemoveTrigger { domain: name, keyword, path } => {
+                if keyword.is_none() && path.is_none() {
+                    eprintln!("Provide --keyword and/or --path to remove");
+                    return;
+                }
+                match domain::remove_trigger(&cwd, &name, keyword.as_deref(), path.as_deref()) {
+                    Ok(()) => println!("Trigger removed from domain '{name}'"),
+                    Err(e) => eprintln!("Failed: {e}"),
+                }
+            }
         },
 
         // ─── Rule ─────────────────────────────────────────
@@ -846,9 +947,28 @@ pub fn run() {
         },
 
         // ─── Learn ────────────────────────────────────────
-        Some(Commands::Learn { text, r#type, domain, project, entity, mention, context }) => {
-            if let Some(slug) = mention {
-                // Mention mode: increment mention count on existing note
+        Some(Commands::Learn { text, r#type, domain, project, entity, mention, context, remove, update, list }) => {
+            if list {
+                if let Err(e) = crud::note::list_notes(&cwd, &config.namespace, if r#type != "insight" { Some(&r#type) } else { None }, domain.as_deref()) {
+                    eprintln!("Error: {e}");
+                }
+            } else if let Some(slug) = remove {
+                match crud::note::remove(&cwd, &config.namespace, &slug) {
+                    Ok(true) => println!("Removed note/{slug}"),
+                    Ok(false) => eprintln!("Not found: note/{slug}"),
+                    Err(e) => eprintln!("Failed: {e}"),
+                }
+            } else if let Some(slug) = update {
+                let Some(new_text) = text else {
+                    eprintln!("--text is required with --update");
+                    std::process::exit(1);
+                };
+                match crud::note::update_text(&cwd, &config.namespace, &slug, &new_text) {
+                    Ok(true) => println!("Updated note/{slug}"),
+                    Ok(false) => eprintln!("Not found: note/{slug}"),
+                    Err(e) => eprintln!("Failed: {e}"),
+                }
+            } else if let Some(slug) = mention {
                 match crud::note::mention(
                     &cwd,
                     &config.namespace,
@@ -859,13 +979,12 @@ pub fn run() {
                     Err(e) => eprintln!("Failed: {e}"),
                 }
             } else {
-                // Standard learn mode: create a new note
                 let Some(text) = text else {
-                    eprintln!("--text is required (or use --mention <slug> for mention tracking)");
+                    eprintln!("--text is required (or use --mention, --remove, --update, --list)");
                     std::process::exit(1);
                 };
                 let Some(domain) = domain else {
-                    eprintln!("--domain is required (or use --mention <slug> for mention tracking)");
+                    eprintln!("--domain is required (or use --mention, --remove, --update, --list)");
                     std::process::exit(1);
                 };
                 match crud::note::learn(
@@ -884,12 +1003,18 @@ pub fn run() {
         }
 
         // ─── Recall ─────────────────────────────────────────
-        Some(Commands::Recall { keyword, domain }) => {
-            if keyword.is_none() && domain.is_none() {
-                eprintln!("Provide --keyword and/or --domain");
-                return;
+        Some(Commands::Recall { keyword, domain, slug }) => {
+            if let Some(slug) = slug {
+                if let Err(e) = crud::note::recall_by_slug(&cwd, &config.namespace, &slug) {
+                    eprintln!("Error: {e}");
+                }
+            } else {
+                if keyword.is_none() && domain.is_none() {
+                    eprintln!("Provide --keyword, --domain, or --slug");
+                    return;
+                }
+                if let Err(e) = crud::note::recall(&cwd, &config.namespace, keyword.as_deref(), domain.as_deref()) { eprintln!("Error: {e}"); }
             }
-            if let Err(e) = crud::note::recall(&cwd, &config.namespace, keyword.as_deref(), domain.as_deref()) { eprintln!("Error: {e}"); }
         }
 
         // ─── Install ─────────────────────────────────────────
@@ -1127,6 +1252,75 @@ pub fn run() {
                     println!("\n{} command(s) available. Type *NAME in a prompt to activate.", commands.len());
                 }
             }
+            CommandAction::Show { name } => {
+                let commands = command::load_commands(&cwd);
+                match commands.iter().find(|c| c.name.eq_ignore_ascii_case(&name)) {
+                    Some(cmd) => {
+                        println!("*{}", cmd.name);
+                        if !cmd.description.is_empty() {
+                            println!("  {}", cmd.description);
+                        }
+                        println!();
+                        for (i, rule) in cmd.rules.iter().enumerate() {
+                            println!("  {i}. {rule}");
+                        }
+                    }
+                    None => eprintln!("Command '{name}' not found. Run `base commands list` to see available."),
+                }
+            }
+            CommandAction::Add { name, description, rule } => {
+                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let path = home.join(".base-gbl").join("commands.toml");
+                let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+                let rules_toml: String = rule.iter()
+                    .map(|r| format!("  \"{}\",", r.replace('"', "\\\"")))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let block = format!(
+                    "\n[[command]]\nname = \"{}\"\ndescription = \"{}\"\nrules = [\n{}\n]\n",
+                    name.replace('"', "\\\""),
+                    description.replace('"', "\\\""),
+                    rules_toml,
+                );
+                content.push_str(&block);
+                if let Err(e) = std::fs::write(&path, content) {
+                    eprintln!("Failed to write commands.toml: {e}");
+                } else {
+                    println!("Added *{name} ({} rules)", rule.len());
+                }
+            }
+            CommandAction::Remove { name } => {
+                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let path = home.join(".base-gbl").join("commands.toml");
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    eprintln!("Cannot read commands.toml");
+                    return;
+                };
+
+                #[derive(serde::Deserialize, serde::Serialize)]
+                struct CmdFile { #[serde(default)] command: Vec<command::CommandDef> }
+
+                let Ok(mut file) = toml::from_str::<CmdFile>(&content) else {
+                    eprintln!("Failed to parse commands.toml");
+                    return;
+                };
+                let before = file.command.len();
+                file.command.retain(|c| !c.name.eq_ignore_ascii_case(&name));
+                if file.command.len() == before {
+                    eprintln!("Command '{name}' not found");
+                    return;
+                }
+                match toml::to_string_pretty(&file) {
+                    Ok(out) => {
+                        if let Err(e) = std::fs::write(&path, out) {
+                            eprintln!("Failed to write: {e}");
+                        } else {
+                            println!("Removed *{name}");
+                        }
+                    }
+                    Err(e) => eprintln!("Failed to serialize: {e}"),
+                }
+            }
         },
 
         // ─── Memory ────────────────────────────────────────
@@ -1273,6 +1467,100 @@ pub fn run() {
                 }
 
                 println!("Memory purge complete: {purged} deleted, {kept} kept (no graph entry — run migrate first)");
+            }
+        },
+
+        // ─── Config ────────────────────────────────────────
+        Some(Commands::Config { action }) => {
+            let home = dirs::home_dir().expect("Cannot determine home directory");
+            let path = home.join(".base-gbl").join("base.toml");
+
+            match action {
+                ConfigAction::List => {
+                    let Ok(content) = std::fs::read_to_string(&path) else {
+                        eprintln!("Cannot read base.toml at {}", path.display());
+                        return;
+                    };
+                    let Ok(val) = content.parse::<toml::Value>() else {
+                        eprintln!("Failed to parse base.toml");
+                        return;
+                    };
+                    if let Some(table) = val.as_table() {
+                        for (section, v) in table {
+                            if let Some(inner) = v.as_table() {
+                                for (key, val) in inner {
+                                    println!("{section}.{key} = {val}");
+                                }
+                            }
+                        }
+                    }
+                }
+                ConfigAction::Get { key } => {
+                    let Ok(content) = std::fs::read_to_string(&path) else {
+                        eprintln!("Cannot read base.toml");
+                        return;
+                    };
+                    let Ok(val) = content.parse::<toml::Value>() else {
+                        eprintln!("Failed to parse base.toml");
+                        return;
+                    };
+                    let parts: Vec<&str> = key.splitn(2, '.').collect();
+                    if parts.len() != 2 {
+                        eprintln!("Key must be section.field (e.g. memory.mode)");
+                        return;
+                    }
+                    match val.get(parts[0]).and_then(|s| s.get(parts[1])) {
+                        Some(v) => println!("{v}"),
+                        None => eprintln!("Key '{key}' not found"),
+                    }
+                }
+                ConfigAction::Set { key, value } => {
+                    let Ok(content) = std::fs::read_to_string(&path) else {
+                        eprintln!("Cannot read base.toml");
+                        return;
+                    };
+                    let Ok(mut doc) = content.parse::<toml::Value>() else {
+                        eprintln!("Failed to parse base.toml");
+                        return;
+                    };
+                    let parts: Vec<&str> = key.splitn(2, '.').collect();
+                    if parts.len() != 2 {
+                        eprintln!("Key must be section.field (e.g. memory.mode)");
+                        return;
+                    }
+                    let section = parts[0];
+                    let field = parts[1];
+
+                    let new_val: toml::Value = if value == "true" {
+                        toml::Value::Boolean(true)
+                    } else if value == "false" {
+                        toml::Value::Boolean(false)
+                    } else if let Ok(n) = value.parse::<i64>() {
+                        toml::Value::Integer(n)
+                    } else {
+                        toml::Value::String(value.clone())
+                    };
+
+                    let table = doc.as_table_mut().unwrap();
+                    let sec = table.entry(section).or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+                    if let Some(sec_table) = sec.as_table_mut() {
+                        sec_table.insert(field.to_string(), new_val.clone());
+                    } else {
+                        eprintln!("Section '{section}' is not a table");
+                        return;
+                    }
+
+                    match toml::to_string_pretty(&doc) {
+                        Ok(out) => {
+                            if let Err(e) = std::fs::write(&path, out) {
+                                eprintln!("Failed to write base.toml: {e}");
+                            } else {
+                                println!("Updated {key} = {new_val}");
+                            }
+                        }
+                        Err(e) => eprintln!("Failed to serialize: {e}"),
+                    }
+                }
             }
         },
 

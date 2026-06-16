@@ -58,14 +58,22 @@ pub fn escape_sparql_literal(s: &str) -> String {
 
 /// Convert a name to a URL-safe slug: lowercase, non-alphanumeric→hyphens, deduped.
 pub fn slugify(name: &str) -> String {
-    name.to_lowercase()
+    let full: String = name.to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
-        .join("-")
+        .join("-");
+    if full.len() <= 80 {
+        return full;
+    }
+    let truncated = &full[..80];
+    match truncated.rfind('-') {
+        Some(pos) if pos > 20 => truncated[..pos].to_string(),
+        _ => truncated.to_string(),
+    }
 }
 
 // ─── SPARQL helpers ──────────────────────────────────────────
