@@ -220,6 +220,14 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Pull targeted graph context on demand (same engine as hook injection)
+    Context {
+        /// Text to match against domain triggers
+        text: Option<String>,
+        /// List all available context triggers
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -435,6 +443,12 @@ pub enum DecisionAction {
     },
     /// Search decisions by keyword
     Search {
+        #[arg(long)]
+        keyword: String,
+    },
+    /// Delete decisions matching a keyword
+    Delete {
+        /// Keyword to match against decision names
         #[arg(long)]
         keyword: String,
     },
@@ -733,6 +747,18 @@ pub fn run() {
                 }
             }
             DecisionAction::Search { keyword } => { if let Err(e) = crud::decision::search(&cwd, &config.namespace, &keyword) { eprintln!("Error: {e}"); } }
+            DecisionAction::Delete { keyword } => {
+                // Show what will be deleted first
+                if let Err(e) = crud::decision::search(&cwd, &config.namespace, &keyword) {
+                    eprintln!("Error: {e}");
+                } else {
+                    match crud::decision::delete(&cwd, &config.namespace, &keyword) {
+                        Ok(0) => println!("No decisions matching '{keyword}'."),
+                        Ok(n) => println!("Deleted {n} decision(s) matching '{keyword}'."),
+                        Err(e) => eprintln!("Failed: {e}"),
+                    }
+                }
+            }
         },
 
         // ─── Entity ──────────────────────────────────────
@@ -1561,6 +1587,16 @@ pub fn run() {
                         Err(e) => eprintln!("Failed to serialize: {e}"),
                     }
                 }
+            }
+        },
+
+        Some(Commands::Context { text, list }) => {
+            if list {
+                domain::query::context_list(&cwd);
+            } else if let Some(text) = text {
+                domain::query::context_pull(&config, &cwd, &text);
+            } else {
+                eprintln!("Usage: base context <text> or base context --list");
             }
         },
 

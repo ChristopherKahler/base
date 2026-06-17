@@ -54,6 +54,12 @@ pub fn handle(config: &BaseConfig, cwd: &Path) -> Result<()> {
             // Extension status injection (Phase 23)
             inject_extension_status(config, cwd);
 
+            // Context triggers cheat-sheet (Phase 21)
+            let triggers = crate::domain::query::context_triggers_block(cwd);
+            if !triggers.is_empty() {
+                print!("\n{triggers}");
+            }
+
             return Ok(());
         }
     }
