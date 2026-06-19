@@ -441,6 +441,32 @@ Every panel reads from the same SPARQL-backed API. The same graph that powers yo
 
 **Fail open.** Every hook catches all errors, logs to stderr, exits 0 with empty stdout. If the graph is corrupt, if SPARQL fails, if the file doesn't exist - Claude keeps working. The system never blocks the prompt.
 
+## Graph durability & recovery
+
+The graph is the durable record, so corruption has to be loud, diagnosable, and
+self-healing — never a silent outage. BASE writes atomically (temp → validate → rename),
+fails loud on a bad parse (non-zero exit + session-start warning), and splits read/write
+behavior: **reads** fall back to a lenient parse that skips malformed lines and warns, so
+one bad line never blanks your context; **writes** stay strict and refuse to run on an
+unhealthy graph, so it's never silently rewritten with data dropped.
+
+```bash
+base doctor                 # parser-independent health scan (both tiers); --json for agents
+base doctor --repair        # quarantine malformed lines + atomic rewrite of the good set
+base doctor --restore       # list snapshots; --restore <backup> rolls one back
+
+base graph compact          # dedup + canonicalize (atomic, idempotent)
+base graph purge --stale    # PREVIEW notes unread > 21 days; --apply to delete, --days N to tune
+```
+
+Every repair/restore/compact/purge **snapshots first** to `graph.nq.bak-<op>-<date>` and
+keeps the newest 10. `base recall` stamps `lastRead`, so a note's purge clock resets every
+time it's used — only notes you never reach for age out (and dry-run is the default).
+
+> **Never hand-edit `graph.nq`.** Use `base graph` / `base doctor`. Every corruption
+> incident came from an interrupted hand-run edit — the commands above are atomic and
+> validated. Full model + recovery runbook: [`docs/graph-durability.md`](docs/graph-durability.md).
+
 ## Extensions
 
 BASE supports declarative extensions that let frameworks plug into the context engine.
