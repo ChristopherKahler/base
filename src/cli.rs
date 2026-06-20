@@ -1434,6 +1434,12 @@ pub fn run() {
                 }
                 let home = dirs::home_dir().expect("Cannot determine home directory");
                 let path = home.join(".base-gbl").join("commands.toml");
+                if let Some(parent) = path.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    eprintln!("Failed to create {}: {e}", parent.display());
+                    std::process::exit(1);
+                }
                 // Append-only: read existing text and never rewrite what precedes.
                 let mut content = std::fs::read_to_string(&path).unwrap_or_default();
                 let existing: std::collections::HashSet<String> = toml::from_str::<CmdFile>(&content)
@@ -1460,7 +1466,7 @@ pub fn run() {
                 }
                 if let Err(e) = std::fs::write(&path, content) {
                     eprintln!("Failed to write commands.toml: {e}");
-                    return;
+                    std::process::exit(1);
                 }
                 println!("Imported {} command(s) from {file}", added.len());
                 if !added.is_empty() {
