@@ -39,10 +39,16 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         session.clear_dedup();
     }
 
-    // Check for *COMMAND before domain matching
+    // Check for *COMMAND(s) before domain matching — supports stacking, so
+    // "*audit *steelman" activates BOTH modes (every matched *word injects).
     let commands = crate::command::load_commands(cwd);
-    if let Some(cmd) = crate::command::match_command(&prompt, &commands) {
-        let cmd_output = crate::command::format_command_output(cmd);
+    let matched = crate::command::match_commands(&prompt, &commands);
+    if !matched.is_empty() {
+        let cmd_output: String = matched
+            .iter()
+            .map(|cmd| crate::command::format_command_output(cmd))
+            .collect::<Vec<_>>()
+            .join("\n");
         if !cmd_output.is_empty() {
             // Star commands bypass domain matching — they're explicit invocations
             if let Some(ref base_dir) = base_dir {

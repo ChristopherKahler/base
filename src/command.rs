@@ -60,23 +60,27 @@ fn merge_commands(base: Vec<CommandDef>, overlay: Vec<CommandDef>) -> Vec<Comman
 
 // ─── Matching ───────────────────────────────────────────────
 
-/// Check if prompt starts with a *COMMAND. Returns the matched command if found.
-/// Matching is case-insensitive: *BRIEF, *brief, *Brief all match.
-pub fn match_command<'a>(prompt: &str, commands: &'a [CommandDef]) -> Option<&'a CommandDef> {
-    let trimmed = prompt.trim();
-
-    // Must start with *
-    if !trimmed.starts_with('*') {
-        return None;
+/// Find every *COMMAND token anywhere in the prompt and return the matching
+/// commands, in first-seen order, deduped. Composition is the point: stacking
+/// two modes in one prompt activates both — "*audit *steelman review this" →
+/// [AUDIT, STEELMAN]. Matching is case-insensitive and tolerant of trailing
+/// punctuation (*blunt, → BLUNT).
+pub fn match_commands<'a>(prompt: &str, commands: &'a [CommandDef]) -> Vec<&'a CommandDef> {
+    let mut matched: Vec<&CommandDef> = Vec::new();
+    for token in prompt.split_whitespace() {
+        let Some(rest) = token.strip_prefix('*') else { continue };
+        // Tolerate trailing punctuation: "*blunt," / "*audit." still match.
+        let name = rest.trim_end_matches(|c: char| !c.is_alphanumeric());
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(cmd) = commands.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+            && !matched.iter().any(|m| m.name.eq_ignore_ascii_case(&cmd.name))
+        {
+            matched.push(cmd);
+        }
     }
-
-    // Extract command name (first word after *)
-    let cmd_text = &trimmed[1..];
-    let cmd_name = cmd_text.split_whitespace().next()?;
-
-    commands
-        .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(cmd_name))
+    matched
 }
 
 /// Format command rules for injection.

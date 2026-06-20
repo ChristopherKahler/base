@@ -321,6 +321,11 @@ pub enum CommandAction {
         /// Command name (case-insensitive)
         name: String,
     },
+    /// Import star commands from a commands.toml file (append-only; skips names already present, never alters preceding content)
+    Import {
+        /// Path to a commands.toml file to import (e.g. an Operator Modes pack)
+        file: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1410,6 +1415,59 @@ pub fn run() {
                         }
                     }
                     Err(e) => eprintln!("Failed to serialize: {e}"),
+                }
+            }
+            CommandAction::Import { file } => {
+                let src = match std::fs::read_to_string(&file) {
+                    Ok(c) => c,
+                    Err(e) => { eprintln!("Cannot read {file}: {e}"); return; }
+                };
+                #[derive(serde::Deserialize)]
+                struct CmdFile { #[serde(default)] command: Vec<command::CommandDef> }
+                let incoming = match toml::from_str::<CmdFile>(&src) {
+                    Ok(f) => f.command,
+                    Err(e) => { eprintln!("Failed to parse {file}: {e}"); return; }
+                };
+                if incoming.is_empty() {
+                    println!("No [[command]] entries found in {file}.");
+                    return;
+                }
+                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let path = home.join(".base-gbl").join("commands.toml");
+                // Append-only: read existing text and never rewrite what precedes.
+                let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+                let existing: std::collections::HashSet<String> = toml::from_str::<CmdFile>(&content)
+                    .map(|f| f.command.iter().map(|c| c.name.to_ascii_uppercase()).collect())
+                    .unwrap_or_default();
+                let (mut added, mut skipped): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+                for cmd in &incoming {
+                    if existing.contains(&cmd.name.to_ascii_uppercase()) {
+                        skipped.push(cmd.name.clone());
+                        continue;
+                    }
+                    let rules_toml: String = cmd.rules.iter()
+                        .map(|r| format!("  \"{}\",", r.replace('"', "\\\"")))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let block = format!(
+                        "\n[[command]]\nname = \"{}\"\ndescription = \"{}\"\nrules = [\n{}\n]\n",
+                        cmd.name.replace('"', "\\\""),
+                        cmd.description.replace('"', "\\\""),
+                        rules_toml,
+                    );
+                    content.push_str(&block);
+                    added.push(cmd.name.clone());
+                }
+                if let Err(e) = std::fs::write(&path, content) {
+                    eprintln!("Failed to write commands.toml: {e}");
+                    return;
+                }
+                println!("Imported {} command(s) from {file}", added.len());
+                if !added.is_empty() {
+                    println!("  added: {}", added.iter().map(|n| format!("*{}", n.to_uppercase())).collect::<Vec<_>>().join(" "));
+                }
+                if !skipped.is_empty() {
+                    println!("  skipped (already present): {}", skipped.iter().map(|n| format!("*{}", n.to_uppercase())).collect::<Vec<_>>().join(" "));
                 }
             }
         },
