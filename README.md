@@ -333,6 +333,22 @@ Four hooks, all wired automatically by `base install`:
 
 All hooks fail open. If anything errors, it logs to stderr and exits with empty stdout. Claude is never blocked by a hook failure.
 
+## Extensions
+
+A framework or skill can wire itself into the hook pipeline **without touching base's core** — ship one TOML file to `~/.base-gbl/extensions/{name}.toml` and base discovers it (no registration step). Extensions can bind to session start, prompt submit, pre-tool, and post-tool.
+
+The post-tool `inject` action (v0.6.0) is the **verify-reflex**: nudge Claude to do something *after* it writes a matching file, once per session.
+
+```toml
+[[hooks.post_tool.handlers]]
+pattern          = "designset"   # built-in design-file detector, or any path substring
+action           = "inject"
+once_per_session = true          # nudge once; re-fires only if message changes
+message          = "Design work detected — verify with /design-humanizer scan before shipping."
+```
+
+Same mechanism powers any "after you do X, verify Y" reflex (copy → humanizer, migrations → reversibility, …). Full reference: **[docs/extensions.md](docs/extensions.md)**.
+
 ## What lives where
 
 ```
