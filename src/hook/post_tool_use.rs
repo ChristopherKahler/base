@@ -72,6 +72,18 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
 
     // ─── Extension post-tool handlers ───────────────────────
     let extensions = crate::extension::load_extensions();
+    // Session state is reused for once-per-session "inject" dedup. Loaded
+    // lazily-shared across all handlers, saved once at the end if dirty.
+    let base_dir = crate::config::find_workspace_base(cwd);
+    let mut session = base_dir
+        .as_deref()
+        .map(crate::domain::session::SessionState::load)
+        .unwrap_or_default();
+    let mut session_dirty = false;
+    // Fourth design signal: styling markers inside the written content
+    // (CSS-in-JS, Tailwind, inline styles) — computed once, path-independent.
+    let content_design = content_has_design_markers(event);
+
     for ext in &extensions {
         if let Some(hooks) = &ext.hooks
             && let Some(post) = &hooks.post_tool
@@ -79,44 +91,191 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             for handler in &post.handlers {
                 for fp in &file_paths {
                     let fp_str = fp.to_string_lossy();
-                    if fp_str.contains(&handler.pattern) {
-                        match handler.action.as_str() {
-                            "log" => {
-                                eprintln!(
-                                    "base: ext:{} post-tool: {} matched {}",
-                                    ext.name, handler.pattern, fp_str
-                                );
-                            }
-                            "reingest" => {
-                                match crate::extension::ingest::ingest_extension(ext, cwd, config) {
-                                    Ok(stats) if stats.entities > 0 => {
-                                        eprintln!(
-                                            "base: ext:{} reingest: {} entities from {} file(s)",
-                                            ext.name, stats.entities, stats.files
-                                        );
-                                    }
-                                    Err(e) => {
-                                        eprintln!("base: ext:{} reingest error: {e}", ext.name);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            "query" => {
-                                // Future: run a SPARQL query on match
-                                eprintln!(
-                                    "base: ext:{} query triggered for {} (stub — Phase 24)",
-                                    ext.name, handler.pattern
-                                );
-                            }
-                            _ => {}
+                    // Match: "designset" sentinel → built-in design-file heuristic;
+                    // any other pattern → substring match (existing behavior).
+                    let matched = if handler.pattern == "designset" {
+                        is_design_file(&fp_str) || content_design
+                    } else {
+                        fp_str.contains(&handler.pattern)
+                    };
+                    if !matched {
+                        continue;
+                    }
+                    match handler.action.as_str() {
+                        "log" => {
+                            eprintln!(
+                                "base: ext:{} post-tool: {} matched {}",
+                                ext.name, handler.pattern, fp_str
+                            );
                         }
+                        "reingest" => {
+                            match crate::extension::ingest::ingest_extension(ext, cwd, config) {
+                                Ok(stats) if stats.entities > 0 => {
+                                    eprintln!(
+                                        "base: ext:{} reingest: {} entities from {} file(s)",
+                                        ext.name, stats.entities, stats.files
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("base: ext:{} reingest error: {e}", ext.name);
+                                }
+                                _ => {}
+                            }
+                        }
+                        "query" => {
+                            // Future: run a SPARQL query on match
+                            eprintln!(
+                                "base: ext:{} query triggered for {} (stub — Phase 24)",
+                                ext.name, handler.pattern
+                            );
+                        }
+                        "inject" => {
+                            // Tool gate: default Write/Edit/MultiEdit, never Read.
+                            let allowed = handler.on_tools.clone().unwrap_or_else(|| {
+                                vec!["Write".into(), "Edit".into(), "MultiEdit".into()]
+                            });
+                            if !allowed.iter().any(|t| t.as_str() == tool_name) {
+                                continue;
+                            }
+                            let Some(message) = handler.message.as_deref() else {
+                                continue;
+                            };
+                            // Once-per-session dedup keyed on ext name + message hash.
+                            // Re-fires only if the message text changes.
+                            let once = handler.once_per_session.unwrap_or(true);
+                            let key = format!("ext-inject:{}", ext.name);
+                            let msg_hash =
+                                crate::domain::session::rules_hash(&[message.to_string()]);
+                            if once && session.is_injected(&key, msg_hash) {
+                                continue;
+                            }
+                            print!("{}", message.trim_end());
+                            data.nudged = true;
+                            if once {
+                                session.mark_injected(&key, msg_hash);
+                                session_dirty = true;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
         }
     }
 
+    if session_dirty
+        && let Some(bd) = base_dir.as_deref()
+    {
+        let _ = session.save(bd);
+    }
+
     Ok(data)
+}
+
+/// Design/frontend file heuristic for the "designset" post-tool inject pattern.
+/// Broad by design — once-per-session dedup caps the cost of a false positive
+/// at a single nudge, so we favor coverage over precision. Three signal classes:
+/// file extension, path segment, and filename. Content markers are a fourth
+/// class handled separately (see `content_has_design_markers`).
+fn is_design_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+
+    // ── 1. Extensions: style, markup, component, template, vector ──
+    const EXTS: &[&str] = &[
+        // stylesheets
+        ".css", ".scss", ".sass", ".less", ".pcss", ".postcss", ".styl",
+        // markup / components
+        ".html", ".htm", ".vue", ".svelte", ".astro", ".tsx", ".jsx", ".mdx",
+        // template engines / server views
+        ".liquid", ".hbs", ".handlebars", ".mustache", ".ejs", ".pug", ".jade",
+        ".haml", ".slim", ".erb", ".twig", ".njk", ".blade.php", ".razor",
+        ".cshtml", ".vbhtml",
+        // native / app UI markup
+        ".xaml", ".axaml", ".qml",
+        // vector / visual
+        ".svg",
+        // CSS-in-TS (vanilla-extract / treat)
+        ".css.ts", ".css.js",
+    ];
+    if EXTS.iter().any(|e| lower.ends_with(e)) {
+        return true;
+    }
+
+    // ── 2. Path segments: folders that imply UI/design work ──
+    const SEGMENTS: &[&str] = &[
+        "/components/", "/component/", "/ui/", "/styles/", "/style/", "/css/",
+        "/scss/", "/sass/", "/less/", "/stylesheets/", "/design/", "/design-system/",
+        "/theme/", "/themes/", "/tokens/", "/layout/", "/layouts/", "/pages/",
+        "/views/", "/templates/", "/partials/", "/sections/", "/blocks/", "/widgets/",
+        "/screens/", "/elements/", "/atoms/", "/molecules/", "/organisms/",
+        "/landing/", "/marketing/", "/brand/", "/branding/", "/motion/",
+        "/animations/", "/fonts/", "/icons/", "/svg/", "/assets/",
+        "/storybook/", "/.storybook/", "/stories/",
+    ];
+    if SEGMENTS.iter().any(|s| lower.contains(s)) {
+        return true;
+    }
+
+    // ── 3. Filenames: framework configs + token/theme files ──
+    const FILES: &[&str] = &[
+        "tailwind.config", "postcss.config", "unocss.config", "uno.config",
+        "windi.config", "panda.config", "stitches.config", "components.json",
+        "globals.css", ".module.css", ".module.scss", ".styles.", ".styled.",
+        "theme.", "tokens.", "palette.", "typography.", "design-tokens.", "stylelint",
+    ];
+    FILES.iter().any(|f| lower.contains(f))
+}
+
+/// Extract the text being written: Write.content, Edit.new_string,
+/// or MultiEdit.edits[].new_string (concatenated).
+fn extract_written_content(event: &serde_json::Value) -> String {
+    let Some(ti) = event.get("tool_input") else {
+        return String::new();
+    };
+    let mut out = String::new();
+    if let Some(c) = ti.get("content").and_then(|v| v.as_str()) {
+        out.push_str(c);
+    }
+    if let Some(c) = ti.get("new_string").and_then(|v| v.as_str()) {
+        out.push('\n');
+        out.push_str(c);
+    }
+    if let Some(edits) = ti.get("edits").and_then(|v| v.as_array()) {
+        for e in edits {
+            if let Some(c) = e.get("new_string").and_then(|v| v.as_str()) {
+                out.push('\n');
+                out.push_str(c);
+            }
+        }
+    }
+    out
+}
+
+/// Fourth signal class: design work hidden inside a non-design extension
+/// (CSS-in-JS, Tailwind, inline styles in a .ts/.js/etc). Scans the written
+/// content for high-signal styling markers.
+fn content_has_design_markers(event: &serde_json::Value) -> bool {
+    let content = extract_written_content(event);
+    if content.is_empty() {
+        return false;
+    }
+    let lower = content.to_lowercase();
+    const MARKERS: &[&str] = &[
+        // JSX / HTML styling attributes
+        "classname=", "class=", "style=", "<style",
+        // CSS-in-JS libraries
+        "styled.", "styled(", "css`", "tw`", "createglobalstyle", "createtheme",
+        "makestyles", "usestyles", "sx={", "cva(", "clsx(",
+        // Tailwind / utility
+        "@apply", "@tailwind", "tailwind",
+        // raw CSS properties / at-rules
+        "@media", "@keyframes", "keyframes", "box-shadow", "border-radius",
+        "linear-gradient", "backdrop-filter", "font-family", "transition:",
+        "flex-direction", ":root",
+        // color functions
+        "rgba(", "hsl(",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
 }
 
 fn is_source_file(path: &str) -> bool {
@@ -237,5 +396,51 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let found = find_workspace_trig(tmp.path());
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn design_file_extensions_and_paths() {
+        // extensions
+        assert!(is_design_file("/p/hero.css"));
+        assert!(is_design_file("/p/Button.tsx"));
+        assert!(is_design_file("/p/page.svelte"));
+        assert!(is_design_file("/p/views/home.blade.php"));
+        assert!(is_design_file("/p/icon.svg"));
+        assert!(is_design_file("/p/styles/theme.css.ts")); // vanilla-extract
+        assert!(is_design_file("/p/Page.HTML")); // case-insensitive
+        // path segments
+        assert!(is_design_file("/p/components/Logic.ts"));
+        assert!(is_design_file("/p/theme/colors.ts"));
+        assert!(is_design_file("/p/.storybook/preview.ts"));
+        // filenames
+        assert!(is_design_file("/p/tailwind.config.js"));
+        assert!(is_design_file("/p/components.json"));
+        assert!(is_design_file("/p/Card.styles.ts"));
+        // negatives
+        assert!(!is_design_file("/p/src/api.ts"));
+        assert!(!is_design_file("/p/server/db.py"));
+        assert!(!is_design_file("/p/README.md"));
+        assert!(!is_design_file("/p/lib/util.rs"));
+    }
+
+    #[test]
+    fn content_markers_catch_hidden_design() {
+        let styled = serde_json::json!({
+            "tool_name": "Write",
+            "tool_input": {"file_path": "/p/Widget.ts", "content": "const C = styled.div`color:red`"}
+        });
+        assert!(content_has_design_markers(&styled));
+
+        let tailwind_edit = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "/p/x.ts", "new_string": "return <div className=\"flex\">"}
+        });
+        assert!(content_has_design_markers(&tailwind_edit));
+
+        let logic = serde_json::json!({
+            "tool_name": "Write",
+            "tool_input": {"file_path": "/p/util.ts", "content": "export const add = (a, b) => a + b;"}
+        });
+        assert!(!content_has_design_markers(&logic));
     }
 }
