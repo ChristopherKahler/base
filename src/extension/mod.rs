@@ -141,9 +141,21 @@ pub struct PostToolHook {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PostToolHandler {
+    /// File-match pattern. Substring match, OR the reserved token "designset"
+    /// which delegates to the built-in design/frontend file heuristic.
     pub pattern: String,
     #[serde(default = "default_action")]
     pub action: String,
+    /// Message printed to stdout (so Claude sees it) when action = "inject".
+    #[serde(default)]
+    pub message: Option<String>,
+    /// For action = "inject": fire only once per session (default true).
+    #[serde(default)]
+    pub once_per_session: Option<bool>,
+    /// For action = "inject": only fire for these tools.
+    /// Default = ["Write", "Edit", "MultiEdit"] (never Read).
+    #[serde(default)]
+    pub on_tools: Option<Vec<String>>,
 }
 
 fn default_action() -> String {

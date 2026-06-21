@@ -32,6 +32,8 @@ pub struct HookEventData {
     pub grep_intercepted: bool,
     /// Post-tool-use: section-specific AST context was injected (partial read)
     pub section_context: bool,
+    /// Post-tool-use: an extension "inject" nudge was emitted this call
+    pub nudged: bool,
 }
 
 /// Extract tool name and file path from hook event JSON.

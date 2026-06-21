@@ -1,4 +1,5 @@
 pub mod matcher;
+pub mod query;
 pub mod session;
 pub mod sync;
 

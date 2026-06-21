@@ -258,13 +258,18 @@ pub fn imports(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Result<()> 
 pub fn file_map_compact(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Option<String> {
     let store = load_ast_store(cwd).ok()?;
     let pfx = ast_prefixes(ns);
-    let file_lower = file_path
-        .trim_start_matches("src/")
+    // Hook passes absolute paths; strip to workspace-relative for CONTAINS matching.
+    // AST graph stores paths like "src/hook/pre_tool_use.rs".
+    let relative = cwd
+        .to_str()
+        .and_then(|cwd_str| file_path.strip_prefix(cwd_str))
+        .map(|p| p.trim_start_matches('/'))
+        .unwrap_or(file_path);
+    let file_lower = relative
         .trim_start_matches("./")
         .to_lowercase();
 
-    // Strip to just filename for matching
-    let filename = file_lower.rsplit('/').next().unwrap_or(&file_lower);
+    let escaped = crate::crud::escape_sparql_literal(&file_lower);
 
     let sparql = format!(
         "{pfx}\n\
@@ -273,7 +278,7 @@ pub fn file_map_compact(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Op
              rdfs:label ?label ;\n\
              ops:sourceFile ?file .\n\
            OPTIONAL {{ ?entity ops:sourceLine ?line }}\n\
-           FILTER(LCASE(STR(?file)) = \"{filename}\")\n\
+           FILTER(CONTAINS(LCASE(STR(?file)), \"{escaped}\"))\n\
          }}\n\
          ORDER BY ?line"
     );

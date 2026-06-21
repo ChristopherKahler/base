@@ -210,6 +210,91 @@ pub fn recall(
     Ok(())
 }
 
+/// Resolve the NOTE IRIs an explicit recall surfaces (notes only — not decisions /
+/// file-changes / AC-results). Best-effort: returns empty on any query error. Used
+/// by the CLI recall handler to stamp `lastRead`; hooks (`recall_to_string`)
+/// deliberately do NOT call this, so hot-path injection never triggers a write.
+pub fn recalled_note_iris(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    keyword: Option<&str>,
+    domain: Option<&str>,
+) -> Vec<String> {
+    let p = &ns.prefix;
+    let where_clause = match (keyword, domain) {
+        (Some(kw), Some(dom)) => {
+            let kw_lower = crud::escape_sparql_literal(&kw.to_lowercase());
+            let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(dom));
+            format!(
+                "{{ ?n a {p}:Note ; {p}:noteText ?text ; {p}:status \"active\" .\n\
+                    FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\")) }}\n\
+                 UNION\n\
+                 {{ ?n a {p}:Note ; {p}:status \"active\" ; {p}:relatedTo <{domain_iri}> }}"
+            )
+        }
+        (Some(kw), None) => {
+            let kw_lower = crud::escape_sparql_literal(&kw.to_lowercase());
+            format!(
+                "?n a {p}:Note ; {p}:noteText ?text ; {p}:status \"active\" .\n\
+                 FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))"
+            )
+        }
+        (None, Some(dom)) => {
+            let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(dom));
+            format!("?n a {p}:Note ; {p}:status \"active\" ; {p}:relatedTo <{domain_iri}>")
+        }
+        (None, None) => return Vec::new(),
+    };
+
+    let sparql = format!("SELECT DISTINCT ?n WHERE {{ GRAPH ?g {{ {where_clause} }} }}");
+    let results = match crud::load_and_query(cwd, ns, &sparql) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut iris = Vec::new();
+    if let QueryResults::Solutions(sols) = results {
+        for row in sols.filter_map(|r| r.ok()) {
+            if let Some(oxigraph::model::Term::NamedNode(n)) = row.get("n") {
+                iris.push(n.as_str().to_string());
+            }
+        }
+    }
+    iris
+}
+
+/// Stamp `{p}:lastRead = now` on the given note IRIs (workspace graph, STRICT load
+/// + `write_back`). This is the usage signal `base graph purge --stale` reads. Called
+/// ONLY from the explicit `base recall` CLI path (never hooks — latency budget +
+/// Phase 35 writes-stay-strict). Returns the count stamped. Errs if the strict load
+/// fails (corrupt graph) so the caller warns + skips — never a silent lenient write.
+pub fn stamp_last_read(cwd: &Path, ns: &NamespaceConfig, note_iris: &[String]) -> Result<usize> {
+    if note_iris.is_empty() {
+        return Ok(0);
+    }
+    let p = &ns.prefix;
+    let ws_slug = crud::workspace_slug(cwd);
+    let graph = crud::workspace_graph_iri(ns, &ws_slug);
+    let now = crud::now_iso();
+
+    let (store, trig_path) = crud::load_workspace_store(cwd)?;
+
+    let mut stmts: Vec<String> = Vec::new();
+    for iri in note_iris {
+        stmts.push(format!(
+            "DELETE {{ GRAPH <{graph}> {{ <{iri}> {p}:lastRead ?o }} }} \
+             WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:lastRead ?o }} }}"
+        ));
+        stmts.push(format!(
+            "INSERT DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:lastRead \"{now}\"^^xsd:dateTime }} }}"
+        ));
+    }
+    let update = format!("{}\n{}", crud::prefixes(ns), stmts.join(";\n"));
+    store.update(&update)?;
+    crate::store::write_back(&store, &trig_path)?;
+    Ok(note_iris.len())
+}
+
 /// Increment mention count on an existing note. Returns the new count.
 pub fn mention(
     cwd: &Path,

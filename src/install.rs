@@ -388,11 +388,31 @@ description = "One-line description of what this extension does"  # Required.
 # inject = "This file is managed by My Extension."
 
 # ─── Post-Tool Hook ──────────────────────────────────────
-# React to file changes after tool execution.
+# React to file changes after tool execution. Each handler matches a file then
+# runs an action. `pattern` is a substring of the file path, OR the reserved
+# token "designset" (built-in design/frontend file heuristic: stylesheets,
+# components, templates, svg, design folders, config + token files, and
+# CSS-in-JS / Tailwind / inline-style content markers).
+#
+# action = "reingest"  — re-pull the matched file into the graph
+# action = "log"       — debug line to stderr (you won't see it; for diagnostics)
+# action = "inject"    — print a message to Claude (stdout). The "verify-reflex":
+#                        nudge Claude to do something after it writes a file.
 #
 # [[hooks.post_tool.handlers]]
 # pattern = "data.json"
-# action = "reingest"          # "reingest" | "log" | "query"
+# action = "reingest"
+#
+# Verify-reflex example — fire ONCE per session when design work is written,
+# telling Claude to verify it (this is exactly how the design-humanizer skill
+# wires itself in):
+#
+# [[hooks.post_tool.handlers]]
+# pattern = "designset"           # built-in design-file detector (or use a substring)
+# action = "inject"
+# once_per_session = true         # default true; re-fires only if `message` changes
+# # on_tools = ["Write", "Edit", "MultiEdit"]   # default; never fires on Read
+# message = "Design work detected — verify with /design-humanizer scan before shipping."
 "#,
         )?;
         println!("   Created extensions/ + _template.toml");

@@ -8,6 +8,10 @@ use crate::ontology;
 use crate::store;
 
 pub fn handle(config: &BaseConfig, cwd: &Path) -> Result<()> {
+    // Surface graph corruption at boot — loud, before any other output, so a
+    // broken graph announces itself immediately instead of degrading silently.
+    warn_unhealthy_graphs(cwd);
+
     // Clear session dedup state for fresh session
     // Try workspace first, fall back to global tier for no-workspace users
     let session_base_dir = crate::config::find_workspace_base(cwd)
@@ -53,6 +57,12 @@ pub fn handle(config: &BaseConfig, cwd: &Path) -> Result<()> {
 
             // Extension status injection (Phase 23)
             inject_extension_status(config, cwd);
+
+            // Context triggers cheat-sheet (Phase 21)
+            let triggers = crate::domain::query::context_triggers_block(cwd);
+            if !triggers.is_empty() {
+                print!("\n{triggers}");
+            }
 
             return Ok(());
         }
@@ -271,6 +281,58 @@ fn ingest_paul_projects(config: &BaseConfig, cwd: &Path) {
             }
         }
         Err(e) => eprintln!("base: paul.toml ingest failed: {e}"),
+    }
+}
+
+/// Emit a loud, clearly-delimited warning block for any graph tier whose
+/// `graph.nq` fails the parser-independent health check ([`store::graph_health`]).
+///
+/// Fail-OPEN: never panics, never blocks session start. Missing tiers (a fresh
+/// workspace with no graph yet) and healthy tiers emit nothing — zero noise,
+/// per the suppression principle. The hook's "loud" channel is THIS stdout
+/// block, never a nonzero exit code (a corrupt graph must never stop a session).
+fn warn_unhealthy_graphs(cwd: &Path) {
+    let mut tiers: Vec<(&str, PathBuf)> = Vec::new();
+
+    // Global tier: ~/.base-gbl/.base/graph.nq
+    if let Some(home) = dirs::home_dir() {
+        let global = home.join(".base-gbl").join(".base").join("graph.nq");
+        if global.exists() {
+            tiers.push(("global", global));
+        }
+    }
+
+    // Workspace tier: walk upward from cwd to the nearest .base/graph.nq
+    let mut dir = cwd.to_path_buf();
+    loop {
+        let ws = dir.join(".base").join("graph.nq");
+        if ws.exists() {
+            tiers.push(("workspace", ws));
+            break;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for (tier, path) in tiers {
+        // Don't warn twice if both tiers resolve to the same underlying file.
+        let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        if let store::GraphHealth::Unhealthy { reason, bad_line } = store::graph_health(&path) {
+            let line = bad_line.map(|n| format!(" (line {n})")).unwrap_or_default();
+            println!("═══════════════════════════════════════");
+            println!("⚠️  BASE GRAPH UNHEALTHY — {tier} tier");
+            println!("   {}", path.display());
+            println!("   {reason}{line}");
+            println!("   recall / learn / sync are DEGRADED until repaired.");
+            println!("   Repair: run `base doctor` once available (v0.5),");
+            println!("           or repair manually per GRAPH-DURABILITY.md");
+            println!("═══════════════════════════════════════");
+        }
     }
 }
 

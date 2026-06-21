@@ -333,6 +333,22 @@ Four hooks, all wired automatically by `base install`:
 
 All hooks fail open. If anything errors, it logs to stderr and exits with empty stdout. Claude is never blocked by a hook failure.
 
+## Extensions
+
+A framework or skill can wire itself into the hook pipeline **without touching base's core** — ship one TOML file to `~/.base-gbl/extensions/{name}.toml` and base discovers it (no registration step). Extensions can bind to session start, prompt submit, pre-tool, and post-tool.
+
+The post-tool `inject` action (v0.6.0) is the **verify-reflex**: nudge Claude to do something *after* it writes a matching file, once per session.
+
+```toml
+[[hooks.post_tool.handlers]]
+pattern          = "designset"   # built-in design-file detector, or any path substring
+action           = "inject"
+once_per_session = true          # nudge once; re-fires only if message changes
+message          = "Design work detected — verify with /design-humanizer scan before shipping."
+```
+
+Same mechanism powers any "after you do X, verify Y" reflex (copy → humanizer, migrations → reversibility, …). Full reference: **[docs/extensions.md](docs/extensions.md)**.
+
 ## What lives where
 
 ```
@@ -440,6 +456,32 @@ Every panel reads from the same SPARQL-backed API. The same graph that powers yo
 **Mandatory edges.** Every entity connects to something. `base learn` requires `--domain`. `base entity add` requires `--domain`. `base project add` requires `--path` (which auto-creates a domain trigger). No orphans in the graph.
 
 **Fail open.** Every hook catches all errors, logs to stderr, exits 0 with empty stdout. If the graph is corrupt, if SPARQL fails, if the file doesn't exist - Claude keeps working. The system never blocks the prompt.
+
+## Graph durability & recovery
+
+The graph is the durable record, so corruption has to be loud, diagnosable, and
+self-healing — never a silent outage. BASE writes atomically (temp → validate → rename),
+fails loud on a bad parse (non-zero exit + session-start warning), and splits read/write
+behavior: **reads** fall back to a lenient parse that skips malformed lines and warns, so
+one bad line never blanks your context; **writes** stay strict and refuse to run on an
+unhealthy graph, so it's never silently rewritten with data dropped.
+
+```bash
+base doctor                 # parser-independent health scan (both tiers); --json for agents
+base doctor --repair        # quarantine malformed lines + atomic rewrite of the good set
+base doctor --restore       # list snapshots; --restore <backup> rolls one back
+
+base graph compact          # dedup + canonicalize (atomic, idempotent)
+base graph purge --stale    # PREVIEW notes unread > 21 days; --apply to delete, --days N to tune
+```
+
+Every repair/restore/compact/purge **snapshots first** to `graph.nq.bak-<op>-<date>` and
+keeps the newest 10. `base recall` stamps `lastRead`, so a note's purge clock resets every
+time it's used — only notes you never reach for age out (and dry-run is the default).
+
+> **Never hand-edit `graph.nq`.** Use `base graph` / `base doctor`. Every corruption
+> incident came from an interrupted hand-run edit — the commands above are atomic and
+> validated. Full model + recovery runbook: [`docs/graph-durability.md`](docs/graph-durability.md).
 
 ## Extensions
 

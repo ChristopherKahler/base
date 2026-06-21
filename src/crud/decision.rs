@@ -98,3 +98,45 @@ pub fn search(cwd: &Path, ns: &NamespaceConfig, keyword: &str) -> Result<()> {
     }
     Ok(())
 }
+
+pub fn delete(cwd: &Path, ns: &NamespaceConfig, keyword: &str) -> Result<usize> {
+    let p = &ns.prefix;
+    let kw_lower = crud::escape_sparql_literal(&keyword.to_lowercase());
+
+    // Find matching decisions first
+    let find_sparql = format!(
+        "SELECT ?d ?name WHERE {{\n\
+           GRAPH ?g {{\n\
+             ?d a {p}:Decision ;\n\
+               {p}:name ?name .\n\
+             FILTER(CONTAINS(LCASE(STR(?name)), \"{kw_lower}\"))\n\
+           }}\n\
+         }}"
+    );
+
+    let results = crud::load_and_query(cwd, ns, &find_sparql)?;
+    let mut iris: Vec<String> = Vec::new();
+    if let QueryResults::Solutions(solutions) = results {
+        for row in solutions.filter_map(|r| r.ok()) {
+            if let Some(d) = row.get("d") {
+                iris.push(d.to_string());
+            }
+        }
+    }
+
+    if iris.is_empty() {
+        return Ok(0);
+    }
+
+    // Delete all triples where the decision is subject or object
+    for iri in &iris {
+        let iri_clean = iri.trim_matches(|c| c == '<' || c == '>');
+        let delete_sparql = format!(
+            "DELETE WHERE {{ GRAPH ?g {{ <{iri_clean}> ?p ?o }} }};\n\
+             DELETE WHERE {{ GRAPH ?g {{ ?s ?p <{iri_clean}> }} }}"
+        );
+        crud::load_and_mutate(cwd, ns, &delete_sparql)?;
+    }
+
+    Ok(iris.len())
+}

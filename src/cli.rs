@@ -220,6 +220,49 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Pull targeted graph context on demand (same engine as hook injection)
+    Context {
+        /// Text to match against domain triggers
+        text: Option<String>,
+        /// List all available context triggers
+        #[arg(long)]
+        list: bool,
+    },
+    /// Diagnose graph health across tiers (parser-independent). Exits nonzero when unhealthy.
+    Doctor {
+        /// Emit machine-readable JSON instead of the human report
+        #[arg(long)]
+        json: bool,
+        /// Self-heal: quarantine malformed lines and atomically rewrite the good set (backs up first)
+        #[arg(long)]
+        repair: bool,
+        /// Restore the workspace graph from a backup snapshot. Bare `--restore` lists snapshots.
+        #[arg(long, num_args = 0..=1)]
+        restore: Option<Option<String>>,
+    },
+    /// First-class graph maintenance (atomic, backs up first — never hand-edit graph.nq)
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GraphAction {
+    /// Dedup + canonicalize the workspace graph (atomic rewrite, snapshots first)
+    Compact,
+    /// Remove notes unread past --days (recency only). PREVIEW unless --apply.
+    Purge {
+        /// Required: select the stale-note rule (no other purge rules yet)
+        #[arg(long)]
+        stale: bool,
+        /// Actually delete (default is a dry-run preview; snapshots before deleting)
+        #[arg(long)]
+        apply: bool,
+        /// Unread-age threshold in days (a note's clock resets each time it's recalled)
+        #[arg(long, default_value_t = 21)]
+        days: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -277,6 +320,11 @@ pub enum CommandAction {
     Remove {
         /// Command name (case-insensitive)
         name: String,
+    },
+    /// Import star commands from a commands.toml file (append-only; skips names already present, never alters preceding content)
+    Import {
+        /// Path to a commands.toml file to import (e.g. an Operator Modes pack)
+        file: String,
     },
 }
 
@@ -438,6 +486,12 @@ pub enum DecisionAction {
         #[arg(long)]
         keyword: String,
     },
+    /// Delete decisions matching a keyword
+    Delete {
+        /// Keyword to match against decision names
+        #[arg(long)]
+        keyword: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -588,6 +642,21 @@ fn resolve(cwd: &std::path::Path, ns: &base::config::NamespaceConfig, entity_typ
     }
 }
 
+/// Print a CLI error to stderr and exit nonzero.
+///
+/// Graph-backed commands route their error paths through this so a corrupt or
+/// unparseable graph fails LOUD (nonzero exit) instead of the old silent exit-0
+/// — the 2026-06-18 incident where `base learn` / `base sync` printed
+/// "Failed to parse graph from <path>" but still returned 0, hiding the
+/// corruption for hours. Hooks deliberately do NOT use this: they stay
+/// fail-open (exit 0) and surface corruption via the session-start warning
+/// block instead (see hook::session_start). `{e:#}` prints the full anyhow
+/// context chain so the underlying parse error is visible.
+fn die(prefix: &str, e: impl std::fmt::Display) -> ! {
+    eprintln!("{prefix}: {e:#}");
+    std::process::exit(1);
+}
+
 pub fn run() {
     let cli = Cli::parse();
     let cwd = match std::env::current_dir() {
@@ -606,13 +675,13 @@ pub fn run() {
         Some(Commands::Ast { action }) => match action {
             AstAction::Query { contains, file, calls, imports } => {
                 if let Some(name) = contains {
-                    if let Err(e) = crud::ast_query::contains(&cwd, &config.namespace, &name) { eprintln!("Error: {e}"); }
+                    if let Err(e) = crud::ast_query::contains(&cwd, &config.namespace, &name) { die("Error", e); }
                 } else if let Some(path) = file {
-                    if let Err(e) = crud::ast_query::file(&cwd, &config.namespace, &path) { eprintln!("Error: {e}"); }
+                    if let Err(e) = crud::ast_query::file(&cwd, &config.namespace, &path) { die("Error", e); }
                 } else if let Some(name) = calls {
-                    if let Err(e) = crud::ast_query::calls(&cwd, &config.namespace, &name) { eprintln!("Error: {e}"); }
+                    if let Err(e) = crud::ast_query::calls(&cwd, &config.namespace, &name) { die("Error", e); }
                 } else if let Some(path) = imports {
-                    if let Err(e) = crud::ast_query::imports(&cwd, &config.namespace, &path) { eprintln!("Error: {e}"); }
+                    if let Err(e) = crud::ast_query::imports(&cwd, &config.namespace, &path) { die("Error", e); }
                 } else {
                     eprintln!("Provide one of: --contains, --file, --calls, --imports");
                 }
@@ -624,19 +693,19 @@ pub fn run() {
             ProjectAction::Add { name, status, path } => {
                 match crud::project::add(&cwd, &config.namespace, &name, &status, Some(&path)) {
                     Ok(slug) => println!("Project '{name}' created (slug: {slug})"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
-            ProjectAction::List => { if let Err(e) = crud::project::list(&cwd, &config.namespace) { eprintln!("Error: {e}"); } }
+            ProjectAction::List => { if let Err(e) = crud::project::list(&cwd, &config.namespace) { die("Error", e); } }
             ProjectAction::Get { slug } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug)
-                    && let Err(e) = crud::project::get(&cwd, &config.namespace, &s) { eprintln!("Error: {e}"); }
+                    && let Err(e) = crud::project::get(&cwd, &config.namespace, &s) { die("Error", e); }
             }
             ProjectAction::Update { slug, status, blocked_by, next_action } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug) {
                     match crud::project::update(&cwd, &config.namespace, &s, status.as_deref(), blocked_by.as_deref(), next_action.as_deref()) {
                         Ok(()) => println!("Project '{s}' updated"),
-                        Err(e) => eprintln!("Failed: {e}"),
+                        Err(e) => die("Failed", e),
                     }
                 }
             }
@@ -651,7 +720,7 @@ pub fn run() {
                 };
                 match crud::milestone::add(&cwd, &config.namespace, &ps, &name, description.as_deref()) {
                     Ok(slug) => println!("Milestone '{name}' created (slug: {slug})"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
             MilestoneAction::List { project } => {
@@ -662,17 +731,17 @@ pub fn run() {
                     },
                     None => None,
                 };
-                if let Err(e) = crud::milestone::list(&cwd, &config.namespace, ps.as_deref()) { eprintln!("Error: {e}"); }
+                if let Err(e) = crud::milestone::list(&cwd, &config.namespace, ps.as_deref()) { die("Error", e); }
             }
             MilestoneAction::Get { slug } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "milestone", &slug)
-                    && let Err(e) = crud::milestone::get(&cwd, &config.namespace, &s) { eprintln!("Error: {e}"); }
+                    && let Err(e) = crud::milestone::get(&cwd, &config.namespace, &s) { die("Error", e); }
             }
             MilestoneAction::Update { slug, status, description } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "milestone", &slug) {
                     match crud::milestone::update(&cwd, &config.namespace, &s, status.as_deref(), description.as_deref()) {
                         Ok(()) => println!("Milestone '{s}' updated"),
-                        Err(e) => eprintln!("Failed: {e}"),
+                        Err(e) => die("Failed", e),
                     }
                 }
             }
@@ -694,7 +763,7 @@ pub fn run() {
                 };
                 match crud::task::add(&cwd, &config.namespace, &ps, &name, priority.as_deref(), ms.as_deref()) {
                     Ok(slug) => println!("Task '{name}' created (slug: {slug})"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
             TaskAction::List { project, milestone } => {
@@ -712,13 +781,13 @@ pub fn run() {
                     },
                     None => None,
                 };
-                if let Err(e) = crud::task::list(&cwd, &config.namespace, ps.as_deref(), ms.as_deref()) { eprintln!("Error: {e}"); }
+                if let Err(e) = crud::task::list(&cwd, &config.namespace, ps.as_deref(), ms.as_deref()) { die("Error", e); }
             }
             TaskAction::Done { slug } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "task", &slug) {
                     match crud::task::done(&cwd, &config.namespace, &s) {
                         Ok(()) => println!("Task '{s}' completed"),
-                        Err(e) => eprintln!("Failed: {e}"),
+                        Err(e) => die("Failed", e),
                     }
                 }
             }
@@ -729,10 +798,22 @@ pub fn run() {
             DecisionAction::Log { domain, decision, rationale, recall } => {
                 match crud::decision::log(&cwd, &config.namespace, &domain, &decision, &rationale, recall.as_deref()) {
                     Ok(slug) => println!("Decision logged (slug: {slug})"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
-            DecisionAction::Search { keyword } => { if let Err(e) = crud::decision::search(&cwd, &config.namespace, &keyword) { eprintln!("Error: {e}"); } }
+            DecisionAction::Search { keyword } => { if let Err(e) = crud::decision::search(&cwd, &config.namespace, &keyword) { die("Error", e); } }
+            DecisionAction::Delete { keyword } => {
+                // Show what will be deleted first
+                if let Err(e) = crud::decision::search(&cwd, &config.namespace, &keyword) {
+                    die("Error", e);
+                } else {
+                    match crud::decision::delete(&cwd, &config.namespace, &keyword) {
+                        Ok(0) => println!("No decisions matching '{keyword}'."),
+                        Ok(n) => println!("Deleted {n} decision(s) matching '{keyword}'."),
+                        Err(e) => die("Failed", e),
+                    }
+                }
+            }
         },
 
         // ─── Entity ──────────────────────────────────────
@@ -740,19 +821,19 @@ pub fn run() {
             EntityAction::Add { name, entity_type, domain, project } => {
                 match crud::entity::add(&cwd, &config.namespace, &name, &entity_type, &domain, project.as_deref()) {
                     Ok(slug) => println!("Entity '{name}' created (slug: {slug}, domain: {domain})"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
-            EntityAction::List => { if let Err(e) = crud::entity::list(&cwd, &config.namespace) { eprintln!("Error: {e}"); } }
+            EntityAction::List => { if let Err(e) = crud::entity::list(&cwd, &config.namespace) { die("Error", e); } }
             EntityAction::Get { slug } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "entity", &slug)
-                    && let Err(e) = crud::entity::get(&cwd, &config.namespace, &s) { eprintln!("Error: {e}"); }
+                    && let Err(e) = crud::entity::get(&cwd, &config.namespace, &s) { die("Error", e); }
             }
             EntityAction::Update { slug, status, description } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "entity", &slug) {
                     match crud::entity::update(&cwd, &config.namespace, &s, status.as_deref(), description.as_deref()) {
                         Ok(()) => println!("Entity '{s}' updated"),
-                        Err(e) => eprintln!("Failed: {e}"),
+                        Err(e) => die("Failed", e),
                     }
                 }
             }
@@ -763,15 +844,15 @@ pub fn run() {
             GoalAction::Add { name, target } => {
                 match crud::goal::add(&cwd, &config.namespace, &name, &target) {
                     Ok(slug) => println!("Goal '{name}' created (slug: {slug})"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
-            GoalAction::List => { if let Err(e) = crud::goal::list(&cwd, &config.namespace) { eprintln!("Error: {e}"); } }
+            GoalAction::List => { if let Err(e) = crud::goal::list(&cwd, &config.namespace) { die("Error", e); } }
             GoalAction::Update { slug, status, target } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "goal", &slug) {
                     match crud::goal::update(&cwd, &config.namespace, &s, status.as_deref(), target.as_deref()) {
                         Ok(()) => println!("Goal '{s}' updated"),
-                        Err(e) => eprintln!("Failed: {e}"),
+                        Err(e) => die("Failed", e),
                     }
                 }
             }
@@ -782,14 +863,14 @@ pub fn run() {
             ReminderAction::Add { name, due } => {
                 match crud::reminder::add(&cwd, &config.namespace, &name, &due) {
                     Ok(slug) => println!("Reminder '{name}' created (slug: {slug})"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
-            ReminderAction::List => { if let Err(e) = crud::reminder::list(&cwd, &config.namespace) { eprintln!("Error: {e}"); } }
+            ReminderAction::List => { if let Err(e) = crud::reminder::list(&cwd, &config.namespace) { die("Error", e); } }
             ReminderAction::Remove { slug } => {
                 match crud::reminder::remove(&cwd, &config.namespace, &slug) {
                     Ok(()) => println!("Reminder '{slug}' removed"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
         },
@@ -799,7 +880,7 @@ pub fn run() {
             if repair {
                 match base::crud::repair_edges(&cwd, &config.namespace) {
                     Ok(count) => println!("Repair complete: {count} edges backfilled"),
-                    Err(e) => eprintln!("Repair failed: {e}"),
+                    Err(e) => die("Repair failed", e),
                 }
                 return;
             }
@@ -858,7 +939,7 @@ pub fn run() {
                             report.scanned, report.extracted, report.skipped
                         );
                     }
-                    Err(e) => eprintln!("Sync failed: {e}"),
+                    Err(e) => die("Sync failed", e),
                 }
             }
         }
@@ -872,7 +953,7 @@ pub fn run() {
                 }
                 match domain::add_trigger(&cwd, &name, keyword.as_deref(), path.as_deref()) {
                     Ok(()) => println!("Trigger added to domain '{name}'"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
             DomainAction::List => domain::list_domains(&cwd),
@@ -884,20 +965,20 @@ pub fn run() {
                         "Domain sync complete: {} domains, {} rules, {} decisions",
                         stats.domains, stats.rules, stats.decisions
                     ),
-                    Err(e) => eprintln!("Domain sync failed: {e}"),
+                    Err(e) => die("Domain sync failed", e),
                 }
             }
             DomainAction::Create { name, keyword, path } => {
                 match domain::create_domain(&cwd, &name, keyword.as_deref(), path.as_deref()) {
                     Ok(()) => println!("Domain '{name}' created"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
             DomainAction::Remove { name } => {
                 match domain::remove_domain(&cwd, &name) {
                     Ok(true) => println!("Domain '{name}' removed"),
                     Ok(false) => eprintln!("Domain '{name}' not found"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
             DomainAction::RemoveTrigger { domain: name, keyword, path } => {
@@ -907,7 +988,7 @@ pub fn run() {
                 }
                 match domain::remove_trigger(&cwd, &name, keyword.as_deref(), path.as_deref()) {
                     Ok(()) => println!("Trigger removed from domain '{name}'"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
         },
@@ -929,7 +1010,7 @@ pub fn run() {
                 RuleAction::Add { domain: name, text } => {
                     match crud::rule::add(&rule_cwd, &config.namespace, &name, &text) {
                         Ok(index) => println!("Rule {index} added to domain '{name}'"),
-                        Err(e) => eprintln!("Failed: {e}"),
+                        Err(e) => die("Failed", e),
                     }
                 }
                 RuleAction::List { domain: name } => {
@@ -940,7 +1021,7 @@ pub fn run() {
                 RuleAction::Remove { domain: name, index } => {
                     match crud::rule::remove(&rule_cwd, &config.namespace, &name, index) {
                         Ok(()) => println!("Rule {index} removed from domain '{name}'"),
-                        Err(e) => eprintln!("Failed: {e}"),
+                        Err(e) => die("Failed", e),
                     }
                 }
             }
@@ -950,13 +1031,13 @@ pub fn run() {
         Some(Commands::Learn { text, r#type, domain, project, entity, mention, context, remove, update, list }) => {
             if list {
                 if let Err(e) = crud::note::list_notes(&cwd, &config.namespace, if r#type != "insight" { Some(&r#type) } else { None }, domain.as_deref()) {
-                    eprintln!("Error: {e}");
+                    die("Error", e);
                 }
             } else if let Some(slug) = remove {
                 match crud::note::remove(&cwd, &config.namespace, &slug) {
                     Ok(true) => println!("Removed note/{slug}"),
                     Ok(false) => eprintln!("Not found: note/{slug}"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             } else if let Some(slug) = update {
                 let Some(new_text) = text else {
@@ -966,7 +1047,7 @@ pub fn run() {
                 match crud::note::update_text(&cwd, &config.namespace, &slug, &new_text) {
                     Ok(true) => println!("Updated note/{slug}"),
                     Ok(false) => eprintln!("Not found: note/{slug}"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             } else if let Some(slug) = mention {
                 match crud::note::mention(
@@ -976,7 +1057,7 @@ pub fn run() {
                     context.as_deref(),
                 ) {
                     Ok(count) => println!("Mention recorded: {slug} (count: {count})"),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             } else {
                 let Some(text) = text else {
@@ -997,23 +1078,38 @@ pub fn run() {
                     entity.as_deref(),
                 ) {
                     Ok(slug) => println!("Learned: '{text}' (slug: {slug}, type: {}, domain: {domain})", r#type),
-                    Err(e) => eprintln!("Failed: {e}"),
+                    Err(e) => die("Failed", e),
                 }
             }
         }
 
         // ─── Recall ─────────────────────────────────────────
         Some(Commands::Recall { keyword, domain, slug }) => {
+            // Note IRIs to stamp lastRead on (usage signal for `base graph purge --stale`).
+            // Resolved BEFORE printing so an explicit recall marks what it surfaced.
+            let mut surfaced: Vec<String> = Vec::new();
             if let Some(slug) = slug {
                 if let Err(e) = crud::note::recall_by_slug(&cwd, &config.namespace, &slug) {
-                    eprintln!("Error: {e}");
+                    die("Error", e);
                 }
+                surfaced.push(crud::build_iri(&config.namespace, "note", &slug));
             } else {
                 if keyword.is_none() && domain.is_none() {
                     eprintln!("Provide --keyword, --domain, or --slug");
                     return;
                 }
-                if let Err(e) = crud::note::recall(&cwd, &config.namespace, keyword.as_deref(), domain.as_deref()) { eprintln!("Error: {e}"); }
+                surfaced = crud::note::recalled_note_iris(
+                    &cwd,
+                    &config.namespace,
+                    keyword.as_deref(),
+                    domain.as_deref(),
+                );
+                if let Err(e) = crud::note::recall(&cwd, &config.namespace, keyword.as_deref(), domain.as_deref()) { die("Error", e); }
+            }
+            // Best-effort lastRead stamping (strict write). On a corrupt graph this
+            // errs — warn and skip rather than silently lenient-writing (Phase 35).
+            if let Err(e) = crud::note::stamp_last_read(&cwd, &config.namespace, &surfaced) {
+                eprintln!("recall: skipped lastRead stamping (graph unhealthy?) — run `base doctor --repair`: {e}");
             }
         }
 
@@ -1321,6 +1417,65 @@ pub fn run() {
                     Err(e) => eprintln!("Failed to serialize: {e}"),
                 }
             }
+            CommandAction::Import { file } => {
+                let src = match std::fs::read_to_string(&file) {
+                    Ok(c) => c,
+                    Err(e) => { eprintln!("Cannot read {file}: {e}"); return; }
+                };
+                #[derive(serde::Deserialize)]
+                struct CmdFile { #[serde(default)] command: Vec<command::CommandDef> }
+                let incoming = match toml::from_str::<CmdFile>(&src) {
+                    Ok(f) => f.command,
+                    Err(e) => { eprintln!("Failed to parse {file}: {e}"); return; }
+                };
+                if incoming.is_empty() {
+                    println!("No [[command]] entries found in {file}.");
+                    return;
+                }
+                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let path = home.join(".base-gbl").join("commands.toml");
+                if let Some(parent) = path.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    eprintln!("Failed to create {}: {e}", parent.display());
+                    std::process::exit(1);
+                }
+                // Append-only: read existing text and never rewrite what precedes.
+                let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+                let existing: std::collections::HashSet<String> = toml::from_str::<CmdFile>(&content)
+                    .map(|f| f.command.iter().map(|c| c.name.to_ascii_uppercase()).collect())
+                    .unwrap_or_default();
+                let (mut added, mut skipped): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+                for cmd in &incoming {
+                    if existing.contains(&cmd.name.to_ascii_uppercase()) {
+                        skipped.push(cmd.name.clone());
+                        continue;
+                    }
+                    let rules_toml: String = cmd.rules.iter()
+                        .map(|r| format!("  \"{}\",", r.replace('"', "\\\"")))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let block = format!(
+                        "\n[[command]]\nname = \"{}\"\ndescription = \"{}\"\nrules = [\n{}\n]\n",
+                        cmd.name.replace('"', "\\\""),
+                        cmd.description.replace('"', "\\\""),
+                        rules_toml,
+                    );
+                    content.push_str(&block);
+                    added.push(cmd.name.clone());
+                }
+                if let Err(e) = std::fs::write(&path, content) {
+                    eprintln!("Failed to write commands.toml: {e}");
+                    std::process::exit(1);
+                }
+                println!("Imported {} command(s) from {file}", added.len());
+                if !added.is_empty() {
+                    println!("  added: {}", added.iter().map(|n| format!("*{}", n.to_uppercase())).collect::<Vec<_>>().join(" "));
+                }
+                if !skipped.is_empty() {
+                    println!("  skipped (already present): {}", skipped.iter().map(|n| format!("*{}", n.to_uppercase())).collect::<Vec<_>>().join(" "));
+                }
+            }
         },
 
         // ─── Memory ────────────────────────────────────────
@@ -1559,6 +1714,143 @@ pub fn run() {
                             }
                         }
                         Err(e) => eprintln!("Failed to serialize: {e}"),
+                    }
+                }
+            }
+        },
+
+        Some(Commands::Context { text, list }) => {
+            if list {
+                domain::query::context_list(&cwd);
+            } else if let Some(text) = text {
+                domain::query::context_pull(&config, &cwd, &text);
+            } else {
+                eprintln!("Usage: base context <text> or base context --list");
+            }
+        },
+
+        // ─── Doctor ───────────────────────────────────────────
+        Some(Commands::Doctor { json, repair, restore }) => {
+            // Parser-independent: every branch must run BECAUSE the graph is broken.
+            if let Some(which) = restore {
+                // --restore: workspace tier only (operator's corruptible graph).
+                let Some(base_dir) = base::config::find_workspace_base(&cwd) else {
+                    eprintln!("doctor --restore: no workspace .base/ found from {}", cwd.display());
+                    std::process::exit(1);
+                };
+                let ws = base_dir.join("graph.nq");
+                match which {
+                    // Bare `--restore` → list available snapshots, mutate nothing.
+                    None => {
+                        let baks = base::doctor::list_backups(&ws);
+                        if json {
+                            let rows: Vec<_> = baks
+                                .iter()
+                                .map(|(p, n)| serde_json::json!({ "path": p.display().to_string(), "lines": n }))
+                                .collect();
+                            println!("{}", serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into()));
+                        } else if baks.is_empty() {
+                            println!("No backups found next to {}", ws.display());
+                        } else {
+                            println!("Backups for {} (newest first):", ws.display());
+                            for (p, n) in &baks {
+                                println!("  {n:>8} lines  {}", p.display());
+                            }
+                            println!("\nRestore with: base doctor --restore <path>");
+                        }
+                    }
+                    // `--restore <name|path>` → resolve, snapshot current, swap in.
+                    Some(arg) => {
+                        let candidate = std::path::Path::new(&arg);
+                        let backup = if candidate.is_absolute() {
+                            candidate.to_path_buf()
+                        } else {
+                            base_dir.join(&arg)
+                        };
+                        match base::doctor::restore_tier(&ws, &backup) {
+                            Ok(()) => {
+                                let after = matches!(
+                                    base::store::graph_health(&ws),
+                                    base::store::GraphHealth::Healthy
+                                );
+                                if json {
+                                    println!(
+                                        "{}",
+                                        serde_json::json!({
+                                            "restored": ws.display().to_string(),
+                                            "from": backup.display().to_string(),
+                                            "healthy_after": after
+                                        })
+                                    );
+                                } else {
+                                    println!("Restored {} from {}", ws.display(), backup.display());
+                                    println!(
+                                        "  graph is now {}",
+                                        if after { "HEALTHY ✓" } else { "still UNHEALTHY ⚠ (bad snapshot?)" }
+                                    );
+                                }
+                                if !after {
+                                    std::process::exit(1);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("doctor --restore failed: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+            } else if repair {
+                // --repair: quarantine bad lines + atomic rewrite of the good set.
+                let outcomes = base::doctor::repair(&cwd);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&outcomes).unwrap_or_else(|_| "[]".into())
+                    );
+                } else {
+                    println!("{}", base::doctor::format_repair_human(&outcomes));
+                }
+                if outcomes.iter().any(|o| !o.healthy_after) {
+                    std::process::exit(1);
+                }
+            } else {
+                // Default: check + report. Print the FULL report, THEN exit nonzero
+                // if unhealthy (unlike `die`, which bails on the first error).
+                let report = base::doctor::diagnose(&cwd);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+                    );
+                } else {
+                    println!("{}", base::doctor::format_human(&report));
+                }
+                if !report.healthy {
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // ─── Graph ────────────────────────────────────────────
+        Some(Commands::Graph { action }) => match action {
+            GraphAction::Compact => match base::graph::compact(&cwd) {
+                Ok(outcome) => print!("{}", base::graph::format_compact_human(&outcome)),
+                Err(e) => {
+                    eprintln!("base graph compact failed: {e}");
+                    std::process::exit(1);
+                }
+            },
+            GraphAction::Purge { stale, apply, days } => {
+                if !stale {
+                    eprintln!("Usage: base graph purge --stale [--apply] [--days N]");
+                    std::process::exit(2);
+                }
+                match base::graph::purge(&cwd, &config.namespace, days, apply) {
+                    Ok(outcome) => print!("{}", base::graph::format_purge_human(&outcome)),
+                    Err(e) => {
+                        eprintln!("base graph purge failed: {e}");
+                        std::process::exit(1);
                     }
                 }
             }

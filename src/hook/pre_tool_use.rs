@@ -88,7 +88,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             let query_text = match (&graph_store, &domain_def.query) {
                 (Some(store), Some(query_name)) => {
                     let fmt = domain_def.query_format.as_deref().unwrap_or("list");
-                    crate::hook::user_prompt_submit::resolve_and_run_query(
+                    crate::domain::query::resolve_and_run_query(
                         store, config, cwd, query_name, fmt, &domain_def.name,
                     )
                 }
