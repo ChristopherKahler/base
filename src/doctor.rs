@@ -56,6 +56,8 @@ pub struct DoctorReport {
     pub tiers: Vec<TierReport>,
     /// True when no tier is "unhealthy" (missing/empty tiers do not count against health).
     pub healthy: bool,
+    /// Advisory operational warnings (bloat, write-probe failures). Do not affect `healthy`.
+    pub warnings: Vec<String>,
 }
 
 /// Diagnose a single graph file. PURE: only touches `path` and its siblings
@@ -68,8 +70,9 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
         GraphHealth::Unhealthy { reason, bad_line } => ("unhealthy", Some(reason), bad_line),
     };
 
-    // A lingering write_back temp file means a write was interrupted.
-    let stale_tmp = path.with_extension("nq.tmp").exists();
+    // A lingering write_back temp means a write was interrupted. Matches both the
+    // legacy shared `graph.nq.tmp` and per-writer `graph.nq.tmp.<pid>` temps.
+    let stale_tmp = stale_temp_count(path) > 0;
 
     if status == "missing" {
         return TierReport {
@@ -126,12 +129,26 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
 /// `hook::session_start::warn_unhealthy_graphs`. NOT unit-tested (reads the real
 /// global tier) — see module docs.
 pub fn diagnose(cwd: &Path) -> DoctorReport {
+    let mut warnings = Vec::new();
     let tiers: Vec<TierReport> = tier_paths(cwd)
         .into_iter()
-        .map(|(tier, path)| diagnose_tier(&tier, &path))
+        .map(|(tier, path)| {
+            let report = diagnose_tier(&tier, &path);
+            warnings.extend(bloat_warnings(&report));
+            if report.status != "missing" {
+                if let Some(err) = write_probe(&path) {
+                    warnings.push(format!("{tier} tier write probe FAILED — {err}"));
+                }
+            }
+            report
+        })
         .collect();
     let healthy = tiers.iter().all(|t| t.status != "unhealthy");
-    DoctorReport { tiers, healthy }
+    DoctorReport {
+        tiers,
+        healthy,
+        warnings,
+    }
 }
 
 /// Render a clearly-delimited human report.
@@ -194,6 +211,13 @@ pub fn format_human(report: &DoctorReport) -> String {
                     b.backup_line_count, b.line_delta, b.path,
                 ));
             }
+        }
+    }
+
+    if !report.warnings.is_empty() {
+        out.push_str("\n─── advisories ───────────────────────\n");
+        for w in &report.warnings {
+            out.push_str(&format!("   ⚠ {w}\n"));
         }
     }
 
@@ -310,6 +334,104 @@ fn newest_backup(path: &Path) -> Option<PathBuf> {
 /// Filesystem-safe local timestamp for backup/quarantine filenames.
 fn stamp() -> String {
     chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string()
+}
+
+// ─── Operational health: stale-temp, bloat, write-probe ───────────────────
+
+/// Count lingering write_back temp files for this graph — both the legacy shared
+/// `graph.nq.tmp` and per-writer `graph.nq.tmp.<pid>`. Any present = an interrupted write.
+fn stale_temp_count(path: &Path) -> usize {
+    let (Some(parent), Some(fname)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return 0;
+    };
+    let prefix = format!("{fname}.tmp");
+    fs::read_dir(parent)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.starts_with(&prefix))
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Count + total bytes of `{name}.bak*` sibling backups.
+fn backup_footprint(path: &Path) -> (usize, u64) {
+    let (Some(parent), Some(fname)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return (0, 0);
+    };
+    let prefix = format!("{fname}.bak");
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    if let Ok(rd) = fs::read_dir(parent) {
+        for e in rd.flatten() {
+            if e
+                .file_name()
+                .to_str()
+                .map(|n| n.starts_with(&prefix))
+                .unwrap_or(false)
+            {
+                count += 1;
+                bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    (count, bytes)
+}
+
+/// Advisory size/backup bloat warnings for a tier. Never affect `healthy` — a big
+/// graph is a smell (slow writes widen the write-race window), not a failure.
+fn bloat_warnings(tier: &TierReport) -> Vec<String> {
+    const BLOAT_GRAPH_BYTES: u64 = 20 * 1024 * 1024;
+    const BLOAT_BACKUP_COUNT: usize = 5;
+    const BLOAT_BACKUP_BYTES: u64 = 50 * 1024 * 1024;
+    let mut w = Vec::new();
+    if tier.status == "missing" {
+        return w;
+    }
+    if tier.size_bytes > BLOAT_GRAPH_BYTES {
+        w.push(format!(
+            "{} graph is {} MB / {} lines — consider `base graph compact`",
+            tier.tier,
+            tier.size_bytes / (1024 * 1024),
+            tier.line_count
+        ));
+    }
+    let (count, bytes) = backup_footprint(Path::new(&tier.path));
+    if count > BLOAT_BACKUP_COUNT || bytes > BLOAT_BACKUP_BYTES {
+        w.push(format!(
+            "{} tier keeps {} backups ({} MB) — prune old .bak files",
+            tier.tier,
+            count,
+            bytes / (1024 * 1024)
+        ));
+    }
+    w
+}
+
+/// Exercise the write path the same way `write_back` does — a temp file + atomic
+/// rename in the tier directory — without touching the real graph. Catches a
+/// read-only FS, bad permissions, or a full disk that the read-only `graph_health`
+/// can't see. Returns `Some(error)` on failure.
+fn write_probe(path: &Path) -> Option<String> {
+    let parent = path.parent()?;
+    let tmp = parent.join(format!(".doctor-write-probe.{}", std::process::id()));
+    let dst = parent.join(".doctor-write-probe");
+    let result = (|| -> std::io::Result<()> {
+        fs::write(&tmp, b"probe\n")?;
+        fs::rename(&tmp, &dst)?;
+        fs::remove_file(&dst)?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(&dst);
+    result.err().map(|e| e.to_string())
 }
 
 // ─── Repair (Phase 35, GRAPH-DURABILITY §4 Layer 3) ────────────────────────

@@ -329,7 +329,39 @@ pub fn write_back(store: &Store, path: &Path) -> Result<()> {
     fs::create_dir_all(parent)
         .with_context(|| format!("Failed to create directory {}", parent.display()))?;
 
-    let tmp_path = path.with_extension("nq.tmp");
+    // Unique per-process temp name so concurrent base writers (hooks fire on every
+    // tool call) never collide on a shared graph.nq.tmp — the collision was reliably
+    // hit on large graphs where serialize is slow, surfacing as a re-open ENOENT.
+    let tmp_path = path.with_extension(format!("nq.tmp.{}", std::process::id()));
+
+    // Best-effort sweep of temp files abandoned by crashed/interrupted writers
+    // (older than 60s — a real write_back finishes in well under a second, so this
+    // never races a live writer). Per-PID temps don't self-overwrite like the old
+    // shared name did, so we reap stragglers here.
+    if let Some(base_name) = path.file_name().and_then(|s| s.to_str()) {
+        let prefix = format!("{base_name}.tmp.");
+        if let Ok(entries) = fs::read_dir(parent) {
+            let now = std::time::SystemTime::now();
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let Some(fname) = fname.to_str() else { continue };
+                if !fname.starts_with(&prefix) {
+                    continue;
+                }
+                let stale = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|d| d.as_secs() > 60)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
     let mut tmp_file = fs::File::create(&tmp_path)
         .with_context(|| format!("Failed to create temp file {}", tmp_path.display()))?;
 
