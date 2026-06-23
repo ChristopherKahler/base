@@ -13,7 +13,6 @@ fn ns() -> NamespaceConfig {
 /// Helper: populate a workspace with test entities at various timestamps.
 fn seed_workspace(dir: &std::path::Path) {
     let ns = ns();
-    let now = chrono::Local::now();
 
     // Active project (recent)
     crud::project::add(dir, &ns, "Active Project", "active", None).unwrap();
@@ -25,20 +24,8 @@ fn seed_workspace(dir: &std::path::Path) {
     // Active task
     crud::task::add(dir, &ns, "active-project", "Fix Auth", Some("high"), None).unwrap();
 
-    // Old project (stale) — we'll set lastActive to 30 days ago via direct SPARQL
-    crud::project::add(dir, &ns, "Stale Project", "active", None).unwrap();
-    let old_ts = (now - chrono::Duration::days(30))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
-    let p = &ns.prefix;
-    let iri = crud::build_iri(&ns, "project", "stale-project");
-    let ws_slug = crud::workspace_slug(dir);
-    let graph = crud::workspace_graph_iri(&ns, &ws_slug);
-    let sparql = format!(
-        "DELETE {{ GRAPH <{graph}> {{ <{iri}> {p}:lastActive ?old }} }}\n\
-         INSERT {{ GRAPH <{graph}> {{ <{iri}> {p}:lastActive \"{old_ts}\"^^xsd:dateTime }} }}\n\
-         WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:lastActive ?old }} }}"
-    );
-    crud::load_and_mutate(dir, &ns, &sparql).unwrap();
+    // Deferred project — excluded from active-awareness (protocol's call, not a time window).
+    crud::project::add(dir, &ns, "Deferred Project", "deferred", None).unwrap();
 
     // Decision
     crud::decision::log(dir, &ns, "dev", "Use JWT", "Stateless", None).unwrap();
@@ -50,13 +37,13 @@ fn active_awareness_surfaces_recent_entities() {
     seed_workspace(tmp.path());
 
     let config = test_config();
-    let output = signal::active_awareness::run(tmp.path(), &config.namespace, &config.signal).unwrap();
+    let output = signal::active_awareness::run(tmp.path(), &config.namespace).unwrap();
 
     assert!(output.contains("Active Project"), "Should include active project");
     assert!(output.contains("Blocked Project"), "Should include blocked project");
     assert!(output.contains("Fix Auth"), "Should include active task");
-    // Stale project should NOT appear (lastActive 30 days ago, window is 7 days)
-    assert!(!output.contains("Stale Project"), "Stale project should not appear in active-awareness");
+    // Deferred project must NOT appear — protocol's deferral is the gate, not a time window.
+    assert!(!output.contains("Deferred Project"), "Deferred project should not appear in active-awareness");
 }
 
 #[test]
@@ -70,18 +57,6 @@ fn pulse_shows_counts() {
     assert!(output.contains("Pulse"), "Should have Pulse header");
     assert!(output.contains("active"), "Should mention active count");
     assert!(output.contains("blocked"), "Should mention blocked count");
-}
-
-#[test]
-fn staleness_detects_old_entities() {
-    let tmp = tempfile::tempdir().unwrap();
-    seed_workspace(tmp.path());
-
-    let config = test_config();
-    let output = signal::staleness::run(tmp.path(), &config.namespace, &config.signal).unwrap();
-
-    assert!(output.contains("Stale Project"), "Should detect stale project");
-    assert!(!output.contains("Active Project"), "Active project should not be stale");
 }
 
 #[test]

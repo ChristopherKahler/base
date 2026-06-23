@@ -63,34 +63,27 @@ pub fn run(target: &Path) -> Result<()> {
         std::fs::write(
             &config_path,
             r#"# BASE — Workspace config overrides
-# Inherits ~/.base-gbl/base.toml. Uncomment only what this workspace overrides.
+# Inherits ~/.base-gbl/base.toml; uncomment only what this workspace overrides.
+# Full per-section docs live in the global ~/.base-gbl/base.toml.
 
-# [namespace]
-# prefix = "ops"
-# uri = "http://ops-sys.local/ontology#"
-
-# [devmode]
+# [devmode]            # 🔧 DEVMODE diagnostic block on each response
 # enabled = true
 
-# [bracket]
+# [signal]             # session-start injection (active set, handoffs, reminders)
 # enabled = true
+# max_chars = 2000     # injection budget per session-start
 
-# [signal]
+# [flow]               # resurface scans: unblocked, deferred-due, recurring ideas
 # enabled = true
-# active_days = 7
-# stale_days = 14
+# mentions = true
 
-# [flow]
+# [memory]             # auto-memory target: "claude" | "both" | "base"
 # enabled = true
-# stale_threshold_days = 14
+# mode = "base"
 
-# [memory]
+# [protocol]           # active⇄deferred reconcile from real folder last-touch
 # enabled = true
-# mode = "base"            # "claude" | "both" | "base"
-
-# [protocol]
-# enabled = true
-# stale_days = 7
+# stale_days = 7       # working project untouched this many days → auto-deferred
 "#,
         )?;
         println!("✓");

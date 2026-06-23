@@ -3,17 +3,14 @@ use std::path::Path;
 use anyhow::Result;
 use oxigraph::sparql::QueryResults;
 
-use crate::config::{NamespaceConfig, SignalConfig};
+use crate::config::NamespaceConfig;
 use crate::crud;
 
-/// Active-awareness signal: surfaces entities active within the configured window.
+/// Active-awareness signal: the working set — every project/task NOT deferred or
+/// terminal. Protocol's reconcile is the single source of "deferred" (it decays cold
+/// projects), so this just renders whatever protocol left in a working state.
 /// Priority 1 (highest — never dropped by budget cap).
-pub fn run(cwd: &Path, ns: &NamespaceConfig, sig: &SignalConfig) -> Result<String> {
-    let cutoff = chrono::Local::now()
-        .checked_sub_signed(chrono::Duration::days(sig.active_days as i64))
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
-        .unwrap_or_default();
-
+pub fn run(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
     let p = &ns.prefix;
     let sparql = format!(
         "SELECT ?type ?name ?status ?nextAction ?blockedBy WHERE {{\n\
@@ -25,7 +22,7 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, sig: &SignalConfig) -> Result<Strin
              OPTIONAL {{ ?entity {p}:nextAction ?nextAction }}\n\
              OPTIONAL {{ ?entity {p}:blockedBy ?blockedBy }}\n\
              FILTER(?type IN ({p}:Project, {p}:App, {p}:Framework, {p}:TrackingProject, {p}:Task))\n\
-             FILTER(?lastActive > \"{cutoff}\"^^xsd:dateTime)\n\
+             FILTER(?status NOT IN (\"deferred\", \"complete\", \"completed\", \"archived\"))\n\
            }}\n\
          }}\n\
          ORDER BY DESC(?lastActive)"

@@ -264,49 +264,71 @@ fn create_global_tier(global_dir: &Path) -> Result<()> {
 # Built by Chris Kahler · Chris AI Systems
 # Community: https://chrisai.cv/skool
 
+# Each [section] documents what it does, what it runs at session-start, and what
+# every knob controls. Set enabled = false to silence a whole section.
+
+# ─── [namespace] — graph identity ────────────────────────────
+# The prefix + URI stamped on every triple base writes. Set once; don't change.
 [namespace]
 prefix = "ops"
 uri = "http://ops-sys.local/ontology#"
 
+# ─── [devmode] — per-response diagnostics ────────────────────
+# Appends a 🔧 DEVMODE block (loaded domains + context bracket) to each response.
 [devmode]
-# Appends a diagnostic block (loaded domains, context bracket) to each response.
-enabled = true
+enabled = true            # false = no diagnostic block
 
+# ─── [bracket] — context-window pressure tiers ───────────────
+# Scales how much gets injected as the context window fills.
 [bracket]
-# Context-window pressure tiers that scale how much gets injected.
 enabled = true
-fresh_until = 3
-moderate_until = 10
-depleted_until = 20
-refresh_interval = 5
+fresh_until = 3           # prompts 0–N: full injection
+moderate_until = 10       # then: trimmed injection
+depleted_until = 20       # past this: minimal injection
+refresh_interval = 5      # re-survey window pressure every N prompts
 
+# ─── [signal] — session-start injection engine ───────────────
+# The block you see when a session opens. Runs:
+#   active_awareness → [Active Projects] / [Active Tasks]  (your working set)
+#   pulse            → <base-pulse> workspace-grooming health
+#   flow_resurface   → see [flow]
+#   handoff_scan     → [Pick up where you left off]
+#   reminder_scan    → [Reminders]
 [signal]
-# Session-start injections: active projects/tasks, blocked, stale, reminders, handoffs.
-enabled = true
-max_chars = 2000          # injection budget per session-start
-active_days = 7           # lastActive within N days → shown as "active"
-stale_days = 14           # active item untouched N days → flagged "stale"
+enabled = true            # master switch for all session-start injection
+max_chars = 2000          # injection budget per session-start (truncates past it)
 
+# ─── [sync] — graph extraction globs ─────────────────────────
+# Which files `base sync` reads to extract metadata/AST into the graph.
 [sync]
 include = ["**/*.md", "**/paul.json"]
 exclude = ["node_modules/", "target/", ".git/", ".base/"]
 
+# ─── [flow] — resurfacing scans + behavioral rules ───────────
+# Surfaces things needing attention. Runs:
+#   blocked_by_scan        → items just unblocked (their blocker completed)
+#   deferred_orphan_scan   → deferred items past their resurface date
+#   mention_threshold_scan → recurring ideas worth promoting to projects
+#   protocol rules block   → injects static status-lifecycle behavioral rules
 [flow]
-# Intent classification + resurfacing scans (blocked-by, stale, deferred orphans).
-enabled = true
-resurface = true
-protocol = true           # inject static status-lifecycle behavioral rules
-mentions = true           # surface recurring ideas once mentioned enough
-stale_threshold_days = 14
-mention_threshold = 3
+enabled = true            # master switch for all flow scans
+resurface = true          # blocked-by + deferred-resurface scans
+protocol = true           # inject status-lifecycle behavioral rules
+mentions = true           # surface recurring ideas (once >= mention_threshold)
+mention_threshold = 3     # mentions before an idea surfaces
 
+# ─── [memory] — auto-memory persistence ──────────────────────
+# Where Claude's auto-memory lands.
+#   mode: "claude" = flat files · "base" = graph only · "both" = mirror to both
 [memory]
-# Persist auto-memory into the graph. mode: "claude" | "both" | "base"
 enabled = true
 mode = "base"
 
+# ─── [protocol] — active⇄deferred reconcile ──────────────────
+# At session-start, sets each project's lastActive from its folder's newest file,
+# then auto-defers working projects gone cold (and revives touched ones). This is
+# what keeps [Active Projects] honest — your true working set.
 [protocol]
-# Mechanical active⇄deferred reconcile at session-start, from real folder last-touch.
 enabled = true
 stale_days = 7            # a working project untouched this many days → auto-deferred
 "#,

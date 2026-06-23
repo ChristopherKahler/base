@@ -124,7 +124,7 @@ pub struct FlowConfig {
     /// Master switch — opt-in feature, default false
     #[serde(default)]
     pub enabled: bool,
-    /// Blocked-by scanning, stale detection, deferred orphan queries
+    /// Blocked-by + deferred-orphan resurface scans
     #[serde(default = "default_true")]
     pub resurface: bool,
     /// Static behavioral rules injection
@@ -133,16 +133,12 @@ pub struct FlowConfig {
     /// Recurring idea tracking
     #[serde(default)]
     pub mentions: bool,
-    /// Days before an active entity is considered stale
-    #[serde(default = "default_flow_stale_days")]
-    pub stale_threshold_days: u32,
     /// Mentions needed before surfacing as recurring
     #[serde(default = "default_mention_threshold")]
     pub mention_threshold: u32,
 }
 
 fn default_true() -> bool { true }
-fn default_flow_stale_days() -> u32 { 14 }
 fn default_mention_threshold() -> u32 { 3 }
 
 impl Default for FlowConfig {
@@ -152,7 +148,6 @@ impl Default for FlowConfig {
             resurface: default_true(),
             protocol: default_true(),
             mentions: false,
-            stale_threshold_days: default_flow_stale_days(),
             mention_threshold: default_mention_threshold(),
         }
     }
@@ -244,25 +239,17 @@ pub struct StageDef {
 pub struct SignalConfig {
     #[serde(default = "default_max_chars")]
     pub max_chars: usize,
-    #[serde(default = "default_stale_days")]
-    pub stale_days: u32,
-    #[serde(default = "default_active_days")]
-    pub active_days: u32,
     #[serde(default = "default_signal_enabled")]
     pub enabled: bool,
 }
 
 fn default_max_chars() -> usize { 2000 }
-fn default_stale_days() -> u32 { 14 }
-fn default_active_days() -> u32 { 7 }
 fn default_signal_enabled() -> bool { true }
 
 impl Default for SignalConfig {
     fn default() -> Self {
         Self {
             max_chars: default_max_chars(),
-            stale_days: default_stale_days(),
-            active_days: default_active_days(),
             enabled: default_signal_enabled(),
         }
     }

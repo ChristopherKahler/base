@@ -7,7 +7,8 @@ use crate::config::{FlowConfig, NamespaceConfig};
 use crate::crud;
 
 /// Flow resurface signal: surfaces items that need attention.
-/// Four sub-queries: blocked-by scan, stale detection, deferred orphan scan, mention threshold.
+/// Three sub-queries: blocked-by scan, deferred orphan scan, mention threshold.
+/// (Stale detection removed — [protocol] reconcile owns active→deferred decay.)
 /// Returns (content, diagnostics) — diagnostics are no-match tags for each sub-query.
 /// Priority 2 (competes with pulse for budget space).
 pub fn run(cwd: &Path, ns: &NamespaceConfig, flow: &FlowConfig, hook: &str) -> Result<(String, Vec<String>)> {
@@ -24,21 +25,14 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, flow: &FlowConfig, hook: &str) -> R
         Err(_) => {}
     }
 
-    // Sub-query 2: Stale active detection
-    match stale_detection(cwd, ns, flow.stale_threshold_days) {
-        Ok(output) if !output.is_empty() => sections.push(output),
-        Ok(_) => diagnostics.push(format!("<{hook}-stale-scan:no-match>")),
-        Err(_) => {}
-    }
-
-    // Sub-query 3: Deferred orphan scan
+    // Sub-query 2: Deferred orphan scan
     match deferred_orphan_scan(cwd, ns) {
         Ok(output) if !output.is_empty() => sections.push(output),
         Ok(_) => diagnostics.push(format!("<{hook}-deferred-scan:no-match>")),
         Err(_) => {}
     }
 
-    // Sub-query 4: Mention threshold scan (gated by flow.mentions)
+    // Sub-query 3: Mention threshold scan (gated by flow.mentions)
     if flow.mentions {
         match mention_threshold_scan(cwd, ns, flow.mention_threshold) {
             Ok(output) if !output.is_empty() => sections.push(output),
@@ -99,64 +93,6 @@ fn blocked_by_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
     let mut output = String::from("[Unblocked]\n");
     for (name, blocker) in &rows {
         output.push_str(&format!("- {name} (was blocked by {blocker})\n"));
-    }
-
-    Ok(output)
-}
-
-/// Find active projects/tasks with lastActive older than the stale threshold.
-fn stale_detection(cwd: &Path, ns: &NamespaceConfig, stale_threshold_days: u32) -> Result<String> {
-    let cutoff = chrono::Local::now()
-        .checked_sub_signed(chrono::Duration::days(stale_threshold_days as i64))
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
-        .unwrap_or_default();
-
-    let now = chrono::Local::now();
-
-    let p = &ns.prefix;
-    let sparql = format!(
-        "SELECT ?name ?type ?lastActive WHERE {{\n\
-           GRAPH ?g {{\n\
-             ?entity a ?type ;\n\
-               {p}:name ?name ;\n\
-               {p}:status \"active\" ;\n\
-               {p}:lastActive ?lastActive .\n\
-             FILTER(?type IN ({p}:Project, {p}:Task, {p}:App, {p}:Framework))\n\
-             FILTER(?lastActive < \"{cutoff}\"^^xsd:dateTime)\n\
-           }}\n\
-         }}\n\
-         ORDER BY ?lastActive"
-    );
-
-    let results = crud::load_and_query(cwd, ns, &sparql)?;
-    let QueryResults::Solutions(solutions) = results else {
-        return Ok(String::new());
-    };
-
-    let rows: Vec<(String, String, String)> = solutions
-        .filter_map(|r| r.ok())
-        .map(|row| {
-            (
-                row.get("name").map(|t| crud::term_display(t.into())).unwrap_or_default(),
-                row.get("type").map(|t| crud::term_display(t.into())).unwrap_or_default(),
-                row.get("lastActive").map(|t| crud::term_display(t.into())).unwrap_or_default(),
-            )
-        })
-        .collect();
-
-    if rows.is_empty() {
-        return Ok(String::new());
-    }
-
-    let mut output = String::from("[Stale]\n");
-    for (name, entity_type, last_active) in &rows {
-        let days_ago = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(last_active) {
-            let diff = now.signed_duration_since(dt);
-            format!("{} days ago", diff.num_days())
-        } else {
-            "unknown".into()
-        };
-        output.push_str(&format!("- {name} ({entity_type}, last active {days_ago})\n"));
     }
 
     Ok(output)
