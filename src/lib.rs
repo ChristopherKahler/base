@@ -14,6 +14,7 @@ pub mod manifest;
 pub mod ontology;
 pub mod operator;
 pub mod plugin;
+pub mod protocol;
 pub mod scaffold;
 pub mod secret;
 pub mod signal;

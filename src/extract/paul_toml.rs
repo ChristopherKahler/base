@@ -138,11 +138,20 @@ pub fn ingest_paul_projects(
         let slug = crud::slugify(&paul.name);
         let iri = crud::build_iri(ns, "project", &slug);
 
-        // Delete existing triples for this project (idempotent)
+        // Re-ingest the volatile paul-derived fields idempotently, but PRESERVE the
+        // mechanical-state predicates: lastActive, status, deferredReason, resurfaceAt,
+        // createdAt, and rdf:type. The old "delete everything + re-insert with
+        // lastActive=now()" wiped these every session — that was the freshness-faking
+        // bug (N projects sharing one identical lastActive) and it also reverted any
+        // mechanical deferral straight back to active. Truth for those fields now comes
+        // from the reconcile pass (real folder touch), not from ingest.
         let delete = format!(
             "{pfx}\n\
-             DELETE {{ GRAPH <{graph}> {{ <{iri}> ?p ?o }} }}\n\
-             WHERE {{ GRAPH <{graph}> {{ <{iri}> ?p ?o }} }}"
+             DELETE {{ GRAPH <{graph}> {{ <{iri}> ?pp ?oo }} }}\n\
+             WHERE {{ GRAPH <{graph}> {{ <{iri}> ?pp ?oo .\n\
+               FILTER(?pp NOT IN (\
+                 rdf:type, {p}:status, {p}:lastActive, {p}:deferredReason, \
+                 {p}:resurfaceAt, {p}:createdAt)) }} }}"
         );
         let _ = store.update(&delete);
 
@@ -188,18 +197,30 @@ pub fn ingest_paul_projects(
                GRAPH <{graph}> {{\n\
                  <{iri}> rdf:type {p}:Project ;\n\
                    {p}:name \"{}\" ;\n\
-                   {p}:status \"{}\" ;\n\
-                   {p}:lastActive \"{now}\"^^xsd:dateTime ;\n\
                    {p}:updatedAt \"{now}\"^^xsd:dateTime .\n\
              {extra_triples}\
                }}\n\
              }}",
             escape(&paul.name),
-            escape(&paul.status),
         );
 
         store.update(&insert)
             .with_context(|| format!("Failed to ingest paul project '{}'", paul.name))?;
+
+        // Seed status + lastActive + createdAt ONLY on first registration. On
+        // re-ingest these are absent from the WHERE match (they were preserved, not
+        // deleted), so this no-ops and the mechanical state set by reconcile stands.
+        let seed = format!(
+            "{pfx}\n\
+             INSERT {{ GRAPH <{graph}> {{\n\
+               <{iri}> {p}:status \"{}\" ;\n\
+                 {p}:lastActive \"{now}\"^^xsd:dateTime ;\n\
+                 {p}:createdAt \"{now}\"^^xsd:dateTime .\n\
+             }} }}\n\
+             WHERE {{ FILTER NOT EXISTS {{ GRAPH <{graph}> {{ <{iri}> {p}:status ?s }} }} }}",
+            escape(&paul.status),
+        );
+        let _ = store.update(&seed);
         registered += 1;
     }
 

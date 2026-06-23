@@ -28,6 +28,12 @@ pub fn handle(config: &BaseConfig, cwd: &Path) -> Result<()> {
     // Scan and ingest paul.toml projects into graph (idempotent)
     ingest_paul_projects(config, cwd);
 
+    // Mechanical reconcile (task-artifact protocol): replace hook-stamped lastActive
+    // with the real folder last-touch, then decay cold projects active→deferred (and
+    // revive the reverse) BEFORE signals surface, so the rendered state is already
+    // true. Fail-open; gated on [protocol] enabled.
+    reconcile_active_state(config, cwd);
+
     // Emit operator profile (if configured)
     if let Some(profile) = crate::operator::load() {
         println!("{}", crate::operator::format_block(&profile));
@@ -261,6 +267,22 @@ fn check_and_banner() {
         && !activated {
             print!("{}", crate::manifest::format_update_banner(pending));
         }
+}
+
+/// Mechanical active⇄deferred reconcile (task-artifact protocol). Fail-open: any
+/// error leaves graph state as-is and never blocks session start. Silent unless a
+/// status actually flipped (suppression principle — lastActive refreshes are noiseless).
+fn reconcile_active_state(config: &BaseConfig, cwd: &Path) {
+    match crate::protocol::reconcile(cwd, config) {
+        Ok(stats) if stats.changed() => {
+            eprintln!(
+                "base: reconcile — {} deferred, {} revived ({} projects scanned)",
+                stats.deferred, stats.revived, stats.scanned
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("base: reconcile failed: {e}"),
+    }
 }
 
 /// Scan all registered workspaces for paul.toml files and ingest into graph. Fail-silent.
