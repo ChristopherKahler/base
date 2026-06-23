@@ -431,9 +431,13 @@ pub enum ProjectAction {
         name: String,
         #[arg(short, long, default_value = "active")]
         status: String,
-        /// Project path (REQUIRED — auto-creates domain trigger for file matching)
+        /// Project path (workspace-relative). If omitted and [protocol] is enabled,
+        /// the folder is derived from the protocol stage and auto-created.
         #[arg(short, long)]
-        path: String,
+        path: Option<String>,
+        /// Protocol lifecycle stage the project starts in (default: first stage).
+        #[arg(long)]
+        stage: Option<String>,
     },
     /// List all projects
     #[command(visible_alias = "l")]
@@ -798,10 +802,25 @@ pub fn run() {
 
         // ─── Project ─────────────────────────────────────
         Some(Commands::Project { action }) => match action {
-            ProjectAction::Add { name, status, path } => {
-                match crud::project::add(&cwd, &config.namespace, &name, &status, Some(&path)) {
-                    Ok(slug) => println!("Project '{name}' created (slug: {slug})"),
-                    Err(e) => die("Failed", e),
+            ProjectAction::Add { name, status, path, stage } => {
+                let slug = crud::slugify(&name);
+                // Explicit --path wins; otherwise the protocol provisions the folder.
+                let provisioned = if path.is_none() {
+                    match crud::project::provision_folder(&cwd, &config.protocol, &name, &slug, stage.as_deref()) {
+                        Ok(v) => v,
+                        Err(e) => die("Failed", e),
+                    }
+                } else {
+                    None
+                };
+                let resolved_stage = provisioned.as_ref().map(|(_, s)| s.clone()).or(stage);
+                let resolved_path = path.or_else(|| provisioned.as_ref().map(|(f, _)| f.clone()));
+                match resolved_path {
+                    Some(rp) => match crud::project::add_with_stage(&cwd, &config.namespace, &name, &status, Some(&rp), resolved_stage.as_deref()) {
+                        Ok(slug) => println!("Project '{name}' created (slug: {slug}, path: {rp})"),
+                        Err(e) => die("Failed", e),
+                    },
+                    None => die("Failed", anyhow::anyhow!("--path is required, or enable [protocol] with a stage in base.toml")),
                 }
             }
             ProjectAction::List => { if let Err(e) = crud::project::list(&cwd, &config.namespace) { die("Error", e); } }

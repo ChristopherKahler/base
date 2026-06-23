@@ -63,6 +63,8 @@ pub struct BaseConfig {
     #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
+    pub protocol: ProtocolConfig,
+    #[serde(default)]
     pub workspace: Vec<WorkspaceEntry>,
 }
 
@@ -177,6 +179,63 @@ impl Default for MemoryConfig {
             mode: default_memory_mode(),
         }
     }
+}
+
+// ─── Protocol Config (task-artifact protocol) ───────────────
+
+/// The operating protocol: where project artifact folders live (by lifecycle stage)
+/// and whether tasks must declare a produced artifact. Set by os-config in the global
+/// `~/.base-gbl/base.toml`; inherited by every workspace via the config overlay
+/// (set once, every scaffolded workspace conforms). base stays agnostic.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProtocolConfig {
+    /// Opt-in master switch (default off so base works unconfigured).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Tasks must declare what they produce — their definition of done.
+    #[serde(default = "default_true")]
+    pub require_artifact: bool,
+    /// Days a project folder may go untouched before its tasks are flagged.
+    #[serde(default = "default_protocol_stale_days")]
+    pub stale_days: u32,
+    /// Lifecycle stages → folder templates. The FIRST stage is where new projects land.
+    #[serde(default)]
+    pub stage: Vec<StageDef>,
+}
+
+fn default_protocol_stale_days() -> u32 { 7 }
+
+impl Default for ProtocolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_artifact: default_true(),
+            stale_days: default_protocol_stale_days(),
+            stage: Vec::new(),
+        }
+    }
+}
+
+impl ProtocolConfig {
+    /// Resolve a stage by name, or the first (default landing) stage when name is None.
+    pub fn stage_for(&self, name: Option<&str>) -> Option<&StageDef> {
+        match name {
+            Some(n) => self.stage.iter().find(|s| s.name == n),
+            None => self.stage.first(),
+        }
+    }
+}
+
+/// One project lifecycle stage and the folder its artifacts live in.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StageDef {
+    /// Stage name (e.g. "planning", "project").
+    pub name: String,
+    /// Folder template relative to the workspace root; `{slug}` is substituted.
+    pub folder: String,
+    /// Optional context-doc filename created in the folder on project creation.
+    #[serde(default)]
+    pub context_doc: Option<String>,
 }
 
 // ─── Signal Config ───────────────────────────────────────────

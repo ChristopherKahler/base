@@ -228,6 +228,10 @@ ops:path          rdf:type rdf:Property ;
                   rdfs:range xsd:string ;
                   rdfs:comment "Filesystem path associated with this entity" .
 
+ops:stage         rdf:type rdf:Property ;
+                  rdfs:range xsd:string ;
+                  rdfs:comment "Project lifecycle stage (protocol-defined: planning, project, ...)" .
+
 # ─── Note predicates ─────────────────────────────────────
 
 ops:noteText      rdf:type rdf:Property ;

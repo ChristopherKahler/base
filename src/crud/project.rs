@@ -1,9 +1,9 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use oxigraph::sparql::QueryResults;
 
-use crate::config::NamespaceConfig;
+use crate::config::{NamespaceConfig, ProtocolConfig};
 use crate::crud;
 
 pub fn add(
@@ -12,6 +12,18 @@ pub fn add(
     name: &str,
     status: &str,
     path: Option<&str>,
+) -> Result<String> {
+    add_with_stage(cwd, ns, name, status, path, None)
+}
+
+/// Like [`add`], but also records the project's protocol lifecycle stage.
+pub fn add_with_stage(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    name: &str,
+    status: &str,
+    path: Option<&str>,
+    stage: Option<&str>,
 ) -> Result<String> {
     let slug = crud::slugify(name);
     let iri = crud::build_iri(ns, "project", &slug);
@@ -26,6 +38,10 @@ pub fn add(
 
     let name = crud::escape_sparql_literal(name);
     let project_path = crud::escape_sparql_literal(&project_path);
+    let stage_triple = match stage {
+        Some(s) => format!("               {p}:stage \"{}\" ;\n", crud::escape_sparql_literal(s)),
+        None => String::new(),
+    };
 
     let sparql = format!(
         "INSERT DATA {{\n\
@@ -34,7 +50,7 @@ pub fn add(
                {p}:name \"{name}\" ;\n\
                {p}:status \"{status}\" ;\n\
                {p}:path \"{project_path}\" ;\n\
-               {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
+{stage_triple}               {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
                {p}:lastActive \"{now}\"^^xsd:dateTime ;\n\
                {p}:belongsTo <{ws_iri}> .\n\
            }}\n\
@@ -55,6 +71,56 @@ pub fn add(
     let _ = crud::load_and_mutate(cwd, ns, &link_sparql);
 
     Ok(slug)
+}
+
+/// Resolve a new project's artifact folder from the protocol, create it (and its
+/// optional context doc), and return (workspace-relative folder, stage name).
+/// Returns Ok(None) when the protocol is disabled or defines no stages — the caller
+/// then falls back to an explicit --path.
+pub fn provision_folder(
+    cwd: &Path,
+    protocol: &ProtocolConfig,
+    name: &str,
+    slug: &str,
+    stage: Option<&str>,
+) -> Result<Option<(String, String)>> {
+    if !protocol.enabled {
+        return Ok(None);
+    }
+    let Some(stage_def) = protocol.stage_for(stage) else {
+        return Ok(None);
+    };
+    let rel_folder = stage_def.folder.replace("{slug}", slug);
+
+    // Workspace root = the directory containing .base/ (fallback: cwd).
+    let ws_root = crate::config::find_workspace_base(cwd)
+        .and_then(|b| b.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let abs_folder = ws_root.join(&rel_folder);
+    std::fs::create_dir_all(&abs_folder)
+        .with_context(|| format!("creating project folder {}", abs_folder.display()))?;
+
+    // Context doc — created once, never overwritten.
+    if let Some(doc) = &stage_def.context_doc {
+        let doc_path = abs_folder.join(doc);
+        if !doc_path.exists() {
+            let now = crud::now_iso();
+            let body = format!(
+                "---\ntype: context\nstatus: active\ntags: [{slug}]\n---\n\n\
+                 # {name}\n\n\
+                 Project context — this folder is the artifact home; touching it keeps the project fresh.\n\n\
+                 ## Goal\n\n## Status\nCreated {now} \u{00b7} stage: {stage_name}\n",
+                slug = slug,
+                name = name,
+                now = now,
+                stage_name = stage_def.name,
+            );
+            std::fs::write(&doc_path, body)
+                .with_context(|| format!("writing context doc {}", doc_path.display()))?;
+        }
+    }
+
+    Ok(Some((rel_folder, stage_def.name.clone())))
 }
 
 /// Auto-create a domain trigger entry in the nearest domains.toml.
