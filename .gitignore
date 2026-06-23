@@ -7,3 +7,8 @@ dashboard/node_modules/
 
 # PAUL project management (local state, not source)
 .paul/
+
+# Dev-only session artifacts — never commit (handoffs are local dev state)
+*HANDOFF*.md
+QUERY-TEST.md
+.base/handoffs/
