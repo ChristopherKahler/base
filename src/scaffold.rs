@@ -63,7 +63,7 @@ pub fn run(target: &Path) -> Result<()> {
         std::fs::write(
             &config_path,
             r#"# BASE — Workspace config overrides
-# Inherits from ~/.base-gbl/base.toml. Only set what you want to override.
+# Inherits ~/.base-gbl/base.toml. Uncomment only what this workspace overrides.
 
 # [namespace]
 # prefix = "ops"
@@ -71,6 +71,26 @@ pub fn run(target: &Path) -> Result<()> {
 
 # [devmode]
 # enabled = true
+
+# [bracket]
+# enabled = true
+
+# [signal]
+# enabled = true
+# active_days = 7
+# stale_days = 14
+
+# [flow]
+# enabled = true
+# stale_threshold_days = 14
+
+# [memory]
+# enabled = true
+# mode = "base"            # "claude" | "both" | "base"
+
+# [protocol]
+# enabled = true
+# stale_days = 7
 "#,
         )?;
         println!("✓");

@@ -269,9 +269,11 @@ prefix = "ops"
 uri = "http://ops-sys.local/ontology#"
 
 [devmode]
+# Appends a diagnostic block (loaded domains, context bracket) to each response.
 enabled = true
 
 [bracket]
+# Context-window pressure tiers that scale how much gets injected.
 enabled = true
 fresh_until = 3
 moderate_until = 10
@@ -279,13 +281,34 @@ depleted_until = 20
 refresh_interval = 5
 
 [signal]
+# Session-start injections: active projects/tasks, blocked, stale, reminders, handoffs.
 enabled = true
-max_chars = 2000
-stale_days = 14
+max_chars = 2000          # injection budget per session-start
+active_days = 7           # lastActive within N days → shown as "active"
+stale_days = 14           # active item untouched N days → flagged "stale"
 
 [sync]
 include = ["**/*.md", "**/paul.json"]
 exclude = ["node_modules/", "target/", ".git/", ".base/"]
+
+[flow]
+# Intent classification + resurfacing scans (blocked-by, stale, deferred orphans).
+enabled = true
+resurface = true
+protocol = true           # inject static status-lifecycle behavioral rules
+mentions = true           # surface recurring ideas once mentioned enough
+stale_threshold_days = 14
+mention_threshold = 3
+
+[memory]
+# Persist auto-memory into the graph. mode: "claude" | "both" | "base"
+enabled = true
+mode = "base"
+
+[protocol]
+# Mechanical active⇄deferred reconcile at session-start, from real folder last-touch.
+enabled = true
+stale_days = 7            # a working project untouched this many days → auto-deferred
 "#,
         )?;
         println!("✓ (created base.toml)");
