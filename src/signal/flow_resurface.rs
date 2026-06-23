@@ -14,6 +14,9 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, flow: &FlowConfig, hook: &str) -> R
     let mut sections: Vec<String> = Vec::new();
     let mut diagnostics: Vec<String> = Vec::new();
 
+    // NOTE: handoff_scan + reminder_scan are run as their own signals in signal::mod
+    // (priority 0, budget- and suppression-exempt) so they surface EVERY session.
+
     // Sub-query 1: Blocked-by scan
     match blocked_by_scan(cwd, ns) {
         Ok(output) if !output.is_empty() => sections.push(output),
@@ -202,6 +205,128 @@ fn deferred_orphan_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
     }
 
     Ok(output)
+}
+
+/// Find OPEN handoffs whose `resurfaceAt` is in the past, across global + workspace
+/// tiers, and render the lettered "pick up where you left off" delegation block.
+pub fn handoff_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
+    let Some(store) = crate::store::load_merged(cwd) else {
+        return Ok(String::new());
+    };
+    let now = chrono::Local::now();
+    let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let p = &ns.prefix;
+    let sparql = format!(
+        "{pfx}\nSELECT ?h ?project ?doc ?created WHERE {{\n\
+           GRAPH ?g {{\n\
+             ?h a {p}:Handoff ;\n\
+               {p}:status \"open\" ;\n\
+               {p}:project ?project ;\n\
+               {p}:handoffDoc ?doc ;\n\
+               {p}:createdAt ?created ;\n\
+               {p}:resurfaceAt ?resurfaceAt .\n\
+             FILTER(?resurfaceAt <= \"{now_str}\"^^xsd:dateTime)\n\
+           }}\n\
+         }}\n\
+         ORDER BY ?created",
+        pfx = crud::prefixes(ns)
+    );
+
+    let QueryResults::Solutions(solutions) = crate::store::query(&store, &sparql)? else {
+        return Ok(String::new());
+    };
+
+    let rows: Vec<(String, String, String, String)> = solutions
+        .filter_map(|r| r.ok())
+        .map(|row| {
+            let get = |k: &str| {
+                row.get(k)
+                    .map(|t| crud::term_display(t.into()))
+                    .unwrap_or_default()
+            };
+            let h = get("h");
+            let slug = h.rsplit('/').next().unwrap_or(&h).to_string();
+            (slug, get("project"), get("doc"), get("created"))
+        })
+        .collect();
+
+    if rows.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut out = String::from("[Pick up where you left off]\n");
+    let mut letter_map: Vec<String> = Vec::new();
+    for (i, (slug, project, doc, created)) in rows.iter().enumerate() {
+        let letter = (b'A' + (i as u8 % 26)) as char;
+        let days = chrono::DateTime::parse_from_rfc3339(created)
+            .map(|dt| now.signed_duration_since(dt).num_days())
+            .unwrap_or(0);
+        out.push_str(&format!("{letter}) {project} · {doc} · {days}d\n"));
+        letter_map.push(format!("{letter}={slug}"));
+    }
+    out.push_str(&format!(
+        "BEHAVIOR: Render this as the FIRST thing in your reply — a clean lettered list \
+         (project · path · age), nothing prepended. Pure delegation: no \"is this stale?\" \
+         prompts. Operator replies with a letter → read that doc and resume; \
+         \"snooze <letter> <N>d\" → run `base handoff snooze <slug> <N>`; \
+         \"archive <letter>\" → run `base handoff archive <slug>`. Letter→slug: {}.",
+        letter_map.join(", ")
+    ));
+
+    Ok(out)
+}
+
+/// Surface reminders whose `resurfaceAt` time has passed, across global + workspace tiers.
+pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
+    let Some(store) = crate::store::load_merged(cwd) else {
+        return Ok(String::new());
+    };
+    let now_str = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let p = &ns.prefix;
+    let sparql = format!(
+        "{pfx}\nSELECT ?r ?name WHERE {{\n\
+           GRAPH ?g {{\n\
+             ?r a {p}:Reminder ;\n\
+               {p}:name ?name ;\n\
+               {p}:resurfaceAt ?when .\n\
+             FILTER(?when <= \"{now_str}\"^^xsd:dateTime)\n\
+           }}\n\
+         }}\n\
+         ORDER BY ?when",
+        pfx = crud::prefixes(ns)
+    );
+
+    let QueryResults::Solutions(solutions) = crate::store::query(&store, &sparql)? else {
+        return Ok(String::new());
+    };
+
+    let rows: Vec<(String, String)> = solutions
+        .filter_map(|r| r.ok())
+        .map(|row| {
+            let get = |k: &str| {
+                row.get(k)
+                    .map(|t| crud::term_display(t.into()))
+                    .unwrap_or_default()
+            };
+            let r = get("r");
+            let slug = r.rsplit('/').next().unwrap_or(&r).to_string();
+            (slug, get("name"))
+        })
+        .collect();
+
+    if rows.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut out = String::from("[Reminders]\n");
+    for (slug, name) in &rows {
+        out.push_str(&format!("- {name}  (clear: base reminder remove {slug})\n"));
+    }
+    out.push_str(
+        "BEHAVIOR: These reminders are due now — surface them to the operator in your first reply. \
+         Clear a handled one with `base reminder remove <slug>`.",
+    );
+    Ok(out)
 }
 
 /// Find notes with mentionCount >= threshold — recurring ideas that should be promoted.

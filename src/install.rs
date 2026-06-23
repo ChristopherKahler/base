@@ -413,6 +413,36 @@ description = "One-line description of what this extension does"  # Required.
 # once_per_session = true         # default true; re-fires only if `message` changes
 # # on_tools = ["Write", "Edit", "MultiEdit"]   # default; never fires on Read
 # message = "Design work detected — verify with /design-humanizer scan before shipping."
+
+# ─── Drop-in CLI Commands (v0.6) ─────────────────────────
+# Contribute new `base <name>` subcommands without forking the binary. Any
+# unrecognized `base <name> …` is routed to your handler with the args forwarded
+# verbatim. Core commands always win — a plugin can never shadow a built-in.
+#
+# The handler MUST be directly executable: a shebang'd script (`#!/usr/bin/env
+# node`, then `chmod +x`) or a compiled binary — any language. base inherits its
+# stdio, so whatever the handler prints to stdout flows straight to the caller
+# (print a `--json` line and Claude/the shell sees it unchanged).
+#
+# Handler path: tilde-expanded; absolute used as-is; relative resolved against
+# `framework_dir`, else this file's own directory.
+#
+# base injects an env contract into every plugin process:
+#   BASE_WORKSPACE   — workspace root (the dir containing .base/)
+#   BASE_GRAPH_PATH  — the workspace graph file (.base/graph.nq)
+#   BASE_GLOBAL_DIR  — ~/.base-gbl
+#   BASE_BIN         — path to the running `base` binary
+# …plus every KEY=VALUE in ~/.base-gbl/.env (the base-framework secret store —
+# put your API keys there; they arrive as env vars, never overriding an
+# already-exported var). Plugins mutate base state ONLY by calling back through
+# $BASE_BIN (e.g. `"$BASE_BIN" learn --text … --domain …`) — base stays the sole
+# graph writer.
+#
+# [[commands]]
+# name = "my-command"                      # invoked as `base my-command …`
+# handler = "bin/my-command.mjs"           # executable; relative to framework_dir
+# description = "What it does (shown in `base ext list`)"
+# usage = "base my-command --flag value"   # optional one-line usage hint
 "#,
         )?;
         println!("   Created extensions/ + _template.toml");

@@ -88,6 +88,23 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         }
     }
 
+    // Handoff + reminder resurface — persistent until dismissed. Their own signals so they
+    // bypass suppression AND the budget cap: they must surface EVERY session until acted on.
+    match flow_resurface::handoff_scan(cwd, ns) {
+        Ok(output) if !output.is_empty() => {
+            results.push(SignalResult { name: "handoff".into(), priority: 0, output });
+        }
+        Ok(_) => diagnostics.push(format!("<{hook}-handoff-scan:no-match>")),
+        Err(e) => eprintln!("base: signal 'handoff' failed: {e}"),
+    }
+    match flow_resurface::reminder_scan(cwd, ns) {
+        Ok(output) if !output.is_empty() => {
+            results.push(SignalResult { name: "reminder".into(), priority: 0, output });
+        }
+        Ok(_) => diagnostics.push(format!("<{hook}-reminder-scan:no-match>")),
+        Err(e) => eprintln!("base: signal 'reminder' failed: {e}"),
+    }
+
     // Sort by priority
     results.sort_by_key(|r| r.priority);
 
@@ -100,6 +117,10 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     let novel: Vec<&SignalResult> = results
         .iter()
         .filter(|r| {
+            // Handoffs/reminders are persistent — never suppress; they surface every session.
+            if r.name == "handoff" || r.name == "reminder" {
+                return true;
+            }
             let hash = suppression::hash_output(&r.output);
             state.is_novel(&r.name, hash)
         })
@@ -115,7 +136,9 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     let mut dropped = 0;
 
     for result in &novel {
-        if result.priority == 1 || chars_used + result.output.len() <= sig.max_chars {
+        // active-awareness (priority 1) and persistent handoff/reminder always emit.
+        let always = result.priority == 1 || result.name == "handoff" || result.name == "reminder";
+        if always || chars_used + result.output.len() <= sig.max_chars {
             combined.push_str(&result.output);
             combined.push('\n');
             chars_used += result.output.len();

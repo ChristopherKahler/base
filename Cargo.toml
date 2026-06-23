@@ -21,6 +21,7 @@ include_dir = "0.7"
 open = "5"
 ureq = { version = "2", features = ["json"] }
 sha2 = "0.11.0"
+rpassword = "7"
 
 [dev-dependencies]
 tempfile = "3"

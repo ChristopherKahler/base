@@ -18,6 +18,34 @@ pub struct ExtensionFile {
     pub extension: ExtensionMeta,
     #[serde(default)]
     pub hooks: Option<ExtensionHooks>,
+    /// Drop-in CLI commands this extension contributes (v0.6). Each becomes a
+    /// `base <name>` subcommand routed to `handler` via the external-subcommand
+    /// seam. See `crate::plugin` for the registry + dispatch.
+    #[serde(default)]
+    pub commands: Vec<CommandSpec>,
+}
+
+/// A single `[[commands]]` entry — a drop-in `base <name>` subcommand.
+///
+/// ```toml
+/// [[commands]]
+/// name = "nano-banana"
+/// handler = "bin/nano-banana.mjs"   # executable (shebang'd script or binary)
+/// description = "Generate/edit images via the Gemini image API"
+/// usage = "base nano-banana generate --prompt \"...\" [--ratio 16:9] [--json]"
+/// ```
+///
+/// `handler` resolution: tilde-expanded; absolute used as-is; relative resolved
+/// against `framework_dir` (then the extension file's own directory). The
+/// handler MUST be directly executable — a shebang'd script (`#!/usr/bin/env
+/// node`, `+x`) or a binary — so base can exec it without knowing the language.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommandSpec {
+    pub name: String,
+    pub handler: String,
+    pub description: String,
+    #[serde(default)]
+    pub usage: Option<String>,
 }
 
 /// The `[extension]` table — identity + optional paths.
@@ -41,6 +69,9 @@ pub struct ExtensionDef {
     pub framework_dir: Option<String>,
     pub state_dir: Option<String>,
     pub hooks: Option<ExtensionHooks>,
+    /// Drop-in CLI commands contributed by this extension (v0.6).
+    #[serde(default)]
+    pub commands: Vec<CommandSpec>,
     /// The file this extension was loaded from (not serialized to TOML).
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
@@ -55,6 +86,7 @@ impl From<ExtensionFile> for ExtensionDef {
             framework_dir: f.extension.framework_dir,
             state_dir: f.extension.state_dir,
             hooks: f.hooks,
+            commands: f.commands,
             source_path: None,
         }
     }

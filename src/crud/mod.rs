@@ -2,6 +2,7 @@ pub mod ast_query;
 pub mod decision;
 pub mod entity;
 pub mod goal;
+pub mod handoff;
 pub mod milestone;
 pub mod note;
 pub mod project;

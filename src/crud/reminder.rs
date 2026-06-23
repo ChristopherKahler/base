@@ -6,7 +6,13 @@ use oxigraph::sparql::QueryResults;
 use crate::config::NamespaceConfig;
 use crate::crud;
 
-pub fn add(cwd: &Path, ns: &NamespaceConfig, name: &str, due_date: &str) -> Result<String> {
+pub fn add(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    name: &str,
+    surface_at: &str,
+    due_date: Option<&str>,
+) -> Result<String> {
     let slug = crud::slugify(name);
     let iri = crud::build_iri(ns, "reminder", &slug);
     let ws_slug = crud::workspace_slug(cwd);
@@ -14,15 +20,23 @@ pub fn add(cwd: &Path, ns: &NamespaceConfig, name: &str, due_date: &str) -> Resu
     let now = crud::now_iso();
     let p = &ns.prefix;
     let name = crud::escape_sparql_literal(name);
-    let due_date = crud::escape_sparql_literal(due_date);
+
+    // Optional dueDate triple — display/back-compat only; surfacing is driven by resurfaceAt.
+    let due_triple = match due_date {
+        Some(d) => format!(
+            "               {p}:dueDate \"{}\"^^xsd:date ;\n",
+            crud::escape_sparql_literal(d)
+        ),
+        None => String::new(),
+    };
 
     let sparql = format!(
         "INSERT DATA {{\n\
            GRAPH <{graph}> {{\n\
              <{iri}> rdf:type {p}:Reminder ;\n\
                {p}:name \"{name}\" ;\n\
-               {p}:dueDate \"{due_date}\"^^xsd:date ;\n\
-               {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
+               {p}:resurfaceAt \"{surface_at}\"^^xsd:dateTime ;\n\
+{due_triple}               {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
                {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
            }}\n\
          }}"
@@ -35,14 +49,14 @@ pub fn add(cwd: &Path, ns: &NamespaceConfig, name: &str, due_date: &str) -> Resu
 pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
     let p = &ns.prefix;
     let sparql = format!(
-        "SELECT ?name ?dueDate WHERE {{\n\
+        "SELECT ?name ?resurfaceAt WHERE {{\n\
            GRAPH ?g {{\n\
              ?r a {p}:Reminder ;\n\
                {p}:name ?name ;\n\
-               {p}:dueDate ?dueDate .\n\
+               {p}:resurfaceAt ?resurfaceAt .\n\
            }}\n\
          }}\n\
-         ORDER BY ?dueDate"
+         ORDER BY ?resurfaceAt"
     );
 
     let results = crud::load_and_query(cwd, ns, &sparql)?;
@@ -52,7 +66,7 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
             .map(|row| {
                 vec![
                     row.get("name").map(|t| crud::term_display(t.into())).unwrap_or_default(),
-                    row.get("dueDate").map(|t| crud::term_display(t.into())).unwrap_or_default(),
+                    row.get("resurfaceAt").map(|t| crud::term_display(t.into())).unwrap_or_default(),
                 ]
             })
             .collect();
@@ -62,8 +76,8 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
             return Ok(());
         }
 
-        println!("| name | due |");
-        println!("|------|-----|");
+        println!("| name | surfaces at |");
+        println!("|------|-------------|");
         for row in &rows {
             println!("| {} | {} |", row[0], row[1]);
         }

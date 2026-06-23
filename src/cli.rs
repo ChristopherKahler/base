@@ -12,7 +12,8 @@ use base::hook;
     name = "base",
     version,
     about = "BASE — Proactive context-injection engine for Claude Code",
-    after_help = "Built by Chris Kahler · Chris AI Systems\n\
+    after_help = "Drop-in plugin commands (from extensions): run `base ext list`\n\n\
+                  Built by Chris Kahler · Chris AI Systems\n\
                   Community & support: https://chrisai.cv/skool\n\
                   Tutorials: https://www.youtube.com/@chris-ai-systems"
 )]
@@ -75,6 +76,11 @@ pub enum Commands {
     Reminder {
         #[command(subcommand)]
         action: ReminderAction,
+    },
+    /// Manage session handoffs (resume docs surfaced at session start)
+    Handoff {
+        #[command(subcommand)]
+        action: HandoffAction,
     },
     /// Sync file-owned data into the graph
     Sync {
@@ -245,6 +251,18 @@ pub enum Commands {
         #[command(subcommand)]
         action: GraphAction,
     },
+    /// Securely manage API keys / secrets in ~/.base-gbl/.env (echo-off, 0600).
+    /// Plugins read these from their environment — never type secrets into chat.
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+    /// Drop-in command plugins from extensions (`base <foo>` → handler).
+    /// Any unrecognized subcommand is captured here and routed to the plugin
+    /// dispatcher (git's `git-foo` external-subcommand model). Core commands
+    /// always resolve first — a plugin can never shadow a built-in.
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[derive(Subcommand)]
@@ -262,6 +280,23 @@ pub enum GraphAction {
         /// Unread-age threshold in days (a note's clock resets each time it's recalled)
         #[arg(long, default_value_t = 21)]
         days: i64,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SecretAction {
+    /// Set a secret by prompting with echo OFF (masked, paste-friendly). Writes
+    /// ~/.base-gbl/.env (0600). Never echoes the value.
+    Set {
+        /// The key name (e.g. GEMINI_API_KEY)
+        key: String,
+    },
+    /// List stored secret KEY names with masked values (never the full secret).
+    List,
+    /// Remove a secret by key.
+    Rm {
+        /// The key name to remove
+        key: String,
     },
 }
 
@@ -289,11 +324,24 @@ pub enum ExtensionAction {
     Install {
         /// Path to the TOML file to install
         path: String,
+        /// Bundle the handler into ~/.base-gbl/plugins/<name>/ and repoint the
+        /// manifest there — a self-contained, repo-independent (shippable) install.
+        #[arg(long)]
+        bundle: bool,
     },
     /// Remove an installed extension by name
     Remove {
         /// Extension name to remove
         name: String,
+    },
+    /// Run a drop-in plugin command explicitly (collision-proof):
+    /// `base ext run <name> [args…]`
+    Run {
+        /// Plugin command name (as declared in an extension's [[commands]])
+        name: String,
+        /// Arguments forwarded verbatim to the handler
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -545,20 +593,80 @@ pub enum GoalAction {
     },
 }
 
+/// Parse a relative duration like "30s", "3m", "2h", "1d".
+fn parse_duration(s: &str) -> anyhow::Result<chrono::Duration> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    let n: i64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad duration number in '{s}'"))?;
+    Ok(match unit {
+        "s" => chrono::Duration::seconds(n),
+        "m" => chrono::Duration::minutes(n),
+        "h" => chrono::Duration::hours(n),
+        "d" => chrono::Duration::days(n),
+        _ => anyhow::bail!("duration unit must be s/m/h/d (e.g. 3m)"),
+    })
+}
+
+/// Resolve a reminder's surface time (ISO-8601 string) from --at, --in, or --due.
+fn resolve_surface_at(
+    due: Option<&str>,
+    at: Option<&str>,
+    in_dur: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(a) = at {
+        let dt = chrono::DateTime::parse_from_rfc3339(a)
+            .map_err(|_| anyhow::anyhow!("--at must be ISO-8601 (e.g. 2026-06-23T14:30:00-05:00)"))?;
+        Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
+    } else if let Some(d) = in_dur {
+        Ok((chrono::Local::now() + parse_duration(d)?)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
+    } else if let Some(due) = due {
+        let off = chrono::Local::now().format("%:z").to_string();
+        Ok(format!("{due}T00:00:00{off}"))
+    } else {
+        anyhow::bail!("provide one of --in <3m|2h|1d>, --at <ISO datetime>, or --due <YYYY-MM-DD>")
+    }
+}
+
 #[derive(Subcommand)]
 pub enum ReminderAction {
-    /// Add a reminder
+    /// Add a reminder (provide one of --in, --at, or --due)
     Add {
         #[arg(long)]
         name: String,
-        /// Due date (YYYY-MM-DD)
+        /// Due date (YYYY-MM-DD) — surfaces on/after this date
         #[arg(long)]
-        due: String,
+        due: Option<String>,
+        /// Exact surface time, ISO-8601 (e.g. 2026-06-23T14:30:00-05:00)
+        #[arg(long)]
+        at: Option<String>,
+        /// Relative surface time from now: 30s, 3m, 2h, 1d
+        #[arg(long = "in")]
+        in_dur: Option<String>,
     },
     /// List all reminders
     List,
     /// Remove a reminder (hard delete)
     Remove { slug: String },
+}
+
+#[derive(Subcommand)]
+pub enum HandoffAction {
+    /// Register a handoff doc (archives any prior open handoff for the project)
+    Create {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        doc: String,
+    },
+    /// List handoffs across global + workspace tiers
+    List,
+    /// Snooze a handoff for N days (hide until then)
+    Snooze { slug: String, days: i64 },
+    /// Archive a handoff (stop resurfacing)
+    Archive { slug: String },
 }
 
 #[derive(Subcommand)]
@@ -858,12 +966,37 @@ pub fn run() {
             }
         },
 
+        // ─── Handoff ─────────────────────────────────────
+        Some(Commands::Handoff { action }) => match action {
+            HandoffAction::Create { project, doc } => {
+                match crud::handoff::create(&cwd, &config.namespace, &project, &doc) {
+                    Ok(slug) => println!("Handoff for '{project}' registered (slug: {slug})"),
+                    Err(e) => die("Failed", e),
+                }
+            }
+            HandoffAction::List => { if let Err(e) = crud::handoff::list(&cwd, &config.namespace) { die("Error", e); } }
+            HandoffAction::Snooze { slug, days } => {
+                match crud::handoff::snooze(&cwd, &config.namespace, &slug, days) {
+                    Ok(()) => println!("Handoff '{slug}' snoozed {days}d"),
+                    Err(e) => die("Failed", e),
+                }
+            }
+            HandoffAction::Archive { slug } => {
+                match crud::handoff::archive(&cwd, &config.namespace, &slug) {
+                    Ok(()) => println!("Handoff '{slug}' archived"),
+                    Err(e) => die("Failed", e),
+                }
+            }
+        },
         // ─── Reminder ────────────────────────────────────
         Some(Commands::Reminder { action }) => match action {
-            ReminderAction::Add { name, due } => {
-                match crud::reminder::add(&cwd, &config.namespace, &name, &due) {
-                    Ok(slug) => println!("Reminder '{name}' created (slug: {slug})"),
-                    Err(e) => die("Failed", e),
+            ReminderAction::Add { name, due, at, in_dur } => {
+                match resolve_surface_at(due.as_deref(), at.as_deref(), in_dur.as_deref()) {
+                    Ok(surface_at) => match crud::reminder::add(&cwd, &config.namespace, &name, &surface_at, due.as_deref()) {
+                        Ok(slug) => println!("Reminder '{name}' set — surfaces at session start on/after {surface_at} (slug: {slug})"),
+                        Err(e) => die("Failed", e),
+                    },
+                    Err(e) => die("Invalid time", e),
                 }
             }
             ReminderAction::List => { if let Err(e) = crud::reminder::list(&cwd, &config.namespace) { die("Error", e); } }
@@ -1221,6 +1354,21 @@ pub fn run() {
                     }
                     println!("\n{} extension(s) installed.", extensions.len());
                 }
+
+                // Drop-in plugin commands contributed by those extensions (v0.6).
+                let registry = base::plugin::build_registry(&extensions);
+                if !registry.is_empty() {
+                    println!();
+                    println!("{:<16} {:<16} DESCRIPTION", "PLUGIN COMMAND", "FROM");
+                    println!("{}", "─".repeat(70));
+                    for c in registry.list() {
+                        println!("base {:<11} ext:{:<12} {}", c.name, c.ext_name, c.description);
+                    }
+                    println!(
+                        "\n{} plugin command(s). Invoke: base <name> …  (or: base ext run <name> …)",
+                        registry.list().len()
+                    );
+                }
             }
             ExtensionAction::Validate { path } => {
                 let p = std::path::Path::new(&path);
@@ -1239,48 +1387,30 @@ pub fn run() {
                     }
                 }
             }
-            ExtensionAction::Install { path } => {
+            ExtensionAction::Install { path, bundle } => {
                 let p = std::path::Path::new(&path);
-                match extension::validate_extension(p) {
-                    Ok(ext) => {
-                        let home = dirs::home_dir().expect("Cannot determine home directory");
-                        let ext_dir = home.join(".base-gbl").join("extensions");
-                        if let Err(e) = std::fs::create_dir_all(&ext_dir) {
-                            eprintln!("Failed to create extensions directory: {e}");
+                if bundle {
+                    match base::plugin::bundle_install(p) {
+                        Ok(outcome) => println!("{}", base::plugin::format_bundle_human(&outcome)),
+                        Err(e) => {
+                            eprintln!("Bundle install failed: {e}");
                             std::process::exit(1);
                         }
-                        let dest = ext_dir.join(format!("{}.toml", ext.name));
-
-                        // Check for existing version
-                        let old_version = if dest.exists() {
-                            std::fs::read_to_string(&dest)
-                                .ok()
-                                .and_then(|c| toml::from_str::<extension::ExtensionFile>(&c).ok())
-                                .map(|f| f.extension.version)
-                        } else {
-                            None
-                        };
-
-                        if let Err(e) = std::fs::copy(p, &dest) {
-                            eprintln!("Failed to install extension: {e}");
-                            std::process::exit(1);
-                        }
-
-                        if let Some(old_v) = old_version {
-                            println!(
-                                "✓ Updated {} (was v{}, now v{})",
-                                ext.name, old_v, ext.version
-                            );
-                        } else {
-                            println!("✓ Installed {} v{}", ext.name, ext.version);
-                        }
-                        println!("  → {}", dest.display());
                     }
-                    Err(violations) => {
-                        eprintln!("✗ Cannot install — validation failed:");
-                        for v in &violations {
-                            eprintln!("  - {v}");
+                    return;
+                }
+                // Linked install — resolves a relative/"." framework_dir to an
+                // absolute path so a shipped base-extension.toml installs correctly.
+                match base::plugin::install_linked(p) {
+                    Ok(o) => {
+                        match o.prev_version {
+                            Some(old) => println!("✓ Updated {} (was v{}, now v{})", o.name, old, o.version),
+                            None => println!("✓ Installed {} v{}", o.name, o.version),
                         }
+                        println!("  → {}", o.dest.display());
+                    }
+                    Err(e) => {
+                        eprintln!("✗ Cannot install: {e}");
                         std::process::exit(1);
                     }
                 }
@@ -1324,6 +1454,7 @@ pub fn run() {
                     std::process::exit(1);
                 }
             }
+            ExtensionAction::Run { name, args } => base::plugin::run_named(&name, &args, &cwd),
         },
 
         // ─── Commands (star commands) ─────────────────────────
@@ -1855,6 +1986,31 @@ pub fn run() {
                 }
             }
         },
+
+        // ─── Secret ───────────────────────────────────────────
+        Some(Commands::Secret { action }) => match action {
+            SecretAction::Set { key } => {
+                if let Err(e) = base::secret::set_interactive(&key) {
+                    die("Failed", e);
+                }
+            }
+            SecretAction::List => {
+                if let Err(e) = base::secret::list() {
+                    die("Failed", e);
+                }
+            }
+            SecretAction::Rm { key } => match base::secret::remove(&key) {
+                Ok(true) => println!("✓ Removed {key} from ~/.base-gbl/.env"),
+                Ok(false) => eprintln!("Secret '{key}' not found"),
+                Err(e) => die("Failed", e),
+            },
+        },
+
+        // ─── Plugin commands (drop-in from extensions) ────────
+        // Any unrecognized subcommand lands here (clap external_subcommand).
+        // Core commands above always match first, so a plugin can never shadow
+        // a built-in. dispatch() never returns (resolves+execs or exits loud).
+        Some(Commands::External(args)) => base::plugin::dispatch(&args, &cwd),
 
         None => eprintln!("No command provided. Run `base --help` for usage."),
     }

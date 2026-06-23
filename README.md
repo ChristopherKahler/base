@@ -349,6 +349,29 @@ message          = "Design work detected — verify with /design-humanizer scan 
 
 Same mechanism powers any "after you do X, verify Y" reflex (copy → humanizer, migrations → reversibility, …). Full reference: **[docs/extensions.md](docs/extensions.md)**.
 
+### Command plugins — drop-in `base <foo>` subcommands
+
+An extension can also contribute **new CLI commands**. Add a `[[commands]]` entry pointing at an executable handler (a shebang'd script or binary, any language); any unrecognized `base <name> …` is routed to it with the args forwarded. Core commands always win — a plugin can never shadow a built-in.
+
+```toml
+[[commands]]
+name = "nano-banana"
+handler = "bin/nano-banana.mjs"     # executable; relative to framework_dir
+description = "Generate/edit images (Gemini)"
+```
+
+base injects an env contract (`BASE_WORKSPACE`, `BASE_GRAPH_PATH`, `BASE_GLOBAL_DIR`, `BASE_BIN`) plus every secret in `~/.base-gbl/.env` (the base-framework key store). Plugins mutate state only by calling back through `$BASE_BIN` — base stays the sole graph writer. stdio is inherited, so a `--json` handler line flows straight to the caller.
+
+```bash
+base nano-banana generate --prompt "…" --json   # flat form
+base ext run nano-banana generate --prompt "…"  # explicit, collision-proof
+base ext list                                    # shows installed plugin commands
+```
+
+Install **linked** (runs from the repo — for development) or **packaged** (`base ext install --bundle <manifest>` copies the handler into `~/.base-gbl/plugins/<name>/` and repoints the manifest — repo-independent, the shippable artifact). Same registry either way.
+
+Full reference: **[docs/command-plugins.md](docs/command-plugins.md)**.
+
 ## What lives where
 
 ```

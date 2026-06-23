@@ -45,7 +45,7 @@ fn goal_add_and_list() {
 #[test]
 fn reminder_add_and_remove() {
     let tmp = tempfile::tempdir().unwrap();
-    crud::reminder::add(tmp.path(), &ns(), "Check deploy", "2026-06-15").unwrap();
+    crud::reminder::add(tmp.path(), &ns(), "Check deploy", "2026-06-15", None).unwrap();
 
     // Verify exists
     let trig = tmp.path().join(".base").join("graph.nq");
