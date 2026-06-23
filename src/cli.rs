@@ -199,6 +199,12 @@ pub enum Commands {
         /// Target directory (defaults to cwd)
         path: Option<String>,
     },
+    /// Reconcile project active/deferred state from real folder last-touch
+    Reconcile {
+        /// Preview what would change — no graph writes. Bypasses the [protocol] enabled gate.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Operator identity profile (init, show)
     Operator {
         #[command(subcommand)]
@@ -1338,6 +1344,35 @@ pub fn run() {
                 .unwrap_or(cwd.clone());
             if let Err(e) = base::scaffold::run(&target) {
                 eprintln!("Scaffold failed: {e}");
+            }
+        }
+
+        // ─── Reconcile ────────────────────────────────────────
+        Some(Commands::Reconcile { dry_run }) => {
+            let config = base::config::BaseConfig::load(&cwd);
+            match base::protocol::reconcile::open_workspace(&cwd) {
+                None => eprintln!("base: no workspace graph found (run from inside a base workspace)"),
+                Some((store, trig_path, ws_root)) => {
+                    let stale = config.protocol.stale_days as i64;
+                    match base::protocol::reconcile::plan(&store, &config.namespace, &ws_root, stale) {
+                        Err(e) => eprintln!("base: reconcile plan failed: {e}"),
+                        Ok(decisions) => {
+                            if dry_run {
+                                print!("{}", base::protocol::reconcile::format_report(&decisions, &ws_root, stale));
+                            } else if !config.protocol.enabled {
+                                eprintln!("base: [protocol] not enabled — refusing to apply. Preview with `base reconcile --dry-run`.");
+                            } else {
+                                match base::protocol::reconcile::apply(&store, &config.namespace, &trig_path, &decisions) {
+                                    Ok(s) => println!(
+                                        "base: reconcile — {} deferred, {} revived, {} refreshed ({} scanned)",
+                                        s.deferred, s.revived, s.refreshed, s.scanned
+                                    ),
+                                    Err(e) => eprintln!("base: reconcile apply failed: {e}"),
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
