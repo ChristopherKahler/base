@@ -205,6 +205,11 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Registered-workspace registry (sync CLAUDE.md from base.toml)
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
     /// Operator identity profile (init, show)
     Operator {
         #[command(subcommand)]
@@ -304,6 +309,12 @@ pub enum SecretAction {
         /// The key name to remove
         key: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum WorkspaceAction {
+    /// Regenerate the registered-workspaces block in ~/.claude/CLAUDE.md from base.toml
+    Sync,
 }
 
 #[derive(Subcommand)]
@@ -1394,6 +1405,14 @@ pub fn run() {
                 }
             }
         }
+
+        // ─── Workspace registry ───────────────────────────────
+        Some(Commands::Workspace { action }) => match action {
+            WorkspaceAction::Sync => match base::scaffold::sync_claude_md_registry() {
+                Ok(n) => println!("✓ synced {n} workspace(s) into ~/.claude/CLAUDE.md"),
+                Err(e) => die("Failed", e),
+            },
+        },
 
         // ─── Operator ─────────────────────────────────────────
         Some(Commands::Operator { action }) => match action {
