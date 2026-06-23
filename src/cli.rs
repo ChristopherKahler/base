@@ -450,6 +450,12 @@ pub enum ProjectAction {
     List,
     /// Show a specific project (accepts slug or display name)
     Get { slug: String },
+    /// Re-point a project's folder path (graph + domain trigger) after it moves
+    Repath {
+        slug: String,
+        /// New folder path (absolute, or relative to the workspace root)
+        path: String,
+    },
     /// Update a project (accepts slug or display name)
     #[command(visible_alias = "u")]
     Update {
@@ -833,6 +839,18 @@ pub fn run() {
             ProjectAction::Get { slug } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug)
                     && let Err(e) = crud::project::get(&cwd, &config.namespace, &s) { die("Error", e); }
+            }
+            ProjectAction::Repath { slug, path } => {
+                if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug) {
+                    match crud::project::repath(&cwd, &config.namespace, &s, &path) {
+                        Ok(r) => {
+                            let from = r.old_path.as_deref().unwrap_or("(none)");
+                            let dom = if r.domain_changed { format!(", domain '{}' trigger updated", r.name) } else { String::new() };
+                            println!("Repathed '{s}': {from} → {}{dom}", r.new_path);
+                        }
+                        Err(e) => die("Failed", e),
+                    }
+                }
             }
             ProjectAction::Update { slug, status, blocked_by, next_action } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug) {
@@ -1354,7 +1372,8 @@ pub fn run() {
                 None => eprintln!("base: no workspace graph found (run from inside a base workspace)"),
                 Some((store, trig_path, ws_root)) => {
                     let stale = config.protocol.stale_days as i64;
-                    match base::protocol::reconcile::plan(&store, &config.namespace, &ws_root, stale) {
+                    let roots = base::protocol::reconcile::registered_roots(&config);
+                    match base::protocol::reconcile::plan(&store, &config.namespace, &ws_root, &roots, stale) {
                         Err(e) => eprintln!("base: reconcile plan failed: {e}"),
                         Ok(decisions) => {
                             if dry_run {

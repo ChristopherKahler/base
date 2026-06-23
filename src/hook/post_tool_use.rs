@@ -9,6 +9,20 @@ use crate::store;
 
 pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Result<super::HookEventData> {
     let mut data = super::HookEventData::default();
+
+    // Folder-move nudge: a Bash `mv` of a registered project's folder must repath
+    // the graph + domain trigger, or the active-state reconcile measures a ghost
+    // location and the project looks "gone". Runs before the file-path early-return
+    // because Bash carries no file_path.
+    if event.get("tool_name").and_then(|v| v.as_str()) == Some("Bash")
+        && let Some(cmd) = event
+            .get("tool_input")
+            .and_then(|i| i.get("command"))
+            .and_then(|c| c.as_str())
+    {
+        emit_move_nudge(config, cwd, cmd);
+    }
+
     let file_paths = extract_file_paths(event);
     if file_paths.is_empty() {
         return Ok(data);
@@ -332,6 +346,79 @@ fn extract_file_paths(event: &serde_json::Value) -> Vec<PathBuf> {
 }
 
 /// Find the workspace .base/graph.nq by walking upward from cwd.
+/// Detect `mv` of a registered project's folder and emit a repath nudge to stdout
+/// (injected as additionalContext). Silent unless a moved folder matches a project
+/// path by basename — no noise on ordinary `mv`s.
+fn emit_move_nudge(config: &BaseConfig, cwd: &Path, command: &str) {
+    let moves = detect_dir_moves(command);
+    if moves.is_empty() {
+        return;
+    }
+    let projects = match crud::project::list_paths(cwd, &config.namespace) {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
+    for (src, dest) in &moves {
+        let Some(src_base) = basename(&strip_paul(src)) else { continue };
+        for (slug, name, ppath) in &projects {
+            if basename(&strip_paul(ppath)).as_deref() == Some(src_base.as_str()) {
+                println!(
+                    "<base:path-drift>\n\
+                     Folder moved: {src} → {dest}\n\
+                     Registered project '{name}' (slug {slug}) still points at the old path: {ppath}\n\
+                     Sync graph + domain trigger:  base project repath {slug} {dest}\n\
+                     </base:path-drift>"
+                );
+            }
+        }
+    }
+}
+
+/// Parse `mv` invocations from a shell command, returning (src, dest) pairs. Naive
+/// by design (whitespace tokens, strips simple quotes + flags) — it only feeds a
+/// nudge, so false negatives are fine and false positives are filtered by the
+/// project-path match.
+fn detect_dir_moves(command: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for seg in command
+        .split(['\n', ';'])
+        .flat_map(|s| s.split("&&"))
+        .flat_map(|s| s.split("||"))
+    {
+        let toks: Vec<String> = seg.split_whitespace().map(unquote).collect();
+        if toks.first().map(String::as_str) != Some("mv") {
+            continue;
+        }
+        let args: Vec<&String> = toks[1..].iter().filter(|t| !t.starts_with('-')).collect();
+        if args.len() < 2 {
+            continue;
+        }
+        let dest = args[args.len() - 1].clone();
+        for src in &args[..args.len() - 1] {
+            out.push(((*src).clone(), dest.clone()));
+        }
+    }
+    out
+}
+
+fn unquote(s: &str) -> String {
+    s.trim_matches('"').trim_matches('\'').to_string()
+}
+
+fn strip_paul(p: &str) -> String {
+    match p.find("/.paul") {
+        Some(i) => p[..i].to_string(),
+        None => p.to_string(),
+    }
+}
+
+fn basename(p: &str) -> Option<String> {
+    Path::new(p.trim_end_matches('/'))
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+}
+
 fn find_workspace_trig(cwd: &Path) -> Option<PathBuf> {
     let mut dir = cwd.to_path_buf();
     loop {

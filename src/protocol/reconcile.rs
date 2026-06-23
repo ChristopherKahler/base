@@ -14,11 +14,16 @@
 //! their `lastActive` is refreshed. This is the resurfaceAt-pin override: the operator
 //! signal wins, everything else decays from the working signals alone.
 //!
-//! Terminal projects (complete / archived) are skipped entirely — no refresh, no
-//! decay (avoids churning the graph for work that's done).
+//! Terminal projects (complete / archived) are skipped entirely.
 //!
-//! Gated entirely on `[protocol] enabled` for the *apply* path. The read-only [`plan`]
-//! is ungated so `base reconcile --dry-run` can preview before the protocol is enabled.
+//! Path resolution is REGISTRY-AWARE: a project's folder is resolved against its own
+//! workspace root first, then — if that doesn't exist — searched by basename across
+//! every registered workspace (`[[workspace]]` in base.toml). A project whose folder
+//! moved to another registered workspace (e.g. a framework promoted to ~/ops-sys/
+//! toolbox) is found and flagged for repath instead of being misreported as "gone".
+//!
+//! Gated on `[protocol] enabled` for the *apply* path. The read-only [`plan`] is
+//! ungated so `base reconcile --dry-run` can preview before the protocol is enabled.
 
 use std::path::{Path, PathBuf};
 
@@ -39,17 +44,12 @@ const TERMINAL_STATUSES: &[&str] = &["complete", "completed", "archived"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Working + cold + unpinned → becomes deferred.
     Defer,
-    /// Deferred + recently touched + unpinned → becomes active.
     Revive,
-    /// Working + warm, or deferred + still cold → status unchanged (lastActive still refreshed).
     Hold,
-    /// Future resurfaceAt → exempt from status change (lastActive refreshed only).
     Pinned,
-    /// Folder path missing/empty → can't measure; left as-is, flagged for cleanup.
+    /// Folder not found under its own workspace OR any registered workspace.
     NoFolder,
-    /// Terminal status → skipped entirely.
     Terminal,
 }
 
@@ -63,6 +63,11 @@ pub struct Decision {
     pub touch_days: Option<i64>,
     pub touch_iso: Option<String>,
     pub action: Action,
+    /// Set when the stored path was stale but the folder was relocated in another
+    /// registered workspace (workspace-relative form). Drives a repath nudge.
+    pub relocated_to: Option<String>,
+    /// Multiple basename matches across registered workspaces — ambiguous, needs a human.
+    pub candidates: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -74,14 +79,22 @@ pub struct ReconcileStats {
 }
 
 impl ReconcileStats {
-    /// Did any *status* actually change? lastActive refreshes alone stay silent.
     pub fn changed(&self) -> bool {
         self.deferred > 0 || self.revived > 0
     }
 }
 
-/// Run the reconcile pass over the workspace graph and APPLY it. No-op (`Ok` default)
-/// when the protocol is disabled or no workspace graph exists.
+/// Registered workspace roots (existing dirs only), from `[[workspace]]` in base.toml.
+pub fn registered_roots(config: &BaseConfig) -> Vec<PathBuf> {
+    config
+        .workspace
+        .iter()
+        .map(|w| PathBuf::from(&w.path))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// Run the reconcile pass over the workspace graph and APPLY it.
 pub fn reconcile(cwd: &Path, config: &BaseConfig) -> Result<ReconcileStats> {
     if !config.protocol.enabled {
         return Ok(ReconcileStats::default());
@@ -89,7 +102,8 @@ pub fn reconcile(cwd: &Path, config: &BaseConfig) -> Result<ReconcileStats> {
     let Some((store, trig_path, ws_root)) = open_workspace(cwd) else {
         return Ok(ReconcileStats::default());
     };
-    let decisions = plan(&store, &config.namespace, &ws_root, config.protocol.stale_days as i64)?;
+    let roots = registered_roots(config);
+    let decisions = plan(&store, &config.namespace, &ws_root, &roots, config.protocol.stale_days as i64)?;
     apply(&store, &config.namespace, &trig_path, &decisions)
 }
 
@@ -105,9 +119,14 @@ pub fn open_workspace(cwd: &Path) -> Option<(Store, PathBuf, PathBuf)> {
     Some((store, trig_path, ws_root))
 }
 
-/// Read-only: compute what reconcile WOULD do for every project-like entity. The
-/// dry-run preview and the real apply share this exact logic — no drift.
-pub fn plan(store: &Store, ns: &NamespaceConfig, ws_root: &Path, stale_days: i64) -> Result<Vec<Decision>> {
+/// Read-only: compute what reconcile WOULD do for every project-like entity.
+pub fn plan(
+    store: &Store,
+    ns: &NamespaceConfig,
+    ws_root: &Path,
+    registered_roots: &[PathBuf],
+    stale_days: i64,
+) -> Result<Vec<Decision>> {
     let p = &ns.prefix;
     let select = format!(
         "{pfx}\n\
@@ -134,12 +153,21 @@ pub fn plan(store: &Store, ns: &NamespaceConfig, ws_root: &Path, stale_days: i64
             out.push(Decision {
                 slug, iri: row.iri, g: row.g, status: row.status, path: row.path,
                 touch_days: None, touch_iso: None, action: Action::Terminal,
+                relocated_to: None, candidates: Vec::new(),
             });
             continue;
         }
 
-        let abs = resolve_path(ws_root, &project_root(&row.path));
-        let touch = crate::protocol::touch::folder_last_touch(&abs);
+        // Registry-aware resolution.
+        let located = locate_folder(&project_root(&row.path), ws_root, registered_roots);
+        let (abs, relocated_to, candidates) = match located {
+            Located::Here(abs) => (Some(abs), None, Vec::new()),
+            Located::Moved { abs, rel } => (Some(abs), Some(rel), Vec::new()),
+            Located::Ambiguous(cands) => (None, None, cands),
+            Located::Missing => (None, None, Vec::new()),
+        };
+
+        let touch = abs.as_deref().and_then(crate::protocol::touch::folder_last_touch);
         let (touch_days, touch_iso) = match &touch {
             Some(t) => (
                 Some(now.signed_duration_since(*t).num_days()),
@@ -171,13 +199,15 @@ pub fn plan(store: &Store, ns: &NamespaceConfig, ws_root: &Path, stale_days: i64
 
         out.push(Decision {
             slug, iri: row.iri, g: row.g, status: row.status, path: row.path,
-            touch_days, touch_iso, action,
+            touch_days, touch_iso, action, relocated_to, candidates,
         });
     }
     Ok(out)
 }
 
 /// Apply a plan: refresh lastActive from real touch, flip statuses, write back once.
+/// NOTE: relocation is reported, never auto-persisted — basenames can collide across
+/// workspaces, so repath is an explicit operator/nudge action.
 pub fn apply(store: &Store, ns: &NamespaceConfig, trig_path: &Path, decisions: &[Decision]) -> Result<ReconcileStats> {
     let mut stats = ReconcileStats { scanned: decisions.len(), ..Default::default() };
     let p = &ns.prefix;
@@ -185,7 +215,6 @@ pub fn apply(store: &Store, ns: &NamespaceConfig, trig_path: &Path, decisions: &
     let mut ops: Vec<String> = Vec::new();
 
     for d in decisions {
-        // Refresh lastActive whenever we have a real touch and the project isn't terminal.
         if let Some(iso) = &d.touch_iso
             && d.action != Action::Terminal
         {
@@ -231,12 +260,12 @@ pub fn format_report(decisions: &[Decision], ws_root: &Path, stale_days: i64) ->
         v.sort_by(|x, y| y.touch_days.unwrap_or(i64::MIN).cmp(&x.touch_days.unwrap_or(i64::MIN)));
         v
     };
-    let line = |d: &Decision, note: &str| format!("  {:<26} {:<13} {}\n", d.slug, d.status, note);
+    let line = |d: &Decision, note: &str| {
+        let moved = d.relocated_to.as_ref().map(|r| format!("  ⟲ moved → {r} (repath)")).unwrap_or_default();
+        format!("  {:<26} {:<13} {}{}\n", d.slug, d.status, note, moved)
+    };
 
-    let mut s = format!(
-        "Reconcile dry-run — {} (stale_days = {})\n\n",
-        ws_root.display(), stale_days
-    );
+    let mut s = format!("Reconcile dry-run — {} (stale_days = {})\n\n", ws_root.display(), stale_days);
 
     let defer = by(Defer);
     s.push_str(&format!("WOULD DEFER — working but cold ({}):\n", defer.len()));
@@ -260,18 +289,93 @@ pub fn format_report(decisions: &[Decision], ws_root: &Path, stale_days: i64) ->
     }
 
     let nofolder = by(NoFolder);
-    s.push_str(&format!("\nNO FOLDER — path missing, left as-is, flag for cleanup ({}):\n", nofolder.len()));
-    for d in &nofolder { s.push_str(&line(d, &format!("{} (gone/empty)", d.path))); }
+    s.push_str(&format!("\nUNRESOLVED — folder not found in any registered workspace ({}):\n", nofolder.len()));
+    for d in &nofolder {
+        if d.candidates.is_empty() {
+            s.push_str(&format!("  {:<26} {:<13} stored: {}\n", d.slug, d.status, d.path));
+        } else {
+            s.push_str(&format!("  {:<26} {:<13} AMBIGUOUS — candidates: {}\n", d.slug, d.status, d.candidates.join(", ")));
+        }
+    }
     if nofolder.is_empty() { s.push_str("  (none)\n"); }
 
     let terminal = by(Terminal).len();
     s.push_str(&format!("\nTERMINAL — complete/archived, skipped: {terminal} project(s)\n"));
 
+    let moved = decisions.iter().filter(|d| d.relocated_to.is_some()).count();
     s.push_str(&format!(
-        "\nSummary: {} defer · {} revive · {} stay · {} no-folder · {} terminal  (no graph writes)\n",
-        defer.len(), revive.len(), hold.len(), nofolder.len(), terminal
+        "\nSummary: {} defer · {} revive · {} stay · {} unresolved · {} terminal · {} moved-needs-repath  (no graph writes)\n",
+        defer.len(), revive.len(), hold.len(), nofolder.len(), terminal, moved
     ));
     s
+}
+
+enum Located {
+    /// Found under its own workspace root at the stored path.
+    Here(PathBuf),
+    /// Found in another registered workspace (stale path); rel = workspace-relative form vs that root.
+    Moved { abs: PathBuf, rel: String },
+    /// Multiple registered workspaces hold a folder with this basename.
+    Ambiguous(Vec<String>),
+    Missing,
+}
+
+/// Resolve a project folder: its own workspace first, then by basename across every
+/// registered workspace. This is what makes reconcile aware of moved/promoted folders.
+fn locate_folder(stored_rel: &str, ws_root: &Path, roots: &[PathBuf]) -> Located {
+    // 1) Stored path under its own workspace (or absolute) — the happy path.
+    let primary = resolve_path(ws_root, stored_rel);
+    if primary.is_dir() {
+        return Located::Here(primary);
+    }
+
+    // 2) Relocate by basename across registered workspaces.
+    let Some(base) = Path::new(stored_rel).file_name().and_then(|n| n.to_str()) else {
+        return Located::Missing;
+    };
+    let mut hits: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        find_dirs_by_basename(root, base, 4, &mut hits);
+        if hits.len() > 5 { break; } // cap — ambiguity is ambiguity
+    }
+    // Don't count the (already-failed) primary location.
+    hits.retain(|h| h != &primary);
+    hits.sort();
+    hits.dedup();
+
+    match hits.len() {
+        0 => Located::Missing,
+        1 => {
+            let abs = hits.remove(0);
+            let rel = abs.to_string_lossy().to_string();
+            Located::Moved { abs, rel }
+        }
+        _ => Located::Ambiguous(hits.iter().map(|h| h.to_string_lossy().to_string()).collect()),
+    }
+}
+
+/// Bounded recursive search for directories named exactly `basename` under `root`.
+fn find_dirs_by_basename(root: &Path, basename: &str, max_depth: usize, out: &mut Vec<PathBuf>) {
+    const IGNORE: &[&str] = &[".git", ".base", "node_modules", "target", "dist", "build", "vendor"];
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if IGNORE.contains(&name.as_ref()) {
+            continue;
+        }
+        let path = entry.path();
+        if name == basename {
+            out.push(path.clone());
+        }
+        if max_depth > 0 {
+            find_dirs_by_basename(&path, basename, max_depth - 1, out);
+        }
+    }
 }
 
 /// Normalize a stored path to the project ROOT folder. Old PAUL projects store
@@ -293,8 +397,6 @@ fn resolve_path(ws_root: &Path, path: &str) -> PathBuf {
 
 struct Row { iri: String, g: String, status: String, path: String, resurface_at: Option<String> }
 
-/// Extract rows, keeping full IRIs for `?iri`/`?g` (needed verbatim in follow-up
-/// updates) rather than the prefix-stripped display form.
 fn collect_rows(store: &Store, sparql: &str) -> Result<Vec<Row>> {
     let QueryResults::Solutions(solutions) = store::query(store, sparql)? else {
         return Ok(Vec::new());
@@ -327,5 +429,32 @@ mod tests {
         assert_eq!(project_root("apps/x/.paul"), "apps/x");
         assert_eq!(project_root("apps/x"), "apps/x");
         assert_eq!(project_root("planning/y"), "planning/y");
+    }
+
+    #[test]
+    fn locate_relocates_by_basename_across_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let other = tmp.path().join("toolbox");
+        std::fs::create_dir_all(ws.join("apps")).unwrap();
+        std::fs::create_dir_all(other.join("frameworks/widget")).unwrap();
+
+        // Stored path apps/widget doesn't exist under ws, but toolbox has it.
+        let roots = vec![ws.clone(), other.clone()];
+        match locate_folder("apps/widget", &ws, &roots) {
+            Located::Moved { abs, .. } => assert!(abs.ends_with("frameworks/widget")),
+            _ => panic!("expected Moved"),
+        }
+    }
+
+    #[test]
+    fn locate_here_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("apps/here")).unwrap();
+        match locate_folder("apps/here", ws, &[ws.to_path_buf()]) {
+            Located::Here(_) => {}
+            _ => panic!("expected Here"),
+        }
     }
 }

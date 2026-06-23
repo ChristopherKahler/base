@@ -269,3 +269,76 @@ pub fn update(
     let sparql = updates.join(" ;\n");
     crud::load_and_mutate(cwd, ns, &sparql)
 }
+
+/// Lightweight (slug, display-name, stored-path) for every project — used by the
+/// folder-move nudge to match a moved directory against registered project paths.
+pub fn list_paths(cwd: &Path, ns: &NamespaceConfig) -> Result<Vec<(String, String, String)>> {
+    let p = &ns.prefix;
+    let sparql = format!(
+        "SELECT ?iri ?name ?path WHERE {{ GRAPH ?g {{ \
+         ?iri a {p}:Project ; {p}:name ?name ; {p}:path ?path }} }}"
+    );
+    let QueryResults::Solutions(sols) = crud::load_and_query(cwd, ns, &sparql)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for row in sols.filter_map(|r| r.ok()) {
+        let disp = |k: &str| row.get(k).map(|t| crud::term_display(t.into())).unwrap_or_default();
+        let iri = disp("iri");
+        let slug = iri.rsplit('/').next().unwrap_or(&iri).to_string();
+        out.push((slug, disp("name"), disp("path")));
+    }
+    Ok(out)
+}
+
+/// Result of a repath, for caller reporting.
+pub struct RepathResult {
+    pub name: String,
+    pub old_path: Option<String>,
+    pub new_path: String,
+    pub domain_changed: bool,
+}
+
+/// Re-point a project's folder in the graph (`ops:path`) AND swap its domain trigger
+/// in domains.toml. This is the corrective for path drift — a folder that moved (e.g.
+/// a framework promoted into the toolbox workspace) keeps being measured by the
+/// active-state reconcile, and its domain keeps matching. The domain name is the
+/// project's display name (the auto-created domain on `project add`).
+pub fn repath(cwd: &Path, ns: &NamespaceConfig, slug: &str, new_path: &str) -> Result<RepathResult> {
+    let iri = crud::build_iri(ns, "project", slug);
+    let ws_slug = crud::workspace_slug(cwd);
+    let graph = crud::workspace_graph_iri(ns, &ws_slug);
+    let p = &ns.prefix;
+
+    // Current name (= domain name) + old path, for the trigger swap + reporting.
+    let sel = format!(
+        "SELECT ?name ?path WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:name ?name . \
+         OPTIONAL {{ <{iri}> {p}:path ?path }} }} }}"
+    );
+    let (name, old_path) = match crud::load_and_query(cwd, ns, &sel)? {
+        QueryResults::Solutions(sols) => {
+            let mut name = String::new();
+            let mut old = None;
+            for row in sols.filter_map(|r| r.ok()) {
+                name = row.get("name").map(|t| crud::term_display(t.into())).unwrap_or_default();
+                old = row.get("path").map(|t| crud::term_display(t.into()));
+            }
+            (name, old)
+        }
+        _ => (String::new(), None),
+    };
+    if name.is_empty() {
+        anyhow::bail!("project '{slug}' not found in this workspace graph");
+    }
+
+    // 1) Update the graph path.
+    let np = crud::escape_sparql_literal(new_path);
+    let upd = crud::field_update(&graph, &iri, &format!("{p}:path"), &format!("\"{np}\""));
+    crud::load_and_mutate(cwd, ns, &upd)?;
+
+    // 2) Swap the domain trigger (domain name == project display name).
+    let domain_changed =
+        crate::domain::repath_trigger(cwd, &name, old_path.as_deref(), new_path).unwrap_or(false);
+
+    Ok(RepathResult { name, old_path, new_path: new_path.to_string(), domain_changed })
+}

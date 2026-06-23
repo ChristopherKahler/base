@@ -159,6 +159,44 @@ pub fn add_trigger(
     Ok(())
 }
 
+/// Swap a path trigger on a domain: drop `old` (if present), add `new`. Used by
+/// `base project repath` so a domain keeps matching its folder after the folder
+/// moves. Returns Ok(true) when the domain existed and its triggers changed.
+pub fn repath_trigger(
+    cwd: &Path,
+    domain_name: &str,
+    old: Option<&str>,
+    new: &str,
+) -> anyhow::Result<bool> {
+    let Some(base_dir) = crate::config::find_workspace_base(cwd) else {
+        return Ok(false);
+    };
+    let toml_path = base_dir.join("domains.toml");
+    if !toml_path.exists() {
+        return Ok(false);
+    }
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(&toml_path)?)?;
+    let Some(domain) = file.domain.iter_mut().find(|d| d.name == domain_name) else {
+        return Ok(false);
+    };
+
+    let before = domain.paths.clone();
+    if let Some(o) = old {
+        domain.paths.retain(|x| x != o);
+    }
+    if !domain.paths.iter().any(|x| x == new) {
+        domain.paths.push(new.to_string());
+    }
+    if domain.paths == before {
+        return Ok(false);
+    }
+
+    let tmp_path = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp_path, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp_path, &toml_path)?;
+    Ok(true)
+}
+
 pub fn create_domain(
     _cwd: &Path,
     domain_name: &str,
