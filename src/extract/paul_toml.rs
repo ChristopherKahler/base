@@ -134,9 +134,18 @@ pub fn ingest_paul_projects(
 
     let mut registered = 0usize;
 
-    for (_toml_path, paul) in projects {
+    for (toml_path, paul) in projects {
         let slug = crud::slugify(&paul.name);
         let iri = crud::build_iri(ns, "project", &slug);
+
+        // Path = the directory we ACTUALLY found the paul.toml in, not paul.toml's
+        // self-declared `path` field. The field only updates during a paul ceremony,
+        // so it goes stale the instant a project is moved; the discovered location is
+        // always live truth. (`.../X/.paul/paul.toml` → `X`.)
+        let discovered_dir = toml_path
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|d| d.to_string_lossy().to_string());
 
         // Re-ingest the volatile paul-derived fields idempotently, but PRESERVE the
         // mechanical-state predicates: lastActive, status, deferredReason, resurfaceAt,
@@ -158,10 +167,10 @@ pub fn ingest_paul_projects(
         // Build milestone/phase/loop description
         let mut extra_triples = String::new();
 
-        if !paul.path.is_empty() {
+        if let Some(ref dir) = discovered_dir {
             extra_triples.push_str(&format!(
                 "      <{iri}> {p}:path \"{}\" .\n",
-                escape(&paul.path)
+                escape(dir)
             ));
         }
 

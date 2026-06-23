@@ -346,21 +346,44 @@ fn extract_file_paths(event: &serde_json::Value) -> Vec<PathBuf> {
 }
 
 /// Find the workspace .base/graph.nq by walking upward from cwd.
-/// Detect `mv` of a registered project's folder and emit a repath nudge to stdout
-/// (injected as additionalContext). Silent unless a moved folder matches a project
-/// path by basename — no noise on ordinary `mv`s.
+/// Handle `mv` of a project directory:
+///   · PAUL project (moved dir has `.paul/paul.toml`) → auto-rewrite the paul.toml
+///     `path` field to the new location (base ingest then self-corrects the graph).
+///   · non-PAUL registered project (basename match) → emit a `repath` nudge.
+/// Silent on ordinary `mv`s.
 fn emit_move_nudge(config: &BaseConfig, cwd: &Path, command: &str) {
     let moves = detect_dir_moves(command);
     if moves.is_empty() {
         return;
     }
-    let projects = match crud::project::list_paths(cwd, &config.namespace) {
-        Ok(v) if !v.is_empty() => v,
-        _ => return,
-    };
+    let mut projects: Option<Vec<(String, String, String)>> = None;
+
     for (src, dest) in &moves {
+        let Some(new_dir) = resolve_moved_dir(cwd, src, dest) else { continue };
+
+        // PAUL project moved → keep its paul.toml path field honest, automatically.
+        let paul_toml = new_dir.join(".paul").join("paul.toml");
+        if paul_toml.is_file() {
+            let abs = new_dir.to_string_lossy().to_string();
+            if update_paul_path(&paul_toml, &abs).unwrap_or(false) {
+                println!(
+                    "<base:paul-path-synced>\n\
+                     Moved PAUL project → {abs}\n\
+                     Rewrote {} path field to the new location; base re-ingests the real \
+                     directory at next session-start (ops:path self-corrects).\n\
+                     </base:paul-path-synced>",
+                    paul_toml.display()
+                );
+            }
+            continue;
+        }
+
+        // Non-PAUL registered project → repath nudge (graph path is the source there).
         let Some(src_base) = basename(&strip_paul(src)) else { continue };
-        for (slug, name, ppath) in &projects {
+        let list = projects.get_or_insert_with(|| {
+            crud::project::list_paths(cwd, &config.namespace).unwrap_or_default()
+        });
+        for (slug, name, ppath) in list.iter() {
             if basename(&strip_paul(ppath)).as_deref() == Some(src_base.as_str()) {
                 println!(
                     "<base:path-drift>\n\
@@ -372,6 +395,75 @@ fn emit_move_nudge(config: &BaseConfig, cwd: &Path, command: &str) {
             }
         }
     }
+}
+
+/// Resolve the new on-disk directory of a moved folder. `mv src dest` lands either
+/// at `dest` (rename) or `dest/<basename(src)>` (move into an existing dir).
+fn resolve_moved_dir(cwd: &Path, src: &str, dest: &str) -> Option<PathBuf> {
+    let abs = |p: &str| {
+        let pb = PathBuf::from(p);
+        if pb.is_absolute() { pb } else { cwd.join(pb) }
+    };
+    let dest_path = abs(dest);
+    let into = basename(src).map(|b| dest_path.join(b));
+    match into {
+        Some(d) if d.is_dir() => Some(d),
+        _ if dest_path.is_dir() => Some(dest_path),
+        _ => None,
+    }
+}
+
+/// Rewrite the top-level `path = "..."` line in a paul.toml. Returns Ok(true) when
+/// the file changed. Line-based (preserves paul's formatting + comments). Operates
+/// only on the top-level keys (above the first `[table]`); inserts after `name =`
+/// when no path field exists.
+fn update_paul_path(paul_toml: &Path, new_dir: &str) -> std::io::Result<bool> {
+    let content = std::fs::read_to_string(paul_toml)?;
+    let target = format!("path = \"{new_dir}\"");
+
+    // Phase 1: replace an existing top-level path line (stop at the first table).
+    let mut out: Vec<String> = Vec::with_capacity(content.lines().count() + 1);
+    let mut replaced = false;
+    let mut in_tables = false;
+    for line in content.lines() {
+        let t = line.trim_start();
+        if t.starts_with('[') {
+            in_tables = true;
+        }
+        if !replaced && !in_tables && (t.starts_with("path =") || t.starts_with("path=")) {
+            if line == target {
+                return Ok(false); // already correct
+            }
+            out.push(target.clone());
+            replaced = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+
+    // Phase 2: no path field existed → insert after `name =`, else before the first
+    // table, else at the top — always keeping it a top-level key.
+    if !replaced {
+        let pos = out
+            .iter()
+            .position(|l| {
+                let t = l.trim_start();
+                t.starts_with("name =") || t.starts_with("name=")
+            })
+            .map(|i| i + 1)
+            .or_else(|| out.iter().position(|l| l.trim_start().starts_with('[')))
+            .unwrap_or(0);
+        out.insert(pos, target);
+    }
+
+    let mut body = out.join("\n");
+    if content.ends_with('\n') {
+        body.push('\n');
+    }
+    let tmp = paul_toml.with_extension("toml.tmp");
+    std::fs::write(&tmp, &body)?;
+    std::fs::rename(&tmp, paul_toml)?;
+    Ok(true)
 }
 
 /// Parse `mv` invocations from a shell command, returning (src, dest) pairs. Naive
