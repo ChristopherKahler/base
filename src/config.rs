@@ -61,6 +61,8 @@ pub struct BaseConfig {
     #[serde(default)]
     pub grounding: GroundingConfig,
     #[serde(default)]
+    pub graph: GraphConfig,
+    #[serde(default)]
     pub flow: FlowConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
@@ -128,6 +130,37 @@ pub struct DevmodeConfig {
 pub struct GroundingConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+// ─── Graph Config (Phase 52 — proactive compaction) ─────────
+
+/// Graph-hygiene policy. Auto-compaction runs from the session-start guard (a
+/// low-frequency path — NOT the hook hot path) when a tier graph exceeds the size
+/// threshold, so graphs never balloon on a user's machine.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GraphConfig {
+    /// Master switch for proactive auto-compaction (opt-out).
+    #[serde(default = "default_true")]
+    pub auto_compact: bool,
+    /// Compact a tier graph at session-start once it exceeds this many MB.
+    #[serde(default = "default_compact_threshold_mb")]
+    pub compact_threshold_mb: u64,
+    /// Minimum hours between auto-compactions of the same tier (anti-churn).
+    #[serde(default = "default_compact_cooldown_hours")]
+    pub compact_cooldown_hours: i64,
+}
+
+fn default_compact_threshold_mb() -> u64 { 12 }
+fn default_compact_cooldown_hours() -> i64 { 24 }
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        Self {
+            auto_compact: true,
+            compact_threshold_mb: default_compact_threshold_mb(),
+            compact_cooldown_hours: default_compact_cooldown_hours(),
+        }
+    }
 }
 
 // ─── Flow Config ────────────────────────────────────────────

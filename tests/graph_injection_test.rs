@@ -290,8 +290,13 @@ rules = ["Never lie", "New rule C"]
     let store = base::store::load_graph(&base_dir.join("graph.nq")).unwrap();
     let p = &ns.prefix;
     let u = &ns.uri;
+    // Scope the count to the GLOBAL domain's own rules. sync writes EVERY merged
+    // domain's rules (incl. the host's real global domains.toml) into the graph, so
+    // an unscoped `?r a Rule` count is host-dependent; the GLOBAL domain's hasRule
+    // edges are exactly {Never lie, New rule C, CLI-added rule} = 3 (Phase 52 fix).
+    let global_iri = base::crud::build_iri(ns, "domain", "global");
     let sparql = format!(
-        "PREFIX {p}: <{u}>\nSELECT ?text WHERE {{ GRAPH ?g {{ ?r a {p}:Rule ; {p}:ruleText ?text . }} }}"
+        "PREFIX {p}: <{u}>\nSELECT ?text WHERE {{ GRAPH ?g {{ <{global_iri}> {p}:hasRule ?r . ?r {p}:ruleText ?text . }} }}"
     );
     let texts: Vec<String> = match store.query(&sparql).unwrap() {
         oxigraph::sparql::QueryResults::Solutions(sols) => sols

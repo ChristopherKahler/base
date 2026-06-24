@@ -391,12 +391,22 @@ pub fn bundle_install(manifest_path: &Path) -> anyhow::Result<BundleOutcome> {
     }
     std::fs::create_dir_all(&dest)?;
 
-    // Copy the framework tree. Keep node_modules (vendored = offline-ready);
-    // drop VCS + generated output.
-    let exclude = [".git", "generated_imgs"];
+    // Copy the framework tree, EXCLUDING build artifacts + VCS + generated output.
+    // These are regenerable and can be huge — a Rust `target/` swept 205 MB on a real
+    // install (Phase 53). node_modules is dropped too: JS deps resolve via the
+    // npm-install fallback below (the portable, per-platform-safe pattern), not a
+    // vendored copy.
+    let exclude = [
+        "target",
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        "generated_imgs",
+    ];
     let files_copied = copy_dir_all(&source, &dest, &exclude)?;
 
-    // Deps: vendored via copy, else install if there's a package.json.
+    // Deps: vendored copy survived the exclude (rare), else install from package.json.
     let deps_ready = if dest.join("node_modules").is_dir() {
         true
     } else if dest.join("package.json").exists() {
@@ -924,6 +934,31 @@ DUP=second
                 .permissions()
                 .mode();
             assert!(mode & 0o111 != 0, "exec bit preserved on copy");
+        }
+    }
+
+    // Phase 53: the bundle copy must drop build-artifact dirs (a Rust `target/`
+    // swept 205 MB on a real install) while keeping real source.
+    #[test]
+    fn copy_dir_all_excludes_build_dirs() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        // Real source to keep.
+        std::fs::create_dir_all(src.path().join("src")).unwrap();
+        std::fs::write(src.path().join("src/main.rs"), "fn main() {}").unwrap();
+        // Build/dep/VCS dirs to drop.
+        for d in ["target", "node_modules", ".git", "dist", "build"] {
+            std::fs::create_dir_all(src.path().join(d)).unwrap();
+            std::fs::write(src.path().join(d).join("junk"), "x").unwrap();
+        }
+
+        let exclude = ["target", "node_modules", ".git", "dist", "build", "generated_imgs"];
+        let n = copy_dir_all(src.path(), dst.path(), &exclude).unwrap();
+
+        assert_eq!(n, 1, "only src/main.rs copied");
+        assert!(dst.path().join("src/main.rs").exists());
+        for d in ["target", "node_modules", ".git", "dist", "build"] {
+            assert!(!dst.path().join(d).exists(), "{d} must be excluded");
         }
     }
 }

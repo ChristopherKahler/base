@@ -71,6 +71,83 @@ pub fn format_compact_human(o: &CompactOutcome) -> String {
     )
 }
 
+// ─── Proactive auto-compaction (Phase 52) ──────────────────────────────────
+
+/// Session-start guard: compact any tier graph that has ballooned past the
+/// configured size threshold, respecting a per-tier cooldown so it never churns
+/// every session. Backup-first + atomic (via [`compact_tier`]); skips an unhealthy
+/// graph (repair must come first). Cheap when nothing is over threshold — one
+/// `stat` per tier, no graph load. Returns the compactions that actually ran so
+/// the caller can print a one-line notice.
+pub fn auto_compact_tiers(cfg: &crate::config::GraphConfig, cwd: &Path) -> Vec<CompactOutcome> {
+    let mut done = Vec::new();
+    if !cfg.auto_compact {
+        return done;
+    }
+    let threshold = cfg.compact_threshold_mb.saturating_mul(1024 * 1024);
+
+    for dir in tier_base_dirs(cwd) {
+        let path = dir.join("graph.nq");
+        let marker = dir.join(".last-auto-compact");
+        if !tier_needs_compaction(&path, threshold, &marker, cfg.compact_cooldown_hours) {
+            continue;
+        }
+        // Stamp the cooldown marker regardless of outcome — an unhealthy graph
+        // shouldn't be retried every session (warn_unhealthy_graphs already shouts).
+        let _ = std::fs::write(&marker, crate::crud::now_iso());
+        if let Ok(outcome) = compact_tier(&path) {
+            done.push(outcome);
+        }
+    }
+    done
+}
+
+/// A tier is due for compaction when its graph exists, exceeds the byte threshold,
+/// and is outside the cooldown window. Pure (stat-only) — the testable decision.
+fn tier_needs_compaction(path: &Path, threshold_bytes: u64, marker: &Path, cooldown_hours: i64) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.len() > threshold_bytes && !within_cooldown(marker, cooldown_hours),
+        Err(_) => false,
+    }
+}
+
+/// Workspace `.base/` (if any) + global `~/.base-gbl/.base/`, de-duplicated.
+fn tier_base_dirs(cwd: &Path) -> Vec<std::path::PathBuf> {
+    let mut bases = Vec::new();
+    if let Some(ws) = crate::config::find_workspace_base(cwd) {
+        bases.push(ws);
+    }
+    if let Some(home) = dirs::home_dir() {
+        let global = home.join(".base-gbl").join(".base");
+        if !bases.contains(&global) {
+            bases.push(global);
+        }
+    }
+    bases
+}
+
+/// True when the marker exists and is younger than `hours` (cooldown still active).
+fn within_cooldown(marker: &Path, hours: i64) -> bool {
+    if hours <= 0 {
+        return false;
+    }
+    let Ok(modified) = std::fs::metadata(marker).and_then(|m| m.modified()) else {
+        return false;
+    };
+    match modified.elapsed() {
+        Ok(elapsed) => elapsed.as_secs() < (hours as u64) * 3600,
+        Err(_) => false, // future mtime (clock skew) → allow compaction
+    }
+}
+
+/// One-line session-start notice for an auto-compaction.
+pub fn format_auto_compact_notice(o: &CompactOutcome) -> String {
+    format!(
+        "ⓘ base auto-compacted {} — {} → {} lines ({} removed; backup: {})",
+        o.path, o.lines_before, o.lines_after, o.removed, o.backup
+    )
+}
+
 // ─── Purge (Phase 36-02 — usage-based note GC) ─────────────────────────────
 
 /// Outcome of a `base graph purge --stale` pass.
@@ -340,5 +417,47 @@ mod tests {
         let ns = NamespaceConfig::default();
         assert!(purge_stale(&p, &ns, 90, true).is_err(), "refuses corrupt graph");
         assert_eq!(fs::read(&p).unwrap(), before, "corrupt graph untouched");
+    }
+
+    // ─── Phase 52: proactive auto-compaction decision ──────────
+
+    #[test]
+    fn tier_needs_compaction_thresholds_and_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.nq");
+        let marker = dir.path().join(".last-auto-compact");
+
+        // Missing graph → never.
+        assert!(!tier_needs_compaction(&path, 0, &marker, 24));
+
+        // 100-byte graph: under a 1000-byte threshold → no; over a 10-byte → yes.
+        fs::write(&path, vec![b'.'; 100]).unwrap();
+        assert!(!tier_needs_compaction(&path, 1000, &marker, 24));
+        assert!(tier_needs_compaction(&path, 10, &marker, 24));
+
+        // Fresh cooldown marker suppresses it; cooldown 0 disables the window.
+        fs::write(&marker, "now").unwrap();
+        assert!(!tier_needs_compaction(&path, 10, &marker, 24));
+        assert!(tier_needs_compaction(&path, 10, &marker, 0));
+    }
+
+    #[test]
+    fn within_cooldown_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".m");
+        // Absent marker → not cooling.
+        assert!(!within_cooldown(&marker, 24));
+        // Fresh marker → cooling (under 24h).
+        fs::write(&marker, "x").unwrap();
+        assert!(within_cooldown(&marker, 24));
+        // Zero/negative window is always off.
+        assert!(!within_cooldown(&marker, 0));
+    }
+
+    #[test]
+    fn auto_compact_disabled_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::GraphConfig { auto_compact: false, compact_threshold_mb: 0, compact_cooldown_hours: 24 };
+        assert!(auto_compact_tiers(&cfg, dir.path()).is_empty());
     }
 }

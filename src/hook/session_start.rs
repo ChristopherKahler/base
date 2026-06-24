@@ -12,6 +12,13 @@ pub fn handle(config: &BaseConfig, cwd: &Path) -> Result<()> {
     // broken graph announces itself immediately instead of degrading silently.
     warn_unhealthy_graphs(cwd);
 
+    // Proactive graph hygiene (Phase 52): compact any tier graph that has ballooned
+    // past the threshold so graphs never balloon on a user's machine. Low-frequency
+    // path; backup-first + atomic + cooldown-gated; skips an unhealthy graph.
+    for outcome in crate::graph::auto_compact_tiers(&config.graph, cwd) {
+        println!("{}", crate::graph::format_auto_compact_notice(&outcome));
+    }
+
     // Clear session dedup state for fresh session
     // Try workspace first, fall back to global tier for no-workspace users
     let session_base_dir = crate::config::find_workspace_base(cwd)
