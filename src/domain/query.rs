@@ -20,14 +20,15 @@ pub fn query_domain_from_graph(
     let domain_iri = crud::build_iri(ns, "domain", &domain_slug);
     let pfx = crud::prefixes(ns);
 
-    // Query 1: Get rules ordered by priority
+    // Query 1: Get rules ordered by priority, with optional rationale (Phase 26)
     let rules_sparql = format!(
         "{pfx}\n\
-         SELECT ?text WHERE {{\n\
+         SELECT ?text ?rationale WHERE {{\n\
            GRAPH ?g {{\n\
              <{domain_iri}> {p}:hasRule ?rule .\n\
              ?rule {p}:ruleText ?text .\n\
              OPTIONAL {{ ?rule {p}:priority ?pri }}\n\
+             OPTIONAL {{ ?rule {p}:rationale ?rationale }}\n\
            }}\n\
          }}\n\
          ORDER BY ?pri"
@@ -38,12 +39,22 @@ pub fn query_domain_from_graph(
             let rules: Vec<String> = solutions
                 .filter_map(|r| r.ok())
                 .filter_map(|row| {
-                    row.get("text").map(|t| match t.into() {
+                    let text = match row.get("text")?.into() {
                         TermRef::Literal(l) => l.value().to_string(),
-                        _ => String::new(),
-                    })
+                        _ => return None,
+                    };
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let rationale = row.get("rationale").and_then(|t| match t.into() {
+                        TermRef::Literal(l) => {
+                            let v = l.value().to_string();
+                            (!v.is_empty()).then_some(v)
+                        }
+                        _ => None,
+                    });
+                    Some(domain::render_rule(&text, rationale.as_deref()))
                 })
-                .filter(|s| !s.is_empty())
                 .collect();
 
             if rules.is_empty() {
@@ -233,7 +244,7 @@ pub fn format_toml_rules(domain_def: &domain::DomainDef) -> String {
     }
     let mut out = format!("[DOMAIN: {}]\n", domain_def.name);
     for (i, rule) in domain_def.rules.iter().enumerate() {
-        out.push_str(&format!("  {i}. {rule}\n"));
+        out.push_str(&format!("  {i}. {}\n", rule.render()));
     }
     out
 }

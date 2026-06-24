@@ -59,6 +59,8 @@ pub struct BaseConfig {
     #[serde(default)]
     pub devmode: DevmodeConfig,
     #[serde(default)]
+    pub grounding: GroundingConfig,
+    #[serde(default)]
     pub flow: FlowConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
@@ -113,6 +115,17 @@ impl Default for BracketConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct DevmodeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+// ─── Grounding Config (Phase 30) ────────────────────────────
+
+/// System-level toggle (like devmode). When enabled, every prompt-time hook
+/// injection carries a `<grounding>` block instructing source-verification of
+/// factual claims. Settable via `base config set grounding.enabled true`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GroundingConfig {
     #[serde(default)]
     pub enabled: bool,
 }

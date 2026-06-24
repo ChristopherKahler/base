@@ -2069,8 +2069,8 @@ pub async fn get_domains(
     let pfx = crate::crud::prefixes(ns);
 
     let result: Vec<DomainInfo> = domains.iter().map(|d| {
-        // Merge TOML rules with graph-native rules
-        let mut rules = d.rules.clone();
+        // Merge TOML rules (rendered with rationale) with graph-native rules
+        let mut rules = d.rendered_rules();
 
         let domain_slug = crate::crud::slugify(&d.name);
         let domain_iri = crate::crud::build_iri(ns, "domain", &domain_slug);

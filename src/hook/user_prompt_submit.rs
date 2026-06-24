@@ -97,6 +97,10 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // Track injection metadata for DEVMODE
     let mut loaded_domains: Vec<(String, String, usize)> = Vec::new(); // (name, match_reason, rule_count)
     let mut deduped_count = 0usize;
+    // Steering layer (v0.4): dedup domain-linked command injection across domains,
+    // and remember whether any fresh content was injected (gates the grounding block).
+    let mut injected_commands: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut injected_any = false;
 
     // Format and emit matched rules
     for dm in &matched {
@@ -115,8 +119,47 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             None => (format_toml_rules(domain_def), String::new()),
         };
 
-        // Don't short-circuit if domain has a query — query-only domains have no rules/neighborhood
-        if rules_text.is_empty() && neighborhood_text.is_empty() && domain_def.query.is_none() {
+        // ─── Steering layer (v0.4): role / linked commands / output-mode / format ───
+        // Role (Phase 29): first line of the domain block.
+        let role_line = domain_def.role.as_deref().map(str::trim).filter(|r| !r.is_empty());
+
+        // Domain-linked command rules (Phase 28): inject each linked mode's rules
+        // once. Explicit *commands short-circuit before domain matching, so this
+        // path only fires when no explicit star was typed — no cross-dedup needed.
+        let mut command_block = String::new();
+        if command_activation_fires(&domain_def.command_activation, &dm.reason) {
+            for cmd_name in &domain_def.commands {
+                let key = cmd_name.to_lowercase();
+                if injected_commands.contains(&key) {
+                    continue;
+                }
+                if let Some(cmd) = commands.iter().find(|c| c.name.eq_ignore_ascii_case(cmd_name)) {
+                    let rendered = crate::command::format_command_output(cmd);
+                    if !rendered.is_empty() {
+                        if !command_block.is_empty() {
+                            command_block.push('\n');
+                        }
+                        command_block.push_str(&rendered);
+                        injected_commands.insert(key);
+                    }
+                }
+            }
+        }
+
+        // Output mode (Phase 31) + format directive (Phase 32).
+        let output_mode_line = output_mode_directive(domain_def.output_mode.as_deref());
+        let format_line = domain_def.format.as_deref().map(str::trim).filter(|f| !f.is_empty());
+
+        // Skip only when the domain contributes nothing — rules, neighborhood, a
+        // query, or any steering directive all count as content.
+        if rules_text.is_empty()
+            && neighborhood_text.is_empty()
+            && domain_def.query.is_none()
+            && role_line.is_none()
+            && command_block.is_empty()
+            && output_mode_line.is_none()
+            && format_line.is_none()
+        {
             continue;
         }
 
@@ -131,23 +174,31 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             _ => String::new(),
         };
 
-        // Build combined output for this domain
-        let mut domain_output = String::new();
+        // Assemble in steering order:
+        // role → command rules → rules → neighborhood → query → output-mode → format.
+        let mut sections: Vec<&str> = Vec::new();
+        if let Some(r) = role_line {
+            sections.push(r);
+        }
+        if !command_block.is_empty() {
+            sections.push(&command_block);
+        }
         if !rules_text.is_empty() {
-            domain_output.push_str(&rules_text);
+            sections.push(&rules_text);
         }
         if !neighborhood_text.is_empty() {
-            if !domain_output.is_empty() {
-                domain_output.push('\n');
-            }
-            domain_output.push_str(&neighborhood_text);
+            sections.push(&neighborhood_text);
         }
         if !query_text.is_empty() {
-            if !domain_output.is_empty() {
-                domain_output.push('\n');
-            }
-            domain_output.push_str(&query_text);
+            sections.push(&query_text);
         }
+        if let Some(om) = output_mode_line {
+            sections.push(om);
+        }
+        if let Some(f) = format_line {
+            sections.push(f);
+        }
+        let domain_output = sections.join("\n");
 
         // Dedup: hash combined output (rules + neighborhood), skip if unchanged.
         // Hash over SORTED lines — SPARQL result order shifts when the graph
@@ -192,9 +243,16 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
 
         output.push_str(&domain_output);
         output.push('\n');
+        injected_any = true;
 
         // Mark as injected in session state
         session.mark_injected(&domain_def.name, combined_hash);
+    }
+
+    // Grounding (Phase 30): when enabled, ride a source-verification block on any
+    // fresh injection this prompt. Skipped on dedup-only prompts (already grounded).
+    if config.grounding.enabled && injected_any {
+        output.push_str(&grounding_block());
     }
 
     // DEVMODE block (Task 2 will populate this fully)
@@ -386,6 +444,40 @@ fn needs_sync_check(domains_toml: &Path, marker: &Path) -> bool {
     }
 }
 
+// ─── Steering layer helpers (v0.4) ──────────────────────────
+
+/// Whether a domain's linked `commands` should auto-activate, given how it
+/// matched. "disabled" suppresses; "keyword"/"filepath" gate on the match
+/// reason; "both" (default) and any unknown value activate on any match (Phase 28).
+fn command_activation_fires(activation: &str, reason: &crate::domain::matcher::MatchReason) -> bool {
+    use crate::domain::matcher::MatchReason::*;
+    match activation {
+        "disabled" => false,
+        "keyword" => matches!(reason, Keyword | KeywordAndFilepath | Always),
+        "filepath" => matches!(reason, Filepath | KeywordAndFilepath),
+        _ => true,
+    }
+}
+
+/// Render the output-mode directive for a domain (Phase 31). "ask"/None/unknown
+/// inject nothing — the model decides per prompt.
+fn output_mode_directive(mode: Option<&str>) -> Option<&'static str> {
+    match mode.map(str::trim) {
+        Some("file") => Some("Default output mode: write to file artifacts."),
+        Some("inline") => Some("Default output mode: respond inline in chat."),
+        _ => None,
+    }
+}
+
+/// The grounding block appended to injections when the system flag is on (Phase 30).
+fn grounding_block() -> String {
+    "\n<grounding>\n\
+     Verify factual claims against current sources before presenting as fact.\n\
+     Treat unfamiliar proper nouns, version numbers, and status claims as requiring search verification.\n\
+     </grounding>\n"
+        .to_string()
+}
+
 // ─── Prompt extraction ──────────────────────────────────────
 
 /// Extract prompt text from the hook event JSON.
@@ -437,5 +529,71 @@ fn gather_active_paths(config: &BaseConfig, graph: &Option<oxigraph::store::Stor
             })
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod steering_tests {
+    use super::*;
+    use crate::domain::matcher::MatchReason;
+
+    // ─── Phase 28: command_activation gating ─────────────────
+
+    #[test]
+    fn activation_disabled_never_fires() {
+        for r in [MatchReason::Always, MatchReason::Keyword, MatchReason::Filepath, MatchReason::KeywordAndFilepath] {
+            assert!(!command_activation_fires("disabled", &r));
+        }
+    }
+
+    #[test]
+    fn activation_keyword_gates_on_keyword_match() {
+        assert!(command_activation_fires("keyword", &MatchReason::Keyword));
+        assert!(command_activation_fires("keyword", &MatchReason::KeywordAndFilepath));
+        assert!(command_activation_fires("keyword", &MatchReason::Always));
+        assert!(!command_activation_fires("keyword", &MatchReason::Filepath));
+    }
+
+    #[test]
+    fn activation_filepath_gates_on_path_match() {
+        assert!(command_activation_fires("filepath", &MatchReason::Filepath));
+        assert!(command_activation_fires("filepath", &MatchReason::KeywordAndFilepath));
+        assert!(!command_activation_fires("filepath", &MatchReason::Keyword));
+        assert!(!command_activation_fires("filepath", &MatchReason::Always));
+    }
+
+    #[test]
+    fn activation_both_and_unknown_fire_on_any_match() {
+        for activation in ["both", "", "garbage"] {
+            assert!(command_activation_fires(activation, &MatchReason::Keyword));
+            assert!(command_activation_fires(activation, &MatchReason::Filepath));
+        }
+    }
+
+    // ─── Phase 31: output-mode directive ─────────────────────
+
+    #[test]
+    fn output_mode_directive_maps_known_modes() {
+        assert_eq!(
+            output_mode_directive(Some("file")),
+            Some("Default output mode: write to file artifacts.")
+        );
+        assert_eq!(
+            output_mode_directive(Some("inline")),
+            Some("Default output mode: respond inline in chat.")
+        );
+        assert_eq!(output_mode_directive(Some("ask")), None);
+        assert_eq!(output_mode_directive(None), None);
+        assert_eq!(output_mode_directive(Some("nonsense")), None);
+    }
+
+    // ─── Phase 30: grounding block ───────────────────────────
+
+    #[test]
+    fn grounding_block_has_tags() {
+        let b = grounding_block();
+        assert!(b.contains("<grounding>"));
+        assert!(b.contains("</grounding>"));
+        assert!(b.contains("Verify factual claims"));
     }
 }

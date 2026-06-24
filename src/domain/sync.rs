@@ -130,9 +130,18 @@ fn sync_domain_list(
             .update(&rule_gc)
             .with_context(|| format!("Failed to GC synced rules for domain '{}'", domain_def.name))?;
 
-        // Insert rules (marked with source so the GC above scopes to them next sync)
-        for (i, rule_text) in domain_def.rules.iter().enumerate() {
+        // Insert rules (marked with source so the GC above scopes to them next sync).
+        // Rationale (Phase 26) persists as an optional ops:rationale triple — the
+        // graph is the live render path for rules (query_domain_from_graph).
+        for (i, rule) in domain_def.rules.iter().enumerate() {
             let rule_iri = crud::build_iri(ns, "rule", &format!("{domain_slug}/{i}"));
+            let rationale_triple = match rule.rationale() {
+                Some(r) => format!(
+                    "                       {p}:rationale \"{}\" ;\n",
+                    crud::escape_sparql_literal(r)
+                ),
+                None => String::new(),
+            };
             let rule_insert = format!(
                 "{pfx}\n\
                  INSERT DATA {{\n\
@@ -140,11 +149,12 @@ fn sync_domain_list(
                      <{rule_iri}> rdf:type {p}:Rule ;\n\
                        {p}:ruleText \"{}\" ;\n\
                        {p}:priority \"{i}\" ;\n\
+                 {rationale_triple}\
                        {p}:source \"{}\" .\n\
                      <{domain_iri}> {p}:hasRule <{rule_iri}> .\n\
                    }}\n\
                  }}",
-                crud::escape_sparql_literal(rule_text),
+                crud::escape_sparql_literal(rule.text()),
                 crud::escape_sparql_literal(&source_marker),
             );
             store
@@ -639,5 +649,56 @@ rules = ["Legacy rule"]
             assert_eq!(kws.len(), 1);
             assert_eq!(kws[0], "old keyword");
         }
+    }
+
+    // ─── Phase 26: rationale persists to graph and renders on injection ──
+    #[test]
+    fn sync_persists_rationale_and_graph_render_includes_because() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_dir = tmp.path().join(".base");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let toml = r#"
+[[domain]]
+name = "GUARD"
+mode = "triggered"
+rules = [{ text = "Never lie", rationale = "trust is load-bearing" }, "Be terse"]
+"#;
+        std::fs::write(base_dir.join("domains.toml"), toml).unwrap();
+
+        let config = BaseConfig::load(tmp.path());
+        let domains = parse_domains(toml);
+        sync_domain_list(&config.namespace, tmp.path(), &domains, None).unwrap();
+
+        // ops:rationale lands in the graph for the detailed rule.
+        let ns = &config.namespace;
+        let p = &ns.prefix;
+        let results = crud::load_and_query(
+            tmp.path(),
+            ns,
+            &format!("SELECT ?r WHERE {{ GRAPH ?g {{ ?rule {p}:rationale ?r }} }}"),
+        )
+        .unwrap();
+        let rationales: Vec<String> = match results {
+            oxigraph::sparql::QueryResults::Solutions(sols) => sols
+                .filter_map(|r| r.ok())
+                .filter_map(|row| row.get("r").map(|t| crud::term_display(t.into())))
+                .collect(),
+            _ => panic!("expected solutions"),
+        };
+        assert!(
+            rationales.iter().any(|r| r.contains("trust is load-bearing")),
+            "rationale persisted: {rationales:?}"
+        );
+
+        // Isolated workspace graph render shows "Never lie — because ..." and the
+        // bare rule unchanged.
+        let store = crate::store::load_graph(&base_dir.join("graph.nq")).unwrap();
+        let (rules_text, _) =
+            crate::domain::query::query_domain_from_graph(&store, &config, &domains[0]);
+        assert!(
+            rules_text.contains("Never lie — because trust is load-bearing"),
+            "rationale rendered: {rules_text}"
+        );
+        assert!(rules_text.contains("Be terse"), "bare rule intact: {rules_text}");
     }
 }

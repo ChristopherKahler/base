@@ -81,6 +81,11 @@ fn devmode_block_format_includes_domains() {
             rules: vec!["Rule 1".into(), "Rule 2".into()],
             query: None,
             query_format: None,
+            commands: vec![],
+            command_activation: "both".into(),
+            role: None,
+            output_mode: None,
+            format: None,
         },
         base::domain::DomainDef {
             name: "DEVELOPMENT".into(),
@@ -92,6 +97,11 @@ fn devmode_block_format_includes_domains() {
             rules: vec!["Dev rule".into()],
             query: None,
             query_format: None,
+            commands: vec![],
+            command_activation: "both".into(),
+            role: None,
+            output_mode: None,
+            format: None,
         },
         base::domain::DomainDef {
             name: "UNMATCHED".into(),
@@ -103,6 +113,11 @@ fn devmode_block_format_includes_domains() {
             rules: vec!["Unused".into()],
             query: None,
             query_format: None,
+            commands: vec![],
+            command_activation: "both".into(),
+            role: None,
+            output_mode: None,
+            format: None,
         },
     ];
 

@@ -726,6 +726,9 @@ pub enum RuleAction {
         domain: String,
         #[arg(long)]
         text: String,
+        /// Optional rationale — injected as "rule — because rationale" (Phase 26)
+        #[arg(long)]
+        rationale: Option<String>,
     },
     /// List rules for a domain from the graph
     List {
@@ -1234,8 +1237,8 @@ pub fn run() {
                 cwd.clone()
             };
             match action {
-                RuleAction::Add { domain: name, text } => {
-                    match crud::rule::add(&rule_cwd, &config.namespace, &name, &text) {
+                RuleAction::Add { domain: name, text, rationale } => {
+                    match crud::rule::add(&rule_cwd, &config.namespace, &name, &text, rationale.as_deref()) {
                         Ok(index) => println!("Rule {index} added to domain '{name}'"),
                         Err(e) => die("Failed", e),
                     }

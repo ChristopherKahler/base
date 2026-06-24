@@ -6,12 +6,13 @@ use oxigraph::sparql::QueryResults;
 use crate::config::NamespaceConfig;
 use crate::crud;
 
-/// Add a rule to a domain in the graph.
+/// Add a rule to a domain in the graph, optionally with a rationale (Phase 26).
 pub fn add(
     cwd: &Path,
     ns: &NamespaceConfig,
     domain_name: &str,
     rule_text: &str,
+    rationale: Option<&str>,
 ) -> Result<u32> {
     let p = &ns.prefix;
     let domain_slug = crud::slugify(domain_name);
@@ -41,6 +42,12 @@ pub fn add(
     );
     let _ = crud::load_and_mutate(cwd, ns, &ensure_domain);
 
+    // Optional rationale triple (Phase 26) — "Do X — because Y" on injection.
+    let rationale_triple = match rationale.filter(|r| !r.is_empty()) {
+        Some(r) => format!("               {p}:rationale \"{}\" ;\n", crud::escape_sparql_literal(r)),
+        None => String::new(),
+    };
+
     // Insert rule with edge to domain. {p}:index is what next_rule_index
     // MAXes over — without it every CLI rule would compute index 0 (the
     // original C3 collision, surviving as a predicate mismatch).
@@ -50,6 +57,7 @@ pub fn add(
              <{rule_iri}> rdf:type {p}:Rule ;\n\
                {p}:ruleText \"{escaped}\" ;\n\
                {p}:index \"{next_index}\" ;\n\
+         {rationale_triple}\
                {p}:priority \"{next_index}\" .\n\
              <{domain_iri}> {p}:hasRule <{rule_iri}> .\n\
            }}\n\

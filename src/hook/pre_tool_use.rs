@@ -72,8 +72,9 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         let graph_store = crate::store::load_merged(cwd);
 
         for domain_def in &matched {
-            // Session dedup: skip if this domain's rules were already injected
-            let rules_hash = domain::session::rules_hash(&domain_def.rules);
+            // Session dedup: skip if this domain's rules were already injected.
+            // Hash the rendered rules (text + rationale) so a rationale edit re-injects.
+            let rules_hash = domain::session::rules_hash(&domain_def.rendered_rules());
             if session.is_injected(&domain_def.name, rules_hash) {
                 data.suppressed += 1;
                 continue;
@@ -417,11 +418,12 @@ fn query_rules_from_graph(
 
     let sparql = format!(
         "{pfx}\n\
-         SELECT ?text WHERE {{\n\
+         SELECT ?text ?rationale WHERE {{\n\
            GRAPH ?g {{\n\
              <{domain_iri}> {p}:hasRule ?rule .\n\
              ?rule {p}:ruleText ?text .\n\
              OPTIONAL {{ ?rule {p}:priority ?pri }}\n\
+             OPTIONAL {{ ?rule {p}:rationale ?rationale }}\n\
            }}\n\
          }}\n\
          ORDER BY ?pri"
@@ -432,12 +434,22 @@ fn query_rules_from_graph(
             let rules: Vec<String> = solutions
                 .filter_map(|r| r.ok())
                 .filter_map(|row| {
-                    row.get("text").map(|t| match t.into() {
+                    let text = match row.get("text")?.into() {
                         TermRef::Literal(l) => l.value().to_string(),
-                        _ => String::new(),
-                    })
+                        _ => return None,
+                    };
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let rationale = row.get("rationale").and_then(|t| match t.into() {
+                        TermRef::Literal(l) => {
+                            let v = l.value().to_string();
+                            (!v.is_empty()).then_some(v)
+                        }
+                        _ => None,
+                    });
+                    Some(domain::render_rule(&text, rationale.as_deref()))
                 })
-                .filter(|s| !s.is_empty())
                 .collect();
 
             if rules.is_empty() {
@@ -460,7 +472,7 @@ fn format_toml_rules(domain_def: &domain::DomainDef) -> String {
     }
     let mut out = format!("[FILE MATCH: {}]\n", domain_def.name);
     for (i, rule) in domain_def.rules.iter().enumerate() {
-        out.push_str(&format!("  {i}. {rule}\n"));
+        out.push_str(&format!("  {i}. {}\n", rule.render()));
     }
     out
 }

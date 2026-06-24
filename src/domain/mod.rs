@@ -9,6 +9,68 @@ use serde::{Deserialize, Serialize};
 
 // ─── Domain data model ───────────────────────────────────────
 
+/// A single rule on a domain. Backward-compatible deserialization:
+/// `rules = ["do X"]` (bare string) and `rules = [{ text = "do X", rationale = "because Y" }]`
+/// both parse. The rationale form lets CARL inject "Do X — because Y", which
+/// aligns the model more reliably than the bare instruction (Phase 26).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum RuleEntry {
+    Bare(String),
+    Detailed {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rationale: Option<String>,
+    },
+}
+
+impl RuleEntry {
+    /// The instruction text, without rationale.
+    pub fn text(&self) -> &str {
+        match self {
+            RuleEntry::Bare(s) => s,
+            RuleEntry::Detailed { text, .. } => text,
+        }
+    }
+
+    /// The rationale, if any (empty strings treated as absent).
+    pub fn rationale(&self) -> Option<&str> {
+        match self {
+            RuleEntry::Bare(_) => None,
+            RuleEntry::Detailed { rationale, .. } => {
+                rationale.as_deref().filter(|r| !r.is_empty())
+            }
+        }
+    }
+
+    /// Render for injection: `text — because rationale` when rationale present,
+    /// otherwise just `text`.
+    pub fn render(&self) -> String {
+        render_rule(self.text(), self.rationale())
+    }
+}
+
+impl From<&str> for RuleEntry {
+    fn from(s: &str) -> Self {
+        RuleEntry::Bare(s.to_string())
+    }
+}
+
+impl From<String> for RuleEntry {
+    fn from(s: String) -> Self {
+        RuleEntry::Bare(s)
+    }
+}
+
+/// Render a rule's text + optional rationale for injection. Shared with the
+/// graph-read paths, where rules come back as separate (text, rationale) terms.
+pub fn render_rule(text: &str, rationale: Option<&str>) -> String {
+    match rationale.filter(|r| !r.is_empty()) {
+        Some(r) => format!("{text} — because {r}"),
+        None => text.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DomainDef {
     pub name: String,
@@ -26,22 +88,55 @@ pub struct DomainDef {
     #[serde(default)]
     pub exclude: Vec<String>,
     #[serde(default)]
-    pub rules: Vec<String>,
+    pub rules: Vec<RuleEntry>,
     /// External SPARQL query file to run on match (e.g., "icp-context" resolves to queries/icp-context.sparql).
     #[serde(default)]
     pub query: Option<String>,
     /// Format for query results: "table" | "list" | "prose". Defaults to "list".
     #[serde(default)]
     pub query_format: Option<String>,
+    /// Star-commands to auto-activate when this domain loads (Phase 28), e.g.
+    /// `commands = ["blunt", "analytical"]`. Referenced by name into commands.toml.
+    #[serde(default)]
+    pub commands: Vec<String>,
+    /// How linked `commands` activate: "keyword" | "filepath" | "both" | "disabled".
+    /// "disabled" preserves the config but suppresses auto-activation (Phase 28).
+    #[serde(default = "default_command_activation")]
+    pub command_activation: String,
+    /// One-line role sentence injected as the first line of this domain's block (Phase 29).
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Default output routing for this domain: "file" | "inline" | "ask" (Phase 31).
+    #[serde(default)]
+    pub output_mode: Option<String>,
+    /// Freeform format directive injected as the final line of this domain's block (Phase 32).
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 fn default_mode() -> String {
     "triggered".into()
 }
 
+fn default_command_activation() -> String {
+    "both".into()
+}
+
 impl DomainDef {
     pub fn is_always(&self) -> bool {
         self.mode == "always"
+    }
+
+    /// Rule instruction texts only (no rationale). Used where stable, rationale-free
+    /// strings are needed (e.g. extension round-trips).
+    pub fn rule_texts(&self) -> Vec<String> {
+        self.rules.iter().map(|r| r.text().to_string()).collect()
+    }
+
+    /// Rules rendered for injection (text + rationale). Used for dedup hashing so a
+    /// rationale edit re-injects, and as the source for graph-free render paths.
+    pub fn rendered_rules(&self) -> Vec<String> {
+        self.rules.iter().map(|r| r.render()).collect()
     }
 }
 
@@ -135,6 +230,11 @@ pub fn add_trigger(
             rules: Vec::new(),
             query: None,
             query_format: None,
+            commands: Vec::new(),
+            command_activation: default_command_activation(),
+            role: None,
+            output_mode: None,
+            format: None,
         });
         file.domain.last_mut().unwrap()
     };
@@ -230,6 +330,11 @@ pub fn create_domain(
         rules: Vec::new(),
         query: None,
         query_format: None,
+        commands: Vec::new(),
+        command_activation: default_command_activation(),
+        role: None,
+        output_mode: None,
+        format: None,
     });
 
     let tmp = toml_path.with_extension("toml.tmp");
@@ -323,11 +428,123 @@ pub fn get_domain(cwd: &Path, name: &str) {
             if !d.exclude.is_empty() {
                 println!("Exclude: {}", d.exclude.join(", "));
             }
+            if let Some(role) = &d.role {
+                println!("Role: {role}");
+            }
+            if !d.commands.is_empty() {
+                println!(
+                    "Commands: {} (activation: {})",
+                    d.commands.join(", "),
+                    d.command_activation
+                );
+            }
+            if let Some(om) = &d.output_mode {
+                println!("Output mode: {om}");
+            }
+            if let Some(fmt) = &d.format {
+                println!("Format: {fmt}");
+            }
             println!("Rules ({}):", d.rules.len());
             for (i, rule) in d.rules.iter().enumerate() {
-                println!("  {i}. {rule}");
+                println!("  {i}. {}", rule.render());
             }
         }
         None => eprintln!("Domain '{name}' not found."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml_str: &str) -> DomainDef {
+        #[derive(Deserialize)]
+        struct F {
+            domain: Vec<DomainDef>,
+        }
+        toml::from_str::<F>(toml_str).unwrap().domain.pop().unwrap()
+    }
+
+    // ─── Phase 26: rule rationale ────────────────────────────
+
+    #[test]
+    fn bare_string_rule_parses_without_rationale() {
+        let d = parse("[[domain]]\nname = \"X\"\nrules = [\"do the thing\"]\n");
+        assert_eq!(d.rules.len(), 1);
+        assert_eq!(d.rules[0].text(), "do the thing");
+        assert_eq!(d.rules[0].rationale(), None);
+        assert_eq!(d.rules[0].render(), "do the thing");
+    }
+
+    #[test]
+    fn detailed_rule_parses_and_renders_rationale() {
+        let d = parse(
+            "[[domain]]\nname = \"X\"\nrules = [{ text = \"do X\", rationale = \"it aligns Y\" }]\n",
+        );
+        assert_eq!(d.rules[0].text(), "do X");
+        assert_eq!(d.rules[0].rationale(), Some("it aligns Y"));
+        assert_eq!(d.rules[0].render(), "do X — because it aligns Y");
+    }
+
+    #[test]
+    fn detailed_rule_without_rationale_renders_text_only() {
+        let d = parse("[[domain]]\nname = \"X\"\nrules = [{ text = \"do X\" }]\n");
+        assert_eq!(d.rules[0].rationale(), None);
+        assert_eq!(d.rules[0].render(), "do X");
+    }
+
+    #[test]
+    fn empty_rationale_treated_as_absent() {
+        let d = parse("[[domain]]\nname = \"X\"\nrules = [{ text = \"do X\", rationale = \"\" }]\n");
+        assert_eq!(d.rules[0].rationale(), None);
+        assert_eq!(d.rules[0].render(), "do X");
+    }
+
+    #[test]
+    fn mixed_bare_and_detailed_rules_in_one_domain() {
+        let d = parse(
+            "[[domain]]\nname = \"X\"\nrules = [\"bare one\", { text = \"rich one\", rationale = \"reason\" }]\n",
+        );
+        assert_eq!(d.rule_texts(), vec!["bare one", "rich one"]);
+        assert_eq!(
+            d.rendered_rules(),
+            vec!["bare one", "rich one — because reason"]
+        );
+    }
+
+    // ─── Phases 28/29/31/32: new domain steering fields ──────
+
+    #[test]
+    fn steering_fields_default_when_absent() {
+        let d = parse("[[domain]]\nname = \"X\"\nrules = []\n");
+        assert!(d.commands.is_empty());
+        assert_eq!(d.command_activation, "both"); // Phase 28 default
+        assert_eq!(d.role, None); // Phase 29
+        assert_eq!(d.output_mode, None); // Phase 31
+        assert_eq!(d.format, None); // Phase 32
+    }
+
+    #[test]
+    fn steering_fields_parse_when_present() {
+        let d = parse(
+            "[[domain]]\nname = \"X\"\nrules = []\n\
+             commands = [\"blunt\", \"analytical\"]\n\
+             command_activation = \"keyword\"\n\
+             role = \"You are a strategist.\"\n\
+             output_mode = \"file\"\n\
+             format = \"Prefer tables.\"\n",
+        );
+        assert_eq!(d.commands, vec!["blunt", "analytical"]);
+        assert_eq!(d.command_activation, "keyword");
+        assert_eq!(d.role.as_deref(), Some("You are a strategist."));
+        assert_eq!(d.output_mode.as_deref(), Some("file"));
+        assert_eq!(d.format.as_deref(), Some("Prefer tables."));
+    }
+
+    #[test]
+    fn rule_entry_from_str_yields_bare() {
+        let r: RuleEntry = "hello".into();
+        assert_eq!(r, RuleEntry::Bare("hello".into()));
+        assert_eq!(r.render(), "hello");
     }
 }

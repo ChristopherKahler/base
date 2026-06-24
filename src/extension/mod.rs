@@ -351,9 +351,19 @@ pub fn extension_domains_to_domain_defs(ext: &ExtensionDef) -> Vec<crate::domain
             file_keywords: ed.file_keywords.clone(),
             paths: ed.paths.clone(),
             exclude: ed.exclude.clone(),
-            rules: ed.rules.clone(),
+            rules: ed
+                .rules
+                .iter()
+                .cloned()
+                .map(crate::domain::RuleEntry::Bare)
+                .collect(),
             query: ed.query.clone(),
             query_format: ed.query_format.clone(),
+            commands: Vec::new(),
+            command_activation: "both".into(),
+            role: None,
+            output_mode: None,
+            format: None,
         })
         .collect()
 }
@@ -633,7 +643,7 @@ rules = ["Content rule"]
         assert_eq!(domains[0].name, "ext:outpost:content");
         assert_eq!(domains[0].mode, "triggered");
         assert_eq!(domains[0].prompt_keywords, vec!["outpost", "publish"]);
-        assert_eq!(domains[0].rules, vec!["Content rule"]);
+        assert_eq!(domains[0].rule_texts(), vec!["Content rule"]);
     }
 
     #[test]

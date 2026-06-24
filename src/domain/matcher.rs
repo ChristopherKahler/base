@@ -96,9 +96,14 @@ mod tests {
             file_keywords: Vec::new(),
             paths: Vec::new(),
             exclude: Vec::new(),
-            rules: rules.iter().map(|s| s.to_string()).collect(),
+            rules: rules.iter().map(|s| crate::domain::RuleEntry::Bare(s.to_string())).collect(),
             query: None,
             query_format: None,
+            commands: Vec::new(),
+            command_activation: "both".into(),
+            role: None,
+            output_mode: None,
+            format: None,
         }
     }
 

@@ -268,7 +268,7 @@ fn sync_gc_removes_stale_synced_rules_keeps_cli_rules() {
     let ns = &config.namespace;
 
     // Add a CLI rule (no source marker) — must survive sync GC
-    base::crud::rule::add(tmp.path(), ns, "GLOBAL", "CLI-added rule").unwrap();
+    base::crud::rule::add(tmp.path(), ns, "GLOBAL", "CLI-added rule", None).unwrap();
 
     // Change toml rules: drop "Always verify", add "New rule C"
     let base_dir = tmp.path().join(".base");
