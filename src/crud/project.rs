@@ -3,8 +3,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use oxigraph::sparql::QueryResults;
 
-use crate::config::{NamespaceConfig, ProtocolConfig};
+use crate::config::{BaseConfig, NamespaceConfig, ProtocolConfig, WorkspaceEntry};
 use crate::crud;
+use crate::scope;
 
 pub fn add(
     cwd: &Path,
@@ -131,52 +132,139 @@ fn auto_create_domain(cwd: &Path, project_name: &str, project_path: &str) -> Res
     Ok(())
 }
 
-pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
+// Canonicalization logic lives once in `scope` (the shared FS wrappers); these are thin
+// local aliases. `canon_path` stays local — scope only wraps strings/registries.
+fn canon_str(p: &str) -> String {
+    scope::canonical_str(p)
+}
+
+fn canon_path(p: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+fn canon_registry(reg: &[WorkspaceEntry]) -> Vec<WorkspaceEntry> {
+    scope::canonical_registry(reg)
+}
+
+pub fn list(cwd: &Path, config: &BaseConfig, project_scope: scope::ProjectScope) -> Result<()> {
+    let ns = &config.namespace;
     let p = &ns.prefix;
     let sparql = format!(
-        "SELECT ?name ?status ?priority ?lastActive WHERE {{\n\
+        "SELECT ?proj ?name ?status ?priority ?lastActive ?path WHERE {{\n\
            GRAPH ?g {{\n\
              ?proj a {p}:Project ;\n\
                {p}:name ?name ;\n\
                {p}:status ?status .\n\
              OPTIONAL {{ ?proj {p}:priority ?priority }}\n\
              OPTIONAL {{ ?proj {p}:lastActive ?lastActive }}\n\
+             OPTIONAL {{ ?proj {p}:path ?path }}\n\
            }}\n\
          }}\n\
          ORDER BY ?name"
     );
 
+    // FS wrapper around the pure scope:: core: canonicalize cwd + registry once,
+    // then resolve the current workspace and filter rows by #path-derived home.
+    let registry = canon_registry(&config.workspace);
+    let current = scope::current_workspace(&canon_path(cwd), &registry);
+    let peer_map = peer_workspaces(cwd, ns)?;
+
     let results = crud::load_and_query(cwd, ns, &sparql)?;
-    if let QueryResults::Solutions(solutions) = results {
-        let vars: Vec<String> = solutions
-            .variables()
-            .iter()
-            .map(|v| v.as_str().to_string())
-            .collect();
-        let rows: Vec<Vec<String>> = solutions
-            .filter_map(|r| r.ok())
-            .map(|row| {
-                vars.iter()
-                    .map(|v| {
-                        row.get(v.as_str())
-                            .map(|t| crud::term_display(t.into()))
-                            .unwrap_or_else(|| "-".into())
-                    })
-                    .collect()
-            })
-            .collect();
+    let QueryResults::Solutions(solutions) = results else {
+        return Ok(());
+    };
 
-        if rows.is_empty() {
-            println!("No projects found.");
-            return Ok(());
+    const COLS: [&str; 4] = ["name", "status", "priority", "lastActive"];
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut unscoped_count = 0usize;
+    for sol in solutions.filter_map(|r| r.ok()) {
+        let cell = |k: &str| sol.get(k).map(|t| crud::term_display(t.into()));
+        let home = scope::home(
+            cell("path").map(|s| canon_str(&s)).as_deref(),
+            &registry,
+        );
+        if matches!(home, scope::Home::Unscoped) {
+            unscoped_count += 1;
         }
+        let peers = cell("proj")
+            .and_then(|iri| peer_map.get(&iri).cloned())
+            .unwrap_or_default();
+        if !scope::in_scope(&home, &peers, current.as_deref(), &project_scope) {
+            continue;
+        }
+        rows.push(
+            COLS.iter()
+                .map(|c| cell(c).unwrap_or_else(|| "-".into()))
+                .collect(),
+        );
+    }
 
-        println!("| {} |", vars.join(" | "));
-        println!("|{}|", vars.iter().map(|_| "---").collect::<Vec<_>>().join("|"));
+    if rows.is_empty() {
+        let where_ = match &project_scope {
+            scope::ProjectScope::All => "any workspace".to_string(),
+            scope::ProjectScope::Unscoped => "the unscoped set".to_string(),
+            scope::ProjectScope::Workspace(w) => format!("workspace '{w}'"),
+            scope::ProjectScope::Current => match &current {
+                Some(c) => format!("workspace '{c}'"),
+                None => "any workspace".to_string(),
+            },
+        };
+        println!("No projects in {where_}.");
+    } else {
+        println!("| {} |", COLS.join(" | "));
+        println!("|{}|", COLS.iter().map(|_| "---").collect::<Vec<_>>().join("|"));
         for row in &rows {
             println!("| {} |", row.join(" | "));
         }
     }
+
+    // Backfill nudge: never silently lose un-homed projects (Req 3). Only in the
+    // workspace-scoped (Current) view — `--all`/`--unscoped` already surface them.
+    if matches!(project_scope, scope::ProjectScope::Current) && unscoped_count > 0 {
+        println!(
+            "\n{unscoped_count} project(s) have no #path (unscoped) — `base project list --unscoped`, or set a home with `base project update <slug> --path <dir>`."
+        );
+    }
+    Ok(())
+}
+
+/// Map every project IRI → its `peerWorkspace` slugs (read-time scoping input).
+fn peer_workspaces(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let p = &ns.prefix;
+    let sparql = format!("SELECT ?proj ?peer WHERE {{ GRAPH ?g {{ ?proj {p}:peerWorkspace ?peer }} }}");
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    if let QueryResults::Solutions(sols) = crud::load_and_query(cwd, ns, &sparql)? {
+        for sol in sols.filter_map(|r| r.ok()) {
+            let iri = sol.get("proj").map(|t| crud::term_display(t.into()));
+            let peer = sol.get("peer").map(|t| crud::term_display(t.into()));
+            if let (Some(iri), Some(peer)) = (iri, peer) {
+                map.entry(iri).or_default().push(peer);
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Add (or remove with `remove = true`) a `peerWorkspace` edge so a project surfaces in another
+/// workspace too. The home graph stays the single source of truth; the edge is a visibility
+/// pointer, not a duplicate. Add writes to the CWD workspace graph; remove is graph-agnostic.
+pub fn peer(cwd: &Path, config: &BaseConfig, slug: &str, workspace: &str, remove: bool) -> Result<()> {
+    let ns = &config.namespace;
+    let p = &ns.prefix;
+    let iri = crud::build_iri(ns, "project", slug);
+    let peer_slug = crud::slugify(workspace);
+    let sparql = if remove {
+        format!("DELETE WHERE {{ GRAPH ?g {{ <{iri}> {p}:peerWorkspace \"{peer_slug}\" }} }}")
+    } else {
+        let graph = crud::workspace_graph_iri(ns, &crud::workspace_slug(cwd));
+        format!("INSERT DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:peerWorkspace \"{peer_slug}\" }} }}")
+    };
+    crud::load_and_mutate(cwd, ns, &sparql)?;
+    let verb = if remove { "removed from" } else { "added to" };
+    println!("Project '{slug}': peer workspace '{peer_slug}' {verb}.");
     Ok(())
 }
 

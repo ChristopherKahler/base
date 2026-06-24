@@ -6,6 +6,7 @@ use base::crud;
 use base::domain;
 use base::extension;
 use base::hook;
+use base::scope;
 
 #[derive(Parser)]
 #[command(
@@ -456,11 +457,32 @@ pub enum ProjectAction {
         #[arg(long)]
         stage: Option<String>,
     },
-    /// List all projects
+    /// List projects (defaults to the current workspace; cross-awareness via flags)
     #[command(visible_alias = "l")]
-    List,
+    List {
+        /// Show projects from every registered workspace (today's flat union)
+        #[arg(long)]
+        all: bool,
+        /// Show only projects homed in the named workspace
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Show only projects with no #path / no registered home
+        #[arg(long)]
+        unscoped: bool,
+    },
     /// Show a specific project (accepts slug or display name)
     Get { slug: String },
+    /// Make a project also surface in another workspace (additive peerWorkspace edge)
+    Peer {
+        /// Project slug or display name
+        slug: String,
+        /// Workspace the project should also surface in
+        #[arg(short, long)]
+        workspace: String,
+        /// Remove the peer edge instead of adding it
+        #[arg(long)]
+        remove: bool,
+    },
     /// Re-point a project's folder path (graph + domain trigger) after it moves
     Repath {
         slug: String,
@@ -846,10 +868,28 @@ pub fn run() {
                     None => die("Failed", anyhow::anyhow!("--path is required, or enable [protocol] with a stage in base.toml")),
                 }
             }
-            ProjectAction::List => { if let Err(e) = crud::project::list(&cwd, &config.namespace) { die("Error", e); } }
+            ProjectAction::List { all, workspace, unscoped } => {
+                // Precedence: --all > --workspace > --unscoped > default (current workspace).
+                let project_scope = if all {
+                    scope::ProjectScope::All
+                } else if let Some(w) = workspace {
+                    scope::ProjectScope::Workspace(crud::slugify(&w))
+                } else if unscoped {
+                    scope::ProjectScope::Unscoped
+                } else if config.signal.scope == "global" {
+                    scope::ProjectScope::All // [signal] scope = "global" restores the flat union
+                } else {
+                    scope::ProjectScope::Current
+                };
+                if let Err(e) = crud::project::list(&cwd, &config, project_scope) { die("Error", e); }
+            }
             ProjectAction::Get { slug } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug)
                     && let Err(e) = crud::project::get(&cwd, &config.namespace, &s) { die("Error", e); }
+            }
+            ProjectAction::Peer { slug, workspace, remove } => {
+                if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug)
+                    && let Err(e) = crud::project::peer(&cwd, &config, &s, &workspace, remove) { die("Error", e); }
             }
             ProjectAction::Repath { slug, path } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug) {

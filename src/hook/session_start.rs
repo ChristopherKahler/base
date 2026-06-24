@@ -293,7 +293,7 @@ fn ingest_paul_projects(config: &BaseConfig, cwd: &Path) {
     }
 
     // Ingest silently — errors to stderr, never block session start
-    match crate::extract::paul_toml::ingest_paul_projects(cwd, &config.namespace, &projects) {
+    match crate::extract::paul_toml::ingest_paul_projects(cwd, config, &projects) {
         Ok(stats) => {
             if stats.registered > 0 {
                 eprintln!(

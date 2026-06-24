@@ -241,16 +241,22 @@ pub struct SignalConfig {
     pub max_chars: usize,
     #[serde(default = "default_signal_enabled")]
     pub enabled: bool,
+    /// Working-set scope: "workspace" (default — the current-workspace view) or "global"
+    /// (the flat union of every registered workspace; restores pre-v0.8 behavior, Req 5).
+    #[serde(default = "default_signal_scope")]
+    pub scope: String,
 }
 
 fn default_max_chars() -> usize { 2000 }
 fn default_signal_enabled() -> bool { true }
+fn default_signal_scope() -> String { "workspace".into() }
 
 impl Default for SignalConfig {
     fn default() -> Self {
         Self {
             max_chars: default_max_chars(),
             enabled: default_signal_enabled(),
+            scope: default_signal_scope(),
         }
     }
 }

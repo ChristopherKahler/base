@@ -16,6 +16,7 @@ pub mod operator;
 pub mod plugin;
 pub mod protocol;
 pub mod scaffold;
+pub mod scope;
 pub mod secret;
 pub mod signal;
 pub mod store;

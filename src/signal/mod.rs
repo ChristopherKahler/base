@@ -47,7 +47,7 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         Err(e) => eprintln!("base: signal 'memory' failed: {e}"),
     }
 
-    match active_awareness::run(cwd, ns) {
+    match active_awareness::run(cwd, config) {
         Ok(output) if !output.is_empty() => {
             results.push(SignalResult { name: "active-awareness".into(), priority: 1, output });
         }

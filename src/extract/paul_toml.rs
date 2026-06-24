@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::config::NamespaceConfig;
+use crate::config::BaseConfig;
 use crate::crud;
 
 // ─── paul.toml schema ───────────────────────────────────────
@@ -122,12 +122,16 @@ pub struct IngestStats {
 /// Ingest all scanned paul.toml projects into the graph. Idempotent: delete + re-insert.
 pub fn ingest_paul_projects(
     cwd: &Path,
-    ns: &NamespaceConfig,
+    config: &BaseConfig,
     projects: &[(PathBuf, PaulToml)],
 ) -> Result<IngestStats> {
+    let ns = &config.namespace;
     let (store, trig_path) = crud::load_workspace_store(cwd)?;
-    let ws_slug = crud::workspace_slug(cwd);
-    let graph = crud::workspace_graph_iri(ns, &ws_slug);
+    // Per-project home routing: a project's named graph comes from where it physically
+    // lives (scope::home of its discovered dir), NOT the CWD slug — so the tag is correct
+    // and CWD-independent (re-running session-start never re-pollutes). Unscoped → CWD slug.
+    let cwd_slug = crud::workspace_slug(cwd);
+    let registry = crate::scope::canonical_registry(&config.workspace);
     let pfx = crud::prefixes(ns);
     let p = &ns.prefix;
     let now = crud::now_iso();
@@ -146,6 +150,19 @@ pub fn ingest_paul_projects(
             .parent()
             .and_then(|p| p.parent())
             .map(|d| d.to_string_lossy().to_string());
+
+        // Route this project into its HOME named graph (derived from the discovered dir);
+        // fall back to the CWD slug when it's under no registered workspace.
+        let graph = match crate::scope::home(
+            discovered_dir
+                .as_deref()
+                .map(crate::scope::canonical_str)
+                .as_deref(),
+            &registry,
+        ) {
+            crate::scope::Home::Workspace(name) => crud::workspace_graph_iri(ns, &name),
+            crate::scope::Home::Unscoped => crud::workspace_graph_iri(ns, &cwd_slug),
+        };
 
         // Re-ingest the volatile paul-derived fields idempotently, but PRESERVE the
         // mechanical-state predicates: lastActive, status, deferredReason, resurfaceAt,
@@ -243,4 +260,86 @@ pub fn ingest_paul_projects(
 
 fn escape(s: &str) -> String {
     crate::crud::escape_sparql_literal(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{NamespaceConfig, WorkspaceEntry};
+    use oxigraph::sparql::QueryResults;
+
+    fn paul(name: &str) -> PaulToml {
+        PaulToml {
+            name: name.into(),
+            status: "active".into(),
+            path: String::new(),
+            milestone: None,
+            phase: None,
+            tags: vec![],
+        }
+    }
+
+    fn config_with(reg: &[&str]) -> BaseConfig {
+        BaseConfig {
+            namespace: NamespaceConfig::default(),
+            workspace: reg
+                .iter()
+                .map(|p| WorkspaceEntry { path: (*p).into() })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Display strings of every named graph that holds `<project/slug> a Project`.
+    fn graphs_for(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Vec<String> {
+        let (store, _) = crud::load_workspace_store(cwd).unwrap();
+        let iri = crud::build_iri(ns, "project", slug);
+        let pfx = crud::prefixes(ns);
+        let p = &ns.prefix;
+        let q = format!("{pfx}\nSELECT ?g WHERE {{ GRAPH ?g {{ <{iri}> a {p}:Project }} }}");
+        let QueryResults::Solutions(sols) = store.query(&q).unwrap() else {
+            return vec![];
+        };
+        sols.filter_map(|r| r.ok())
+            .filter_map(|s| s.get("g").map(|t| crud::term_display(t.into())))
+            .collect()
+    }
+
+    // AC-1 + AC-2: a project discovered under /ws/A is tagged graph/ws/a regardless of the
+    // CWD, and re-ingesting is idempotent (same single tag — never moves, never duplicates).
+    #[test]
+    fn ingest_routes_to_home_graph_not_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_with(&["/ws/A", "/ws/B"]);
+        let projects = vec![(
+            PathBuf::from("/ws/A/proj/.paul/paul.toml"),
+            paul("AProj"),
+        )];
+
+        ingest_paul_projects(tmp.path(), &config, &projects).unwrap();
+        let g1 = graphs_for(tmp.path(), &config.namespace, "aproj");
+        assert_eq!(g1.len(), 1, "exactly one named graph holds the project");
+        assert!(g1[0].ends_with("graph/ws/a"), "home graph expected, got {}", g1[0]);
+
+        // Re-ingest (same cwd) — idempotent: still exactly one, still graph/ws/a.
+        ingest_paul_projects(tmp.path(), &config, &projects).unwrap();
+        assert_eq!(graphs_for(tmp.path(), &config.namespace, "aproj"), g1);
+    }
+
+    // AC-3: a project under no registered workspace falls back to the CWD slug (today's behavior).
+    #[test]
+    fn ingest_unscoped_falls_back_to_cwd_slug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_with(&["/ws/A"]); // does not cover the project's location
+        let projects = vec![(
+            PathBuf::from("/nope/elsewhere/proj/.paul/paul.toml"),
+            paul("Lonely"),
+        )];
+
+        ingest_paul_projects(tmp.path(), &config, &projects).unwrap();
+        let expected = format!("graph/ws/{}", crud::workspace_slug(tmp.path()));
+        let g = graphs_for(tmp.path(), &config.namespace, "lonely");
+        assert_eq!(g.len(), 1);
+        assert!(g[0].ends_with(&expected), "cwd-slug fallback expected {expected}, got {}", g[0]);
+    }
 }

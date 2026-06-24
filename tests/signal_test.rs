@@ -37,7 +37,7 @@ fn active_awareness_surfaces_recent_entities() {
     seed_workspace(tmp.path());
 
     let config = test_config();
-    let output = signal::active_awareness::run(tmp.path(), &config.namespace).unwrap();
+    let output = signal::active_awareness::run(tmp.path(), &config).unwrap();
 
     assert!(output.contains("Active Project"), "Should include active project");
     assert!(output.contains("Blocked Project"), "Should include blocked project");

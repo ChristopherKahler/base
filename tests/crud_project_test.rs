@@ -1,7 +1,8 @@
 use oxigraph::sparql::QueryResults;
 
-use base::config::NamespaceConfig;
+use base::config::{BaseConfig, NamespaceConfig};
 use base::crud;
+use base::scope::ProjectScope;
 
 fn default_ns() -> NamespaceConfig {
     NamespaceConfig::default()
@@ -60,7 +61,8 @@ fn list_projects_runs() {
     crud::project::add(tmp.path(), &ns, "Beta", "blocked", None).unwrap();
 
     // Should not error
-    let result = crud::project::list(tmp.path(), &ns);
+    let config = BaseConfig { namespace: ns.clone(), ..Default::default() };
+    let result = crud::project::list(tmp.path(), &config, ProjectScope::All);
     assert!(result.is_ok());
 }
 
