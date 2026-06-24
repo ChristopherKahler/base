@@ -692,6 +692,7 @@ mod tests {
                     usage: None,
                 })
                 .collect(),
+            dist: None,
             source_path: None,
         }
     }

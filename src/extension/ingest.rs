@@ -430,6 +430,7 @@ mod tests {
                 post_tool: None,
             }),
             commands: vec![],
+            dist: None,
             source_path: None,
         };
 
@@ -493,6 +494,7 @@ mod tests {
                 post_tool: None,
             }),
             commands: vec![],
+            dist: None,
             source_path: None,
         };
 
@@ -569,6 +571,7 @@ mod tests {
                 post_tool: None,
             }),
             commands: vec![],
+            dist: None,
             source_path: None,
         };
 

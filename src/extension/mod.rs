@@ -23,6 +23,30 @@ pub struct ExtensionFile {
     /// seam. See `crate::plugin` for the registry + dispatch.
     #[serde(default)]
     pub commands: Vec<CommandSpec>,
+    /// Optional cross-platform distribution descriptor (Plugin Distribution P1).
+    /// Absent ⇒ today's local/`--bundle` behavior, unchanged. Present ⇒ P2's
+    /// platform-aware fetch can pull the compiled binary from a GitHub release.
+    #[serde(default)]
+    pub dist: Option<DistSpec>,
+}
+
+/// The `[dist]` table — how to fetch this plugin's compiled binary per-OS.
+///
+/// ```toml
+/// [dist]
+/// repo    = "ChristopherKahler/meta-cli"   # GitHub owner/repo holding releases
+/// version = "0.1.0"                          # pinned tag, resolved as v<version>
+/// binary  = "meta"                            # bin name (→ meta.exe on Windows)
+/// ```
+///
+/// Asset naming reuses base's own scheme: `<binary>-<os>-<arch>.<ext>` —
+/// `<binary>-linux-x86_64.tar.gz` / `<binary>-darwin-aarch64.tar.gz` /
+/// `<binary>-windows-x86_64.zip`. Parsed in P1; consumed by P2 (fetch).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DistSpec {
+    pub repo: String,
+    pub version: String,
+    pub binary: String,
 }
 
 /// A single `[[commands]]` entry — a drop-in `base <name>` subcommand.
@@ -72,6 +96,10 @@ pub struct ExtensionDef {
     /// Drop-in CLI commands contributed by this extension (v0.6).
     #[serde(default)]
     pub commands: Vec<CommandSpec>,
+    /// Cross-platform distribution descriptor (Plugin Distribution P1), carried
+    /// from the manifest so P2's fetch path can read it. `None` for local plugins.
+    #[serde(default)]
+    pub dist: Option<DistSpec>,
     /// The file this extension was loaded from (not serialized to TOML).
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
@@ -87,6 +115,7 @@ impl From<ExtensionFile> for ExtensionDef {
             state_dir: f.extension.state_dir,
             hooks: f.hooks,
             commands: f.commands,
+            dist: f.dist,
             source_path: None,
         }
     }
@@ -664,5 +693,56 @@ name = "d"
         let file: ExtensionFile = toml::from_str(toml_str).unwrap();
         let ext: ExtensionDef = file.into();
         assert_eq!(ext.hook_summary(), "S·U");
+    }
+
+    // ─── Plugin Distribution P1: optional [dist] block ─────────
+
+    #[test]
+    fn dist_block_parses() {
+        let toml_str = r#"
+[extension]
+name = "meta"
+version = "0.1.0"
+description = "Meta Ads CLI"
+
+[dist]
+repo = "ChristopherKahler/meta-cli"
+version = "0.1.0"
+binary = "meta"
+"#;
+        let file: ExtensionFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            file.dist,
+            Some(DistSpec {
+                repo: "ChristopherKahler/meta-cli".into(),
+                version: "0.1.0".into(),
+                binary: "meta".into(),
+            })
+        );
+        // AC-3: From carries it into ExtensionDef.
+        let ext: ExtensionDef = file.into();
+        assert_eq!(ext.dist.unwrap().binary, "meta");
+    }
+
+    #[test]
+    fn absent_dist_is_none_and_rest_unchanged() {
+        // Mirrors today's nano-banana shape: [extension] + [[commands]], no [dist].
+        let toml_str = r#"
+[extension]
+name = "nano-banana"
+version = "1.0.0"
+description = "Image gen"
+
+[[commands]]
+name = "nano-banana"
+handler = "bin/nano-banana.mjs"
+description = "Generate/edit images"
+"#;
+        let file: ExtensionFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(file.dist, None, "absent [dist] → None (backward-compat)");
+        assert_eq!(file.commands.len(), 1, "commands still parse unchanged");
+        let ext: ExtensionDef = file.into();
+        assert_eq!(ext.dist, None);
+        assert_eq!(ext.commands[0].name, "nano-banana");
     }
 }
