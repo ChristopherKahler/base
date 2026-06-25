@@ -1644,12 +1644,19 @@ pub fn run() {
                     }
                 }
             }
-            ExtensionAction::Scaffold { name, path, repo } => {
+            ExtensionAction::Scaffold { name, path, into, repo, build, git, create_repo, bootstrap } => {
                 let parent = match path {
                     Some(p) => std::path::PathBuf::from(p),
                     None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
                 };
-                match base::plugin::scaffold::scaffold_plugin(&name, &parent, repo.as_deref()) {
+                let opts = base::plugin::scaffold::ScaffoldOpts {
+                    into: into.map(std::path::PathBuf::from),
+                    repo,
+                    build: build || bootstrap,
+                    git: git || bootstrap,
+                    create_repo: create_repo || bootstrap,
+                };
+                match base::plugin::scaffold::scaffold_plugin(&name, &parent, &opts) {
                     Ok(outcome) => println!("{}", base::plugin::scaffold::format_scaffold_human(&outcome)),
                     Err(e) => {
                         eprintln!("✗ Cannot scaffold: {e}");

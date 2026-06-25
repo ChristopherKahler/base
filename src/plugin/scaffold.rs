@@ -11,14 +11,35 @@
 //! scaffolded tool builds + bundles + `base ext add`s with no further wiring.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+
+/// What to do after writing the files. `--bootstrap` turns all three on for the
+/// one-command, zero-step kickoff.
+#[derive(Default)]
+pub struct ScaffoldOpts {
+    /// Exact target folder (overrides the default `<parent>/<name>-cli`).
+    pub into: Option<PathBuf>,
+    /// GitHub owner/repo for [dist] + `--create-repo` (default ChristopherKahler/<name>-cli).
+    pub repo: Option<String>,
+    /// Run prepare.sh (bun build → bin/<name>) after writing files.
+    pub build: bool,
+    /// git init + first commit.
+    pub git: bool,
+    /// gh repo create (private) + wire remote + push. Implies git.
+    pub create_repo: bool,
+}
 
 /// Outcome of a scaffold, for CLI reporting.
 pub struct ScaffoldOutcome {
     pub name: String,
     pub dir: PathBuf,
     pub files: Vec<String>,
+    pub built: bool,
+    pub git: bool,
+    /// owner/repo if a GitHub repo was created + pushed.
+    pub repo_pushed: Option<String>,
 }
 
 /// Validate a plugin/binary name: lowercase, alnum + single hyphens (clap/asset-safe).
@@ -36,19 +57,24 @@ fn render(template: &str, name: &str, repo: &str) -> String {
         .replace("{{REPO}}", repo)
 }
 
-/// Scaffold `<parent>/<name>-cli/` with a complete, buildable Bun plugin.
-pub fn scaffold_plugin(name: &str, parent: &Path, repo: Option<&str>) -> Result<ScaffoldOutcome> {
+/// Scaffold a complete, buildable Bun plugin, then optionally build + git-init +
+/// create+push a private GitHub repo (the fully-bootstrapped one-command kickoff).
+pub fn scaffold_plugin(name: &str, parent: &Path, opts: &ScaffoldOpts) -> Result<ScaffoldOutcome> {
     if crate::plugin::is_reserved(name) {
         bail!("'{name}' is a reserved base command — pick another plugin name");
     }
     if !valid_name(name) {
         bail!("invalid plugin name '{name}' — use lowercase letters, digits and single hyphens (e.g. my-tool)");
     }
-    let repo = repo.map(str::to_string).unwrap_or_else(|| format!("ChristopherKahler/{name}-cli"));
+    let repo = opts.repo.clone().unwrap_or_else(|| format!("ChristopherKahler/{name}-cli"));
 
-    let dir = parent.join(format!("{name}-cli"));
+    // Target: --into <dir> exactly, else <parent>/<name>-cli. Must be new or empty.
+    let dir = opts.into.clone().unwrap_or_else(|| parent.join(format!("{name}-cli")));
     if dir.exists() {
-        bail!("{} already exists — refusing to overwrite", dir.display());
+        let nonempty = std::fs::read_dir(&dir).map(|mut it| it.next().is_some()).unwrap_or(true);
+        if nonempty {
+            bail!("{} exists and is not empty — refusing to overwrite", dir.display());
+        }
     }
     std::fs::create_dir_all(dir.join(".github").join("workflows"))?;
     std::fs::create_dir_all(dir.join("commands"))?;
@@ -81,22 +107,128 @@ pub fn scaffold_plugin(name: &str, parent: &Path, repo: Option<&str>) -> Result<
         let _ = std::fs::set_permissions(dir.join("prepare.sh"), std::fs::Permissions::from_mode(0o755));
     }
 
+    // ── post-write bootstrap (each step fail-loud so the operator isn't left half-done) ──
+    let built = if opts.build { run_prepare(&dir)? } else { false };
+    let want_git = opts.git || opts.create_repo;
+    let git_done = if want_git {
+        git_init_commit(&dir, name)?;
+        true
+    } else {
+        false
+    };
+    let repo_pushed = if opts.create_repo {
+        gh_create_repo(&dir, &repo)?;
+        Some(repo.clone())
+    } else {
+        None
+    };
+
     Ok(ScaffoldOutcome {
         name: name.to_string(),
         dir,
         files,
+        built,
+        git: git_done,
+        repo_pushed,
     })
 }
 
+/// Build the freshly-scaffolded plugin via prepare.sh (best-effort: a missing Bun is
+/// a warning, not a failure — the files are already written).
+fn run_prepare(dir: &Path) -> Result<bool> {
+    let have_bun = Command::new("bun").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
+    if !have_bun {
+        eprintln!("base: bun not found — skipping build (run ./prepare.sh after installing Bun: https://bun.sh)");
+        return Ok(false);
+    }
+    let status = Command::new("bash").arg("prepare.sh").current_dir(dir).status().context("running prepare.sh")?;
+    if !status.success() {
+        eprintln!("base: warning — prepare.sh did not succeed; build skipped");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// git init (idempotent) + add -A + commit.
+fn git_init_commit(dir: &Path, name: &str) -> Result<()> {
+    let git = |args: &[&str]| -> Result<bool> {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .with_context(|| format!("running `git {}` (is git installed?)", args.join(" ")))?;
+        Ok(status.success())
+    };
+    if !dir.join(".git").exists() && !git(&["init", "-q"])? {
+        bail!("git init failed");
+    }
+    if !git(&["add", "-A"])? {
+        bail!("git add failed");
+    }
+    if !git(&["commit", "-q", "-m", &format!("init {name} — base ext scaffold")])? {
+        bail!("git commit failed (configure git user.name / user.email, then commit)");
+    }
+    Ok(())
+}
+
+/// Create a PRIVATE GitHub repo, wire `origin` (SSH), and push.
+///
+/// We create with `gh` but push via direct `git` over SSH rather than
+/// `gh repo create --push`: gh's internal push uses HTTPS, which fails when git's
+/// `git-remote-https` helper isn't on PATH (e.g. a snap-confined gh). SSH uses the
+/// `ssh` transport already on PATH — the operator's normal git auth.
+fn gh_create_repo(dir: &Path, repo: &str) -> Result<()> {
+    let created = Command::new("gh")
+        .args(["repo", "create", repo, "--private"])
+        .current_dir(dir)
+        .status()
+        .context("running `gh repo create` (is the GitHub CLI installed + authed? `gh auth login`)")?;
+    if !created.success() {
+        bail!("gh repo create failed — does {repo} already exist, or is `gh` unauthed?");
+    }
+    let git = |args: &[&str]| -> Result<bool> {
+        Ok(Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .with_context(|| format!("running `git {}`", args.join(" ")))?
+            .success())
+    };
+    let url = format!("git@github.com:{repo}.git");
+    if !git(&["remote", "add", "origin", &url])? {
+        bail!("git remote add origin failed");
+    }
+    if !git(&["push", "-u", "origin", "HEAD"])? {
+        bail!("git push failed — is SSH to GitHub working? test with `ssh -T git@github.com`");
+    }
+    Ok(())
+}
+
 pub fn format_scaffold_human(o: &ScaffoldOutcome) -> String {
-    format!(
-        "✓ Scaffolded '{}' → {} ({} files)\n\nNext:\n  cd {}\n  ./prepare.sh                         # bun build --compile → bin/{}\n  base ext install --bundle ./base-extension.toml   # local install\n  # ship cross-platform: git init + push to the [dist] repo, tag v0.1.0 → release.yml builds all 3 OSes, then `base ext add`\n  # edit index.ts to add your commands (replace the `hello` example)",
-        o.name,
-        o.dir.display(),
-        o.files.len(),
-        o.dir.display(),
-        o.name,
-    )
+    let mut s = format!("✓ Scaffolded '{}' → {} ({} files)", o.name, o.dir.display(), o.files.len());
+    if o.built {
+        s.push_str(&format!("\n  built → bin/{}", o.name));
+    }
+    if o.git {
+        s.push_str("\n  git → initialized + committed");
+    }
+    if let Some(repo) = &o.repo_pushed {
+        s.push_str(&format!("\n  github → created (private) + pushed → {repo}"));
+    }
+    s.push_str("\n\nNext:");
+    s.push_str(&format!("\n  cd {}", o.dir.display()));
+    if !o.built {
+        s.push_str(&format!("\n  ./prepare.sh                                   # bun build → bin/{}", o.name));
+    }
+    s.push_str("\n  # edit index.ts — replace the `hello` example with your commands");
+    s.push_str("\n  base ext install --bundle ./base-extension.toml  # local install");
+    if o.repo_pushed.is_some() {
+        s.push_str("\n  git tag v0.1.0 && git push origin v0.1.0          # release.yml builds linux/darwin/windows");
+        s.push_str("\n  base ext add ./base-extension.toml                # then fetch the prebuilt binary cross-platform");
+    } else {
+        s.push_str("\n  # ship cross-platform: re-run with --bootstrap, or push to the [dist] repo + tag v0.1.0, then `base ext add`");
+    }
+    s
 }
 
 // ─── Templates (mirror the shipped meta/highlevel/nano-banana layout) ────────
