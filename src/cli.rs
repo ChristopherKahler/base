@@ -1142,9 +1142,17 @@ pub fn run() {
                     return;
                 };
 
-                let base_dir = base::config::find_workspace_base(&cwd)
-                    .unwrap_or_else(|| cwd.join(".base"));
-                let ast_ttl = base_dir.join("ast.ttl");
+                // Per-app self-contained map: resolve output to the TARGET's app
+                // root (`<app_root>/.base/ast.ttl`), not cwd — so parsing app B
+                // never clobbers app A's map.
+                let target_path = {
+                    let t = std::path::Path::new(target_dir);
+                    if t.is_absolute() { t.to_path_buf() } else { cwd.join(t) }
+                };
+                let ast_ttl = base::config::resolve_ast_ttl(&target_path);
+                if let Some(parent) = ast_ttl.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
 
                 // AST data lives ONLY in ast.ttl. Never write it into graph.nq —
                 // Turtle appended to an NQuads file corrupts the whole graph (AUDIT C10).

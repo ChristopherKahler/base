@@ -422,12 +422,8 @@ fn ast_prefixes(ns: &NamespaceConfig) -> String {
 }
 
 fn load_ast_store(cwd: &Path) -> Result<oxigraph::store::Store> {
-    let base_dir = crate::config::find_workspace_base(cwd)
-        .ok_or_else(|| anyhow::anyhow!("No .base/ directory found"))?;
-    let ast_path = base_dir.join("ast.ttl");
-    if !ast_path.exists() {
-        anyhow::bail!("No ast.ttl found. Run `base sync --ast` first.");
-    }
+    let ast_path = crate::config::find_ast_ttl(cwd)
+        .ok_or_else(|| anyhow::anyhow!("No ast.ttl found. Run `base sync --ast` first."))?;
     let store = oxigraph::store::Store::new()?;
     crate::store::load_turtle_into(&store, &ast_path)?;
     Ok(store)

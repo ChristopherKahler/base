@@ -18,6 +18,63 @@ pub fn find_workspace_base(cwd: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Find the app root for AST scoping: nearest ancestor (including `target` itself
+/// when it is a directory) that carries an app marker — `.git`, `.paul`, `.base-ast`,
+/// or an existing `.base`. This is what makes each codebase's AST map self-contained
+/// instead of every parse clobbering one shared workspace `ast.ttl`.
+fn ast_app_root(target: &Path) -> Option<PathBuf> {
+    let mut dir = if target.is_file() {
+        target.parent()?.to_path_buf()
+    } else {
+        target.to_path_buf()
+    };
+    loop {
+        if dir.join(".git").exists()
+            || dir.join(".paul").is_dir()
+            || dir.join(".base-ast").is_dir()
+            || dir.join(".base").is_dir()
+        {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Resolve where a target's AST map should be WRITTEN: `<app_root>/.base-ast/ast.ttl`.
+/// A dedicated `.base-ast/` sidecar (sibling to `.base-ast-cache/`) is used instead
+/// of `.base/` so an app's map never shadows workspace `.base/` resolution for
+/// knowledge commands. `target` must be an absolute path.
+pub fn resolve_ast_ttl(target: &Path) -> PathBuf {
+    let root = ast_app_root(target).or_else(|| {
+        find_workspace_base(target).and_then(|b| b.parent().map(Path::to_path_buf))
+    });
+    match root {
+        Some(r) => r.join(".base-ast").join("ast.ttl"),
+        None => target.join(".base-ast").join("ast.ttl"),
+    }
+}
+
+/// Find the AST map to READ from `cwd`, walking up: prefers `<root>/.base-ast/ast.ttl`,
+/// falling back to a legacy `<root>/.base/ast.ttl` (the pre-sidecar workspace map).
+pub fn find_ast_ttl(cwd: &Path) -> Option<PathBuf> {
+    let mut dir = cwd.to_path_buf();
+    loop {
+        let sidecar = dir.join(".base-ast").join("ast.ttl");
+        if sidecar.is_file() {
+            return Some(sidecar);
+        }
+        let legacy = dir.join(".base").join("ast.ttl");
+        if legacy.is_file() {
+            return Some(legacy);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 // ─── Namespace Config ────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
