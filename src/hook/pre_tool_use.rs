@@ -131,12 +131,15 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         for fp in &file_paths {
             if let Some(fp_str) = fp.to_str()
                 && is_source_file(fp_str) {
-                    // Session dedup: only inject AST map once per file per session
-                    if !session.has_ast_injected(fp_str)
+                    // Content-keyed dedup: re-inject only when the file has changed
+                    // since its last injection this session (a stale map is worse
+                    // than none when you're actively editing the file).
+                    let ver = file_version(fp);
+                    if !session.has_ast_injected(fp_str, ver)
                         && let Some(map) = crud::ast_query::file_map_compact(cwd, &config.namespace, fp_str) {
                             output.push_str(&map);
                             output.push('\n');
-                            session.mark_ast_injected(fp_str);
+                            session.mark_ast_injected(fp_str, ver);
                             session_dirty = true;
                             data.ast_injected = true;
                         }
@@ -187,6 +190,17 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     }
 
     Ok(data)
+}
+
+/// Content-version of a file for content-keyed dedup: a hash of its bytes (0 if
+/// unreadable). Changes whenever the file changes, so the AST map re-injects after
+/// an edit instead of staying stale for the rest of the session.
+fn file_version(path: &std::path::Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let Ok(bytes) = std::fs::read(path) else { return 0 };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
 }
 
 /// Check if a file path is a source code file worth AST injection.

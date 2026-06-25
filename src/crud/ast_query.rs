@@ -256,13 +256,20 @@ pub fn imports(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Result<()> 
 
 /// Compact file map for hook injection. Returns None if no AST data found.
 pub fn file_map_compact(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Option<String> {
-    let store = load_ast_store(cwd).ok()?;
+    // Resolve the AST map from the FILE's app root, not the session cwd. A file
+    // inside a sub-app (apps/X/src/y.rs) reads apps/X's OWN sidecar map — whose
+    // paths are rooted at the app ("src/y.rs") — even when the session runs from
+    // the parent workspace. Without this, touching a sub-app file from the parent
+    // queries the parent's (stale, differently-rooted) map and injects nothing.
+    let app_root = crate::config::ast_app_root(Path::new(file_path))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let store = load_ast_store(&app_root).ok()?;
     let pfx = ast_prefixes(ns);
-    // Hook passes absolute paths; strip to workspace-relative for CONTAINS matching.
+    // Hook passes absolute paths; strip to app-root-relative for CONTAINS matching.
     // AST graph stores paths like "src/hook/pre_tool_use.rs".
-    let relative = cwd
+    let relative = app_root
         .to_str()
-        .and_then(|cwd_str| file_path.strip_prefix(cwd_str))
+        .and_then(|root| file_path.strip_prefix(root))
         .map(|p| p.trim_start_matches('/'))
         .unwrap_or(file_path);
     let file_lower = relative

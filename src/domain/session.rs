@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -40,9 +40,11 @@ pub struct SessionState {
     /// Number of user prompts in this session (for bracket calculation)
     #[serde(default)]
     pub prompt_count: u32,
-    /// Files whose AST map has been injected this session (dedup)
+    /// File path → content-version of the AST map last injected this session.
+    /// Keyed on content (not just path) so a file that CHANGES re-injects fresh
+    /// context, while an unchanged re-touch stays deduped.
     #[serde(default)]
-    pub ast_injected: HashSet<String>,
+    pub ast_injected: HashMap<String, u64>,
 }
 
 impl SessionState {
@@ -117,14 +119,15 @@ impl SessionState {
         self.injected.clear();
     }
 
-    /// Check if AST map was already injected for this file this session.
-    pub fn has_ast_injected(&self, file_path: &str) -> bool {
-        self.ast_injected.contains(file_path)
+    /// Whether this file's AST map was already injected this session AT ITS
+    /// CURRENT content-version. A changed file (new version) returns false → re-inject.
+    pub fn has_ast_injected(&self, file_path: &str, version: u64) -> bool {
+        self.ast_injected.get(file_path) == Some(&version)
     }
 
-    /// Mark a file's AST map as injected this session.
-    pub fn mark_ast_injected(&mut self, file_path: &str) {
-        self.ast_injected.insert(file_path.to_string());
+    /// Record that a file's AST map was injected at the given content-version.
+    pub fn mark_ast_injected(&mut self, file_path: &str, version: u64) {
+        self.ast_injected.insert(file_path.to_string(), version);
     }
 }
 
