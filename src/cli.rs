@@ -305,6 +305,23 @@ pub enum GraphAction {
         #[arg(short, long)]
         model: Option<String>,
     },
+    /// GraphRAG: answer a natural-language question over the graph (retrieve + synthesize)
+    Query {
+        /// The natural-language question
+        question: String,
+        /// Traversal depth
+        #[arg(short, long, default_value_t = 3)]
+        depth: usize,
+        /// Token budget for the retrieved subgraph
+        #[arg(short = 'b', long, default_value_t = 2000)]
+        token_budget: usize,
+        /// Claude Code model alias for synthesis
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Print the retrieved subgraph instead of a synthesized answer
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2198,6 +2215,17 @@ pub fn run() {
                 match base::graph_extract::run(&cwd, &config.namespace, &tp, model.as_deref()) {
                     Ok(report) => print!("{}", base::graph_extract::format_report(&report)),
                     Err(e) => die("graph extract failed", e),
+                }
+            }
+            GraphAction::Query { question, depth, token_budget, model, raw } => {
+                let opts = base::graph_query::Options {
+                    depth,
+                    token_budget,
+                    model: model.as_deref(),
+                    raw,
+                };
+                if let Err(e) = base::graph_query::run(&cwd, &config.namespace, &question, &opts) {
+                    die("graph query failed", e);
                 }
             }
         },
