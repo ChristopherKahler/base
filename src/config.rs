@@ -22,7 +22,7 @@ pub fn find_workspace_base(cwd: &Path) -> Option<PathBuf> {
 /// when it is a directory) that carries an app marker — `.git`, `.paul`, `.base-ast`,
 /// or an existing `.base`. This is what makes each codebase's AST map self-contained
 /// instead of every parse clobbering one shared workspace `ast.ttl`.
-fn ast_app_root(target: &Path) -> Option<PathBuf> {
+pub fn ast_app_root(target: &Path) -> Option<PathBuf> {
     let mut dir = if target.is_file() {
         target.parent()?.to_path_buf()
     } else {

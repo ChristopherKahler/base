@@ -110,11 +110,20 @@ def main():
     ttl = extract_project(target, project, full=args.full, confirm=args.confirm)
 
     if args.out:
-        mode = "a" if args.append else "w"
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        with open(args.out, mode, encoding="utf-8") as f:
-            f.write(ttl)
-            f.write("\n")
+        if args.append:
+            with open(args.out, "a", encoding="utf-8") as f:
+                f.write(ttl)
+                f.write("\n")
+        else:
+            # Atomic write: temp + rename, so a concurrent/background sync
+            # (e.g. the Stop hook) can never observe or leave a torn ast.ttl.
+            import os
+            tmp = args.out.parent / (args.out.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(ttl)
+                f.write("\n")
+            os.replace(tmp, args.out)
         print(f"TTL written to {args.out}", file=sys.stderr)
     else:
         print(ttl)

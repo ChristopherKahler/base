@@ -1,0 +1,70 @@
+//! Stop hook: at the end of each Claude turn, keep the current app's AST map
+//! live by spawning a backgrounded `base sync --ast` for the cwd's app.
+//!
+//! Three guards keep this cheap and safe:
+//!   1. Opt-in — only apps already mapped once (`.base-ast/ast.ttl` exists) are
+//!      auto-refreshed, so a Stop in a never-mapped dir (or the workspace root,
+//!      which trips the file-count threshold) does nothing.
+//!   2. Debounced — at most one refresh per `DEBOUNCE_SECS`, so rapid turns
+//!      don't pile up overlapping syncs.
+//!   3. Detached — the sync is spawned and never waited on, so the turn never
+//!      blocks. Combined with the extractor's atomic temp+rename write, an
+//!      in-flight sync can never leave a torn `ast.ttl`.
+//!
+//! Fail-open: any error surfaces to stderr and the hook still exits 0.
+
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use crate::config::BaseConfig;
+
+const DEBOUNCE_SECS: u64 = 20;
+
+pub fn handle(_config: &BaseConfig, cwd: &Path) -> anyhow::Result<()> {
+    let Some(root) = crate::config::ast_app_root(cwd) else {
+        return Ok(());
+    };
+    let base_ast = root.join(".base-ast");
+    let ttl = base_ast.join("ast.ttl");
+
+    // Opt-in: only keep already-mapped apps fresh.
+    if !ttl.is_file() {
+        return Ok(());
+    }
+
+    let marker = base_ast.join(".last-sync");
+    if recently_synced(&marker) {
+        return Ok(());
+    }
+    let _ = std::fs::write(&marker, b"");
+    spawn_sync(&root);
+    Ok(())
+}
+
+/// True if a refresh ran within the debounce window — skip this one.
+fn recently_synced(marker: &Path) -> bool {
+    std::fs::metadata(marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|e| e < Duration::from_secs(DEBOUNCE_SECS))
+        .unwrap_or(false)
+}
+
+/// Spawn a detached, backgrounded per-app AST sync. Never waited on.
+fn spawn_sync(app_root: &Path) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = Command::new(exe)
+        .arg("sync")
+        .arg("--ast")
+        .arg("--target")
+        .arg(app_root)
+        .current_dir(app_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}

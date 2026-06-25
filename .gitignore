@@ -1,6 +1,7 @@
 /target
 __pycache__/
 .base-ast-cache/
+.base-ast/
 huly-DESIGN.md
 dashboard/node_modules/
 # dashboard/dist/ is committed — embedded in binary via include_dir, needed for CI

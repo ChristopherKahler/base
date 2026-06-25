@@ -518,6 +518,7 @@ fn wire_hooks(settings_path: &Path) -> Result<()> {
         ("UserPromptSubmit", "base hook user-prompt-submit"),
         ("PreToolUse", "base hook pre-tool-use"),
         ("PostToolUse", "base hook post-tool-use"),
+        ("Stop", "base hook stop"),
     ];
 
     // Check if already fully wired (all 4 present)

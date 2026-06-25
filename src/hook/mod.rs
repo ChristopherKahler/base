@@ -3,6 +3,7 @@ pub mod memory;
 pub mod post_tool_use;
 pub mod pre_tool_use;
 pub mod session_start;
+pub mod stop;
 pub mod user_prompt_submit;
 
 use std::io::Read;
@@ -110,6 +111,10 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
             let mut data = user_prompt_submit::handle(&config, &cwd, &stdin_json)?;
             data.session_id = session_id;
             Ok(data)
+        }
+        "stop" => {
+            stop::handle(&config, &cwd)?;
+            Ok(HookEventData { session_id, ..Default::default() })
         }
         _ => Ok(HookEventData::default()),
     }
