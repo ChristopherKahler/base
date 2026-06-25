@@ -366,6 +366,19 @@ pub enum ExtensionAction {
         /// Path to the base-extension.toml (with a [dist] block) to fetch + install
         path: String,
     },
+    /// Scaffold a new, conformant Bun cross-platform plugin (index.ts skeleton,
+    /// package.json, prepare.sh, base-extension.toml with [dist], Bun release.yml).
+    /// Born cross-platform-ready — build with ./prepare.sh, then bundle or `ext add`.
+    Scaffold {
+        /// Plugin/binary name — the `base <name>` command (lowercase, hyphens ok)
+        name: String,
+        /// Parent directory to create <name>-cli/ in (default: current dir)
+        #[arg(long)]
+        path: Option<String>,
+        /// GitHub owner/repo for releases (default: ChristopherKahler/<name>-cli)
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Remove an installed extension by name
     Remove {
         /// Extension name to remove
@@ -1589,6 +1602,19 @@ pub fn run() {
                     Ok(outcome) => println!("{}", base::plugin::dist::format_dist_human(&outcome)),
                     Err(e) => {
                         eprintln!("✗ Cannot add: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            ExtensionAction::Scaffold { name, path, repo } => {
+                let parent = match path {
+                    Some(p) => std::path::PathBuf::from(p),
+                    None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                };
+                match base::plugin::scaffold::scaffold_plugin(&name, &parent, repo.as_deref()) {
+                    Ok(outcome) => println!("{}", base::plugin::scaffold::format_scaffold_human(&outcome)),
+                    Err(e) => {
+                        eprintln!("✗ Cannot scaffold: {e}");
                         std::process::exit(1);
                     }
                 }
