@@ -13,33 +13,71 @@
 //!
 //! Fail-open: any error surfaces to stderr and the hook still exits 0.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::config::BaseConfig;
+use crate::domain::session::SessionState;
 
 const DEBOUNCE_SECS: u64 = 20;
 
 pub fn handle(_config: &BaseConfig, cwd: &Path) -> anyhow::Result<()> {
-    let Some(root) = crate::config::ast_app_root(cwd) else {
-        return Ok(());
-    };
+    // Refresh the session-cwd app AND every app whose files were edited this turn
+    // (tracked by the pre-tool-use hook). Without the latter, editing files in a
+    // sub-app from the parent workspace would leave that sub-app's map stale — so
+    // the next touch's blast radius wouldn't reflect this turn's edits.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(root) = crate::config::ast_app_root(cwd) {
+        roots.push(root);
+    }
+
+    let base_dir = crate::config::find_workspace_base(cwd);
+    let mut session = base_dir.as_deref().map(SessionState::load);
+    if let Some(s) = session.as_mut() {
+        for app in s.take_dirty_apps() {
+            roots.push(PathBuf::from(app));
+        }
+    }
+
+    roots.sort();
+    roots.dedup();
+
+    // Requeue apps that are mapped but debounced, so they refresh next Stop
+    // instead of being silently dropped.
+    let mut requeue: Vec<String> = Vec::new();
+    for root in &roots {
+        if !refresh_app(root) && root.join(".base-ast").join("ast.ttl").is_file()
+            && let Some(s) = root.to_str()
+        {
+            requeue.push(s.to_string());
+        }
+    }
+
+    if let (Some(s), Some(bd)) = (session.as_mut(), base_dir.as_deref()) {
+        for app in requeue {
+            s.mark_dirty_app(&app);
+        }
+        let _ = s.save(bd);
+    }
+    Ok(())
+}
+
+/// Refresh one app's AST map (opt-in + debounced). Returns true if a sync was
+/// spawned, false if skipped (not mapped, or within the debounce window).
+fn refresh_app(root: &Path) -> bool {
     let base_ast = root.join(".base-ast");
     let ttl = base_ast.join("ast.ttl");
-
-    // Opt-in: only keep already-mapped apps fresh.
     if !ttl.is_file() {
-        return Ok(());
+        return false; // opt-in: only keep already-mapped apps fresh
     }
-
     let marker = base_ast.join(".last-sync");
     if recently_synced(&marker) {
-        return Ok(());
+        return false;
     }
     let _ = std::fs::write(&marker, b"");
-    spawn_sync(&root);
-    Ok(())
+    spawn_sync(root);
+    true
 }
 
 /// True if a refresh ran within the debounce window — skip this one.

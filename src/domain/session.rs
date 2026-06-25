@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -45,6 +45,10 @@ pub struct SessionState {
     /// context, while an unchanged re-touch stays deduped.
     #[serde(default)]
     pub ast_injected: HashMap<String, u64>,
+    /// App roots whose files were edited this turn — the Stop hook refreshes
+    /// exactly these code maps (not just the session-cwd app), then clears the set.
+    #[serde(default)]
+    pub dirty_apps: HashSet<String>,
 }
 
 impl SessionState {
@@ -128,6 +132,16 @@ impl SessionState {
     /// Record that a file's AST map was injected at the given content-version.
     pub fn mark_ast_injected(&mut self, file_path: &str, version: u64) {
         self.ast_injected.insert(file_path.to_string(), version);
+    }
+
+    /// Flag an app root as edited this turn. Returns true if newly added.
+    pub fn mark_dirty_app(&mut self, app_root: &str) -> bool {
+        self.dirty_apps.insert(app_root.to_string())
+    }
+
+    /// Drain the edited-app set (the Stop hook refreshes these maps).
+    pub fn take_dirty_apps(&mut self) -> Vec<String> {
+        self.dirty_apps.drain().collect()
     }
 }
 

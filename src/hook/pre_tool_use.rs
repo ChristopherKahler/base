@@ -55,6 +55,20 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             .unwrap_or_default();
         let mut session_dirty = false;
 
+        // Track apps whose files are being edited this turn so the Stop hook can
+        // refresh exactly those code maps — not just the session-cwd app. This is
+        // what keeps blast-radius injection current: edits this turn → map refresh
+        // on Stop → next touch sees the updated call graph.
+        if is_mutating_tool(event) {
+            for fp in &file_paths {
+                if let Some(root) = crate::config::ast_app_root(fp).and_then(|r| r.to_str().map(String::from))
+                    && session.mark_dirty_app(&root)
+                {
+                    session_dirty = true;
+                }
+            }
+        }
+
         let domains = domain::load_domains(cwd);
         let file_path_strings: Vec<String> = file_paths
             .iter()
@@ -231,6 +245,15 @@ fn file_version(path: &std::path::Path) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
     h.finish()
+}
+
+/// Whether the tool call mutates a file (so its app's code map should be
+/// refreshed on Stop). Read/Grep/etc. don't change code, so they don't dirty.
+fn is_mutating_tool(event: &serde_json::Value) -> bool {
+    matches!(
+        event.get("tool_name").and_then(|v| v.as_str()),
+        Some("Edit" | "Write" | "MultiEdit" | "NotebookEdit")
+    )
 }
 
 /// Doc files that may carry graph-extracted semantic concepts.
