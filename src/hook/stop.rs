@@ -62,6 +62,9 @@ fn spawn_sync(app_root: &Path) {
         .arg("--ast")
         .arg("--target")
         .arg(app_root)
+        // Background refresh only touches the ttl — skip the workspace-graph
+        // registration write so frequent turns don't churn graph.nq.
+        .env("BASE_AST_SKIP_REGISTER", "1")
         .current_dir(app_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

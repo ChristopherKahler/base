@@ -1,3 +1,4 @@
+pub mod ast_map;
 pub mod ast_query;
 pub mod decision;
 pub mod entity;

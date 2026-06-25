@@ -1168,6 +1168,19 @@ pub fn run() {
                 match status {
                     Ok(s) if s.success() => {
                         println!("AST extraction complete → {}", ast_ttl.display());
+                        // Register a pointer to this map in the workspace graph so
+                        // it's discoverable outside a dev session. Foreground syncs
+                        // only — the Stop hook sets BASE_AST_SKIP_REGISTER to keep
+                        // frequent background refreshes off graph.nq.
+                        if std::env::var("BASE_AST_SKIP_REGISTER").is_err() {
+                            if let Some(app_root) = ast_ttl.parent().and_then(|p| p.parent()) {
+                                if let Err(e) = crud::ast_map::register(
+                                    &cwd, &config.namespace, app_root, &ast_ttl,
+                                ) {
+                                    eprintln!("(ast map registration skipped: {e})");
+                                }
+                            }
+                        }
                     }
                     Ok(s) => eprintln!("AST extraction exited with code {:?}", s.code()),
                     Err(e) => eprintln!("Failed to run AST extractor: {e}"),
