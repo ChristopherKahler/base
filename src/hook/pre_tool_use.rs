@@ -127,23 +127,53 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             }
         }
 
-        // ─── AST file map injection (source files) ──────────────
+        // ─── File-touch context injection ───────────────────────
+        // Touch a file under an app root → inject targeted context about it:
+        //   source files → AST map + call neighborhood (what it calls / calls it)
+        //   docs (.md)    → the semantic concepts the graph derived from it
+        // Content-keyed dedup re-injects only when the file changed — a stale map
+        // is worse than none while you're actively editing.
         for fp in &file_paths {
-            if let Some(fp_str) = fp.to_str()
-                && is_source_file(fp_str) {
-                    // Content-keyed dedup: re-inject only when the file has changed
-                    // since its last injection this session (a stale map is worse
-                    // than none when you're actively editing the file).
-                    let ver = file_version(fp);
-                    if !session.has_ast_injected(fp_str, ver)
-                        && let Some(map) = crud::ast_query::file_map_compact(cwd, &config.namespace, fp_str) {
-                            output.push_str(&map);
-                            output.push('\n');
-                            session.mark_ast_injected(fp_str, ver);
-                            session_dirty = true;
-                            data.ast_injected = true;
-                        }
+            if let Some(fp_str) = fp.to_str() {
+                let is_src = is_source_file(fp_str);
+                let is_doc = is_doc_file(fp_str);
+                if !(is_src || is_doc) {
+                    continue;
                 }
+                let ver = file_version(fp);
+                if session.has_ast_injected(fp_str, ver) {
+                    continue;
+                }
+                let mut block = String::new();
+                if is_src
+                    && let Some(map) = crud::ast_query::file_map_compact(cwd, &config.namespace, fp_str) {
+                        block.push_str(&map);
+                        block.push('\n');
+                    }
+                if is_doc {
+                    let fname = std::path::Path::new(fp_str)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(fp_str);
+                    let concepts = crud::semantic::concepts_for_file(cwd, &config.namespace, fname);
+                    if !concepts.is_empty() {
+                        block.push_str(&format!("[Concepts] {fname} — {} linked\n", concepts.len()));
+                        for (name, summary) in concepts.iter().take(8) {
+                            if summary.is_empty() {
+                                block.push_str(&format!("  {name}\n"));
+                            } else {
+                                block.push_str(&format!("  {name} — {summary}\n"));
+                            }
+                        }
+                    }
+                }
+                if !block.is_empty() {
+                    output.push_str(&block);
+                    session.mark_ast_injected(fp_str, ver);
+                    session_dirty = true;
+                    data.ast_injected = true;
+                }
+            }
         }
 
         // ─── PAUL context injection (file change history) ───────
@@ -201,6 +231,12 @@ fn file_version(path: &std::path::Path) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
     h.finish()
+}
+
+/// Doc files that may carry graph-extracted semantic concepts.
+fn is_doc_file(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.ends_with(".md") || p.ends_with(".markdown")
 }
 
 /// Check if a file path is a source code file worth AST injection.

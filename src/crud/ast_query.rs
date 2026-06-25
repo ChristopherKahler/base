@@ -280,7 +280,7 @@ pub fn file_map_compact(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Op
 
     let sparql = format!(
         "{pfx}\n\
-         SELECT ?label ?line ?type WHERE {{\n\
+         SELECT ?entity ?label ?line ?type WHERE {{\n\
            ?entity rdf:type ?type ;\n\
              rdfs:label ?label ;\n\
              ops:sourceFile ?file .\n\
@@ -292,13 +292,15 @@ pub fn file_map_compact(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Op
 
     let results = crate::store::query(&store, &sparql).ok()?;
     if let QueryResults::Solutions(solutions) = results {
-        let rows: Vec<(String, String, String)> = solutions
+        // (entity_iri, label, line, type)
+        let rows: Vec<(String, String, String, String)> = solutions
             .filter_map(|r| r.ok())
             .map(|row| {
+                let iri = row.get("entity").map(|t| t.to_string()).unwrap_or_default();
                 let label = get_str(&row, "label");
                 let line = get_str(&row, "line");
                 let etype = get_type_str(&row, "type");
-                (label, line, etype)
+                (iri, label, line, etype)
             })
             .collect();
 
@@ -312,7 +314,7 @@ pub fn file_map_compact(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Op
         let key: Vec<String> = rows
             .iter()
             .take(10)
-            .map(|(label, line, etype)| {
+            .map(|(_iri, label, line, etype)| {
                 if !line.is_empty() {
                     format!("{etype} {label} (line {line})")
                 } else {
@@ -334,6 +336,34 @@ pub fn file_map_compact(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Op
         let importers = query_file_importers(&store, ns, &file_lower);
         if !importers.is_empty() {
             out.push_str(&format!("  Imported by: {}\n", importers.join(", ")));
+        }
+
+        // Call neighborhood: what this file's entities call, and who calls them.
+        // The high-value "if I change this, here's what's connected" signal.
+        let mut calls_out: Vec<String> = Vec::new();
+        let mut called_by: Vec<String> = Vec::new();
+        for (iri, ..) in rows.iter().take(12) {
+            if iri.is_empty() {
+                continue;
+            }
+            for c in query_calls(&store, ns, iri) {
+                if !calls_out.contains(&c) {
+                    calls_out.push(c);
+                }
+            }
+            for c in query_callers(&store, ns, iri) {
+                if !called_by.contains(&c) {
+                    called_by.push(c);
+                }
+            }
+        }
+        if !calls_out.is_empty() {
+            calls_out.truncate(15);
+            out.push_str(&format!("  Calls out: {}\n", calls_out.join(", ")));
+        }
+        if !called_by.is_empty() {
+            called_by.truncate(15);
+            out.push_str(&format!("  Called by: {}\n", called_by.join(", ")));
         }
 
         Some(out)
@@ -412,6 +442,55 @@ pub fn section_entities(
     } else {
         None
     }
+}
+
+/// Federate the per-app AST map (resolved from `cwd`) into a node/edge form the
+/// concept graph can traverse. Returns `(nodes, edges)` where a node is
+/// `(iri, label, type, source_file)` and an edge is `(from_iri, to_iri, relation)`
+/// for `ops:calls` and `ops:importsFrom`. Best-effort: empty if no map is found,
+/// so callers can unconditionally fold this into their graph.
+#[allow(clippy::type_complexity)]
+pub fn code_graph(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+) -> (Vec<(String, String, String, String)>, Vec<(String, String, String)>) {
+    let Ok(store) = load_ast_store(cwd) else { return (Vec::new(), Vec::new()) };
+    let pfx = ast_prefixes(ns);
+
+    let mut nodes = Vec::new();
+    let ent_q = format!(
+        "{pfx}\n\
+         SELECT ?e ?label ?type ?file WHERE {{\n\
+           ?e rdfs:label ?label .\n\
+           OPTIONAL {{ ?e rdf:type ?type }}\n\
+           OPTIONAL {{ ?e ops:sourceFile ?file }}\n\
+         }}"
+    );
+    if let Ok(QueryResults::Solutions(sols)) = crate::store::query(&store, &ent_q) {
+        for row in sols.filter_map(|r| r.ok()) {
+            let Some(id) = row.get("e").map(|t| t.to_string()) else { continue };
+            let label = row.get("label").map(|t| crud::term_display(t.into())).unwrap_or_default();
+            let ntype = row.get("type").map(|t| crud::term_display(t.into())).unwrap_or_default();
+            let file = row.get("file").map(|t| crud::term_display(t.into())).unwrap_or_default();
+            nodes.push((id, label, ntype, file));
+        }
+    }
+
+    let mut edges = Vec::new();
+    for (pattern, rel) in [("ops:calls", "calls"), ("ops:importsFrom", "imports")] {
+        let eq = format!("{pfx}\nSELECT ?a ?b WHERE {{ ?a {pattern} ?b }}");
+        if let Ok(QueryResults::Solutions(sols)) = crate::store::query(&store, &eq) {
+            for row in sols.filter_map(|r| r.ok()) {
+                if let (Some(a), Some(b)) =
+                    (row.get("a").map(|t| t.to_string()), row.get("b").map(|t| t.to_string()))
+                {
+                    edges.push((a, b, rel.to_string()));
+                }
+            }
+        }
+    }
+
+    (nodes, edges)
 }
 
 // ─── Internal helpers ────────────────────────────────────────

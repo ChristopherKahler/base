@@ -62,7 +62,7 @@ fn label<'a>(nodes: &'a HashMap<String, Node>, id: &'a str) -> &'a str {
 
 /// `base graph get-node <node>` — full detail for one node plus its direct edges.
 pub fn get_node(cwd: &Path, ns: &NamespaceConfig, input: &str) -> Result<()> {
-    let (nodes, adj) = load_graph(cwd, ns)?;
+    let (nodes, adj) = load_graph(cwd, ns, true)?;
     let id = resolve(&nodes, ns, input)?;
     let n = &nodes[&id];
 
@@ -86,7 +86,7 @@ pub fn get_node(cwd: &Path, ns: &NamespaceConfig, input: &str) -> Result<()> {
 
 /// `base graph neighbors <node> [-d N]` — the n-hop neighborhood as EDGE lines.
 pub fn neighbors(cwd: &Path, ns: &NamespaceConfig, input: &str, depth: usize) -> Result<()> {
-    let g = load_graph(cwd, ns)?;
+    let g = load_graph(cwd, ns, true)?;
     let (nodes, adj) = &g;
     let seed = resolve(nodes, ns, input)?;
 
@@ -118,7 +118,7 @@ pub fn neighbors(cwd: &Path, ns: &NamespaceConfig, input: &str, depth: usize) ->
 
 /// `base graph path <from> <to>` — shortest undirected path between two nodes.
 pub fn shortest_path(cwd: &Path, ns: &NamespaceConfig, from: &str, to: &str) -> Result<()> {
-    let (nodes, adj) = load_graph(cwd, ns)?;
+    let (nodes, adj) = load_graph(cwd, ns, true)?;
     let src = resolve(&nodes, ns, from)?;
     let dst = resolve(&nodes, ns, to)?;
     if src == dst {

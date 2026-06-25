@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use oxigraph::sparql::QueryResults;
 use serde::Deserialize;
 
 use crate::config::NamespaceConfig;
@@ -39,6 +40,30 @@ pub struct Edge {
     pub confidence: f64,
     #[serde(default)]
     pub provenance: String,
+}
+
+/// Concepts the semantic graph derived from a given source file (matched by
+/// filename, so it works regardless of the root a doc was extracted under).
+/// Returns `(name, summary)` pairs — the "linked concepts" for file-touch context.
+pub fn concepts_for_file(cwd: &Path, ns: &NamespaceConfig, file_name: &str) -> Vec<(String, String)> {
+    let p = &ns.prefix;
+    let needle = crud::escape_sparql_literal(&file_name.to_lowercase());
+    let q = format!(
+        "SELECT DISTINCT ?name ?summary WHERE {{ GRAPH ?g {{\n\
+           ?c a {p}:Concept ; {p}:name ?name ; {p}:sourceDoc ?doc .\n\
+           OPTIONAL {{ ?c {p}:summary ?summary }}\n\
+           FILTER(CONTAINS(LCASE(STR(?doc)), \"{needle}\"))\n\
+         }} }} LIMIT 12"
+    );
+    let mut out = Vec::new();
+    if let Ok(QueryResults::Solutions(sols)) = crud::load_and_query(cwd, ns, &q) {
+        for row in sols.filter_map(|r| r.ok()) {
+            let Some(name) = row.get("name").map(|t| crud::term_display(t.into())) else { continue };
+            let summary = row.get("summary").map(|t| crud::term_display(t.into())).unwrap_or_default();
+            out.push((name, summary));
+        }
+    }
+    out
 }
 
 /// Per-document named graph IRI: `{uri}graph/semantic/{ws}/{doc-slug}`.

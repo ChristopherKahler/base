@@ -12,7 +12,9 @@ use crate::config::NamespaceConfig;
 use crate::graph_query::load_graph;
 
 pub fn run(cwd: &Path, ns: &NamespaceConfig, top_n: usize) -> Result<()> {
-    let (nodes, adj) = load_graph(cwd, ns)?;
+    // Concept-level analysis: AST federation is left to query/agentic tools so
+    // community/centrality output stays about ideas, not code structure.
+    let (nodes, adj) = load_graph(cwd, ns, false)?;
     if nodes.is_empty() {
         println!("The graph has no labelled nodes yet. Run `base graph extract` first.");
         return Ok(());

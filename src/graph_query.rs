@@ -34,7 +34,7 @@ pub struct Options<'a> {
 }
 
 pub fn run(cwd: &Path, ns: &NamespaceConfig, question: &str, opts: &Options) -> Result<()> {
-    let (nodes, adj) = load_graph(cwd, ns)?;
+    let (nodes, adj) = load_graph(cwd, ns, true)?;
     if nodes.is_empty() {
         println!("The graph has no labelled nodes yet. Run `base graph extract` first.");
         return Ok(());
@@ -86,6 +86,7 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, question: &str, opts: &Options) -> 
 pub fn load_graph(
     cwd: &Path,
     ns: &NamespaceConfig,
+    include_ast: bool,
 ) -> Result<(HashMap<String, Node>, HashMap<String, Vec<(String, String)>>)> {
     let p = &ns.prefix;
 
@@ -125,6 +126,29 @@ pub fn load_graph(
             adj.entry(b).or_default().push((a, rel)); // undirected for reachability
         }
     }
+
+    // Federate the per-app AST map so code entities (functions/structs/modules)
+    // and their call/import relationships traverse alongside semantic concepts.
+    // Edges are kept only when both endpoints are real nodes (drops dangling
+    // import targets). Code-entity IRIs (code:*) never collide with concept IRIs.
+    if include_ast {
+        let (code_nodes, code_edges) = crate::crud::ast_query::code_graph(cwd, ns);
+        for (id, label, ntype, file) in code_nodes {
+            nodes.entry(id).or_insert(Node {
+                label,
+                ntype,
+                source: file,
+                summary: String::new(),
+            });
+        }
+        for (a, b, rel) in code_edges {
+            if nodes.contains_key(&a) && nodes.contains_key(&b) {
+                adj.entry(a.clone()).or_default().push((b.clone(), rel.clone()));
+                adj.entry(b).or_default().push((a, rel));
+            }
+        }
+    }
+
     Ok((nodes, adj))
 }
 
