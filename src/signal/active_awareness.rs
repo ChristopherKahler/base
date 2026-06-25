@@ -132,12 +132,11 @@ fn render_working_set(rows: &[Wrow], current: Option<&str>, registry: &[Workspac
         let mut elsewhere_ws: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut elsewhere_n = 0usize;
         for r in rows.iter().filter(|r| r.status != "blocked" && is_project(&r.ty)) {
-            if let Home::Workspace(w) = home_of(&r.path) {
-                if current.map(|c| w.as_str() != c).unwrap_or(false) {
+            if let Home::Workspace(w) = home_of(&r.path)
+                && current.map(|c| w.as_str() != c).unwrap_or(false) {
                     elsewhere_n += 1;
                     elsewhere_ws.insert(w);
                 }
-            }
         }
         if elsewhere_n > 0 {
             output.push_str(&format!(

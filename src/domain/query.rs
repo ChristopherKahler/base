@@ -309,7 +309,7 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
         }
 
         if !output.is_empty() {
-            print!("{output}\n");
+            println!("{output}");
 
             // Register hash so hook-side dedup suppresses same content later
             let combined_hash = {
@@ -322,11 +322,10 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
         }
     }
 
-    if session_dirty {
-        if let Some(bd) = base_dir.as_deref() {
+    if session_dirty
+        && let Some(bd) = base_dir.as_deref() {
             let _ = session.save(bd);
         }
-    }
 }
 
 /// List all available context triggers (domains with keywords or queries).

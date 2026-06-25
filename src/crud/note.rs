@@ -263,8 +263,8 @@ pub fn recalled_note_iris(
     iris
 }
 
-/// Stamp `{p}:lastRead = now` on the given note IRIs (workspace graph, STRICT load
-/// + `write_back`). This is the usage signal `base graph purge --stale` reads. Called
+/// Stamp `{p}:lastRead = now` on the given note IRIs (workspace graph, STRICT load +
+/// `write_back`). This is the usage signal `base graph purge --stale` reads. Called
 /// ONLY from the explicit `base recall` CLI path (never hooks — latency budget +
 /// Phase 35 writes-stay-strict). Returns the count stamped. Errs if the strict load
 /// fails (corrupt graph) so the caller warns + skips — never a silent lenient write.

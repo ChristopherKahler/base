@@ -167,9 +167,9 @@ pub struct PurgeOutcome {
 
 /// Select (and, when `apply`, delete) stale notes by RECENCY alone: unread for
 /// > `days` (COALESCE(lastRead, createdAt, epoch) < cutoff). Attachment is
-/// irrelevant — `lastRead` renews the clock on every recall, so only notes never
-/// pulled back up age out (operator decision 2026-06-19). DRY-RUN by default —
-/// writes nothing unless `apply`. Refuses an unhealthy graph. PURE/path-scoped.
+/// > irrelevant — `lastRead` renews the clock on every recall, so only notes never
+/// > pulled back up age out (operator decision 2026-06-19). DRY-RUN by default —
+/// > writes nothing unless `apply`. Refuses an unhealthy graph. PURE/path-scoped.
 pub fn purge_stale(path: &Path, ns: &NamespaceConfig, days: i64, apply: bool) -> Result<PurgeOutcome> {
     if !matches!(store::graph_health(path), GraphHealth::Healthy) {
         anyhow::bail!(
@@ -204,11 +204,10 @@ pub fn purge_stale(path: &Path, ns: &NamespaceConfig, days: i64, apply: bool) ->
         for row in sols.filter_map(|r| r.ok()) {
             if let Some(Term::NamedNode(n)) = row.get("n") {
                 candidates.push(n.as_str().to_string());
-                if sample.len() < 5 {
-                    if let Some(Term::Literal(l)) = row.get("text") {
+                if sample.len() < 5
+                    && let Some(Term::Literal(l)) = row.get("text") {
                         sample.push(l.value().chars().take(70).collect());
                     }
-                }
             }
         }
     }

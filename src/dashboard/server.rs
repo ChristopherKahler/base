@@ -19,6 +19,18 @@ pub struct AppState {
     pub trig_path: PathBuf,
 }
 
+impl AppState {
+    /// Lock the store, recovering from a poisoned mutex instead of propagating the
+    /// panic. The dashboard is a long-running server: one handler that panicked while
+    /// holding the lock must not cascade into every later request panicking too. Graph
+    /// integrity is guaranteed at the persistence layer (`write_back` validates the
+    /// serialized output before the atomic rename), so serving from a recovered guard
+    /// is safe.
+    pub fn store_guard(&self) -> std::sync::MutexGuard<'_, oxigraph::store::Store> {
+        self.store.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Start the dashboard server on the given port.
 pub async fn start(port: u16, cwd: PathBuf) {
     let config = BaseConfig::load(&cwd);

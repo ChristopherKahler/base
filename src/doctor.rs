@@ -135,11 +135,10 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         .map(|(tier, path)| {
             let report = diagnose_tier(&tier, &path);
             warnings.extend(bloat_warnings(&report));
-            if report.status != "missing" {
-                if let Some(err) = write_probe(&path) {
+            if report.status != "missing"
+                && let Some(err) = write_probe(&path) {
                     warnings.push(format!("{tier} tier write probe FAILED — {err}"));
                 }
-            }
             report
         })
         .collect();
@@ -598,7 +597,7 @@ pub fn list_backups(path: &Path) -> Vec<(PathBuf, usize)> {
             baks.push((mt, p));
         }
     }
-    baks.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    baks.sort_by_key(|b| std::cmp::Reverse(b.0)); // newest first
     baks.into_iter().map(|(_, p)| {
         let n = count_lines(&p);
         (p, n)

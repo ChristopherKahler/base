@@ -198,7 +198,7 @@ fn splice_workspace_block(content: &str, block: &str) -> String {
     }
     let mut out = content.to_string();
     if !out.ends_with('\n') { out.push('\n'); }
-    out.push_str("\n");
+    out.push('\n');
     out.push_str(block);
     out.push('\n');
     out

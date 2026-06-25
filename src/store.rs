@@ -419,13 +419,16 @@ pub fn snapshot(path: &Path, op: &str) -> Result<PathBuf> {
         format!("failed to snapshot {} → {}", path.display(), backup.display())
     })?;
 
-    rotate_backups(path, fname);
+    rotate_backups(path, fname, &backup);
     Ok(backup)
 }
 
 /// Keep the newest [`BACKUP_KEEP`] `{fname}.bak*` snapshots; delete the rest.
-/// Non-fatal: any IO error is logged and skipped.
-fn rotate_backups(path: &Path, fname: &str) {
+/// `just_written` (the snapshot the caller just created) always ranks newest so
+/// rotation can never prune it — mtime ties are routine under coarse FS granularity
+/// and rapid auto-compaction snapshots, and losing the freshest backup is the worst
+/// failure mode for a durability layer. Non-fatal: any IO error is logged and skipped.
+fn rotate_backups(path: &Path, fname: &str, just_written: &Path) {
     let Some(parent) = path.parent() else {
         return;
     };
@@ -453,7 +456,16 @@ fn rotate_backups(path: &Path, fname: &str) {
     if baks.len() <= BACKUP_KEEP {
         return;
     }
-    baks.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    // Newest first. The just-written snapshot is forced to the front so it survives
+    // rotation regardless of mtime; filename is a deterministic tiebreak for the rest.
+    baks.sort_by(|a, b| {
+        let a_new = a.1 == just_written;
+        let b_new = b.1 == just_written;
+        b_new
+            .cmp(&a_new)
+            .then(b.0.cmp(&a.0))
+            .then(b.1.cmp(&a.1))
+    });
     for (_, p) in baks.into_iter().skip(BACKUP_KEEP) {
         if let Err(e) = fs::remove_file(&p) {
             eprintln!("graph: failed to rotate out backup {}: {e}", p.display());

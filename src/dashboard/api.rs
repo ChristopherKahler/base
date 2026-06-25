@@ -120,7 +120,7 @@ pub async fn nodes(State(state): State<Arc<AppState>>) -> Json<Vec<GraphNode>> {
     let ns = &state.config.namespace;
     let p = &ns.prefix;
     let pfx = crate::crud::prefixes(ns);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     let sparql = format!(
         "{pfx}\n\
@@ -164,7 +164,7 @@ pub async fn edges(State(state): State<Arc<AppState>>) -> Json<Vec<GraphEdge>> {
     let ns = &state.config.namespace;
     let p = &ns.prefix;
     let pfx = crate::crud::prefixes(ns);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     let edge_predicates = [
         "relatedTo", "references", "hasRule", "hasDecision",
@@ -212,7 +212,7 @@ pub async fn search(
     let p = &ns.prefix;
     let pfx = crate::crud::prefixes(ns);
     let q_lower = crate::crud::escape_sparql_literal(&q.to_lowercase());
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     // Search by name, description, or note text
     let sparql = format!(
@@ -261,7 +261,7 @@ pub async fn node_detail(
     let ns = &state.config.namespace;
     let pfx = crate::crud::prefixes(ns);
     let decoded_iri = urldecode(&iri);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     let props_sparql = format!(
         "{pfx}\nSELECT ?p ?o WHERE {{ GRAPH ?g {{ <{decoded_iri}> ?p ?o }} }}"
@@ -334,7 +334,7 @@ pub async fn get_notes(
 ) -> Json<Vec<NoteEntry>> {
     let ns = &state.config.namespace;
     let decoded_iri = urldecode(&iri);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
     Json(fetch_notes(&store, ns, &decoded_iri))
 }
 
@@ -352,7 +352,7 @@ pub async fn add_note(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     // Get next index
     let existing = fetch_notes(&store, ns, &decoded_iri);
@@ -403,7 +403,7 @@ pub async fn update_note(
     let p = &ns.prefix;
     let pfx = crate::crud::prefixes(ns);
     let decoded_iri = urldecode(&iri);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     if body.text.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -464,7 +464,7 @@ pub async fn delete_note(
     let p = &ns.prefix;
     let pfx = crate::crud::prefixes(ns);
     let decoded_iri = urldecode(&iri);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     // Find the note IRI
     let find = format!(
@@ -537,7 +537,7 @@ pub async fn ops_projects(State(state): State<Arc<AppState>>) -> Json<Vec<OpsPro
     let ns = &state.config.namespace;
     let p = &ns.prefix;
     let pfx = crate::crud::prefixes(ns);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     // Get projects
     let proj_sparql = format!(
@@ -613,7 +613,7 @@ pub async fn ops_decisions(State(state): State<Arc<AppState>>) -> Json<Vec<OpsDe
     let ns = &state.config.namespace;
     let p = &ns.prefix;
     let pfx = crate::crud::prefixes(ns);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     let sparql = format!(
         "{pfx}\nSELECT ?d ?name ?rationale ?created ?dname WHERE {{\n\
@@ -646,7 +646,7 @@ pub async fn ops_reminders(State(state): State<Arc<AppState>>) -> Json<Vec<OpsRe
     let ns = &state.config.namespace;
     let p = &ns.prefix;
     let pfx = crate::crud::prefixes(ns);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     let sparql = format!(
         "{pfx}\nSELECT ?r ?name ?due ?rstatus ?relIri ?relName WHERE {{\n\
@@ -709,7 +709,7 @@ pub async fn create_decision(
             domain_triple = format!("<{iri}> {p}:hasDomain <{domain_iri}> .\n");
         }
 
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
     let insert = format!(
         "{pfx}\nINSERT DATA {{\n  GRAPH <{graph}> {{\n\
            <{iri}> rdf:type {p}:Decision .\n\
@@ -744,7 +744,7 @@ pub async fn update_decision(
     let ns = &state.config.namespace;
     let p = &ns.prefix;
     let pfx = crate::crud::prefixes(ns);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     if let Some(ref name) = body.name {
         let u = format!(
@@ -799,7 +799,7 @@ pub async fn delete_decision(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let iri = urldecode(&iri);
     let pfx = crate::crud::prefixes(&state.config.namespace);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     let del = format!(
         "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> ?p ?o }} }}\n\
@@ -849,7 +849,7 @@ pub async fn create_reminder(
             extra_triples.push_str(&format!("<{iri}> {p}:relatedTo <{related_iri}> .\n"));
         }
 
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
     let insert = format!(
         "{pfx}\nINSERT DATA {{\n  GRAPH <{graph}> {{\n\
            <{iri}> rdf:type {p}:Reminder .\n\
@@ -874,7 +874,7 @@ pub async fn complete_reminder(
     let ns = &state.config.namespace;
     let p = &ns.prefix;
     let pfx = crate::crud::prefixes(ns);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     // Delete old status, insert completed
     let del = format!(
@@ -899,7 +899,7 @@ pub async fn delete_reminder(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let iri = urldecode(&iri);
     let pfx = crate::crud::prefixes(&state.config.namespace);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     let del = format!(
         "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> ?p ?o }} }}\n\
@@ -934,7 +934,7 @@ pub async fn update_project_status(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     let check = format!("{pfx}\nASK {{ GRAPH ?g {{ <{iri}> rdf:type ?t }} }}");
     match store.query(&check) {
@@ -1276,7 +1276,7 @@ pub async fn update_task_status(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     // Verify entity exists
     let check = format!(
@@ -1812,7 +1812,7 @@ pub async fn reload_graph(
     let new_store = crate::store::load_graph(&state.trig_path)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let mut store = state.store.lock().unwrap();
+    let mut store = state.store_guard();
     *store = new_store;
 
     Ok(Json(serde_json::json!({ "reloaded": true })))
@@ -1853,7 +1853,7 @@ pub async fn create_task(
             ));
         }
 
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     let insert = format!(
         "{pfx}\nINSERT DATA {{\n  GRAPH <{graph}> {{\n\
@@ -1894,7 +1894,7 @@ pub async fn update_task(
     let p = &ns.prefix;
     let pfx = crate::crud::prefixes(ns);
 
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     // Verify entity exists
     let check = format!(
@@ -1970,7 +1970,7 @@ pub async fn delete_task(
     let ns = &state.config.namespace;
     let pfx = crate::crud::prefixes(ns);
 
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     // Verify entity exists
     let check = format!(
@@ -2029,7 +2029,7 @@ pub async fn create_entity(
         domain_triple = format!("<{entity_iri}> {p}:hasDomain <{domain_iri}> .\n");
     }
 
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     let insert = format!(
         "{pfx}\nINSERT DATA {{\n  GRAPH <{graph}> {{\n\
@@ -2063,7 +2063,7 @@ pub async fn get_domains(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<DomainInfo>> {
     let domains = crate::domain::load_domains(&state.cwd);
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
     let ns = &state.config.namespace;
     let p = &ns.prefix;
     let pfx = crate::crud::prefixes(ns);
@@ -2124,7 +2124,7 @@ pub async fn add_rule(
     let ws_slug = crate::crud::workspace_slug(&state.cwd);
     let graph = crate::crud::workspace_graph_iri(ns, &ws_slug);
 
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     let insert = format!(
         "{pfx}\nINSERT DATA {{\n  GRAPH <{graph}> {{\n\
@@ -2158,7 +2158,7 @@ pub async fn delete_rule(
     let rule_slug = crate::crud::slugify(&body.text);
     let rule_iri = crate::crud::build_iri(ns, "rule", &rule_slug);
 
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     let delete = format!(
         "{pfx}\nDELETE WHERE {{ GRAPH ?g {{ <{rule_iri}> ?p ?o }} }};\n\
@@ -2202,7 +2202,7 @@ pub async fn export_graph_json(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let ns = &state.config.namespace;
-    let store = state.store.lock().unwrap();
+    let store = state.store_guard();
 
     // Reuse existing nodes + edges queries
     let nodes_sparql = build_nodes_sparql(ns);
