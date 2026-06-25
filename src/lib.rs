@@ -1,4 +1,5 @@
 pub mod ast_repo;
+pub mod graph_analyze;
 pub mod graph_extract;
 pub mod graph_query;
 pub mod llm;

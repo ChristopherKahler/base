@@ -322,6 +322,12 @@ pub enum GraphAction {
         #[arg(long)]
         raw: bool,
     },
+    /// Analyze emergent structure: god nodes, communities, surprising connections
+    Analyze {
+        /// How many of each to show
+        #[arg(short = 'n', long, default_value_t = 10)]
+        top_n: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -383,18 +389,33 @@ pub enum ExtensionAction {
         /// Path to the base-extension.toml (with a [dist] block) to fetch + install
         path: String,
     },
-    /// Scaffold a new, conformant Bun cross-platform plugin (index.ts skeleton,
-    /// package.json, prepare.sh, base-extension.toml with [dist], Bun release.yml).
-    /// Born cross-platform-ready — build with ./prepare.sh, then bundle or `ext add`.
+    /// Scaffold a new, conformant Bun cross-platform plugin. With --bootstrap, the
+    /// one-command kickoff: writes the files, builds, git-inits, and creates+pushes
+    /// a private GitHub repo — ready to develop, born cross-platform.
     Scaffold {
         /// Plugin/binary name — the `base <name>` command (lowercase, hyphens ok)
         name: String,
         /// Parent directory to create <name>-cli/ in (default: current dir)
         #[arg(long)]
         path: Option<String>,
+        /// Exact target folder (new or empty) — overrides the default <name>-cli
+        #[arg(long)]
+        into: Option<String>,
         /// GitHub owner/repo for releases (default: ChristopherKahler/<name>-cli)
         #[arg(long)]
         repo: Option<String>,
+        /// Run prepare.sh (bun build → bin/<name>) after writing files
+        #[arg(long)]
+        build: bool,
+        /// git init + first commit
+        #[arg(long)]
+        git: bool,
+        /// Create a private GitHub repo, wire origin, and push (implies --git)
+        #[arg(long)]
+        create_repo: bool,
+        /// One-flag full kickoff: build + git + create-repo
+        #[arg(long)]
+        bootstrap: bool,
     },
     /// Remove an installed extension by name
     Remove {
@@ -2226,6 +2247,11 @@ pub fn run() {
                 };
                 if let Err(e) = base::graph_query::run(&cwd, &config.namespace, &question, &opts) {
                     die("graph query failed", e);
+                }
+            }
+            GraphAction::Analyze { top_n } => {
+                if let Err(e) = base::graph_analyze::run(&cwd, &config.namespace, top_n) {
+                    die("graph analyze failed", e);
                 }
             }
         },

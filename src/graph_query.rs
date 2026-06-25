@@ -14,10 +14,10 @@ use oxigraph::sparql::QueryResults;
 use crate::config::NamespaceConfig;
 use crate::crud;
 
-struct Node {
-    label: String,
-    ntype: String,
-    source: String,
+pub struct Node {
+    pub label: String,
+    pub ntype: String,
+    pub source: String,
 }
 
 const EXACT: f64 = 1000.0;
@@ -82,7 +82,7 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, question: &str, opts: &Options) -> 
 /// Pull labelled nodes and the concept edge-set from graph.nq into memory.
 /// Edges come from reified semantic edges (ops:from/ops:to); traversal is
 /// undirected so BFS reaches both callers and callees of a concept.
-fn load_graph(
+pub fn load_graph(
     cwd: &Path,
     ns: &NamespaceConfig,
 ) -> Result<(HashMap<String, Node>, HashMap<String, Vec<(String, String)>>)> {
