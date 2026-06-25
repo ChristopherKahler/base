@@ -421,6 +421,51 @@ fn ast_prefixes(ns: &NamespaceConfig) -> String {
     )
 }
 
+/// List registered per-app code maps from the workspace graph — what maps
+/// exist, where, and how big. Lets Claude discover an app's map outside a dev
+/// session, then query it with `base ast query --target <app>`.
+pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
+    let p = &ns.prefix;
+    let sparql = format!(
+        "SELECT ?name ?count ?path ?synced WHERE {{\n\
+           GRAPH ?g {{\n\
+             ?m a {p}:CodeMap ;\n\
+               {p}:name ?name ;\n\
+               {p}:hasCodeMap ?path .\n\
+             OPTIONAL {{ ?m {p}:astEntityCount ?count }}\n\
+             OPTIONAL {{ ?m {p}:lastSynced ?synced }}\n\
+           }}\n\
+         }} ORDER BY ?name"
+    );
+
+    let results = crud::load_and_query(cwd, ns, &sparql)?;
+    if let QueryResults::Solutions(solutions) = results {
+        let rows: Vec<Vec<String>> = solutions
+            .filter_map(|r| r.ok())
+            .map(|row| {
+                vec![
+                    row.get("name").map(|t| crud::term_display(t.into())).unwrap_or_default(),
+                    row.get("count").map(|t| crud::term_display(t.into())).unwrap_or_else(|| "-".into()),
+                    row.get("path").map(|t| crud::term_display(t.into())).unwrap_or_default(),
+                    row.get("synced").map(|t| crud::term_display(t.into())).unwrap_or_else(|| "-".into()),
+                ]
+            })
+            .collect();
+
+        if rows.is_empty() {
+            println!("No code maps registered. Run `base sync --ast --target <app>`.");
+            return Ok(());
+        }
+
+        println!("| app | entities | map | last synced |");
+        println!("|-----|----------|-----|-------------|");
+        for r in &rows {
+            println!("| {} | {} | {} | {} |", r[0], r[1], r[2], r[3]);
+        }
+    }
+    Ok(())
+}
+
 fn load_ast_store(cwd: &Path) -> Result<oxigraph::store::Store> {
     let ast_path = crate::config::find_ast_ttl(cwd)
         .ok_or_else(|| anyhow::anyhow!("No ast.ttl found. Run `base sync --ast` first."))?;

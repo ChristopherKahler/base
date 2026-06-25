@@ -440,7 +440,13 @@ pub enum AstAction {
         /// Find all files that import from a given file
         #[arg(short, long)]
         imports: Option<String>,
+        /// Query a specific app's map by path (e.g. apps/foo) instead of the cwd's map
+        #[arg(short, long)]
+        target: Option<String>,
     },
+    /// List registered per-app code maps (name, entities, path, last synced)
+    #[command(visible_alias = "l")]
+    List,
 }
 
 #[derive(Subcommand)]
@@ -836,18 +842,30 @@ pub fn run() {
 
         // ─── AST Query ──────────────────────────────────
         Some(Commands::Ast { action }) => match action {
-            AstAction::Query { contains, file, calls, imports } => {
+            AstAction::Query { contains, file, calls, imports, target } => {
+                // --target lets the parent query a specific app's map: resolve to
+                // that dir so find_ast_ttl walks up to its .base-ast/ast.ttl.
+                let qcwd = match &target {
+                    Some(t) => {
+                        let p = std::path::Path::new(t);
+                        if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
+                    }
+                    None => cwd.clone(),
+                };
                 if let Some(name) = contains {
-                    if let Err(e) = crud::ast_query::contains(&cwd, &config.namespace, &name) { die("Error", e); }
+                    if let Err(e) = crud::ast_query::contains(&qcwd, &config.namespace, &name) { die("Error", e); }
                 } else if let Some(path) = file {
-                    if let Err(e) = crud::ast_query::file(&cwd, &config.namespace, &path) { die("Error", e); }
+                    if let Err(e) = crud::ast_query::file(&qcwd, &config.namespace, &path) { die("Error", e); }
                 } else if let Some(name) = calls {
-                    if let Err(e) = crud::ast_query::calls(&cwd, &config.namespace, &name) { die("Error", e); }
+                    if let Err(e) = crud::ast_query::calls(&qcwd, &config.namespace, &name) { die("Error", e); }
                 } else if let Some(path) = imports {
-                    if let Err(e) = crud::ast_query::imports(&cwd, &config.namespace, &path) { die("Error", e); }
+                    if let Err(e) = crud::ast_query::imports(&qcwd, &config.namespace, &path) { die("Error", e); }
                 } else {
                     eprintln!("Provide one of: --contains, --file, --calls, --imports");
                 }
+            }
+            AstAction::List => {
+                if let Err(e) = crud::ast_query::list(&cwd, &config.namespace) { die("Error", e); }
             }
         },
 

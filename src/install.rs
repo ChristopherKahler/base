@@ -723,7 +723,8 @@ The `base` binary is on PATH. Use these commands proactively during sessions —
 
 | Trigger | Command |
 |---------|---------|
-| Navigate code: find functions, callers, imports | `base ast query --contains "name"` or `--file`, `--calls`, `--imports` |
+| Navigate code: find functions, callers, imports | `base ast query --contains "name"` or `--file`, `--calls`, `--imports` (add `--target apps/X` to query another app's map) |
+| Discover which apps have a code map | `base ast list` |
 | A decision is made (architectural, process, tooling) | `base decision log --domain X --decision "..." --rationale "..."` |
 | An insight, correction, or lesson emerges | `base learn --text "..." --domain X --type insight\|correction\|decision` |
 | User defines or refines a behavioral rule | `base rule add --domain X --text "..."` |
@@ -739,6 +740,10 @@ The AST graph already knows every function, struct, class, import, and call rela
 - `base ast query --file "main.rs"` (or `base a q -f "main.rs"`) — list entities in a file
 - `base ast query --calls "validate"` — find all callers of a function
 - `base ast query --imports "config.rs"` (or `base a q -i "config.rs"`) — find importers
+- `base ast query --target apps/X -c "auth"` — query a specific app's map from anywhere (e.g. the parent workspace), no `cd` needed
+- `base ast list` — see which apps have a code map, with entity counts + paths
+
+Each app keeps its own self-contained map at `<app>/.base-ast/ast.ttl`, registered in the workspace graph and kept current automatically (a Stop hook refreshes the cwd app's map after each turn). Map a new app once with `base sync --ast --target apps/X`; thereafter it stays live.
 
 **Order of operations:** `base ast query` first → understand structure → `Read` specific lines only. Never scan-then-understand when you can understand-then-read.
 
