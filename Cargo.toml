@@ -22,6 +22,7 @@ open = "5"
 ureq = { version = "2", features = ["json"] }
 sha2 = "0.11.0"
 rpassword = "7"
+pdf-extract = "0.10.0"
 
 [dev-dependencies]
 tempfile = "3"

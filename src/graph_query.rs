@@ -18,6 +18,7 @@ pub struct Node {
     pub label: String,
     pub ntype: String,
     pub source: String,
+    pub summary: String,
 }
 
 const EXACT: f64 = 1000.0;
@@ -89,10 +90,11 @@ pub fn load_graph(
     let p = &ns.prefix;
 
     let node_q = format!(
-        "SELECT ?s ?label ?type ?src WHERE {{ GRAPH ?g {{\n\
+        "SELECT ?s ?label ?type ?src ?summary WHERE {{ GRAPH ?g {{\n\
            ?s {p}:name ?label .\n\
            OPTIONAL {{ ?s {p}:conceptType ?type }}\n\
            OPTIONAL {{ ?s {p}:sourceDoc ?src }}\n\
+           OPTIONAL {{ ?s {p}:summary ?summary }}\n\
          }} }}"
     );
     let mut nodes: HashMap<String, Node> = HashMap::new();
@@ -103,6 +105,7 @@ pub fn load_graph(
                 label: row.get("label").map(|t| crud::term_display(t.into())).unwrap_or_default(),
                 ntype: row.get("type").map(|t| crud::term_display(t.into())).unwrap_or_default(),
                 source: row.get("src").map(|t| crud::term_display(t.into())).unwrap_or_default(),
+                summary: row.get("summary").map(|t| crud::term_display(t.into())).unwrap_or_default(),
             });
         }
     }

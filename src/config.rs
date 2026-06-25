@@ -120,6 +120,8 @@ pub struct BaseConfig {
     #[serde(default)]
     pub graph: GraphConfig,
     #[serde(default)]
+    pub multimodal: MultimodalConfig,
+    #[serde(default)]
     pub flow: FlowConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
@@ -218,6 +220,21 @@ impl Default for GraphConfig {
             compact_cooldown_hours: default_compact_cooldown_hours(),
         }
     }
+}
+
+// ─── Multimodal Config (graph extract — P4) ─────────────────
+
+/// Multimodal ingest for `base graph extract` (PDF / image-via-vision /
+/// audio+video-via-Whisper). OFF by default: with it off, extract is markdown-only
+/// and pulls ZERO extra dependencies. No sudo is ever required — PDF is in-process
+/// (`pdf-extract` crate), image uses the already-present `claude`, and only
+/// audio/video pull `whisper`+`ffmpeg`, installed once via `pip install --user`
+/// (marker-gated, never again) the first time such a corpus is ingested with this
+/// enabled. Flip on with `base config set multimodal.enabled true`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MultimodalConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 // ─── Flow Config ────────────────────────────────────────────

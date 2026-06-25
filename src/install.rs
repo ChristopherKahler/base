@@ -747,6 +747,22 @@ Each app keeps its own self-contained map at `<app>/.base-ast/ast.ttl`, register
 
 **Order of operations:** `base ast query` first → understand structure → `Read` specific lines only. Never scan-then-understand when you can understand-then-read.
 
+### GraphRAG — ask questions across a doc corpus
+
+- `base graph extract --target docs/` — LLM pass over markdown → concepts + relationship edges in the graph (no API key, content-cached, ~25s/doc)
+- `base graph query "<question>"` — retrieve the relevant subgraph and synthesize a **cited** answer in one command
+- `base graph query "<q>" --raw` — return just the retrieved subgraph for the current session to reason over (highest-quality path)
+- `base graph analyze` — emergent structure: god nodes (core abstractions), communities, surprising cross-community bridges
+
+**Agentic retrieval** (read-only primitives — drive your own multi-call traversal instead of one-shot query):
+- `base graph get-node "<label|slug>"` — one node's type, source, summary, and edges
+- `base graph neighbors "<node>" -d N` — the N-hop neighborhood as edge lines
+- `base graph path "<from>" "<to>"` — shortest path between two concepts
+
+**Multimodal ingest is OFF by default** (markdown-only, zero extra deps). PDF/image/audio/video need it on:
+- `base config set multimodal.enabled true` (or one-shot `base graph extract --multimodal`)
+- **No sudo, ever.** PDF → in-process (`pdf-extract` crate, zero dep); image → Claude vision (uses the present `claude`, zero dep); audio/video → Whisper, whose `whisper`+`ffmpeg` install **once** via `pip install --user` (marker-gated), never again. An operator who never enables it — or only feeds docs/images — installs nothing.
+
 ### Project management
 
 - `base project add --name "..." --path "src/x"` (or `base p a -n "..." -p "src/x"`) — register a project

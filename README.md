@@ -237,7 +237,41 @@ base ast query --contains "auth"             # or: base a q -c "auth"
 base ast query --file "main.rs"              # or: base a q -f "main.rs"
 base ast query --imports "config.rs"         # or: base a q -i "config.rs"
 base ast query --calls "handle_request"      # find callers
+base ast query --target apps/X -c "auth"     # query another app's map from anywhere (no cd)
+base ast list                                # which apps have a code map
 ```
+
+Each app keeps a self-contained map at `<app>/.base-ast/ast.ttl`, kept current by a Stop hook and regenerated on checkout.
+
+### GraphRAG (semantic graph over docs)
+
+```bash
+base graph extract --target docs/            # LLM: docs -> concepts + edges (no API key, cached)
+base graph query "how does auth work?"       # retrieve + synthesize a cited answer
+base graph query "..." --raw                 # just the retrieved subgraph (let a session reason)
+base graph analyze                           # structure: god nodes, communities, bridges
+
+# agentic retrieval — primitives a live session drives across turns
+base graph get-node "auth flow"              # one node: type, source, summary, edges
+base graph neighbors "auth flow" -d 2        # the 2-hop neighborhood as edge lines
+base graph path "login" "session store"      # shortest path between two concepts
+```
+
+**Multimodal ingest is OFF by default.** `extract` processes markdown only and pulls
+zero extra tooling. Flip it on to also ingest PDF / image / audio / video:
+
+```bash
+base config set multimodal.enabled true      # persistent switch (or one-shot: extract --multimodal)
+base graph extract --target media/           # see per-modality deps below
+```
+
+No sudo, ever — the dependency hierarchy is in-process → user-space → (never) system:
+- **PDF** → in-process (`pdf-extract` crate, baked into the binary) — zero dependency.
+- **Image** → a Claude vision pass via the already-present `claude` — zero dependency.
+- **Audio / video** → Whisper transcription. The first audio/video run installs `whisper`
+  + `ffmpeg` **once** via `pip install --user` (no sudo, marker-gated), then never again.
+
+An operator who never enables multimodal — or only ever feeds it docs/images — installs nothing.
 
 ### Decisions, rules, memory
 
@@ -369,6 +403,8 @@ base ext list                                    # shows installed plugin comman
 ```
 
 Install **linked** (runs from the repo — for development) or **packaged** (`base ext install --bundle <manifest>` copies the handler into `~/.base-gbl/plugins/<name>/` and repoints the manifest — repo-independent, the shippable artifact). Same registry either way.
+
+**Cross-platform** (for compiled handlers): give the manifest a `[dist]` block (`repo`/`version`/`binary`) and `base ext add <manifest>` detects the host OS/arch, fetches the matching prebuilt binary from the plugin's GitHub release, verifies its sha256, and installs it — no operator toolchain. **Scaffold** a new conformant plugin with `base ext scaffold <name>` — `--bootstrap` is the one-command kickoff: writes the Bun skeleton, builds it, `git init`s, and creates + pushes a private repo. See **[PLUGIN-DIST-SPEC.md](PLUGIN-DIST-SPEC.md)**.
 
 Full reference: **[docs/command-plugins.md](docs/command-plugins.md)**.
 

@@ -296,7 +296,9 @@ pub enum GraphAction {
         #[arg(long, default_value_t = 21)]
         days: i64,
     },
-    /// LLM semantic extraction over a doc corpus → concepts + edges in the graph
+    /// LLM semantic extraction over a doc corpus → concepts + edges in the graph.
+    /// Markdown-only by default; PDF/image/audio/video need multimodal enabled
+    /// (`base config set multimodal.enabled true`, or one-shot --multimodal).
     Extract {
         /// Directory to extract (defaults to cwd)
         #[arg(short, long)]
@@ -304,6 +306,10 @@ pub enum GraphAction {
         /// Claude Code model alias for extraction (e.g. haiku, sonnet, opus)
         #[arg(short, long)]
         model: Option<String>,
+        /// Force multimodal ingest for this run (overrides config; bootstraps
+        /// pdftotext/ffmpeg/whisper once if a non-markdown corpus needs them)
+        #[arg(long)]
+        multimodal: bool,
     },
     /// GraphRAG: answer a natural-language question over the graph (retrieve + synthesize)
     Query {
@@ -327,6 +333,26 @@ pub enum GraphAction {
         /// How many of each to show
         #[arg(short = 'n', long, default_value_t = 10)]
         top_n: usize,
+    },
+    /// Agentic retrieval: full detail for one node (label, type, source, summary, edges)
+    GetNode {
+        /// Node label, concept slug, or unique substring
+        node: String,
+    },
+    /// Agentic retrieval: the n-hop neighborhood of a node as edge lines
+    Neighbors {
+        /// Node label, concept slug, or unique substring
+        node: String,
+        /// Hops to expand
+        #[arg(short, long, default_value_t = 1)]
+        depth: usize,
+    },
+    /// Agentic retrieval: shortest path between two nodes
+    Path {
+        /// Start node (label, slug, or unique substring)
+        from: String,
+        /// End node (label, slug, or unique substring)
+        to: String,
     },
 }
 
@@ -2234,13 +2260,14 @@ pub fn run() {
                     }
                 }
             }
-            GraphAction::Extract { target, model } => {
+            GraphAction::Extract { target, model, multimodal } => {
                 let tp = {
                     let t = target.as_deref().unwrap_or(".");
                     let p = std::path::Path::new(t);
                     if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
                 };
-                match base::graph_extract::run(&cwd, &config.namespace, &tp, model.as_deref()) {
+                let mm_enabled = multimodal || config.multimodal.enabled;
+                match base::graph_extract::run(&cwd, &config.namespace, &tp, model.as_deref(), mm_enabled) {
                     Ok(report) => print!("{}", base::graph_extract::format_report(&report)),
                     Err(e) => die("graph extract failed", e),
                 }
@@ -2259,6 +2286,21 @@ pub fn run() {
             GraphAction::Analyze { top_n } => {
                 if let Err(e) = base::graph_analyze::run(&cwd, &config.namespace, top_n) {
                     die("graph analyze failed", e);
+                }
+            }
+            GraphAction::GetNode { node } => {
+                if let Err(e) = base::graph_tools::get_node(&cwd, &config.namespace, &node) {
+                    die("graph get-node failed", e);
+                }
+            }
+            GraphAction::Neighbors { node, depth } => {
+                if let Err(e) = base::graph_tools::neighbors(&cwd, &config.namespace, &node, depth) {
+                    die("graph neighbors failed", e);
+                }
+            }
+            GraphAction::Path { from, to } => {
+                if let Err(e) = base::graph_tools::shortest_path(&cwd, &config.namespace, &from, &to) {
+                    die("graph path failed", e);
                 }
             }
         },
