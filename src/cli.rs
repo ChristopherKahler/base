@@ -1192,6 +1192,7 @@ pub fn run() {
                         // frequent background refreshes off graph.nq.
                         if std::env::var("BASE_AST_SKIP_REGISTER").is_err() {
                             if let Some(app_root) = ast_ttl.parent().and_then(|p| p.parent()) {
+                                base::ast_repo::ensure_repo_wiring(app_root);
                                 if let Err(e) = crud::ast_map::register(
                                     &cwd, &config.namespace, app_root, &ast_ttl,
                                 ) {

@@ -1,3 +1,4 @@
+pub mod ast_repo;
 pub mod command;
 pub mod config;
 pub mod crud;
