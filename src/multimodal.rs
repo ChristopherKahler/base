@@ -201,9 +201,9 @@ pub fn ensure_deps(mods: &BTreeSet<Modality>) -> Result<()> {
     }
     let missing: Vec<&Dep> = needed.into_iter().filter(|d| !on_path(d.bin)).collect();
     if missing.is_empty() {
-        if let Some(mp) = marker_path() {
-            let _ = std::fs::write(&mp, b"ok\n");
-        }
+        // Nothing to install — don't write the marker. The marker means "we
+        // attempted a bootstrap", so a dep that goes missing later still gets
+        // its one auto-install attempt.
         return Ok(());
     }
 
