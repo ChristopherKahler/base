@@ -22,6 +22,8 @@ use std::process::Command;
 
 use crate::extension::{self, ExtensionDef};
 
+pub mod dist;
+
 // ─── Reserved core command names ─────────────────────────────
 //
 // A plugin can never shadow a built-in: core subcommands always resolve first
@@ -171,16 +173,33 @@ pub fn build_registry(exts: &[ExtensionDef]) -> CommandRegistry {
 /// relative (exec will fail loud if it can't be found).
 fn resolve_handler(handler: &str, ext: &ExtensionDef) -> PathBuf {
     let expanded = expand_tilde(handler);
-    if expanded.is_absolute() {
-        return expanded;
+    let path = if expanded.is_absolute() {
+        expanded
+    } else if let Some(fw) = &ext.framework_dir {
+        expand_tilde(fw).join(&expanded)
+    } else if let Some(parent) = ext.source_path.as_ref().and_then(|p| p.parent()) {
+        parent.join(&expanded)
+    } else {
+        expanded
+    };
+    windows_exe_fixup(path)
+}
+
+/// P3 (PLUGIN-DIST-SPEC §4): on Windows, a handler declared without an extension
+/// (`bin/highlevel`) maps to the packaged `highlevel.exe`. If the bare path is
+/// missing but its `.exe` sibling exists, use that. No-op on unix and whenever the
+/// declared path already resolves — strictly additive.
+fn windows_exe_fixup(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if path.extension().is_none() && !path.exists() {
+            let exe = path.with_extension("exe");
+            if exe.exists() {
+                return exe;
+            }
+        }
     }
-    if let Some(fw) = &ext.framework_dir {
-        return expand_tilde(fw).join(&expanded);
-    }
-    if let Some(parent) = ext.source_path.as_ref().and_then(|p| p.parent()) {
-        return parent.join(&expanded);
-    }
-    expanded
+    path
 }
 
 /// Expand a leading `~/` to the home directory.

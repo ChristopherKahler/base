@@ -296,6 +296,15 @@ pub enum GraphAction {
         #[arg(long, default_value_t = 21)]
         days: i64,
     },
+    /// LLM semantic extraction over a doc corpus → concepts + edges in the graph
+    Extract {
+        /// Directory to extract (defaults to cwd)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Claude Code model alias for extraction (e.g. haiku, sonnet, opus)
+        #[arg(short, long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -349,6 +358,13 @@ pub enum ExtensionAction {
         /// manifest there — a self-contained, repo-independent (shippable) install.
         #[arg(long)]
         bundle: bool,
+    },
+    /// Fetch a plugin's prebuilt binary for THIS host from its GitHub release
+    /// ([dist] block), verify the sha256, unpack + install — cross-platform, no
+    /// toolchain. Falls back to a local source build when no host asset exists.
+    Add {
+        /// Path to the base-extension.toml (with a [dist] block) to fetch + install
+        path: String,
     },
     /// Remove an installed extension by name
     Remove {
@@ -1567,6 +1583,16 @@ pub fn run() {
                     }
                 }
             }
+            ExtensionAction::Add { path } => {
+                let p = std::path::Path::new(&path);
+                match base::plugin::dist::dist_install(p) {
+                    Ok(outcome) => println!("{}", base::plugin::dist::format_dist_human(&outcome)),
+                    Err(e) => {
+                        eprintln!("✗ Cannot add: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             ExtensionAction::Remove { name } => {
                 let home = dirs::home_dir().expect("Cannot determine home directory");
                 let ext_dir = home.join(".base-gbl").join("extensions");
@@ -2135,6 +2161,17 @@ pub fn run() {
                         eprintln!("base graph purge failed: {e}");
                         std::process::exit(1);
                     }
+                }
+            }
+            GraphAction::Extract { target, model } => {
+                let tp = {
+                    let t = target.as_deref().unwrap_or(".");
+                    let p = std::path::Path::new(t);
+                    if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
+                };
+                match base::graph_extract::run(&cwd, &config.namespace, &tp, model.as_deref()) {
+                    Ok(report) => print!("{}", base::graph_extract::format_report(&report)),
+                    Err(e) => die("graph extract failed", e),
                 }
             }
         },
