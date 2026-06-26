@@ -1380,7 +1380,7 @@ pub fn run() {
                 // AST data lives ONLY in ast.ttl. Never write it into graph.nq —
                 // Turtle appended to an NQuads file corrupts the whole graph (AUDIT C10).
                 println!("AST extraction: {} → {}", target_dir, ast_ttl.display());
-                let status = std::process::Command::new("python3")
+                let status = std::process::Command::new(base::multimodal::python_bin())
                     .arg(&ast_script)
                     .arg(target_dir)
                     .arg("--full")

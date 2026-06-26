@@ -94,6 +94,24 @@ fn base_bin_dir() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".base-gbl").join("bin"))
 }
 
+/// Resolve the Python interpreter name to invoke. On Unix `python3` is canonical
+/// (`python` may still be Python 2); on Windows the python.org installer ships
+/// `python.exe` only and a bare `python3` hits the Microsoft Store stub, so prefer
+/// `python` there. Falls back to the other name when the preferred one isn't found.
+pub fn python_bin() -> &'static str {
+    #[cfg(windows)]
+    let (first, second) = ("python", "python3");
+    #[cfg(not(windows))]
+    let (first, second) = ("python3", "python");
+    if on_path(first) {
+        first
+    } else if on_path(second) {
+        second
+    } else {
+        first
+    }
+}
+
 /// Is a binary resolvable? Side-effect-free scan of PATH plus base's own bin dir
 /// (don't spawn the tool just to test for it).
 fn on_path(bin: &str) -> bool {
@@ -162,7 +180,7 @@ fn install_ffmpeg_userspace() -> bool {
         return false;
     }
     // Resolve the bundled binary and shim it onto base's bin dir.
-    let py = if on_path("python3") { "python3" } else { "python" };
+    let py = python_bin();
     let out = Command::new(py)
         .arg("-c")
         .arg("import imageio_ffmpeg,sys; sys.stdout.write(imageio_ffmpeg.get_ffmpeg_exe())")

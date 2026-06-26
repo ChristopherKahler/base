@@ -1,0 +1,39 @@
+# base AST extractor (onto_ast.py) Python dependencies.
+# The core tree-sitter runtime is required (Language API v2, >= 0.23.0).
+# Each grammar below is optional and imported lazily — if a grammar has no
+# wheel for the host platform, the extractor skips that language gracefully
+# rather than failing the whole run.
+#
+# Install:  python -m pip install -r requirements.txt
+# (`base install` attempts this automatically.)
+
+tree-sitter>=0.23.0
+
+# Language grammars (one PyPI package per language the extractor supports).
+tree-sitter-bash
+tree-sitter-c
+tree-sitter-c-sharp
+tree-sitter-cpp
+tree-sitter-elixir
+tree-sitter-fortran
+tree-sitter-go
+tree-sitter-groovy
+tree-sitter-java
+tree-sitter-javascript
+tree-sitter-json
+tree-sitter-julia
+tree-sitter-kotlin
+tree-sitter-lua
+tree-sitter-objc
+tree-sitter-pascal
+tree-sitter-php
+tree-sitter-powershell
+tree-sitter-python
+tree-sitter-ruby
+tree-sitter-rust
+tree-sitter-scala
+tree-sitter-sql
+tree-sitter-swift
+tree-sitter-typescript
+tree-sitter-verilog
+tree-sitter-zig

@@ -148,6 +148,18 @@ That's three commands. `base install` handles everything: binary goes to `~/.loc
 
 `base scaffold` creates `.base/` in your workspace with domains.toml and default config.
 
+### Windows
+
+Easiest path: grab the prebuilt `base-windows-x86_64.zip` from the [latest release](../../releases) (or `npx chrisai`) — no toolchain needed.
+
+To build from source instead, run the helper from a normal PowerShell window:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-base-windows.ps1
+```
+
+It imports the MSVC developer environment, resolves LLVM/libclang (bindgen needs it for the vendored RocksDB), and runs `cargo install`. A bare `cargo build` fails without that setup. AST extraction uses `python` on Windows (the bare `python3` name hits the Microsoft Store stub); `base install` resolves the interpreter automatically and `pip install`s `scripts/ast/requirements.txt`.
+
 ## Quick win - see it work in 5 minutes
 
 After install, try this sequence:

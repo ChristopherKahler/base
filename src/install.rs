@@ -640,8 +640,16 @@ fn install_scripts(binary_path: &Path, global_dir: &Path) -> Result<()> {
         .find(|p| p.join("onto_ast.py").exists());
 
     let Some(source_dir) = source_dir else {
-        println!("⊘ scripts/ast/ not found near binary — skipped");
-        println!("   Copy scripts/ast/ to {} manually", scripts_dest.display());
+        // No source near the binary (e.g. `cargo install` drops only the binary,
+        // or a Windows release ships scripts straight to the global dir). If the
+        // destination already has the extractor, that's success — report ✓.
+        if scripts_dest.join("onto_ast.py").exists() {
+            println!("✓ (already present in {})", scripts_dest.display());
+            install_python_deps(&scripts_dest);
+        } else {
+            println!("⊘ scripts/ast/ not found near binary — skipped");
+            println!("   Copy scripts/ast/ to {} manually", scripts_dest.display());
+        }
         return Ok(());
     };
 
@@ -664,7 +672,33 @@ fn install_scripts(binary_path: &Path, global_dir: &Path) -> Result<()> {
     }
 
     println!("✓ ({count} scripts → {})", scripts_dest.display());
+    install_python_deps(&scripts_dest);
     Ok(())
+}
+
+/// Best-effort `pip install -r requirements.txt` for the AST extractor. Uses the
+/// resolved Python interpreter (`python` on Windows, `python3` on Unix) via
+/// `python -m pip`, which sidesteps the Microsoft Store `python3` stub. Never
+/// fatal: a failure (no pip, externally-managed env, offline) only prints a
+/// manual-fallback hint so `base install` still completes.
+fn install_python_deps(scripts_dest: &Path) {
+    let req = scripts_dest.join("requirements.txt");
+    if !req.exists() {
+        return;
+    }
+    let py = crate::multimodal::python_bin();
+    print!("   python deps (tree-sitter) ... ");
+    let status = std::process::Command::new(py)
+        .args(["-m", "pip", "install", "-q", "-r"])
+        .arg(&req)
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("✓"),
+        _ => {
+            println!("⚠ skipped");
+            println!("   Install manually: {py} -m pip install -r {}", req.display());
+        }
+    }
 }
 
 // ─── Step 6: Seed system rules ──────────────────────────────

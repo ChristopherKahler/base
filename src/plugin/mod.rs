@@ -552,6 +552,33 @@ fn npm_install(dir: &Path) -> anyhow::Result<bool> {
     }
 }
 
+/// Serialize a string as a valid TOML basic string token (including the
+/// surrounding quotes), escaping per the TOML spec. Critical on Windows: a path
+/// like `C:\Users\…` written raw into `"…"` turns `\U` into an invalid unicode
+/// escape, so the manifest silently fails to parse and the extension never loads.
+/// Lossless — the parsed value round-trips to the exact input path.
+fn toml_basic_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Replace the `framework_dir` value in a manifest's text, preserving all other
 /// lines + comments. Errors if there's no `framework_dir` line to repoint.
 fn rewrite_framework_dir(original: &str, dest: &str) -> anyhow::Result<String> {
@@ -559,7 +586,7 @@ fn rewrite_framework_dir(original: &str, dest: &str) -> anyhow::Result<String> {
     let mut replaced = false;
     for line in original.lines() {
         if line.trim_start().starts_with("framework_dir") && line.contains('=') {
-            out.push_str(&format!("framework_dir = \"{dest}\"\n"));
+            out.push_str(&format!("framework_dir = {}\n", toml_basic_string(dest)));
             replaced = true;
         } else {
             out.push_str(line);
@@ -908,6 +935,27 @@ DUP=second
         assert!(out.contains("# header comment"), "comments preserved");
         assert!(out.contains("name = \"x\""));
         assert!(!out.contains("~/old/path"));
+    }
+
+    #[test]
+    fn rewrite_framework_dir_windows_path_roundtrips() {
+        // A Windows dest (`\Users`) written raw would emit an invalid `\U`
+        // escape; the manifest must stay valid TOML and parse back to the
+        // exact path.
+        let original =
+            "[extension]\nname = \"x\"\nversion = \"0.1.0\"\ndescription = \"d\"\nframework_dir = \"~/old\"\n";
+        let dest = r"C:\Users\chris\.base-gbl\plugins\x";
+        let out = rewrite_framework_dir(original, dest).unwrap();
+        let parsed: extension::ExtensionFile =
+            toml::from_str(&out).expect("repointed manifest must be valid TOML");
+        assert_eq!(parsed.extension.framework_dir.as_deref(), Some(dest));
+    }
+
+    #[test]
+    fn toml_basic_string_escapes_specials() {
+        assert_eq!(toml_basic_string(r"C:\a"), r#""C:\\a""#);
+        assert_eq!(toml_basic_string("/home/u/x"), r#""/home/u/x""#);
+        assert_eq!(toml_basic_string("a\"b"), r#""a\"b""#);
     }
 
     #[test]

@@ -46,6 +46,7 @@ jobs:
           cp target/${{ matrix.target }}/release/${{ matrix.binary }} staging/
           strip staging/${{ matrix.binary }} || true
           cp scripts/ast/*.py staging/scripts/ast/
+          cp scripts/ast/requirements.txt staging/scripts/ast/
           cd staging
           tar -czf ../${{ matrix.asset }} ${{ matrix.binary }} scripts/
 
@@ -56,6 +57,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path staging/scripts/ast | Out-Null
           Copy-Item target/${{ matrix.target }}/release/${{ matrix.binary }} staging/
           Copy-Item scripts/ast/*.py staging/scripts/ast/
+          Copy-Item scripts/ast/requirements.txt staging/scripts/ast/
           Compress-Archive -Path staging/* -DestinationPath ${{ matrix.asset }}
 
       - name: Upload artifact
