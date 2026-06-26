@@ -161,6 +161,8 @@ pub fn handoff_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
                {p}:handoffDoc ?doc ;\n\
                {p}:createdAt ?created ;\n\
                {p}:resurfaceAt ?resurfaceAt .\n\
+             OPTIONAL {{ ?h {p}:kind ?kind }}\n\
+             FILTER(!BOUND(?kind) || ?kind != \"fork\")\n\
              FILTER(?resurfaceAt <= \"{now_str}\"^^xsd:dateTime)\n\
            }}\n\
          }}\n\
@@ -208,6 +210,74 @@ pub fn handoff_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
          \"archive <letter>\" → run `base handoff archive <slug>`. Letter→slug: {}.",
         letter_map.join(", ")
     ));
+
+    Ok(out)
+}
+
+/// Find OPEN forks (kind = "fork") whose `resurfaceAt` is in the past, across
+/// global + workspace tiers, and render the "Forks" block. Forks are additive
+/// parallel side-work — multiple surface at once, each summoned by its title
+/// (== slug == doc basename), distinct from the single Handoff resume line.
+pub fn fork_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
+    let Some(store) = crate::store::load_merged(cwd) else {
+        return Ok(String::new());
+    };
+    let now = chrono::Local::now();
+    let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let p = &ns.prefix;
+    let sparql = format!(
+        "{pfx}\nSELECT ?h ?project ?doc ?created WHERE {{\n\
+           GRAPH ?g {{\n\
+             ?h a {p}:Handoff ;\n\
+               {p}:kind \"fork\" ;\n\
+               {p}:status \"open\" ;\n\
+               {p}:project ?project ;\n\
+               {p}:handoffDoc ?doc ;\n\
+               {p}:createdAt ?created ;\n\
+               {p}:resurfaceAt ?resurfaceAt .\n\
+             FILTER(?resurfaceAt <= \"{now_str}\"^^xsd:dateTime)\n\
+           }}\n\
+         }}\n\
+         ORDER BY ?created",
+        pfx = crud::prefixes(ns)
+    );
+
+    let QueryResults::Solutions(solutions) = crate::store::query(&store, &sparql)? else {
+        return Ok(String::new());
+    };
+
+    let rows: Vec<(String, String, String, String)> = solutions
+        .filter_map(|r| r.ok())
+        .map(|row| {
+            let get = |k: &str| {
+                row.get(k)
+                    .map(|t| crud::term_display(t.into()))
+                    .unwrap_or_default()
+            };
+            let h = get("h");
+            let slug = h.rsplit('/').next().unwrap_or(&h).to_string();
+            (slug, get("project"), get("doc"), get("created"))
+        })
+        .collect();
+
+    if rows.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut out = String::from("[Forks]\n");
+    for (slug, project, doc, created) in &rows {
+        let days = chrono::DateTime::parse_from_rfc3339(created)
+            .map(|dt| now.signed_duration_since(dt).num_days())
+            .unwrap_or(0);
+        out.push_str(&format!("- {slug} · {project} · {doc} · {days}d\n"));
+    }
+    out.push_str(
+        "BEHAVIOR: These are open parallel side-work forks — independent of the continuity \
+         handoff and of each other. To pick one up, name its title (the first field, == doc \
+         basename) → read that doc and build the feature autonomously. Multiple can stay open \
+         at once; do not treat these as a single lettered choice. \"snooze <title> <N>d\" → run \
+         `base fork snooze <title> <N>`; \"archive <title>\" → run `base fork archive <title>`.",
+    );
 
     Ok(out)
 }

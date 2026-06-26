@@ -69,6 +69,23 @@ A plugin can be installed two ways — same registry (`~/.base-gbl/extensions/`)
 
 Re-running `--bundle` cleanly replaces the previous copy.
 
+## Cross-platform distribution: `base ext add`
+
+`--bundle` lands the **build host's** binary — a Linux ELF won't `exec` on macOS/Windows. For compiled handlers, give the manifest a `[dist]` block and ship per-OS release assets instead:
+
+```toml
+[dist]
+repo    = "owner/my-tool-cli"   # GitHub repo holding the releases
+version = "0.1.0"               # pinned tag (resolved as v<version>)
+binary  = "my-tool"            # → my-tool.exe on Windows
+```
+
+`base ext add <manifest>` then detects the host OS/arch, downloads the matching asset (`<binary>-<os>-<arch>.<ext>` — `linux-x86_64.tar.gz` / `darwin-aarch64.tar.gz` / `windows-x86_64.zip`) from the GitHub release, **verifies its sha256**, unpacks into `~/.base-gbl/plugins/<name>/`, and repoints the manifest — no operator toolchain. Private repos are supported (it uses `GITHUB_TOKEN` / `~/.base-gbl/.env` / `gh`). If no asset exists for the host but a local source dir with `prepare.sh` is present, it falls back to a source build. `[dist]` is optional — absent, nothing changes.
+
+## Scaffold a conformant plugin: `base ext scaffold`
+
+`base ext scaffold <name>` stamps a complete, buildable Bun plugin (runnable `index.ts` skeleton with the envelope + exit-code contract, `package.json`, `prepare.sh`, `base-extension.toml` with `[dist]`, the standard cross-compile `release.yml`, `commands/`). Flags: `--into <dir>` (exact target folder), `--build`, `--git`, `--create-repo`, and **`--bootstrap`** — the one-command kickoff that writes the files, builds the binary, `git init`s + commits, and creates + pushes a private GitHub repo. New tools are born cross-platform-ready.
+
 ## The env contract
 
 Every plugin process receives:

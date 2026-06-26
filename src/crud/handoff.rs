@@ -58,33 +58,75 @@ fn mutate_file(path: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<()> {
     crate::store::write_back(&store, path)
 }
 
+/// Derive a flow-doc slug from its doc path basename (no extension).
+/// `/abs/path/FORK-COMMAND-SPEC.md` → `FORK-COMMAND-SPEC`. Used VERBATIM (no
+/// slugify/lowercase) so the doc filename and the graph slug are the SAME string
+/// — that single name is the title a handoff/fork is summoned by (doc==slug protocol).
+fn doc_basename_slug(doc_path: &str) -> Result<String> {
+    Path::new(doc_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .with_context(|| format!("could not derive a slug from doc path '{doc_path}'"))
+}
+
+/// Resolve the slug for a flow-doc: an explicit `--slug` override (verbatim) when
+/// given and non-blank, else the doc basename. THE STANDARD for both handoff and
+/// fork: doc filename and graph slug always align, so the operator summons the
+/// next session by one consistent name.
+fn resolve_doc_slug(slug: Option<&str>, doc_path: &str) -> Result<String> {
+    match slug {
+        Some(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
+        _ => doc_basename_slug(doc_path),
+    }
+}
+
 /// Register a handoff pointing at a resume document. Archives any prior OPEN
-/// handoff for the same project (one open handoff per project), then inserts the
-/// new one with `resurfaceAt = now` so it surfaces on the next session start.
-pub fn create(cwd: &Path, ns: &NamespaceConfig, project: &str, doc_path: &str) -> Result<String> {
-    let now_dt = chrono::Local::now();
-    let now = now_dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
-    let slug = format!("{}-{}", crud::slugify(project), now_dt.timestamp_micros());
+/// continuity handoff for the same project (one open handoff per project), then
+/// inserts the new one with `resurfaceAt = now` so it surfaces next session start.
+/// Slug defaults to the doc basename (doc==slug protocol); pass `slug` to override.
+/// Re-registering the same slug re-points it idempotently (no duplicate triples).
+pub fn create(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    project: &str,
+    doc_path: &str,
+    slug: Option<&str>,
+) -> Result<String> {
+    let now = crud::now_iso();
+    let slug = resolve_doc_slug(slug, doc_path)?;
     let iri = crud::build_iri(ns, "handoff", &slug);
     let (path, graph) = write_tier(cwd, ns)?;
     let p = &ns.prefix;
     let project = crud::escape_sparql_literal(project);
     let doc = crud::escape_sparql_literal(doc_path);
 
-    // 1. Archive any existing open handoff for this project in the target tier.
+    // 1. Archive any existing open *continuity* handoff for this project in the
+    //    target tier. Forks (kind = "fork") share the Handoff type + project but
+    //    are additive side-work — never archive them here.
     let archive_prior = format!(
         "DELETE {{ GRAPH <{graph}> {{ ?h {p}:status \"open\" }} }}\n\
          INSERT {{ GRAPH <{graph}> {{ ?h {p}:status \"archived\" }} }}\n\
-         WHERE  {{ GRAPH <{graph}> {{ ?h a {p}:Handoff ; {p}:project \"{project}\" ; {p}:status \"open\" }} }}"
+         WHERE  {{ GRAPH <{graph}> {{ ?h a {p}:Handoff ; {p}:project \"{project}\" ; {p}:status \"open\" .\n\
+           OPTIONAL {{ ?h {p}:kind ?kind }}\n\
+           FILTER(!BOUND(?kind) || ?kind != \"fork\") }} }}"
     );
 
-    // 2. Insert the new handoff.
+    // 2. Clean any existing node at this exact slug so re-registration re-points
+    //    it instead of layering duplicate status/timestamp triples.
+    let clean_target = format!(
+        "DELETE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }}"
+    );
+
+    // 3. Insert the new handoff.
     let insert = format!(
         "INSERT DATA {{ GRAPH <{graph}> {{\n\
            <{iri}> rdf:type {p}:Handoff ;\n\
              {p}:name \"{project}\" ;\n\
              {p}:project \"{project}\" ;\n\
              {p}:handoffDoc \"{doc}\" ;\n\
+             {p}:kind \"handoff\" ;\n\
              {p}:status \"open\" ;\n\
              {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
              {p}:resurfaceAt \"{now}\"^^xsd:dateTime ;\n\
@@ -92,11 +134,53 @@ pub fn create(cwd: &Path, ns: &NamespaceConfig, project: &str, doc_path: &str) -
          }} }}"
     );
 
-    mutate_file(&path, ns, &format!("{archive_prior};\n{insert}"))?;
+    mutate_file(&path, ns, &format!("{archive_prior};\n{clean_target};\n{insert}"))?;
     Ok(slug)
 }
 
-/// List handoffs across both tiers (global + workspace).
+/// Register a fork pointing at a build-spec document. Forks are ADDITIVE —
+/// creating one does NOT archive sibling forks (contrast `create`, which archives
+/// the prior open handoff for the project). Slug defaults to the doc basename
+/// (doc==slug protocol), so `handoff/<doc-basename>` is the node IRI; pass `slug`
+/// to override. `resurfaceAt = now` so it surfaces next session.
+pub fn create_fork(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    project: &str,
+    doc_path: &str,
+    slug: Option<&str>,
+) -> Result<String> {
+    let now = crud::now_iso();
+    let slug = resolve_doc_slug(slug, doc_path)?;
+    let iri = crud::build_iri(ns, "handoff", &slug);
+    let (path, graph) = write_tier(cwd, ns)?;
+    let p = &ns.prefix;
+    let project = crud::escape_sparql_literal(project);
+    let name = crud::escape_sparql_literal(&slug);
+    let doc = crud::escape_sparql_literal(doc_path);
+
+    // Additive: no archive-prior. A re-create of the same slug re-points it
+    // (idempotent) by deleting any existing node at this IRI first.
+    let insert = format!(
+        "DELETE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }};\n\
+         INSERT DATA {{ GRAPH <{graph}> {{\n\
+           <{iri}> rdf:type {p}:Handoff ;\n\
+             {p}:name \"{name}\" ;\n\
+             {p}:project \"{project}\" ;\n\
+             {p}:handoffDoc \"{doc}\" ;\n\
+             {p}:kind \"fork\" ;\n\
+             {p}:status \"open\" ;\n\
+             {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
+             {p}:resurfaceAt \"{now}\"^^xsd:dateTime ;\n\
+             {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
+         }} }}"
+    );
+
+    mutate_file(&path, ns, &insert)?;
+    Ok(slug)
+}
+
+/// List handoffs (continuity docs only — forks excluded) across both tiers.
 pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
     let Some(store) = crate::store::load_merged(cwd) else {
         println!("No handoffs.");
@@ -110,6 +194,8 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
                {p}:project ?project ;\n\
                {p}:status ?status .\n\
              OPTIONAL {{ ?h {p}:resurfaceAt ?resurfaceAt }}\n\
+             OPTIONAL {{ ?h {p}:kind ?kind }}\n\
+             FILTER(!BOUND(?kind) || ?kind != \"fork\")\n\
            }}\n\
          }}\n\
          ORDER BY ?status ?project",
@@ -136,6 +222,55 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
 
         println!("| slug | project | status | resurfaceAt |");
         println!("|------|---------|--------|-------------|");
+        for row in &rows {
+            println!("| {} | {} | {} | {} |", row[0], row[1], row[2], row[3]);
+        }
+    }
+    Ok(())
+}
+
+/// List forks (parallel side-work build-specs) across both tiers. Multiple may
+/// be open at once. Title == slug == doc basename.
+pub fn list_forks(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
+    let Some(store) = crate::store::load_merged(cwd) else {
+        println!("No forks.");
+        return Ok(());
+    };
+    let p = &ns.prefix;
+    let sparql = format!(
+        "{pfx}\nSELECT ?h ?project ?status ?doc WHERE {{\n\
+           GRAPH ?g {{\n\
+             ?h a {p}:Handoff ;\n\
+               {p}:kind \"fork\" ;\n\
+               {p}:project ?project ;\n\
+               {p}:status ?status ;\n\
+               {p}:handoffDoc ?doc .\n\
+           }}\n\
+         }}\n\
+         ORDER BY ?status ?h",
+        pfx = crud::prefixes(ns)
+    );
+
+    if let QueryResults::Solutions(solutions) = crate::store::query(&store, &sparql)? {
+        let rows: Vec<Vec<String>> = solutions
+            .filter_map(|r| r.ok())
+            .map(|row| {
+                let get = |k: &str| {
+                    row.get(k).map(|t| crud::term_display(t.into())).unwrap_or_default()
+                };
+                let h = get("h");
+                let slug = h.rsplit('/').next().unwrap_or(&h).to_string();
+                vec![slug, get("project"), get("status"), get("doc")]
+            })
+            .collect();
+
+        if rows.is_empty() {
+            println!("No forks.");
+            return Ok(());
+        }
+
+        println!("| title | project | status | doc |");
+        println!("|-------|---------|--------|-----|");
         for row in &rows {
             println!("| {} | {} | {} | {} |", row[0], row[1], row[2], row[3]);
         }

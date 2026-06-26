@@ -73,7 +73,7 @@ ops:Reminder      rdf:type rdfs:Class ;
 
 ops:Handoff       rdf:type rdfs:Class ;
                   rdfs:label "Handoff" ;
-                  rdfs:comment "A session resume document, surfaced at session start until archived" .
+                  rdfs:comment "A flow document surfaced at session start until archived. kind \"handoff\" = continuity resume doc (one open per project); kind \"fork\" = parallel side-work build-spec (multiple open at once)" .
 
 ops:Workspace     rdf:type rdfs:Class ;
                   rdfs:label "Workspace" ;
@@ -345,6 +345,10 @@ ops:handoffDoc    rdf:type rdf:Property ;
 ops:project       rdf:type rdf:Property ;
                   rdfs:range xsd:string ;
                   rdfs:comment "Project name a handoff belongs to (one open handoff per project)" .
+
+ops:kind          rdf:type rdf:Property ;
+                  rdfs:range xsd:string ;
+                  rdfs:comment "Flow-doc kind: \"handoff\" (continuity, archive-prior) or \"fork\" (parallel side-work, additive)" .
 
 ops:action        rdf:type rdf:Property ;
                   rdfs:comment "LedgerEntry action (plan, apply, unify)" .

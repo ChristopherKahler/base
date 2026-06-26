@@ -430,3 +430,46 @@ pub fn repath(cwd: &Path, ns: &NamespaceConfig, slug: &str, new_path: &str) -> R
 
     Ok(RepathResult { name, old_path, new_path: new_path.to_string(), domain_changed })
 }
+
+/// Re-home a project end-to-end to another workspace graph: the project node + its
+/// domain + tasks/milestones + decisions/rules + edge-attached notes + handoffs, all
+/// rewritten from `graph/ws/<current>` to `graph/ws/<to>`. Built on the
+/// [`crate::graph_move`] primitive (snapshot-both → write → health-gate → rollback).
+///
+/// AST is NEVER moved (it rebuilds from the code): the underlying move runs with
+/// `no_ast = true`, so `codemap/<slug>` + `code#` entities stay put and the
+/// destination map is regenerated separately (`base sync --ast`). The current
+/// workspace (derived from `cwd`) is the source; `to` is the destination workspace
+/// name resolved through the `[[workspace]]` registry.
+pub fn move_project(
+    cwd: &Path,
+    config: &BaseConfig,
+    slug: &str,
+    to: &str,
+    dry_run: bool,
+) -> Result<crate::graph_move::MoveReport> {
+    use crate::graph_move::{self, Selector};
+    let ns = &config.namespace;
+    let from_name = crud::workspace_slug(cwd);
+    let spec = graph_move::spec_from_names(&from_name, to, &config.workspace, ns, true)?;
+
+    // Collect every subject belonging to the project. Domain selection already covers
+    // the domain node, slug-convention tasks/decisions/rules/milestones, and anything
+    // that links to the domain (notes via relatedTo, the project via hasDomain). Add
+    // handoffs, which key off the slug but carry no domain edge.
+    let mut subjects =
+        graph_move::resolve_selector(&spec.source_path, &Selector::Domain(slug.to_string()), &spec.source_graph, ns)?;
+    subjects.extend(graph_move::resolve_selector(
+        &spec.source_path,
+        &Selector::Prefix(format!("{}handoff/{}", ns.uri, slug)),
+        &spec.source_graph,
+        ns,
+    )?);
+
+    let project_iri = crud::build_iri(ns, "project", slug);
+    if !subjects.contains(&project_iri) {
+        anyhow::bail!("project '{slug}' not found in workspace '{from_name}' graph");
+    }
+
+    graph_move::graph_move_subjects(&spec, &subjects, ns, dry_run)
+}

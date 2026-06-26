@@ -1,6 +1,7 @@
 pub mod ast_repo;
 pub mod graph_analyze;
 pub mod graph_extract;
+pub mod graph_move;
 pub mod graph_query;
 pub mod graph_tools;
 pub mod llm;

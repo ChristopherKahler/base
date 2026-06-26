@@ -93,6 +93,16 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         Ok(_) => diagnostics.push(format!("<{hook}-reminder-scan:no-match>")),
         Err(e) => eprintln!("base: signal 'reminder' failed: {e}"),
     }
+    // Forks — parallel side-work build-specs. Persistent like handoffs: their own
+    // signal so they bypass suppression AND the budget cap and surface every
+    // session until picked up, snoozed, or archived. Additive (multiple open).
+    match flow_resurface::fork_scan(cwd, ns) {
+        Ok(output) if !output.is_empty() => {
+            results.push(SignalResult { name: "fork".into(), priority: 0, output });
+        }
+        Ok(_) => diagnostics.push(format!("<{hook}-fork-scan:no-match>")),
+        Err(e) => eprintln!("base: signal 'fork' failed: {e}"),
+    }
 
     // Sort by priority
     results.sort_by_key(|r| r.priority);
@@ -106,8 +116,8 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     let novel: Vec<&SignalResult> = results
         .iter()
         .filter(|r| {
-            // Handoffs/reminders are persistent — never suppress; they surface every session.
-            if r.name == "handoff" || r.name == "reminder" {
+            // Handoffs/reminders/forks are persistent — never suppress; they surface every session.
+            if r.name == "handoff" || r.name == "reminder" || r.name == "fork" {
                 return true;
             }
             let hash = suppression::hash_output(&r.output);
@@ -125,8 +135,11 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     let mut dropped = 0;
 
     for result in &novel {
-        // active-awareness (priority 1) and persistent handoff/reminder always emit.
-        let always = result.priority == 1 || result.name == "handoff" || result.name == "reminder";
+        // active-awareness (priority 1) and persistent handoff/reminder/fork always emit.
+        let always = result.priority == 1
+            || result.name == "handoff"
+            || result.name == "reminder"
+            || result.name == "fork";
         if always || chars_used + result.output.len() <= sig.max_chars {
             combined.push_str(&result.output);
             combined.push('\n');

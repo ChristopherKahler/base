@@ -83,6 +83,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: HandoffAction,
     },
+    /// Manage parallel side-work forks (build-specs surfaced at session start)
+    Fork {
+        #[command(subcommand)]
+        action: ForkAction,
+    },
     /// Sync file-owned data into the graph
     Sync {
         /// Only re-extract files changed since last sync
@@ -354,6 +359,28 @@ pub enum GraphAction {
         /// End node (label, slug, or unique substring)
         to: String,
     },
+    /// Move a subgraph between workspace graphs (rewrites the named-graph stamp,
+    /// backs up both tiers, atomic with rollback). PREVIEW unless --yes.
+    Move {
+        /// What to move: `node:<iri>`, `domain:<name>`, `prefix:<str>`, or a full node IRI
+        #[arg(long)]
+        select: String,
+        /// Destination workspace name (registered in base.toml [[workspace]])
+        #[arg(long)]
+        to: String,
+        /// Source workspace name (defaults to the current workspace)
+        #[arg(long)]
+        from: Option<String>,
+        /// Preview the move plan; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Exclude AST entities (code# namespace + codemap/ pointers); regenerate at destination
+        #[arg(long)]
+        no_ast: bool,
+        /// Apply the move (without it, prints the plan and writes nothing)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -602,6 +629,24 @@ pub enum ProjectAction {
         #[arg(long)]
         next_action: Option<String>,
     },
+    /// Re-home a project to another workspace graph (node + tasks + domain +
+    /// decisions/rules/notes). AST regenerates at the destination. PREVIEW unless --yes.
+    Move {
+        /// Project slug or display name (in the current workspace)
+        slug: String,
+        /// Destination workspace name (registered in base.toml [[workspace]])
+        #[arg(long)]
+        to: String,
+        /// Preview the move plan; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip regenerating the AST map at the destination
+        #[arg(long)]
+        no_ast: bool,
+        /// Apply the move (without it, prints the plan and writes nothing)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -811,12 +856,35 @@ pub enum HandoffAction {
         project: String,
         #[arg(long)]
         doc: String,
+        /// Graph slug / title to summon it by (default: doc basename)
+        #[arg(long)]
+        slug: Option<String>,
     },
     /// List handoffs across global + workspace tiers
     List,
     /// Snooze a handoff for N days (hide until then)
     Snooze { slug: String, days: i64 },
     /// Archive a handoff (stop resurfacing)
+    Archive { slug: String },
+}
+
+#[derive(Subcommand)]
+pub enum ForkAction {
+    /// Register a fork build-spec (additive — does not archive sibling forks)
+    Create {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        doc: String,
+        /// Graph slug / title to summon it by (default: doc basename)
+        #[arg(long)]
+        slug: Option<String>,
+    },
+    /// List forks across global + workspace tiers
+    List,
+    /// Snooze a fork for N days (hide until then)
+    Snooze { slug: String, days: i64 },
+    /// Archive a fork (stop resurfacing)
     Archive { slug: String },
 }
 
@@ -1028,6 +1096,27 @@ pub fn run() {
                     }
                 }
             }
+            ProjectAction::Move { slug, to, dry_run, no_ast, yes } => {
+                if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug) {
+                    // The destructive remove-from-source requires --yes; otherwise preview.
+                    let preview_only = dry_run || !yes;
+                    match crud::project::move_project(&cwd, &config, &s, &to, preview_only) {
+                        Ok(report) => {
+                            print!("{}", base::graph_move::format_report(&report));
+                            if report.applied && report.moved_lines > 0 {
+                                if no_ast {
+                                    println!("   AST regeneration skipped (--no-ast).");
+                                } else {
+                                    println!("   Next: run `base sync --ast` from '{to}' to rebuild {s}'s code map.");
+                                }
+                            } else if preview_only && !dry_run {
+                                println!("   Pass --yes to apply.");
+                            }
+                        }
+                        Err(e) => die("project move failed", e),
+                    }
+                }
+            }
         },
 
         // ─── Milestone ──────────────────────────────────
@@ -1179,8 +1268,8 @@ pub fn run() {
 
         // ─── Handoff ─────────────────────────────────────
         Some(Commands::Handoff { action }) => match action {
-            HandoffAction::Create { project, doc } => {
-                match crud::handoff::create(&cwd, &config.namespace, &project, &doc) {
+            HandoffAction::Create { project, doc, slug } => {
+                match crud::handoff::create(&cwd, &config.namespace, &project, &doc, slug.as_deref()) {
                     Ok(slug) => println!("Handoff for '{project}' registered (slug: {slug})"),
                     Err(e) => die("Failed", e),
                 }
@@ -1195,6 +1284,29 @@ pub fn run() {
             HandoffAction::Archive { slug } => {
                 match crud::handoff::archive(&cwd, &config.namespace, &slug) {
                     Ok(()) => println!("Handoff '{slug}' archived"),
+                    Err(e) => die("Failed", e),
+                }
+            }
+        },
+
+        // ─── Fork ────────────────────────────────────────
+        Some(Commands::Fork { action }) => match action {
+            ForkAction::Create { project, doc, slug } => {
+                match crud::handoff::create_fork(&cwd, &config.namespace, &project, &doc, slug.as_deref()) {
+                    Ok(slug) => println!("Fork '{slug}' registered for '{project}'"),
+                    Err(e) => die("Failed", e),
+                }
+            }
+            ForkAction::List => { if let Err(e) = crud::handoff::list_forks(&cwd, &config.namespace) { die("Error", e); } }
+            ForkAction::Snooze { slug, days } => {
+                match crud::handoff::snooze(&cwd, &config.namespace, &slug, days) {
+                    Ok(()) => println!("Fork '{slug}' snoozed {days}d"),
+                    Err(e) => die("Failed", e),
+                }
+            }
+            ForkAction::Archive { slug } => {
+                match crud::handoff::archive(&cwd, &config.namespace, &slug) {
+                    Ok(()) => println!("Fork '{slug}' archived"),
                     Err(e) => die("Failed", e),
                 }
             }
@@ -2301,6 +2413,31 @@ pub fn run() {
             GraphAction::Path { from, to } => {
                 if let Err(e) = base::graph_tools::shortest_path(&cwd, &config.namespace, &from, &to) {
                     die("graph path failed", e);
+                }
+            }
+            GraphAction::Move { select, to, from, dry_run, no_ast, yes } => {
+                let selector = match base::graph_move::Selector::parse(&select) {
+                    Ok(s) => s,
+                    Err(e) => die("graph move", e),
+                };
+                let from_name = from.unwrap_or_else(|| crud::workspace_slug(&cwd));
+                let spec = match base::graph_move::spec_from_names(
+                    &from_name, &to, &config.workspace, &config.namespace, no_ast,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => die("graph move", e),
+                };
+                // The destructive remove-from-source requires --yes; without it (and
+                // not an explicit --dry-run) we still show the full plan, write nothing.
+                let preview_only = dry_run || !yes;
+                match base::graph_move::graph_move(&spec, &selector, &config.namespace, preview_only) {
+                    Ok(report) => {
+                        print!("{}", base::graph_move::format_report(&report));
+                        if preview_only && !dry_run {
+                            println!("   Pass --yes to apply.");
+                        }
+                    }
+                    Err(e) => die("graph move failed", e),
                 }
             }
         },
