@@ -94,6 +94,13 @@ pub fn prefixes(ns: &NamespaceConfig) -> String {
 
 /// Build a DELETE+INSERT operation for a single field.
 /// Handles the case where the field doesn't exist yet (OPTIONAL).
+///
+/// The DELETE is graph-AGNOSTIC (`GRAPH ?gg`): it removes the old value wherever it
+/// is stamped, then INSERTs the canonical value into `graph_iri`. Scoping the DELETE
+/// to a single graph left a stale value stamped under a *different* workspace graph
+/// behind, so the new value appended instead of replacing it — the `base project
+/// repath` append bug after a cross-workspace move (the moved entity's prior field
+/// lived under the old `graph/ws/<name>` stamp, which the single-graph DELETE missed).
 pub fn field_update(
     graph_iri: &str,
     subject_iri: &str,
@@ -101,11 +108,11 @@ pub fn field_update(
     new_value: &str,
 ) -> String {
     format!(
-        "DELETE {{ GRAPH <{g}> {{ <{s}> {pred} ?old }} }}\n\
+        "DELETE {{ GRAPH ?gg {{ <{s}> {pred} ?old }} }}\n\
          INSERT {{ GRAPH <{g}> {{ <{s}> {pred} {val} }} }}\n\
          WHERE {{\n\
            GRAPH <{g}> {{ <{s}> a ?type }}\n\
-           OPTIONAL {{ GRAPH <{g}> {{ <{s}> {pred} ?old }} }}\n\
+           OPTIONAL {{ GRAPH ?gg {{ <{s}> {pred} ?old }} }}\n\
          }}",
         g = graph_iri,
         s = subject_iri,
@@ -386,6 +393,50 @@ mod tests {
         assert_eq!(
             workspace_graph_iri(&ns, "chris-ai-systems"),
             "http://ops-sys.local/ontology#graph/ws/chris-ai-systems"
+        );
+    }
+
+    #[test]
+    fn field_update_replaces_value_across_named_graphs() {
+        // Regression (repath append bug): a field must be REPLACED even when a stale
+        // value is stamped under a DIFFERENT workspace graph (the cross-workspace-move
+        // case). Before the graph-agnostic DELETE the stale value survived and the new
+        // value appended, leaving two values.
+        let ns = NamespaceConfig::default();
+        let p = &ns.prefix;
+        let store = oxigraph::store::Store::new().unwrap();
+        let g_a = workspace_graph_iri(&ns, "alpha");
+        let g_b = workspace_graph_iri(&ns, "beta");
+        let s = build_iri(&ns, "project", "p");
+
+        // Seed: entity + path "alpha" in graph A; a STALE path in graph B.
+        let seed = format!(
+            "INSERT DATA {{ GRAPH <{g_a}> {{ <{s}> a {p}:Project ; {p}:path \"alpha\" }} \
+                            GRAPH <{g_b}> {{ <{s}> {p}:path \"beta-stale\" }} }}"
+        );
+        store.update(&format!("{}\n{}", prefixes(&ns), seed)).unwrap();
+
+        // Replace path → "new" (canonical graph = A).
+        let upd = field_update(&g_a, &s, &format!("{p}:path"), "\"new\"");
+        store.update(&format!("{}\n{}", prefixes(&ns), upd)).unwrap();
+
+        // Exactly one path value remains across ALL graphs: "new".
+        let q = format!(
+            "{}\nSELECT ?v WHERE {{ GRAPH ?g {{ <{s}> {p}:path ?v }} }}",
+            prefixes(&ns)
+        );
+        let mut vals: Vec<String> = Vec::new();
+        if let oxigraph::sparql::QueryResults::Solutions(sols) = store.query(&q).unwrap() {
+            for r in sols.filter_map(|x| x.ok()) {
+                if let Some(t) = r.get("v") {
+                    vals.push(term_display(t.into()));
+                }
+            }
+        }
+        assert_eq!(
+            vals,
+            vec!["new".to_string()],
+            "stale cross-graph value removed; single canonical value remains"
         );
     }
 }
