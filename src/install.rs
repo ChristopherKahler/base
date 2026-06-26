@@ -227,15 +227,27 @@ fn install_binary(binary: &Path, dest: &Path, bin_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(bin_dir)
         .with_context(|| format!("Creating {}", bin_dir.display()))?;
 
-    // Remove existing binary
-    if dest.exists() {
-        std::fs::remove_file(dest)
-            .with_context(|| format!("Removing existing {}", dest.display()))?;
-    }
+    // If we're already running from the destination, the binary is in place.
+    // Removing it would unlink the running executable — the gated installer
+    // extracts straight to ~/.local/bin/base, then invokes `base install`, so
+    // current_exe() == dest. Remove-then-copy would self-delete the binary.
+    let already_in_place = dest.exists()
+        && matches!(
+            (binary.canonicalize(), dest.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        );
 
-    // Copy binary (not symlink — this is a shippable install)
-    std::fs::copy(binary, dest)
-        .with_context(|| format!("Copying {} → {}", binary.display(), dest.display()))?;
+    if !already_in_place {
+        // Remove existing binary
+        if dest.exists() {
+            std::fs::remove_file(dest)
+                .with_context(|| format!("Removing existing {}", dest.display()))?;
+        }
+
+        // Copy binary (not symlink — this is a shippable install)
+        std::fs::copy(binary, dest)
+            .with_context(|| format!("Copying {} → {}", binary.display(), dest.display()))?;
+    }
 
     // Set executable permission on unix
     #[cfg(unix)]
