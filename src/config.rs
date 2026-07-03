@@ -128,7 +128,39 @@ pub struct BaseConfig {
     #[serde(default)]
     pub protocol: ProtocolConfig,
     #[serde(default)]
+    pub standards: StandardsConfig,
+    #[serde(default)]
     pub workspace: Vec<WorkspaceEntry>,
+}
+
+// ─── Standards Config (MIDAS standards-injection layer) ─────
+
+/// Context-triggered best-practice injection on PreToolUse Edit/Write.
+/// The budget fields keep injection scarce — whole-catalog injection is
+/// context pollution and gets tuned out.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StandardsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Max standards injected per touched file (hard-capped at 5 in code).
+    #[serde(default = "default_standards_max_inject")]
+    pub max_inject: usize,
+    /// Minimum match score — 3 means a bare language or path match never injects.
+    #[serde(default = "default_standards_min_score")]
+    pub min_score: u32,
+}
+
+fn default_standards_max_inject() -> usize { 3 }
+fn default_standards_min_score() -> u32 { 3 }
+
+impl Default for StandardsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            max_inject: default_standards_max_inject(),
+            min_score: default_standards_min_score(),
+        }
+    }
 }
 
 // ─── Workspace Registry ─────────────────────────────────────

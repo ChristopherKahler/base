@@ -49,6 +49,11 @@ pub struct SessionState {
     /// exactly these code maps (not just the session-cwd app), then clears the set.
     #[serde(default)]
     pub dirty_apps: HashSet<String>,
+    /// Standard id → content hash of the injected rule text. Once per standard
+    /// per session; the bracket force-refresh clears it (via clear_dedup) so
+    /// long sessions get a top-of-awareness restore.
+    #[serde(default)]
+    pub standards_injected: HashMap<String, u64>,
 }
 
 impl SessionState {
@@ -121,6 +126,18 @@ impl SessionState {
     /// Clear all dedup state (used for force-refresh).
     pub fn clear_dedup(&mut self) {
         self.injected.clear();
+        self.standards_injected.clear();
+    }
+
+    /// Whether this standard was already injected this session with the same
+    /// rule content. Edited standards (new hash) re-inject.
+    pub fn is_standard_injected(&self, id: &str, hash: u64) -> bool {
+        self.standards_injected.get(id) == Some(&hash)
+    }
+
+    /// Record a standard as injected at its current content hash.
+    pub fn mark_standard_injected(&mut self, id: &str, hash: u64) {
+        self.standards_injected.insert(id.to_string(), hash);
     }
 
     /// Whether this file's AST map was already injected this session AT ITS

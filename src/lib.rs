@@ -27,5 +27,6 @@ pub mod scaffold;
 pub mod scope;
 pub mod secret;
 pub mod signal;
+pub mod standards;
 pub mod store;
 pub mod update;

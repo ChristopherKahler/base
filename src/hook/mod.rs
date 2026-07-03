@@ -35,6 +35,8 @@ pub struct HookEventData {
     pub section_context: bool,
     /// Post-tool-use: an extension "inject" nudge was emitted this call
     pub nudged: bool,
+    /// Pre-tool-use: number of standards injected for this mutation
+    pub standards_injected: usize,
 }
 
 /// Extract tool name and file path from hook event JSON.

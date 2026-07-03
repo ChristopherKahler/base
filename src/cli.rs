@@ -108,6 +108,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: DomainAction,
     },
+    /// Manage context-triggered standards (MIDAS protocols injected on edit)
+    #[command(visible_alias = "std")]
+    Standards {
+        #[command(subcommand)]
+        action: StandardsAction,
+    },
     /// Graph-backed structured memory
     Learn {
         /// The memory text to store (required unless --mention, --remove, --update, or --list)
@@ -960,6 +966,27 @@ pub enum DomainAction {
     },
 }
 
+#[derive(Subcommand)]
+pub enum StandardsAction {
+    /// Sync MIDAS protocols.md → standards.toml + graph Standard entities
+    Sync {
+        /// Override the protocols.md source path
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// List all standards with trigger/annotation counts
+    List,
+    /// Show a standard's full config
+    Get { id: String },
+    /// Dry-run the matcher against a file — scores + what would inject
+    Test {
+        file: String,
+        /// Extra content included in the haystack (simulates an edit payload)
+        #[arg(long)]
+        content: Option<String>,
+    },
+}
+
 /// Resolve a user identifier (slug, display name, or mixed) to a canonical slug.
 /// Prints error and returns None on failure.
 fn resolve(cwd: &std::path::Path, ns: &base::config::NamespaceConfig, entity_type: &str, input: &str) -> Option<String> {
@@ -1468,6 +1495,38 @@ pub fn run() {
                     Ok(()) => println!("Trigger removed from domain '{name}'"),
                     Err(e) => die("Failed", e),
                 }
+            }
+        },
+
+        // ─── Standards ────────────────────────────────────
+        Some(Commands::Standards { action }) => match action {
+            StandardsAction::Sync { source } => {
+                match base::standards::sync::sync_standards(&config, source.as_deref()) {
+                    Ok(stats) => {
+                        println!(
+                            "Standards sync complete: {} parsed from protocols.md, {} updated, {} created → {}",
+                            stats.parsed,
+                            stats.updated,
+                            stats.created,
+                            stats.toml_path.display()
+                        );
+                        if stats.graph_standards > 0 {
+                            println!("Graph: {} Standard entities synced (global tier)", stats.graph_standards);
+                        }
+                        if !stats.unannotated.is_empty() {
+                            println!(
+                                "UNANNOTATED (inert until triggers added in standards.toml): {}",
+                                stats.unannotated.join(", ")
+                            );
+                        }
+                    }
+                    Err(e) => die("Standards sync failed", e),
+                }
+            }
+            StandardsAction::List => base::standards::sync::list_standards(&cwd),
+            StandardsAction::Get { id } => base::standards::sync::get_standard(&cwd, &id),
+            StandardsAction::Test { file, content } => {
+                base::standards::sync::test_standard_match(&config, &cwd, &file, content.as_deref())
             }
         },
 

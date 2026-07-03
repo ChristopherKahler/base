@@ -222,6 +222,26 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             }
         }
 
+        // ─── Standards injection (MIDAS best practices) ─────────
+        // Mutating tools only, injected LAST so the standards are the most
+        // recent thing read before the edit lands — top-of-awareness. The
+        // matcher scores each standard against the file's language, path,
+        // semantic classes, and the edit payload itself; budget-capped so
+        // injection stays scarce enough to be applied rather than skimmed.
+        if is_mutating_tool(event) && config.standards.enabled {
+            let payload = crate::standards::edit_payload(event);
+            for fp in &file_paths {
+                if let Some(block) =
+                    crate::standards::inject_for_file(config, cwd, fp, &payload, &mut session)
+                {
+                    data.standards_injected += block.lines().filter(|l| l.starts_with("  ")).count();
+                    output.push_str(&block);
+                    output.push('\n');
+                    session_dirty = true;
+                }
+            }
+        }
+
         // Single save for the whole branch — only when something changed.
         if session_dirty
             && let Some(bd) = base_dir.as_deref() {
