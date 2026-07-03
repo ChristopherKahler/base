@@ -91,6 +91,11 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
     match event {
         "session-start" => {
             session_start::handle(&config, &cwd)?;
+            // Relay inbox push: pending messages addressed to this session
+            // (unregistered sessions get a one-line notice that a relay is live).
+            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true) {
+                print!("{block}");
+            }
             Ok(HookEventData { session_id, ..Default::default() })
         }
         "pre-tool-use" => {
@@ -111,6 +116,13 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
         }
         "user-prompt-submit" => {
             let mut data = user_prompt_submit::handle(&config, &cwd, &stdin_json)?;
+            // Relay inbox push for messages that arrived mid-session. Runs in
+            // the dispatcher (not the handler) so star-command and empty-prompt
+            // early returns can't swallow a pending delivery. Silent when
+            // unregistered — the session-start notice already ran.
+            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), false) {
+                print!("{block}");
+            }
             data.session_id = session_id;
             Ok(data)
         }

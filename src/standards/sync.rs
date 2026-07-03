@@ -535,10 +535,12 @@ pub fn seed_file() -> StandardsFile {
             "Know your platform's structural limits before designing the deploy architecture — e.g., Railway volumes attach to ONE service.",
             "A deploy architecture the platform silently won't honor.",
             "medium",
+            // Railway-evidence only — "volumes"/"worker" alone would push
+            // Railway-specific advice onto every docker-compose user.
             TriggerDef {
                 semantic: svec(&["ci-deploy"]),
-                content: svec(&["railway", "volumes", "worker"]),
-                paths: svec(&["railway.json", "railway.toml", "docker-compose", "procfile"]),
+                content: svec(&["railway", "Railway", "RAILWAY_"]),
+                paths: svec(&["railway.json", "railway.toml"]),
                 ..Default::default()
             },
             &[],

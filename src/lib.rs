@@ -23,6 +23,7 @@ pub mod ontology;
 pub mod operator;
 pub mod plugin;
 pub mod protocol;
+pub mod relay;
 pub mod scaffold;
 pub mod scope;
 pub mod secret;

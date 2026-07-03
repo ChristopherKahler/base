@@ -376,6 +376,22 @@ rules = []
         println!("   domains.toml exists, preserved");
     }
 
+    // standards.toml — bootstrap from the embedded curated seed if missing.
+    // Ships the standards-injection layer active out of the box; MIDAS users
+    // get canonical text re-derived on their first `base standards sync`.
+    // Disable via `[standards] enabled = false` in base.toml.
+    let standards_toml = global_dir.join("standards.toml");
+    if !standards_toml.exists() {
+        let seed = crate::standards::sync::seed_file();
+        std::fs::write(&standards_toml, toml::to_string_pretty(&seed)?)?;
+        println!(
+            "   Created standards.toml ({} standards seeded — `base standards list`)",
+            seed.standards.len()
+        );
+    } else {
+        println!("   standards.toml exists, preserved");
+    }
+
     // docs/markdown-ontology-protocol.md — bundled MOP spec
     let docs_dir = global_dir.join("docs");
     std::fs::create_dir_all(&docs_dir)?;
@@ -384,6 +400,10 @@ rules = []
         std::fs::write(&mop_path, include_str!("../docs/markdown-ontology-protocol.md"))?;
         println!("   Created docs/markdown-ontology-protocol.md");
     }
+
+    // docs/parallel-paul-protocol.md — relay choreography for parallel sessions
+    let relay_doc = docs_dir.join("parallel-paul-protocol.md");
+    std::fs::write(&relay_doc, include_str!("../docs/parallel-paul-protocol.md"))?;
 
     // extensions/ directory + _template.toml
     let ext_dir = global_dir.join("extensions");

@@ -114,6 +114,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: StandardsAction,
     },
+    /// Session-to-session message relay (parallel PAUL workers, Cadre firm members)
+    Relay {
+        #[command(subcommand)]
+        action: RelayAction,
+    },
     /// Graph-backed structured memory
     Learn {
         /// The memory text to store (required unless --mention, --remove, --update, or --list)
@@ -987,6 +992,113 @@ pub enum StandardsAction {
     },
 }
 
+#[derive(Subcommand)]
+pub enum RelayAction {
+    /// Create the ephemeral relay store for a project
+    Init {
+        #[arg(long)]
+        project: String,
+    },
+    /// Register (or re-bind) this session under a stable title
+    Register {
+        /// Stable identity: worker-phase-11, quill, orchestrator…
+        #[arg(long = "as")]
+        title: String,
+        /// Session id override (defaults to CLAUDE_CODE_SESSION_ID)
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        phase: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Send a message to a session, title, phase, or all
+    Send {
+        /// Recipient: title | session-id | phase:<n> | all
+        #[arg(long)]
+        to: String,
+        /// claim|release|notify|unblock|contract-change|ready-to-merge|question|answer
+        #[arg(long = "type")]
+        mtype: String,
+        #[arg(long)]
+        msg: String,
+        /// Sender override (defaults to this session's registered title)
+        #[arg(long)]
+        from: Option<String>,
+        /// File paths / phase ids this message references
+        #[arg(long)]
+        refs: Vec<String>,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Non-blocking read of pending messages (consumes them)
+    Poll {
+        /// Read for a specific title (defaults to this session's identity)
+        #[arg(long = "for")]
+        for_title: Option<String>,
+        /// Peek without consuming
+        #[arg(long)]
+        peek: bool,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// BLOCK until a matching message arrives — burns zero session tokens
+    Wait {
+        /// Only messages from this sender
+        #[arg(long)]
+        from: Option<String>,
+        /// Only messages of this type
+        #[arg(long = "type")]
+        mtype: Option<String>,
+        /// Timeout in seconds
+        #[arg(long, default_value = "300")]
+        timeout: u64,
+        /// Wait as a specific title (defaults to this session's identity)
+        #[arg(long = "for")]
+        for_title: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Take an advisory claim on a path or phase (TTL-bounded)
+    Claim {
+        resource: String,
+        #[arg(long, default_value = "")]
+        note: String,
+        /// TTL in seconds
+        #[arg(long, default_value = "3600")]
+        ttl: i64,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Release a claim
+    Release {
+        resource: String,
+        /// Operator force-release of another session's claim
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Operator view: sessions, liveness, claims, pending messages
+    Board {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Export the spool as inbox.nq (read-only graph snapshot)
+    Export {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// End-of-milestone teardown — the store is disposable by design
+    Dispose {
+        #[arg(long)]
+        project: String,
+        /// Actually delete (without this, prints what would be removed)
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 /// Resolve a user identifier (slug, display name, or mixed) to a canonical slug.
 /// Prints error and returns None on failure.
 fn resolve(cwd: &std::path::Path, ns: &base::config::NamespaceConfig, entity_type: &str, input: &str) -> Option<String> {
@@ -1529,6 +1641,178 @@ pub fn run() {
                 base::standards::sync::test_standard_match(&config, &cwd, &file, content.as_deref())
             }
         },
+
+        // ─── Relay ────────────────────────────────────────
+        Some(Commands::Relay { action }) => {
+            use base::relay::{self, RelayStore};
+
+            // Identity: explicit flag → BASE_RELAY_AS / registry binding.
+            fn who(store: &RelayStore, explicit: Option<String>) -> Option<String> {
+                explicit.or_else(|| store.identity(relay::env_session_id().as_deref()))
+            }
+            fn need_identity(store: &RelayStore, explicit: Option<String>) -> Option<String> {
+                let id = who(store, explicit);
+                if id.is_none() {
+                    eprintln!(
+                        "Cannot resolve your relay identity. Register first \
+                         (base relay register --as <title>) or pass the identity flag."
+                    );
+                }
+                id
+            }
+
+            match action {
+                RelayAction::Init { project } => {
+                    let base_dir = base::config::find_workspace_base(&cwd)
+                        .unwrap_or_else(|| cwd.join(".base"));
+                    let store = RelayStore {
+                        root: base_dir.join("relay").join(&project),
+                        project: project.clone(),
+                    };
+                    match store.init() {
+                        Ok(()) => println!(
+                            "Relay store '{project}' ready: {}\nSessions join with: base relay register --as <title> --project {project}",
+                            store.root.display()
+                        ),
+                        Err(e) => die("Relay init failed", e),
+                    }
+                }
+                RelayAction::Register { title, session, phase, project } => {
+                    let store = match relay::resolve_store(&cwd, project.as_deref()) {
+                        Ok(s) => s,
+                        Err(e) => die("Relay", e),
+                    };
+                    if !store.exists() {
+                        eprintln!("Store '{}' not initialized — run: base relay init --project {}", store.project, store.project);
+                        return;
+                    }
+                    let sid = session.or_else(relay::env_session_id);
+                    let wt = cwd.to_string_lossy().to_string();
+                    match store.register(&title, sid.as_deref(), &wt, phase.as_deref()) {
+                        Ok(()) => println!(
+                            "Registered '{title}' in relay '{}'{}",
+                            store.project,
+                            sid.map(|s| format!(" (session {s})")).unwrap_or_else(|| " (no session binding — set BASE_RELAY_AS for hook delivery)".into())
+                        ),
+                        Err(e) => die("Register failed", e),
+                    }
+                }
+                RelayAction::Send { to, mtype, msg, from, refs, project } => {
+                    let store = match relay::resolve_store(&cwd, project.as_deref()) {
+                        Ok(s) => s,
+                        Err(e) => die("Relay", e),
+                    };
+                    let Some(sender) = need_identity(&store, from) else { return };
+                    match store.send(&sender, &to, &mtype, &msg, &refs) {
+                        Ok(m) => println!("Sent {} → {} ({})", m.mtype, m.to, m.id),
+                        Err(e) => die("Send failed", e),
+                    }
+                }
+                RelayAction::Poll { for_title, peek, project } => {
+                    let store = match relay::resolve_store(&cwd, project.as_deref()) {
+                        Ok(s) => s,
+                        Err(e) => die("Relay", e),
+                    };
+                    let Some(title) = need_identity(&store, for_title) else { return };
+                    let pending = store.pending_for(&title);
+                    if pending.is_empty() {
+                        println!("No pending messages for '{title}'.");
+                        return;
+                    }
+                    for m in &pending {
+                        let refs = if m.refs.is_empty() { String::new() } else { format!(" [refs: {}]", m.refs.join(", ")) };
+                        println!("[{} · {} · {} ago] {}{refs}", m.from, m.mtype, base::relay::age_str(&m.ts), m.msg);
+                    }
+                    if !peek {
+                        let ids: Vec<String> = pending.iter().map(|m| m.id.clone()).collect();
+                        if let Err(e) = store.mark_seen(&title, &ids) {
+                            eprintln!("Warning: failed to mark seen: {e}");
+                        }
+                    }
+                }
+                RelayAction::Wait { from, mtype, timeout, for_title, project } => {
+                    let store = match relay::resolve_store(&cwd, project.as_deref()) {
+                        Ok(s) => s,
+                        Err(e) => die("Relay", e),
+                    };
+                    let Some(title) = need_identity(&store, for_title) else { return };
+                    match store.wait(&title, from.as_deref(), mtype.as_deref(), timeout) {
+                        Some(m) => {
+                            println!("[{} · {} · {}] {}", m.from, m.mtype, m.ts, m.msg);
+                            if !m.refs.is_empty() {
+                                println!("refs: {}", m.refs.join(", "));
+                            }
+                        }
+                        None => {
+                            eprintln!("Timeout after {timeout}s — no matching message.");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                RelayAction::Claim { resource, note, ttl, project } => {
+                    let store = match relay::resolve_store(&cwd, project.as_deref()) {
+                        Ok(s) => s,
+                        Err(e) => die("Relay", e),
+                    };
+                    let Some(title) = need_identity(&store, None) else { return };
+                    match store.claim(&resource, &title, &note, ttl) {
+                        Ok(()) => println!("Claimed '{resource}' for '{title}' (ttl {ttl}s)"),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                RelayAction::Release { resource, force, project } => {
+                    let store = match relay::resolve_store(&cwd, project.as_deref()) {
+                        Ok(s) => s,
+                        Err(e) => die("Relay", e),
+                    };
+                    let title = who(&store, None).unwrap_or_else(|| "operator".into());
+                    match store.release(&resource, &title, force) {
+                        Ok(()) => println!("Released '{resource}'"),
+                        Err(e) => die("Release failed", e),
+                    }
+                }
+                RelayAction::Board { project } => {
+                    base::relay::board::print_board(&cwd, project.as_deref());
+                }
+                RelayAction::Export { project } => {
+                    let store = match relay::resolve_store(&cwd, project.as_deref()) {
+                        Ok(s) => s,
+                        Err(e) => die("Relay", e),
+                    };
+                    match store.export_nq(config.namespace.uri.trim_end_matches(['#', '/'])) {
+                        Ok(path) => println!("Exported: {}", path.display()),
+                        Err(e) => die("Export failed", e),
+                    }
+                }
+                RelayAction::Dispose { project, force } => {
+                    let store = match relay::resolve_store(&cwd, Some(&project)) {
+                        Ok(s) => s,
+                        Err(e) => die("Relay", e),
+                    };
+                    if !store.exists() {
+                        eprintln!("Store '{project}' does not exist.");
+                        return;
+                    }
+                    let msgs = store.all_messages().len();
+                    let sessions = store.load_registry().sessions.len();
+                    if !force {
+                        println!(
+                            "Would remove relay '{project}': {msgs} messages, {sessions} sessions at {}.\n\
+                             Promote anything durable first (base decision log / base learn), then re-run with --force.",
+                            store.root.display()
+                        );
+                        return;
+                    }
+                    match store.dispose() {
+                        Ok(()) => println!("Relay '{project}' disposed ({msgs} messages gone). Durable outcomes belong in the graph."),
+                        Err(e) => die("Dispose failed", e),
+                    }
+                }
+            }
+        }
 
         // ─── Rule ─────────────────────────────────────────
         Some(Commands::Rule { global, action }) => {
