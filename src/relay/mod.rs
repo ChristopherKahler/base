@@ -1,5 +1,7 @@
 pub mod board;
 pub mod deliver;
+pub mod session_registry;
+pub mod task_inbox;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};

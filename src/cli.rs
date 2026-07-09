@@ -1097,6 +1097,37 @@ pub enum RelayAction {
         #[arg(long)]
         force: bool,
     },
+    /// Relay a briefed task to a live titled session. It auto-fires in that
+    /// session's hooks (loud) until picked up — cross-workspace via the global tier.
+    Task {
+        /// Target session's registered title (set with: base relay register --as <title>)
+        #[arg(long)]
+        to: String,
+        /// Task slug — kebab-case, matches the briefing doc basename
+        #[arg(long)]
+        slug: String,
+        /// One-line summary shown in the alert
+        #[arg(long)]
+        summary: String,
+        /// Absolute path to the full briefing doc the receiver should read
+        #[arg(long)]
+        doc: Option<String>,
+        /// Priority: high | medium (default: high)
+        #[arg(long)]
+        priority: Option<String>,
+        /// Origin label shown to the receiver (defaults to this session's title)
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Mark a relayed task done — clears the inbox alert and closes the graph mirror
+    Done {
+        /// Task slug
+        slug: String,
+    },
+    /// List inbound relay tasks across all live sessions
+    Tasks,
+    /// List titled sessions in the global registry (liveness for `*task` targets)
+    Sessions,
 }
 
 /// Resolve a user identifier (slug, display name, or mixed) to a canonical slug.
@@ -1678,23 +1709,39 @@ pub fn run() {
                     }
                 }
                 RelayAction::Register { title, session, phase, project } => {
-                    let store = match relay::resolve_store(&cwd, project.as_deref()) {
-                        Ok(s) => s,
-                        Err(e) => die("Relay", e),
-                    };
-                    if !store.exists() {
-                        eprintln!("Store '{}' not initialized — run: base relay init --project {}", store.project, store.project);
-                        return;
-                    }
                     let sid = session.or_else(relay::env_session_id);
-                    let wt = cwd.to_string_lossy().to_string();
-                    match store.register(&title, sid.as_deref(), &wt, phase.as_deref()) {
-                        Ok(()) => println!(
-                            "Registered '{title}' in relay '{}'{}",
-                            store.project,
-                            sid.map(|s| format!(" (session {s})")).unwrap_or_else(|| " (no session binding — set BASE_RELAY_AS for hook delivery)".into())
+                    // Global session registry: the cross-workspace title binding
+                    // that makes `*task <title>` deliverable. Always attempted.
+                    match &sid {
+                        Some(s) => {
+                            if let Err(e) = relay::session_registry::register(&title, s, &cwd) {
+                                eprintln!("Warning: global session registry update failed: {e:#}");
+                            }
+                        }
+                        None => eprintln!(
+                            "No session id (set CLAUDE_CODE_SESSION_ID or pass --session) — \
+                             '{title}' not globally bound; *task delivery needs a session binding."
                         ),
-                        Err(e) => die("Register failed", e),
+                    }
+                    // Project relay store binding (Cadre/PAUL fan-outs) — only when a store exists.
+                    match relay::resolve_store(&cwd, project.as_deref()) {
+                        Ok(store) if store.exists() => {
+                            let wt = cwd.to_string_lossy().to_string();
+                            match store.register(&title, sid.as_deref(), &wt, phase.as_deref()) {
+                                Ok(()) => println!(
+                                    "Registered '{title}' in relay '{}' + global registry{}",
+                                    store.project,
+                                    sid.as_deref().map(|s| format!(" (session {s})")).unwrap_or_default()
+                                ),
+                                Err(e) => die("Register failed", e),
+                            }
+                        }
+                        _ => println!(
+                            "Registered '{title}' globally{}. Other sessions can now relay to you: *task {title} …",
+                            sid.as_deref()
+                                .map(|s| format!(" (session {s})"))
+                                .unwrap_or_else(|| " (no session binding — hook delivery needs CLAUDE_CODE_SESSION_ID)".into())
+                        ),
                     }
                 }
                 RelayAction::Send { to, mtype, msg, from, refs, project } => {
@@ -1809,6 +1856,90 @@ pub fn run() {
                     match store.dispose() {
                         Ok(()) => println!("Relay '{project}' disposed ({msgs} messages gone). Durable outcomes belong in the graph."),
                         Err(e) => die("Dispose failed", e),
+                    }
+                }
+                RelayAction::Task { to, slug, summary, doc, priority, from } => {
+                    let Some(entry) = relay::session_registry::resolve(&to) else {
+                        die("Relay task", anyhow::anyhow!(
+                            "no session registered as '{to}'. The target session must first run: base relay register --as {to}"
+                        ));
+                    };
+                    if !entry.alive() {
+                        eprintln!(
+                            "Warning: session '{to}' last seen {} ago — it may be dead. Relaying anyway.",
+                            base::relay::age_str(&entry.last_heartbeat)
+                        );
+                    }
+                    // Origin label: explicit --from, else this session's own title.
+                    let origin = from.or_else(|| {
+                        relay::env_session_id().and_then(|sid| {
+                            relay::session_registry::list()
+                                .into_iter()
+                                .find(|e| e.session_id == sid)
+                                .map(|e| e.title)
+                        })
+                    });
+                    let slug = crud::slugify(&slug);
+                    let task = base::relay::task_inbox::InboxTask {
+                        slug: slug.clone(),
+                        summary,
+                        doc: doc.unwrap_or_default(),
+                        from: origin.unwrap_or_default(),
+                        to_title: to.clone(),
+                        to_session: entry.session_id.clone(),
+                        priority: priority.unwrap_or_else(|| "high".into()),
+                        created: base::relay::now_iso(),
+                        status: "pending".into(),
+                        last_loud_session: String::new(),
+                        last_alert_ts: String::new(),
+                    };
+                    match base::relay::task_inbox::enqueue(&config.namespace, &task) {
+                        Ok(path) => println!(
+                            "Relayed '{slug}' → {to} (session {}). Fires in that session on its next hook.\n  inbox: {}",
+                            entry.session_id,
+                            path.display()
+                        ),
+                        Err(e) => die("Relay task failed", e),
+                    }
+                }
+                RelayAction::Done { slug } => {
+                    let slug = crud::slugify(&slug);
+                    match base::relay::task_inbox::done(&config.namespace, &slug) {
+                        Ok(0) => println!("No inbound relay task '{slug}' found (already done, or wrong slug)."),
+                        Ok(n) => println!(
+                            "Relay task '{slug}' done — cleared {n} inbox entr{}.",
+                            if n == 1 { "y" } else { "ies" }
+                        ),
+                        Err(e) => die("Relay done failed", e),
+                    }
+                }
+                RelayAction::Tasks => {
+                    let tasks = base::relay::task_inbox::list_all();
+                    if tasks.is_empty() {
+                        println!("No inbound relay tasks.");
+                    } else {
+                        println!("Inbound relay tasks ({}):", tasks.len());
+                        for t in &tasks {
+                            println!("{}", base::relay::task_inbox::format_row(t));
+                        }
+                    }
+                }
+                RelayAction::Sessions => {
+                    let sessions = relay::session_registry::list();
+                    if sessions.is_empty() {
+                        println!("No titled sessions. A session claims a title with: base relay register --as <title>");
+                    } else {
+                        println!("Titled sessions ({}):", sessions.len());
+                        for e in &sessions {
+                            let live = if e.alive() { "live" } else { "DEAD" };
+                            let ws = if e.workspace.is_empty() { "-" } else { e.workspace.as_str() };
+                            println!(
+                                "  {title}  [{live} · {age}]  ws:{ws}  session:{sid}",
+                                title = e.title,
+                                age = base::relay::age_str(&e.last_heartbeat),
+                                sid = e.session_id,
+                            );
+                        }
                     }
                 }
             }

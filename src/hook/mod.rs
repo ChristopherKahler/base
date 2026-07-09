@@ -96,6 +96,11 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
             if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true) {
                 print!("{block}");
             }
+            // Session-targeted task relay: refresh liveness + announce any tasks
+            // assigned to this session (loud, re-announced on each new session).
+            if let Some(sid) = session_id.as_deref() {
+                relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::SessionStart, true);
+            }
             Ok(HookEventData { session_id, ..Default::default() })
         }
         "pre-tool-use" => {
@@ -103,6 +108,11 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
             let (tool_name, file_path) = extract_tool_context(&stdin_json);
             data.tool_name = tool_name;
             data.file_path = file_path;
+            // Mid-turn task-relay scan: a pending task fires loud immediately so
+            // an autonomous run picks it up without waiting for the next prompt.
+            if let Some(sid) = session_id.as_deref() {
+                relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::Tool, false);
+            }
             data.session_id = session_id;
             Ok(data)
         }
@@ -123,14 +133,40 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
             if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), false) {
                 print!("{block}");
             }
+            // Session-targeted task relay: refresh liveness + deliver assigned tasks.
+            if let Some(sid) = session_id.as_deref() {
+                relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::Prompt, true);
+            }
             data.session_id = session_id;
             Ok(data)
         }
         "stop" => {
             stop::handle(&config, &cwd)?;
+            // End-of-turn nudge for any still-open relayed task (terse, throttled).
+            if let Some(sid) = session_id.as_deref() {
+                relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::Stop, false);
+            }
             Ok(HookEventData { session_id, ..Default::default() })
         }
         _ => Ok(HookEventData::default()),
+    }
+}
+
+/// Session-targeted task-relay tick: on boundary events (session-start, prompt)
+/// ensure this session has an auto-assigned codename and a fresh heartbeat, then
+/// deliver any tasks assigned to it, printing the injection block to stdout.
+/// Fail-open — a broken inbox or registry never blocks the hook.
+fn relay_task_tick(
+    session_id: &str,
+    cwd: &std::path::Path,
+    phase: crate::relay::task_inbox::Phase,
+    boundary: bool,
+) {
+    if boundary {
+        let _ = crate::relay::session_registry::touch(session_id, cwd);
+    }
+    if let Some(block) = crate::relay::task_inbox::deliver(session_id, phase) {
+        print!("{block}");
     }
 }
 
