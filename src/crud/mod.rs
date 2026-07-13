@@ -72,7 +72,13 @@ pub fn slugify(name: &str) -> String {
     if full.len() <= 80 {
         return full;
     }
-    let truncated = &full[..80];
+    // Truncate to at most 80 bytes, backing off to a UTF-8 char boundary so a
+    // multi-byte char (e.g. 'μ') straddling byte 80 doesn't panic the slice.
+    let mut cut = 80;
+    while cut > 0 && !full.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let truncated = &full[..cut];
     match truncated.rfind('-') {
         Some(pos) if pos > 20 => truncated[..pos].to_string(),
         _ => truncated.to_string(),
@@ -376,6 +382,20 @@ mod tests {
         assert_eq!(slugify("CaseGate v2"), "casegate-v2");
         assert_eq!(slugify("hello--world"), "hello-world");
         assert_eq!(slugify("  spaced  "), "spaced");
+    }
+
+    #[test]
+    fn slugify_does_not_panic_on_multibyte_at_truncation_boundary() {
+        // Regression: a 2-byte char ('μ') straddling byte 80 used to panic the
+        // `&full[..80]` slice ("not a char boundary"). See the fractal-alternate
+        // journal concept "...participation measure μ".
+        let label = "x".repeat(79) + "μ"; // slug = 79 bytes + μ (bytes 79..81)
+        let s = slugify(&label);
+        assert!(s.len() <= 80);
+        assert!(s.chars().all(|c| c.is_alphanumeric() || c == '-'));
+        // and the real-world label that crashed
+        let real = "market depth L2 participation measure μ ".repeat(3);
+        let _ = slugify(&real); // must not panic
     }
 
     #[test]
