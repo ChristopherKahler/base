@@ -363,7 +363,13 @@ fn mention_threshold_scan(cwd: &Path, ns: &NamespaceConfig, threshold: u32) -> R
             let count = row.get("count").map(|t| crud::term_display(t.into())).unwrap_or_default();
             // Truncate long text for signal display
             let preview = if text.len() > 80 {
-                format!("{}...", &text[..80])
+                // Back off to a UTF-8 char boundary so a multi-byte char at byte 80
+                // doesn't panic the slice.
+                let mut cut = 80;
+                while cut > 0 && !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!("{}...", &text[..cut])
             } else {
                 text
             };
