@@ -748,7 +748,7 @@ pub enum TaskAction {
         #[arg(short, long)]
         milestone: Option<String>,
     },
-    /// List tasks (filter by project or milestone)
+    /// List tasks (filter by project, milestone, or label)
     #[command(visible_alias = "l")]
     List {
         /// Project slug or display name
@@ -757,6 +757,9 @@ pub enum TaskAction {
         /// Milestone slug to filter by
         #[arg(short, long)]
         milestone: Option<String>,
+        /// Only tasks carrying ALL of these labels (repeatable)
+        #[arg(long)]
+        label: Vec<String>,
         /// Emit JSON (stable dashboard contract) instead of a table
         #[arg(long)]
         json: bool,
@@ -804,6 +807,16 @@ pub enum TaskAction {
     },
     /// Mark a task as completed
     Done { slug: String },
+    /// Attach/detach free-form labels on a task (the dashboard's tagging facet)
+    Tag {
+        slug: String,
+        /// Label to attach (repeatable, idempotent)
+        #[arg(long = "add")]
+        add: Vec<String>,
+        /// Label to detach (repeatable)
+        #[arg(long = "remove")]
+        remove: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1527,7 +1540,7 @@ pub fn run() {
                     Err(e) => die("Failed", e),
                 }
             }
-            TaskAction::List { project, milestone, json } => {
+            TaskAction::List { project, milestone, label, json } => {
                 let ps = match project.as_deref() {
                     Some(p) => match resolve(&cwd, &config.namespace, "project", p) {
                         Some(s) => Some(s),
@@ -1543,9 +1556,9 @@ pub fn run() {
                     None => None,
                 };
                 let r = if json {
-                    crud::task::list_json(&cwd, &config.namespace, ps.as_deref(), ms.as_deref())
+                    crud::task::list_json(&cwd, &config.namespace, ps.as_deref(), ms.as_deref(), &label)
                 } else {
-                    crud::task::list(&cwd, &config.namespace, ps.as_deref(), ms.as_deref())
+                    crud::task::list(&cwd, &config.namespace, ps.as_deref(), ms.as_deref(), &label)
                 };
                 if let Err(e) = r { die("Error", e); }
             }
@@ -1610,6 +1623,14 @@ pub fn run() {
                 if let Some(s) = resolve(&cwd, &config.namespace, "task", &slug) {
                     match crud::task::done(&cwd, &config.namespace, &s) {
                         Ok(()) => println!("Task '{s}' completed"),
+                        Err(e) => die("Failed", e),
+                    }
+                }
+            }
+            TaskAction::Tag { slug, add, remove } => {
+                if let Some(s) = resolve(&cwd, &config.namespace, "task", &slug) {
+                    match crud::task::tag(&cwd, &config.namespace, &s, &add, &remove) {
+                        Ok(()) => println!("Task '{s}' labels updated (+{} -{})", add.len(), remove.len()),
                         Err(e) => die("Failed", e),
                     }
                 }

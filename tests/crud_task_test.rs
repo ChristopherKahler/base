@@ -50,7 +50,7 @@ fn list_tasks_by_project() {
     crud::task::add(tmp.path(), &ns, "proj", "Task A", None, None).unwrap();
     crud::task::add(tmp.path(), &ns, "proj", "Task B", None, None).unwrap();
 
-    let result = crud::task::list(tmp.path(), &ns, Some("proj"), None);
+    let result = crud::task::list(tmp.path(), &ns, Some("proj"), None, &[]);
     assert!(result.is_ok());
 }
 
@@ -173,15 +173,55 @@ fn task_list_json_shape() {
     crud::project::add(tmp.path(), &ns, "Proj", "active", None).unwrap();
     crud::task::add(tmp.path(), &ns, "proj", "Alpha", Some("high"), None).unwrap();
 
-    let rows = crud::task::list_data(tmp.path(), &ns, Some("proj"), None).unwrap();
+    let rows = crud::task::list_data(tmp.path(), &ns, Some("proj"), None, &[]).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, "proj.alpha");
     let json = serde_json::to_string(&rows).unwrap();
     for key in [
         "\"id\"", "\"name\"", "\"status\"", "\"priority\"", "\"project\"",
         "\"milestone\"", "\"description\"", "\"assignee\"", "\"due\"",
-        "\"created\"", "\"updated\"", "\"last_active\"",
+        "\"created\"", "\"updated\"", "\"last_active\"", "\"labels\"",
     ] {
         assert!(json.contains(key), "json missing stable key {key}: {json}");
     }
+}
+
+#[test]
+fn task_tag_add_remove_and_filter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ns = default_ns();
+
+    crud::project::add(tmp.path(), &ns, "Proj", "active", None).unwrap();
+    crud::task::add(tmp.path(), &ns, "proj", "Mine Task", None, None).unwrap();
+    crud::task::add(tmp.path(), &ns, "proj", "Their Task", None, None).unwrap();
+
+    // add labels; re-adding is idempotent (no duplicate triple)
+    crud::task::tag(tmp.path(), &ns, "proj.mine-task", &["mine".into(), "extendly".into()], &[]).unwrap();
+    crud::task::tag(tmp.path(), &ns, "proj.mine-task", &["mine".into()], &[]).unwrap();
+    crud::task::tag(tmp.path(), &ns, "proj.their-task", &["extendly".into()], &[]).unwrap();
+
+    // get reflects labels (sorted, deduped)
+    let rec = crud::task::get_data(tmp.path(), &ns, "proj.mine-task").unwrap().unwrap();
+    assert_eq!(rec.labels, vec!["extendly".to_string(), "mine".to_string()]);
+
+    // filter: only tasks carrying the label
+    let mine = crud::task::list_data(tmp.path(), &ns, Some("proj"), None, &["mine".to_string()]).unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].id, "proj.mine-task");
+
+    let extendly = crud::task::list_data(tmp.path(), &ns, Some("proj"), None, &["extendly".to_string()]).unwrap();
+    assert_eq!(extendly.len(), 2);
+
+    // AND semantics across multiple labels
+    let both = crud::task::list_data(
+        tmp.path(), &ns, Some("proj"), None,
+        &["mine".to_string(), "extendly".to_string()],
+    ).unwrap();
+    assert_eq!(both.len(), 1);
+    assert_eq!(both[0].id, "proj.mine-task");
+
+    // remove one label
+    crud::task::tag(tmp.path(), &ns, "proj.mine-task", &[], &["mine".into()]).unwrap();
+    let rec2 = crud::task::get_data(tmp.path(), &ns, "proj.mine-task").unwrap().unwrap();
+    assert_eq!(rec2.labels, vec!["extendly".to_string()]);
 }

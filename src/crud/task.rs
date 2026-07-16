@@ -70,15 +70,65 @@ pub struct TaskRecord {
     pub created: Option<String>,
     pub updated: Option<String>,
     pub last_active: Option<String>,
+    /// Free-form labels (multi-valued `{p}:label`) — the dashboard's tagging facet.
+    /// Serializes as a (possibly empty) array; always present, never null.
+    pub labels: Vec<String>,
 }
 
-/// Query task records (typed), optionally scoped to a project or milestone. Shared
-/// core behind both the human `list` and the `--json` `list_json`.
+/// All task→labels in the workspace, one query. Key = task slug (== `TaskRecord.id`).
+fn labels_map(cwd: &Path, ns: &NamespaceConfig) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let p = &ns.prefix;
+    let sparql = format!(
+        "SELECT ?task ?label WHERE {{\n\
+           GRAPH ?g {{ ?task a {p}:Task ; {p}:label ?label }}\n\
+         }}"
+    );
+    let results = crud::load_and_query(cwd, ns, &sparql)?;
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    if let QueryResults::Solutions(solutions) = results {
+        for row in solutions.filter_map(|r| r.ok()) {
+            let id = row.get("task").map(|t| crud::slug_of(&crud::term_display(t.into())));
+            let label = row.get("label").map(|t| crud::term_display(t.into()));
+            if let (Some(id), Some(label)) = (id, label) {
+                map.entry(id).or_default().push(label);
+            }
+        }
+    }
+    for v in map.values_mut() {
+        v.sort();
+        v.dedup();
+    }
+    Ok(map)
+}
+
+/// Labels on one task (sorted, deduped).
+fn labels_of(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<Vec<String>> {
+    let iri = crud::build_iri(ns, "task", slug);
+    let p = &ns.prefix;
+    let sparql = format!("SELECT ?label WHERE {{ GRAPH ?g {{ <{iri}> {p}:label ?label }} }}");
+    let results = crud::load_and_query(cwd, ns, &sparql)?;
+    let mut labels: Vec<String> = Vec::new();
+    if let QueryResults::Solutions(solutions) = results {
+        for row in solutions.filter_map(|r| r.ok()) {
+            if let Some(l) = row.get("label").map(|t| crud::term_display(t.into())) {
+                labels.push(l);
+            }
+        }
+    }
+    labels.sort();
+    labels.dedup();
+    Ok(labels)
+}
+
+/// Query task records (typed), optionally scoped to a project or milestone, and
+/// filtered to tasks carrying ALL of `label_filter` (empty slice = no filter).
+/// Shared core behind both the human `list` and the `--json` `list_json`.
 pub fn list_data(
     cwd: &Path,
     ns: &NamespaceConfig,
     project_slug: Option<&str>,
     milestone_slug: Option<&str>,
+    label_filter: &[String],
 ) -> Result<Vec<TaskRecord>> {
     let p = &ns.prefix;
     // Scope anchor: a milestone or project `hasTask` edge, else all tasks.
@@ -136,14 +186,23 @@ pub fn list_data(
                 created: lit("created"),
                 updated: lit("updated"),
                 last_active: lit("lastActive"),
+                labels: Vec::new(),
             });
         }
+    }
+    // Attach labels (one extra query), then apply the --label AND-filter.
+    let lmap = labels_map(cwd, ns)?;
+    for t in out.iter_mut() {
+        t.labels = lmap.get(&t.id).cloned().unwrap_or_default();
+    }
+    if !label_filter.is_empty() {
+        out.retain(|t| label_filter.iter().all(|f| t.labels.iter().any(|l| l == f)));
     }
     Ok(out)
 }
 
-pub fn list(cwd: &Path, ns: &NamespaceConfig, project_slug: Option<&str>, milestone_slug: Option<&str>) -> Result<()> {
-    let rows = list_data(cwd, ns, project_slug, milestone_slug)?;
+pub fn list(cwd: &Path, ns: &NamespaceConfig, project_slug: Option<&str>, milestone_slug: Option<&str>, label_filter: &[String]) -> Result<()> {
+    let rows = list_data(cwd, ns, project_slug, milestone_slug, label_filter)?;
     if rows.is_empty() {
         println!("No tasks found.");
         return Ok(());
@@ -164,8 +223,8 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig, project_slug: Option<&str>, milest
 }
 
 /// `--json` list: valid JSON array on stdout, nothing else.
-pub fn list_json(cwd: &Path, ns: &NamespaceConfig, project_slug: Option<&str>, milestone_slug: Option<&str>) -> Result<()> {
-    let rows = list_data(cwd, ns, project_slug, milestone_slug)?;
+pub fn list_json(cwd: &Path, ns: &NamespaceConfig, project_slug: Option<&str>, milestone_slug: Option<&str>, label_filter: &[String]) -> Result<()> {
+    let rows = list_data(cwd, ns, project_slug, milestone_slug, label_filter)?;
     println!("{}", serde_json::to_string_pretty(&rows)?);
     Ok(())
 }
@@ -240,6 +299,7 @@ pub fn get_data(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<Option<T
                 created: lit("created"),
                 updated: lit("updated"),
                 last_active: lit("lastActive"),
+                labels: labels_of(cwd, ns, slug)?,
             }));
         }
     }
@@ -362,4 +422,35 @@ pub fn delete(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<()> {
          DELETE WHERE {{ GRAPH ?g {{ ?s ?p <{iri}> }} }}"
     );
     crud::load_and_mutate(cwd, ns, &sparql)
+}
+
+/// Attach / detach free-form labels on a task (multi-valued `{p}:label` triples) —
+/// the `base-board` dashboard's tagging facet. Removals apply before additions;
+/// `--add` is idempotent (INSERT DATA of an existing triple is a no-op in RDF).
+/// base assigns NO meaning to label strings — conventions (`mine`, `extendly`, …)
+/// live in the consumer. Touches `updatedAt`/`lastActive` like `update`/`done`.
+pub fn tag(cwd: &Path, ns: &NamespaceConfig, slug: &str, add: &[String], remove: &[String]) -> Result<()> {
+    let iri = crud::build_iri(ns, "task", slug);
+    let ws_slug = crud::workspace_slug(cwd);
+    let graph = crud::workspace_graph_iri(ns, &ws_slug);
+    let now = crud::now_iso();
+    let p = &ns.prefix;
+
+    for label in remove {
+        let esc = crud::escape_sparql_literal(label);
+        let sparql = format!("DELETE WHERE {{ GRAPH ?g {{ <{iri}> {p}:label \"{esc}\" }} }}");
+        crud::load_and_mutate(cwd, ns, &sparql)?;
+    }
+    for label in add {
+        let esc = crud::escape_sparql_literal(label);
+        let sparql = format!("INSERT DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:label \"{esc}\" }} }}");
+        crud::load_and_mutate(cwd, ns, &sparql)?;
+    }
+
+    let bump = [
+        crud::field_update(&graph, &iri, &format!("{p}:updatedAt"), &format!("\"{now}\"^^xsd:dateTime")),
+        crud::field_update(&graph, &iri, &format!("{p}:lastActive"), &format!("\"{now}\"^^xsd:dateTime")),
+    ]
+    .join(" ;\n");
+    crud::load_and_mutate(cwd, ns, &bump)
 }
