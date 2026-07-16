@@ -146,18 +146,46 @@ fn canon_registry(reg: &[WorkspaceEntry]) -> Vec<WorkspaceEntry> {
     scope::canonical_registry(reg)
 }
 
-pub fn list(cwd: &Path, config: &BaseConfig, project_scope: scope::ProjectScope) -> Result<()> {
+/// One project, all fields the graph holds. Stable `--json` contract for the dashboard.
+#[derive(Debug, serde::Serialize)]
+pub struct ProjectRecord {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub priority: Option<String>,
+    pub path: Option<String>,
+    pub stage: Option<String>,
+    pub blocked_by: Option<String>,
+    pub next_action: Option<String>,
+    pub created: Option<String>,
+    pub updated: Option<String>,
+    pub last_active: Option<String>,
+}
+
+/// Query scoped project records (typed). Returns the in-scope records plus the count
+/// of unscoped (no-#path) projects — the shared core behind human `list` and `--json`
+/// `list_json`. Scoping logic is identical for both surfaces.
+pub fn list_data(
+    cwd: &Path,
+    config: &BaseConfig,
+    project_scope: &scope::ProjectScope,
+) -> Result<(Vec<ProjectRecord>, usize)> {
     let ns = &config.namespace;
     let p = &ns.prefix;
     let sparql = format!(
-        "SELECT ?proj ?name ?status ?priority ?lastActive ?path WHERE {{\n\
+        "SELECT ?proj ?name ?status ?priority ?path ?stage ?blockedBy ?nextAction ?created ?updated ?lastActive WHERE {{\n\
            GRAPH ?g {{\n\
              ?proj a {p}:Project ;\n\
                {p}:name ?name ;\n\
                {p}:status ?status .\n\
              OPTIONAL {{ ?proj {p}:priority ?priority }}\n\
-             OPTIONAL {{ ?proj {p}:lastActive ?lastActive }}\n\
              OPTIONAL {{ ?proj {p}:path ?path }}\n\
+             OPTIONAL {{ ?proj {p}:stage ?stage }}\n\
+             OPTIONAL {{ ?proj {p}:blockedBy ?blockedBy }}\n\
+             OPTIONAL {{ ?proj {p}:nextAction ?nextAction }}\n\
+             OPTIONAL {{ ?proj {p}:createdAt ?created }}\n\
+             OPTIONAL {{ ?proj {p}:updatedAt ?updated }}\n\
+             OPTIONAL {{ ?proj {p}:lastActive ?lastActive }}\n\
            }}\n\
          }}\n\
          ORDER BY ?name"
@@ -171,11 +199,10 @@ pub fn list(cwd: &Path, config: &BaseConfig, project_scope: scope::ProjectScope)
 
     let results = crud::load_and_query(cwd, ns, &sparql)?;
     let QueryResults::Solutions(solutions) = results else {
-        return Ok(());
+        return Ok((Vec::new(), 0));
     };
 
-    const COLS: [&str; 4] = ["name", "status", "priority", "lastActive"];
-    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut records: Vec<ProjectRecord> = Vec::new();
     let mut unscoped_count = 0usize;
     for sol in solutions.filter_map(|r| r.ok()) {
         let cell = |k: &str| sol.get(k).map(|t| crud::term_display(t.into()));
@@ -186,20 +213,37 @@ pub fn list(cwd: &Path, config: &BaseConfig, project_scope: scope::ProjectScope)
         if matches!(home, scope::Home::Unscoped) {
             unscoped_count += 1;
         }
-        let peers = cell("proj")
-            .and_then(|iri| peer_map.get(&iri).cloned())
+        let proj_iri = cell("proj");
+        let peers = proj_iri
+            .as_ref()
+            .and_then(|iri| peer_map.get(iri).cloned())
             .unwrap_or_default();
-        if !scope::in_scope(&home, &peers, current.as_deref(), &project_scope) {
+        if !scope::in_scope(&home, &peers, current.as_deref(), project_scope) {
             continue;
         }
-        rows.push(
-            COLS.iter()
-                .map(|c| cell(c).unwrap_or_else(|| "-".into()))
-                .collect(),
-        );
+        records.push(ProjectRecord {
+            id: proj_iri.as_deref().map(crud::slug_of).unwrap_or_default(),
+            name: cell("name").unwrap_or_default(),
+            status: cell("status").unwrap_or_default(),
+            priority: cell("priority"),
+            path: cell("path"),
+            stage: cell("stage"),
+            blocked_by: cell("blockedBy"),
+            next_action: cell("nextAction"),
+            created: cell("created"),
+            updated: cell("updated"),
+            last_active: cell("lastActive"),
+        });
     }
+    Ok((records, unscoped_count))
+}
 
-    if rows.is_empty() {
+pub fn list(cwd: &Path, config: &BaseConfig, project_scope: scope::ProjectScope) -> Result<()> {
+    let (records, unscoped_count) = list_data(cwd, config, &project_scope)?;
+    let registry = canon_registry(&config.workspace);
+    let current = scope::current_workspace(&canon_path(cwd), &registry);
+
+    if records.is_empty() {
         let where_ = match &project_scope {
             scope::ProjectScope::All => "any workspace".to_string(),
             scope::ProjectScope::Unscoped => "the unscoped set".to_string(),
@@ -211,10 +255,17 @@ pub fn list(cwd: &Path, config: &BaseConfig, project_scope: scope::ProjectScope)
         };
         println!("No projects in {where_}.");
     } else {
+        const COLS: [&str; 4] = ["name", "status", "priority", "lastActive"];
         println!("| {} |", COLS.join(" | "));
         println!("|{}|", COLS.iter().map(|_| "---").collect::<Vec<_>>().join("|"));
-        for row in &rows {
-            println!("| {} |", row.join(" | "));
+        for r in &records {
+            println!(
+                "| {} | {} | {} | {} |",
+                r.name,
+                r.status,
+                r.priority.as_deref().unwrap_or("-"),
+                r.last_active.as_deref().unwrap_or("-"),
+            );
         }
     }
 
@@ -225,6 +276,13 @@ pub fn list(cwd: &Path, config: &BaseConfig, project_scope: scope::ProjectScope)
             "\n{unscoped_count} project(s) have no #path (unscoped) — `base project list --unscoped`, or set a home with `base project update <slug> --path <dir>`."
         );
     }
+    Ok(())
+}
+
+/// `--json` list: valid JSON array of the in-scope project records on stdout, nothing else.
+pub fn list_json(cwd: &Path, config: &BaseConfig, project_scope: scope::ProjectScope) -> Result<()> {
+    let (records, _unscoped) = list_data(cwd, config, &project_scope)?;
+    println!("{}", serde_json::to_string_pretty(&records)?);
     Ok(())
 }
 
@@ -268,50 +326,145 @@ pub fn peer(cwd: &Path, config: &BaseConfig, slug: &str, workspace: &str, remove
     Ok(())
 }
 
-pub fn get(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<()> {
+/// Fetch one project as a typed record. `None` when no node matches the slug.
+pub fn get_data(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<Option<ProjectRecord>> {
     let iri = crud::build_iri(ns, "project", slug);
+    let p = &ns.prefix;
     let sparql = format!(
-        "SELECT ?pred ?obj WHERE {{\n\
+        "SELECT ?name ?status ?priority ?path ?stage ?blockedBy ?nextAction ?created ?updated ?lastActive WHERE {{\n\
            GRAPH ?g {{\n\
-             <{iri}> ?pred ?obj .\n\
+             <{iri}> a {p}:Project ;\n\
+               {p}:name ?name ;\n\
+               {p}:status ?status .\n\
+             OPTIONAL {{ <{iri}> {p}:priority ?priority }}\n\
+             OPTIONAL {{ <{iri}> {p}:path ?path }}\n\
+             OPTIONAL {{ <{iri}> {p}:stage ?stage }}\n\
+             OPTIONAL {{ <{iri}> {p}:blockedBy ?blockedBy }}\n\
+             OPTIONAL {{ <{iri}> {p}:nextAction ?nextAction }}\n\
+             OPTIONAL {{ <{iri}> {p}:createdAt ?created }}\n\
+             OPTIONAL {{ <{iri}> {p}:updatedAt ?updated }}\n\
+             OPTIONAL {{ <{iri}> {p}:lastActive ?lastActive }}\n\
            }}\n\
-         }}"
+         }}\n\
+         LIMIT 1"
     );
 
     let results = crud::load_and_query(cwd, ns, &sparql)?;
     if let QueryResults::Solutions(solutions) = results {
-        let rows: Vec<(String, String)> = solutions
-            .filter_map(|r| r.ok())
-            .map(|row| {
-                let pred = row
-                    .get("pred")
-                    .map(|t| crud::term_display(t.into()))
-                    .unwrap_or_default();
-                let obj = row
-                    .get("obj")
-                    .map(|t| crud::term_display(t.into()))
-                    .unwrap_or_default();
-                (pred, obj)
-            })
-            .collect();
-
-        if rows.is_empty() {
-            eprintln!("Project '{slug}' not found.");
-            return Ok(());
-        }
-
-        println!("Project: {slug}");
-        for (pred, obj) in &rows {
-            // Skip rdf:type display name — show it as "type"
-            let label = if pred == "type" {
-                "type".to_string()
-            } else {
-                pred.clone()
-            };
-            println!("  {label}: {obj}");
+        for row in solutions.filter_map(|r| r.ok()) {
+            let cell = |k: &str| row.get(k).map(|t| crud::term_display(t.into()));
+            return Ok(Some(ProjectRecord {
+                id: slug.to_string(),
+                name: cell("name").unwrap_or_default(),
+                status: cell("status").unwrap_or_default(),
+                priority: cell("priority"),
+                path: cell("path"),
+                stage: cell("stage"),
+                blocked_by: cell("blockedBy"),
+                next_action: cell("nextAction"),
+                created: cell("created"),
+                updated: cell("updated"),
+                last_active: cell("lastActive"),
+            }));
         }
     }
+    Ok(None)
+}
+
+pub fn get(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<()> {
+    match get_data(cwd, ns, slug)? {
+        None => {
+            eprintln!("Project '{slug}' not found.");
+            Ok(())
+        }
+        Some(r) => {
+            println!("Project: {}", r.id);
+            println!("  name: {}", r.name);
+            println!("  status: {}", r.status);
+            if let Some(v) = &r.priority { println!("  priority: {v}"); }
+            if let Some(v) = &r.path { println!("  path: {v}"); }
+            if let Some(v) = &r.stage { println!("  stage: {v}"); }
+            if let Some(v) = &r.blocked_by { println!("  blockedBy: {v}"); }
+            if let Some(v) = &r.next_action { println!("  nextAction: {v}"); }
+            if let Some(v) = &r.created { println!("  created: {v}"); }
+            if let Some(v) = &r.updated { println!("  updated: {v}"); }
+            if let Some(v) = &r.last_active { println!("  lastActive: {v}"); }
+            Ok(())
+        }
+    }
+}
+
+/// `--json` get: one JSON document (record or `null`) on stdout.
+pub fn get_json(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<()> {
+    let rec = get_data(cwd, ns, slug)?;
+    println!("{}", serde_json::to_string_pretty(&rec)?);
     Ok(())
+}
+
+/// Preview of a project delete: the subject set the cascade would remove, mirroring
+/// exactly what `project move` traverses (domain node + tasks + milestones + decisions
+/// + rules + linked notes + the project node).
+pub struct ProjectDeletePlan {
+    /// True when a project node with this slug actually exists in the workspace graph.
+    pub exists: bool,
+    /// Every subject IRI that would be removed (includes the project + domain scaffold).
+    pub subjects: std::collections::HashSet<String>,
+    /// Subjects beyond the project + domain scaffold (tasks/milestones/decisions/rules/notes).
+    pub children: usize,
+}
+
+/// Resolve what `delete` would remove. Reuses the `graph_move` domain selector so the
+/// delete traversal and the move traversal can never drift apart.
+pub fn delete_plan(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<ProjectDeletePlan> {
+    use crate::graph_move::{self, Selector};
+    let base_dir = crate::config::find_workspace_base(cwd)
+        .context("no .base/ directory found")?;
+    let source_path = base_dir.join("graph.nq");
+    let source_graph = crud::workspace_graph_iri(ns, &crud::workspace_slug(cwd));
+
+    let subjects = if source_path.exists() {
+        graph_move::resolve_selector(&source_path, &Selector::Domain(slug.to_string()), &source_graph, ns)?
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let project_iri = crud::build_iri(ns, "project", slug);
+    let domain_iri = crud::build_iri(ns, "domain", slug);
+    let exists = subjects.contains(&project_iri);
+    let children = subjects
+        .iter()
+        .filter(|s| *s != &project_iri && *s != &domain_iri)
+        .count();
+
+    Ok(ProjectDeletePlan { exists, subjects, children })
+}
+
+/// Delete a project. Refuses a non-empty project (any child node) unless `force`, in
+/// which case it CASCADE-deletes everything the `project move` traversal covers —
+/// node + domain + tasks + milestones + decisions + rules + linked notes. Each subject
+/// is removed atomically, backup-first, through the shared store primitive. Returns the
+/// number of subjects removed.
+pub fn delete(cwd: &Path, ns: &NamespaceConfig, slug: &str, force: bool) -> Result<usize> {
+    let plan = delete_plan(cwd, ns, slug)?;
+    if !plan.exists {
+        anyhow::bail!("project '{slug}' not found in this workspace graph");
+    }
+    if plan.children > 0 && !force {
+        anyhow::bail!(
+            "project '{slug}' has {} child node(s) (tasks/milestones/decisions/rules). \
+             Re-run with --force to cascade-delete them.",
+            plan.children
+        );
+    }
+
+    for subject in &plan.subjects {
+        let del = format!(
+            "DELETE WHERE {{ GRAPH ?g {{ <{subject}> ?p ?o }} }};\n\
+             DELETE WHERE {{ GRAPH ?g {{ ?s ?p <{subject}> }} }}"
+        );
+        crud::load_and_mutate(cwd, ns, &del)?;
+    }
+    Ok(plan.subjects.len())
 }
 
 pub fn update(

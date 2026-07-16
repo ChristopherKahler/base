@@ -113,3 +113,75 @@ fn add_task_default_priority() {
         _ => panic!("Expected boolean"),
     }
 }
+
+#[test]
+fn get_update_delete_task_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ns = default_ns();
+
+    crud::project::add(tmp.path(), &ns, "Proj", "active", None).unwrap();
+    crud::project::add(tmp.path(), &ns, "Other", "active", None).unwrap();
+    crud::milestone::add(tmp.path(), &ns, "proj", "M1", None).unwrap();
+    let slug = crud::task::add(tmp.path(), &ns, "proj", "Round Trip", Some("low"), None).unwrap();
+    assert_eq!(slug, "proj.round-trip");
+
+    // get: all fields present, project edge resolved
+    let rec = crud::task::get_data(tmp.path(), &ns, &slug).unwrap().expect("task exists");
+    assert_eq!(rec.name, "Round Trip");
+    assert_eq!(rec.status, "active");
+    assert_eq!(rec.priority.as_deref(), Some("low"));
+    assert_eq!(rec.project.as_deref(), Some("proj"));
+    assert!(rec.milestone.is_none());
+
+    // update: scalar fields + reassign project + attach milestone
+    crud::task::update(
+        tmp.path(), &ns, &slug,
+        Some("Renamed"), Some("completed"), Some("high"),
+        Some("a note"), Some("chris"), Some("2026-08-01"),
+        Some("other"), Some("proj.m1"),
+    ).unwrap();
+    let rec2 = crud::task::get_data(tmp.path(), &ns, &slug).unwrap().unwrap();
+    assert_eq!(rec2.name, "Renamed");
+    assert_eq!(rec2.status, "completed");
+    assert_eq!(rec2.priority.as_deref(), Some("high"));
+    assert_eq!(rec2.description.as_deref(), Some("a note"));
+    assert_eq!(rec2.assignee.as_deref(), Some("chris"));
+    assert_eq!(rec2.due.as_deref(), Some("2026-08-01"));
+    assert_eq!(rec2.project.as_deref(), Some("other"), "reassigned to other project");
+    assert_eq!(rec2.milestone.as_deref(), Some("proj.m1"), "attached to milestone");
+
+    // delete: node + reverse edges gone
+    crud::task::delete(tmp.path(), &ns, &slug).unwrap();
+    assert!(crud::task::get_data(tmp.path(), &ns, &slug).unwrap().is_none(), "task removed");
+    let trig = tmp.path().join(".base").join("graph.nq");
+    let store = base::store::load_graph(&trig).unwrap();
+    let sparql = format!(
+        "PREFIX {p}: <{u}>\nASK {{ GRAPH ?g {{ ?s {p}:hasTask <{u}task/proj.round-trip> }} }}",
+        p = ns.prefix, u = ns.uri,
+    );
+    match store.query(&sparql).unwrap() {
+        QueryResults::Boolean(yes) => assert!(!yes, "no dangling hasTask edge should remain"),
+        _ => panic!("Expected boolean"),
+    }
+}
+
+#[test]
+fn task_list_json_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ns = default_ns();
+
+    crud::project::add(tmp.path(), &ns, "Proj", "active", None).unwrap();
+    crud::task::add(tmp.path(), &ns, "proj", "Alpha", Some("high"), None).unwrap();
+
+    let rows = crud::task::list_data(tmp.path(), &ns, Some("proj"), None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "proj.alpha");
+    let json = serde_json::to_string(&rows).unwrap();
+    for key in [
+        "\"id\"", "\"name\"", "\"status\"", "\"priority\"", "\"project\"",
+        "\"milestone\"", "\"description\"", "\"assignee\"", "\"due\"",
+        "\"created\"", "\"updated\"", "\"last_active\"",
+    ] {
+        assert!(json.contains(key), "json missing stable key {key}: {json}");
+    }
+}

@@ -241,6 +241,12 @@ pub fn resolve_slug(cwd: &Path, ns: &NamespaceConfig, entity_type: &str, input: 
 
 // ─── Display helpers ─────────────────────────────────────────
 
+/// Extract the bare entity slug from an IRI display form (`task/foo.bar` → `foo.bar`,
+/// `project/foo` → `foo`). Safe on plain slugs (returns them unchanged).
+pub fn slug_of(display: &str) -> String {
+    display.rsplit('/').next().unwrap_or(display).to_string()
+}
+
 /// Extract a human-readable string from an RDF term.
 pub fn term_display(term: oxigraph::model::TermRef<'_>) -> String {
     use oxigraph::model::TermRef;

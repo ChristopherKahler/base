@@ -609,9 +609,17 @@ pub enum ProjectAction {
         /// Show only projects with no #path / no registered home
         #[arg(long)]
         unscoped: bool,
+        /// Emit JSON (stable dashboard contract) instead of a table
+        #[arg(long)]
+        json: bool,
     },
     /// Show a specific project (accepts slug or display name)
-    Get { slug: String },
+    Get {
+        slug: String,
+        /// Emit JSON instead of the human field list
+        #[arg(long)]
+        json: bool,
+    },
     /// Make a project also surface in another workspace (additive peerWorkspace edge)
     Peer {
         /// Project slug or display name
@@ -658,6 +666,18 @@ pub enum ProjectAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Delete a project. Refuses a non-empty project unless --force (which cascade-
+    /// deletes tasks/milestones/decisions/rules). PREVIEW unless --yes.
+    Delete {
+        /// Project slug or display name
+        slug: String,
+        /// Cascade-delete child tasks/milestones/decisions/rules
+        #[arg(long)]
+        force: bool,
+        /// Apply the delete (without it, prints the plan and writes nothing)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -679,9 +699,17 @@ pub enum MilestoneAction {
         /// Project slug or display name
         #[arg(short, long)]
         project: Option<String>,
+        /// Emit JSON (stable dashboard contract) instead of a table
+        #[arg(long)]
+        json: bool,
     },
     /// Show a specific milestone
-    Get { slug: String },
+    Get {
+        slug: String,
+        /// Emit JSON instead of the human field list
+        #[arg(long)]
+        json: bool,
+    },
     /// Update a milestone
     #[command(visible_alias = "u")]
     Update {
@@ -690,6 +718,17 @@ pub enum MilestoneAction {
         status: Option<String>,
         #[arg(short, long)]
         description: Option<String>,
+    },
+    /// Delete a milestone. Tasks are DETACHED to project-level by default; --force
+    /// cascade-deletes them. PREVIEW unless --yes.
+    Delete {
+        slug: String,
+        /// Cascade-delete the milestone's tasks instead of detaching them
+        #[arg(long)]
+        force: bool,
+        /// Apply the delete (without it, prints the plan and writes nothing)
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -718,6 +757,50 @@ pub enum TaskAction {
         /// Milestone slug to filter by
         #[arg(short, long)]
         milestone: Option<String>,
+        /// Emit JSON (stable dashboard contract) instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a specific task (all fields; accepts slug or display name)
+    Get {
+        slug: String,
+        /// Emit JSON instead of the human field list
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update a task's mutable fields (accepts slug or display name)
+    #[command(visible_alias = "u")]
+    Update {
+        slug: String,
+        /// New display name
+        #[arg(long)]
+        name: Option<String>,
+        /// Status (canonical vocabulary: active | completed)
+        #[arg(short, long)]
+        status: Option<String>,
+        #[arg(long)]
+        priority: Option<String>,
+        /// Free-form description / notes
+        #[arg(long, visible_alias = "notes")]
+        description: Option<String>,
+        #[arg(long)]
+        assignee: Option<String>,
+        /// Due date (free-form or ISO)
+        #[arg(long)]
+        due: Option<String>,
+        /// Reassign to another project (rewrites the project edge only)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Reassign to another milestone (rewrites the milestone edge only)
+        #[arg(short, long)]
+        milestone: Option<String>,
+    },
+    /// Delete a task node + its edges. PREVIEW unless --yes.
+    Delete {
+        slug: String,
+        /// Apply the delete (without it, prints the task and writes nothing)
+        #[arg(long)]
+        yes: bool,
     },
     /// Mark a task as completed
     Done { slug: String },
@@ -740,12 +823,29 @@ pub enum DecisionAction {
     Search {
         #[arg(long)]
         keyword: String,
+        /// Emit JSON (stable dashboard contract) instead of a table
+        #[arg(long)]
+        json: bool,
     },
     /// Delete decisions matching a keyword
     Delete {
         /// Keyword to match against decision names
         #[arg(long)]
         keyword: String,
+    },
+    /// Update a decision in place, addressed by its stable {domain}.{decision} slug
+    #[command(visible_alias = "u")]
+    Update {
+        /// Decision slug ({domain}.{decision}) or exact decision text
+        slug: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        rationale: Option<String>,
+        #[arg(long)]
+        recall: Option<String>,
+        #[arg(short, long)]
+        status: Option<String>,
     },
 }
 
@@ -1119,6 +1219,22 @@ pub enum RelayAction {
         #[arg(long)]
         from: Option<String>,
     },
+    /// Instant message to a live titled session — no doc, no done-ceremony.
+    /// Screams in the receiver's hooks mid-turn; their reply ping clears it.
+    Ping {
+        /// Target session's registered title
+        #[arg(long)]
+        to: String,
+        /// The message — carries ALL context inline (a sentence or three; more than that is a task, not a ping)
+        #[arg(long)]
+        msg: String,
+        /// File paths / entity ids this ping references
+        #[arg(long)]
+        refs: Vec<String>,
+        /// Origin label (defaults to this session's registered/auto-assigned title)
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Mark a relayed task done — clears the inbox alert and closes the graph mirror
     Done {
         /// Task slug
@@ -1223,7 +1339,7 @@ pub fn run() {
                     None => die("Failed", anyhow::anyhow!("--path is required, or enable [protocol] with a stage in base.toml")),
                 }
             }
-            ProjectAction::List { all, workspace, unscoped } => {
+            ProjectAction::List { all, workspace, unscoped, json } => {
                 // Precedence: --all > --workspace > --unscoped > default (current workspace).
                 let project_scope = if all {
                     scope::ProjectScope::All
@@ -1236,11 +1352,22 @@ pub fn run() {
                 } else {
                     scope::ProjectScope::Current
                 };
-                if let Err(e) = crud::project::list(&cwd, &config, project_scope) { die("Error", e); }
+                let r = if json {
+                    crud::project::list_json(&cwd, &config, project_scope)
+                } else {
+                    crud::project::list(&cwd, &config, project_scope)
+                };
+                if let Err(e) = r { die("Error", e); }
             }
-            ProjectAction::Get { slug } => {
-                if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug)
-                    && let Err(e) = crud::project::get(&cwd, &config.namespace, &s) { die("Error", e); }
+            ProjectAction::Get { slug, json } => {
+                if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug) {
+                    let r = if json {
+                        crud::project::get_json(&cwd, &config.namespace, &s)
+                    } else {
+                        crud::project::get(&cwd, &config.namespace, &s)
+                    };
+                    if let Err(e) = r { die("Error", e); }
+                }
             }
             ProjectAction::Peer { slug, workspace, remove } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug)
@@ -1287,6 +1414,33 @@ pub fn run() {
                     }
                 }
             }
+            ProjectAction::Delete { slug, force, yes } => {
+                if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug) {
+                    match crud::project::delete_plan(&cwd, &config.namespace, &s) {
+                        Ok(plan) if !plan.exists => {
+                            eprintln!("Project '{s}' not found in this workspace graph.");
+                        }
+                        Ok(plan) => {
+                            println!(
+                                "Project '{s}': {} node(s) would be removed ({} child node(s)).",
+                                plan.subjects.len(),
+                                plan.children
+                            );
+                            if plan.children > 0 && !force {
+                                println!("   Non-empty — pass --force to cascade-delete the children, plus --yes to apply.");
+                            } else if !yes {
+                                println!("   Pass --yes to apply.");
+                            } else {
+                                match crud::project::delete(&cwd, &config.namespace, &s, force) {
+                                    Ok(n) => println!("Deleted project '{s}' ({n} node(s) removed)."),
+                                    Err(e) => die("Failed", e),
+                                }
+                            }
+                        }
+                        Err(e) => die("Error", e),
+                    }
+                }
+            }
         },
 
         // ─── Milestone ──────────────────────────────────
@@ -1301,7 +1455,7 @@ pub fn run() {
                     Err(e) => die("Failed", e),
                 }
             }
-            MilestoneAction::List { project } => {
+            MilestoneAction::List { project, json } => {
                 let ps = match project.as_deref() {
                     Some(p) => match resolve(&cwd, &config.namespace, "project", p) {
                         Some(s) => Some(s),
@@ -1309,17 +1463,46 @@ pub fn run() {
                     },
                     None => None,
                 };
-                if let Err(e) = crud::milestone::list(&cwd, &config.namespace, ps.as_deref()) { die("Error", e); }
+                let r = if json {
+                    crud::milestone::list_json(&cwd, &config.namespace, ps.as_deref())
+                } else {
+                    crud::milestone::list(&cwd, &config.namespace, ps.as_deref())
+                };
+                if let Err(e) = r { die("Error", e); }
             }
-            MilestoneAction::Get { slug } => {
-                if let Some(s) = resolve(&cwd, &config.namespace, "milestone", &slug)
-                    && let Err(e) = crud::milestone::get(&cwd, &config.namespace, &s) { die("Error", e); }
+            MilestoneAction::Get { slug, json } => {
+                if let Some(s) = resolve(&cwd, &config.namespace, "milestone", &slug) {
+                    let r = if json {
+                        crud::milestone::get_json(&cwd, &config.namespace, &s)
+                    } else {
+                        crud::milestone::get(&cwd, &config.namespace, &s)
+                    };
+                    if let Err(e) = r { die("Error", e); }
+                }
             }
             MilestoneAction::Update { slug, status, description } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "milestone", &slug) {
                     match crud::milestone::update(&cwd, &config.namespace, &s, status.as_deref(), description.as_deref()) {
                         Ok(()) => println!("Milestone '{s}' updated"),
                         Err(e) => die("Failed", e),
+                    }
+                }
+            }
+            MilestoneAction::Delete { slug, force, yes } => {
+                if let Some(s) = resolve(&cwd, &config.namespace, "milestone", &slug) {
+                    let n = match crud::milestone::task_count(&cwd, &config.namespace, &s) {
+                        Ok(n) => n,
+                        Err(e) => die("Error", e),
+                    };
+                    let fate = if force { "cascade-deleted" } else { "detached to project-level" };
+                    println!("Milestone '{s}': {n} task(s) will be {fate}.");
+                    if !yes {
+                        println!("   Pass --yes to apply.");
+                    } else {
+                        match crud::milestone::delete(&cwd, &config.namespace, &s, force) {
+                            Ok(removed) => println!("Deleted milestone '{s}' ({removed} task(s) cascade-deleted)."),
+                            Err(e) => die("Failed", e),
+                        }
                     }
                 }
             }
@@ -1344,7 +1527,7 @@ pub fn run() {
                     Err(e) => die("Failed", e),
                 }
             }
-            TaskAction::List { project, milestone } => {
+            TaskAction::List { project, milestone, json } => {
                 let ps = match project.as_deref() {
                     Some(p) => match resolve(&cwd, &config.namespace, "project", p) {
                         Some(s) => Some(s),
@@ -1359,7 +1542,69 @@ pub fn run() {
                     },
                     None => None,
                 };
-                if let Err(e) = crud::task::list(&cwd, &config.namespace, ps.as_deref(), ms.as_deref()) { die("Error", e); }
+                let r = if json {
+                    crud::task::list_json(&cwd, &config.namespace, ps.as_deref(), ms.as_deref())
+                } else {
+                    crud::task::list(&cwd, &config.namespace, ps.as_deref(), ms.as_deref())
+                };
+                if let Err(e) = r { die("Error", e); }
+            }
+            TaskAction::Get { slug, json } => {
+                if let Some(s) = resolve(&cwd, &config.namespace, "task", &slug) {
+                    let r = if json {
+                        crud::task::get_json(&cwd, &config.namespace, &s)
+                    } else {
+                        crud::task::get(&cwd, &config.namespace, &s)
+                    };
+                    if let Err(e) = r { die("Error", e); }
+                }
+            }
+            TaskAction::Update { slug, name, status, priority, description, assignee, due, project, milestone } => {
+                if let Some(s) = resolve(&cwd, &config.namespace, "task", &slug) {
+                    // Resolve reassignment targets (slug or display name) up front.
+                    let proj = match project.as_deref() {
+                        Some(p) => match resolve(&cwd, &config.namespace, "project", p) {
+                            Some(x) => Some(x),
+                            None => return,
+                        },
+                        None => None,
+                    };
+                    let ms = match milestone.as_deref() {
+                        Some(m) => match resolve(&cwd, &config.namespace, "milestone", m) {
+                            Some(x) => Some(x),
+                            None => return,
+                        },
+                        None => None,
+                    };
+                    match crud::task::update(
+                        &cwd, &config.namespace, &s,
+                        name.as_deref(), status.as_deref(), priority.as_deref(),
+                        description.as_deref(), assignee.as_deref(), due.as_deref(),
+                        proj.as_deref(), ms.as_deref(),
+                    ) {
+                        Ok(()) => println!("Task '{s}' updated"),
+                        Err(e) => die("Failed", e),
+                    }
+                }
+            }
+            TaskAction::Delete { slug, yes } => {
+                if let Some(s) = resolve(&cwd, &config.namespace, "task", &slug) {
+                    if yes {
+                        match crud::task::delete(&cwd, &config.namespace, &s) {
+                            Ok(()) => println!("Deleted task '{s}'."),
+                            Err(e) => die("Failed", e),
+                        }
+                    } else {
+                        match crud::task::get_data(&cwd, &config.namespace, &s) {
+                            Ok(Some(t)) => {
+                                println!("Task '{}' (status: {}) will be deleted.", t.id, t.status);
+                                println!("   Pass --yes to apply.");
+                            }
+                            Ok(None) => eprintln!("Task '{s}' not found."),
+                            Err(e) => die("Error", e),
+                        }
+                    }
+                }
             }
             TaskAction::Done { slug } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "task", &slug) {
@@ -1379,7 +1624,14 @@ pub fn run() {
                     Err(e) => die("Failed", e),
                 }
             }
-            DecisionAction::Search { keyword } => { if let Err(e) = crud::decision::search(&cwd, &config.namespace, &keyword) { die("Error", e); } }
+            DecisionAction::Search { keyword, json } => {
+                let r = if json {
+                    crud::decision::search_json(&cwd, &config.namespace, &keyword)
+                } else {
+                    crud::decision::search(&cwd, &config.namespace, &keyword)
+                };
+                if let Err(e) = r { die("Error", e); }
+            }
             DecisionAction::Delete { keyword } => {
                 // Show what will be deleted first
                 if let Err(e) = crud::decision::search(&cwd, &config.namespace, &keyword) {
@@ -1388,6 +1640,17 @@ pub fn run() {
                     match crud::decision::delete(&cwd, &config.namespace, &keyword) {
                         Ok(0) => println!("No decisions matching '{keyword}'."),
                         Ok(n) => println!("Deleted {n} decision(s) matching '{keyword}'."),
+                        Err(e) => die("Failed", e),
+                    }
+                }
+            }
+            DecisionAction::Update { slug, name, rationale, recall, status } => {
+                if let Some(s) = resolve(&cwd, &config.namespace, "decision", &slug) {
+                    match crud::decision::update(
+                        &cwd, &config.namespace, &s,
+                        name.as_deref(), rationale.as_deref(), recall.as_deref(), status.as_deref(),
+                    ) {
+                        Ok(()) => println!("Decision '{s}' updated"),
                         Err(e) => die("Failed", e),
                     }
                 }
@@ -1892,6 +2155,8 @@ pub fn run() {
                         status: "pending".into(),
                         last_loud_session: String::new(),
                         last_alert_ts: String::new(),
+                        kind: "task".into(),
+                        refs: Vec::new(),
                     };
                     match base::relay::task_inbox::enqueue(&config.namespace, &task) {
                         Ok(path) => println!(
@@ -1900,6 +2165,71 @@ pub fn run() {
                             path.display()
                         ),
                         Err(e) => die("Relay task failed", e),
+                    }
+                }
+                RelayAction::Ping { to, msg, refs, from } => {
+                    let Some(entry) = relay::session_registry::resolve(&to) else {
+                        die("Relay ping", anyhow::anyhow!(
+                            "no session registered as '{to}'. The target session must first run: base relay register --as {to}"
+                        ));
+                    };
+                    if !entry.alive() {
+                        eprintln!(
+                            "Warning: session '{to}' last seen {} ago — it may be dead. Pinging anyway.",
+                            base::relay::age_str(&entry.last_heartbeat)
+                        );
+                    }
+                    // Origin: explicit --from, else every title this session holds
+                    // (auto-codenames included — hooks touch() one on each boundary).
+                    let my_titles: Vec<String> = match &from {
+                        Some(f) => vec![f.clone()],
+                        None => relay::env_session_id()
+                            .map(|sid| relay::session_registry::titles_for(&sid))
+                            .unwrap_or_default(),
+                    };
+                    let origin = my_titles.first().cloned().unwrap_or_default();
+                    if origin.is_empty() {
+                        eprintln!(
+                            "Warning: this session has no relay title — the receiver cannot ping back. \
+                             Register one: base relay register --as <title>"
+                        );
+                    }
+                    // Replying? Any pending inbound ping FROM the target in OUR
+                    // inbox means this send is the answer — clear those now, and
+                    // mark this ping a reply so it can't demand its own ack.
+                    let answered =
+                        base::relay::task_inbox::clear_pings_from(&config.namespace, &to, &my_titles);
+                    let kind = if answered > 0 { "reply" } else { "ping" };
+                    let id = format!(
+                        "ping-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0)
+                    );
+                    let ping = base::relay::task_inbox::InboxTask {
+                        slug: id.clone(),
+                        summary: msg.clone(),
+                        doc: String::new(),
+                        from: origin,
+                        to_title: to.clone(),
+                        to_session: entry.session_id.clone(),
+                        priority: "high".into(),
+                        created: base::relay::now_iso(),
+                        status: "pending".into(),
+                        last_loud_session: String::new(),
+                        last_alert_ts: String::new(),
+                        kind: kind.into(),
+                        refs,
+                    };
+                    match base::relay::task_inbox::enqueue(&config.namespace, &ping) {
+                        Ok(_) if answered > 0 => println!(
+                            "Ping (reply) → {to}: \"{msg}\" — cleared {answered} inbound ping(s); fires on their next tool call."
+                        ),
+                        Ok(_) => println!(
+                            "Ping → {to}: \"{msg}\" — fires on their next tool call; clears when they ping back."
+                        ),
+                        Err(e) => die("Relay ping failed", e),
                     }
                 }
                 RelayAction::Done { slug } => {
