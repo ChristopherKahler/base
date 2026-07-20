@@ -11,7 +11,32 @@ from pathlib import Path
 # Output directory name — override with BASE_AST_OUT env var for worktrees or
 # shared-output setups. Accepts a relative name (".base-ast-cache-feature") or an
 # absolute path ("/shared/.base-ast-cache").
-_BASE_AST_OUT = os.environ.get("BASE_AST_OUT", ".base-ast-cache")
+_BASE_AST_OUT = os.environ.get("BASE_AST_OUT") or ".base-ast-cache"
+
+
+def _cache_base(root: Path) -> Path:
+    _out = Path(_BASE_AST_OUT)
+    return _out if _out.is_absolute() else Path(root).resolve() / _out
+
+
+_self_ignored: set[str] = set()
+
+
+def _ensure_self_ignore(base: Path) -> None:
+    """Self-contained gitignore for the cache root, mirroring .base-ast/
+    (src/ast_repo.rs) — keeps the cache out of git in any repo without touching
+    the repo's root .gitignore. Root-scanning formatters that only honor
+    root-level ignore files still need their own entry; that stays operator-owned.
+    """
+    if str(base) in _self_ignored:
+        return
+    _self_ignored.add(str(base))
+    gi = base / ".gitignore"
+    if not gi.exists():
+        try:
+            gi.write_text("# Generated AST cache — regenerated on sync, never committed.\n*\n")
+        except OSError:
+            pass
 
 
 def _body_content(content: bytes) -> bytes:
@@ -36,9 +61,7 @@ _stat_index_dirty: bool = False
 
 
 def _stat_index_file(root: Path) -> Path:
-    _out = Path(_BASE_AST_OUT)
-    base = _out if _out.is_absolute() else Path(root).resolve() / _out
-    return base / "cache" / "stat-index.json"
+    return _cache_base(root) / "cache" / "stat-index.json"
 
 
 def _ensure_stat_index(root: Path) -> None:
@@ -64,6 +87,7 @@ def _flush_stat_index() -> None:
     p = _stat_index_file(_stat_index_root)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_self_ignore(p.parent.parent)
         fd, tmp = tempfile.mkstemp(dir=p.parent, prefix="stat-index.", suffix=".tmp")
         try:
             os.write(fd, json.dumps(_stat_index, separators=(",", ":")).encode())
@@ -152,10 +176,10 @@ def cache_dir(root: Path = Path("."), kind: str = "ast") -> Path:
     kind is "ast" or "semantic". Separate subdirectories prevent semantic cache
     entries from overwriting AST cache entries for the same source_file (#582).
     """
-    _out = Path(_BASE_AST_OUT)
-    base = _out if _out.is_absolute() else Path(root).resolve() / _out
+    base = _cache_base(root)
     d = base / "cache" / kind
     d.mkdir(parents=True, exist_ok=True)
+    _ensure_self_ignore(base)
     return d
 
 
@@ -208,7 +232,9 @@ def save_cached(path: Path, result: dict, root: Path = Path("."), kind: str = "a
     entry = target_dir / f"{h}.json"
     fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=f"{h}.", suffix=".tmp")
     try:
-        os.write(fd, json.dumps(result).encode())
+        # default=str is a resilience net: a single unserializable value must
+        # degrade to a string, never raise and abort the whole batch extraction.
+        os.write(fd, json.dumps(result, default=str).encode())
         os.close(fd)
         try:
             os.replace(tmp_path, entry)
