@@ -180,7 +180,12 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<String> {
         {
             return Ok(t);
         }
-        let name = pick_name(session_id, &reg);
+        // BASE_RELAY_AS pins the codename at launch (e.g. `cc work` wrapper);
+        // otherwise fall back to the random wordlist pick.
+        let name = match std::env::var("BASE_RELAY_AS") {
+            Ok(t) if !t.is_empty() => t,
+            _ => pick_name(session_id, &reg),
+        };
         let now = now_iso();
         reg.sessions.insert(
             name.clone(),

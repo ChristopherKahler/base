@@ -10,7 +10,16 @@ use crate::domain::session::SessionState;
 
 /// PreToolUse: see file path in tool call → match file_keywords + path triggers → inject rules BEFORE tool executes.
 /// Also: inject AST file map for source files, and redirect grep/find to ast query.
-pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Result<super::HookEventData> {
+///
+/// Returns the injection text instead of printing it: Claude Code only feeds
+/// PreToolUse context to the model via the JSON `hookSpecificOutput.additionalContext`
+/// envelope (plain stdout is transcript-only), so the dispatcher assembles ALL
+/// pre-tool output — this handler's plus the relay blocks — into one envelope.
+pub fn handle(
+    config: &BaseConfig,
+    cwd: &Path,
+    event: &serde_json::Value,
+) -> Result<(super::HookEventData, String)> {
     let mut output = String::new();
     let mut data = super::HookEventData::default();
 
@@ -249,11 +258,8 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             }
     }
 
-    if !output.is_empty() {
-        print!("{}", output.trim_end());
-    }
-
-    Ok(data)
+    let context = output.trim_end().to_string();
+    Ok((data, context))
 }
 
 /// Content-version of a file for content-keyed dedup: a hash of its bytes (0 if

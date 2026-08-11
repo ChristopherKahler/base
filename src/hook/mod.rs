@@ -93,25 +93,50 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
             session_start::handle(&config, &cwd)?;
             // Relay inbox push: pending messages addressed to this session
             // (unregistered sessions get a one-line notice that a relay is live).
-            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true) {
+            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true, false) {
                 print!("{block}");
             }
             // Session-targeted task relay: refresh liveness + announce any tasks
             // assigned to this session (loud, re-announced on each new session).
-            if let Some(sid) = session_id.as_deref() {
-                relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::SessionStart, true);
+            if let Some(sid) = session_id.as_deref()
+                && let Some(block) = relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::SessionStart, true)
+            {
+                print!("{block}");
             }
             Ok(HookEventData { session_id, ..Default::default() })
         }
         "pre-tool-use" => {
-            let mut data = pre_tool_use::handle(&config, &cwd, &stdin_json)?;
+            let (mut data, mut context) = pre_tool_use::handle(&config, &cwd, &stdin_json)?;
             let (tool_name, file_path) = extract_tool_context(&stdin_json);
             data.tool_name = tool_name;
             data.file_path = file_path;
-            // Mid-turn task-relay scan: a pending task fires loud immediately so
-            // an autonomous run picks it up without waiting for the next prompt.
-            if let Some(sid) = session_id.as_deref() {
-                relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::Tool, false);
+            // Mid-turn task-relay scan: a pending task or ping fires loud
+            // immediately so an autonomous run picks it up without waiting for
+            // the next prompt.
+            if let Some(sid) = session_id.as_deref()
+                && let Some(block) = relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::Tool, false)
+            {
+                context.push('\n');
+                context.push_str(&block);
+            }
+            // Mid-turn spool push: a question from a squad peer must interrupt
+            // the running turn, not queue behind a prompt boundary that an
+            // autonomous run may never hit.
+            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), false, true) {
+                context.push('\n');
+                context.push_str(&block);
+            }
+            // PreToolUse context only reaches the model through the JSON
+            // envelope — plain stdout is transcript-only on this event.
+            let context = context.trim().to_string();
+            if !context.is_empty() {
+                let envelope = serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": context,
+                    }
+                });
+                println!("{envelope}");
             }
             data.session_id = session_id;
             Ok(data)
@@ -130,12 +155,14 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
             // the dispatcher (not the handler) so star-command and empty-prompt
             // early returns can't swallow a pending delivery. Silent when
             // unregistered — the session-start notice already ran.
-            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), false) {
+            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), false, false) {
                 print!("{block}");
             }
             // Session-targeted task relay: refresh liveness + deliver assigned tasks.
-            if let Some(sid) = session_id.as_deref() {
-                relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::Prompt, true);
+            if let Some(sid) = session_id.as_deref()
+                && let Some(block) = relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::Prompt, true)
+            {
+                print!("{block}");
             }
             data.session_id = session_id;
             Ok(data)
@@ -143,8 +170,10 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
         "stop" => {
             stop::handle(&config, &cwd)?;
             // End-of-turn nudge for any still-open relayed task (terse, throttled).
-            if let Some(sid) = session_id.as_deref() {
-                relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::Stop, false);
+            if let Some(sid) = session_id.as_deref()
+                && let Some(block) = relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::Stop, false)
+            {
+                print!("{block}");
             }
             Ok(HookEventData { session_id, ..Default::default() })
         }
@@ -154,20 +183,20 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
 
 /// Session-targeted task-relay tick: on boundary events (session-start, prompt)
 /// ensure this session has an auto-assigned codename and a fresh heartbeat, then
-/// deliver any tasks assigned to it, printing the injection block to stdout.
+/// deliver any tasks/pings assigned to it, returning the injection block. The
+/// caller decides the output channel — plain stdout on boundary events, the
+/// JSON additionalContext envelope on pre-tool-use.
 /// Fail-open — a broken inbox or registry never blocks the hook.
 fn relay_task_tick(
     session_id: &str,
     cwd: &std::path::Path,
     phase: crate::relay::task_inbox::Phase,
     boundary: bool,
-) {
+) -> Option<String> {
     if boundary {
         let _ = crate::relay::session_registry::touch(session_id, cwd);
     }
-    if let Some(block) = crate::relay::task_inbox::deliver(session_id, phase) {
-        print!("{block}");
-    }
+    crate::relay::task_inbox::deliver(session_id, phase)
 }
 
 /// Append a hook event to the JSONL log file. Fire-and-forget — never blocks hooks.

@@ -1,4 +1,5 @@
-//! Session-targeted task inbox — the delivery channel for `*task <title> …`.
+//! Session-targeted task inbox — the delivery channel for `*task <title> …`
+//! and `*ping <title> …`.
 //!
 //! A task relayed to a live session lands as one JSON file under
 //! `~/.base-gbl/.base/relay-inbox/<target-title>/<slug>.json`. The inbox is keyed
@@ -8,6 +9,13 @@
 //! session id → held titles, scan those dirs on every event (session-start,
 //! prompt, tool-use, stop), and inject a loud "CONSUME AND EXECUTE" block the
 //! first time a given session sees it, then a throttled reminder until done.
+//!
+//! Pings ride the same rail with IM semantics instead of work semantics: no
+//! briefing doc (the message IS the payload, mirrored to the graph), and the
+//! obligation is a REPLY, not completion — an inbound `kind == "ping"` nags on
+//! a short throttle until the receiver sends a ping back to the sender, which
+//! auto-clears it. The reply (`kind == "reply"`) is announced once and
+//! consumed on delivery, so an ack never demands its own ack.
 //!
 //! Why a filesystem inbox and not the graph as the live medium: `base task
 //! list` is workspace-scoped, so two sessions on adjacent projects can't see
@@ -27,6 +35,10 @@ use crate::config::NamespaceConfig;
 /// Terse reminders re-fire at most this often (per task) outside a fresh
 /// session — keeps a long autonomous run nudged without spamming every tool call.
 const TERSE_THROTTLE_SECS: i64 = 600;
+
+/// Unanswered pings nag much harder than open tasks — the sender is waiting
+/// on a live round-trip, not a work package.
+const PING_TERSE_THROTTLE_SECS: i64 = 180;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxTask {
@@ -54,10 +66,22 @@ pub struct InboxTask {
     /// ISO timestamp of the last alert of any kind (loud or terse).
     #[serde(default)]
     pub last_alert_ts: String,
+    /// "task" (briefed work, cleared by `base relay done`), "ping" (instant
+    /// message, cleared by the receiver's reply), or "reply" (announced once,
+    /// consumed on delivery — no further obligation).
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// File paths / entity ids the message references (pings).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
 }
 
 fn default_priority() -> String {
     "high".into()
+}
+
+fn default_kind() -> String {
+    "task".into()
 }
 
 /// Which hook is asking to deliver — controls loud vs terse.
@@ -151,6 +175,7 @@ pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
     let now = now_iso();
     let mut loud_blocks: Vec<String> = Vec::new();
     let mut terse_slugs: Vec<String> = Vec::new();
+    let mut terse_pings: Vec<String> = Vec::new();
 
     for (path, mut task) in tasks {
         if task.status == "done" {
@@ -163,26 +188,52 @@ pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
         // behavior. Otherwise it's a throttled terse nudge.
         let loud = is_pending || (phase.is_boundary() && is_new_session);
 
+        // A reply is IM-consumed: announced once, then gone. No obligation,
+        // no reminders — otherwise every ack would demand its own ack.
+        if task.kind == "reply" {
+            if loud {
+                loud_blocks.push(render_reply(&task));
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+
         if loud {
-            loud_blocks.push(render_loud(&task));
+            loud_blocks.push(if task.kind == "ping" {
+                render_loud_ping(&task)
+            } else {
+                render_loud(&task)
+            });
             task.status = "delivered".into();
             task.last_loud_session = session_id.to_string();
             task.last_alert_ts = now.clone();
             let _ = write_json_atomic(&path, &task);
-        } else if terse_due(&task.last_alert_ts, &now) {
-            terse_slugs.push(task.slug.clone());
+        } else if terse_due(&task.last_alert_ts, throttle_for(&task)) {
+            if task.kind == "ping" {
+                let from = if task.from.is_empty() { "?".to_string() } else { task.from.clone() };
+                terse_pings.push(format!("{from} ({})", task.summary));
+            } else {
+                terse_slugs.push(task.slug.clone());
+            }
             task.last_alert_ts = now.clone();
             let _ = write_json_atomic(&path, &task);
         }
     }
 
-    if loud_blocks.is_empty() && terse_slugs.is_empty() {
+    if loud_blocks.is_empty() && terse_slugs.is_empty() && terse_pings.is_empty() {
         return None;
     }
 
     let mut out = String::new();
     for b in &loud_blocks {
         out.push_str(b);
+    }
+    if !terse_pings.is_empty() {
+        out.push_str(&format!(
+            "<relay-ping-open>❗ UNANSWERED PING(s) — the sender is waiting on you: {}. \
+             Reply RIGHT NOW: `base relay ping --to <sender> --msg \"...\"` — a one-line ack counts.</relay-ping-open>\n",
+            terse_pings.join("; ")
+        ));
     }
     if !terse_slugs.is_empty() {
         out.push_str(&format!(
@@ -194,9 +245,13 @@ pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
     Some(out)
 }
 
-fn terse_due(last_alert_ts: &str, _now: &str) -> bool {
+fn throttle_for(task: &InboxTask) -> i64 {
+    if task.kind == "ping" { PING_TERSE_THROTTLE_SECS } else { TERSE_THROTTLE_SECS }
+}
+
+fn terse_due(last_alert_ts: &str, throttle_secs: i64) -> bool {
     match parse_ts(last_alert_ts) {
-        Some(t) => (chrono::Local::now() - t).num_seconds() >= TERSE_THROTTLE_SECS,
+        Some(t) => (chrono::Local::now() - t).num_seconds() >= throttle_secs,
         None => true, // never alerted (or unparseable) — due now
     }
 }
@@ -226,25 +281,104 @@ fn render_loud(task: &InboxTask) -> String {
     )
 }
 
+fn refs_line(task: &InboxTask) -> String {
+    if task.refs.is_empty() {
+        String::new()
+    } else {
+        format!("Refs: {}\n", task.refs.join(", "))
+    }
+}
+
+fn render_loud_ping(task: &InboxTask) -> String {
+    // An untitled sender can't receive a reply ping — fall back to `done`.
+    let reply_line = if task.from.is_empty() {
+        format!(
+            "The sender is untitled, so you cannot ping back — consume the message and clear it with: base relay done {}\n",
+            task.slug
+        )
+    } else {
+        format!(
+            "DIRECTIVE: PAUSE and reply BEFORE your next action: `base relay ping --to \"{from}\" --msg \"<answer or ack>\"`. \
+             If the full answer needs time, send a one-line ack NOW (\"on it — folding into current work\") and a follow-up ping when you have it. \
+             Your reply clears this alert; until you send one it re-fires. \
+             Then resume your in-flight work and note the ping + your reply in ONE line of your response.\n",
+            from = task.from
+        )
+    };
+    format!(
+        "<relay-ping-inbound from=\"{from}\" to=\"{title}\">\n\
+         🚨 INSTANT PING from {from} — REPLY REQUIRED BEFORE YOUR NEXT ACTION.\n\
+         {msg}\n\
+         {refs}\
+         {reply_line}\
+         </relay-ping-inbound>\n",
+        from = if task.from.is_empty() { "another session" } else { &task.from },
+        title = task.to_title,
+        msg = task.summary,
+        refs = refs_line(task),
+    )
+}
+
+fn render_reply(task: &InboxTask) -> String {
+    format!(
+        "<relay-ping-reply from=\"{from}\" to=\"{title}\">\n\
+         🔔 PING REPLY from {from}: {msg}\n\
+         {refs}\
+         Consumed — no acknowledgment needed. Fold it into your work, continue, and mention it in one line of your response.\n\
+         </relay-ping-reply>\n",
+        from = if task.from.is_empty() { "another session" } else { &task.from },
+        title = task.to_title,
+        msg = task.summary,
+        refs = refs_line(task),
+    )
+}
+
+/// The receiver's reply IS the ack: clear every pending inbound ping FROM
+/// `peer` sitting in any of `my_titles`' inboxes, flipping each graph mirror
+/// to answered (best-effort). Returns how many pings cleared.
+pub fn clear_pings_from(ns: &NamespaceConfig, peer: &str, my_titles: &[String]) -> usize {
+    let mut cleared = 0;
+    for title in my_titles {
+        let Some(dir) = title_dir(title) else { continue };
+        for (path, task) in read_tasks_in(&dir) {
+            if task.kind == "ping" && task.from == peer && std::fs::remove_file(&path).is_ok() {
+                cleared += 1;
+                if let Err(e) = answer_in_graph(ns, &task.slug) {
+                    eprintln!("base relay ping: graph mirror update skipped: {e:#}");
+                }
+            }
+        }
+    }
+    cleared
+}
+
 // ─── Completion + listing ────────────────────────────────────
 
 /// Mark a relayed task done: remove every matching inbox entry (across all
 /// session dirs — the receiver may not know which subdir it landed in) and flip
 /// the durable graph mirror to completed. Returns how many inbox files cleared.
+/// Also the escape hatch for pings whose sender is untitled (can't be replied
+/// to) — their mirror flips to answered instead of completed.
 pub fn done(ns: &NamespaceConfig, slug: &str) -> Result<usize> {
     let target = format!("{}.json", sanitize(slug));
     let mut cleared = 0;
+    let mut was_ping = false;
     if let Some(root) = inbox_root()
         && let Ok(sessions) = std::fs::read_dir(&root)
     {
         for s in sessions.filter_map(|e| e.ok()) {
             let f = s.path().join(&target);
-            if f.is_file() && std::fs::remove_file(&f).is_ok() {
+            if !f.is_file() {
+                continue;
+            }
+            was_ping |= read_json::<InboxTask>(&f).is_some_and(|t| t.kind != "task");
+            if std::fs::remove_file(&f).is_ok() {
                 cleared += 1;
             }
         }
     }
-    if let Err(e) = complete_in_graph(ns, slug) {
+    let mirror = if was_ping { answer_in_graph(ns, slug) } else { complete_in_graph(ns, slug) };
+    if let Err(e) = mirror {
         eprintln!("base relay done: graph mirror update skipped: {e:#}");
     }
     Ok(cleared)
@@ -270,8 +404,9 @@ pub fn list_all() -> Vec<InboxTask> {
 
 /// Human-readable one-liner for a task (used by `base relay tasks`).
 pub fn format_row(t: &InboxTask) -> String {
+    let kind = if t.kind == "task" { String::new() } else { format!(" ({})", t.kind) };
     format!(
-        "  {slug} → {title} [{status}, {pri}] · {age} · from {from}",
+        "  {slug}{kind} → {title} [{status}, {pri}] · {age} · from {from}",
         slug = t.slug,
         title = t.to_title,
         status = t.status,
@@ -290,35 +425,74 @@ fn global_cwd() -> Option<PathBuf> {
 fn mirror_to_graph(ns: &NamespaceConfig, task: &InboxTask) -> Result<()> {
     let cwd = global_cwd().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
     let p = &ns.prefix;
-    let iri = crate::crud::build_iri(ns, "task", &task.slug);
     let ws_slug = crate::crud::workspace_slug(&cwd);
     let graph = crate::crud::workspace_graph_iri(ns, &ws_slug);
     let now = crate::crud::now_iso();
     let name = crate::crud::escape_sparql_literal(&task.summary);
-    let doc = crate::crud::escape_sparql_literal(&task.doc);
     let from = crate::crud::escape_sparql_literal(&task.from);
     let to = crate::crud::escape_sparql_literal(&task.to_title);
     let sid = crate::crud::escape_sparql_literal(&task.to_session);
-    let pri = crate::crud::escape_sparql_literal(&task.priority);
 
-    let sparql = format!(
-        "INSERT DATA {{\n\
-           GRAPH <{graph}> {{\n\
-             <{iri}> rdf:type {p}:Task ;\n\
-               {p}:name \"{name}\" ;\n\
-               {p}:status \"active\" ;\n\
-               {p}:priority \"{pri}\" ;\n\
-               {p}:relayInbound \"true\" ;\n\
-               {p}:assignedTo \"{to}\" ;\n\
-               {p}:assignedSession \"{sid}\" ;\n\
-               {p}:relayFrom \"{from}\" ;\n\
-               {p}:brief \"{doc}\" ;\n\
-               {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
-               {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
-           }}\n\
-         }}"
-    );
+    // Pings mirror as their own entity type — the message body IS the durable
+    // record (no doc), and they must never pollute `base task list`.
+    let sparql = if task.kind == "task" {
+        let iri = crate::crud::build_iri(ns, "task", &task.slug);
+        let doc = crate::crud::escape_sparql_literal(&task.doc);
+        let pri = crate::crud::escape_sparql_literal(&task.priority);
+        format!(
+            "INSERT DATA {{\n\
+               GRAPH <{graph}> {{\n\
+                 <{iri}> rdf:type {p}:Task ;\n\
+                   {p}:name \"{name}\" ;\n\
+                   {p}:status \"active\" ;\n\
+                   {p}:priority \"{pri}\" ;\n\
+                   {p}:relayInbound \"true\" ;\n\
+                   {p}:assignedTo \"{to}\" ;\n\
+                   {p}:assignedSession \"{sid}\" ;\n\
+                   {p}:relayFrom \"{from}\" ;\n\
+                   {p}:brief \"{doc}\" ;\n\
+                   {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
+                   {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
+               }}\n\
+             }}"
+        )
+    } else {
+        let iri = crate::crud::build_iri(ns, "ping", &task.slug);
+        // A reply's obligation is already met the moment it's sent.
+        let status = if task.kind == "reply" { "answered" } else { "open" };
+        let refs = task
+            .refs
+            .iter()
+            .map(|r| format!(" ;\n               {p}:references \"{}\"", crate::crud::escape_sparql_literal(r)))
+            .collect::<String>();
+        format!(
+            "INSERT DATA {{\n\
+               GRAPH <{graph}> {{\n\
+                 <{iri}> rdf:type {p}:Ping ;\n\
+                   {p}:message \"{name}\" ;\n\
+                   {p}:pingKind \"{kind}\" ;\n\
+                   {p}:status \"{status}\" ;\n\
+                   {p}:relayFrom \"{from}\" ;\n\
+                   {p}:assignedTo \"{to}\" ;\n\
+                   {p}:assignedSession \"{sid}\"{refs} ;\n\
+                   {p}:createdAt \"{now}\"^^xsd:dateTime .\n\
+               }}\n\
+             }}",
+            kind = task.kind,
+        )
+    };
     crate::crud::load_and_mutate(&cwd, ns, &sparql)
+}
+
+/// Flip a mirrored ping to answered (reply sent, or operator-cleared).
+fn answer_in_graph(ns: &NamespaceConfig, slug: &str) -> Result<()> {
+    let cwd = global_cwd().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+    let p = &ns.prefix;
+    let iri = crate::crud::build_iri(ns, "ping", slug);
+    let ws_slug = crate::crud::workspace_slug(&cwd);
+    let graph = crate::crud::workspace_graph_iri(ns, &ws_slug);
+    let update = crate::crud::field_update(&graph, &iri, &format!("{p}:status"), "\"answered\"");
+    crate::crud::load_and_mutate(&cwd, ns, &update)
 }
 
 fn complete_in_graph(ns: &NamespaceConfig, slug: &str) -> Result<()> {
@@ -379,6 +553,26 @@ mod tests {
             status: "pending".into(),
             last_loud_session: String::new(),
             last_alert_ts: String::new(),
+            kind: "task".into(),
+            refs: Vec::new(),
+        }
+    }
+
+    fn sample_ping(kind: &str, from: &str, to_title: &str, session: &str, msg: &str) -> InboxTask {
+        InboxTask {
+            slug: format!("ping-{}", msg.len()),
+            summary: msg.into(),
+            doc: String::new(),
+            from: from.into(),
+            to_title: to_title.into(),
+            to_session: session.into(),
+            priority: "high".into(),
+            created: crate::relay::now_iso(),
+            status: "pending".into(),
+            last_loud_session: String::new(),
+            last_alert_ts: String::new(),
+            kind: kind.into(),
+            refs: Vec::new(),
         }
     }
 
@@ -488,6 +682,93 @@ mod tests {
             t.slug = "Rebuild Auth Guard".into(); // raw; done() matches via filename sanitization
             enqueue(&ns, &t).unwrap();
             assert_eq!(done(&ns, "Rebuild Auth Guard").unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn legacy_task_json_without_kind_still_parses() {
+        with_home(|home| {
+            bind("caddy-backend", "sid-B", home);
+            // A task written by a pre-ping binary has no `kind`/`refs` fields.
+            let dir = title_dir("caddy-backend").unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("old-task.json"),
+                r#"{"slug":"old-task","summary":"legacy","doc":"","from":"x","to_title":"caddy-backend","to_session":"sid-B","priority":"high","created":"2026-07-01T00:00:00-0500","status":"pending","last_loud_session":"","last_alert_ts":""}"#,
+            )
+            .unwrap();
+            let block = deliver("sid-B", Phase::Tool).expect("legacy task must deliver");
+            assert!(block.contains("NEW TASK TO IMMEDIATELY CONSUME"), "defaults to kind=task");
+        });
+    }
+
+    #[test]
+    fn ping_fires_loud_mid_turn_and_mandates_reply() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("caddy-backend", "sid-B", home);
+            enqueue(&ns, &sample_ping("ping", "orchestrator", "caddy-backend", "sid-B", "auth guard status?")).unwrap();
+
+            // Pre-tool-use (mid-turn) must scream immediately.
+            let block = deliver("sid-B", Phase::Tool).expect("ping must fire on Tool phase");
+            assert!(block.contains("INSTANT PING"));
+            assert!(block.contains("auth guard status?"));
+            assert!(block.contains("REPLY REQUIRED BEFORE YOUR NEXT ACTION"));
+            assert!(block.contains("base relay ping --to \"orchestrator\""));
+
+            // Unanswered → still in the inbox (unlike a reply, which consumes).
+            assert_eq!(list_all().len(), 1);
+        });
+    }
+
+    #[test]
+    fn reply_announces_once_then_consumes() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("orchestrator", "sid-A", home);
+            enqueue(&ns, &sample_ping("reply", "caddy-backend", "orchestrator", "sid-A", "ack — on it")).unwrap();
+
+            let block = deliver("sid-A", Phase::Tool).expect("reply must announce");
+            assert!(block.contains("PING REPLY from caddy-backend"));
+            assert!(block.contains("ack — on it"));
+            assert!(!block.contains("REPLY REQUIRED"), "a reply never demands its own ack");
+
+            // Consumed on delivery — inbox empty, nothing re-fires.
+            assert!(list_all().is_empty());
+            assert!(deliver("sid-A", Phase::SessionStart).is_none());
+        });
+    }
+
+    #[test]
+    fn reply_send_clears_inbound_pings_from_peer() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("caddy-backend", "sid-B", home);
+            enqueue(&ns, &sample_ping("ping", "orchestrator", "caddy-backend", "sid-B", "status?")).unwrap();
+            enqueue(&ns, &sample_ping("ping", "someone-else", "caddy-backend", "sid-B", "unrelated")).unwrap();
+
+            // caddy-backend pings orchestrator back → only orchestrator's ping clears.
+            let cleared = clear_pings_from(&ns, "orchestrator", &["caddy-backend".to_string()]);
+            assert_eq!(cleared, 1);
+            let remaining = list_all();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].from, "someone-else");
+        });
+    }
+
+    #[test]
+    fn untitled_sender_ping_falls_back_to_done() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("caddy-backend", "sid-B", home);
+            let mut p = sample_ping("ping", "", "caddy-backend", "sid-B", "fire and forget");
+            p.slug = "ping-anon".into();
+            enqueue(&ns, &p).unwrap();
+
+            let block = deliver("sid-B", Phase::Tool).expect("ping must fire");
+            assert!(block.contains("base relay done ping-anon"), "untitled sender → done escape hatch");
+            assert_eq!(done(&ns, "ping-anon").unwrap(), 1);
+            assert!(list_all().is_empty());
         });
     }
 }
