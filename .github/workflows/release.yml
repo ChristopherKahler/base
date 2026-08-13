@@ -25,6 +25,13 @@ jobs:
             os: macos-14
             asset: base-darwin-aarch64.tar.gz
             binary: base
+          # Intel Macs. Without this there is no macOS download at all for anyone
+          # on pre-2020 hardware — not a broken install, simply nothing to install.
+          # Cross-compiled from the ARM runner; macos-14 ships both toolchains.
+          - target: x86_64-apple-darwin
+            os: macos-14
+            asset: base-darwin-x86_64.tar.gz
+            binary: base
 
     runs-on: ${{ matrix.os }}
 
@@ -80,6 +87,7 @@ jobs:
             base-linux-x86_64.tar.gz/base-linux-x86_64.tar.gz
             base-windows-x86_64.zip/base-windows-x86_64.zip
             base-darwin-aarch64.tar.gz/base-darwin-aarch64.tar.gz
+            base-darwin-x86_64.tar.gz/base-darwin-x86_64.tar.gz
           body: |
             ## Install
 

@@ -244,6 +244,11 @@ pub fn platform_token() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Ok("linux-x64"),
         ("macos", "aarch64") => Ok("darwin-arm64"),
+        // Intel Macs. Absent this arm, every pre-2020 Mac was told "no base build
+        // is published for your platform" — which was true, because the release
+        // workflow only built aarch64. Both halves are fixed together; adding the
+        // token alone would point at an asset that does not exist.
+        ("macos", "x86_64") => Ok("darwin-x64"),
         ("windows", "x86_64") => Ok("win32-x64"),
         (os, arch) => bail!("no base build is published for your platform ({os}-{arch})"),
     }
@@ -546,7 +551,9 @@ mod tests {
     #[test]
     fn platform_token_resolves_or_errors_clearly() {
         match platform_token() {
-            Ok(t) => assert!(["linux-x64", "darwin-arm64", "win32-x64"].contains(&t)),
+            Ok(t) => assert!(
+                ["linux-x64", "darwin-arm64", "darwin-x64", "win32-x64"].contains(&t)
+            ),
             Err(e) => assert!(e.to_string().contains("no base build")),
         }
     }
