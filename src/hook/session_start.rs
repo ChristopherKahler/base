@@ -193,9 +193,12 @@ fn inject_extension_status(config: &BaseConfig, cwd: &Path) {
                     }
                 };
 
-                // Load graph and run query
+                // Load graph and run query. Union default graph for the same reason
+                // as domain queries: an extension author writing plain patterns
+                // would otherwise match nothing, since base stores only into
+                // named graphs.
                 if let Some(store) = store::load_merged(cwd) {
-                    match store.query(&sparql) {
+                    match store::query_union(&store, &sparql) {
                         Ok(oxigraph::sparql::QueryResults::Solutions(solutions)) => {
                             let rows: Vec<_> = solutions.filter_map(|r| r.ok()).collect();
                             if !rows.is_empty() {
@@ -228,10 +231,20 @@ fn inject_extension_status(config: &BaseConfig, cwd: &Path) {
                             ext.name, stats.entities, stats.files
                         );
                     }
+                    // Zero entities from a declared ingest is reported, not swallowed.
+                    // The old `_ => {}` meant a misconfigured extension produced the
+                    // exact same output as a working one — validate passing, HOOKS:S
+                    // showing, exit 0 — which reads as success.
+                    Ok(_) => {
+                        eprintln!(
+                            "base: ext:{} declared {} ingest source(s) but ingested 0 entities",
+                            ext.name,
+                            ss.ingest.len()
+                        );
+                    }
                     Err(e) => {
                         eprintln!("base: ext:{} ingest error: {e}", ext.name);
                     }
-                    _ => {}
                 }
             }
         }

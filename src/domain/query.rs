@@ -57,6 +57,26 @@ pub fn query_domain_from_graph(
                 })
                 .collect();
 
+            // Dedupe identical rules, preserving priority order.
+            //
+            // The SPARQL above matches inside an UNBOUND `GRAPH ?g`, and the store
+            // is a MERGE of the global and workspace tiers. A domain declared once
+            // in the global domains.toml gets synced into both tiers' graphs (under
+            // ws/base-gbl and ws/<workspace> respectively), so the same rule is a
+            // distinct QUAD in each and matches twice — rendering every rule double.
+            //
+            // Deduping here rather than with SPARQL DISTINCT on purpose: DISTINCT
+            // would have to project ?pri to keep ORDER BY legal, and differing
+            // priorities across tiers would then defeat it. Identical rendered text
+            // is the thing that must appear once, whatever the graph topology.
+            let rules = {
+                let mut seen = std::collections::HashSet::new();
+                rules
+                    .into_iter()
+                    .filter(|r| seen.insert(r.clone()))
+                    .collect::<Vec<String>>()
+            };
+
             if rules.is_empty() {
                 format_toml_rules(domain_def)
             } else {
@@ -161,10 +181,16 @@ pub fn resolve_and_run_query(
         .replace("{{prefix}}", p)
         .replace("{{uri}}", u);
 
-    match crate::store::query(store, &sparql) {
+    // User-authored query: union default graph, so patterns written without an
+    // explicit `GRAPH ?g { … }` still match. base stores nothing in the default
+    // graph, so without this a valid query silently returns zero rows forever.
+    match crate::store::query_union(store, &sparql) {
         Ok(oxigraph::sparql::QueryResults::Solutions(solutions)) => {
             let rows: Vec<_> = solutions.filter_map(|r| r.ok()).collect();
             if rows.is_empty() {
+                eprintln!(
+                    "base: query '{query_name}' (domain {domain_name}) returned 0 rows"
+                );
                 return String::new();
             }
 

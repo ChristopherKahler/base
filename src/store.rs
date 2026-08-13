@@ -314,9 +314,37 @@ pub fn load_turtle_into(store: &Store, path: &Path) -> Result<()> {
 }
 
 /// Run a SPARQL query (SELECT or ASK) against the store.
+///
+/// Uses the plain default dataset. base's own internal queries wrap their patterns
+/// in `GRAPH ?g { ... }`, so they match named graphs explicitly and need nothing
+/// more. For queries a USER wrote, prefer [`query_union`].
 pub fn query(store: &Store, sparql: &str) -> Result<QueryResults> {
     store
         .query(sparql)
+        .with_context(|| format!("SPARQL query failed: {sparql}"))
+}
+
+/// Run a user-authored SPARQL query with the default graph set to the UNION of all
+/// named graphs.
+///
+/// base writes every triple into a named graph (`…#graph/ws/<slug>`) and nothing
+/// into the default graph. A hand-written query therefore matches nothing unless
+/// its author happens to know to wrap every pattern in `GRAPH ?g { … }` — so a
+/// perfectly valid query registers, runs, errors nowhere, and silently returns zero
+/// rows. That is a trap, not a contract: the fix is to make the default graph mean
+/// "everything base stores", which is what the author already assumed it meant.
+///
+/// `GRAPH ?g { … }` still behaves normally, so queries already written the explicit
+/// way are unaffected.
+pub fn query_union(store: &Store, sparql: &str) -> Result<QueryResults> {
+    use oxigraph::sparql::Query;
+
+    let mut parsed = Query::parse(sparql, None)
+        .with_context(|| format!("SPARQL parse failed: {sparql}"))?;
+    parsed.dataset_mut().set_default_graph_as_union();
+
+    store
+        .query(parsed)
         .with_context(|| format!("SPARQL query failed: {sparql}"))
 }
 
@@ -577,5 +605,64 @@ mod tests {
             GraphHealth::Unhealthy { bad_line, .. } => assert_eq!(bad_line, Some(2)),
             other => panic!("expected Unhealthy, got {other:?}"),
         }
+    }
+
+    /// A store shaped like base's own: everything in a named graph, nothing in
+    /// the default graph.
+    fn named_graph_store() -> Store {
+        let store = Store::new().unwrap();
+        let nq = r#"<http://ex/doc1> <http://ops-sys.local/ontology#name> "Camilla" <http://ops-sys.local/ontology#graph/ws/base-gbl> .
+<http://ex/doc1> <http://ops-sys.local/ontology#hasTag> "rel-courting" <http://ops-sys.local/ontology#graph/ws/base-gbl> .
+"#;
+        store
+            .load_from_reader(RdfFormat::NQuads, nq.as_bytes())
+            .unwrap();
+        store
+    }
+
+    fn row_count(results: QueryResults) -> usize {
+        match results {
+            QueryResults::Solutions(s) => s.filter_map(|r| r.ok()).count(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn plain_query_cannot_see_named_graphs() {
+        // This is the trap: a valid, error-free query over base's own data that
+        // returns nothing, because base writes only into named graphs.
+        let store = named_graph_store();
+        let sparql = r#"SELECT ?name WHERE { ?d <http://ops-sys.local/ontology#name> ?name }"#;
+        assert_eq!(
+            row_count(query(&store, sparql).unwrap()),
+            0,
+            "default-graph query unexpectedly saw named-graph data"
+        );
+    }
+
+    #[test]
+    fn union_query_sees_named_graphs() {
+        let store = named_graph_store();
+        let sparql = r#"SELECT ?name WHERE { ?d <http://ops-sys.local/ontology#name> ?name }"#;
+        assert_eq!(
+            row_count(query_union(&store, sparql).unwrap()),
+            1,
+            "union default graph should expose named-graph data"
+        );
+    }
+
+    #[test]
+    fn union_query_still_honors_explicit_graph_blocks() {
+        // Queries already written the explicit way must not regress.
+        let store = named_graph_store();
+        let sparql = r#"SELECT ?name WHERE { GRAPH ?g { ?d <http://ops-sys.local/ontology#name> ?name } }"#;
+        assert_eq!(row_count(query_union(&store, sparql).unwrap()), 1);
+        assert_eq!(row_count(query(&store, sparql).unwrap()), 1);
+    }
+
+    #[test]
+    fn union_query_surfaces_parse_errors() {
+        let store = named_graph_store();
+        assert!(query_union(&store, "SELECT ?x WHERE { this is not sparql").is_err());
     }
 }
