@@ -64,19 +64,52 @@ pub struct DistSpec {
 /// handler MUST be directly executable — a shebang'd script (`#!/usr/bin/env
 /// node`, `+x`) or a binary — so base can exec it without knowing the language.
 ///
-/// `deny_unknown_fields` below is load-bearing, not tidiness. `state_dir` written
-/// one line under a `[[commands]]` header is bound by TOML to the command, not to
-/// `[extension]` — and was silently dropped, so ingest fell back to cwd, found no
-/// files, and reported nothing. A manifest that declares something base ignores
-/// must fail loudly at parse time rather than degrade into a no-op.
+/// Unknown keys are CAPTURED, not rejected. `state_dir` written one line under a
+/// `[[commands]]` header is bound by TOML to the command rather than `[extension]`,
+/// and used to vanish silently — ingest then fell back to cwd and reported nothing.
+///
+/// The obvious fix is `deny_unknown_fields`, and it is the wrong one for shipped
+/// software: it converts a plugin that mostly works into one that refuses to load,
+/// at upgrade time, on a machine whose owner changed nothing. Capturing the strays
+/// keeps the plugin working and lets `warnings()` say exactly what was ignored and
+/// where it belongs — visible without being destructive.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct CommandSpec {
     pub name: String,
     pub handler: String,
     pub description: String,
     #[serde(default)]
     pub usage: Option<String>,
+    /// Keys base does not recognize on a command. Surfaced by [`CommandSpec::warnings`].
+    #[serde(flatten, default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
+impl CommandSpec {
+    /// Human-readable warnings for keys base ignored on this command.
+    /// Empty when the command is clean.
+    pub fn warnings(&self) -> Vec<String> {
+        self.unknown
+            .keys()
+            .map(|key| {
+                // The one that actually bit: it looks like it configures the
+                // extension, sits inside a command, and is silently discarded.
+                if key == "state_dir" {
+                    format!(
+                        "command '{}' has 'state_dir', which base ignores here. \
+                         Move it ABOVE the first [[commands]] header so it belongs to \
+                         [extension] — where it sits now, ingest cannot see it.",
+                        self.name
+                    )
+                } else {
+                    format!(
+                        "command '{}' has unknown key '{key}' — ignored.",
+                        self.name
+                    )
+                }
+            })
+            .collect()
+    }
 }
 
 /// The `[extension]` table — identity + optional paths.
@@ -290,6 +323,14 @@ pub fn load_extensions_from(ext_dir: &Path) -> Vec<ExtensionDef> {
                 continue;
             }
         };
+
+        // Say what was ignored, then carry on loading. A stray key is a note to
+        // fix, never a reason to take someone's working plugin away on upgrade.
+        for cmd in &file.commands {
+            for warning in cmd.warnings() {
+                eprintln!("base: extension {}: {warning}", path.display());
+            }
+        }
 
         let name = &file.extension.name;
         if name.is_empty() {
@@ -799,12 +840,7 @@ description = "Generate/edit images"
     /// The exact shape that cost a day: `state_dir` one line under `[[commands]]`.
     /// TOML binds it to the command, serde used to drop it, ingest fell back to cwd,
     /// and everything downstream reported success.
-    #[test]
-    fn state_dir_under_commands_header_is_rejected_not_dropped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = write_ext(
-            tmp.path(),
-            r#"
+    const MISPLACED_STATE_DIR: &str = r#"
 [extension]
 name = "lore"
 version = "0.2.0"
@@ -820,13 +856,62 @@ state_dir = "~/.base-gbl/lore/"
 file = "facts.json"
 entity = "LoreFact"
 strategy = "upsert"
-"#,
-        );
+"#;
+
+    /// The exact shape that cost a day: `state_dir` one line under `[[commands]]`.
+    #[test]
+    fn state_dir_under_commands_header_is_flagged_by_validate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write_ext(tmp.path(), MISPLACED_STATE_DIR);
         let err = validate_extension(&p).expect_err("misplaced state_dir must not validate");
         assert!(
             err.iter().any(|v| v.contains("state_dir")),
             "expected a state_dir violation, got {err:?}"
         );
+    }
+
+    /// …but the plugin must still LOAD. Refusing to load would turn a working
+    /// install into a missing command the moment someone upgrades, on a machine
+    /// where nothing changed. Warn, do not confiscate.
+    #[test]
+    fn misplaced_key_still_loads_with_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ext(tmp.path(), MISPLACED_STATE_DIR);
+
+        let loaded = load_extensions_from(tmp.path());
+        assert_eq!(loaded.len(), 1, "a stray key must not drop the extension");
+        assert_eq!(loaded[0].commands[0].name, "lore");
+
+        let warnings = loaded[0].commands[0].warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("Move it ABOVE the first [[commands]] header"),
+            "warning must say how to fix it, got: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn clean_command_produces_no_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ext(
+            tmp.path(),
+            r#"
+[extension]
+name = "lore"
+version = "0.2.0"
+description = "world model"
+state_dir = "~/.base-gbl/lore/"
+
+[[commands]]
+name = "lore"
+handler = "bin/lore"
+description = "pen"
+"#,
+        );
+        let loaded = load_extensions_from(tmp.path());
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].commands[0].warnings().is_empty());
     }
 
     #[test]

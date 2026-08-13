@@ -757,6 +757,7 @@ mod tests {
                     handler: h.into(),
                     description: format!("{n} command"),
                     usage: None,
+                    unknown: Default::default(),
                 })
                 .collect(),
             dist: None,
