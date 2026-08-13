@@ -28,6 +28,43 @@ impl fmt::Display for Bracket {
     }
 }
 
+impl Bracket {
+    /// Rules to inject at this tier: `always` first, then the tier's own bucket.
+    ///
+    /// Additive rather than exclusive — a DEPLETED prompt gets `always` + `depleted`.
+    /// `always` leads so the permanent rules keep a stable position in the block
+    /// regardless of tier, which matters for a rule that is re-read every prompt.
+    pub fn rules<'a>(&self, rules: &'a crate::config::BracketRules) -> Vec<&'a str> {
+        let tier = match self {
+            Self::Fresh => &rules.fresh,
+            Self::Moderate => &rules.moderate,
+            Self::Depleted => &rules.depleted,
+            Self::Critical => &rules.critical,
+        };
+        rules
+            .always
+            .iter()
+            .chain(tier.iter())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// Render the bracket's rules as an injectable block. Empty string when the tier
+/// contributes nothing, so the hook can push it unconditionally.
+pub fn format_bracket_rules(bracket: Bracket, rules: &crate::config::BracketRules) -> String {
+    let selected = bracket.rules(rules);
+    if selected.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("[BRACKET RULES — {bracket}]\n");
+    for (i, rule) in selected.iter().enumerate() {
+        out.push_str(&format!("  {i}. {rule}\n"));
+    }
+    out.push('\n');
+    out
+}
+
 // ─── Session State ──────────────────────────────────────────
 
 /// Tracks which domains have been injected in the current session.
@@ -281,6 +318,109 @@ mod tests {
 
     fn default_bracket_config() -> BracketConfig {
         BracketConfig::default()
+    }
+
+    fn sample_rules() -> crate::config::BracketRules {
+        crate::config::BracketRules {
+            always: vec!["ALWAYS_A".into(), "ALWAYS_B".into()],
+            fresh: vec!["FRESH_ONLY".into()],
+            moderate: vec!["MOD_ONLY".into()],
+            depleted: vec!["DEP_ONLY".into()],
+            critical: vec!["CRIT_ONLY".into()],
+        }
+    }
+
+    #[test]
+    fn bracket_rules_are_always_plus_tier() {
+        let r = sample_rules();
+        assert_eq!(
+            Bracket::Fresh.rules(&r),
+            vec!["ALWAYS_A", "ALWAYS_B", "FRESH_ONLY"]
+        );
+        assert_eq!(
+            Bracket::Critical.rules(&r),
+            vec!["ALWAYS_A", "ALWAYS_B", "CRIT_ONLY"]
+        );
+        // A tier never leaks another tier's bucket.
+        assert!(!Bracket::Moderate.rules(&r).contains(&"DEP_ONLY"));
+    }
+
+    #[test]
+    fn always_rules_survive_every_tier() {
+        let r = sample_rules();
+        // The whole point of `always`: no tier can drop it. If this breaks, the
+        // rules meant to hold under context pressure silently stop being sent.
+        for b in [
+            Bracket::Fresh,
+            Bracket::Moderate,
+            Bracket::Depleted,
+            Bracket::Critical,
+        ] {
+            let got = b.rules(&r);
+            assert!(got.contains(&"ALWAYS_A"), "{b} dropped ALWAYS_A");
+            assert!(got.contains(&"ALWAYS_B"), "{b} dropped ALWAYS_B");
+        }
+    }
+
+    #[test]
+    fn empty_rules_render_nothing() {
+        let empty = crate::config::BracketRules::default();
+        assert!(empty.is_empty());
+        assert_eq!(format_bracket_rules(Bracket::Depleted, &empty), "");
+    }
+
+    #[test]
+    fn rendered_block_is_numbered_and_tier_labelled() {
+        let out = format_bracket_rules(Bracket::Depleted, &sample_rules());
+        assert!(out.starts_with("[BRACKET RULES — DEPLETED]\n"));
+        assert!(out.contains("  0. ALWAYS_A\n"));
+        assert!(out.contains("  2. DEP_ONLY\n"));
+    }
+
+    #[test]
+    fn percent_mode_overrides_turn_count() {
+        let mut config = BracketConfig::default();
+        config.mode = Some("percent".into());
+        let mut state = SessionState::default();
+        // 40 prompts would be CRITICAL on turns; 10% context says FRESH.
+        state.prompt_counts.insert("s1".into(), 40);
+        assert_eq!(
+            state.bracket_for(&config, Some("s1"), Some(10.0)),
+            Bracket::Fresh
+        );
+        // With no reading available it falls back to the turn thresholds.
+        assert_eq!(
+            state.bracket_for(&config, Some("s1"), None),
+            Bracket::Critical
+        );
+    }
+
+    #[test]
+    fn concurrent_sessions_do_not_share_a_counter() {
+        let mut state = SessionState::default();
+        for _ in 0..5 {
+            state.increment_prompt_for(Some("alpha"));
+        }
+        state.increment_prompt_for(Some("beta"));
+        // The bug this fixes: beta's SessionStart or prompts moving alpha's count.
+        assert_eq!(state.prompt_count_for(Some("alpha")), 5);
+        assert_eq!(state.prompt_count_for(Some("beta")), 1);
+    }
+
+    #[test]
+    fn clearing_one_session_leaves_the_other_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = SessionState::default();
+        state.increment_prompt_for(Some("alpha"));
+        state.increment_prompt_for(Some("alpha"));
+        state.increment_prompt_for(Some("beta"));
+        state.save(tmp.path()).unwrap();
+
+        SessionState::clear_for(tmp.path(), Some("beta"));
+
+        let loaded = SessionState::load(tmp.path());
+        assert_eq!(loaded.prompt_count_for(Some("alpha")), 2, "alpha was reset");
+        assert_eq!(loaded.prompt_count_for(Some("beta")), 0);
     }
 
     #[test]

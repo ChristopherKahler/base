@@ -376,6 +376,22 @@ moderate_until = 10       # then: trimmed injection
 depleted_until = 20       # past this: minimal injection
 refresh_interval = 5      # re-survey window pressure every N prompts
 
+# ─── [bracket.rules] — rules injected by tier ────────────────
+# Domains inject on a keyword or path match, which makes them the wrong home for a
+# rule that must hold regardless of subject — it silently stops applying the moment
+# the conversation drifts off its triggers. These inject on the TIER alone.
+#
+# `always` goes out every prompt at every tier: the layer that survives a long
+# session because it is re-sent, not remembered. Tier buckets are ADDITIVE with it,
+# so a DEPLETED prompt receives always + depleted. Never deduped.
+#
+# [bracket.rules]
+# always   = ["A rule that must never erode, with its BECAUSE attached."]
+# fresh    = ["Room to spare — fuller guidance here."]
+# moderate = ["Condensed."]
+# depleted = ["Terse. Prefer precision over coverage."]
+# critical = ["Minimal. Only what cannot be dropped."]
+
 # ─── [signal] — session-start injection engine ───────────────
 # The block you see when a session opens. Runs:
 #   active_awareness → [Active Projects] / [Active Tasks]  (your working set)

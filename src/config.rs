@@ -212,6 +212,47 @@ pub struct BracketConfig {
     pub moderate_until_pct: f64,
     #[serde(default = "default_depleted_until_pct")]
     pub depleted_until_pct: f64,
+
+    /// Rules injected by tier. See [`BracketRules`].
+    #[serde(default)]
+    pub rules: BracketRules,
+}
+
+/// Rules the bracket injects directly, independent of domain matching.
+///
+/// Domains inject on a keyword or path match, which makes them the wrong home for
+/// a rule that must hold regardless of subject — the rule silently stops applying
+/// the moment the conversation drifts off its triggers. These inject on the tier
+/// alone, so `always` is genuinely every prompt and the tiered buckets track
+/// context pressure rather than topic.
+///
+/// The tiered buckets are additive with `always`, not exclusive: at DEPLETED a
+/// prompt receives `always` + `depleted`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BracketRules {
+    /// Injected every prompt at every tier. For rules that must not erode —
+    /// the layer that survives a long session because it is re-sent, not remembered.
+    #[serde(default)]
+    pub always: Vec<String>,
+    #[serde(default)]
+    pub fresh: Vec<String>,
+    #[serde(default)]
+    pub moderate: Vec<String>,
+    #[serde(default)]
+    pub depleted: Vec<String>,
+    #[serde(default)]
+    pub critical: Vec<String>,
+}
+
+impl BracketRules {
+    /// True when no bucket holds anything — lets the hook skip the block entirely.
+    pub fn is_empty(&self) -> bool {
+        self.always.is_empty()
+            && self.fresh.is_empty()
+            && self.moderate.is_empty()
+            && self.depleted.is_empty()
+            && self.critical.is_empty()
+    }
 }
 
 fn default_fresh_until() -> u32 { 3 }
@@ -249,6 +290,7 @@ impl Default for BracketConfig {
             fresh_until_pct: default_fresh_until_pct(),
             moderate_until_pct: default_moderate_until_pct(),
             depleted_until_pct: default_depleted_until_pct(),
+            rules: BracketRules::default(),
         }
     }
 }

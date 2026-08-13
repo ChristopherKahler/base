@@ -15,10 +15,10 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         return Ok(super::HookEventData::default());
     }
 
+    // No early return on an empty domain set: bracket rules are tier-gated, not
+    // domain-gated, and must still inject for a user with no domains configured.
+    // The check moves below, once the bracket block has been built.
     let domains = domain::load_domains(cwd);
-    if domains.is_empty() {
-        return Ok(super::HookEventData::default());
-    }
 
     // Resolve base dir: workspace first, fall back to global tier
     let base_dir = crate::config::find_workspace_base(cwd)
@@ -50,6 +50,25 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         session.clear_dedup();
     }
 
+    // Bracket rules — tier-gated, never deduped. Re-injecting every prompt IS the
+    // feature: these are the rules that must not erode as context fills, which a
+    // once-per-session domain injection cannot guarantee. Built before the *command
+    // branch so a star command cannot bypass them.
+    let bracket_rules = crate::domain::session::format_bracket_rules(bracket, &config.bracket.rules);
+
+    // Deferred from above: nothing else to do without domains, but the bracket
+    // block still goes out.
+    if domains.is_empty() {
+        if let Some(ref base_dir) = base_dir {
+            let _ = session.save(base_dir);
+        }
+        print!("{bracket_rules}");
+        return Ok(super::HookEventData {
+            prompt_num: Some(session.prompt_count_for(session_id)),
+            ..Default::default()
+        });
+    }
+
     // Check for *COMMAND(s) before domain matching — supports stacking, so
     // "*audit *steelman" activates BOTH modes (every matched *word injects).
     let commands = crate::command::load_commands(cwd);
@@ -65,7 +84,9 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             if let Some(ref base_dir) = base_dir {
                 let _ = session.save(base_dir);
             }
-            print!("{cmd_output}");
+            // Bracket rules ride along with star commands too — a mode changes
+            // stance, it does not suspend the always-on layer.
+            print!("{bracket_rules}{cmd_output}");
             return Ok(super::HookEventData {
                 prompt_num: Some(session.prompt_count_for(session_id)),
                 ..Default::default()
@@ -100,10 +121,11 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // sessions inflate.
     let prompt_num = session.prompt_count_for(session_id);
 
-    // Emit context bracket tag
+    // Emit context bracket tag, then the tier's rules
     let mut output = format!(
         "<context-bracket>[{bracket}] (prompt {prompt_num})</context-bracket>\n\n"
     );
+    output.push_str(&bracket_rules);
 
     // Determine if we're in lean mode (FRESH, first 2 prompts — rules only, skip neighborhood)
     let lean_mode = bracket == Bracket::Fresh && prompt_num <= 2;
