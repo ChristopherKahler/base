@@ -88,6 +88,11 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    // Bind the process before any SessionState::load, so domain/AST/standards
+    // dedup is namespaced per session. Without this, a second Claude session in
+    // the same workspace marks a domain injected and the first one stops seeing it.
+    crate::domain::session::set_process_session(session_id.as_deref());
+
     match event {
         "session-start" => {
             session_start::handle(&config, &cwd, session_id.as_deref())?;

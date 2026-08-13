@@ -135,12 +135,21 @@ impl UpdateChannel for MockChannel {
 /// installer for free) or the hostname. Advisory only; the server does not
 /// currently enforce it.
 pub fn machine_id() -> String {
-    let seed = claude_machine_id()
-        .or_else(hostname)
-        .unwrap_or_else(|| "unknown".to_string());
-    let digest = Sha256::digest(seed.as_bytes());
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    hex[..32].to_string()
+    // Computed once per process. The seed comes from ~/.claude.json, which Claude
+    // Code rewrites continuously — so two uncached calls could read the file
+    // mid-write, fall through to the hostname on one of them, and disagree.
+    // A machine id cannot change within a process; caching makes that explicit.
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let seed = claude_machine_id()
+                .or_else(hostname)
+                .unwrap_or_else(|| "unknown".to_string());
+            let digest = Sha256::digest(seed.as_bytes());
+            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            hex[..32].to_string()
+        })
+        .clone()
 }
 
 fn claude_machine_id() -> Option<String> {
