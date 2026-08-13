@@ -63,6 +63,16 @@ pub struct DistSpec {
 /// against `framework_dir` (then the extension file's own directory). The
 /// handler MUST be directly executable — a shebang'd script (`#!/usr/bin/env
 /// node`, `+x`) or a binary — so base can exec it without knowing the language.
+///
+/// Unknown keys are CAPTURED, not rejected. `state_dir` written one line under a
+/// `[[commands]]` header is bound by TOML to the command rather than `[extension]`,
+/// and used to vanish silently — ingest then fell back to cwd and reported nothing.
+///
+/// The obvious fix is `deny_unknown_fields`, and it is the wrong one for shipped
+/// software: it converts a plugin that mostly works into one that refuses to load,
+/// at upgrade time, on a machine whose owner changed nothing. Capturing the strays
+/// keeps the plugin working and lets `warnings()` say exactly what was ignored and
+/// where it belongs — visible without being destructive.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CommandSpec {
     pub name: String,
@@ -70,6 +80,36 @@ pub struct CommandSpec {
     pub description: String,
     #[serde(default)]
     pub usage: Option<String>,
+    /// Keys base does not recognize on a command. Surfaced by [`CommandSpec::warnings`].
+    #[serde(flatten, default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
+impl CommandSpec {
+    /// Human-readable warnings for keys base ignored on this command.
+    /// Empty when the command is clean.
+    pub fn warnings(&self) -> Vec<String> {
+        self.unknown
+            .keys()
+            .map(|key| {
+                // The one that actually bit: it looks like it configures the
+                // extension, sits inside a command, and is silently discarded.
+                if key == "state_dir" {
+                    format!(
+                        "command '{}' has 'state_dir', which base ignores here. \
+                         Move it ABOVE the first [[commands]] header so it belongs to \
+                         [extension] — where it sits now, ingest cannot see it.",
+                        self.name
+                    )
+                } else {
+                    format!(
+                        "command '{}' has unknown key '{key}' — ignored.",
+                        self.name
+                    )
+                }
+            })
+            .collect()
+    }
 }
 
 /// The `[extension]` table — identity + optional paths.
@@ -284,6 +324,14 @@ pub fn load_extensions_from(ext_dir: &Path) -> Vec<ExtensionDef> {
             }
         };
 
+        // Say what was ignored, then carry on loading. A stray key is a note to
+        // fix, never a reason to take someone's working plugin away on upgrade.
+        for cmd in &file.commands {
+            for warning in cmd.warnings() {
+                eprintln!("base: extension {}: {warning}", path.display());
+            }
+        }
+
         let name = &file.extension.name;
         if name.is_empty() {
             eprintln!(
@@ -346,6 +394,43 @@ pub fn validate_extension(path: &Path) -> Result<ExtensionDef, Vec<String>> {
 
     if meta.description.is_empty() {
         violations.push("extension.description is required (non-empty)".into());
+    }
+
+    // An ingest block without a resolvable state_dir can only ever no-op: ingest
+    // falls back to cwd, matches nothing, and reports nothing. Catch it here so
+    // `base ext validate` fails instead of the plugin appearing to work.
+    if let Some(hooks) = &file.hooks
+        && let Some(ss) = &hooks.session_start
+        && !ss.ingest.is_empty()
+    {
+        match &meta.state_dir {
+            None => violations.push(
+                "extension.state_dir is required when [[hooks.session_start.ingest]] is declared \
+                 — without it ingest resolves against the session cwd and silently matches nothing. \
+                 NOTE: state_dir must appear ABOVE the first [[commands]] header, or TOML binds it \
+                 to that command instead of to [extension]."
+                    .into(),
+            ),
+            Some(sd) if sd.trim().is_empty() => {
+                violations.push("extension.state_dir is declared but empty".into());
+            }
+            Some(_) => {}
+        }
+
+        for (i, src) in ss.ingest.iter().enumerate() {
+            if src.file.trim().is_empty() {
+                violations.push(format!("hooks.session_start.ingest[{i}].file is empty"));
+            }
+            if src.entity.trim().is_empty() {
+                violations.push(format!("hooks.session_start.ingest[{i}].entity is empty"));
+            }
+            if !matches!(src.strategy.as_str(), "upsert" | "replace") {
+                violations.push(format!(
+                    "hooks.session_start.ingest[{i}].strategy '{}' is not 'upsert' or 'replace'",
+                    src.strategy
+                ));
+            }
+        }
     }
 
     if violations.is_empty() {
@@ -744,5 +829,158 @@ description = "Generate/edit images"
         let ext: ExtensionDef = file.into();
         assert_eq!(ext.dist, None);
         assert_eq!(ext.commands[0].name, "nano-banana");
+    }
+
+    fn write_ext(dir: &Path, body: &str) -> PathBuf {
+        let p = dir.join("ext.toml");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// The exact shape that cost a day: `state_dir` one line under `[[commands]]`.
+    /// TOML binds it to the command, serde used to drop it, ingest fell back to cwd,
+    /// and everything downstream reported success.
+    const MISPLACED_STATE_DIR: &str = r#"
+[extension]
+name = "lore"
+version = "0.2.0"
+description = "world model"
+
+[[commands]]
+name = "lore"
+handler = "bin/lore"
+description = "pen"
+state_dir = "~/.base-gbl/lore/"
+
+[[hooks.session_start.ingest]]
+file = "facts.json"
+entity = "LoreFact"
+strategy = "upsert"
+"#;
+
+    /// The exact shape that cost a day: `state_dir` one line under `[[commands]]`.
+    #[test]
+    fn state_dir_under_commands_header_is_flagged_by_validate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write_ext(tmp.path(), MISPLACED_STATE_DIR);
+        let err = validate_extension(&p).expect_err("misplaced state_dir must not validate");
+        assert!(
+            err.iter().any(|v| v.contains("state_dir")),
+            "expected a state_dir violation, got {err:?}"
+        );
+    }
+
+    /// …but the plugin must still LOAD. Refusing to load would turn a working
+    /// install into a missing command the moment someone upgrades, on a machine
+    /// where nothing changed. Warn, do not confiscate.
+    #[test]
+    fn misplaced_key_still_loads_with_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ext(tmp.path(), MISPLACED_STATE_DIR);
+
+        let loaded = load_extensions_from(tmp.path());
+        assert_eq!(loaded.len(), 1, "a stray key must not drop the extension");
+        assert_eq!(loaded[0].commands[0].name, "lore");
+
+        let warnings = loaded[0].commands[0].warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("Move it ABOVE the first [[commands]] header"),
+            "warning must say how to fix it, got: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn clean_command_produces_no_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ext(
+            tmp.path(),
+            r#"
+[extension]
+name = "lore"
+version = "0.2.0"
+description = "world model"
+state_dir = "~/.base-gbl/lore/"
+
+[[commands]]
+name = "lore"
+handler = "bin/lore"
+description = "pen"
+"#,
+        );
+        let loaded = load_extensions_from(tmp.path());
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].commands[0].warnings().is_empty());
+    }
+
+    #[test]
+    fn ingest_without_state_dir_is_a_violation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write_ext(
+            tmp.path(),
+            r#"
+[extension]
+name = "lore"
+version = "0.2.0"
+description = "world model"
+
+[[hooks.session_start.ingest]]
+file = "facts.json"
+entity = "LoreFact"
+strategy = "upsert"
+"#,
+        );
+        let err = validate_extension(&p).expect_err("ingest without state_dir must not validate");
+        assert!(err.iter().any(|v| v.contains("state_dir is required")));
+    }
+
+    #[test]
+    fn ingest_with_state_dir_above_commands_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write_ext(
+            tmp.path(),
+            r#"
+[extension]
+name = "lore"
+version = "0.2.0"
+description = "world model"
+state_dir = "~/.base-gbl/lore/"
+
+[[commands]]
+name = "lore"
+handler = "bin/lore"
+description = "pen"
+
+[[hooks.session_start.ingest]]
+file = "facts.json"
+entity = "LoreFact"
+strategy = "upsert"
+"#,
+        );
+        let ext = validate_extension(&p).expect("correct placement must validate");
+        assert_eq!(ext.state_dir.as_deref(), Some("~/.base-gbl/lore/"));
+    }
+
+    #[test]
+    fn bad_ingest_strategy_is_a_violation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write_ext(
+            tmp.path(),
+            r#"
+[extension]
+name = "lore"
+version = "0.2.0"
+description = "world model"
+state_dir = "~/.base-gbl/lore/"
+
+[[hooks.session_start.ingest]]
+file = "facts.json"
+entity = "LoreFact"
+strategy = "merge"
+"#,
+        );
+        let err = validate_extension(&p).expect_err("unknown strategy must not validate");
+        assert!(err.iter().any(|v| v.contains("strategy")));
     }
 }

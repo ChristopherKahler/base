@@ -204,9 +204,16 @@ fn dedup_skips_unchanged_graph_injection() {
     // Load session state to verify something was marked
     let base_dir = base::config::find_workspace_base(tmp.path()).unwrap();
     let session = base::domain::session::SessionState::load(&base_dir);
+    // Dedup keys are namespaced per session ("<session>\u{1}GLOBAL") so concurrent
+    // sessions in one workspace cannot suppress each other. Assert on the suffix
+    // rather than the bare name.
     assert!(
-        session.injected.contains_key("GLOBAL"),
-        "GLOBAL should be marked as injected after first call"
+        session
+            .injected
+            .keys()
+            .any(|k| k.split('\u{1}').next_back() == Some("GLOBAL")),
+        "GLOBAL should be marked as injected after first call; keys were {:?}",
+        session.injected.keys().collect::<Vec<_>>()
     );
 
     // Second call with same prompt — GLOBAL should be deduped at the hook

@@ -5908,6 +5908,26 @@ def extract_elixir(path: Path) -> dict:
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls, "input_tokens": 0, "output_tokens": 0}
 
 
+def _json_safe(value: Any) -> Any:
+    """Normalise YAML-native scalars that aren't JSON-serializable into ISO-8601
+    strings, recursing through dicts and lists.
+
+    yaml.safe_load turns unquoted frontmatter dates (``created: 2026-07-02``)
+    into datetime.date / datetime objects. Left raw, they crash the cache write
+    (json.dumps -> "Object of type date is not JSON serializable", aborting the
+    whole AST sync) and are silently dropped by the TTL serializer's isinstance
+    checks. Normalising to strings fixes both at the source.
+    """
+    import datetime as _dt
+    if isinstance(value, (_dt.date, _dt.time)):  # date, datetime (date subclass), time
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def _parse_frontmatter(source: str) -> tuple[dict | None, int]:
     """Extract YAML frontmatter from markdown source. Returns (parsed_dict, end_line) or (None, 0)."""
     lines = source.splitlines()
@@ -5925,7 +5945,7 @@ def _parse_frontmatter(source: str) -> tuple[dict | None, int]:
         fm = yaml.safe_load("\n".join(lines[1:end]))
         if not isinstance(fm, dict):
             return None, 0
-        return fm, end + 1
+        return _json_safe(fm), end + 1
     except Exception:
         return None, 0
 
@@ -7853,4 +7873,4 @@ if __name__ == "__main__":
         paths.extend(collect_files(Path(arg)))
 
     result = extract(paths)
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2, default=str))

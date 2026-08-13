@@ -15,10 +15,10 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         return Ok(super::HookEventData::default());
     }
 
+    // No early return on an empty domain set: bracket rules are tier-gated, not
+    // domain-gated, and must still inject for a user with no domains configured.
+    // The check moves below, once the bracket block has been built.
     let domains = domain::load_domains(cwd);
-    if domains.is_empty() {
-        return Ok(super::HookEventData::default());
-    }
 
     // Resolve base dir: workspace first, fall back to global tier
     let base_dir = crate::config::find_workspace_base(cwd)
@@ -30,13 +30,43 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         .map(SessionState::load)
         .unwrap_or_default();
 
+    // Session identity: `.session` is per-workspace but several Claude sessions can
+    // share a workspace, so the counter must be keyed or they clobber each other.
+    let session_id = event.get("session_id").and_then(serde_json::Value::as_str);
+
+    // Real context depletion, read off the live transcript. None on the first
+    // prompt (no usage written yet) or an unreadable path → turn-count fallback.
+    let context_pct = event
+        .get("transcript_path")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|p| crate::domain::transcript::context_pct(p, config.bracket.context_window));
+
     // Track prompt count and derive bracket
-    session.increment_prompt();
-    let bracket = session.bracket(&config.bracket);
+    session.increment_prompt_for(session_id);
+    let bracket = session.bracket_for(&config.bracket, session_id, context_pct);
 
     // Force-refresh dedup in DEPLETED/CRITICAL on interval
-    if session.should_force_refresh(&config.bracket) {
+    if session.should_force_refresh_for(&config.bracket, session_id, context_pct) {
         session.clear_dedup();
+    }
+
+    // Bracket rules — tier-gated, never deduped. Re-injecting every prompt IS the
+    // feature: these are the rules that must not erode as context fills, which a
+    // once-per-session domain injection cannot guarantee. Built before the *command
+    // branch so a star command cannot bypass them.
+    let bracket_rules = crate::domain::session::format_bracket_rules(bracket, &config.bracket.rules);
+
+    // Deferred from above: nothing else to do without domains, but the bracket
+    // block still goes out.
+    if domains.is_empty() {
+        if let Some(ref base_dir) = base_dir {
+            let _ = session.save(base_dir);
+        }
+        print!("{bracket_rules}");
+        return Ok(super::HookEventData {
+            prompt_num: Some(session.prompt_count_for(session_id)),
+            ..Default::default()
+        });
     }
 
     // Check for *COMMAND(s) before domain matching — supports stacking, so
@@ -54,9 +84,11 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             if let Some(ref base_dir) = base_dir {
                 let _ = session.save(base_dir);
             }
-            print!("{cmd_output}");
+            // Bracket rules ride along with star commands too — a mode changes
+            // stance, it does not suspend the always-on layer.
+            print!("{bracket_rules}{cmd_output}");
             return Ok(super::HookEventData {
-                prompt_num: Some(session.prompt_count),
+                prompt_num: Some(session.prompt_count_for(session_id)),
                 ..Default::default()
             });
         }
@@ -85,14 +117,18 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         });
     }
 
-    // Emit context bracket tag
+    // This session's depth — not the workspace-wide total, which concurrent
+    // sessions inflate.
+    let prompt_num = session.prompt_count_for(session_id);
+
+    // Emit context bracket tag, then the tier's rules
     let mut output = format!(
-        "<context-bracket>[{}] (prompt {})</context-bracket>\n\n",
-        bracket, session.prompt_count
+        "<context-bracket>[{bracket}] (prompt {prompt_num})</context-bracket>\n\n"
     );
+    output.push_str(&bracket_rules);
 
     // Determine if we're in lean mode (FRESH, first 2 prompts — rules only, skip neighborhood)
-    let lean_mode = bracket == Bracket::Fresh && session.prompt_count <= 2;
+    let lean_mode = bracket == Bracket::Fresh && prompt_num <= 2;
 
     // Track injection metadata for DEVMODE
     let mut loaded_domains: Vec<(String, String, usize)> = Vec::new(); // (name, match_reason, rule_count)

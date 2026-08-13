@@ -7,7 +7,7 @@ use crate::config::{load_queries, BaseConfig};
 use crate::ontology;
 use crate::store;
 
-pub fn handle(config: &BaseConfig, cwd: &Path) -> Result<()> {
+pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Result<()> {
     // Surface graph corruption at boot — loud, before any other output, so a
     // broken graph announces itself immediately instead of degrading silently.
     warn_unhealthy_graphs(cwd);
@@ -25,8 +25,10 @@ pub fn handle(config: &BaseConfig, cwd: &Path) -> Result<()> {
         .or_else(|| {
             dirs::home_dir().map(|h| h.join(".base-gbl").join(".base")).filter(|p| p.is_dir())
         });
+    // Clear THIS session only. A blanket clear() deleted the shared file, which
+    // reset every concurrently-running session's bracket to FRESH mid-conversation.
     if let Some(ref base_dir) = session_base_dir {
-        crate::domain::session::SessionState::clear(base_dir);
+        crate::domain::session::SessionState::clear_for(base_dir, session_id);
     }
 
     // Auto-sync domains to graph
@@ -191,9 +193,12 @@ fn inject_extension_status(config: &BaseConfig, cwd: &Path) {
                     }
                 };
 
-                // Load graph and run query
+                // Load graph and run query. Union default graph for the same reason
+                // as domain queries: an extension author writing plain patterns
+                // would otherwise match nothing, since base stores only into
+                // named graphs.
                 if let Some(store) = store::load_merged(cwd) {
-                    match store.query(&sparql) {
+                    match store::query_union(&store, &sparql) {
                         Ok(oxigraph::sparql::QueryResults::Solutions(solutions)) => {
                             let rows: Vec<_> = solutions.filter_map(|r| r.ok()).collect();
                             if !rows.is_empty() {
@@ -226,10 +231,20 @@ fn inject_extension_status(config: &BaseConfig, cwd: &Path) {
                             ext.name, stats.entities, stats.files
                         );
                     }
+                    // Zero entities from a declared ingest is reported, not swallowed.
+                    // The old `_ => {}` meant a misconfigured extension produced the
+                    // exact same output as a working one — validate passing, HOOKS:S
+                    // showing, exit 0 — which reads as success.
+                    Ok(_) => {
+                        eprintln!(
+                            "base: ext:{} declared {} ingest source(s) but ingested 0 entities",
+                            ext.name,
+                            ss.ingest.len()
+                        );
+                    }
                     Err(e) => {
                         eprintln!("base: ext:{} ingest error: {e}", ext.name);
                     }
-                    _ => {}
                 }
             }
         }

@@ -541,15 +541,35 @@ fn copy_dir_all(src: &Path, dst: &Path, exclude: &[&str]) -> std::io::Result<usi
 /// Run a production-only `npm install` in `dir`. Best-effort: errors bubble up
 /// so the caller can warn (a copied node_modules may already suffice).
 fn npm_install(dir: &Path) -> anyhow::Result<bool> {
-    let status = Command::new("npm")
-        .current_dir(dir)
-        .args(["install", "--omit=dev", "--no-audit", "--no-fund", "--silent"])
-        .status();
-    match status {
-        Ok(s) if s.success() => Ok(true),
-        Ok(s) => anyhow::bail!("npm install exited with code {}", s.code().unwrap_or(-1)),
-        Err(e) => anyhow::bail!("npm not available ({e}) — vendor node_modules or install npm"),
+    // On Windows npm ships as npm.cmd, a batch script — there is no bare `npm`
+    // executable, so CreateProcess cannot find it and the spawn fails with
+    // "program not found" even when npm is installed and on PATH. Try the .cmd
+    // form first there, and keep the bare name as a fallback for environments
+    // that do expose a shim (Git Bash, MSYS, a vendored npm).
+    let candidates: &[&str] = if cfg!(windows) {
+        &["npm.cmd", "npm"]
+    } else {
+        &["npm"]
+    };
+
+    let mut last_err = None;
+    for exe in candidates {
+        let status = Command::new(exe)
+            .current_dir(dir)
+            .args(["install", "--omit=dev", "--no-audit", "--no-fund", "--silent"])
+            .status();
+        match status {
+            Ok(s) if s.success() => return Ok(true),
+            // A real exit code means npm ran — that is a build failure, not a
+            // lookup failure, so do not fall through to the next candidate.
+            Ok(s) => anyhow::bail!("npm install exited with code {}", s.code().unwrap_or(-1)),
+            Err(e) => last_err = Some(format!("{exe}: {e}")),
+        }
     }
+    anyhow::bail!(
+        "npm not available ({}) — vendor node_modules or install npm",
+        last_err.unwrap_or_else(|| "no candidates tried".to_string())
+    )
 }
 
 /// Serialize a string as a valid TOML basic string token (including the
@@ -737,6 +757,7 @@ mod tests {
                     handler: h.into(),
                     description: format!("{n} command"),
                     usage: None,
+                    unknown: Default::default(),
                 })
                 .collect(),
             dist: None,

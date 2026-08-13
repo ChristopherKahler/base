@@ -2,6 +2,7 @@ pub mod matcher;
 pub mod query;
 pub mod session;
 pub mod sync;
+pub mod transcript;
 
 use std::path::Path;
 

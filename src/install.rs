@@ -260,6 +260,66 @@ fn install_binary(binary: &Path, dest: &Path, bin_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Percent-mode keys added to an existing `[bracket]` section on upgrade.
+/// `mode` is written commented-OUT deliberately: turning percent on silently would
+/// measure the user against the fallback 200k window, and anyone on a larger-context
+/// model would compute several times their real depletion and sit in CRITICAL from
+/// their first prompt. They opt in after setting `context_window` for their model.
+const BRACKET_PERCENT_KEYS: &str = r#"
+# ── context-percentage mode (added in v0.10.5) ──
+# Reads REAL context depletion from the session transcript instead of counting
+# prompts. Turn length is a wildcard — a build turn reading three large files eats
+# far more window than a discussion turn — so prompt counts trip early while
+# chatting and late while building. Percent measures the thing you actually care
+# about, and means the same on every machine.
+#
+# TO ENABLE: set context_window for YOUR model, then uncomment mode.
+# Left off until you do: with a wrong window every session reads CRITICAL.
+# mode = "percent"
+context_window = 200000   # your model's window (1000000 for 1M-context models)
+fresh_until_pct = 20      # 0–N% consumed: full injection
+moderate_until_pct = 45   # then: trimmed injection
+depleted_until_pct = 70   # past this: minimal injection
+"#;
+
+/// Add percent-mode keys to a pre-v0.10.5 `[bracket]` section, then say so.
+///
+/// Idempotent: a config already carrying `context_window` is left alone. Existing
+/// turn thresholds are never touched — they remain the fallback for the first
+/// prompt of a session and for unreadable transcripts.
+fn migrate_bracket_percent(base_toml: &Path) {
+    let Ok(content) = std::fs::read_to_string(base_toml) else {
+        return;
+    };
+    if content.contains("context_window") {
+        return; // already migrated
+    }
+
+    let updated = if let Some(idx) = content.find("[bracket]") {
+        // Insert immediately after the section header so the keys land inside it.
+        let after_header = idx + "[bracket]".len();
+        let mut s = String::with_capacity(content.len() + BRACKET_PERCENT_KEYS.len());
+        s.push_str(&content[..after_header]);
+        s.push_str(BRACKET_PERCENT_KEYS);
+        s.push_str(&content[after_header..]);
+        s
+    } else {
+        // No [bracket] section at all — append a complete one.
+        format!("{content}\n# ─── [bracket] — context-window pressure tiers ───────────────\n[bracket]\nenabled = true\nfresh_until = 3\nmoderate_until = 10\ndepleted_until = 20\nrefresh_interval = 5\n{BRACKET_PERCENT_KEYS}")
+    };
+
+    if std::fs::write(base_toml, updated).is_err() {
+        return;
+    }
+
+    println!("   ↑ base.toml: added context-percentage bracket keys (v0.10.5)");
+    println!("     Brackets still count turns until you opt in. To switch:");
+    println!("       1. set  context_window  to your model's window");
+    println!("       2. uncomment  mode = \"percent\"");
+    println!("     Then tune fresh/moderate/depleted _pct to taste.");
+    println!("     File: {}", base_toml.display());
+}
+
 // ─── Step 2: Global tier ────────────────────────────────────
 
 fn create_global_tier(global_dir: &Path) -> Result<()> {
@@ -292,12 +352,45 @@ enabled = true            # false = no diagnostic block
 
 # ─── [bracket] — context-window pressure tiers ───────────────
 # Scales how much gets injected as the context window fills.
+#
+# mode = "percent" (default) reads REAL depletion from the session transcript.
+# mode = "turns" uses the prompt count instead — the legacy behavior.
+# Percent is preferred because turn length is a wildcard: a build turn that reads
+# three large files eats far more window than a discussion turn, so a fixed prompt
+# count trips early while chatting and late while building — backwards from intent.
+# The turn thresholds below stay live as the fallback for the first prompt of a
+# session (no usage written yet) or an unreadable transcript, so this never blinds.
 [bracket]
 enabled = true
+mode = "percent"          # "percent" (context-aware) | "turns" (legacy)
+
+# Percent-mode thresholds — % of context_window consumed.
+context_window = 200000   # set to your model's window (1000000 for 1M-context models)
+fresh_until_pct = 20      # 0–N%: full injection
+moderate_until_pct = 45   # then: trimmed injection
+depleted_until_pct = 70   # past this: minimal injection
+
+# Turn-mode thresholds — also the percent-mode fallback.
 fresh_until = 3           # prompts 0–N: full injection
 moderate_until = 10       # then: trimmed injection
 depleted_until = 20       # past this: minimal injection
 refresh_interval = 5      # re-survey window pressure every N prompts
+
+# ─── [bracket.rules] — rules injected by tier ────────────────
+# Domains inject on a keyword or path match, which makes them the wrong home for a
+# rule that must hold regardless of subject — it silently stops applying the moment
+# the conversation drifts off its triggers. These inject on the TIER alone.
+#
+# `always` goes out every prompt at every tier: the layer that survives a long
+# session because it is re-sent, not remembered. Tier buckets are ADDITIVE with it,
+# so a DEPLETED prompt receives always + depleted. Never deduped.
+#
+# [bracket.rules]
+# always   = ["A rule that must never erode, with its BECAUSE attached."]
+# fresh    = ["Room to spare — fuller guidance here."]
+# moderate = ["Condensed."]
+# depleted = ["Terse. Prefer precision over coverage."]
+# critical = ["Minimal. Only what cannot be dropped."]
 
 # ─── [signal] — session-start injection engine ───────────────
 # The block you see when a session opens. Runs:
@@ -348,6 +441,7 @@ stale_days = 7            # a working project untouched this many days → auto-
         println!("✓ (created base.toml)");
     } else {
         println!("✓ (base.toml exists, preserved)");
+        migrate_bracket_percent(&base_toml);
     }
 
     // domains.toml — only create if missing
@@ -965,4 +1059,81 @@ fn append_claude_md(claude_md_path: &Path) -> Result<()> {
 
     println!("✓ (appended BASE CLI section)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BracketConfig;
+
+    fn write(dir: &Path, body: &str) -> std::path::PathBuf {
+        let p = dir.join("base.toml");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    fn bracket_of(path: &Path) -> BracketConfig {
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            bracket: BracketConfig,
+        }
+        let text = std::fs::read_to_string(path).unwrap();
+        toml::from_str::<Probe>(&text).expect("migrated base.toml must parse").bracket
+    }
+
+    #[test]
+    fn migration_adds_percent_keys_to_existing_bracket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(
+            tmp.path(),
+            "[bracket]\nenabled = true\nfresh_until = 7\nmoderate_until = 20\ndepleted_until = 30\nrefresh_interval = 7\n\n[devmode]\nenabled = true\n",
+        );
+        migrate_bracket_percent(&p);
+
+        let b = bracket_of(&p);
+        assert_eq!(b.context_window, 200_000);
+        assert_eq!(b.fresh_until_pct, 20.0);
+        // Existing turn thresholds must survive untouched.
+        assert_eq!(b.fresh_until, 7);
+        assert_eq!(b.depleted_until, 30);
+        // Percent stays OFF until the user sets their window and uncomments it —
+        // silently enabling it against a wrong window pins the session to CRITICAL.
+        assert!(!b.is_percent_mode());
+        // Sections after [bracket] must not be captured by the insert.
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[devmode]"));
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(tmp.path(), "[bracket]\nenabled = true\nfresh_until = 3\n");
+        migrate_bracket_percent(&p);
+        let once = std::fs::read_to_string(&p).unwrap();
+        migrate_bracket_percent(&p);
+        let twice = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(once, twice, "second run must be a no-op");
+        // Count the assignment, not the word — it also appears in the guidance comment.
+        assert_eq!(once.matches("context_window = ").count(), 1);
+    }
+
+    #[test]
+    fn migration_appends_section_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(tmp.path(), "[devmode]\nenabled = true\n");
+        migrate_bracket_percent(&p);
+        let b = bracket_of(&p);
+        assert_eq!(b.context_window, 200_000);
+        assert_eq!(b.refresh_interval, 5);
+    }
+
+    #[test]
+    fn migration_leaves_already_configured_file_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "[bracket]\nenabled = true\nmode = \"percent\"\ncontext_window = 1000000\n";
+        let p = write(tmp.path(), body);
+        migrate_bracket_percent(&p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
+        assert!(bracket_of(&p).is_percent_mode());
+    }
 }

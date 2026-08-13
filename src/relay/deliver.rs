@@ -4,8 +4,11 @@ use super::{age_str, list_projects, relay_root, RelayStore};
 
 // ─── Hook delivery (the push path) ───────────────────────────
 //
-// Session-start and prompt-submit inject pending relay messages addressed to
-// the current session. Polling is only for explicit `wait` gates — a session
+// Session-start, prompt-submit AND pre-tool-use inject pending relay messages
+// addressed to the current session. The mid-turn (tool) path exists because
+// autonomous runs — Cadre members, PAUL workers — can go a whole milestone
+// without hitting a prompt boundary; a question must interrupt the turn, not
+// queue behind it. Polling is only for explicit `wait` gates — a session
 // should never burn tokens checking an empty inbox.
 //
 // Identity: BASE_RELAY_AS env (Cadre Pulse contracts, routines) or registry
@@ -15,7 +18,15 @@ use super::{age_str, list_projects, relay_root, RelayStore};
 
 /// Collect and consume pending messages for the current session across all
 /// relay stores in this workspace. Returns the injection block, if any.
-pub fn deliver(cwd: &Path, session_id: Option<&str>, notice_when_unregistered: bool) -> Option<String> {
+/// `mid_turn` marks the pre-tool-use path: it skips the idle heartbeat write
+/// (a locked registry mutation on every tool call would be pure contention)
+/// and never emits the unregistered notice.
+pub fn deliver(
+    cwd: &Path,
+    session_id: Option<&str>,
+    notice_when_unregistered: bool,
+    mid_turn: bool,
+) -> Option<String> {
     let root = relay_root(cwd)?;
     let projects = list_projects(&root);
     if projects.is_empty() {
@@ -29,11 +40,14 @@ pub fn deliver(cwd: &Path, session_id: Option<&str>, notice_when_unregistered: b
         let store = RelayStore { root: root.join(p), project: p.clone() };
         match store.identity(session_id) {
             Some(title) => {
-                store.heartbeat(&title);
                 let pending = store.pending_for(&title);
                 if pending.is_empty() {
+                    if !mid_turn {
+                        store.heartbeat(&title);
+                    }
                     continue;
                 }
+                store.heartbeat(&title);
                 out.push_str(&format!("<relay project=\"{p}\" you=\"{title}\">\n"));
                 let ids: Vec<String> = pending.iter().map(|m| m.id.clone()).collect();
                 for m in &pending {
@@ -55,7 +69,11 @@ pub fn deliver(cwd: &Path, session_id: Option<&str>, notice_when_unregistered: b
                 });
                 if needs_reply {
                     out.push_str(
-                        "Reply with: base relay send --to <sender> --type answer --msg \"...\"\n",
+                        "⚠️ REPLY REQUIRED NOW — before your next action, send: \
+                         base relay send --to <sender> --type answer --msg \"...\" \
+                         A one-line ack (\"on it\") counts if the full answer needs time. \
+                         Never leave a question unanswered — the sender is blocked on you. \
+                         Then resume your work.\n",
                     );
                 }
                 out.push_str("</relay>\n");
@@ -107,12 +125,29 @@ mod tests {
         s.register("quill", Some("sess-abc"), "/firm", None).unwrap();
         s.send("sterling", "quill", "notify", "3 units queued for you", &[]).unwrap();
 
-        let block = deliver(tmp.path(), Some("sess-abc"), true).expect("delivery expected");
+        let block = deliver(tmp.path(), Some("sess-abc"), true, false).expect("delivery expected");
         assert!(block.contains("you=\"quill\""));
         assert!(block.contains("3 units queued for you"));
 
         // Consumed — second delivery is empty (registered → no notice either).
-        assert!(deliver(tmp.path(), Some("sess-abc"), true).is_none());
+        assert!(deliver(tmp.path(), Some("sess-abc"), true, false).is_none());
+    }
+
+    #[test]
+    fn mid_turn_delivers_questions_between_tool_calls() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let s = setup(tmp.path());
+        s.register("worker", Some("sess-w"), "/wt", None).unwrap();
+        s.send("orch", "worker", "question", "which schema version?", &[]).unwrap();
+
+        // Pre-tool-use path: the question interrupts the running turn.
+        let block = deliver(tmp.path(), Some("sess-w"), false, true).expect("mid-turn delivery");
+        assert!(block.contains("which schema version?"));
+        assert!(block.contains("REPLY REQUIRED NOW"));
+
+        // Empty inbox mid-turn: silent, no notice.
+        assert!(deliver(tmp.path(), Some("sess-w"), false, true).is_none());
     }
 
     #[test]
@@ -123,8 +158,9 @@ mod tests {
         s.register("orch", Some("sess-1"), "/main", None).unwrap();
         s.send("worker", "orch", "contract-change", "need col rename", &[]).unwrap();
 
-        let block = deliver(tmp.path(), Some("sess-1"), true).unwrap();
+        let block = deliver(tmp.path(), Some("sess-1"), true, false).unwrap();
         assert!(block.contains("base relay send --to <sender> --type answer"));
+        assert!(block.contains("REPLY REQUIRED NOW"));
     }
 
     #[test]
@@ -135,11 +171,11 @@ mod tests {
         s.send("a", "b", "notify", "x", &[]).unwrap();
 
         // session-start path: notice.
-        let block = deliver(tmp.path(), Some("unknown-sess"), true).unwrap();
+        let block = deliver(tmp.path(), Some("unknown-sess"), true, false).unwrap();
         assert!(block.contains("<relay-notice>"));
 
         // prompt-submit path: silent.
-        assert!(deliver(tmp.path(), Some("unknown-sess"), false).is_none());
+        assert!(deliver(tmp.path(), Some("unknown-sess"), false, false).is_none());
     }
 
     #[test]
@@ -151,7 +187,7 @@ mod tests {
 
         // SAFETY: test-local env mutation; no parallel test reads this var.
         unsafe { std::env::set_var("BASE_RELAY_AS", "quill") };
-        let block = deliver(tmp.path(), None, false);
+        let block = deliver(tmp.path(), None, false, false);
         unsafe { std::env::remove_var("BASE_RELAY_AS") };
 
         let block = block.expect("env identity should receive delivery");

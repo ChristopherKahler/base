@@ -46,7 +46,18 @@ pub fn ingest_extension(
         None => cwd.to_path_buf(),
     };
 
+    // Declaring ingest and then finding no state_dir is always a misconfiguration,
+    // never a valid steady state. Returning Ok(0) here read as success to the
+    // caller and printed nothing, so a broken manifest looked identical to a
+    // working one that had nothing new to ingest.
     if !state_dir.is_dir() {
+        eprintln!(
+            "base: ext:{} declares {} ingest source(s) but state_dir '{}' is not a directory \
+             — nothing ingested. Set extension.state_dir (above the first [[commands]] header).",
+            ext.name,
+            ss.ingest.len(),
+            state_dir.display()
+        );
         return Ok(IngestStats::default());
     }
 
@@ -74,6 +85,18 @@ pub fn ingest_extension(
     for source in &ss.ingest {
         // Resolve file paths (handle globs)
         let file_paths = resolve_file_paths(&state_dir, &source.file);
+
+        // A declared source that matches no file is a misconfiguration too — a
+        // typo'd filename or a state_dir pointing somewhere plausible but wrong.
+        // Silence here is what made a whole plugin look implemented-but-inert.
+        if file_paths.is_empty() {
+            eprintln!(
+                "base: ext:{} ingest source '{}' matched no files under {} — skipped",
+                ext.name,
+                source.file,
+                state_dir.display()
+            );
+        }
 
         for file_path in &file_paths {
             match ingest_file(&ctx, source, file_path) {

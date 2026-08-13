@@ -121,3 +121,50 @@ fn update_project_changes_status() {
         _ => panic!("Expected boolean"),
     }
 }
+
+#[test]
+fn delete_project_refuses_nonempty_then_cascades() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ns = default_ns();
+
+    crud::project::add(tmp.path(), &ns, "Doomed", "active", None).unwrap();
+    crud::task::add(tmp.path(), &ns, "doomed", "T1", None, None).unwrap();
+    crud::milestone::add(tmp.path(), &ns, "doomed", "M1", None).unwrap();
+
+    // Non-empty project refuses without --force.
+    assert!(
+        crud::project::delete(tmp.path(), &ns, "doomed", false).is_err(),
+        "non-empty project must refuse without force",
+    );
+    assert!(crud::project::get_data(tmp.path(), &ns, "doomed").unwrap().is_some(), "still present");
+
+    // --force cascade-deletes node + children.
+    let removed = crud::project::delete(tmp.path(), &ns, "doomed", true).unwrap();
+    assert!(removed >= 3, "project + task + milestone removed, got {removed}");
+    assert!(crud::project::get_data(tmp.path(), &ns, "doomed").unwrap().is_none(), "project gone");
+    assert!(crud::task::get_data(tmp.path(), &ns, "doomed.t1").unwrap().is_none(), "task cascaded");
+    assert!(crud::milestone::get_data(tmp.path(), &ns, "doomed.m1").unwrap().is_none(), "milestone cascaded");
+}
+
+#[test]
+fn project_list_get_json_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ns = default_ns();
+
+    crud::project::add(tmp.path(), &ns, "JsonProj", "active", Some("/tmp/x")).unwrap();
+    let config = BaseConfig { namespace: ns.clone(), ..Default::default() };
+
+    let (rows, _) = crud::project::list_data(tmp.path(), &config, &ProjectScope::All).unwrap();
+    assert!(rows.iter().any(|r| r.id == "jsonproj"), "project in list_data");
+    let json = serde_json::to_string(&rows).unwrap();
+    for key in [
+        "\"id\"", "\"name\"", "\"status\"", "\"priority\"", "\"path\"",
+        "\"stage\"", "\"blocked_by\"", "\"next_action\"", "\"last_active\"",
+    ] {
+        assert!(json.contains(key), "json missing stable key {key}");
+    }
+
+    let rec = crud::project::get_data(tmp.path(), &ns, "jsonproj").unwrap().expect("project exists");
+    assert_eq!(rec.name, "JsonProj");
+    assert_eq!(rec.path.as_deref(), Some("/tmp/x"));
+}
