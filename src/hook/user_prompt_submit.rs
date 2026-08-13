@@ -30,12 +30,23 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         .map(SessionState::load)
         .unwrap_or_default();
 
+    // Session identity: `.session` is per-workspace but several Claude sessions can
+    // share a workspace, so the counter must be keyed or they clobber each other.
+    let session_id = event.get("session_id").and_then(serde_json::Value::as_str);
+
+    // Real context depletion, read off the live transcript. None on the first
+    // prompt (no usage written yet) or an unreadable path → turn-count fallback.
+    let context_pct = event
+        .get("transcript_path")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|p| crate::domain::transcript::context_pct(p, config.bracket.context_window));
+
     // Track prompt count and derive bracket
-    session.increment_prompt();
-    let bracket = session.bracket(&config.bracket);
+    session.increment_prompt_for(session_id);
+    let bracket = session.bracket_for(&config.bracket, session_id, context_pct);
 
     // Force-refresh dedup in DEPLETED/CRITICAL on interval
-    if session.should_force_refresh(&config.bracket) {
+    if session.should_force_refresh_for(&config.bracket, session_id, context_pct) {
         session.clear_dedup();
     }
 
@@ -56,7 +67,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             }
             print!("{cmd_output}");
             return Ok(super::HookEventData {
-                prompt_num: Some(session.prompt_count),
+                prompt_num: Some(session.prompt_count_for(session_id)),
                 ..Default::default()
             });
         }
@@ -85,14 +96,17 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         });
     }
 
+    // This session's depth — not the workspace-wide total, which concurrent
+    // sessions inflate.
+    let prompt_num = session.prompt_count_for(session_id);
+
     // Emit context bracket tag
     let mut output = format!(
-        "<context-bracket>[{}] (prompt {})</context-bracket>\n\n",
-        bracket, session.prompt_count
+        "<context-bracket>[{bracket}] (prompt {prompt_num})</context-bracket>\n\n"
     );
 
     // Determine if we're in lean mode (FRESH, first 2 prompts — rules only, skip neighborhood)
-    let lean_mode = bracket == Bracket::Fresh && session.prompt_count <= 2;
+    let lean_mode = bracket == Bracket::Fresh && prompt_num <= 2;
 
     // Track injection metadata for DEVMODE
     let mut loaded_domains: Vec<(String, String, usize)> = Vec::new(); // (name, match_reason, rule_count)

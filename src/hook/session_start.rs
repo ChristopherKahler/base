@@ -7,7 +7,7 @@ use crate::config::{load_queries, BaseConfig};
 use crate::ontology;
 use crate::store;
 
-pub fn handle(config: &BaseConfig, cwd: &Path) -> Result<()> {
+pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Result<()> {
     // Surface graph corruption at boot — loud, before any other output, so a
     // broken graph announces itself immediately instead of degrading silently.
     warn_unhealthy_graphs(cwd);
@@ -25,8 +25,10 @@ pub fn handle(config: &BaseConfig, cwd: &Path) -> Result<()> {
         .or_else(|| {
             dirs::home_dir().map(|h| h.join(".base-gbl").join(".base")).filter(|p| p.is_dir())
         });
+    // Clear THIS session only. A blanket clear() deleted the shared file, which
+    // reset every concurrently-running session's bracket to FRESH mid-conversation.
     if let Some(ref base_dir) = session_base_dir {
-        crate::domain::session::SessionState::clear(base_dir);
+        crate::domain::session::SessionState::clear_for(base_dir, session_id);
     }
 
     // Auto-sync domains to graph

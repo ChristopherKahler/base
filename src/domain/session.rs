@@ -37,9 +37,20 @@ pub struct SessionState {
     /// domain name → rules hash (for change detection)
     #[serde(default)]
     pub injected: HashMap<String, u64>,
-    /// Number of user prompts in this session (for bracket calculation)
+    /// Number of user prompts, workspace-wide. Retained for backward compatibility
+    /// and as the fallback when no session id is available; mirrors the active
+    /// session's count so existing readers stay coherent.
     #[serde(default)]
     pub prompt_count: u32,
+    /// Prompt count per Claude Code `session_id`.
+    ///
+    /// `.session` is one file per WORKSPACE, but several Claude sessions can run in
+    /// one workspace at once (cx terminals, squads). Keying the counter on the
+    /// workspace made concurrent sessions increment and clear each other's count —
+    /// observed in telemetry as counts repeating, jumping, and resetting mid-session.
+    /// The bracket was therefore reporting some other conversation's depth.
+    #[serde(default)]
+    pub prompt_counts: HashMap<String, u32>,
     /// File path → content-version of the AST map last injected this session.
     /// Keyed on content (not just path) so a file that CHANGES re-injects fresh
     /// context, while an unchanged re-touch stays deduped.
@@ -91,21 +102,78 @@ impl SessionState {
     }
 
     /// Increment prompt count and return the new value.
+    /// Workspace-wide; prefer `increment_prompt_for` with a session id.
     pub fn increment_prompt(&mut self) -> u32 {
         self.prompt_count += 1;
         self.prompt_count
     }
 
+    /// Increment this session's prompt count and return the new value.
+    /// Falls back to the workspace-wide counter when no session id is available.
+    pub fn increment_prompt_for(&mut self, session_id: Option<&str>) -> u32 {
+        match session_id {
+            Some(id) => {
+                let count = self.prompt_counts.entry(id.to_string()).or_insert(0);
+                *count += 1;
+                let count = *count;
+                // Mirror onto the legacy field so existing readers see this
+                // session's depth rather than a stale workspace total.
+                self.prompt_count = count;
+                count
+            }
+            None => self.increment_prompt(),
+        }
+    }
+
+    /// This session's prompt count, or the workspace-wide count when unkeyed.
+    pub fn prompt_count_for(&self, session_id: Option<&str>) -> u32 {
+        session_id
+            .and_then(|id| self.prompt_counts.get(id).copied())
+            .unwrap_or(self.prompt_count)
+    }
+
     /// Derive context bracket from prompt count and config thresholds.
+    /// Turn-based only; prefer `bracket_for`, which uses real context depletion.
     pub fn bracket(&self, config: &BracketConfig) -> Bracket {
+        self.bracket_for(config, None, None)
+    }
+
+    /// Derive the context bracket.
+    ///
+    /// Uses `context_pct` (real depletion read from the transcript) when percent
+    /// mode is on and a reading is available. Falls back to turn thresholds
+    /// otherwise, so a missing or not-yet-written transcript degrades rather than
+    /// blinding the bracket.
+    pub fn bracket_for(
+        &self,
+        config: &BracketConfig,
+        session_id: Option<&str>,
+        context_pct: Option<f64>,
+    ) -> Bracket {
         if !config.enabled {
             return Bracket::Moderate; // default when brackets disabled
         }
-        if self.prompt_count <= config.fresh_until {
+
+        if config.is_percent_mode() {
+            if let Some(pct) = context_pct {
+                return if pct <= config.fresh_until_pct {
+                    Bracket::Fresh
+                } else if pct <= config.moderate_until_pct {
+                    Bracket::Moderate
+                } else if pct <= config.depleted_until_pct {
+                    Bracket::Depleted
+                } else {
+                    Bracket::Critical
+                };
+            }
+        }
+
+        let count = self.prompt_count_for(session_id);
+        if count <= config.fresh_until {
             Bracket::Fresh
-        } else if self.prompt_count <= config.moderate_until {
+        } else if count <= config.moderate_until {
             Bracket::Moderate
-        } else if self.prompt_count <= config.depleted_until {
+        } else if count <= config.depleted_until {
             Bracket::Depleted
         } else {
             Bracket::Critical
@@ -115,12 +183,47 @@ impl SessionState {
     /// Whether to force-refresh dedup (re-inject all domains) this prompt.
     /// True when DEPLETED or CRITICAL AND prompt lands on the refresh interval.
     pub fn should_force_refresh(&self, config: &BracketConfig) -> bool {
+        self.should_force_refresh_for(config, None, None)
+    }
+
+    /// Session-aware force-refresh check. The interval still counts prompts —
+    /// it is a cadence, not a depth measure — but the bracket gating it comes
+    /// from real depletion when available.
+    pub fn should_force_refresh_for(
+        &self,
+        config: &BracketConfig,
+        session_id: Option<&str>,
+        context_pct: Option<f64>,
+    ) -> bool {
         if !config.enabled || config.refresh_interval == 0 {
             return false;
         }
-        let bracket = self.bracket(config);
+        let bracket = self.bracket_for(config, session_id, context_pct);
+        let count = self.prompt_count_for(session_id);
         matches!(bracket, Bracket::Depleted | Bracket::Critical)
-            && self.prompt_count.is_multiple_of(config.refresh_interval)
+            && count > 0
+            && count.is_multiple_of(config.refresh_interval)
+    }
+
+    /// Clear state for ONE session, leaving concurrent sessions' counters intact.
+    ///
+    /// SessionStart previously called `clear()`, deleting the shared file — so a
+    /// new terminal reset every other live session's bracket to FRESH. Dedup maps
+    /// are still cleared workspace-wide, which is the pre-existing behavior a fresh
+    /// session depends on for a full re-injection.
+    pub fn clear_for(base_dir: &Path, session_id: Option<&str>) {
+        let Some(id) = session_id else {
+            Self::clear(base_dir);
+            return;
+        };
+        let mut state = Self::load(base_dir);
+        state.prompt_counts.remove(id);
+        state.prompt_count = 0;
+        state.injected.clear();
+        state.standards_injected.clear();
+        state.ast_injected.clear();
+        state.dirty_apps.clear();
+        let _ = state.save(base_dir);
     }
 
     /// Clear all dedup state (used for force-refresh).

@@ -90,7 +90,7 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
 
     match event {
         "session-start" => {
-            session_start::handle(&config, &cwd)?;
+            session_start::handle(&config, &cwd, session_id.as_deref())?;
             // Relay inbox push: pending messages addressed to this session
             // (unregistered sessions get a one-line notice that a relay is live).
             if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true, false) {

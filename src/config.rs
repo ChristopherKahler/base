@@ -172,6 +172,15 @@ pub struct WorkspaceEntry {
 
 // ─── Context Bracket Config ─────────────────────────────────
 
+/// Thresholds for the context bracket.
+///
+/// Two modes. `percent` (default) derives the bracket from real context-window
+/// depletion read off the transcript; `turns` uses the legacy prompt count.
+/// Percent is preferred because turn length is a wildcard — a build turn reading
+/// three large files consumes far more context than a discussion turn, so a fixed
+/// prompt count fires early in conversation and late in heavy work. The turn
+/// thresholds are retained and still used whenever the transcript is unreadable
+/// (first prompt of a session, missing path), so the bracket never goes blind.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BracketConfig {
     #[serde(default = "default_fresh_until")]
@@ -184,6 +193,25 @@ pub struct BracketConfig {
     pub refresh_interval: u32,
     #[serde(default = "default_bracket_enabled")]
     pub enabled: bool,
+
+    /// "percent" or "turns". ABSENT means turns — a base.toml written before this
+    /// feature existed must keep behaving exactly as it did. Defaulting an absent
+    /// key to percent would silently measure every legacy install against the
+    /// fallback 200k window, so anyone on a larger-context model would compute
+    /// several times their real depletion and pin to CRITICAL permanently.
+    /// New installs and the migration both write this key explicitly.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Context window to measure depletion against. Configured rather than
+    /// inferred: the transcript records the model but not its window size.
+    #[serde(default = "default_context_window")]
+    pub context_window: u32,
+    #[serde(default = "default_fresh_until_pct")]
+    pub fresh_until_pct: f64,
+    #[serde(default = "default_moderate_until_pct")]
+    pub moderate_until_pct: f64,
+    #[serde(default = "default_depleted_until_pct")]
+    pub depleted_until_pct: f64,
 }
 
 fn default_fresh_until() -> u32 { 3 }
@@ -191,6 +219,20 @@ fn default_moderate_until() -> u32 { 10 }
 fn default_depleted_until() -> u32 { 20 }
 fn default_refresh_interval() -> u32 { 5 }
 fn default_bracket_enabled() -> bool { true }
+fn default_context_window() -> u32 { 200_000 }
+fn default_fresh_until_pct() -> f64 { 20.0 }
+fn default_moderate_until_pct() -> f64 { 45.0 }
+fn default_depleted_until_pct() -> f64 { 70.0 }
+
+impl BracketConfig {
+    /// Whether to derive the bracket from context percentage.
+    /// Absent `mode` = legacy turn counting; percent is opt-in per the field docs.
+    pub fn is_percent_mode(&self) -> bool {
+        self.mode
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("percent"))
+    }
+}
 
 impl Default for BracketConfig {
     fn default() -> Self {
@@ -200,6 +242,13 @@ impl Default for BracketConfig {
             depleted_until: default_depleted_until(),
             refresh_interval: default_refresh_interval(),
             enabled: default_bracket_enabled(),
+            // None = turn mode. Percent is opt-in via config; the installer and
+            // the migration write `mode = "percent"` explicitly.
+            mode: None,
+            context_window: default_context_window(),
+            fresh_until_pct: default_fresh_until_pct(),
+            moderate_until_pct: default_moderate_until_pct(),
+            depleted_until_pct: default_depleted_until_pct(),
         }
     }
 }

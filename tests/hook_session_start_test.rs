@@ -62,7 +62,7 @@ fn session_start_emits_active_projects() {
 
     // Capture stdout by calling handle (it prints to stdout)
     // We verify no error; full stdout capture tested via CLI integration
-    let result = session_start::handle(&config, tmp.path());
+    let result = session_start::handle(&config, tmp.path(), None);
     assert!(result.is_ok(), "session-start should succeed: {result:?}");
 }
 
@@ -72,7 +72,7 @@ fn session_start_silent_when_no_trig() {
     // No .base/ directory at all
     let config = BaseConfig::default();
 
-    let result = session_start::handle(&config, tmp.path());
+    let result = session_start::handle(&config, tmp.path(), None);
     assert!(
         result.is_ok(),
         "session-start with no TriG should succeed silently"
@@ -90,7 +90,7 @@ fn session_start_failopen_on_malformed_trig() {
 
     // Should return an error, but the dispatch wrapper catches it (fail-open)
     // At the handler level, an error is expected here
-    let result = session_start::handle(&config, tmp.path());
+    let result = session_start::handle(&config, tmp.path(), None);
     assert!(result.is_err(), "Malformed TriG should error at handler level");
 }
 
@@ -140,7 +140,7 @@ SELECT ?name WHERE {
         ..BaseConfig::default()
     };
 
-    let result = session_start::handle(&config, tmp.path());
+    let result = session_start::handle(&config, tmp.path(), None);
     assert!(
         result.is_ok(),
         "session-start with custom namespace should succeed: {result:?}"
