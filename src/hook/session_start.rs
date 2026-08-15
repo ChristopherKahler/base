@@ -257,6 +257,12 @@ fn check_and_banner() {
         return; // No manifest = nothing to check
     };
 
+    // A hand-swapped binary leaves the recorded version stale, and every decision
+    // below is made against it. Correct it before reading anything else.
+    if crate::manifest::reconcile_running_version(&mut manifest) {
+        let _ = manifest.save();
+    }
+
     let activated = manifest.is_activated();
     let pending = &manifest.update_check.pending_update;
 

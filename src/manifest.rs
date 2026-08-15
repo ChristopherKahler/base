@@ -270,6 +270,36 @@ const NPM_PACKAGES: &[(&str, &str)] = &[
 const GITHUB_REPO: &str = "ChristopherKahler/base";
 const HTTP_TIMEOUT_SECS: u64 = 3;
 
+/// Reconcile the recorded base version with the binary that is actually running.
+/// Returns true when the manifest was stale and has been corrected in-place
+/// (caller is responsible for persisting).
+///
+/// `[components.base] version` is only ever written by `base install` or
+/// `base update`, so replacing the binary by hand — dropping a fresh build into
+/// `~/.local/bin/base` — leaves it pinned at the old version indefinitely.
+/// Everything downstream then compares against that stale number:
+/// `check_for_updates` keeps resolving the remote as newer, `pending_update`
+/// stays set, and `check_and_banner` short-circuits on a non-empty
+/// `pending_update` before reaching the periodic check that could have cleared
+/// it. The banner therefore advertises a version the user already has, forever.
+/// `base --version` never explains the discrepancy because it reports
+/// `CARGO_PKG_VERSION` from the real binary and never consults the manifest.
+pub fn reconcile_running_version(manifest: &mut Manifest) -> bool {
+    let running = env!("CARGO_PKG_VERSION");
+    let Some(entry) = manifest.components.get_mut("base") else {
+        return false;
+    };
+    if entry.version == running {
+        return false;
+    }
+    entry.version = running.to_string();
+    // `pending_update` was computed against the version we just corrected, so it
+    // is stale by construction. Clear it rather than let it keep the banner alive
+    // until the next periodic check — that check is exactly what it blocks.
+    manifest.update_check.pending_update = String::new();
+    true
+}
+
 /// Check if enough time has passed since last version check.
 pub fn should_check(manifest: &Manifest) -> bool {
     if manifest.update_check.last_checked.is_empty() {
@@ -526,5 +556,64 @@ mod tests {
             ..Default::default()
         };
         assert!(!is_snoozed(&manifest));
+    }
+
+    /// Build a manifest whose recorded base version is whatever the caller says,
+    /// with a pending_update string as if a check had already run against it.
+    fn manifest_recording(version: &str, pending: &str) -> Manifest {
+        let mut components = HashMap::new();
+        components.insert(
+            "base".to_string(),
+            ComponentEntry {
+                version: version.to_string(),
+                path: "~/.local/bin/base".to_string(),
+                installed_at: "2026-06-03T15:00:00-05:00".to_string(),
+            },
+        );
+        Manifest {
+            components,
+            update_check: UpdateCheck {
+                pending_update: pending.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reconcile_rewrites_stale_version_and_clears_pending() {
+        let mut m = manifest_recording("0.0.1", "base 0.0.1→9.9.9");
+        assert!(reconcile_running_version(&mut m), "stale manifest must report a change");
+        assert_eq!(m.components["base"].version, env!("CARGO_PKG_VERSION"));
+        assert!(
+            m.update_check.pending_update.is_empty(),
+            "pending_update was computed against the stale version and must be dropped"
+        );
+    }
+
+    #[test]
+    fn reconcile_is_a_noop_when_already_current() {
+        let mut m = manifest_recording(env!("CARGO_PKG_VERSION"), "base x→y");
+        assert!(!reconcile_running_version(&mut m), "current manifest must not report a change");
+        assert_eq!(
+            m.update_check.pending_update, "base x→y",
+            "a genuine pending update must survive when the version is already correct"
+        );
+    }
+
+    #[test]
+    fn reconcile_handles_manifest_without_base_component() {
+        let mut m = Manifest::default();
+        assert!(!reconcile_running_version(&mut m));
+    }
+
+    /// A rollback is the same shape as an upgrade: record what is running, drop
+    /// the stale pending string, and let the next periodic check decide.
+    #[test]
+    fn reconcile_handles_downgrade() {
+        let mut m = manifest_recording("99.0.0", "base 99.0.0→99.1.0");
+        assert!(reconcile_running_version(&mut m));
+        assert_eq!(m.components["base"].version, env!("CARGO_PKG_VERSION"));
+        assert!(m.update_check.pending_update.is_empty());
     }
 }
