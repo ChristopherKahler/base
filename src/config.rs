@@ -47,9 +47,24 @@ pub fn ast_app_root(target: &Path) -> Option<PathBuf> {
 /// of `.base/` so an app's map never shadows workspace `.base/` resolution for
 /// knowledge commands. `target` must be an absolute path.
 pub fn resolve_ast_ttl(target: &Path) -> PathBuf {
-    let root = ast_app_root(target).or_else(|| {
-        find_workspace_base(target).and_then(|b| b.parent().map(Path::to_path_buf))
-    });
+    let root = ast_app_root(target)
+        .or_else(|| find_workspace_base(target).and_then(|b| b.parent().map(Path::to_path_buf)))
+        // Never adopt the HOME directory as an app root for a target that lives
+        // beneath it. Home almost always carries `.base` (it is the usual
+        // workspace), so both resolution tiers above walk up and land on it —
+        // and then every project under home shares one `~/.base-ast/ast.ttl`.
+        // Each sync overwrites the last and all of them register under the same
+        // app name (the home folder's), which is the exact clobbering this
+        // module exists to prevent.
+        //
+        // Verified 2026-08-14 on Windows AND Linux: mapping app B erased app A,
+        // `base ast list` showed a single app, and querying app A returned
+        // "No AST entities matching". Falling through to `None` here gives the
+        // target its own self-contained sidecar instead.
+        //
+        // Home itself remains valid when it IS the target, so an intentional
+        // workspace-wide map still works.
+        .filter(|r| dirs::home_dir().as_deref() != Some(r.as_path()) || r.as_path() == target);
     match root {
         Some(r) => r.join(".base-ast").join("ast.ttl"),
         None => target.join(".base-ast").join("ast.ttl"),
