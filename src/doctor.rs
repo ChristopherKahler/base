@@ -54,10 +54,16 @@ pub struct TierReport {
 #[derive(Debug, Serialize)]
 pub struct DoctorReport {
     pub tiers: Vec<TierReport>,
-    /// True when no tier is "unhealthy" (missing/empty tiers do not count against health).
+    /// True when no tier is "unhealthy" AND no config file is corrupt
+    /// (missing/empty tiers and files do not count against health).
     pub healthy: bool,
     /// Advisory operational warnings (bloat, write-probe failures). Do not affect `healthy`.
     pub warnings: Vec<String>,
+    /// Config files that exist but cannot be parsed. The loaders that read these
+    /// fail open by design, so this is the only surface that reports them — a
+    /// corrupt file otherwise looks exactly like an absent one. Counts against
+    /// `healthy`: silently-dead star commands are a fault, not an advisory.
+    pub config_errors: Vec<String>,
 }
 
 /// Diagnose a single graph file. PURE: only touches `path` and its siblings
@@ -142,11 +148,13 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
             report
         })
         .collect();
-    let healthy = tiers.iter().all(|t| t.status != "unhealthy");
+    let config_errors = crate::command::check_command_files(cwd);
+    let healthy = tiers.iter().all(|t| t.status != "unhealthy") && config_errors.is_empty();
     DoctorReport {
         tiers,
         healthy,
         warnings,
+        config_errors,
     }
 }
 
@@ -159,6 +167,11 @@ pub fn format_human(report: &DoctorReport) -> String {
 
     if report.tiers.is_empty() {
         out.push_str("No graph tiers found (no .base/graph.nq in workspace or global tier).\n");
+        // A corrupt config is still worth reporting with no graph present — it is
+        // the reason star commands went quiet, and it has nothing to do with tiers.
+        for e in &report.config_errors {
+            out.push_str(&format!("   ⚠ {e}\n"));
+        }
         return out;
     }
 
@@ -210,6 +223,13 @@ pub fn format_human(report: &DoctorReport) -> String {
                     b.backup_line_count, b.line_delta, b.path,
                 ));
             }
+        }
+    }
+
+    if !report.config_errors.is_empty() {
+        out.push_str("\n─── config faults ────────────────────\n");
+        for e in &report.config_errors {
+            out.push_str(&format!("   ⚠ {e}\n"));
         }
     }
 

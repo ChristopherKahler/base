@@ -2765,7 +2765,7 @@ pub fn run() {
                     Ok(c) => c,
                     Err(e) => { eprintln!("Cannot read {file}: {e}"); return; }
                 };
-                #[derive(serde::Deserialize)]
+                #[derive(serde::Deserialize, serde::Serialize)]
                 struct CmdFile { #[serde(default)] command: Vec<command::CommandDef> }
                 let incoming = match toml::from_str::<CmdFile>(&src) {
                     Ok(f) => f.command,
@@ -2783,31 +2783,52 @@ pub fn run() {
                     eprintln!("Failed to create {}: {e}", parent.display());
                     std::process::exit(1);
                 }
-                // Append-only: read existing text and never rewrite what precedes.
-                let mut content = std::fs::read_to_string(&path).unwrap_or_default();
-                let existing: std::collections::HashSet<String> = toml::from_str::<CmdFile>(&content)
-                    .map(|f| f.command.iter().map(|c| c.name.to_ascii_uppercase()).collect())
-                    .unwrap_or_default();
+                // Parse what is already there before touching it. The previous
+                // implementation appended raw text and treated an unparseable file as
+                // empty, so importing onto a corrupt file silently duplicated every
+                // command on top of the damage. Refuse instead, and point at the tool
+                // that explains why.
+                let existing_text = std::fs::read_to_string(&path).unwrap_or_default();
+                let mut merged: Vec<command::CommandDef> = if existing_text.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    match toml::from_str::<CmdFile>(&existing_text) {
+                        Ok(f) => f.command,
+                        Err(e) => {
+                            eprintln!("Refusing to import: {} is not valid TOML: {e}", path.display());
+                            eprintln!("Run `base doctor` for the diagnosis, then repair or move that file and retry.");
+                            std::process::exit(1);
+                        }
+                    }
+                };
+
                 let (mut added, mut skipped): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
-                for cmd in &incoming {
-                    if existing.contains(&cmd.name.to_ascii_uppercase()) {
-                        skipped.push(cmd.name.clone());
+                for cmd in incoming {
+                    if merged.iter().any(|c| c.name.eq_ignore_ascii_case(&cmd.name)) {
+                        skipped.push(cmd.name);
                         continue;
                     }
-                    let rules_toml: String = cmd.rules.iter()
-                        .map(|r| format!("  \"{}\",", r.replace('"', "\\\"")))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let block = format!(
-                        "\n[[command]]\nname = \"{}\"\ndescription = \"{}\"\nrules = [\n{}\n]\n",
-                        cmd.name.replace('"', "\\\""),
-                        cmd.description.replace('"', "\\\""),
-                        rules_toml,
-                    );
-                    content.push_str(&block);
                     added.push(cmd.name.clone());
+                    merged.push(cmd);
                 }
-                if let Err(e) = std::fs::write(&path, content) {
+
+                // Serialize through the toml crate. The hand-rolled emitter this
+                // replaces escaped only double quotes, so any rule containing a
+                // newline, tab, or backslash — which multi-line rules routinely do —
+                // produced an invalid basic string and corrupted the file.
+                let out = match toml::to_string_pretty(&CmdFile { command: merged }) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("Failed to serialize commands: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                // Never persist bytes we cannot read back.
+                if let Err(e) = toml::from_str::<CmdFile>(&out) {
+                    eprintln!("Refusing to write {}: serialized output does not round-trip: {e}", path.display());
+                    std::process::exit(1);
+                }
+                if let Err(e) = std::fs::write(&path, out) {
                     eprintln!("Failed to write commands.toml: {e}");
                     std::process::exit(1);
                 }
