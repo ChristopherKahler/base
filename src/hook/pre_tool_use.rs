@@ -302,13 +302,15 @@ fn is_source_file(path: &str) -> bool {
 /// Check if AST data has been extracted for the current workspace.
 /// ast.ttl IS the AST store (never merged into graph.nq — AUDIT C10),
 /// so its existence is the correct populated check.
+///
+/// Resolution MUST go through `find_ast_ttl`, which checks the `.base-ast/`
+/// sidecar before the legacy `{ws}/.base/ast.ttl`. Hand-joining the legacy path
+/// here made this check unsatisfiable for every workspace mapped after the
+/// sidecar migration, so the "not yet populated" hint fired forever no matter
+/// how many times `base sync --ast` was run.
 fn ast_graph_populated(cwd: &Path) -> bool {
-    let base_dir = crate::config::find_workspace_base(cwd);
-    match base_dir {
-        Some(bd) => {
-            let ast_path = bd.join("ast.ttl");
-            ast_path.exists() && std::fs::metadata(&ast_path).map(|m| m.len() > 0).unwrap_or(false)
-        }
+    match crate::config::find_ast_ttl(cwd) {
+        Some(ast_path) => std::fs::metadata(&ast_path).map(|m| m.len() > 0).unwrap_or(false),
         None => false,
     }
 }
