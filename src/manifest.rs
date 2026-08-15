@@ -267,7 +267,7 @@ const NPM_PACKAGES: &[(&str, &str)] = &[
     ("skillsmith", "@chrisai/skillsmith"),
 ];
 
-const GITHUB_REPO: &str = "ChristopherKahler/base";
+pub(crate) const GITHUB_REPO: &str = "ChristopherKahler/base";
 const HTTP_TIMEOUT_SECS: u64 = 3;
 
 /// Reconcile the recorded base version with the binary that is actually running.

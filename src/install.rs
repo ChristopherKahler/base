@@ -42,6 +42,9 @@ pub fn run(carl_json_path: Option<&Path>, skip_hooks: bool, full: bool) -> Resul
     // Step 6: Seed system rules
     seed_system_rules(&global_dir)?;
 
+    // Step 6: Install bundled Claude skills (local checkout, else fetch)
+    install_skills(&binary_path, &home)?;
+
     // Step 7: Append BASE CLI section to ~/.claude/CLAUDE.md
     let claude_md = home.join(".claude").join("CLAUDE.md");
     append_claude_md(&claude_md)?;
@@ -111,16 +114,33 @@ pub fn uninstall(purge: bool) -> Result<()> {
         println!("3. Binary not found at {} — skipped", binary.display());
     }
 
-    // 4. Purge global tier if requested
+    // 4. Remove bundled skills. Backups (<skill>.bak-*) are the operator's own
+    //    customised copies, so they survive uninstall deliberately.
+    let skills_root = home.join(".claude").join("skills");
+    let mut removed_skills = Vec::new();
+    for skill in BUNDLED_SKILLS {
+        let dir = skills_root.join(skill);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+            removed_skills.push(*skill);
+        }
+    }
+    if removed_skills.is_empty() {
+        println!("4. No bundled skills installed — skipped");
+    } else {
+        println!("4. Remove bundled skills ... ✓ {}", removed_skills.join(", "));
+    }
+
+    // 5. Purge global tier if requested
     if purge {
         let global_dir = home.join(".base-gbl");
         if global_dir.exists() {
-            print!("4. Purge global tier ... ");
+            print!("5. Purge global tier ... ");
             std::fs::remove_dir_all(&global_dir)?;
             println!("✓ removed {}", global_dir.display());
         }
     } else {
-        println!("4. Global tier preserved (~/.base-gbl/) — use --purge to remove");
+        println!("5. Global tier preserved (~/.base-gbl/) — use --purge to remove");
     }
 
     println!("\n═══════════════════════════════════════");
@@ -802,6 +822,248 @@ fn install_scripts(binary_path: &Path, global_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// ─── Claude skills ──────────────────────────────────────────
+
+/// Skills shipped with base, installed into `~/.claude/skills/<name>/`.
+const BUNDLED_SKILLS: &[&str] = &["base-help"];
+
+/// Repo-relative parent of the bundled skills (also the GitHub API path).
+const SKILLS_REPO_DIR: &str = "claude/skills";
+
+/// Generous next to the 3s update ping: `base-help` carries an 87KB Q&A bank and
+/// this runs once per install, not on every session start.
+const SKILL_FETCH_TIMEOUT_SECS: u64 = 15;
+
+/// Install bundled skills into `~/.claude/skills/`.
+///
+/// Two sources, in order. A local checkout wins, because that is the tree the
+/// operator is actually running. Failing that we fetch from GitHub: release
+/// assets carry only the binary and the AST scripts, so anyone who installed
+/// from a tarball has no local copy of the skill at all.
+///
+/// Never fatal. A skill that cannot be installed prints a manual fallback and
+/// `base install` still completes — the CLI works fine without it.
+fn install_skills(binary_path: &Path, home: &Path) -> Result<()> {
+    print!("6. Install Claude skills ... ");
+
+    let dest_root = home.join(".claude").join("skills");
+    std::fs::create_dir_all(&dest_root)?;
+    let local_root = find_local_skills_dir(binary_path);
+
+    let mut results: Vec<String> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+
+    for skill in BUNDLED_SKILLS {
+        let local = local_root
+            .as_ref()
+            .map(|r| r.join(skill))
+            .filter(|p| p.join("SKILL.md").is_file());
+
+        match install_one_skill(skill, local.as_deref(), &dest_root) {
+            Ok(outcome) => results.push(outcome),
+            Err(e) => failures.push((skill.to_string(), e.to_string())),
+        }
+    }
+
+    if failures.is_empty() {
+        println!("✓ ({})", results.join(", "));
+    } else {
+        println!("partial");
+        for r in &results {
+            println!("   ✓ {r}");
+        }
+        for (skill, err) in &failures {
+            println!("   ⊘ {skill} — {err}");
+            println!(
+                "      Copy {SKILLS_REPO_DIR}/{skill}/ to {} manually",
+                dest_root.join(skill).display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Stage a skill, then reconcile it against whatever is already installed.
+///
+/// Staging first means a failed download never leaves a half-written skill in
+/// place. The reconcile step exists because `base-help` rewrites its own Q&A
+/// bank as it learns — overwriting on every `base install` would silently
+/// discard the operator's appended pairs, so a changed skill is backed up
+/// before it is replaced, and an unchanged one is left alone entirely.
+fn install_one_skill(skill: &str, local: Option<&Path>, dest_root: &Path) -> Result<String> {
+    let dest = dest_root.join(skill);
+    // Stage inside dest_root so the final promotion is a same-filesystem rename.
+    let staging = dest_root.join(format!(".{skill}.staging-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+
+    let staged = match local {
+        Some(src) => copy_dir_all(src, &staging).map(|n| (n, "local")),
+        None => fetch_skill_from_github(skill, &staging).map(|n| (n, "fetched")),
+    };
+    let (count, source) = match staged {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+
+    if !dest.exists() {
+        std::fs::rename(&staging, &dest)?;
+        return Ok(format!("{skill} ({count} files, {source})"));
+    }
+    if dirs_identical(&staging, &dest) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Ok(format!("{skill} (already current)"));
+    }
+
+    let backup = dest_root.join(format!(
+        "{skill}.bak-{}",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    std::fs::rename(&dest, &backup)?;
+    std::fs::rename(&staging, &dest)?;
+    Ok(format!(
+        "{skill} ({count} files, {source}; previous kept at {})",
+        backup.display()
+    ))
+}
+
+/// Locate `claude/skills/` relative to the running binary, mirroring the search
+/// `install_scripts` does for `scripts/ast/`.
+fn find_local_skills_dir(binary_path: &Path) -> Option<std::path::PathBuf> {
+    let candidates = [
+        binary_path.parent().and_then(|p| p.parent()).map(skills_dir),
+        binary_path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(skills_dir),
+        Some(skills_dir(&std::env::current_dir().unwrap_or_default())),
+    ];
+    candidates.into_iter().flatten().find(|p| p.is_dir())
+}
+
+fn skills_dir(root: &Path) -> std::path::PathBuf {
+    root.join("claude").join("skills")
+}
+
+/// Recursively copy `src` into `dest`, returning the number of files written.
+fn copy_dir_all(src: &Path, dest: &Path) -> Result<usize> {
+    std::fs::create_dir_all(dest)?;
+    let mut count = 0;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let target = dest.join(entry.file_name());
+        if path.is_dir() {
+            count += copy_dir_all(&path, &target)?;
+        } else {
+            std::fs::copy(&path, &target)?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Byte-for-byte comparison of two directory trees.
+fn dirs_identical(a: &Path, b: &Path) -> bool {
+    let (Ok(mut left), Ok(mut right)) = (collect_tree(a), collect_tree(b)) else {
+        return false;
+    };
+    left.sort();
+    right.sort();
+    left == right
+}
+
+/// Flatten a tree into sorted (relative path, contents) pairs.
+fn collect_tree(root: &Path) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+    fn walk(
+        dir: &Path,
+        root: &Path,
+        out: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, out)?;
+            } else {
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                out.push((rel, std::fs::read(&path)?));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out)?;
+    Ok(out)
+}
+
+/// Fetch a skill from the repo. Prefers the tag matching this binary so the
+/// skill and the CLI it documents stay in step; falls back to `main` for dev
+/// builds whose version was never tagged.
+fn fetch_skill_from_github(skill: &str, dest: &Path) -> Result<usize> {
+    let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for git_ref in [tag.as_str(), "main"] {
+        match fetch_tree(&format!("{SKILLS_REPO_DIR}/{skill}"), git_ref, dest) {
+            Ok(n) if n > 0 => return Ok(n),
+            Ok(_) => last_err = Some(anyhow::anyhow!("{skill} is empty at {git_ref}")),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(dest);
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("could not fetch {skill}")))
+}
+
+/// Recursively download a repo directory through the GitHub contents API.
+fn fetch_tree(repo_path: &str, git_ref: &str, dest: &Path) -> Result<usize> {
+    let url = format!(
+        "https://api.github.com/repos/{}/contents/{repo_path}?ref={git_ref}",
+        manifest::GITHUB_REPO
+    );
+    let entries: Vec<serde_json::Value> = ureq::get(&url)
+        .set("User-Agent", "base-install")
+        .timeout(std::time::Duration::from_secs(SKILL_FETCH_TIMEOUT_SECS))
+        .call()
+        .with_context(|| format!("listing {repo_path}@{git_ref}"))?
+        .into_json()
+        .with_context(|| format!("parsing listing for {repo_path}@{git_ref}"))?;
+
+    std::fs::create_dir_all(dest)?;
+    let mut count = 0;
+    for entry in entries {
+        let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        match entry.get("type").and_then(|v| v.as_str()) {
+            Some("dir") => {
+                count += fetch_tree(&format!("{repo_path}/{name}"), git_ref, &dest.join(name))?;
+            }
+            Some("file") => {
+                let Some(download) = entry.get("download_url").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let body = ureq::get(download)
+                    .set("User-Agent", "base-install")
+                    .timeout(std::time::Duration::from_secs(SKILL_FETCH_TIMEOUT_SECS))
+                    .call()
+                    .with_context(|| format!("downloading {name}"))?
+                    .into_string()
+                    .with_context(|| format!("reading {name}"))?;
+                std::fs::write(dest.join(name), body)?;
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok(count)
+}
+
 /// Best-effort `pip install -r requirements.txt` for the AST extractor. Uses the
 /// resolved Python interpreter (`python` on Windows, `python3` on Unix) via
 /// `python -m pip`, which sidesteps the Microsoft Store `python3` stub. Never
@@ -1135,5 +1397,108 @@ mod tests {
         migrate_bracket_percent(&p);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
         assert!(bracket_of(&p).is_percent_mode());
+    }
+
+    // ─── Skill install ──────────────────────────────────────
+
+    /// Build a skill source tree shaped like the real one: SKILL.md plus a
+    /// references/ subdirectory, so the recursive paths are actually exercised.
+    fn make_skill_src(root: &Path, bank: &str) -> std::path::PathBuf {
+        let src = root.join("base-help");
+        std::fs::create_dir_all(src.join("references")).unwrap();
+        std::fs::write(src.join("SKILL.md"), "---\nname: base-help\n---\n").unwrap();
+        std::fs::write(src.join("README.md"), "readme\n").unwrap();
+        std::fs::write(src.join("references").join("qa.md"), bank).unwrap();
+        src
+    }
+
+    #[test]
+    fn copy_dir_all_recurses_and_counts_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = make_skill_src(tmp.path(), "pairs\n");
+        let dest = tmp.path().join("out");
+        assert_eq!(copy_dir_all(&src, &dest).unwrap(), 3);
+        assert!(dest.join("references").join("qa.md").is_file());
+    }
+
+    #[test]
+    fn dirs_identical_detects_nested_difference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = make_skill_src(&tmp.path().join("a"), "pairs\n");
+        let b = make_skill_src(&tmp.path().join("b"), "pairs\n");
+        assert!(dirs_identical(&a, &b));
+        std::fs::write(b.join("references").join("qa.md"), "different\n").unwrap();
+        assert!(!dirs_identical(&a, &b), "a nested change must not read as identical");
+    }
+
+    #[test]
+    fn install_one_skill_installs_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = make_skill_src(&tmp.path().join("repo"), "pairs\n");
+        let dest_root = tmp.path().join("skills");
+        std::fs::create_dir_all(&dest_root).unwrap();
+
+        let msg = install_one_skill("base-help", Some(&src), &dest_root).unwrap();
+        assert!(msg.contains("3 files"), "got: {msg}");
+        assert!(dest_root.join("base-help").join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn install_one_skill_is_a_noop_when_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = make_skill_src(&tmp.path().join("repo"), "pairs\n");
+        let dest_root = tmp.path().join("skills");
+        std::fs::create_dir_all(&dest_root).unwrap();
+
+        install_one_skill("base-help", Some(&src), &dest_root).unwrap();
+        let msg = install_one_skill("base-help", Some(&src), &dest_root).unwrap();
+        assert!(msg.contains("already current"), "got: {msg}");
+        let backups: Vec<_> = std::fs::read_dir(&dest_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
+            .collect();
+        assert!(backups.is_empty(), "an unchanged reinstall must not leave backups");
+    }
+
+    /// base-help appends to its own Q&A bank as it learns. A reinstall must not
+    /// discard those pairs — they get preserved beside the fresh copy.
+    #[test]
+    fn install_one_skill_backs_up_operator_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = make_skill_src(&tmp.path().join("repo"), "shipped pairs\n");
+        let dest_root = tmp.path().join("skills");
+        std::fs::create_dir_all(&dest_root).unwrap();
+
+        install_one_skill("base-help", Some(&src), &dest_root).unwrap();
+        // Operator's own appended pair.
+        let installed_bank = dest_root.join("base-help").join("references").join("qa.md");
+        std::fs::write(&installed_bank, "shipped pairs\n### Q: mine\n").unwrap();
+
+        let msg = install_one_skill("base-help", Some(&src), &dest_root).unwrap();
+        assert!(msg.contains("previous kept at"), "got: {msg}");
+
+        let backup = std::fs::read_dir(&dest_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().contains(".bak-"))
+            .expect("edited skill must be backed up");
+        let saved =
+            std::fs::read_to_string(backup.path().join("references").join("qa.md")).unwrap();
+        assert!(saved.contains("### Q: mine"), "operator's pair must survive");
+        // And the fresh copy is in place.
+        assert_eq!(std::fs::read_to_string(&installed_bank).unwrap(), "shipped pairs\n");
+    }
+
+    #[test]
+    fn install_one_skill_leaves_nothing_behind_when_source_is_bad() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest_root = tmp.path().join("skills");
+        std::fs::create_dir_all(&dest_root).unwrap();
+        let missing = tmp.path().join("nope");
+
+        assert!(install_one_skill("base-help", Some(&missing), &dest_root).is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(&dest_root).unwrap().filter_map(|e| e.ok()).collect();
+        assert!(leftovers.is_empty(), "a failed install must not leave staging dirs");
     }
 }
