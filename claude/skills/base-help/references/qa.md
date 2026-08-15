@@ -277,7 +277,7 @@ Forks are additive, registering a new one never archives existing forks or the p
 <!-- v0.11.0 | verified: source|reference -->
 
 ### Q: How do I add a rule to the global tier instead of the workspace?
-**A:** Pass `-g` (or `--global`) to `base rule` itself, before the subcommand: `base rule -g add --domain X --text "..."` and `base rule -g list --domain X`. Putting `-g` after `add` is invalid, it belongs on the `rule` command, not the subcommand. Note that `rule` is the ONLY command carrying a `-g/--global` flag in v0.11.0: `base entity`, `base learn`, `base decision`, and `base domain` have no such flag, so their tier is decided by where you run them (inside a registered workspace, or falling back to global outside one). Check with `base <sub> --help` before assuming a `-g` exists.
+**A:** Pass `-g` (or `--global`) to `base rule` itself, before the subcommand: `base rule -g add --domain X --text "..."` and `base rule -g list --domain X`. Putting `-g` after `add` is invalid, it belongs on the `rule` command, not the subcommand. Note that `rule` is the ONLY command carrying a `-g/--global` flag in v0.11.0: `base entity`, `base learn`, `base decision`, and `base domain` have no such flag, so their tier is decided by where you run them (inside a registered workspace, or falling back to global outside one). Check with `base help <sub>` before assuming a `-g` exists.
 <!-- v0.11.0 | verified: cli-help|source -->
 
 ---

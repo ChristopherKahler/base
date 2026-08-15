@@ -1,6 +1,6 @@
 # base command reference (v0.11.0)
 
-Verified against base v0.11.0 on 2026-08-13. If the installed version differs, re-check flags with `base <sub> --help` before asserting.
+Verified against base v0.11.0 on 2026-08-13. If the installed version differs, re-check flags with `base help <sub>` before asserting.
 
 ## Read-only, safe to run anytime
 

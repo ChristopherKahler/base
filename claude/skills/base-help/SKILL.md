@@ -2,7 +2,7 @@
 name: 'base-help'
 description: 'Coach mode for the `base` CLI: teaches what to do and why, rather than just answering. Use for any question about base (how to use it, what it can do for me, star commands, handoffs, forks, rules, domains, recall, AST queries, sync, the graph), or when a base command errors or behaves unexpectedly. Also invoked directly as /base-help [question].'
 argument-hint: '[question]'
-allowed-tools: 'Bash(grep *), Bash(rg *), Bash(which base), Bash(base --version), Bash(base doctor), Bash(base * --help), Bash(base --help), Bash(base commands list), Bash(base commands show *), Bash(base recall *), Bash(base decision search *), Bash(base handoff list), Bash(base fork list), Bash(base ast list), Bash(base ast query *), Bash(base context *), Bash(base relay board), Bash(base relay sessions), Bash(base relay tasks), Bash(base rule list *), Bash(base project list), Bash(base operator show), Bash(ls ~/.base-gbl/*)'
+allowed-tools: 'Read, Write, Edit, Bash(grep *), Bash(rg *), Bash(which base), Bash(base --version), Bash(base doctor), Bash(base help *), Bash(base --help), Bash(base commands list), Bash(base commands show *), Bash(base recall *), Bash(base decision search *), Bash(base handoff list), Bash(base fork list), Bash(base ast list), Bash(base ast query *), Bash(base context *), Bash(base relay board), Bash(base relay sessions), Bash(base relay tasks), Bash(base rule list *), Bash(base project list), Bash(base operator show), Bash(ls ~/.base-gbl/*)'
 ---
 
 # base-help: coach mode
@@ -37,7 +37,7 @@ Try 2-3 keyword variants (the user's words, plus the base term for the concept: 
 
 - **Bank hit + universal question** → answer from the pair directly, in coach format (below). Near-instant, no searching.
 - **Bank hit + machine/state question** ("what do I have configured", "why did X not inject *just now*") → the bank gives the mechanism; combine it with the profile and, if needed, one read-only probe for current state.
-- **Bank miss, or installed version differs from the bank's stamp** → verify live: `base <sub> --help`, `base commands show <name>`, `references/commands.md`, or the source checkout recorded in the profile. Then close the loop (below).
+- **Bank miss, or installed version differs from the bank's stamp** → verify live: `base help <sub>`, `base commands show <name>`, `references/commands.md`, or the source checkout recorded in the profile. Then close the loop (below).
 - **Exact syntax questions** → `references/commands.md` is faster than the bank.
 
 Trust order when they disagree: live CLI output > source code > qa.md > memory. If the bank is wrong, fix the pair, don't just answer around it.
