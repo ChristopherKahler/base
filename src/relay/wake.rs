@@ -128,7 +128,10 @@ pub fn arm_block(title: &str) -> Option<String> {
          your compliance proof (`base relay board` shows it) and this nudge repeats until it is fresh.\n\
          STATUS LINE: whenever what you are working on changes, write one short line to \
          {inbox_disp}/.status (e.g. `echo \"building X\" > .../.status`) — the ping hub shows it \
-         on your session card so Chris sees live work state at a glance.\n"
+         on your session card so Chris sees live work state at a glance.\n\
+         PROJECT TAG: the moment you know which project this session serves (and again whenever \
+         it changes), run `base relay register --as {title} --project <project-name>` — every \
+         project ever named stays on your hub card as a filter keyword; nothing is removed.\n"
     ))
 }
 

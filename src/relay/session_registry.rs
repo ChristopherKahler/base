@@ -43,6 +43,11 @@ pub struct SessionEntry {
     /// every boot sequence) would otherwise shadow the session forever.
     #[serde(default)]
     pub auto: bool,
+    /// Every project that EVER touched this session (Chris spec 2026-08-17):
+    /// `register --project X` appends, nothing removes — the ping hub filters
+    /// session cards by these keywords.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
 }
 
 impl SessionEntry {
@@ -77,7 +82,7 @@ pub fn load() -> SessionRegistry {
 /// Bind (or re-bind) a title to the current session. Re-registering the same
 /// title with a fresh session id is the normal path — a new Claude session
 /// reclaims its stable title.
-pub fn register(title: &str, session_id: &str, cwd: &Path) -> Result<()> {
+pub fn register(title: &str, session_id: &str, cwd: &Path, project: Option<&str>) -> Result<()> {
     with_lock(|| {
         let mut reg = load();
         let now = now_iso();
@@ -87,6 +92,12 @@ pub fn register(title: &str, session_id: &str, cwd: &Path) -> Result<()> {
             registered_at: now.clone(),
             ..Default::default()
         });
+        if let Some(p) = project
+            && !p.is_empty()
+            && !entry.projects.iter().any(|x| x == p)
+        {
+            entry.projects.push(p.to_string());
+        }
         entry.session_id = session_id.to_string();
         entry.cwd = cwd.to_string_lossy().to_string();
         entry.workspace = workspace;
@@ -234,6 +245,7 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<String> {
                 last_heartbeat: now,
                 auto: true,
                 wt_session: std::env::var("WT_SESSION").unwrap_or_default(),
+                ..Default::default()
             },
         );
         save(&reg)?;

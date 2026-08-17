@@ -1998,7 +1998,7 @@ pub fn run() {
                     // that makes `*task <title>` deliverable. Always attempted.
                     match &sid {
                         Some(s) => {
-                            if let Err(e) = relay::session_registry::register(&title, s, &cwd) {
+                            if let Err(e) = relay::session_registry::register(&title, s, &cwd, project.as_deref()) {
                                 eprintln!("Warning: global session registry update failed: {e:#}");
                             }
                         }

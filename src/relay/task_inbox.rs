@@ -598,7 +598,7 @@ mod tests {
     /// Bind the receiver title to a session id in the global registry so
     /// deliver()'s session→titles resolution finds the inbox.
     fn bind(title: &str, session: &str, home: &Path) {
-        crate::relay::session_registry::register(title, session, home).unwrap();
+        crate::relay::session_registry::register(title, session, home, None).unwrap();
     }
 
     #[test]
@@ -686,7 +686,7 @@ mod tests {
         with_home(|home| {
             // Boot order in every real session: auto-name first, explicit second.
             let ghost = crate::relay::session_registry::touch("sess-g", home).unwrap();
-            crate::relay::session_registry::register("realname", "sess-g", home).unwrap();
+            crate::relay::session_registry::register("realname", "sess-g", home, None).unwrap();
             let titles = crate::relay::session_registry::titles_for("sess-g");
             assert_eq!(titles, vec!["realname".to_string()], "ghost '{ghost}' must be retired");
             // Re-touch must NOT resurrect a new codename — an explicit title exists.
