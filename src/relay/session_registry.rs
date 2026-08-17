@@ -32,6 +32,12 @@ pub struct SessionEntry {
     pub workspace: String,
     pub registered_at: String,
     pub last_heartbeat: String,
+    /// True when this title was auto-assigned from the codename wordlist.
+    /// An explicit `relay register` drops the session's auto titles — the
+    /// boot-order ghost (auto-name lands before the explicit register in
+    /// every boot sequence) would otherwise shadow the session forever.
+    #[serde(default)]
+    pub auto: bool,
 }
 
 impl SessionEntry {
@@ -80,6 +86,12 @@ pub fn register(title: &str, session_id: &str, cwd: &Path) -> Result<()> {
         entry.cwd = cwd.to_string_lossy().to_string();
         entry.workspace = workspace;
         entry.last_heartbeat = now;
+        entry.auto = false;
+        // Claiming a real title retires this session's auto-codename ghosts —
+        // otherwise every registered session carries a wordlist title it never
+        // asked for (and, under the wake contract, gets nudged to arm it).
+        reg.sessions
+            .retain(|_, e| !(e.session_id == session_id && e.auto && e.title != title));
         save(&reg)
     })
 }
@@ -196,6 +208,7 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<String> {
                 workspace: workspace_name(cwd),
                 registered_at: now.clone(),
                 last_heartbeat: now,
+                auto: true,
             },
         );
         save(&reg)?;

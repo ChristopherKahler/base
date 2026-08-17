@@ -663,6 +663,19 @@ mod tests {
     }
 
     #[test]
+    fn explicit_register_retires_auto_codename_ghost() {
+        with_home(|home| {
+            // Boot order in every real session: auto-name first, explicit second.
+            let ghost = crate::relay::session_registry::touch("sess-g", home).unwrap();
+            crate::relay::session_registry::register("realname", "sess-g", home).unwrap();
+            let titles = crate::relay::session_registry::titles_for("sess-g");
+            assert_eq!(titles, vec!["realname".to_string()], "ghost '{ghost}' must be retired");
+            // Re-touch must NOT resurrect a new codename — an explicit title exists.
+            assert_eq!(crate::relay::session_registry::touch("sess-g", home).unwrap(), "realname");
+        });
+    }
+
+    #[test]
     fn no_autoname_env_opts_out() {
         with_home(|home| {
             // SAFETY: guarded by ENV_LOCK via with_home.
