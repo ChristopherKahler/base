@@ -2230,6 +2230,47 @@ pub fn run() {
                              Register one: base relay register --as <title>"
                         );
                     }
+                    // Chris's output-style contract applies to his pipe
+                    // (2026-08-17): pings to chris are scored by his
+                    // style-guard (--text mode). Hard violation = the send is
+                    // REFUSED so the sender rewrites — same loop his Stop hook
+                    // runs on replies. Fail-open when the guard is absent.
+                    if to == "chris"
+                        && let Some(guard) = dirs::home_dir()
+                            .map(|h| h.join(".claude").join("hooks").join("style-guard.py"))
+                            .filter(|p| p.exists())
+                    {
+                        use std::io::Write as _;
+                        use std::process::{Command, Stdio};
+                        let run = Command::new("python")
+                            .arg(&guard)
+                            .arg("--text")
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::null())
+                            .spawn()
+                            .and_then(|mut ch| {
+                                if let Some(mut si) = ch.stdin.take() {
+                                    let _ = si.write_all(msg.as_bytes());
+                                }
+                                ch.wait_with_output()
+                            });
+                        if let Ok(out) = run {
+                            let verdict =
+                                String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            match out.status.code() {
+                                Some(2) => die(
+                                    "Ping to chris REFUSED by style guard",
+                                    anyhow::anyhow!(
+                                        "{verdict}. Rewrite in Chris's style — plain words, \
+                                         within budget, no banned phrases — and resend."
+                                    ),
+                                ),
+                                Some(1) => eprintln!("{verdict} — sent anyway; tighten next time."),
+                                _ => {}
+                            }
+                        }
+                    }
                     // Replying? Any pending inbound ping FROM the target in OUR
                     // inbox means this send is the answer — clear those now, and
                     // mark this ping a reply so it can't demand its own ack.
