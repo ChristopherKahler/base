@@ -111,8 +111,11 @@ pub fn arm_block(title: &str) -> Option<String> {
     Some(format!(
         "=== RELAY WAKE CONTRACT ({title}) — arm NOW, before your next action ===\n\
          No live wake monitor for your relay title \"{title}\" (sentinel stale or missing). \
-         Call the Monitor tool ONCE, exactly as below, then continue your task. Do not ask \
-         permission, do not verify beyond the tool call succeeding, do not send test pings. \
+         Call the Monitor tool ONCE, exactly as below, then continue your task. If Monitor is a \
+         deferred tool in your harness, load it FIRST (ToolSearch \"select:Monitor\") — a direct \
+         call fails with InputValidationError until the schema is loaded; do not give up on that \
+         error, load and retry. Do not ask permission, do not verify beyond the tool call \
+         succeeding, do not send test pings. \
          If THIS session already runs a monitor for \"{title}\" armed with THIS script (its loop \
          touches .watching), skip — never arm a duplicate. If your running monitor is an older \
          script that does not touch the sentinel, TaskStop it first, then arm this one.\n\n\
