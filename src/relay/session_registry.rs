@@ -228,7 +228,15 @@ fn pick_name(session_id: &str, reg: &SessionRegistry) -> String {
         let cand = WORDLIST[(start + k) % WORDLIST.len()];
         match reg.sessions.get(cand) {
             None => return cand.to_string(),
-            Some(e) if e.session_id == session_id || !e.alive() => return cand.to_string(),
+            Some(e) if e.session_id == session_id => return cand.to_string(),
+            // A stale heartbeat alone does not free a title: heartbeats only
+            // refresh at boundary hooks, so a long autonomous turn looks dead
+            // for many minutes while its wake monitor is provably alive. The
+            // sentinel is the stronger liveness signal — a spawned tab stole
+            // "heron" from a mid-build session exactly this way (2026-08-17).
+            Some(e) if !e.alive() && !super::wake::is_watching(cand) => {
+                return cand.to_string()
+            }
             _ => {}
         }
     }
