@@ -107,6 +107,39 @@ mod tests {
     /// through this — cargo test is multi-threaded and env is process-global.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Holds ENV_LOCK *and* scrubs BASE_RELAY_AS for the test's duration,
+    /// restoring the shell's value on drop.
+    ///
+    /// Serializing alone was never enough: the lock stopped tests from racing
+    /// each other but nothing cleared what the *shell* exported. A
+    /// wrapper-launched session (`cc work` sets BASE_RELAY_AS) made `deliver()`
+    /// resolve identity from the env instead of the registry binding, so every
+    /// message addressed to a registered title looked undeliverable.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: ENV_LOCK is still held — no other test reads this var.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("BASE_RELAY_AS", v),
+                    None => std::env::remove_var("BASE_RELAY_AS"),
+                }
+            }
+        }
+    }
+
+    fn env_guard() -> EnvGuard {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("BASE_RELAY_AS");
+        // SAFETY: guarded by ENV_LOCK — no other test reads this var concurrently.
+        unsafe { std::env::remove_var("BASE_RELAY_AS") };
+        EnvGuard { _lock, prev }
+    }
+
     fn setup(tmp: &Path) -> RelayStore {
         let base = tmp.join(".base");
         let s = RelayStore {
@@ -119,7 +152,7 @@ mod tests {
 
     #[test]
     fn delivers_to_registered_session_and_consumes() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let tmp = tempfile::tempdir().unwrap();
         let s = setup(tmp.path());
         s.register("quill", Some("sess-abc"), "/firm", None).unwrap();
@@ -135,7 +168,7 @@ mod tests {
 
     #[test]
     fn mid_turn_delivers_questions_between_tool_calls() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let tmp = tempfile::tempdir().unwrap();
         let s = setup(tmp.path());
         s.register("worker", Some("sess-w"), "/wt", None).unwrap();
@@ -152,7 +185,7 @@ mod tests {
 
     #[test]
     fn question_prompts_reply_instruction() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let tmp = tempfile::tempdir().unwrap();
         let s = setup(tmp.path());
         s.register("orch", Some("sess-1"), "/main", None).unwrap();
@@ -165,7 +198,7 @@ mod tests {
 
     #[test]
     fn unregistered_session_gets_notice_only_when_asked() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let tmp = tempfile::tempdir().unwrap();
         let s = setup(tmp.path());
         s.send("a", "b", "notify", "x", &[]).unwrap();
@@ -180,7 +213,7 @@ mod tests {
 
     #[test]
     fn env_identity_overrides_registry() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let tmp = tempfile::tempdir().unwrap();
         let s = setup(tmp.path());
         s.send("sterling", "quill", "notify", "for the env-bound member", &[]).unwrap();

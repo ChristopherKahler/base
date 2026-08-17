@@ -532,10 +532,16 @@ mod tests {
         // every fake session share one "tab" and steal titles across tests
         // (real WSL shells under Windows Terminal DO carry it).
         let prev_wt = std::env::var_os("WT_SESSION");
+        // BASE_RELAY_AS must not leak in either: auto_register prefers it over
+        // the wordlist pick, so a wrapper-launched shell (`cc work` exports it)
+        // hands EVERY fake session the same codename and the uniqueness
+        // assertions fail — 8 tests, contaminated-env only, never on CI.
+        let prev_as = std::env::var_os("BASE_RELAY_AS");
         // SAFETY: guarded by ENV_LOCK — no other test reads HOME concurrently.
         unsafe {
             std::env::set_var("HOME", tmp.path());
             std::env::remove_var("WT_SESSION");
+            std::env::remove_var("BASE_RELAY_AS");
         }
         let out = f(tmp.path());
         unsafe {
@@ -545,6 +551,9 @@ mod tests {
             }
             if let Some(w) = prev_wt {
                 std::env::set_var("WT_SESSION", w);
+            }
+            if let Some(a) = prev_as {
+                std::env::set_var("BASE_RELAY_AS", a);
             }
         }
         out
