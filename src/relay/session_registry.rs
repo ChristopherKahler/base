@@ -32,6 +32,11 @@ pub struct SessionEntry {
     pub workspace: String,
     pub registered_at: String,
     pub last_heartbeat: String,
+    /// Windows Terminal tab id (WT_SESSION env) captured at bind time. It
+    /// survives /clear — the new session in the same tab reclaims this title
+    /// instead of drawing a fresh codename (Chris's handoff→clear flow).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wt_session: String,
     /// True when this title was auto-assigned from the codename wordlist.
     /// An explicit `relay register` drops the session's auto titles — the
     /// boot-order ghost (auto-name lands before the explicit register in
@@ -87,6 +92,7 @@ pub fn register(title: &str, session_id: &str, cwd: &Path) -> Result<()> {
         entry.workspace = workspace;
         entry.last_heartbeat = now;
         entry.auto = false;
+        entry.wt_session = std::env::var("WT_SESSION").unwrap_or_default();
         // Claiming a real title retires this session's auto-codename ghosts —
         // otherwise every registered session carries a wordlist title it never
         // asked for (and, under the wake contract, gets nudged to arm it).
@@ -192,6 +198,24 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<String> {
         {
             return Ok(t);
         }
+        // Same-tab continuity: /clear starts a NEW session id in the SAME
+        // Windows Terminal tab (WT_SESSION persists). A title whose tab id
+        // matches ours but whose session id differs is this tab's
+        // predecessor — reclaim it instead of drawing a fresh codename, so
+        // Chris's handoff → /clear → resume flow keeps the window's name.
+        if let Ok(wt) = std::env::var("WT_SESSION")
+            && !wt.is_empty()
+            && let Some(prev) = reg
+                .sessions
+                .values_mut()
+                .find(|e| e.wt_session == wt && e.session_id != session_id)
+        {
+            prev.session_id = session_id.to_string();
+            prev.last_heartbeat = now_iso();
+            let t = prev.title.clone();
+            save(&reg)?;
+            return Ok(t);
+        }
         // BASE_RELAY_AS pins the codename at launch (e.g. `cc work` wrapper);
         // otherwise fall back to the random wordlist pick.
         let name = match std::env::var("BASE_RELAY_AS") {
@@ -209,6 +233,7 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<String> {
                 registered_at: now.clone(),
                 last_heartbeat: now,
                 auto: true,
+                wt_session: std::env::var("WT_SESSION").unwrap_or_default(),
             },
         );
         save(&reg)?;
