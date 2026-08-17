@@ -113,7 +113,9 @@ pub fn arm_block(title: &str) -> Option<String> {
          No live wake monitor for your relay title \"{title}\" (sentinel stale or missing). \
          Call the Monitor tool ONCE, exactly as below, then continue your task. Do not ask \
          permission, do not verify beyond the tool call succeeding, do not send test pings. \
-         If THIS session already has a running monitor for \"{title}\", skip — never arm a duplicate.\n\n\
+         If THIS session already runs a monitor for \"{title}\" armed with THIS script (its loop \
+         touches .watching), skip — never arm a duplicate. If your running monitor is an older \
+         script that does not touch the sentinel, TaskStop it first, then arm this one.\n\n\
          \x20 description: relay wake: {title}\n\
          \x20 persistent: true\n\
          \x20 command:\n{indented}\n\
