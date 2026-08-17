@@ -528,13 +528,23 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("HOME");
+        // WT_SESSION must not leak in: the tab-continuity reclaim would let
+        // every fake session share one "tab" and steal titles across tests
+        // (real WSL shells under Windows Terminal DO carry it).
+        let prev_wt = std::env::var_os("WT_SESSION");
         // SAFETY: guarded by ENV_LOCK — no other test reads HOME concurrently.
-        unsafe { std::env::set_var("HOME", tmp.path()) };
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::remove_var("WT_SESSION");
+        }
         let out = f(tmp.path());
         unsafe {
             match prev {
                 Some(p) => std::env::set_var("HOME", p),
                 None => std::env::remove_var("HOME"),
+            }
+            if let Some(w) = prev_wt {
+                std::env::set_var("WT_SESSION", w);
             }
         }
         out
