@@ -107,7 +107,7 @@ fn inbox_root() -> Option<PathBuf> {
     super::session_registry::global_base_dir().map(|d| d.join("relay-inbox"))
 }
 
-fn title_dir(title: &str) -> Option<PathBuf> {
+pub(crate) fn title_dir(title: &str) -> Option<PathBuf> {
     inbox_root().map(|r| r.join(sanitize(title)))
 }
 

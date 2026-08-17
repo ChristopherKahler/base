@@ -2027,6 +2027,15 @@ pub fn run() {
                                 .unwrap_or_else(|| " (no session binding — hook delivery needs CLAUDE_CODE_SESSION_ID)".into())
                         ),
                     }
+                    // Wake contract, in-band: registration is often a boot
+                    // sequence's last tool call, so the arming block must ride
+                    // the register output itself — a hook nudge on the NEXT
+                    // tool call never fires if the session goes idle here.
+                    if !base::relay::wake::is_watching(&title)
+                        && let Some(block) = base::relay::wake::arm_block(&title)
+                    {
+                        println!("\n{block}");
+                    }
                 }
                 RelayAction::Send { to, mtype, msg, from, refs, project } => {
                     let store = match relay::resolve_store(&cwd, project.as_deref()) {
@@ -2198,6 +2207,12 @@ pub fn run() {
                         eprintln!(
                             "Warning: session '{to}' last seen {} ago — it may be dead. Pinging anyway.",
                             base::relay::age_str(&entry.last_heartbeat)
+                        );
+                    } else if !base::relay::wake::is_watching(&to) {
+                        eprintln!(
+                            "Note: '{to}' has no live wake monitor ({}) — if idle it will NOT wake; \
+                             the ping lands on its next tool call or prompt.",
+                            base::relay::wake::watch_cell(&to)
                         );
                     }
                     // Origin: explicit --from, else every title this session holds

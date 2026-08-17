@@ -46,8 +46,8 @@ fn print_store_board(store: &RelayStore) {
     );
 
     if !reg.sessions.is_empty() {
-        println!("\n| Session | Phase | Worktree | Bound | Last seen | Pending |");
-        println!("|---------|-------|----------|-------|-----------|---------|");
+        println!("\n| Session | Phase | Worktree | Bound | Last seen | Watching | Pending |");
+        println!("|---------|-------|----------|-------|-----------|----------|---------|");
         for entry in reg.sessions.values() {
             let alive = parse_ts(&entry.last_heartbeat)
                 .map(|t| (chrono::Local::now() - t).num_seconds() < DEAD_AFTER_SECS)
@@ -58,12 +58,13 @@ fn print_store_board(store: &RelayStore) {
                 format!("DEAD ({})", age_str(&entry.last_heartbeat))
             };
             println!(
-                "| {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} |",
                 entry.title,
                 entry.phase.as_deref().unwrap_or("-"),
                 entry.worktree,
                 if entry.session_id.is_some() { "✓" } else { "-" },
                 liveness,
+                super::wake::watch_cell(&entry.title),
                 store.pending_for(&entry.title).len(),
             );
         }

@@ -201,7 +201,23 @@ fn relay_task_tick(
     if boundary {
         let _ = crate::relay::session_registry::touch(session_id, cwd);
     }
-    crate::relay::task_inbox::deliver(session_id, phase)
+    let delivered = crate::relay::task_inbox::deliver(session_id, phase);
+    // Wake contract: any of this session's titles with a stale .watching
+    // sentinel gets its Monitor arming block re-injected — forced at
+    // session-start, throttled mid-turn. Stop is excluded: arming belongs at
+    // starts of activity, not turn ends.
+    let wake = (!matches!(phase, crate::relay::task_inbox::Phase::Stop))
+        .then(|| {
+            crate::relay::wake::arm_blocks_for(
+                session_id,
+                matches!(phase, crate::relay::task_inbox::Phase::SessionStart),
+            )
+        })
+        .flatten();
+    match (delivered, wake) {
+        (Some(d), Some(w)) => Some(format!("{d}\n{w}")),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Append a hook event to the JSONL log file. Fire-and-forget — never blocks hooks.
