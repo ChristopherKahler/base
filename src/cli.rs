@@ -2242,7 +2242,8 @@ pub fn run() {
                     {
                         use std::io::Write as _;
                         use std::process::{Command, Stdio};
-                        let run = Command::new("python")
+                        let py = if cfg!(windows) { "python" } else { "python3" };
+                        let run = Command::new(py)
                             .arg(&guard)
                             .arg("--text")
                             .stdin(Stdio::piped())
