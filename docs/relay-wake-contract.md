@@ -38,6 +38,13 @@ observable from outside the session.
 - `base relay ping` — warns the sender when the target's sentinel is stale:
   the ping will land on the target's next tool call or prompt, not mid-idle.
 
+## Opt-out
+
+`BASE_NO_WAKE_NUDGE=1` suppresses the hook-emitted arming blocks for a session
+whose harness has no Monitor tool (Agent SDK runs, brain.js NPC sessions) —
+otherwise every cooldown re-injects an instruction it can never follow. The
+in-band block on `relay register` still prints; it is output, not context.
+
 ## Rules
 
 - One monitor per title per session; the arming block says "never arm a

@@ -129,6 +129,11 @@ pub fn arm_block(title: &str) -> Option<String> {
 /// (session-start) bypasses the cooldown — a fresh context must always be
 /// told to arm.
 pub fn arm_blocks_for(session_id: &str, force: bool) -> Option<String> {
+    // Harnesses without a Monitor tool (Agent SDK runs, brain.js NPCs) can't
+    // comply — let them opt out instead of eating a nudge every cooldown.
+    if std::env::var_os("BASE_NO_WAKE_NUDGE").is_some() {
+        return None;
+    }
     let mut out = String::new();
     for title in super::session_registry::titles_for(session_id) {
         if is_watching(&title) {
