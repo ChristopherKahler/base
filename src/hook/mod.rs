@@ -202,6 +202,23 @@ fn relay_task_tick(
         let _ = crate::relay::session_registry::touch(session_id, cwd);
     }
     let delivered = crate::relay::task_inbox::deliver(session_id, phase);
+    // Star commands inside relayed pings resolve exactly like typed prompts
+    // (Chris directive 2026-08-17, spoken pings from the hub): scan the
+    // delivery block and append every matched command mode's rules.
+    let delivered = delivered.map(|block| {
+        let commands = crate::command::load_commands(cwd);
+        let matched = crate::command::match_commands(&block, &commands);
+        if matched.is_empty() {
+            block
+        } else {
+            let extra: String = matched
+                .iter()
+                .map(|c| crate::command::format_command_output(c))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{block}\n{extra}")
+        }
+    });
     // Wake contract: any of this session's titles with a stale .watching
     // sentinel gets its Monitor arming block re-injected — forced at
     // session-start, throttled mid-turn. Stop is excluded: arming belongs at
