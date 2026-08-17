@@ -106,6 +106,7 @@ done"#
 /// register`) when a title's sentinel is stale. A mandatory-first-action
 /// contract, not a suggestion.
 pub fn arm_block(title: &str) -> Option<String> {
+    let inbox_disp = title_dir(title)?.to_string_lossy().replace('\\', "/");
     let script = watch_script(title)?;
     let indented: String = script.lines().map(|l| format!("    {l}\n")).collect();
     Some(format!(
@@ -123,7 +124,10 @@ pub fn arm_block(title: &str) -> Option<String> {
          \x20 persistent: true\n\
          \x20 command:\n{indented}\n\
          While the monitor runs, its loop touches the .watching sentinel every 5s poll — that is \
-         your compliance proof (`base relay board` shows it) and this nudge repeats until it is fresh.\n"
+         your compliance proof (`base relay board` shows it) and this nudge repeats until it is fresh.\n\
+         STATUS LINE: whenever what you are working on changes, write one short line to \
+         {inbox_disp}/.status (e.g. `echo \"building X\" > .../.status`) — the ping hub shows it \
+         on your session card so Chris sees live work state at a glance.\n"
     ))
 }
 
