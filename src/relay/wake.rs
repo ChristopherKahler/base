@@ -92,7 +92,8 @@ while true; do
     for f in $(ls -1t "$INBOX" 2>/dev/null | head -5); do
       case "$seen" in *"$f|"*) continue;; esac
       from=$(grep -o '"from": *"[^"]*"' "$INBOX/$f" 2>/dev/null | head -1 | cut -d'"' -f4)
-      msg=$(tr -d '\n' < "$INBOX/$f" 2>/dev/null | cut -c1-400)
+      msg=$(tr -d '\n' < "$INBOX/$f" 2>/dev/null | sed -n 's/.*"summary": *"\(.*\)", *"doc".*/\1/p' | cut -c1-700)
+      [ -z "$msg" ] && msg=$(tr -d '\n' < "$INBOX/$f" 2>/dev/null | cut -c1-400)
       echo "RELAY PING from ${{from:-unknown}}: $msg"
     done
     seen=$cur
