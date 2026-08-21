@@ -254,10 +254,15 @@ def _resolve_source_file(
     file_node_id = file_membership.get(node_id)
     if not file_node_id:
         return fallback
+    # The file-node id is derived from the full path, so it is unique per file.
+    # Try it FIRST: the bare-name key below collapses every same-named file in
+    # the tree (`mod.rs`, `index.ts`, `__init__.py`) onto a single path, which
+    # silently mis-attributes their entities to one arbitrary winner.
+    if file_map and file_node_id in file_map:
+        return file_map[file_node_id]
     bare_name = node_labels.get(file_node_id, "")
     if not bare_name:
         return fallback
-    # Gap 3: use file_map to get relative path instead of bare filename
     if file_map and bare_name in file_map:
         return file_map[bare_name]
     return bare_name
@@ -356,12 +361,14 @@ def serialize(
         node_source = _resolve_source_file(
             node["id"], file_membership, node_labels, file_map, source_file
         )
-        # For file-level Module nodes, also use relative path as label
+        # For file-level Module nodes, also use relative path as label. A module
+        # node's own id IS its file-node id, so it resolves uniquely — the bare
+        # label is only a fallback (see _resolve_source_file).
         if node_type == "module" and file_map:
-            bare = node.get("label", "")
-            if bare in file_map:
-                label = _escape_literal(file_map[bare])
-                node_source = file_map[bare]
+            rel = file_map.get(node["id"]) or file_map.get(node.get("label", ""))
+            if rel:
+                label = _escape_literal(rel)
+                node_source = rel
 
         lines.append(f"{iri} a ops:{ops_type} ;")
         lines.append(f'    rdfs:label "{label}" ;')

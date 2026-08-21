@@ -9,7 +9,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from extractor import extract, _get_extractor, _safe_extract, collect_files
+from extractor import extract, _get_extractor, _safe_extract, collect_files, _make_id, _file_stem
 from ttl_serializer import serialize
 
 LANG_MAP = {
@@ -68,14 +68,33 @@ def extract_project(target: Path, project: str, full: bool = False, confirm: boo
 
     if full:
         result = extract(files, cache_root=target)
-        # Build file map: bare filename → relative path (for sourceFile resolution)
+        # Map every file to its relative path under every key a file node might
+        # carry, most specific first:
+        #
+        #   _make_id(relative path) — what multi-file extraction actually emits
+        #                             (`src/relay/mod.rs` -> `src_relay_mod_rs`)
+        #   _make_id(full path)     — single-file extraction, which sees an
+        #                             absolute path
+        #   _make_id(stem + suffix) — extractors that id by `parent.stem`
+        #   bare filename           — legacy fallback, still correct whenever the
+        #                             name is unique in the tree
+        #
+        # Every id form is unique per file; the bare name is NOT. Keying on the
+        # bare name alone collapsed every same-named file in the tree (every
+        # `mod.rs`, `index.ts`, `__init__.py`) onto whichever one was extracted
+        # last, so their entities were all attributed to one arbitrary wrong
+        # file — `base ast query --file src/relay/mod.rs` found nothing while
+        # its 270 entities sat under `src/update/mod.rs`.
         file_map = {}
         for f in files:
             try:
                 rel = str(f.relative_to(target))
             except ValueError:
                 rel = f.name
-            file_map[f.name] = rel
+            file_map[_make_id(rel)] = rel
+            file_map[_make_id(str(f))] = rel
+            file_map[_make_id(f"{_file_stem(f)}{f.suffix}")] = rel
+            file_map.setdefault(f.name, rel)
         return serialize(result, project, str(target), "multi", file_map=file_map)
 
     chunks = []
