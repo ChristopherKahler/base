@@ -294,6 +294,27 @@ fn run_inner(check_only: bool, force: bool, quiet: bool) -> Result<()> {
     run_verbose(check_only, force)
 }
 
+/// Where an automatic update should land: over the binary that is actually
+/// running, whenever that is a real writable path.
+///
+/// `install_dest()` names the canonical `~/.local/bin/base`, which is right for
+/// a manual `base update` but wrong to assume automatically — someone running
+/// base from `/usr/local/bin` or a cargo path would silently accumulate a second
+/// copy in `~/.local/bin` and never actually get the update they were given.
+/// Falls back to the canonical path when the running location can't be resolved
+/// or can't be written.
+fn auto_install_dest() -> Result<PathBuf> {
+    let canonical = install_dest()?;
+    let Ok(running) = std::env::current_exe() else {
+        return Ok(canonical);
+    };
+    let writable = running
+        .parent()
+        .map(|d| d.metadata().map(|m| !m.permissions().readonly()).unwrap_or(false))
+        .unwrap_or(false);
+    if writable { Ok(running) } else { Ok(canonical) }
+}
+
 /// The background path: no output, no ceremony, just get current.
 fn run_quiet(force: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
@@ -310,7 +331,7 @@ fn run_quiet(force: bool) -> Result<()> {
         if !force && !new_ver.is_empty() && is_current(current, &new_ver) {
             return Ok(());
         }
-        atomic_swap(&new_bin, &install_dest()?)
+        atomic_swap(&new_bin, &auto_install_dest()?)
     })();
     let _ = std::fs::remove_dir_all(&work);
     outcome
