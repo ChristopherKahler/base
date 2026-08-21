@@ -460,7 +460,7 @@ const GITIGNORE: &str = r#"/bin
 
 const README: &str = r#"# {{NAME}}
 
-A [BASE](https://chrisai.cv/skool) command-plugin (Bun). Scaffolded by `base ext scaffold`.
+A [BASE](https://www.skool.com/claude-code-titans-9203) command-plugin (Bun). Scaffolded by `base ext scaffold`.
 
 ## Build & install (local)
 

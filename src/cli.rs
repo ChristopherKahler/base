@@ -15,7 +15,7 @@ use base::scope;
     about = "BASE — Proactive context-injection engine for Claude Code",
     after_help = "Drop-in plugin commands (from extensions): run `base ext list`\n\n\
                   Built by Chris Kahler · Chris AI Systems\n\
-                  Community & support: https://chrisai.cv/skool\n\
+                  Community & support: https://www.skool.com/claude-code-titans-9203\n\
                   Tutorials: https://www.youtube.com/@chris-ai-systems"
 )]
 pub struct Cli {

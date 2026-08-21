@@ -37,7 +37,7 @@ pub fn run(target: &Path) -> Result<()> {
             format!(
                 r#"# BASE — Workspace domain triggers for {ws_name}
 # Built by Chris Kahler · Chris AI Systems
-# Community: https://chrisai.cv/skool
+# Community: https://www.skool.com/claude-code-titans-9203
 #
 # Workspace-specific triggers. Rules live in the graph (base rule add/list/remove).
 # Global domains in ~/.base-gbl/domains.toml apply everywhere.
@@ -130,7 +130,7 @@ pub fn run(target: &Path) -> Result<()> {
     println!("Chris AI Systems");
     println!();
     println!("Community & support:");
-    println!("  https://chrisai.cv/skool");
+    println!("  https://www.skool.com/claude-code-titans-9203");
     println!("───────────────────────────────────────");
 
     Ok(())

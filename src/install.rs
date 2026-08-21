@@ -90,7 +90,7 @@ pub fn run(
     println!("Chris AI Systems");
     println!();
     println!("Community & support:");
-    println!("  https://chrisai.cv/skool");
+    println!("  https://www.skool.com/claude-code-titans-9203");
     println!();
     println!("Tutorials:");
     println!("  https://www.youtube.com/@chris-ai-systems");
@@ -436,7 +436,7 @@ fn create_global_tier(global_dir: &Path) -> Result<()> {
             &base_toml,
             r#"# BASE — Proactive context-injection engine for Claude Code
 # Built by Chris Kahler · Chris AI Systems
-# Community: https://chrisai.cv/skool
+# Community: https://www.skool.com/claude-code-titans-9203
 
 # Each [section] documents what it does, what it runs at session-start, and what
 # every knob controls. Set enabled = false to silence a whole section.
@@ -553,7 +553,7 @@ stale_days = 7            # a working project untouched this many days → auto-
             &domains_toml,
             r#"# BASE — Domain configuration
 # Built by Chris Kahler · Chris AI Systems
-# Community: https://chrisai.cv/skool
+# Community: https://www.skool.com/claude-code-titans-9203
 #
 # Global domains — loaded in every workspace.
 # Workspace-specific domains go in {workspace}/.base/domains.toml
@@ -620,7 +620,7 @@ rules = []
 # Declare only the hooks your framework needs.
 #
 # Built by Chris Kahler · Chris AI Systems
-# Community: https://chrisai.cv/skool
+# Community: https://www.skool.com/claude-code-titans-9203
 # ═══════════════════════════════════════════════════════════
 
 [extension]
@@ -1301,7 +1301,7 @@ Each app keeps its own self-contained map at `<app>/.base-ast/ast.ttl`, register
 - Rules, decisions, notes, and projects are graph entities with relational edges
 - `domains.toml` defines triggers only (keywords, paths) — rule content lives in the graph
 - `~/.base-gbl/` = global tier, `{workspace}/.base/` = workspace tier
-- Built by Chris Kahler · Chris AI Systems · https://chrisai.cv/skool
+- Built by Chris Kahler · Chris AI Systems · https://www.skool.com/claude-code-titans-9203
 "#;
 
 // ─── Step 8: Write manifest ─────────────────────────────────

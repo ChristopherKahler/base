@@ -41,7 +41,7 @@
 <!-- v0.11.0 | verified: reference -->
 
 ### Q: Who makes base, and where do I get support or tutorials?
-**A:** base is built by Chris Kahler of Chris AI Systems. Community and support live at `https://chrisai.cv/skool`, and tutorials are on YouTube at `@chris-ai-systems`. This is printed at the bottom of `base --help`.
+**A:** base is built by Chris Kahler of Chris AI Systems. Community and support live at `https://www.skool.com/claude-code-titans-9203`, and tutorials are on YouTube at `@chris-ai-systems`. This is printed at the bottom of `base --help`.
 <!-- v0.11.0 | verified: cli-help -->
 
 ---
@@ -629,7 +629,7 @@ Forks are additive, registering a new one never archives existing forks or the p
 <!-- v0.11.0 | verified: cli-help -->
 
 ### Q: Where does base actually get its updates from?
-**A:** `base update` pulls from a license-gated ChrisAI distribution channel. Specifically: the `base` component itself is checked against GitHub releases (`fetch_github_version`), while other ChrisAI components (PAUL, SEED, SKILLSMITH, etc.) are checked against npm packages. The default source recorded in the manifest is `https://chrisai.cv/skool`.
+**A:** `base update` pulls from a license-gated ChrisAI distribution channel. Specifically: the `base` component itself is checked against GitHub releases (`fetch_github_version`), while other ChrisAI components (PAUL, SEED, SKILLSMITH, etc.) are checked against npm packages. The default source recorded in the manifest is `https://www.skool.com/claude-code-titans-9203`.
 <!-- v0.11.0 | verified: source -->
 
 ### Q: What's in the manifest.toml file and why does it matter for updates?

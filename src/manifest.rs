@@ -52,7 +52,7 @@ pub struct UpdateCheck {
 }
 
 fn default_source() -> String {
-    "https://chrisai.cv/skool".into()
+    "https://www.skool.com/claude-code-titans-9203".into()
 }
 
 fn default_ttl() -> u64 {
@@ -235,7 +235,7 @@ pub fn activate(key: &str) -> Result<()> {
     if hash_key(key) != ACTIVATION_KEY_HASH {
         println!("════════════════════════════════════════");
         println!("⛔ Invalid activation key.\n");
-        println!("Get your key at https://chrisai.cv/skool");
+        println!("Get your key at https://www.skool.com/claude-code-titans-9203");
         println!("════════════════════════════════════════");
         anyhow::bail!("Invalid activation key");
     }
@@ -249,11 +249,11 @@ pub fn activate(key: &str) -> Result<()> {
 
     manifest.save()?;
 
-    println!("════════════════════════════════════════");
+    println!("════════════════════════════════════════════════════════════════");
     println!("✓ Activated — attribution removed.\n");
     println!("Thank you for being a ChrisAI member.");
-    println!("Chris AI Systems · https://chrisai.cv/skool");
-    println!("════════════════════════════════════════");
+    println!("Chris AI Systems · https://www.skool.com/claude-code-titans-9203");
+    println!("════════════════════════════════════════════════════════════════");
 
     Ok(())
 }
@@ -374,14 +374,14 @@ pub fn check_for_updates(manifest: &mut Manifest) -> Result<Option<String>> {
 /// Format the persistent update banner.
 pub fn format_update_banner(pending: &str) -> String {
     format!(
-        "\n═══════════════════════════════════════\n\
+        "\n═══════════════════════════════════════════════════════════════════\n\
          🔄 ChrisAI update available\n\
          \x20  {pending}\n\
          \n\
          \x20  Run: base update\n\
          \x20  Snooze 24h: base update --snooze\n\
-         \x20  Chris AI Systems · https://chrisai.cv/skool\n\
-         ═══════════════════════════════════════\n"
+         \x20  Chris AI Systems · https://www.skool.com/claude-code-titans-9203\n\
+         ═══════════════════════════════════════════════════════════════════\n"
     )
 }
 
@@ -453,7 +453,7 @@ mod tests {
         let manifest = Manifest {
             chrisai: ChrisAiSection {
                 installed_at: "2026-06-03T15:00:00-05:00".to_string(),
-                source: "https://chrisai.cv/skool".to_string(),
+                source: "https://www.skool.com/claude-code-titans-9203".to_string(),
                 token: String::new(),
             },
             components,

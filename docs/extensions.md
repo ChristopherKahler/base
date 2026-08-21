@@ -117,4 +117,4 @@ First consumer: the **design-humanizer** skill ships `design-humanizer.toml` wit
 - Keep `message` short and actionable — it's an interruption; make it earn the space.
 - To uninstall a reflex, remove the handler (or the whole `.toml`). No deregistration step.
 
-*Built by Chris Kahler · Chris AI Systems · https://chrisai.cv/skool*
+*Built by Chris Kahler · Chris AI Systems · https://www.skool.com/claude-code-titans-9203*

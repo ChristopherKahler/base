@@ -221,4 +221,4 @@ basemode is source-available under the [PolyForm Noncommercial License 1.0.0](LI
 ---
 
 Built by Chris Kahler
-[Chris AI Systems](https://chrisai.cv) / [Community](https://chrisai.cv/skool) / [YouTube](https://www.youtube.com/@chris-ai-systems)
+[Chris AI Systems](https://chrisai.cv) / [Community](https://www.skool.com/claude-code-titans-9203) / [YouTube](https://www.youtube.com/@chris-ai-systems)

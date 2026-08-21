@@ -118,7 +118,7 @@ pub fn init(name: &str) -> Result<()> {
         format!(
             r#"# BASE — Operator Profile
 # Built by Chris Kahler · Chris AI Systems
-# Community: https://chrisai.cv/skool
+# Community: https://www.skool.com/claude-code-titans-9203
 #
 # This profile injects on every session start.
 # Edit these fields to match your identity and goals.

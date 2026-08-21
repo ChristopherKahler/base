@@ -172,6 +172,73 @@ fn find_base_binary(dir: &Path, depth: u32) -> Option<PathBuf> {
     None
 }
 
+/// Copy the release's `scripts/` over the installed ones.
+///
+/// Not everything base ships is inside the binary: AST extraction is Python,
+/// living in `~/.base-gbl/scripts/ast/`. Updating only the binary meant a fix
+/// on that side could never reach anyone through `base update` — it needed a
+/// full re-`install`, which nobody would know to run. Since the release tarball
+/// already carries `scripts/`, refresh them alongside the binary.
+///
+/// Best-effort: a failure here must never fail the binary update, which is the
+/// part that matters. Returns how many files were replaced.
+fn refresh_scripts(extract_root: &Path) -> usize {
+    let Some(src) = find_scripts_dir(extract_root, 3) else {
+        return 0;
+    };
+    let Some(dest) = dirs::home_dir().map(|h| h.join(".base-gbl").join("scripts")) else {
+        return 0;
+    };
+    copy_tree(&src, &dest)
+}
+
+fn find_scripts_dir(dir: &Path, depth: u32) -> Option<PathBuf> {
+    let direct = dir.join("scripts");
+    if direct.is_dir() {
+        return Some(direct);
+    }
+    if depth == 0 {
+        return None;
+    }
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir()
+            && let Some(found) = find_scripts_dir(&p, depth - 1)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Recursive copy, overwriting. Skips `__pycache__`, whose stale `.pyc` files
+/// would otherwise shadow the very modules being replaced.
+fn copy_tree(src: &Path, dest: &Path) -> usize {
+    let mut n = 0;
+    if std::fs::create_dir_all(dest).is_err() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let name = entry.file_name();
+        if name == "__pycache__" {
+            continue;
+        }
+        let to = dest.join(&name);
+        if from.is_dir() {
+            n += copy_tree(&from, &to);
+        } else if std::fs::copy(&from, &to).is_ok() {
+            n += 1;
+        }
+    }
+    // A stale cache next to freshly-copied sources is worse than none.
+    let _ = std::fs::remove_dir_all(dest.join("ast").join("__pycache__"));
+    n
+}
+
 /// `<binary> --version` → the version token (e.g. "base 0.9.0" → "0.9.0").
 fn binary_version(bin: &Path) -> Option<String> {
     let out = std::process::Command::new(bin).arg("--version").output().ok()?;
@@ -331,7 +398,9 @@ fn run_quiet(force: bool) -> Result<()> {
         if !force && !new_ver.is_empty() && is_current(current, &new_ver) {
             return Ok(());
         }
-        atomic_swap(&new_bin, &auto_install_dest()?)
+        atomic_swap(&new_bin, &auto_install_dest()?)?;
+        refresh_scripts(&work.join("x"));
+        Ok(())
     })();
     let _ = std::fs::remove_dir_all(&work);
     outcome
@@ -371,8 +440,11 @@ fn run_verbose(check_only: bool, force: bool) -> Result<()> {
         atomic_swap(&new_bin, &dest)?;
         let shown = if new_ver.is_empty() { "(new)".to_string() } else { new_ver };
         println!("✓ updated: {} is now base {shown}", dest.display());
-        println!("  (only the binary was touched — shipped docs/hooks unchanged;");
-        println!("   run `base install` if a release adds new ones.)");
+        let n = refresh_scripts(&work.join("x"));
+        if n > 0 {
+            println!("✓ refreshed {n} shipped script file(s) in ~/.base-gbl/scripts/");
+        }
+        println!("  (hooks and docs are unchanged — run `base install` if a release adds new ones.)");
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(&work);
