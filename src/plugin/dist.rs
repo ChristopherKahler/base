@@ -1,4 +1,4 @@
-//! Cross-platform plugin distribution — P2 of PLUGIN-DIST-SPEC.md.
+//! Cross-platform plugin distribution.
 //!
 //! `base ext add <manifest>` reads the manifest's optional `[dist]` block, detects
 //! the host OS/arch, fetches the matching prebuilt binary from the plugin's GitHub
