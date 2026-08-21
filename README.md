@@ -69,6 +69,15 @@ It imports the MSVC developer environment, resolves LLVM/libclang (bindgen needs
 
 </details>
 
+### Staying current
+
+base keeps itself up to date. Session start checks for a new release and, when there is one, installs it in a detached background process — no download in your way, no output, nothing to run. The swap is an atomic rename, so the session you are in keeps the binary it started with and the next one comes up new.
+
+```bash
+base config set update.auto false   # pin this machine instead
+base update                         # or drive it by hand any time
+```
+
 ## See it work in five minutes
 
 ```bash

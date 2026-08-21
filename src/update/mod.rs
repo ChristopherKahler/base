@@ -215,9 +215,108 @@ fn atomic_swap(new_bin: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Marker for an in-flight background update. Without it, every session start
+/// during a slow download would spawn another updater.
+fn inflight_marker() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".base-gbl").join(".update-inflight"))
+}
+
+/// How long a marker is trusted before we assume the updater died mid-download.
+const INFLIGHT_STALE_SECS: u64 = 600;
+
+fn inflight_fresh(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|e| e.as_secs() < INFLIGHT_STALE_SECS)
+}
+
+/// Fire `base update` in a detached child and return immediately.
+///
+/// Session start must never wait on a multi-megabyte download, and the update
+/// itself must never be the reason a session is slow to come up. The child
+/// swaps the binary by atomic rename, so the session that spawned it keeps
+/// running the old inode and the NEXT session starts on the new version.
+///
+/// Silent by contract: stdout and stderr are discarded. A failed update is not
+/// something to interrupt someone's work with — the next session tries again.
+pub fn spawn_background_update() {
+    let Some(marker) = inflight_marker() else {
+        return;
+    };
+    if marker.exists() && inflight_fresh(&marker) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&marker, b"");
+
+    // Spawned and never waited on: the hook process exits immediately, the
+    // child is reparented and finishes the download on its own. All three
+    // stdio handles are null so nothing it does can print into a session.
+    let _ = std::process::Command::new(exe)
+        .arg("update")
+        .env("BASE_UPDATE_BACKGROUND", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Clear the in-flight marker. Called by the child when it finishes, so a
+/// genuinely stuck updater is the only thing that ever waits out the TTL.
+fn clear_inflight() {
+    if let Some(m) = inflight_marker() {
+        let _ = std::fs::remove_file(m);
+    }
+}
+
 /// `base update` — check GitHub releases, pull this platform's binary, atomic-swap.
 /// `check_only` stops after the version check; `force` installs even when current.
 pub fn run(check_only: bool, force: bool) -> Result<()> {
+    let background = std::env::var_os("BASE_UPDATE_BACKGROUND").is_some();
+    let out = run_inner(check_only, force, background);
+    if background {
+        clear_inflight();
+    }
+    out
+}
+
+fn run_inner(check_only: bool, force: bool, quiet: bool) -> Result<()> {
+    if quiet {
+        return run_quiet(force);
+    }
+    run_verbose(check_only, force)
+}
+
+/// The background path: no output, no ceremony, just get current.
+fn run_quiet(force: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let (latest, url) = fetch_latest_release()?;
+    if !force && is_current(current, &latest) {
+        return Ok(());
+    }
+    let work = std::env::temp_dir().join(format!("base-update-{}", std::process::id()));
+    std::fs::create_dir_all(&work)?;
+    let outcome = (|| -> Result<()> {
+        let archive = download_asset(&url, &work)?;
+        let new_bin = extract_and_locate(&archive, &work.join("x"))?;
+        let new_ver = binary_version(&new_bin).unwrap_or_default();
+        if !force && !new_ver.is_empty() && is_current(current, &new_ver) {
+            return Ok(());
+        }
+        atomic_swap(&new_bin, &install_dest()?)
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    outcome
+}
+
+fn run_verbose(check_only: bool, force: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     println!("base {current} — checking GitHub releases …");
 

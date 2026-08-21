@@ -131,6 +131,8 @@ pub struct BaseConfig {
     #[serde(default)]
     pub devmode: DevmodeConfig,
     #[serde(default)]
+    pub update: UpdateConfig,
+    #[serde(default)]
     pub grounding: GroundingConfig,
     #[serde(default)]
     pub graph: GraphConfig,
@@ -316,6 +318,31 @@ impl Default for BracketConfig {
 pub struct DevmodeConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+// ─── Update Config ──────────────────────────────────────────
+
+/// Self-update behavior. Session start is the trigger: when the periodic check
+/// finds a newer release, base installs it in a detached background process and
+/// says nothing. Everyone stays current without being asked to run anything, and
+/// nobody eats a download in the middle of a session — the swap is an atomic
+/// rename, so the running process keeps its inode and the next session is new.
+///
+/// Pin a machine with `base config set update.auto false`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateConfig {
+    #[serde(default = "default_auto_update")]
+    pub auto: bool,
+}
+
+fn default_auto_update() -> bool {
+    true
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self { auto: default_auto_update() }
+    }
 }
 
 // ─── Grounding Config (Phase 30) ────────────────────────────
@@ -675,4 +702,29 @@ fn merge_queries(base: Vec<QueryDef>, overlay: Vec<QueryDef>) -> Vec<QueryDef> {
         }
     }
     merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Auto-update is ON unless a machine opts out: everyone should land on the
+    // current release without being told to run anything. A regression here is
+    // silent — users simply stop getting updates — so pin the default.
+    #[test]
+    fn auto_update_defaults_on_and_survives_absent_config() {
+        assert!(UpdateConfig::default().auto);
+
+        // Absent [update] section entirely.
+        let c: BaseConfig = toml::from_str("").expect("empty config must parse");
+        assert!(c.update.auto, "a config with no [update] section must still auto-update");
+
+        // Section present but empty.
+        let c: BaseConfig = toml::from_str("[update]\n").unwrap();
+        assert!(c.update.auto);
+
+        // Explicit opt-out is honored.
+        let c: BaseConfig = toml::from_str("[update]\nauto = false\n").unwrap();
+        assert!(!c.update.auto);
+    }
 }

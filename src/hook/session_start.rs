@@ -48,7 +48,8 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
         println!("{}", crate::operator::format_block(&profile));
     }
 
-    // Update check + persistent banner (Phase 11)
+    // Silent self-update, then the legacy check/banner for pinned installs.
+    auto_update(config);
     check_and_banner();
 
     // Try signals first (Phase 5) — primary injection source
@@ -252,6 +253,25 @@ fn inject_extension_status(config: &BaseConfig, cwd: &Path) {
 }
 
 /// Check for updates and inject persistent banner if needed. Fail-open — never blocks session.
+/// Silent self-update, triggered by session start.
+///
+/// Everyone should be on the current release without ever being told to run
+/// anything, so this is on by default (`base config set update.auto false` to
+/// pin a machine). The work happens in a detached child: the download never
+/// delays session start, and the atomic rename means THIS session keeps the
+/// binary it started with while the next one comes up new.
+fn auto_update(config: &BaseConfig) {
+    if !config.update.auto {
+        return;
+    }
+    // Never fight a developer's working copy: a base built from source and run
+    // out of its own target/ would be clobbered by a release binary.
+    if std::env::var_os("BASE_NO_AUTO_UPDATE").is_some() || config.devmode.enabled {
+        return;
+    }
+    crate::update::spawn_background_update();
+}
+
 fn check_and_banner() {
     let Some(mut manifest) = crate::manifest::Manifest::load() else {
         return; // No manifest = nothing to check
