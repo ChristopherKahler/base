@@ -189,7 +189,7 @@ pub enum Commands {
         /// Activation key from ChrisAI community
         key: String,
     },
-    /// Self-update the base binary via the license-gated chrisai channel (or snooze the banner)
+    /// Self-update the base binary from public GitHub releases (or snooze the banner)
     Update {
         /// Re-validate + report whether a newer base is available, without installing
         #[arg(long)]

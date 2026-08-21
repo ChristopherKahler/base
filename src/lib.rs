@@ -17,7 +17,6 @@ pub mod graph;
 pub mod extract;
 pub mod hook;
 pub mod install;
-pub mod license;
 pub mod manifest;
 pub mod ontology;
 pub mod operator;
