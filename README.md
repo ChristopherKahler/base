@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-PolyForm_Noncommercial-0B63D6?style=flat-square" alt="License: PolyForm Noncommercial 1.0.0"></a>
-  <img src="https://img.shields.io/badge/version-0.12.3-12263A?style=flat-square" alt="Version 0.12.3">
+  <img src="https://img.shields.io/badge/version-0.13.0-12263A?style=flat-square" alt="Version 0.13.0">
   <img src="https://img.shields.io/badge/rust-single_binary-2F4A63?style=flat-square&logo=rust&logoColor=white" alt="Rust, single binary">
   <img src="https://img.shields.io/badge/built_for-Claude_Code-C2551F?style=flat-square" alt="Built for Claude Code">
 </p>
@@ -52,7 +52,7 @@ cd ~/my-workspace
 base scaffold
 ```
 
-Three commands. `base install` puts the binary in `~/.local/bin/base`, writes global config to `~/.base-gbl/`, and wires the hooks into `~/.claude/settings.json`. `base scaffold` creates `.base/` in your workspace.
+Three commands. `base install` puts the binary in `~/.local/bin/base`, writes global config to `~/.base-gbl/`, and wires the hooks into `~/.claude/settings.json`. It also offers the starter star commands — `*handoff`, `*fork`, `*base`, `*end` — so a fresh install has something to type on day one (`--starter-commands` / `--no-starter-commands` to answer without the prompt). `base scaffold` creates `.base/` in your workspace.
 
 <details>
 <summary><strong>Windows</strong></summary>

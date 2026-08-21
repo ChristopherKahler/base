@@ -8,6 +8,7 @@ fn ns() -> NamespaceConfig { NamespaceConfig::default() }
 #[test]
 fn entity_add_person() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let slug = crud::entity::add(tmp.path(), &ns(), "Charlie", "person", "GLOBAL", None).unwrap();
     assert_eq!(slug, "charlie");
 
@@ -26,6 +27,7 @@ fn entity_add_person() {
 #[test]
 fn goal_add_and_list() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     crud::goal::add(tmp.path(), &ns(), "Revenue", "$7k/mo").unwrap();
 
     let trig = tmp.path().join(".base").join("graph.nq");
@@ -45,6 +47,7 @@ fn goal_add_and_list() {
 #[test]
 fn reminder_add_and_remove() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     crud::reminder::add(tmp.path(), &ns(), "Check deploy", "2026-06-15", None).unwrap();
 
     // Verify exists
@@ -73,6 +76,7 @@ fn reminder_add_and_remove() {
 #[test]
 fn entity_update() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     crud::entity::add(tmp.path(), &ns(), "Charlie", "person", "GLOBAL", None).unwrap();
     crud::entity::update(tmp.path(), &ns(), "charlie", Some("inactive"), None).unwrap();
 

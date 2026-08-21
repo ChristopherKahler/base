@@ -34,6 +34,7 @@ fn seed_workspace(dir: &std::path::Path) {
 #[test]
 fn active_awareness_surfaces_recent_entities() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     seed_workspace(tmp.path());
 
     let config = test_config();
@@ -49,6 +50,7 @@ fn active_awareness_surfaces_recent_entities() {
 #[test]
 fn pulse_shows_counts() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     seed_workspace(tmp.path());
 
     let config = test_config();
@@ -62,6 +64,7 @@ fn pulse_shows_counts() {
 #[test]
 fn suppression_skips_unchanged_signals() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     seed_workspace(tmp.path());
 
     let config = test_config();
@@ -78,6 +81,7 @@ fn suppression_skips_unchanged_signals() {
 #[test]
 fn suppression_re_emits_on_change() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     seed_workspace(tmp.path());
 
     let config = test_config();
@@ -96,6 +100,7 @@ fn suppression_re_emits_on_change() {
 #[test]
 fn budget_cap_truncates() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     seed_workspace(tmp.path());
 
     let mut config = test_config();
@@ -110,6 +115,7 @@ fn budget_cap_truncates() {
 #[test]
 fn disabled_signals_emit_nothing() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     seed_workspace(tmp.path());
 
     let mut config = test_config();

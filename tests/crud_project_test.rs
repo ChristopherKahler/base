@@ -11,6 +11,7 @@ fn default_ns() -> NamespaceConfig {
 #[test]
 fn add_project_creates_triples() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     let slug = crud::project::add(tmp.path(), &ns, "Test Project", "active", None).unwrap();
@@ -35,6 +36,7 @@ fn add_project_creates_triples() {
 #[test]
 fn add_project_with_custom_path() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     crud::project::add(tmp.path(), &ns, "PathTest", "active", Some("/custom/path")).unwrap();
@@ -55,6 +57,7 @@ fn add_project_with_custom_path() {
 #[test]
 fn list_projects_runs() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     crud::project::add(tmp.path(), &ns, "Alpha", "active", None).unwrap();
@@ -69,6 +72,7 @@ fn list_projects_runs() {
 #[test]
 fn get_project_runs() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     crud::project::add(tmp.path(), &ns, "GetMe", "active", None).unwrap();
@@ -80,6 +84,7 @@ fn get_project_runs() {
 #[test]
 fn update_project_changes_status() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     crud::project::add(tmp.path(), &ns, "Updatable", "active", None).unwrap();
@@ -125,6 +130,7 @@ fn update_project_changes_status() {
 #[test]
 fn delete_project_refuses_nonempty_then_cascades() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     crud::project::add(tmp.path(), &ns, "Doomed", "active", None).unwrap();
@@ -149,6 +155,7 @@ fn delete_project_refuses_nonempty_then_cascades() {
 #[test]
 fn project_list_get_json_shape() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     crud::project::add(tmp.path(), &ns, "JsonProj", "active", Some("/tmp/x")).unwrap();

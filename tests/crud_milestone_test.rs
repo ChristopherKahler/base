@@ -8,6 +8,7 @@ fn ns() -> NamespaceConfig {
 #[test]
 fn delete_milestone_detaches_tasks_by_default() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let n = ns();
 
     crud::project::add(tmp.path(), &n, "Proj", "active", None).unwrap();
@@ -28,6 +29,7 @@ fn delete_milestone_detaches_tasks_by_default() {
 #[test]
 fn delete_milestone_force_cascades_tasks() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let n = ns();
 
     crud::project::add(tmp.path(), &n, "Proj", "active", None).unwrap();
@@ -43,6 +45,7 @@ fn delete_milestone_force_cascades_tasks() {
 #[test]
 fn milestone_list_get_json_shape() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let n = ns();
 
     crud::project::add(tmp.path(), &n, "Proj", "active", None).unwrap();

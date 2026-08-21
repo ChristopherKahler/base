@@ -310,6 +310,7 @@ mod tests {
     #[test]
     fn ingest_routes_to_home_graph_not_cwd() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
         let config = config_with(&["/ws/A", "/ws/B"]);
         let projects = vec![(
             PathBuf::from("/ws/A/proj/.paul/paul.toml"),
@@ -330,6 +331,7 @@ mod tests {
     #[test]
     fn ingest_unscoped_falls_back_to_cwd_slug() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
         let config = config_with(&["/ws/A"]); // does not cover the project's location
         let projects = vec![(
             PathBuf::from("/nope/elsewhere/proj/.paul/paul.toml"),

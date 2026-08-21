@@ -266,6 +266,40 @@ impl RelayStore {
         false
     }
 
+    /// Registry titles that should be woken for a message addressed to `to`.
+    ///
+    /// `relay send` writes into this workspace spool, but armed wake monitors
+    /// watch the GLOBAL relay-inbox — two different directories, so a send
+    /// could never fire a monitor (issue #9). The sender uses this to fan the
+    /// recipient spec (title, session id, "phase:<n>", "all") out to concrete
+    /// titles and drop a wake notification in each one's global inbox.
+    pub fn wake_targets(&self, to: &str, sender: &str) -> Vec<String> {
+        let probe = Message {
+            id: String::new(),
+            ts: String::new(),
+            from: sender.to_string(),
+            to: to.to_string(),
+            mtype: String::new(),
+            msg: String::new(),
+            refs: Vec::new(),
+        };
+        let reg = self.load_registry();
+        let mut titles: Vec<String> = reg
+            .sessions
+            .values()
+            .filter(|e| e.title != sender)
+            .filter(|e| Self::addressed_to(&probe, &e.title, e.session_id.as_deref(), e.phase.as_deref()))
+            .map(|e| e.title.clone())
+            .collect();
+        // A direct title send can target a session registered globally but not
+        // in this workspace store (cross-project --project sends). Let the
+        // caller try the global registry for it.
+        if titles.is_empty() && to != "all" && !to.starts_with("phase:") {
+            titles.push(to.to_string());
+        }
+        titles
+    }
+
     /// Unseen messages addressed to `title`. Does NOT mark seen.
     pub fn pending_for(&self, title: &str) -> Vec<Message> {
         let reg = self.load_registry();
@@ -666,6 +700,30 @@ mod tests {
         s.register("solo", Some("sess-1"), "/main", None).unwrap();
         s.send("solo", "all", "notify", "hello everyone", &[]).unwrap();
         assert!(s.pending_for("solo").is_empty());
+    }
+
+    #[test]
+    fn wake_targets_fan_out_matches_addressing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.register("orchestrator", Some("sess-1"), "/main", None).unwrap();
+        s.register("worker-p11", Some("sess-2"), "/wt/p11", Some("11")).unwrap();
+        s.register("worker-p12", Some("sess-3"), "/wt/p12", Some("12")).unwrap();
+
+        // Direct title → that title only.
+        assert_eq!(s.wake_targets("worker-p11", "orchestrator"), vec!["worker-p11"]);
+        // Session id → the title bound to it.
+        assert_eq!(s.wake_targets("sess-3", "orchestrator"), vec!["worker-p12"]);
+        // Phase → the member in that phase.
+        assert_eq!(s.wake_targets("phase:11", "orchestrator"), vec!["worker-p11"]);
+        // Broadcast → everyone except the sender.
+        let all = s.wake_targets("all", "orchestrator");
+        assert_eq!(all.len(), 2);
+        assert!(!all.contains(&"orchestrator".to_string()));
+        // Unknown direct title falls through for a global-registry lookup;
+        // unknown phase and broadcast never do.
+        assert_eq!(s.wake_targets("elsewhere", "orchestrator"), vec!["elsewhere"]);
+        assert!(s.wake_targets("phase:99", "orchestrator").is_empty());
     }
 
     #[test]

@@ -8,18 +8,20 @@ use crate::config::NamespaceConfig;
 use crate::crud;
 
 /// Resolve the target graph file + graph IRI for a write.
-/// Workspace tier when inside a workspace; otherwise the global catchall
-/// (`~/.base-gbl/.base/graph.nq`) so a handoff generated outside any workspace
-/// still lands somewhere it will resurface from.
+///
+/// Workspace tier, always. The old global catchall (issue #8) meant a handoff
+/// created outside a workspace landed in `~/.base-gbl` and then resurfaced at
+/// the start of every unrelated project, forever. Global is now something you
+/// opt into with `-g` — which routes cwd to `~/.base-gbl`, so this resolves it
+/// as that tier's workspace rather than as a silent fallback.
 fn write_tier(cwd: &Path, ns: &NamespaceConfig) -> Result<(PathBuf, String)> {
-    if let Some(base) = crate::config::find_workspace_base(cwd) {
-        let ws_slug = crud::workspace_slug(cwd);
-        Ok((base.join("graph.nq"), crud::workspace_graph_iri(ns, &ws_slug)))
-    } else {
-        let home = dirs::home_dir().context("no home directory")?;
-        let gbl = home.join(".base-gbl").join(".base").join("graph.nq");
-        Ok((gbl, format!("{}graph/global", ns.uri)))
-    }
+    let base = crate::config::find_workspace_base(cwd).context(
+        "no .base/ directory found — refusing to write outside a workspace. \
+         Use --global (-g) to file this against the global tier deliberately, \
+         or run `base scaffold` here first.",
+    )?;
+    let ws_slug = crud::workspace_slug(cwd);
+    Ok((base.join("graph.nq"), crud::workspace_graph_iri(ns, &ws_slug)))
 }
 
 /// Every existing graph file across tiers — used for tier-agnostic mutations

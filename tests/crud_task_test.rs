@@ -10,6 +10,7 @@ fn default_ns() -> NamespaceConfig {
 #[test]
 fn add_task_linked_to_project() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     // Create project first
@@ -44,6 +45,7 @@ fn add_task_linked_to_project() {
 #[test]
 fn list_tasks_by_project() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     crud::project::add(tmp.path(), &ns, "Proj", "active", None).unwrap();
@@ -57,6 +59,7 @@ fn list_tasks_by_project() {
 #[test]
 fn mark_task_done() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     crud::project::add(tmp.path(), &ns, "Proj", "active", None).unwrap();
@@ -94,6 +97,7 @@ fn mark_task_done() {
 #[test]
 fn add_task_default_priority() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     crud::project::add(tmp.path(), &ns, "Proj", "active", None).unwrap();
@@ -117,6 +121,7 @@ fn add_task_default_priority() {
 #[test]
 fn get_update_delete_task_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     crud::project::add(tmp.path(), &ns, "Proj", "active", None).unwrap();
@@ -168,6 +173,7 @@ fn get_update_delete_task_round_trip() {
 #[test]
 fn task_list_json_shape() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     crud::project::add(tmp.path(), &ns, "Proj", "active", None).unwrap();
@@ -189,6 +195,7 @@ fn task_list_json_shape() {
 #[test]
 fn task_tag_add_remove_and_filter() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let ns = default_ns();
 
     crud::project::add(tmp.path(), &ns, "Proj", "active", None).unwrap();

@@ -57,6 +57,9 @@ pub enum Commands {
     /// Log and search decisions
     #[command(visible_alias = "d")]
     Decision {
+        /// Target the global tier (~/.base-gbl/) instead of workspace
+        #[arg(long, short)]
+        global: bool,
         #[command(subcommand)]
         action: DecisionAction,
     },
@@ -80,11 +83,17 @@ pub enum Commands {
     },
     /// Manage session handoffs (resume docs surfaced at session start)
     Handoff {
+        /// Target the global tier (~/.base-gbl/) instead of workspace
+        #[arg(long, short)]
+        global: bool,
         #[command(subcommand)]
         action: HandoffAction,
     },
     /// Manage parallel side-work forks (build-specs surfaced at session start)
     Fork {
+        /// Target the global tier (~/.base-gbl/) instead of workspace
+        #[arg(long, short)]
+        global: bool,
         #[command(subcommand)]
         action: ForkAction,
     },
@@ -121,6 +130,9 @@ pub enum Commands {
     },
     /// Graph-backed structured memory
     Learn {
+        /// Target the global tier (~/.base-gbl/) instead of workspace
+        #[arg(long, short)]
+        global: bool,
         /// The memory text to store (required unless --mention, --remove, --update, or --list)
         #[arg(long)]
         text: Option<String>,
@@ -183,6 +195,12 @@ pub enum Commands {
         /// Register all ChrisAI components (PAUL, SEED, SKILLSMITH) in manifest
         #[arg(long)]
         full: bool,
+        /// Install the starter star commands without asking (*handoff, *fork, *base, *end)
+        #[arg(long)]
+        starter_commands: bool,
+        /// Skip the starter star commands without asking
+        #[arg(long, conflicts_with = "starter_commands")]
+        no_starter_commands: bool,
     },
     /// Activate ChrisAI — enter your Skool classroom key to remove attribution
     Activate {
@@ -1286,6 +1304,20 @@ fn die(prefix: &str, e: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+/// Which tier a write targets: `-g/--global` swaps cwd for `~/.base-gbl`, so
+/// the global tier is something you opt into rather than something you land in
+/// (issue #8). Without the flag, tier-bound writes resolve from cwd and fail
+/// loudly outside a workspace instead of silently discarding.
+fn tier_cwd(cwd: &std::path::Path, global: bool) -> std::path::PathBuf {
+    if !global {
+        return cwd.to_path_buf();
+    }
+    match dirs::home_dir() {
+        Some(h) => h.join(".base-gbl"),
+        None => die("Failed", "cannot determine home directory for --global"),
+    }
+}
+
 pub fn run() {
     let cli = Cli::parse();
     let cwd = match std::env::current_dir() {
@@ -1638,45 +1670,48 @@ pub fn run() {
         },
 
         // ─── Decision ────────────────────────────────────
-        Some(Commands::Decision { action }) => match action {
-            DecisionAction::Log { domain, decision, rationale, recall } => {
-                match crud::decision::log(&cwd, &config.namespace, &domain, &decision, &rationale, recall.as_deref()) {
-                    Ok(slug) => println!("Decision logged (slug: {slug})"),
-                    Err(e) => die("Failed", e),
-                }
-            }
-            DecisionAction::Search { keyword, json } => {
-                let r = if json {
-                    crud::decision::search_json(&cwd, &config.namespace, &keyword)
-                } else {
-                    crud::decision::search(&cwd, &config.namespace, &keyword)
-                };
-                if let Err(e) = r { die("Error", e); }
-            }
-            DecisionAction::Delete { keyword } => {
-                // Show what will be deleted first
-                if let Err(e) = crud::decision::search(&cwd, &config.namespace, &keyword) {
-                    die("Error", e);
-                } else {
-                    match crud::decision::delete(&cwd, &config.namespace, &keyword) {
-                        Ok(0) => println!("No decisions matching '{keyword}'."),
-                        Ok(n) => println!("Deleted {n} decision(s) matching '{keyword}'."),
+        Some(Commands::Decision { global, action }) => {
+            let cwd = tier_cwd(&cwd, global);
+            match action {
+                DecisionAction::Log { domain, decision, rationale, recall } => {
+                    match crud::decision::log(&cwd, &config.namespace, &domain, &decision, &rationale, recall.as_deref()) {
+                        Ok(slug) => println!("Decision logged (slug: {slug})"),
                         Err(e) => die("Failed", e),
                     }
                 }
-            }
-            DecisionAction::Update { slug, name, rationale, recall, status } => {
-                if let Some(s) = resolve(&cwd, &config.namespace, "decision", &slug) {
-                    match crud::decision::update(
-                        &cwd, &config.namespace, &s,
-                        name.as_deref(), rationale.as_deref(), recall.as_deref(), status.as_deref(),
-                    ) {
-                        Ok(()) => println!("Decision '{s}' updated"),
-                        Err(e) => die("Failed", e),
+                DecisionAction::Search { keyword, json } => {
+                    let r = if json {
+                        crud::decision::search_json(&cwd, &config.namespace, &keyword)
+                    } else {
+                        crud::decision::search(&cwd, &config.namespace, &keyword)
+                    };
+                    if let Err(e) = r { die("Error", e); }
+                }
+                DecisionAction::Delete { keyword } => {
+                    // Show what will be deleted first
+                    if let Err(e) = crud::decision::search(&cwd, &config.namespace, &keyword) {
+                        die("Error", e);
+                    } else {
+                        match crud::decision::delete(&cwd, &config.namespace, &keyword) {
+                            Ok(0) => println!("No decisions matching '{keyword}'."),
+                            Ok(n) => println!("Deleted {n} decision(s) matching '{keyword}'."),
+                            Err(e) => die("Failed", e),
+                        }
+                    }
+                }
+                DecisionAction::Update { slug, name, rationale, recall, status } => {
+                    if let Some(s) = resolve(&cwd, &config.namespace, "decision", &slug) {
+                        match crud::decision::update(
+                            &cwd, &config.namespace, &s,
+                            name.as_deref(), rationale.as_deref(), recall.as_deref(), status.as_deref(),
+                        ) {
+                            Ok(()) => println!("Decision '{s}' updated"),
+                            Err(e) => die("Failed", e),
+                        }
                     }
                 }
             }
-        },
+        }
 
         // ─── Entity ──────────────────────────────────────
         Some(Commands::Entity { action }) => match action {
@@ -1721,50 +1756,56 @@ pub fn run() {
         },
 
         // ─── Handoff ─────────────────────────────────────
-        Some(Commands::Handoff { action }) => match action {
-            HandoffAction::Create { project, doc, slug } => {
-                match crud::handoff::create(&cwd, &config.namespace, &project, &doc, slug.as_deref()) {
-                    Ok(slug) => println!("Handoff for '{project}' registered (slug: {slug})"),
-                    Err(e) => die("Failed", e),
+        Some(Commands::Handoff { global, action }) => {
+            let cwd = tier_cwd(&cwd, global);
+            match action {
+                HandoffAction::Create { project, doc, slug } => {
+                    match crud::handoff::create(&cwd, &config.namespace, &project, &doc, slug.as_deref()) {
+                        Ok(slug) => println!("Handoff for '{project}' registered (slug: {slug})"),
+                        Err(e) => die("Failed", e),
+                    }
+                }
+                HandoffAction::List => { if let Err(e) = crud::handoff::list(&cwd, &config.namespace) { die("Error", e); } }
+                HandoffAction::Snooze { slug, days } => {
+                    match crud::handoff::snooze(&cwd, &config.namespace, &slug, days) {
+                        Ok(()) => println!("Handoff '{slug}' snoozed {days}d"),
+                        Err(e) => die("Failed", e),
+                    }
+                }
+                HandoffAction::Archive { slug } => {
+                    match crud::handoff::archive(&cwd, &config.namespace, &slug) {
+                        Ok(()) => println!("Handoff '{slug}' archived"),
+                        Err(e) => die("Failed", e),
+                    }
                 }
             }
-            HandoffAction::List => { if let Err(e) = crud::handoff::list(&cwd, &config.namespace) { die("Error", e); } }
-            HandoffAction::Snooze { slug, days } => {
-                match crud::handoff::snooze(&cwd, &config.namespace, &slug, days) {
-                    Ok(()) => println!("Handoff '{slug}' snoozed {days}d"),
-                    Err(e) => die("Failed", e),
-                }
-            }
-            HandoffAction::Archive { slug } => {
-                match crud::handoff::archive(&cwd, &config.namespace, &slug) {
-                    Ok(()) => println!("Handoff '{slug}' archived"),
-                    Err(e) => die("Failed", e),
-                }
-            }
-        },
+        }
 
         // ─── Fork ────────────────────────────────────────
-        Some(Commands::Fork { action }) => match action {
-            ForkAction::Create { project, doc, slug } => {
-                match crud::handoff::create_fork(&cwd, &config.namespace, &project, &doc, slug.as_deref()) {
-                    Ok(slug) => println!("Fork '{slug}' registered for '{project}'"),
-                    Err(e) => die("Failed", e),
+        Some(Commands::Fork { global, action }) => {
+            let cwd = tier_cwd(&cwd, global);
+            match action {
+                ForkAction::Create { project, doc, slug } => {
+                    match crud::handoff::create_fork(&cwd, &config.namespace, &project, &doc, slug.as_deref()) {
+                        Ok(slug) => println!("Fork '{slug}' registered for '{project}'"),
+                        Err(e) => die("Failed", e),
+                    }
+                }
+                ForkAction::List => { if let Err(e) = crud::handoff::list_forks(&cwd, &config.namespace) { die("Error", e); } }
+                ForkAction::Snooze { slug, days } => {
+                    match crud::handoff::snooze(&cwd, &config.namespace, &slug, days) {
+                        Ok(()) => println!("Fork '{slug}' snoozed {days}d"),
+                        Err(e) => die("Failed", e),
+                    }
+                }
+                ForkAction::Archive { slug } => {
+                    match crud::handoff::archive(&cwd, &config.namespace, &slug) {
+                        Ok(()) => println!("Fork '{slug}' archived"),
+                        Err(e) => die("Failed", e),
+                    }
                 }
             }
-            ForkAction::List => { if let Err(e) = crud::handoff::list_forks(&cwd, &config.namespace) { die("Error", e); } }
-            ForkAction::Snooze { slug, days } => {
-                match crud::handoff::snooze(&cwd, &config.namespace, &slug, days) {
-                    Ok(()) => println!("Fork '{slug}' snoozed {days}d"),
-                    Err(e) => die("Failed", e),
-                }
-            }
-            ForkAction::Archive { slug } => {
-                match crud::handoff::archive(&cwd, &config.namespace, &slug) {
-                    Ok(()) => println!("Fork '{slug}' archived"),
-                    Err(e) => die("Failed", e),
-                }
-            }
-        },
+        }
         // ─── Reminder ────────────────────────────────────
         Some(Commands::Reminder { action }) => match action {
             ReminderAction::Add { name, due, at, in_dur } => {
@@ -2044,7 +2085,41 @@ pub fn run() {
                     };
                     let Some(sender) = need_identity(&store, from) else { return };
                     match store.send(&sender, &to, &mtype, &msg, &refs) {
-                        Ok(m) => println!("Sent {} → {} ({})", m.mtype, m.to, m.id),
+                        Ok(m) => {
+                            println!("Sent {} → {} ({})", m.mtype, m.to, m.id);
+                            // The spool holds the message; the wake monitor
+                            // watches the global relay-inbox. Drop a consumed-
+                            // on-announce notify there per recipient so a
+                            // watching session actually wakes (issue #9).
+                            let mut woken = 0usize;
+                            for t in store.wake_targets(&to, &sender) {
+                                let Some(entry) = relay::session_registry::resolve(&t) else {
+                                    continue;
+                                };
+                                let notify = base::relay::task_inbox::InboxTask {
+                                    slug: format!("notify-{}-{}", m.id, t),
+                                    summary: format!("[{}] {}", m.mtype, m.msg),
+                                    doc: String::new(),
+                                    from: sender.clone(),
+                                    to_title: t.clone(),
+                                    to_session: entry.session_id.clone(),
+                                    priority: "high".into(),
+                                    created: base::relay::now_iso(),
+                                    status: "pending".into(),
+                                    last_loud_session: String::new(),
+                                    last_alert_ts: String::new(),
+                                    kind: "notify".into(),
+                                    refs: refs.clone(),
+                                };
+                                match base::relay::task_inbox::enqueue(&config.namespace, &notify) {
+                                    Ok(_) => woken += 1,
+                                    Err(e) => eprintln!("Warning: wake notify for '{t}' failed: {e:#}"),
+                                }
+                            }
+                            if woken > 0 {
+                                println!("Wake notify → {woken} inbox(es); fires on the receiver's monitor or next tool call.");
+                            }
+                        }
                         Err(e) => die("Send failed", e),
                     }
                 }
@@ -2355,17 +2430,7 @@ pub fn run() {
 
         // ─── Rule ─────────────────────────────────────────
         Some(Commands::Rule { global, action }) => {
-            let rule_cwd = if global {
-                match dirs::home_dir() {
-                    Some(h) => h.join(".base-gbl"),
-                    None => {
-                        eprintln!("Failed: cannot determine home directory");
-                        return;
-                    }
-                }
-            } else {
-                cwd.clone()
-            };
+            let rule_cwd = tier_cwd(&cwd, global);
             match action {
                 RuleAction::Add { domain: name, text, rationale } => {
                     match crud::rule::add(&rule_cwd, &config.namespace, &name, &text, rationale.as_deref()) {
@@ -2388,7 +2453,8 @@ pub fn run() {
         },
 
         // ─── Learn ────────────────────────────────────────
-        Some(Commands::Learn { text, r#type, domain, project, entity, mention, context, remove, update, list }) => {
+        Some(Commands::Learn { global, text, r#type, domain, project, entity, mention, context, remove, update, list }) => {
+            let cwd = tier_cwd(&cwd, global);
             if list {
                 if let Err(e) = crud::note::list_notes(&cwd, &config.namespace, if r#type != "insight" { Some(&r#type) } else { None }, domain.as_deref()) {
                     die("Error", e);
@@ -2474,9 +2540,14 @@ pub fn run() {
         }
 
         // ─── Install ─────────────────────────────────────────
-        Some(Commands::Install { carl, skip_hooks, full }) => {
+        Some(Commands::Install { carl, skip_hooks, full, starter_commands, no_starter_commands }) => {
             let carl_path = carl.as_ref().map(std::path::Path::new);
-            if let Err(e) = base::install::run(carl_path, skip_hooks, full) {
+            let starter = match (starter_commands, no_starter_commands) {
+                (true, _) => base::install::StarterCommands::Yes,
+                (_, true) => base::install::StarterCommands::No,
+                _ => base::install::StarterCommands::Ask,
+            };
+            if let Err(e) = base::install::run(carl_path, skip_hooks, full, starter) {
                 eprintln!("Install failed: {e}");
             }
         }

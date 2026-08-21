@@ -5,8 +5,27 @@ use anyhow::{Context, Result};
 use crate::config::BaseConfig;
 use crate::manifest::{self, Manifest};
 
+/// The generic star-command pack offered at install. A fresh install otherwise
+/// ships zero commands, which leaves a new user with the machinery and no idea
+/// what to type first.
+const STARTER_COMMANDS: &str = include_str!("starter-commands.toml");
+
+/// What to do about the starter star commands: ask (interactive default),
+/// or a decision already made by flag for unattended installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StarterCommands {
+    Ask,
+    Yes,
+    No,
+}
+
 /// Run the full install process: build, symlink, create global tier, wire hooks, write manifest.
-pub fn run(carl_json_path: Option<&Path>, skip_hooks: bool, full: bool) -> Result<()> {
+pub fn run(
+    carl_json_path: Option<&Path>,
+    skip_hooks: bool,
+    full: bool,
+    starter: StarterCommands,
+) -> Result<()> {
     let home = dirs::home_dir().context("Cannot determine home directory")?;
     let binary_path = std::env::current_exe().context("Cannot determine binary path")?;
 
@@ -45,6 +64,9 @@ pub fn run(carl_json_path: Option<&Path>, skip_hooks: bool, full: bool) -> Resul
     // Step 6: Install bundled Claude skills (local checkout, else fetch)
     install_skills(&binary_path, &home)?;
 
+    // Step 6b: Offer the starter star commands
+    install_starter_commands(&global_dir, starter)?;
+
     // Step 7: Append BASE CLI section to ~/.claude/CLAUDE.md
     let claude_md = home.join(".claude").join("CLAUDE.md");
     append_claude_md(&claude_md)?;
@@ -75,6 +97,66 @@ pub fn run(carl_json_path: Option<&Path>, skip_hooks: bool, full: bool) -> Resul
     println!("───────────────────────────────────────");
 
     Ok(())
+}
+
+// ─── Starter star commands ──────────────────────────────────
+
+/// Write the generic star-command pack to the global tier, if wanted.
+///
+/// An existing `commands.toml` is NEVER touched: the user's own commands are
+/// the one thing here that cannot be regenerated. In that case this reports
+/// and returns.
+fn install_starter_commands(global_dir: &Path, choice: StarterCommands) -> Result<()> {
+    let path = global_dir.join("commands.toml");
+
+    if path.exists() {
+        println!("· Star commands: {} already exists — left untouched\n", path.display());
+        return Ok(());
+    }
+
+    let wanted = match choice {
+        StarterCommands::Yes => true,
+        StarterCommands::No => false,
+        // A non-interactive install (CI, piped installer) can't answer, and
+        // silently writing config nobody asked for is worse than shipping none.
+        StarterCommands::Ask if !std::io::IsTerminal::is_terminal(&std::io::stdin()) => false,
+        StarterCommands::Ask => prompt_starter_commands(),
+    };
+
+    if !wanted {
+        println!("⊘ Starter star commands skipped.");
+        println!("  Add them later:  base install --starter-commands\n");
+        return Ok(());
+    }
+
+    std::fs::write(&path, STARTER_COMMANDS)
+        .with_context(|| format!("writing {}", path.display()))?;
+    println!("✓ Starter star commands → {}", path.display());
+    println!("  *handoff  *fork  *base  *end   (see them: base commands list)\n");
+    Ok(())
+}
+
+/// Ask once. Anything that isn't an explicit yes is a no.
+fn prompt_starter_commands() -> bool {
+    use std::io::Write as _;
+    println!("Star commands are typed straight into a Claude Code chat (`*handoff`) to");
+    println!("switch its behavior for that turn. A fresh install ships none.");
+    println!();
+    println!("  *handoff  end a session so the next one resumes where you left off");
+    println!("  *fork     park side-work without derailing what you're doing");
+    println!("  *base     sweep this session's decisions and learnings into the graph");
+    println!("  *end      all three at once, to close out cleanly");
+    println!();
+    println!("They are plain TOML in ~/.base-gbl/commands.toml — edit or delete freely.");
+    print!("Install the starter pack? [Y/n] ");
+    let _ = std::io::stdout().flush();
+
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    let a = answer.trim().to_lowercase();
+    a.is_empty() || a == "y" || a == "yes"
 }
 
 // ─── Uninstall ──────────────────────────────────────────────
@@ -1500,5 +1582,41 @@ mod tests {
         assert!(install_one_skill("base-help", Some(&missing), &dest_root).is_err());
         let leftovers: Vec<_> = std::fs::read_dir(&dest_root).unwrap().filter_map(|e| e.ok()).collect();
         assert!(leftovers.is_empty(), "a failed install must not leave staging dirs");
+    }
+
+    // The starter pack ships embedded, so a TOML typo would only surface on a
+    // stranger's first install. Parse it here instead.
+    #[test]
+    fn starter_commands_pack_is_valid_and_complete() {
+        let cmds: Vec<crate::command::CommandDef> =
+            toml::from_str::<toml::Value>(super::STARTER_COMMANDS)
+                .expect("starter-commands.toml must parse")
+                .get("command")
+                .cloned()
+                .expect("must define [[command]] entries")
+                .try_into()
+                .expect("entries must match the CommandDef schema");
+
+        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["handoff", "fork", "base", "end"]);
+
+        for c in &cmds {
+            assert!(!c.description.is_empty(), "*{} needs a description", c.name);
+            assert!(c.rules.len() >= 4, "*{} is too thin to be useful", c.name);
+            assert!(
+                c.rules.iter().all(|r| !r.trim().is_empty()),
+                "*{} has an empty rule",
+                c.name
+            );
+        }
+
+        // Issue #8: the shipped commands must never teach the global fallback.
+        let handoff = cmds.iter().find(|c| c.name == "handoff").unwrap();
+        let body = handoff.rules.join(" ");
+        assert!(body.contains("base scaffold"), "handoff must be scaffold-first");
+        assert!(
+            body.contains("never write a handoff to the global tier"),
+            "handoff must forbid the global fallback"
+        );
     }
 }

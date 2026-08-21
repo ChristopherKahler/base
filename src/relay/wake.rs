@@ -84,7 +84,7 @@ fn watch_script(title: &str) -> Option<String> {
     Some(format!(
         r#"INBOX="{inbox}"
 mkdir -p "$INBOX"
-seen=$(ls -1 "$INBOX" 2>/dev/null | sort | tr '\n' '|')
+seen=""
 while true; do
   touch "$INBOX/.watching" 2>/dev/null
   cur=$(ls -1 "$INBOX" 2>/dev/null | sort | tr '\n' '|')

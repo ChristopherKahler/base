@@ -190,9 +190,16 @@ pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
 
         // A reply is IM-consumed: announced once, then gone. No obligation,
         // no reminders — otherwise every ack would demand its own ack.
-        if task.kind == "reply" {
+        // A notify (relay-send wake, issue #9) gets the same lifecycle: the
+        // durable message sits in the workspace spool for `relay poll`; this
+        // file exists only to wake the receiver once.
+        if task.kind == "reply" || task.kind == "notify" {
             if loud {
-                loud_blocks.push(render_reply(&task));
+                loud_blocks.push(if task.kind == "reply" {
+                    render_reply(&task)
+                } else {
+                    render_notify(&task)
+                });
                 let _ = std::fs::remove_file(&path);
             }
             continue;
@@ -326,6 +333,20 @@ fn render_reply(task: &InboxTask) -> String {
          {refs}\
          Consumed — no acknowledgment needed. Fold it into your work, continue, and mention it in one line of your response.\n\
          </relay-ping-reply>\n",
+        from = if task.from.is_empty() { "another session" } else { &task.from },
+        title = task.to_title,
+        msg = task.summary,
+        refs = refs_line(task),
+    )
+}
+
+fn render_notify(task: &InboxTask) -> String {
+    format!(
+        "<relay-message-inbound from=\"{from}\" to=\"{title}\">\n\
+         📨 RELAY MESSAGE from {from}: {msg}\n\
+         {refs}\
+         The full message queue is in the workspace relay spool — consume it now (marks it seen): base relay poll\n\
+         </relay-message-inbound>\n",
         from = if task.from.is_empty() { "another session" } else { &task.from },
         title = task.to_title,
         msg = task.summary,
@@ -768,6 +789,25 @@ mod tests {
             // Consumed on delivery — inbox empty, nothing re-fires.
             assert!(list_all().is_empty());
             assert!(deliver("sid-A", Phase::SessionStart).is_none());
+        });
+    }
+
+    #[test]
+    fn notify_announces_once_then_consumes() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("worker-p11", "sid-N", home);
+            enqueue(&ns, &sample_ping("notify", "orchestrator", "worker-p11", "sid-N", "[notify] contracts frozen")).unwrap();
+
+            let block = deliver("sid-N", Phase::Tool).expect("notify must announce");
+            assert!(block.contains("RELAY MESSAGE from orchestrator"));
+            assert!(block.contains("contracts frozen"));
+            assert!(block.contains("base relay poll"), "must route the receiver to the spool");
+            assert!(!block.contains("REPLY REQUIRED"), "a notify never demands an ack");
+
+            // Consumed on delivery — inbox empty, nothing re-fires.
+            assert!(list_all().is_empty());
+            assert!(deliver("sid-N", Phase::SessionStart).is_none());
         });
     }
 

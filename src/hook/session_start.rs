@@ -315,6 +315,12 @@ fn reconcile_active_state(config: &BaseConfig, cwd: &Path) {
 
 /// Scan all registered workspaces for paul.toml files and ingest into graph. Fail-silent.
 fn ingest_paul_projects(config: &BaseConfig, cwd: &Path) {
+    // No workspace here means there is nothing to ingest INTO. Skipping is
+    // correct and silent: a session opened in a scratch directory must never
+    // get a stray `.base/` scaffolded under it (issue #8).
+    if crate::config::find_workspace_base(cwd).is_none() {
+        return;
+    }
     let projects = crate::extract::paul_toml::scan_all_workspaces(config);
     if projects.is_empty() {
         return;

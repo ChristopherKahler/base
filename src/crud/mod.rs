@@ -133,20 +133,23 @@ pub fn now_iso() -> String {
 
 // ─── Graph pipeline ──────────────────────────────────────────
 
-/// Find or create the workspace `.base/` directory.
-fn find_or_create_base(cwd: &Path) -> Result<PathBuf> {
-    if let Some(base) = crate::config::find_workspace_base(cwd) {
-        Ok(base)
-    } else {
-        let base = cwd.join(".base");
-        std::fs::create_dir_all(&base).context("creating .base/ directory")?;
-        Ok(base)
-    }
+/// Find the workspace `.base/` directory for a tier-bound write.
+///
+/// Never auto-creates (issue #8): outside a workspace the data would land in
+/// a stray `.base/` that no later session resolves, so a success message here
+/// is indistinguishable from data loss. Fail loudly and name both escape
+/// hatches. Global-tier writers opt in by passing `~/.base-gbl` as cwd.
+fn require_base_for_write(cwd: &Path) -> Result<PathBuf> {
+    crate::config::find_workspace_base(cwd).context(
+        "no .base/ directory found — refusing to write outside a workspace. \
+         Use --global (-g) for the global tier, or run `base scaffold` to create a workspace.",
+    )
 }
 
-/// Load the workspace store. Creates .base/ and an empty store if graph.nq doesn't exist.
+/// Load the workspace store. Requires an existing .base/; creates an empty
+/// store only when graph.nq itself doesn't exist yet.
 pub fn load_workspace_store(cwd: &Path) -> Result<(Store, PathBuf)> {
-    let base_dir = find_or_create_base(cwd)?;
+    let base_dir = require_base_for_write(cwd)?;
     let trig_path = base_dir.join("graph.nq");
 
     let store = if trig_path.exists() {
@@ -464,5 +467,23 @@ mod tests {
             vec!["new".to_string()],
             "stale cross-graph value removed; single canonical value remains"
         );
+    }
+
+    // Issue #8: a tier-bound write outside a workspace must fail loudly and
+    // leave nothing behind. Silent success with a discarded write is
+    // indistinguishable from data loss.
+    #[test]
+    fn write_outside_workspace_fails_and_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ns = NamespaceConfig::default();
+
+        let err = load_and_mutate(tmp.path(), &ns, "INSERT DATA { GRAPH <urn:g> { <urn:s> <urn:p> \"v\" } }")
+            .expect_err("write outside a workspace must not succeed");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to write outside a workspace"), "got: {msg}");
+        assert!(msg.contains("--global"), "must name the global escape hatch: {msg}");
+        assert!(msg.contains("base scaffold"), "must name the scaffold escape hatch: {msg}");
+
+        assert!(!tmp.path().join(".base").exists(), "no stray .base/ may be created");
     }
 }

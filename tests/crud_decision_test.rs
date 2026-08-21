@@ -8,6 +8,7 @@ fn ns() -> NamespaceConfig { NamespaceConfig::default() }
 #[test]
 fn log_decision_creates_triples() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     let slug = crud::decision::log(
         tmp.path(), &ns(), "dev", "Use JWT", "Stateless auth", Some("auth, tokens"),
     ).unwrap();
@@ -28,6 +29,7 @@ fn log_decision_creates_triples() {
 #[test]
 fn search_finds_matching_decision() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     crud::decision::log(tmp.path(), &ns(), "auth", "Use JWT tokens", "Fast auth", None).unwrap();
     crud::decision::log(tmp.path(), &ns(), "db", "Use Postgres", "Reliable", None).unwrap();
 
@@ -39,6 +41,7 @@ fn search_finds_matching_decision() {
 #[test]
 fn update_decision_changes_fields() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     // Decisions carry a stable {domain}.{decision} slug — update addresses it directly.
     let slug = crud::decision::log(tmp.path(), &ns(), "arch", "Use oxigraph", "Embedded RDF", None).unwrap();
     assert_eq!(slug, "arch.use-oxigraph");
@@ -59,6 +62,7 @@ fn update_decision_changes_fields() {
 #[test]
 fn decision_search_json_shape() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     crud::decision::log(tmp.path(), &ns(), "db", "Use Postgres", "Reliable", Some("db, sql")).unwrap();
 
     let rows = crud::decision::search_data(tmp.path(), &ns(), "postgres").unwrap();

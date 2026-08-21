@@ -148,6 +148,7 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
             report
         })
         .collect();
+    warnings.extend(leaked_global_handoffs());
     let config_errors = crate::command::check_command_files(cwd);
     let healthy = tiers.iter().all(|t| t.status != "unhealthy") && config_errors.is_empty();
     DoctorReport {
@@ -406,6 +407,51 @@ fn backup_footprint(path: &Path) -> (usize, u64) {
 
 /// Advisory size/backup bloat warnings for a tier. Never affect `healthy` — a big
 /// graph is a smell (slow writes widen the write-race window), not a failure.
+/// Open handoffs/forks sitting in the GLOBAL tier are almost always leaks from
+/// the pre-#8 fallback, which wrote them there whenever a session ran outside a
+/// workspace — and a global handoff then resurfaces at the start of every
+/// unrelated project. The user has no way to suspect this without being told,
+/// so surface it with the exact command that stops it.
+fn leaked_global_handoffs() -> Vec<String> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    leaked_handoffs_in(&home.join(".base-gbl").join(".base").join("graph.nq"))
+}
+
+/// PURE seam for [`leaked_global_handoffs`]: only touches `gbl`, so it never
+/// reaches the real global tier under test.
+fn leaked_handoffs_in(gbl: &Path) -> Vec<String> {
+    if !gbl.exists() {
+        return Vec::new();
+    }
+    let Ok(store) = store::load_graph(gbl) else {
+        return Vec::new();
+    };
+    // Namespace-agnostic: match on the type's local name so a customized
+    // prefix/URI still reports.
+    let sparql = "SELECT ?h WHERE { GRAPH ?g { ?h a ?t ; ?statusP \"open\" . \
+                  FILTER(STRENDS(STR(?t), \"Handoff\")) \
+                  FILTER(STRENDS(STR(?statusP), \"status\")) } }";
+    let Ok(QueryResults::Solutions(sols)) = store::query(&store, sparql) else {
+        return Vec::new();
+    };
+    let slugs: Vec<String> = sols
+        .filter_map(|r| r.ok())
+        .filter_map(|row| row.get("h").map(local_name))
+        .collect();
+    if slugs.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "{} open handoff/fork(s) in the GLOBAL tier — these resurface in every project. \
+         Likely leaks from writes made outside a workspace. Review with `base handoff list` \
+         and stop each with `base handoff archive <slug>`: {}",
+        slugs.len(),
+        slugs.join(", ")
+    )]
+}
+
 fn bloat_warnings(tier: &TierReport) -> Vec<String> {
     const BLOAT_GRAPH_BYTES: u64 = 20 * 1024 * 1024;
     const BLOAT_BACKUP_COUNT: usize = 5;
@@ -799,5 +845,34 @@ mod tests {
         let baks = list_backups(&p);
         assert_eq!(baks.len(), 1);
         assert_eq!(baks[0].1, 2);
+    }
+
+    // Issue #8 cleanup: a handoff that leaked into the global tier resurfaces
+    // in every unrelated project. Doctor must name it and the archive command.
+    #[test]
+    fn leaked_global_handoff_is_flagged_with_its_slug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gbl = tmp.path().join("graph.nq");
+
+        // Absent tier is silent, not a warning.
+        assert!(leaked_handoffs_in(&gbl).is_empty());
+
+        let o = "http://ops-sys.local/ontology#";
+        fs::write(
+            &gbl,
+            format!(
+                "<{o}handoff/stray-one> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{o}Handoff> <{o}graph/global> .\n\
+                 <{o}handoff/stray-one> <{o}status> \"open\" <{o}graph/global> .\n\
+                 <{o}handoff/archived-one> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{o}Handoff> <{o}graph/global> .\n\
+                 <{o}handoff/archived-one> <{o}status> \"archived\" <{o}graph/global> .\n"
+            ),
+        )
+        .unwrap();
+
+        let w = leaked_handoffs_in(&gbl);
+        assert_eq!(w.len(), 1, "one advisory line, got {w:?}");
+        assert!(w[0].contains("stray-one"), "must name the open handoff: {}", w[0]);
+        assert!(!w[0].contains("archived-one"), "archived ones are already silenced: {}", w[0]);
+        assert!(w[0].contains("base handoff archive"), "must name the fix: {}", w[0]);
     }
 }
