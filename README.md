@@ -9,6 +9,8 @@
   <img src="https://img.shields.io/badge/built_for-Claude_Code-C2551F?style=flat-square" alt="Built for Claude Code">
 </p>
 
+<h3 align="center">Works with Claude Code today &nbsp;·&nbsp; Codex and Antigravity — coming soon</h3>
+
 Your agent is a genius with amnesia. Every session it meets your codebase for the first time and pretends otherwise. basemode gives it one memory that actually knows what things are — your code structure, your projects, your decisions, your rules, what it all means and how it connects — and puts the right slice of it in front of the model the second it's needed. No prompt to paste. No document to maintain. Same agent, briefed.
 
 This repo is the basemode engine: one Rust binary, `base`, that maps your workspace into a knowledge graph and wires it into Claude Code's hook pipeline.
