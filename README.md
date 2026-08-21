@@ -608,6 +608,10 @@ See `~/.base-gbl/extensions/_template.toml` for the full contract specification 
 | AST extraction | Tree-sitter (Python scripts, 35+ languages) |
 | Hooks | Claude Code settings.json (stdin/stdout JSON) |
 
+## License
+
+BASE is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You can use it, study it, and modify it for any noncommercial purpose. Commercial use — including reselling, repackaging, or building it into a product — requires a separate commercial license granted individually, with approval and terms. Reach out via [chrisai.cv](https://chrisai.cv).
+
 ---
 
 Built by Chris Kahler
