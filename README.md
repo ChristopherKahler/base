@@ -170,9 +170,26 @@ Every command has a short alias (`base p a`, `base a q`, `base d log`). `base he
 
 **Vector-store memory** is a heap of passages with similarity search bolted on — you get the closest-looking paragraph. basemode stores what things *mean* and what they *connect to*: the decision, its rationale, the files it governs, the tasks it spawned.
 
-**Graph-a-repo tools** point at your codebase and hand you a knowledge graph in an output folder. Impressive to look at, and stale by your next commit — a batch artifact that knows your files but not your projects, your decisions, or the session you're in the middle of. It answers when you remember to ask it, which is the one thing an agent mid-task never does. basemode's graph maintains itself as you work — every turn re-syncs it — and it doesn't wait for a query: it's wired inside the agent's own loop, placing what it knows into the turn at the moment it matters.
-
 **Persistence is table stakes. Delivery is the product.** A memory nobody opens is a filing cabinet with extra steps — an agent can't go looking for something it doesn't know exists. basemode speaks first.
+
+## A graph in a folder is not a memory
+
+There's a category of tool that points at your repo and hands you a knowledge graph in an output folder. The graph is real, the pictures are impressive, and the demo is convincing — right up until you keep working. It's a batch artifact: stale by your next commit, re-built by hand, and it knows your files while knowing nothing about your projects, your decisions, your rules, or the session you're in the middle of.
+
+Worse, it only answers when asked. An agent mid-task doesn't stop to interrogate a side database — it doesn't know what's in there, so it doesn't go looking. It guesses instead, in complete sentences. A memory that waits for a query is a filing cabinet with extra steps, and the cabinet is in another room.
+
+basemode is built on the opposite bet:
+
+| | Graph-in-a-folder | basemode |
+|---|---|---|
+| **Freshness** | Batch export, re-run by hand, stale at the next commit | Maintains itself — hooks re-sync the graph as you work |
+| **What it knows** | Files and extracted concepts | Code structure *and* projects, decisions with rationale, rules, sessions |
+| **Delivery** | Answers when you remember to ask | Speaks first — four injection points inside the agent's own turn |
+| **Precision** | The subgraph you asked for | The slice the moment calls for — this file's shape, this domain's rules, nothing else |
+| **Scope** | One repo at a time | Every workspace on the machine, one graph, inherited by every agent |
+| **Sessions** | No concept of one | Handoffs, forks, and a relay between live sessions |
+
+The graph was never the product. The graph is plumbing. The product is the right fact arriving in the turn before the model starts guessing — automatically, every time, without anyone asking.
 
 ## Stack
 
