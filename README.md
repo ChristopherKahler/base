@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/base-logo.png" alt="BASE" width="100%">
+</p>
+
 # BASE
 
 The intelligence layer Claude Code doesn't have.
