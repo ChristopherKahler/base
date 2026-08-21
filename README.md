@@ -170,6 +170,8 @@ Every command has a short alias (`base p a`, `base a q`, `base d log`). `base he
 
 **Vector-store memory** is a heap of passages with similarity search bolted on — you get the closest-looking paragraph. basemode stores what things *mean* and what they *connect to*: the decision, its rationale, the files it governs, the tasks it spawned.
 
+**Graph-a-repo tools** point at your codebase and hand you a knowledge graph in an output folder. Impressive to look at, and stale by your next commit — a batch artifact that knows your files but not your projects, your decisions, or the session you're in the middle of. It answers when you remember to ask it, which is the one thing an agent mid-task never does. basemode's graph maintains itself as you work — every turn re-syncs it — and it doesn't wait for a query: it's wired inside the agent's own loop, placing what it knows into the turn at the moment it matters.
+
 **Persistence is table stakes. Delivery is the product.** A memory nobody opens is a filing cabinet with extra steps — an agent can't go looking for something it doesn't know exists. basemode speaks first.
 
 ## Stack
