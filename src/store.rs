@@ -7,6 +7,8 @@ use oxigraph::io::{RdfFormat, RdfSerializer};
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 
+use crate::changelog::Change;
+
 /// The canonical RDF format for graph persistence.
 /// NQuads is immune to the graph-block split corruption bug in oxigraph's
 /// TriG serializer (one quad per line, no stateful graph-block machine).
@@ -48,7 +50,7 @@ pub fn migrate_trig_to_nq(nq_path: &Path) -> Result<bool> {
         ))?;
 
     // Write as NQuads using write_back (includes validation)
-    write_back(&store, nq_path)?;
+    write_back(&store, nq_path, Change::Op("store.migrate_trig_to_nq"))?;
 
     // Remove old TriG file
     let _ = fs::remove_file(&trig_path);
@@ -350,7 +352,13 @@ pub fn query_union(store: &Store, sparql: &str) -> Result<QueryResults> {
 
 /// Serialize the store to NQuads and write atomically (temp + rename).
 /// Validates the output by re-parsing before committing the rename.
-pub fn write_back(store: &Store, path: &Path) -> Result<()> {
+///
+/// `change` describes what produced this write and is appended to the sibling
+/// `changes.jsonl` **after** the rename commits -- see [`crate::changelog`]. It is a
+/// required parameter rather than an optional call at each writer because a writer
+/// that forgets to log is indistinguishable, to the reader, from no write at all;
+/// requiring it makes that a compile error instead of a silent gap.
+pub fn write_back(store: &Store, path: &Path, change: Change<'_>) -> Result<()> {
     let parent = path
         .parent()
         .context("Path has no parent directory")?;
@@ -423,6 +431,10 @@ pub fn write_back(store: &Store, path: &Path) -> Result<()> {
             path.display()
         )
     })?;
+
+    // The write has landed. Only now is there something true to log, and a
+    // failure here is not allowed to fail the user's command.
+    crate::changelog::append(path, change);
 
     Ok(())
 }

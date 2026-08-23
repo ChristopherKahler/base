@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use crate::config::BaseConfig;
 use crate::crud;
 
+use crate::changelog::Change;
 use super::{StandardDef, StandardsFile, SyncSource, TriggerDef};
 
 // ─── Sync: protocols.md → standards.toml → graph ─────────────
@@ -311,7 +312,7 @@ pub fn sync_standards_to_graph(
             .with_context(|| format!("Failed to insert standard '{}'", s.id))?;
     }
 
-    crate::store::write_back(&store, &trig_path)?;
+    crate::store::write_back(&store, &trig_path, Change::Op("standards.sync"))?;
     Ok(standards.len())
 }
 

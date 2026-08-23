@@ -4,6 +4,7 @@ use anyhow::Result;
 use oxigraph::sparql::QueryResults;
 
 use crate::config::NamespaceConfig;
+use crate::changelog::Change;
 use crate::crud;
 
 /// Create a note (memory entry) with optional relational edges.
@@ -291,7 +292,7 @@ pub fn stamp_last_read(cwd: &Path, ns: &NamespaceConfig, note_iris: &[String]) -
     }
     let update = format!("{}\n{}", crud::prefixes(ns), stmts.join(";\n"));
     store.update(&update)?;
-    crate::store::write_back(&store, &trig_path)?;
+    crate::store::write_back(&store, &trig_path, Change::Sparql(&update))?;
     Ok(note_iris.len())
 }
 
@@ -420,7 +421,7 @@ pub fn remove(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<bool> {
         crud::prefixes(ns)
     );
     store.update(&delete)?;
-    crate::store::write_back(&store, &trig_path)?;
+    crate::store::write_back(&store, &trig_path, Change::Sparql(&delete))?;
     Ok(true)
 }
 
@@ -455,7 +456,7 @@ pub fn update_text(cwd: &Path, ns: &NamespaceConfig, slug: &str, new_text: &str)
         crud::prefixes(ns)
     );
     store.update(&update)?;
-    crate::store::write_back(&store, &trig_path)?;
+    crate::store::write_back(&store, &trig_path, Change::Sparql(&update))?;
     Ok(true)
 }
 

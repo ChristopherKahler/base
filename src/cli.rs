@@ -176,6 +176,22 @@ pub enum Commands {
         #[arg(long)]
         slug: Option<String>,
     },
+    /// Read the graph change log — every successful graph write, as JSON
+    ///
+    /// Cursor is a BYTE OFFSET into the log, not a sequence number: it needs no
+    /// sidecar counter, survives concurrent appenders, and is what a reader
+    /// resumes from directly.
+    Changes {
+        /// Target the global tier (~/.base-gbl/) instead of workspace
+        #[arg(long, short)]
+        global: bool,
+        /// Print entries written after this byte offset
+        #[arg(long)]
+        since: Option<u64>,
+        /// Print only the current end offset and exit
+        #[arg(long)]
+        cursor: bool,
+    },
     /// Manage rules in the graph (add, list, remove)
     Rule {
         /// Target the global tier (~/.base-gbl/) instead of workspace
@@ -2536,6 +2552,56 @@ pub fn run() {
             // errs — warn and skip rather than silently lenient-writing (Phase 35).
             if let Err(e) = crud::note::stamp_last_read(&cwd, &config.namespace, &surfaced) {
                 eprintln!("recall: skipped lastRead stamping (graph unhealthy?) — run `base doctor --repair`: {e}");
+            }
+        }
+
+        // ─── Changes (graph change log) ─────────────────────
+        // Machine-readable only: stdout is always one JSON object, including on
+        // error, because this is the surface an external app polls.
+        Some(Commands::Changes { global, since, cursor }) => {
+            let tier = tier_cwd(&cwd, global);
+            let Some(base_dir) = base::config::find_workspace_base(&tier) else {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": "no .base/ directory found",
+                        "cwd": tier.display().to_string(),
+                    })
+                );
+                std::process::exit(1);
+            };
+            let log = base::changelog::log_path_for(&base_dir.join("graph.nq"));
+
+            if cursor {
+                println!("{}", serde_json::json!({ "offset": base::changelog::cursor(&log) }));
+                return;
+            }
+
+            match base::changelog::read_since(&log, since.unwrap_or(0)) {
+                Ok(page) => {
+                    let mut parsed = Vec::with_capacity(page.lines.len());
+                    let mut skipped = 0usize;
+                    for line in &page.lines {
+                        match serde_json::from_str::<serde_json::Value>(line) {
+                            Ok(v) => parsed.push(v),
+                            Err(_) => skipped += 1,
+                        }
+                    }
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "offset": page.offset,
+                            "reset": page.reset,
+                            "count": parsed.len(),
+                            "skipped": skipped,
+                            "changes": parsed,
+                        })
+                    );
+                }
+                Err(e) => {
+                    println!("{}", serde_json::json!({ "error": e.to_string() }));
+                    std::process::exit(1);
+                }
             }
         }
 

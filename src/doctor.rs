@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use oxigraph::model::Term;
 use oxigraph::sparql::QueryResults;
 
+use crate::changelog::Change;
 use crate::store::{self, GraphHealth};
 
 /// Size/line comparison of the current graph against its newest backup.
@@ -566,7 +567,7 @@ pub fn repair_tier(tier: &str, path: &Path) -> Result<RepairOutcome> {
             };
 
             // 4. Atomic rewrite of the good set (temp → validate → rename).
-            store::write_back(&good, path)?;
+            store::write_back(&good, path, Change::Op("doctor.repair"))?;
 
             // 5. Re-verify.
             let healthy_after = matches!(store::graph_health(path), GraphHealth::Healthy);

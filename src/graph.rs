@@ -12,6 +12,7 @@ use oxigraph::sparql::QueryResults;
 use serde::Serialize;
 
 use crate::config::NamespaceConfig;
+use crate::changelog::Change;
 use crate::store::{self, GraphHealth};
 
 /// Outcome of a `base graph compact` pass over one tier.
@@ -41,7 +42,7 @@ pub fn compact_tier(path: &Path) -> Result<CompactOutcome> {
     let backup = store::snapshot(path, "compact").context("failed to snapshot before compact")?;
 
     let graph = store::load_graph(path)?;
-    store::write_back(&graph, path)?;
+    store::write_back(&graph, path, Change::Op("graph.compact"))?;
 
     let lines_after = count_lines(path);
     Ok(CompactOutcome {
@@ -233,7 +234,7 @@ pub fn purge_stale(path: &Path, ns: &NamespaceConfig, days: i64, apply: bool) ->
     }
     let update = format!("{}\n{}", crate::crud::prefixes(ns), stmts.join(";\n"));
     store.update(&update)?;
-    store::write_back(&store, path)?;
+    store::write_back(&store, path, Change::Sparql(&update))?;
 
     Ok(PurgeOutcome {
         path: path.display().to_string(),

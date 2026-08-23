@@ -10,6 +10,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Context, Result};
 
 use crate::config::{BaseConfig, NamespaceConfig};
+use crate::changelog::Change;
 use crate::crud;
 
 /// Report from a sync operation.
@@ -172,7 +173,7 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
         report.extracted += ledger_count;
     }
 
-    crate::store::write_back(&store, &trig_path)?;
+    crate::store::write_back(&store, &trig_path, Change::Op("extract.markdown"))?;
     Ok(report)
 }
 

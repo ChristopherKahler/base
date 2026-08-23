@@ -5,6 +5,7 @@ use chrono::Local;
 
 use crate::config::BaseConfig;
 use crate::crud;
+use crate::changelog::Change;
 use crate::store;
 
 pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Result<super::HookEventData> {
@@ -33,7 +34,8 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     if let Some(ref tp) = trig_path {
         let graph = store::load_graph(tp)?;
         let now = Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
-        let mut updated = false;
+        // Collect the deltas that actually applied so the change log carries them.
+        let mut applied: Vec<String> = Vec::new();
 
         for file_path in &file_paths {
             let sparql = format!(
@@ -54,12 +56,12 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             );
 
             if graph.update(&sparql).is_ok() {
-                updated = true;
+                applied.push(sparql);
             }
         }
 
-        if updated {
-            store::write_back(&graph, tp)?;
+        if !applied.is_empty() {
+            store::write_back(&graph, tp, Change::Sparql(&applied.join(";\n")))?;
         }
     }
 

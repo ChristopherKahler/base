@@ -35,6 +35,7 @@ use oxigraph::store::Store;
 
 use crate::config::{BaseConfig, NamespaceConfig};
 use crate::crud;
+use crate::changelog::Change;
 use crate::store;
 
 /// Statuses that count as "working" — eligible to decay to `deferred` when cold.
@@ -247,7 +248,7 @@ pub fn apply(store: &Store, ns: &NamespaceConfig, trig_path: &Path, decisions: &
         for op in &ops {
             let _ = store.update(&format!("{pfx}\n{op}"));
         }
-        store::write_back(store, trig_path)?;
+        store::write_back(store, trig_path, Change::Sparql(&ops.join(";\n")))?;
     }
     Ok(stats)
 }

@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 use crate::config::{BaseConfig, NamespaceConfig};
 use crate::crud;
+use crate::changelog::Change;
 use crate::domain;
 
 // ─── Sync stats ─────────────────────────────────────────────
@@ -172,7 +173,7 @@ fn sync_domain_list(
     };
     total_rules += carl_rules;
 
-    crate::store::write_back(&store, &trig_path)?;
+    crate::store::write_back(&store, &trig_path, Change::Op("domain.sync"))?;
 
     Ok(SyncStats {
         domains: domains.len(),

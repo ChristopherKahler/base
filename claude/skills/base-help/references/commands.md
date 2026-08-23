@@ -26,6 +26,8 @@ base relay tasks                         # inbound relay tasks
 base rule list --domain X                # rules for a domain (global tier: base rule -g list ...)
 base project list                        # registered projects
 base operator show                       # operator identity block
+base changes --cursor                    # graph change log: current end offset (byte offset, not a seq)
+base changes --since <offset>            # every graph write after that offset, as JSON (-g for global tier)
 ```
 
 ## Mutating: show, don't run

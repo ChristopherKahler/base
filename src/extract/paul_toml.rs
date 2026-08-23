@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::config::BaseConfig;
+use crate::changelog::Change;
 use crate::crud;
 
 // ─── paul.toml schema ───────────────────────────────────────
@@ -250,7 +251,7 @@ pub fn ingest_paul_projects(
         registered += 1;
     }
 
-    crate::store::write_back(&store, &trig_path)?;
+    crate::store::write_back(&store, &trig_path, Change::Op("extract.paul_toml"))?;
 
     Ok(IngestStats {
         scanned: projects.len(),

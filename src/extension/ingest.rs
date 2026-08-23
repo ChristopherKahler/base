@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::config::BaseConfig;
 use crate::crud;
+use crate::changelog::Change;
 use crate::store;
 
 /// Stats returned from an ingest run.
@@ -120,7 +121,8 @@ pub fn ingest_extension(
 
     // Write back if we changed anything
     if graph_dirty {
-        store::write_back(&graph_store, &trig_path)
+        let op = format!("extension.ingest:{}", ext.name);
+        store::write_back(&graph_store, &trig_path, Change::Op(&op))
             .with_context(|| format!("Failed to write back graph after ext:{} ingest", ext.name))?;
     }
 

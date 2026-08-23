@@ -5,6 +5,7 @@ use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 
 use crate::config::NamespaceConfig;
+use crate::changelog::Change;
 use crate::crud;
 
 /// Resolve the target graph file + graph IRI for a write.
@@ -57,7 +58,7 @@ fn mutate_file(path: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<()> {
     store
         .update(&full)
         .with_context(|| format!("handoff update failed: {full}"))?;
-    crate::store::write_back(&store, path)
+    crate::store::write_back(&store, path, Change::Sparql(&full))
 }
 
 /// Derive a flow-doc slug from its doc path basename (no extension).

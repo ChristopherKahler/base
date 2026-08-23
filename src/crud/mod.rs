@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 
+use crate::changelog::Change;
 use crate::config::NamespaceConfig;
 
 // ─── IRI building ────────────────────────────────────────────
@@ -168,7 +169,7 @@ pub fn load_and_mutate(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result
     store
         .update(&full_sparql)
         .with_context(|| format!("SPARQL update failed: {full_sparql}"))?;
-    crate::store::write_back(&store, &trig_path)
+    crate::store::write_back(&store, &trig_path, Change::Sparql(&full_sparql))
 }
 
 /// Load workspace graph and run a SPARQL SELECT query.
@@ -282,28 +283,30 @@ pub fn repair_edges(cwd: &Path, ns: &NamespaceConfig) -> Result<usize> {
     let graph = workspace_graph_iri(ns, &ws_slug);
     let p = &ns.prefix;
     let pfx = prefixes(ns);
-    let mut count = 0;
+    // Each repair applies its own INSERT DATA; collect them so the change log
+    // carries the actual delta rather than an opaque "a repair happened".
+    let mut applied: Vec<String> = Vec::new();
 
     // 1. Decisions → domain edges (slug format: {domain}.{decision})
-    count += repair_entity_edges(
+    applied.extend(repair_entity_edges(
         &store, &pfx, &graph, ns, p,
         "Decision", "domain", "hasDecision",
-    )?;
+    )?);
 
     // 2. Milestones → project edges (slug format: {project}.{milestone})
-    count += repair_entity_edges(
+    applied.extend(repair_entity_edges(
         &store, &pfx, &graph, ns, p,
         "Milestone", "project", "hasMilestone",
-    )?;
+    )?);
 
     // 3. Tasks → project edges (slug format: {project}.{task})
-    count += repair_entity_edges(
+    applied.extend(repair_entity_edges(
         &store, &pfx, &graph, ns, p,
         "Task", "project", "hasTask",
-    )?;
+    )?);
 
-    crate::store::write_back(&store, &trig_path)?;
-    Ok(count)
+    crate::store::write_back(&store, &trig_path, Change::Sparql(&applied.join(";\n")))?;
+    Ok(applied.len())
 }
 
 #[allow(clippy::too_many_arguments)] // internal helper, params are query fragments
@@ -316,13 +319,13 @@ fn repair_entity_edges(
     type_name: &str,
     parent_type: &str,
     predicate: &str,
-) -> Result<usize> {
+) -> Result<Vec<String>> {
     // Find all entities of this type (check both named graph and any graph)
     let sparql = format!(
         "{pfx}\nSELECT ?s WHERE {{ {{ GRAPH <{graph}> {{ ?s rdf:type {p}:{type_name} }} }} UNION {{ GRAPH ?g {{ ?s rdf:type {p}:{type_name} }} }} }}"
     );
 
-    let mut edges_added = 0;
+    let mut applied: Vec<String> = Vec::new();
 
     if let Ok(QueryResults::Solutions(solutions)) = store.query(&sparql) {
         let iris: Vec<String> = solutions
@@ -371,14 +374,14 @@ fn repair_entity_edges(
             );
 
             if store.update(&insert).is_ok() {
-                edges_added += 1;
+                applied.push(insert);
                 let short_slug = slug.split('.').next_back().unwrap_or(slug);
                 println!("  + {parent_slug} → {predicate} → {short_slug}");
             }
         }
     }
 
-    Ok(edges_added)
+    Ok(applied)
 }
 
 #[cfg(test)]
