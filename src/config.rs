@@ -6,11 +6,33 @@ use serde::Deserialize;
 
 /// Find the workspace `.base/` directory by walking up from cwd.
 pub fn find_workspace_base(cwd: &Path) -> Option<PathBuf> {
-    let mut dir = cwd.to_path_buf();
-    loop {
+    walk_up(cwd, |dir| {
         let base = dir.join(".base");
-        if base.is_dir() {
-            return Some(base);
+        base.is_dir().then_some(base)
+    })
+}
+
+/// Walk up from `start` (inclusive), returning the first ancestor for which
+/// `hit` yields `Some`.
+///
+/// The crate had six copies of this loop, and every one of them could climb out
+/// of a test's tempdir into a real workspace on the machine. In test builds this
+/// stops at the sandbox ceiling: on Windows `%TEMP%` is
+/// `C:\Users\<user>\AppData\Local\Temp`, so walking up from a tempdir passes
+/// straight through `C:\Users\<user>` — itself a real base workspace — and
+/// resolves the operator's own tier as if it were the test's. On Linux the same
+/// walk ends at `/` and finds nothing, which is why it took a Windows run to see
+/// it. Production is unaffected: the check compiles out entirely, so a machine
+/// whose home IS a workspace still resolves it.
+pub fn walk_up<T>(start: &Path, hit: impl Fn(&Path) -> Option<T>) -> Option<T> {
+    let mut dir = start.to_path_buf();
+    loop {
+        #[cfg(feature = "isolation-guard")]
+        if !crate::home::within_sandbox(&dir) {
+            return None;
+        }
+        if let Some(found) = hit(&dir) {
+            return Some(found);
         }
         if !dir.pop() {
             return None;
@@ -23,23 +45,18 @@ pub fn find_workspace_base(cwd: &Path) -> Option<PathBuf> {
 /// or an existing `.base`. This is what makes each codebase's AST map self-contained
 /// instead of every parse clobbering one shared workspace `ast.ttl`.
 pub fn ast_app_root(target: &Path) -> Option<PathBuf> {
-    let mut dir = if target.is_file() {
+    let start = if target.is_file() {
         target.parent()?.to_path_buf()
     } else {
         target.to_path_buf()
     };
-    loop {
-        if dir.join(".git").exists()
+    walk_up(&start, |dir| {
+        let marked = dir.join(".git").exists()
             || dir.join(".paul").is_dir()
             || dir.join(".base-ast").is_dir()
-            || dir.join(".base").is_dir()
-        {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+            || dir.join(".base").is_dir();
+        marked.then(|| dir.to_path_buf())
+    })
 }
 
 /// Resolve where a target's AST map should be WRITTEN: `<app_root>/.base-ast/ast.ttl`.
@@ -74,20 +91,14 @@ pub fn resolve_ast_ttl(target: &Path) -> PathBuf {
 /// Find the AST map to READ from `cwd`, walking up: prefers `<root>/.base-ast/ast.ttl`,
 /// falling back to a legacy `<root>/.base/ast.ttl` (the pre-sidecar workspace map).
 pub fn find_ast_ttl(cwd: &Path) -> Option<PathBuf> {
-    let mut dir = cwd.to_path_buf();
-    loop {
+    walk_up(cwd, |dir| {
         let sidecar = dir.join(".base-ast").join("ast.ttl");
         if sidecar.is_file() {
             return Some(sidecar);
         }
         let legacy = dir.join(".base").join("ast.ttl");
-        if legacy.is_file() {
-            return Some(legacy);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+        legacy.is_file().then_some(legacy)
+    })
 }
 
 // ─── Namespace Config ────────────────────────────────────────

@@ -706,18 +706,13 @@ fn tier_paths(cwd: &Path) -> Vec<(String, PathBuf)> {
         }
     }
 
-    let mut dir = cwd.to_path_buf();
-    loop {
+    if let Some(ws) = crate::config::walk_up(cwd, |dir| {
         let ws = dir.join(".base").join("graph.nq");
-        if ws.exists() {
-            let key = fs::canonicalize(&ws).unwrap_or_else(|_| ws.clone());
-            if seen.insert(key) {
-                tiers.push(("workspace".to_string(), ws));
-            }
-            break;
-        }
-        if !dir.pop() {
-            break;
+        ws.exists().then_some(ws)
+    }) {
+        let key = fs::canonicalize(&ws).unwrap_or_else(|_| ws.clone());
+        if seen.insert(key) {
+            tiers.push(("workspace".to_string(), ws));
         }
     }
     tiers

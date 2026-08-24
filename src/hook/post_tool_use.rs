@@ -514,16 +514,10 @@ fn basename(p: &str) -> Option<String> {
 }
 
 fn find_workspace_trig(cwd: &Path) -> Option<PathBuf> {
-    let mut dir = cwd.to_path_buf();
-    loop {
+    crate::config::walk_up(cwd, |dir| {
         let candidate = dir.join(".base").join("graph.nq");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+        candidate.exists().then_some(candidate)
+    })
 }
 
 #[cfg(test)]

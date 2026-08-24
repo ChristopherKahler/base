@@ -379,16 +379,11 @@ fn warn_unhealthy_graphs(cwd: &Path) {
     }
 
     // Workspace tier: walk upward from cwd to the nearest .base/graph.nq
-    let mut dir = cwd.to_path_buf();
-    loop {
+    if let Some(ws) = crate::config::walk_up(cwd, |dir| {
         let ws = dir.join(".base").join("graph.nq");
-        if ws.exists() {
-            tiers.push(("workspace", ws));
-            break;
-        }
-        if !dir.pop() {
-            break;
-        }
+        ws.exists().then_some(ws)
+    }) {
+        tiers.push(("workspace", ws));
     }
 
     let mut seen = std::collections::HashSet::new();
@@ -425,16 +420,11 @@ fn discover_trig_files(cwd: &Path) -> Vec<PathBuf> {
     }
 
     // Workspace tier: walk upward from cwd to find .base/graph.nq
-    let mut dir = cwd.to_path_buf();
-    loop {
+    if let Some(ws) = crate::config::walk_up(cwd, |dir| {
         let ws = dir.join(".base").join("graph.nq");
-        if ws.exists() {
-            files.push(ws);
-            break;
-        }
-        if !dir.pop() {
-            break;
-        }
+        ws.exists().then_some(ws)
+    }) {
+        files.push(ws);
     }
 
     files

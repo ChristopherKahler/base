@@ -103,6 +103,25 @@ pub fn with_thread_home<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// True when `dir` is inside this test process's sandbox.
+///
+/// The sandbox is the system temp directory (where every test workspace is
+/// built) plus the isolated home root. Used to stop workspace resolution from
+/// climbing out of a test's tempdir into a real workspace on the machine.
+///
+/// This exists because of a Windows-only failure the WSL suite could not see:
+/// `%TEMP%` is `C:\Users\<user>\AppData\Local\Temp`, so walking up from a
+/// tempdir passes straight through `C:\Users\<user>` — which is itself a real
+/// base workspace. On Linux the same walk goes `/tmp` → `/` and finds nothing,
+/// which is why the bug was invisible until the suite ran on Windows.
+#[cfg(feature = "isolation-guard")]
+pub fn within_sandbox(dir: &std::path::Path) -> bool {
+    if dir.starts_with(std::env::temp_dir()) {
+        return true;
+    }
+    home_root().is_some_and(|h| dir.starts_with(h))
+}
+
 /// Panics when a graph write is about to land on a real global tier while this
 /// process is isolated. Armed by [`isolation_active`] — the feature alone is
 /// enough, so a redirected test with no `BASE_HOME` set is still covered.
@@ -191,6 +210,25 @@ mod tests {
                 "a test build must never resolve the operator's real global tier"
             );
         }
+    }
+
+    /// The invariant the Windows failure violated: whatever the sandbox is on
+    /// this platform, the operator's real home is never inside it. On Windows
+    /// `%TEMP%` sits UNDER the profile, so `C:\Users\<user>` is an ancestor of
+    /// the sandbox rather than a member of it — this assertion is what stops
+    /// workspace resolution from walking up into it.
+    #[test]
+    fn the_real_home_is_never_inside_the_sandbox() {
+        let real = real_home().expect("the OS always has a home here");
+        assert!(!within_sandbox(&real), "real home must be outside the sandbox");
+        assert!(
+            !within_sandbox(&real.join(".base")),
+            "the real home's workspace tier must be outside the sandbox"
+        );
+        assert!(
+            !within_sandbox(&real.join(".base-gbl")),
+            "the real global tier must be outside the sandbox"
+        );
     }
 
     #[test]

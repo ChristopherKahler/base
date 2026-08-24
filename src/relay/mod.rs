@@ -490,8 +490,7 @@ pub fn relay_root(cwd: &Path) -> Option<PathBuf> {
         }
     }
     // Worktree fallback: .git FILE → gitdir: <main>/.git/worktrees/<name>
-    let mut dir = cwd.to_path_buf();
-    loop {
+    crate::config::walk_up(cwd, |dir| {
         let dotgit = dir.join(".git");
         if dotgit.is_file()
             && let Ok(content) = std::fs::read_to_string(&dotgit)
@@ -506,10 +505,8 @@ pub fn relay_root(cwd: &Path) -> Option<PathBuf> {
                 }
             }
         }
-        if !dir.pop() {
-            return None;
-        }
-    }
+        None
+    })
 }
 
 /// Resolve a project store. With no --project and exactly one store, use it.
