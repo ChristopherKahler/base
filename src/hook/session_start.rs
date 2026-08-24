@@ -23,7 +23,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
     // Try workspace first, fall back to global tier for no-workspace users
     let session_base_dir = crate::config::find_workspace_base(cwd)
         .or_else(|| {
-            dirs::home_dir().map(|h| h.join(".base-gbl").join(".base")).filter(|p| p.is_dir())
+            crate::home::home_root().map(|h| h.join(".base-gbl").join(".base")).filter(|p| p.is_dir())
         });
     // Clear THIS session only. A blanket clear() deleted the shared file, which
     // reset every concurrently-running session's bracket to FRESH mid-conversation.
@@ -171,7 +171,7 @@ fn inject_extension_status(config: &BaseConfig, cwd: &Path) {
             for query_rel_path in &ss.queries {
                 let query_path = if let Some(fw_dir) = &ext.framework_dir {
                     let expanded = if fw_dir.starts_with("~/") {
-                        dirs::home_dir()
+                        crate::home::home_root()
                             .map(|h| h.join(&fw_dir[2..]))
                             .unwrap_or_else(|| PathBuf::from(fw_dir))
                     } else {
@@ -371,7 +371,7 @@ fn warn_unhealthy_graphs(cwd: &Path) {
     let mut tiers: Vec<(&str, PathBuf)> = Vec::new();
 
     // Global tier: ~/.base-gbl/.base/graph.nq
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::home::home_root() {
         let global = home.join(".base-gbl").join(".base").join("graph.nq");
         if global.exists() {
             tiers.push(("global", global));
@@ -417,7 +417,7 @@ fn discover_trig_files(cwd: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
 
     // Global tier: ~/.base-gbl/.base/graph.nq
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::home::home_root() {
         let global = home.join(".base-gbl").join(".base").join("graph.nq");
         if global.exists() {
             files.push(global);

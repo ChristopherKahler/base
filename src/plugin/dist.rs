@@ -251,7 +251,7 @@ pub fn dist_install(manifest_path: &Path) -> Result<DistOutcome> {
         .clone()
         .ok_or_else(|| anyhow!("manifest has no [dist] block — `base ext add` needs one (use `base ext install --bundle` for a local build, or add [dist] with repo/version/binary)"))?;
 
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
+    let home = crate::home::home_root().ok_or_else(|| anyhow!("cannot determine home directory"))?;
     let dest = home.join(".base-gbl").join("plugins").join(&ext.name);
     let tag = format!("v{}", dist.version);
 

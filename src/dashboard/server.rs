@@ -43,7 +43,7 @@ pub async fn start(port: u16, cwd: PathBuf) {
     let mut trig_paths: Vec<PathBuf> = vec![trig_path.clone()];
 
     // Read registered workspaces from BASE's own registry (~/.base-gbl/base.toml)
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::home::home_root() {
         let base_toml = home.join(".base-gbl/base.toml");
         if let Ok(content) = std::fs::read_to_string(&base_toml)
             && let Ok(table) = content.parse::<toml::Table>()

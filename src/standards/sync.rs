@@ -40,7 +40,7 @@ const DEFAULT_PROTOCOLS_PATH: &str = ".base-frameworks/midas/frameworks/protocol
 
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
+        && let Some(home) = crate::home::home_root()
     {
         return home.join(rest);
     }
@@ -71,7 +71,7 @@ pub fn sync_standards(
     let protocols_path = source_override
         .map(expand_tilde)
         .or_else(|| file.sync.protocols.as_deref().map(expand_tilde))
-        .or_else(|| dirs::home_dir().map(|h| h.join(DEFAULT_PROTOCOLS_PATH)));
+        .or_else(|| crate::home::home_root().map(|h| h.join(DEFAULT_PROTOCOLS_PATH)));
 
     let mut stats = StandardsSyncStats {
         parsed: 0,
@@ -144,7 +144,7 @@ pub fn sync_standards(
     std::fs::rename(&tmp, &toml_path)?;
 
     // Graph tier: Standard entities in the global graph.
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::home::home_root() {
         let global_dir = home.join(".base-gbl");
         if global_dir.join(".base").is_dir() {
             stats.graph_standards =

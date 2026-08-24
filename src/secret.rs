@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 
 /// Path to the secret store, `~/.base-gbl/.env`.
 pub fn env_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let home = crate::home::home_root().context("cannot determine home directory")?;
     Ok(home.join(".base-gbl").join(".env"))
 }
 

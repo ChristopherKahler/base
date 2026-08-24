@@ -344,7 +344,7 @@ fn resolve_file_paths(state_dir: &Path, pattern: &str) -> Vec<PathBuf> {
 /// Expand `~/` prefix to home directory.
 fn expand_tilde(path: &str) -> PathBuf {
     if path.starts_with("~/") {
-        dirs::home_dir()
+        crate::home::home_root()
             .map(|h| h.join(&path[2..]))
             .unwrap_or_else(|| PathBuf::from(path))
     } else {

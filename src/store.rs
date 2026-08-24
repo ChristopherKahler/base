@@ -252,7 +252,7 @@ pub fn load_graphs(paths: &[&Path]) -> Result<Store> {
 pub fn load_merged(cwd: &Path) -> Option<Store> {
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
 
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::home::home_root() {
         let global_nq = home.join(".base-gbl").join(".base").join("graph.nq");
         if global_nq.exists() {
             paths.push(global_nq);
@@ -359,6 +359,7 @@ pub fn query_union(store: &Store, sparql: &str) -> Result<QueryResults> {
 /// that forgets to log is indistinguishable, to the reader, from no write at all;
 /// requiring it makes that a compile error instead of a silent gap.
 pub fn write_back(store: &Store, path: &Path, change: Change<'_>) -> Result<()> {
+    crate::home::assert_isolated_write(path);
     let parent = path
         .parent()
         .context("Path has no parent directory")?;

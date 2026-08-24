@@ -133,7 +133,10 @@ mod tests {
     }
 
     fn env_guard() -> EnvGuard {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Before capturing `prev`, so a failing run cannot restore the shell's
+        // contaminated value into a sibling module's tests.
+        crate::relay::scrub_shell_env();
         let prev = std::env::var_os("BASE_RELAY_AS");
         // SAFETY: guarded by ENV_LOCK — no other test reads this var concurrently.
         unsafe { std::env::remove_var("BASE_RELAY_AS") };

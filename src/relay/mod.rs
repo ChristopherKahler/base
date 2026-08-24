@@ -861,3 +861,27 @@ mod tests {
         assert_eq!(root, main.join(".base").join("relay"));
     }
 }
+
+/// Clear the two shell variables that contaminate relay tests — once for the
+/// whole test process, and never restored.
+///
+/// `BASE_RELAY_AS` pins a session's codename and `WT_SESSION` drives tab
+/// continuity, so a suite run from a wrapper-launched shell (`cc work` exports
+/// both) hands every fake session the same title and the uniqueness assertions
+/// fail. Two modules used to scrub-and-restore these behind two *different*
+/// mutexes, which do not serialize against each other: `deliver`'s guard
+/// restored the shell's value while `task_inbox`'s tests were mid-run, putting
+/// the contamination back. Nothing in the suite wants the shell's value back,
+/// so the fix is to stop restoring it.
+#[cfg(test)]
+pub(crate) fn scrub_shell_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: runs exactly once, and no test sets these except under its
+        // own lock, after this has already run.
+        unsafe {
+            std::env::remove_var("BASE_RELAY_AS");
+            std::env::remove_var("WT_SESSION");
+        }
+    });
+}

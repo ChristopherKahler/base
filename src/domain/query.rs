@@ -161,7 +161,7 @@ pub fn resolve_and_run_query(
         .and_then(|base| std::fs::read_to_string(base.join("queries").join(&filename)).ok())
         // Tier 2: global
         .or_else(|| {
-            dirs::home_dir().and_then(|home| {
+            crate::home::home_root().and_then(|home| {
                 std::fs::read_to_string(home.join(".base-gbl").join("queries").join(&filename)).ok()
             })
         });

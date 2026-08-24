@@ -118,7 +118,7 @@ fn tier_base_dirs(cwd: &Path) -> Vec<std::path::PathBuf> {
     if let Some(ws) = crate::config::find_workspace_base(cwd) {
         bases.push(ws);
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::home::home_root() {
         let global = home.join(".base-gbl").join(".base");
         if !bases.contains(&global) {
             bases.push(global);

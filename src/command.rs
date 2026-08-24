@@ -27,7 +27,7 @@ pub fn load_commands(cwd: &Path) -> Vec<CommandDef> {
     let mut commands = Vec::new();
 
     // Global
-    if let Some(home) = dirs::home_dir()
+    if let Some(home) = crate::home::home_root()
         && let Ok(content) =
             std::fs::read_to_string(home.join(".base-gbl").join("commands.toml"))
         && let Ok(file) = toml::from_str::<CommandsFile>(&content)
@@ -76,7 +76,7 @@ pub fn check_command_file(tier: &str, path: &Path) -> Option<String> {
 /// Every commands.toml `load_commands` would read, in the same tier order.
 pub fn command_file_paths(cwd: &Path) -> Vec<(String, std::path::PathBuf)> {
     let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::home::home_root() {
         paths.push((
             "global".to_string(),
             home.join(".base-gbl").join("commands.toml"),

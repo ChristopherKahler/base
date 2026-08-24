@@ -1,0 +1,7 @@
+# `dirs::home_dir()` is banned crate-wide: reaching for the home directory at a
+# call site is what let `cargo test` write to the operator's real global graph.
+# Resolve through `crate::home::home_root()`, which honours the BASE_HOME
+# override that test builds rely on. Fork: base-tests-write-live-graph.
+disallowed-methods = [
+  { path = "dirs::home_dir", reason = "use crate::home::home_root() — see src/home.rs" },
+]

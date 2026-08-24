@@ -85,13 +85,13 @@ fn deps_for(m: Modality) -> &'static [Dep] {
 }
 
 fn marker_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".base-gbl").join(".multimodal-bootstrap"))
+    Some(crate::home::home_root()?.join(".base-gbl").join(".multimodal-bootstrap"))
 }
 
 /// base-managed bin dir on which user-space binaries (e.g. an imageio-ffmpeg
 /// shim) are exposed so child tools like whisper can find them.
 fn base_bin_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".base-gbl").join("bin"))
+    Some(crate::home::home_root()?.join(".base-gbl").join("bin"))
 }
 
 /// Resolve the Python interpreter name to invoke. On Unix `python3` is canonical

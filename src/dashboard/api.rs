@@ -1018,7 +1018,7 @@ struct PaulToml {
 fn collect_workspace_roots(primary: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut roots = vec![primary.to_path_buf()];
 
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::home::home_root() {
         let base_toml = home.join(".base-gbl/base.toml");
         if let Ok(content) = std::fs::read_to_string(&base_toml)
             && let Ok(table) = content.parse::<toml::Table>()
@@ -1561,7 +1561,7 @@ fn project_from_dir_name(dir_name: &str) -> String {
 }
 
 fn parse_claude_code(days: u32) -> Vec<UsageEvent> {
-    let claude_dir = dirs::home_dir()
+    let claude_dir = crate::home::home_root()
         .map(|h| h.join(".claude").join("projects"))
         .unwrap_or_default();
 

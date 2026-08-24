@@ -15,6 +15,7 @@ pub mod doctor;
 pub mod domain;
 pub mod extension;
 pub mod graph;
+pub mod home;
 pub mod extract;
 pub mod hook;
 pub mod install;

@@ -1328,7 +1328,7 @@ fn tier_cwd(cwd: &std::path::Path, global: bool) -> std::path::PathBuf {
     if !global {
         return cwd.to_path_buf();
     }
-    match dirs::home_dir() {
+    match base::home::home_root() {
         Some(h) => h.join(".base-gbl"),
         None => die("Failed", "cannot determine home directory for --global"),
     }
@@ -1783,13 +1783,24 @@ pub fn run() {
                 }
                 HandoffAction::List => { if let Err(e) = crud::handoff::list(&cwd, &config.namespace) { die("Error", e); } }
                 HandoffAction::Snooze { slug, days } => {
-                    match crud::handoff::snooze(&cwd, &config.namespace, &slug, days) {
+                    match crud::handoff::snooze(
+                        base::home::home_root().as_deref(),
+                        &cwd,
+                        &config.namespace,
+                        &slug,
+                        days,
+                    ) {
                         Ok(()) => println!("Handoff '{slug}' snoozed {days}d"),
                         Err(e) => die("Failed", e),
                     }
                 }
                 HandoffAction::Archive { slug } => {
-                    match crud::handoff::archive(&cwd, &config.namespace, &slug) {
+                    match crud::handoff::archive(
+                        base::home::home_root().as_deref(),
+                        &cwd,
+                        &config.namespace,
+                        &slug,
+                    ) {
                         Ok(()) => println!("Handoff '{slug}' archived"),
                         Err(e) => die("Failed", e),
                     }
@@ -1809,13 +1820,24 @@ pub fn run() {
                 }
                 ForkAction::List => { if let Err(e) = crud::handoff::list_forks(&cwd, &config.namespace) { die("Error", e); } }
                 ForkAction::Snooze { slug, days } => {
-                    match crud::handoff::snooze(&cwd, &config.namespace, &slug, days) {
+                    match crud::handoff::snooze(
+                        base::home::home_root().as_deref(),
+                        &cwd,
+                        &config.namespace,
+                        &slug,
+                        days,
+                    ) {
                         Ok(()) => println!("Fork '{slug}' snoozed {days}d"),
                         Err(e) => die("Failed", e),
                     }
                 }
                 ForkAction::Archive { slug } => {
-                    match crud::handoff::archive(&cwd, &config.namespace, &slug) {
+                    match crud::handoff::archive(
+                        base::home::home_root().as_deref(),
+                        &cwd,
+                        &config.namespace,
+                        &slug,
+                    ) {
                         Ok(()) => println!("Fork '{slug}' archived"),
                         Err(e) => die("Failed", e),
                     }
@@ -1854,7 +1876,7 @@ pub fn run() {
             if ast {
                 // AST extraction via bundled Python scripts
                 let target_dir = target.as_deref().unwrap_or(".");
-                let home = dirs::home_dir().unwrap_or_default();
+                let home = base::home::home_root().unwrap_or_default();
 
                 // Search order: ~/.base-gbl/scripts/ast/ → cwd/scripts/ast/ → source relative
                 let search_paths = [
@@ -2327,7 +2349,7 @@ pub fn run() {
                     // REFUSED so the sender rewrites — same loop his Stop hook
                     // runs on replies. Fail-open when the guard is absent.
                     if to == "chris"
-                        && let Some(guard) = dirs::home_dir()
+                        && let Some(guard) = base::home::home_root()
                             .map(|h| h.join(".claude").join("hooks").join("style-guard.py"))
                             .filter(|p| p.exists())
                     {
@@ -2822,7 +2844,7 @@ pub fn run() {
                 }
             }
             ExtensionAction::Remove { name } => {
-                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let home = base::home::home_root().expect("Cannot determine home directory");
                 let ext_dir = home.join(".base-gbl").join("extensions");
 
                 if !ext_dir.is_dir() {
@@ -2902,7 +2924,7 @@ pub fn run() {
                 }
             }
             CommandAction::Add { name, description, rule } => {
-                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let home = base::home::home_root().expect("Cannot determine home directory");
                 let path = home.join(".base-gbl").join("commands.toml");
                 let mut content = std::fs::read_to_string(&path).unwrap_or_default();
                 let rules_toml: String = rule.iter()
@@ -2923,7 +2945,7 @@ pub fn run() {
                 }
             }
             CommandAction::Remove { name } => {
-                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let home = base::home::home_root().expect("Cannot determine home directory");
                 let path = home.join(".base-gbl").join("commands.toml");
                 let Ok(content) = std::fs::read_to_string(&path) else {
                     eprintln!("Cannot read commands.toml");
@@ -2969,7 +2991,7 @@ pub fn run() {
                     println!("No [[command]] entries found in {file}.");
                     return;
                 }
-                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let home = base::home::home_root().expect("Cannot determine home directory");
                 let path = home.join(".base-gbl").join("commands.toml");
                 if let Some(parent) = path.parent()
                     && let Err(e) = std::fs::create_dir_all(parent)
@@ -3039,7 +3061,7 @@ pub fn run() {
         // ─── Memory ────────────────────────────────────────
         Some(Commands::Memory { action }) => match action {
             MemoryAction::List => {
-                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let home = base::home::home_root().expect("Cannot determine home directory");
                 let claude_projects = home.join(".claude").join("projects");
                 if !claude_projects.is_dir() {
                     println!("No Claude projects directory found.");
@@ -3124,7 +3146,7 @@ pub fn run() {
                 println!("To convert: base learn --text \"...\" --domain <domain> --type <type>");
             }
             MemoryAction::Purge => {
-                let home = dirs::home_dir().expect("Cannot determine home directory");
+                let home = base::home::home_root().expect("Cannot determine home directory");
                 let claude_projects = home.join(".claude").join("projects");
                 if !claude_projects.is_dir() {
                     println!("No Claude projects directory found.");
@@ -3185,7 +3207,7 @@ pub fn run() {
 
         // ─── Config ────────────────────────────────────────
         Some(Commands::Config { action }) => {
-            let home = dirs::home_dir().expect("Cannot determine home directory");
+            let home = base::home::home_root().expect("Cannot determine home directory");
             let path = home.join(".base-gbl").join("base.toml");
 
             match action {

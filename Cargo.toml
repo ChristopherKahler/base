@@ -24,5 +24,13 @@ sha2 = "0.11.0"
 rpassword = "7"
 pdf-extract = "0.10.0"
 
+[features]
+# Enabled ONLY for test builds, via the self-dev-dependency below. `cfg(test)`
+# cannot do this job: `tests/*.rs` link the library compiled without it, so an
+# integration test that forgot to isolate would read the real home unchecked.
+# Off for every `cargo build` / `cargo run`, so production never redirects.
+isolation-guard = []
+
 [dev-dependencies]
+base = { path = ".", features = ["isolation-guard"] }
 tempfile = "3"

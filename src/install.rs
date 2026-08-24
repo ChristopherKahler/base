@@ -26,7 +26,7 @@ pub fn run(
     full: bool,
     starter: StarterCommands,
 ) -> Result<()> {
-    let home = dirs::home_dir().context("Cannot determine home directory")?;
+    let home = crate::home::home_root().context("Cannot determine home directory")?;
     let binary_path = std::env::current_exe().context("Cannot determine binary path")?;
 
     println!("═══════════════════════════════════════");
@@ -164,7 +164,7 @@ fn prompt_starter_commands() -> bool {
 /// Remove base hooks from settings.json, remove binary, strip CLAUDE.md section.
 /// With --purge, also removes ~/.base-gbl/ global tier.
 pub fn uninstall(purge: bool) -> Result<()> {
-    let home = dirs::home_dir().context("Cannot determine home directory")?;
+    let home = crate::home::home_root().context("Cannot determine home directory")?;
 
     println!("═══════════════════════════════════════");
     println!("BASE v2 — Uninstall");

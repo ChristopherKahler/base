@@ -240,7 +240,7 @@ fn fork_archive_by_title() {
     let p = ns().prefix;
     let slug =
         crud::handoff::create_fork(tmp.path(), &ns(), "p", "/d/FEATURE-A.md", None).unwrap();
-    crud::handoff::archive(tmp.path(), &ns(), &slug).unwrap();
+    crud::handoff::archive(Some(tmp.path()), tmp.path(), &ns(), &slug).unwrap();
 
     let store = store_of(tmp.path());
     let still_open = count(

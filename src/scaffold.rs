@@ -147,7 +147,7 @@ fn registered_workspace_paths() -> Vec<String> {
     #[derive(serde::Deserialize)]
     struct WsPath { path: String }
 
-    let Some(home) = dirs::home_dir() else { return Vec::new() };
+    let Some(home) = crate::home::home_root() else { return Vec::new() };
     let toml_path = home.join(".base-gbl").join("base.toml");
     let Ok(content) = std::fs::read_to_string(&toml_path) else { return Vec::new() };
     toml::from_str::<WsOnly>(&content)
@@ -208,7 +208,7 @@ fn splice_workspace_block(content: &str, block: &str) -> String {
 /// the global registry. Idempotent; only ever rewrites between the markers. No-op if
 /// CLAUDE.md is absent. Returns the number of workspaces written.
 pub fn sync_claude_md_registry() -> Result<usize> {
-    let home = dirs::home_dir().context("Cannot determine home directory")?;
+    let home = crate::home::home_root().context("Cannot determine home directory")?;
     let claude_md = home.join(".claude").join("CLAUDE.md");
     if !claude_md.exists() {
         return Ok(0);
@@ -227,7 +227,7 @@ pub fn sync_claude_md_registry() -> Result<usize> {
 
 /// Add a workspace path to ~/.base-gbl/base.toml [[workspace]] if not already present.
 fn register_workspace(path: &str) -> Result<()> {
-    let home = dirs::home_dir().context("Cannot determine home directory")?;
+    let home = crate::home::home_root().context("Cannot determine home directory")?;
     let global_toml = home.join(".base-gbl").join("base.toml");
 
     if !global_toml.exists() {

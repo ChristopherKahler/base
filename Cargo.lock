@@ -175,6 +175,7 @@ version = "0.13.2"
 dependencies = [
  "anyhow",
  "axum",
+ "base",
  "chrono",
  "clap",
  "dirs",

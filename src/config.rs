@@ -64,7 +64,7 @@ pub fn resolve_ast_ttl(target: &Path) -> PathBuf {
         //
         // Home itself remains valid when it IS the target, so an intentional
         // workspace-wide map still works.
-        .filter(|r| dirs::home_dir().as_deref() != Some(r.as_path()) || r.as_path() == target);
+        .filter(|r| crate::home::home_root().as_deref() != Some(r.as_path()) || r.as_path() == target);
     match root {
         Some(r) => r.join(".base-ast").join("ast.ttl"),
         None => target.join(".base-ast").join("ast.ttl"),
@@ -585,7 +585,7 @@ impl BaseConfig {
     }
 
     fn try_load(cwd: &Path) -> Option<Self> {
-        let home = dirs::home_dir()?;
+        let home = crate::home::home_root()?;
         let global_path = home.join(".base-gbl").join("base.toml");
         let ws_path = cwd.join(".base").join("base.toml");
 
@@ -663,7 +663,7 @@ pub fn load_queries(cwd: &Path, config: &BaseConfig) -> Vec<QueryDef> {
     let mut queries = parse_queries_toml(DEFAULT_QUERIES_TOML);
 
     // Layer global queries
-    if let Some(home) = dirs::home_dir()
+    if let Some(home) = crate::home::home_root()
         && let Ok(content) =
             std::fs::read_to_string(home.join(".base-gbl").join("queries.toml"))
     {

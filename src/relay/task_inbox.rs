@@ -440,7 +440,7 @@ pub fn format_row(t: &InboxTask) -> String {
 // ─── Graph mirror (global tier, best-effort) ─────────────────
 
 fn global_cwd() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".base-gbl"))
+    crate::home::home_root().map(|h| h.join(".base-gbl"))
 }
 
 fn mirror_to_graph(ns: &NamespaceConfig, task: &InboxTask) -> Result<()> {
@@ -541,43 +541,25 @@ mod tests {
     use crate::config::NamespaceConfig;
     use std::path::Path;
 
-    // HOME is process-global and cargo test is multi-threaded — every test that
-    // repoints ~/.base-gbl serializes through this.
+    // Each test gets its OWN fake home, on its own thread, via the seam's
+    // per-thread override. `cargo test` runs each test on a separate thread, so
+    // thread-local IS the isolation boundary — no shared root for the sessions
+    // in one test to collide with the sessions in another. The previous version
+    // set `$HOME`, which the seam deliberately no longer reads: `dirs` ignores
+    // `$HOME` on Windows, which is the whole reason the override exists.
+    //
+    // The lock survives for one reason only: `no_autoname_env_opts_out` sets
+    // BASE_NO_AUTONAME, which `auto_register` reads, and env is process-global.
+    // Taken with `unwrap_or_else(into_inner)` so a failing test fails ALONE —
+    // the old `unwrap()` is why a single assertion failure surfaced as nine,
+    // eight of them PoisonError noise pointing at the lock instead of the bug.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn with_home<T>(f: impl FnOnce(&Path) -> T) -> T {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::relay::scrub_shell_env();
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("HOME");
-        // WT_SESSION must not leak in: the tab-continuity reclaim would let
-        // every fake session share one "tab" and steal titles across tests
-        // (real WSL shells under Windows Terminal DO carry it).
-        let prev_wt = std::env::var_os("WT_SESSION");
-        // BASE_RELAY_AS must not leak in either: auto_register prefers it over
-        // the wordlist pick, so a wrapper-launched shell (`cc work` exports it)
-        // hands EVERY fake session the same codename and the uniqueness
-        // assertions fail — 8 tests, contaminated-env only, never on CI.
-        let prev_as = std::env::var_os("BASE_RELAY_AS");
-        // SAFETY: guarded by ENV_LOCK — no other test reads HOME concurrently.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::remove_var("WT_SESSION");
-            std::env::remove_var("BASE_RELAY_AS");
-        }
-        let out = f(tmp.path());
-        unsafe {
-            match prev {
-                Some(p) => std::env::set_var("HOME", p),
-                None => std::env::remove_var("HOME"),
-            }
-            if let Some(w) = prev_wt {
-                std::env::set_var("WT_SESSION", w);
-            }
-            if let Some(a) = prev_as {
-                std::env::set_var("BASE_RELAY_AS", a);
-            }
-        }
-        out
+        crate::home::with_thread_home(tmp.path(), || f(tmp.path()))
     }
 
     fn sample(session: &str) -> InboxTask {

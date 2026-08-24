@@ -86,7 +86,7 @@ impl Default for UpdateCheck {
 impl Manifest {
     /// Resolve path to `~/.base-gbl/manifest.toml`.
     pub fn manifest_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".base-gbl").join("manifest.toml"))
+        crate::home::home_root().map(|h| h.join(".base-gbl").join("manifest.toml"))
     }
 
     /// Load manifest from `~/.base-gbl/manifest.toml`. Returns None if missing or unparseable.
@@ -135,7 +135,7 @@ fn hash_key(key: &str) -> String {
 
 /// Scan the filesystem for a known component and return its entry if found.
 pub fn detect_component(name: &str) -> Option<ComponentEntry> {
-    let home = dirs::home_dir()?;
+    let home = crate::home::home_root()?;
     let now = chrono::Local::now().to_rfc3339();
 
     match name {

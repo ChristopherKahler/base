@@ -107,7 +107,7 @@ pub struct StandardsFile {
 // ─── Loading (tiered: global → workspace) ────────────────────
 
 pub fn global_standards_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".base-gbl").join("standards.toml"))
+    crate::home::home_root().map(|h| h.join(".base-gbl").join("standards.toml"))
 }
 
 fn read_standards_file(path: &Path) -> Option<StandardsFile> {

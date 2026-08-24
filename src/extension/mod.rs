@@ -270,7 +270,7 @@ fn default_action() -> String {
 /// Duplicate names (by extension.name) are skipped with a warning.
 /// Returns extensions sorted by name for deterministic ordering.
 pub fn load_extensions() -> Vec<ExtensionDef> {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::home::home_root() else {
         return Vec::new();
     };
     let ext_dir = home.join(".base-gbl").join("extensions");

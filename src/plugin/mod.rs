@@ -206,7 +206,7 @@ fn windows_exe_fixup(path: PathBuf) -> PathBuf {
 /// Expand a leading `~/` to the home directory.
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
-        dirs::home_dir()
+        crate::home::home_root()
             .map(|h| h.join(rest))
             .unwrap_or_else(|| PathBuf::from(path))
     } else {
@@ -238,7 +238,7 @@ fn resolve_framework_dir(manifest_path: &Path, fw: &str) -> PathBuf {
 /// environment so a handler can read e.g. `GEMINI_API_KEY` from `process.env`
 /// without knowing where it came from. Git-ignored, operator-owned.
 pub fn global_env_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".base-gbl").join(".env"))
+    crate::home::home_root().map(|h| h.join(".base-gbl").join(".env"))
 }
 
 /// Parse `KEY=VALUE` lines from a `.env` file body.
@@ -307,7 +307,7 @@ fn base_contract(cwd: &Path) -> Vec<(String, String)> {
             b.join("graph.nq").to_string_lossy().into_owned(),
         ));
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::home::home_root() {
         v.push((
             "BASE_GLOBAL_DIR".into(),
             home.join(".base-gbl").to_string_lossy().into_owned(),
@@ -404,7 +404,7 @@ pub fn bundle_install(manifest_path: &Path) -> anyhow::Result<BundleOutcome> {
         anyhow::bail!("framework_dir not found: {}", source.display());
     }
 
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let home = crate::home::home_root().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     let dest = home.join(".base-gbl").join("plugins").join(&ext.name);
     if dest.exists() {
         std::fs::remove_dir_all(&dest)?; // re-bundle = clean replace
@@ -482,7 +482,7 @@ pub fn install_linked(manifest_path: &Path) -> anyhow::Result<LinkedOutcome> {
         _ => original,
     };
 
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let home = crate::home::home_root().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     let ext_dir = home.join(".base-gbl").join("extensions");
     std::fs::create_dir_all(&ext_dir)?;
     let dest = ext_dir.join(format!("{}.toml", ext.name));

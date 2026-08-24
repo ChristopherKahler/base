@@ -66,7 +66,7 @@ pub struct SessionRegistry {
 
 /// `~/.base-gbl/.base/` — the global tier base dir. `None` only if there is no home dir.
 pub fn global_base_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".base-gbl").join(".base"))
+    crate::home::home_root().map(|h| h.join(".base-gbl").join(".base"))
 }
 
 fn registry_path() -> Option<PathBuf> {

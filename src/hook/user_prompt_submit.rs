@@ -23,7 +23,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // Resolve base dir: workspace first, fall back to global tier
     let base_dir = crate::config::find_workspace_base(cwd)
         .or_else(|| {
-            dirs::home_dir().map(|h| h.join(".base-gbl").join(".base")).filter(|p| p.is_dir())
+            crate::home::home_root().map(|h| h.join(".base-gbl").join(".base")).filter(|p| p.is_dir())
         });
     let mut session = base_dir
         .as_deref()
@@ -429,7 +429,7 @@ pub fn ensure_domain_sync_pub(config: &BaseConfig, cwd: &Path) {
 /// Syncs both global (~/.base-gbl/) and workspace tiers.
 fn ensure_domain_sync(config: &BaseConfig, cwd: &Path) {
     // Global tier: sync ~/.base-gbl/domains.toml → ~/.base-gbl/.base/graph.nq
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::home::home_root() {
         let global_dir = home.join(".base-gbl");
         let global_base = global_dir.join(".base");
         if global_base.is_dir() {

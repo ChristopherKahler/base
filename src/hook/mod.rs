@@ -242,7 +242,7 @@ fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>) {
     let cwd = std::env::current_dir().unwrap_or_default();
     let base_dir = match crate::config::find_workspace_base(&cwd)
         .or_else(|| {
-            dirs::home_dir().map(|h| h.join(".base-gbl").join(".base")).filter(|p| p.is_dir())
+            crate::home::home_root().map(|h| h.join(".base-gbl").join(".base")).filter(|p| p.is_dir())
         }) {
         Some(d) => d,
         None => return,

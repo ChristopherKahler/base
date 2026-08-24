@@ -27,9 +27,15 @@ fn write_tier(cwd: &Path, ns: &NamespaceConfig) -> Result<(PathBuf, String)> {
 
 /// Every existing graph file across tiers — used for tier-agnostic mutations
 /// (snooze/archive) so a handoff is updated wherever it lives.
-fn all_tier_files(cwd: &Path) -> Vec<PathBuf> {
+///
+/// Takes `gbl_root` rather than resolving the home directory itself. This
+/// function is why the fork exists: reaching for the home directory here meant
+/// every test that archived a fixture handoff rewrote the operator's real
+/// global graph. As a parameter the compiler will not let a caller — test or
+/// otherwise — forget to say which root it means.
+fn all_tier_files(gbl_root: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = gbl_root {
         let gbl = home.join(".base-gbl").join(".base").join("graph.nq");
         if gbl.exists() {
             files.push(gbl);
@@ -283,7 +289,13 @@ pub fn list_forks(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
 
 /// Snooze a handoff: push `resurfaceAt` to now + `days`, hiding it until then.
 /// Applied to every tier file so it works wherever the handoff lives.
-pub fn snooze(cwd: &Path, ns: &NamespaceConfig, slug: &str, days: i64) -> Result<()> {
+pub fn snooze(
+    gbl_root: Option<&Path>,
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    slug: &str,
+    days: i64,
+) -> Result<()> {
     let iri = crud::build_iri(ns, "handoff", slug);
     let wake = (chrono::Local::now() + chrono::Duration::days(days))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
@@ -294,14 +306,14 @@ pub fn snooze(cwd: &Path, ns: &NamespaceConfig, slug: &str, days: i64) -> Result
          WHERE  {{ GRAPH ?g {{ <{iri}> a {p}:Handoff }}\n\
            OPTIONAL {{ GRAPH ?g {{ <{iri}> {p}:resurfaceAt ?old }} }} }}"
     );
-    for f in all_tier_files(cwd) {
+    for f in all_tier_files(gbl_root, cwd) {
         mutate_file(&f, ns, &sparql)?;
     }
     Ok(())
 }
 
 /// Archive a handoff: set status to "archived" so it stops resurfacing.
-pub fn archive(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<()> {
+pub fn archive(gbl_root: Option<&Path>, cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<()> {
     let iri = crud::build_iri(ns, "handoff", slug);
     let p = &ns.prefix;
     let sparql = format!(
@@ -310,7 +322,7 @@ pub fn archive(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<()> {
          WHERE  {{ GRAPH ?g {{ <{iri}> a {p}:Handoff }}\n\
            OPTIONAL {{ GRAPH ?g {{ <{iri}> {p}:status ?old }} }} }}"
     );
-    for f in all_tier_files(cwd) {
+    for f in all_tier_files(gbl_root, cwd) {
         mutate_file(&f, ns, &sparql)?;
     }
     Ok(())

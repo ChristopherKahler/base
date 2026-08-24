@@ -74,6 +74,7 @@ pub enum Change<'a> {
 ///
 /// Best-effort by contract: never returns, never panics, never fails the caller.
 pub fn append(graph_path: &Path, change: Change<'_>) {
+    crate::home::assert_isolated_write(graph_path);
     let log_path = log_path_for(graph_path);
     let line = record_line(graph_path, change);
     if let Err(e) = append_line(&log_path, &line) {

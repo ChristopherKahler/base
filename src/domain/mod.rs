@@ -155,7 +155,7 @@ pub fn load_domains(cwd: &Path) -> Vec<DomainDef> {
     let mut domains = Vec::new();
 
     // Global
-    if let Some(home) = dirs::home_dir()
+    if let Some(home) = crate::home::home_root()
         && let Ok(content) =
             std::fs::read_to_string(home.join(".base-gbl").join("domains.toml"))
         && let Ok(file) = toml::from_str::<DomainsFile>(&content)
@@ -304,7 +304,7 @@ pub fn create_domain(
     keyword: Option<&str>,
     path: Option<&str>,
 ) -> anyhow::Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let home = crate::home::home_root().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let toml_path = home.join(".base-gbl").join("domains.toml");
     let mut file: DomainsFile = if toml_path.exists() {
         toml::from_str(&std::fs::read_to_string(&toml_path)?)?
@@ -345,7 +345,7 @@ pub fn create_domain(
 }
 
 pub fn remove_domain(_cwd: &Path, domain_name: &str) -> anyhow::Result<bool> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let home = crate::home::home_root().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let toml_path = home.join(".base-gbl").join("domains.toml");
     if !toml_path.exists() { return Ok(false); }
 
@@ -366,7 +366,7 @@ pub fn remove_trigger(
     keyword: Option<&str>,
     path: Option<&str>,
 ) -> anyhow::Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let home = crate::home::home_root().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let toml_path = home.join(".base-gbl").join("domains.toml");
     if !toml_path.exists() { anyhow::bail!("domains.toml not found"); }
 

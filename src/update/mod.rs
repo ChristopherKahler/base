@@ -186,7 +186,7 @@ fn refresh_scripts(extract_root: &Path) -> usize {
     let Some(src) = find_scripts_dir(extract_root, 3) else {
         return 0;
     };
-    let Some(dest) = dirs::home_dir().map(|h| h.join(".base-gbl").join("scripts")) else {
+    let Some(dest) = crate::home::home_root().map(|h| h.join(".base-gbl").join("scripts")) else {
         return 0;
     };
     copy_tree(&src, &dest)
@@ -255,7 +255,7 @@ fn binary_version(bin: &Path) -> Option<String> {
 /// Canonical install location: `~/.local/bin/base` (`base.exe` on Windows).
 fn install_dest() -> Result<PathBuf> {
     let name = if cfg!(windows) { "base.exe" } else { "base" };
-    dirs::home_dir()
+    crate::home::home_root()
         .map(|h| h.join(".local").join("bin").join(name))
         .context("cannot resolve home directory")
 }
@@ -285,7 +285,7 @@ fn atomic_swap(new_bin: &Path, dest: &Path) -> Result<()> {
 /// Marker for an in-flight background update. Without it, every session start
 /// during a slow download would spawn another updater.
 fn inflight_marker() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".base-gbl").join(".update-inflight"))
+    crate::home::home_root().map(|h| h.join(".base-gbl").join(".update-inflight"))
 }
 
 /// How long a marker is trusted before we assume the updater died mid-download.

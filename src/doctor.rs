@@ -414,7 +414,7 @@ fn backup_footprint(path: &Path) -> (usize, u64) {
 /// unrelated project. The user has no way to suspect this without being told,
 /// so surface it with the exact command that stops it.
 fn leaked_global_handoffs() -> Vec<String> {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::home::home_root() else {
         return Vec::new();
     };
     leaked_handoffs_in(&home.join(".base-gbl").join(".base").join("graph.nq"))
@@ -696,7 +696,7 @@ fn tier_paths(cwd: &Path) -> Vec<(String, PathBuf)> {
     let mut tiers = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::home::home_root() {
         let global = home.join(".base-gbl").join(".base").join("graph.nq");
         if global.exists() {
             let key = fs::canonicalize(&global).unwrap_or_else(|_| global.clone());

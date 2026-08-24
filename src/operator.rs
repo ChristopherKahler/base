@@ -41,7 +41,7 @@ impl Default for OperatorProfile {
 /// Load operator profile from ~/.base-gbl/operator.toml.
 /// Returns None if file missing or inactive.
 pub fn load() -> Option<OperatorProfile> {
-    let home = dirs::home_dir()?;
+    let home = crate::home::home_root()?;
     let path = home.join(".base-gbl").join("operator.toml");
     load_from(&path)
 }
@@ -102,7 +102,7 @@ pub fn show() {
 // ─── CLI: init ──────────────────────────────────────────────
 
 pub fn init(name: &str) -> Result<()> {
-    let home = dirs::home_dir().context("Cannot determine home directory")?;
+    let home = crate::home::home_root().context("Cannot determine home directory")?;
     let global_dir = home.join(".base-gbl");
     std::fs::create_dir_all(&global_dir)?;
 
