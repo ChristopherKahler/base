@@ -445,13 +445,23 @@ pub fn run(graph_path: &Path, input: &str) -> (Value, i32) {
         return (Outcome::default().to_json(), 0);
     }
 
-    let store = match crate::store::load_graph(graph_path) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                OpError::whole("graph_load_failed", e.to_string()).to_json(),
-                1,
-            );
+    // A machine that has never written anything has no graph.nq yet, and a first
+    // pull is exactly that case — so start from an empty store rather than
+    // refusing, matching `crud::load_workspace_store`, the write path `base learn`
+    // already takes on a fresh home.
+    let store = if graph_path.exists() {
+        match crate::store::load_graph(graph_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return (OpError::whole("graph_load_failed", e.to_string()).to_json(), 1);
+            }
+        }
+    } else {
+        match Store::new() {
+            Ok(s) => s,
+            Err(e) => {
+                return (OpError::whole("store_init_failed", e.to_string()).to_json(), 1);
+            }
         }
     };
 
@@ -512,6 +522,23 @@ mod tests {
         let log = std::fs::read_to_string(crate::changelog::log_path_for(&g)).unwrap();
         assert_eq!(log.lines().count(), 1, "exactly one change record");
         assert!(log.contains("\"origin\":\"remote\""), "tagged remote: {log}");
+    }
+
+    #[test]
+    fn first_pull_on_a_machine_with_no_graph_yet() {
+        // A new machine's first pull arrives before it has ever written anything,
+        // so there is no graph.nq to load. Refusing here would make the very first
+        // sync the one that cannot work.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".base");
+        std::fs::create_dir_all(&base).unwrap();
+        let g = base.join("graph.nq");
+        assert!(!g.exists(), "precondition: no graph file");
+
+        let (out, code) = run(&g, &format!("[{}]", assert_op("01FIRST", Q)));
+        assert_eq!(code, 0, "got {out}");
+        assert_eq!(out["applied"], 1);
+        assert!(std::fs::read_to_string(&g).unwrap().contains("<urn:s/1>"), "graph created");
     }
 
     #[test]
