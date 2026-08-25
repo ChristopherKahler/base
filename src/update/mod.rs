@@ -264,15 +264,21 @@ fn refresh_skills(version: &str, report: crate::install::SkillReport) {
         return;
     };
     let binary_path = std::env::current_exe().unwrap_or_default();
-    if let Err(e) = crate::install::install_skills(
+    match crate::install::install_skills(
         &binary_path,
         &home,
         version,
         crate::install::SkillSource::TagOnly,
         report,
-    ) && report != crate::install::SkillReport::Silent
-    {
-        println!("  (Claude skills not refreshed — {e}; run `base install` to retry)");
+    ) {
+        // Re-stamp the manifest so `base doctor` compares the coach that is
+        // actually on disk now, not the one the last full install left.
+        Ok(()) => crate::install::record_base_help_after_update(),
+        Err(e) => {
+            if report != crate::install::SkillReport::Silent {
+                println!("  (Claude skills not refreshed — {e}; run `base install` to retry)");
+            }
+        }
     }
 }
 

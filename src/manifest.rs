@@ -37,6 +37,15 @@ pub struct ComponentEntry {
     pub version: String,
     pub path: String,
     pub installed_at: String,
+    /// Fingerprint of the component's primary content file exactly as shipped.
+    ///
+    /// Only `base-help` sets it, over `references/qa.md`. It is what separates
+    /// "the operator appended their own Q&A pairs" from "the release changed the
+    /// bank" — a whole-tree comparison cannot tell those apart, and the two want
+    /// opposite handling. Defaulted so every manifest written before this field
+    /// existed still round-trips.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +155,7 @@ pub fn detect_component(name: &str) -> Option<ComponentEntry> {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     path: "~/.local/bin/base".to_string(),
                     installed_at: now,
+                    content_hash: String::new(),
                 })
             } else {
                 None
@@ -186,7 +196,67 @@ fn detect_skill_component(home: &Path, name: &str, now: &str) -> Option<Componen
         version,
         path: display_path,
         installed_at: now.to_string(),
+        content_hash: String::new(),
     })
+}
+
+/// The base-help coach, installed at `~/.claude/skills/base-help/`.
+///
+/// Detected separately from `detect_skill_component` because that one looks
+/// under `~/.claude/commands/<name>/` and reads a package.json or frontmatter
+/// version — neither of which applies here. The coach's meaningful version is
+/// the base release its Q&A bank was verified against, which is the only thing
+/// that makes lag detectable: recording the *binary* version would match by
+/// construction and could never report drift.
+pub fn detect_base_help(home: &Path, now: &str) -> Option<ComponentEntry> {
+    let dir = home.join(".claude").join("skills").join("base-help");
+    let bank = dir.join("references").join("qa.md");
+    if !bank.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&bank).ok()?;
+    Some(ComponentEntry {
+        version: bank_version(&text).unwrap_or_else(|| "unstamped".to_string()),
+        path: "~/.claude/skills/base-help".to_string(),
+        installed_at: now.to_string(),
+        content_hash: hash_bytes(text.as_bytes()),
+    })
+}
+
+/// Parse the base version a Q&A bank is stamped to. PURE.
+///
+/// The stamp is prose, not frontmatter — "Verified against base v0.12.3 on …"
+/// or "Stamped for base v0.13.2 on …" — so match the `base v<semver>` token
+/// rather than a fixed sentence, and take the first one so a later mention of an
+/// older release in the body cannot win.
+pub fn bank_version(text: &str) -> Option<String> {
+    let mut rest = text;
+    while let Some(i) = rest.find("base v") {
+        let tail = &rest[i + "base v".len()..];
+        let v: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        // The stamp is prose, so the version is usually followed by sentence
+        // punctuation: "base v0.13.2." must not parse as a four-part version.
+        let v = v.trim_end_matches('.').to_string();
+        if v.split('.').count() == 3 && v.split('.').all(|p| !p.is_empty()) {
+            return Some(v);
+        }
+        rest = tail;
+    }
+    None
+}
+
+/// Hex sha256 of arbitrary bytes.
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 /// Read version from a skill's entry point YAML frontmatter (e.g. seed.md, skillsmith.md).
@@ -439,6 +509,7 @@ mod tests {
                 version: "0.1.0".to_string(),
                 path: "~/.local/bin/base".to_string(),
                 installed_at: "2026-06-03T15:00:00-05:00".to_string(),
+                content_hash: String::new(),
             },
         );
         components.insert(
@@ -447,6 +518,7 @@ mod tests {
                 version: "1.4.0".to_string(),
                 path: "~/.claude/paul-framework".to_string(),
                 installed_at: "2026-06-03T15:00:00-05:00".to_string(),
+                content_hash: String::new(),
             },
         );
 
@@ -568,6 +640,7 @@ mod tests {
                 version: version.to_string(),
                 path: "~/.local/bin/base".to_string(),
                 installed_at: "2026-06-03T15:00:00-05:00".to_string(),
+                content_hash: String::new(),
             },
         );
         Manifest {
@@ -615,5 +688,109 @@ mod tests {
         assert!(reconcile_running_version(&mut m));
         assert_eq!(m.components["base"].version, env!("CARGO_PKG_VERSION"));
         assert!(m.update_check.pending_update.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod base_help_component_tests {
+    use super::*;
+
+    /// The stamp is prose and its wording changed between releases ("Verified
+    /// against base v0.12.3", "Stamped for base v0.13.2"). Match the token.
+    #[test]
+    fn bank_version_reads_either_stamp_wording() {
+        assert_eq!(
+            bank_version("**Verified against base v0.12.3 on 2026-08-19.** …").as_deref(),
+            Some("0.12.3")
+        );
+        assert_eq!(
+            bank_version("**Stamped for base v0.13.2 on 2026-08-25 (sha `7dea613`).**").as_deref(),
+            Some("0.13.2")
+        );
+    }
+
+    /// A later mention of an older release in the body must not win over the
+    /// header stamp.
+    #[test]
+    fn bank_version_takes_the_first_stamp() {
+        let text = "Stamped for base v0.13.2.\n\nFixed in base v0.12.0, see base v0.11.0.";
+        assert_eq!(bank_version(text).as_deref(), Some("0.13.2"));
+    }
+
+    #[test]
+    fn bank_version_is_none_when_unstamped() {
+        assert_eq!(bank_version("# A bank with no version stamp at all"), None);
+        assert_eq!(bank_version("base v0.13 is not a semver triple"), None);
+    }
+
+    /// The whole point of recording the BANK's version rather than the binary's:
+    /// a coach one release behind must be detectable.
+    #[test]
+    fn detect_base_help_records_the_bank_stamp_and_hash() {
+        let home = tempfile::tempdir().unwrap();
+        let refs = home.path().join(".claude").join("skills").join("base-help").join("references");
+        std::fs::create_dir_all(&refs).unwrap();
+        let body = "**Verified against base v0.12.3 on 2026-08-19.**\n";
+        std::fs::write(refs.join("qa.md"), body).unwrap();
+
+        let e = detect_base_help(home.path(), "2026-08-25T00:00:00-05:00").expect("detected");
+        assert_eq!(e.version, "0.12.3", "records the bank stamp, not the binary");
+        assert_eq!(e.content_hash, hash_bytes(body.as_bytes()));
+        assert_eq!(e.path, "~/.claude/skills/base-help");
+    }
+
+    #[test]
+    fn detect_base_help_is_none_when_not_installed() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(detect_base_help(home.path(), "now").is_none());
+    }
+
+    #[test]
+    fn detect_base_help_marks_an_unstamped_bank() {
+        let home = tempfile::tempdir().unwrap();
+        let refs = home.path().join(".claude").join("skills").join("base-help").join("references");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("qa.md"), "no stamp here").unwrap();
+        assert_eq!(detect_base_help(home.path(), "now").unwrap().version, "unstamped");
+    }
+
+    /// A manifest written before `content_hash` existed must still load. If this
+    /// breaks, every existing install loses its component registry.
+    #[test]
+    fn manifest_round_trips_without_content_hash() {
+        let toml = r#"
+[chrisai]
+installed_at = "2026-06-03T15:00:00-05:00"
+source = "https://example.invalid"
+token = ""
+
+[components.base]
+version = "0.13.1"
+path = "~/.local/bin/base"
+installed_at = "2026-06-03T15:00:00-05:00"
+
+[update_check]
+last_checked = ""
+ttl_seconds = 86400
+pending_update = ""
+dismissed_until = ""
+"#;
+        let m: Manifest = toml::from_str(toml).expect("pre-content_hash manifest must still parse");
+        assert_eq!(m.components["base"].version, "0.13.1");
+        assert_eq!(m.components["base"].content_hash, "", "defaults empty");
+    }
+
+    /// An empty hash must not be written back out, so manifests stay clean for
+    /// every component that has no content file.
+    #[test]
+    fn empty_content_hash_is_not_serialized() {
+        let e = ComponentEntry {
+            version: "0.13.2".to_string(),
+            path: "~/.local/bin/base".to_string(),
+            installed_at: "now".to_string(),
+            content_hash: String::new(),
+        };
+        let out = toml::to_string(&e).unwrap();
+        assert!(!out.contains("content_hash"), "got: {out}");
     }
 }

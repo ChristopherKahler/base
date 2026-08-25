@@ -150,6 +150,7 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         })
         .collect();
     warnings.extend(leaked_global_handoffs());
+    warnings.extend(coach_drift());
     let config_errors = crate::command::check_command_files(cwd);
     let healthy = tiers.iter().all(|t| t.status != "unhealthy") && config_errors.is_empty();
     DoctorReport {
@@ -173,6 +174,12 @@ pub fn format_human(report: &DoctorReport) -> String {
         // the reason star commands went quiet, and it has nothing to do with tiers.
         for e in &report.config_errors {
             out.push_str(&format!("   ⚠ {e}\n"));
+        }
+        // Same reasoning for advisories: a coach lagging the binary is true
+        // whether or not a graph exists here, and this early return used to
+        // swallow it entirely.
+        for w in &report.warnings {
+            out.push_str(&format!("   ⚠ {w}\n"));
         }
         return out;
     }
@@ -355,6 +362,59 @@ fn newest_backup(path: &Path) -> Option<PathBuf> {
 /// Filesystem-safe local timestamp for backup/quarantine filenames.
 fn stamp() -> String {
     chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string()
+}
+
+// ─── base-help coach drift ────────────────────────────────────────────────
+
+/// Advisory when the installed base-help coach has fallen behind the binary.
+/// PURE — no filesystem, so the wording is unit-testable.
+///
+/// The coach is base's own answer surface. Before `base update` learned to
+/// refresh skills, updating the binary left it frozen at whatever release last
+/// ran a full `base install`, and nothing said so: the operator got confident
+/// answers describing the previous version of the CLI. This is the surface that
+/// makes that visible, and it is the ONLY reader the background update path has,
+/// which is why it is a report rather than a prompt.
+///
+/// Advisory only — it never counts against `healthy`. A stale coach is wrong
+/// documentation, not a broken graph.
+pub fn skill_drift_warning(
+    bank_version: Option<&str>,
+    binary_version: &str,
+    skill_installed: bool,
+) -> Option<String> {
+    match bank_version {
+        // Registered and in step: nothing to say.
+        Some(v) if v == binary_version => None,
+        Some("unstamped") => Some(
+            "base-help coach carries no version stamp in references/qa.md — cannot tell whether it matches this binary; run `base install` to reinstall it"
+                .to_string(),
+        ),
+        Some(v) => Some(format!(
+            "base-help coach is stamped for base v{v} but this binary is {binary_version} — its answers may describe the previous release; run `base update` (or `base install`) to refresh it"
+        )),
+        // On disk but never registered: an old install, or a hand-copied skill.
+        None if skill_installed => Some(
+            "base-help coach is installed but not registered in manifest.toml — version drift cannot be detected; run `base install` to register it"
+                .to_string(),
+        ),
+        None => None,
+    }
+}
+
+/// Read the two facts `skill_drift_warning` compares, then apply it.
+fn coach_drift() -> Option<String> {
+    let home = crate::home::home_root()?;
+    let installed = home
+        .join(".claude")
+        .join("skills")
+        .join("base-help")
+        .join("references")
+        .join("qa.md")
+        .is_file();
+    let recorded = crate::manifest::Manifest::load()
+        .and_then(|m| m.components.get("base-help").map(|c| c.version.clone()));
+    skill_drift_warning(recorded.as_deref(), env!("CARGO_PKG_VERSION"), installed)
 }
 
 // ─── Operational health: stale-temp, bloat, write-probe ───────────────────
@@ -870,5 +930,67 @@ mod tests {
         assert!(w[0].contains("stray-one"), "must name the open handoff: {}", w[0]);
         assert!(!w[0].contains("archived-one"), "archived ones are already silenced: {}", w[0]);
         assert!(w[0].contains("base handoff archive"), "must name the fix: {}", w[0]);
+    }
+}
+
+#[cfg(test)]
+mod coach_drift_tests {
+    use super::*;
+
+    #[test]
+    fn doctor_is_quiet_when_the_coach_is_in_step() {
+        assert_eq!(skill_drift_warning(Some("0.13.2"), "0.13.2", true), None);
+    }
+
+    /// The drift this whole fork exists to make visible: binary moved, coach
+    /// did not.
+    #[test]
+    fn doctor_reports_a_lagging_coach() {
+        let w = skill_drift_warning(Some("0.12.3"), "0.13.2", true).expect("must warn");
+        assert!(w.contains("0.12.3") && w.contains("0.13.2"), "got: {w}");
+        assert!(w.contains("base update"), "must name the fix: {w}");
+    }
+
+    /// A coach AHEAD of the binary is drift too — it happens when someone rolls
+    /// back a binary — so warn rather than only comparing one direction.
+    #[test]
+    fn doctor_reports_a_coach_ahead_of_the_binary() {
+        assert!(skill_drift_warning(Some("0.14.0"), "0.13.2", true).is_some());
+    }
+
+    #[test]
+    fn doctor_reports_an_unstamped_bank() {
+        let w = skill_drift_warning(Some("unstamped"), "0.13.2", true).expect("must warn");
+        assert!(w.contains("no version stamp"), "got: {w}");
+    }
+
+    /// Installed but never registered: an install predating the manifest entry,
+    /// or a hand-copied skill. Drift is undetectable until it is registered.
+    #[test]
+    fn doctor_reports_an_unregistered_coach() {
+        let w = skill_drift_warning(None, "0.13.2", true).expect("must warn");
+        assert!(w.contains("not registered"), "got: {w}");
+    }
+
+    /// No skill installed at all is not a fault — base works fine without it.
+    #[test]
+    fn doctor_is_quiet_when_no_coach_is_installed() {
+        assert_eq!(skill_drift_warning(None, "0.13.2", false), None);
+    }
+
+    /// Advisory, never a health verdict: a stale coach is wrong documentation,
+    /// not a broken graph.
+    #[test]
+    fn coach_drift_never_counts_against_health() {
+        let report = DoctorReport {
+            tiers: vec![],
+            healthy: true,
+            warnings: vec![skill_drift_warning(Some("0.12.3"), "0.13.2", true).unwrap()],
+            config_errors: vec![],
+        };
+        assert!(report.healthy, "an advisory must not flip the verdict");
+        // Reaches the reader even with no graph tiers present — a lagging coach
+        // is true regardless of whether a graph exists in this directory.
+        assert!(format_human(&report).contains("0.12.3"), "advisory must be rendered");
     }
 }

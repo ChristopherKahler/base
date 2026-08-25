@@ -1124,16 +1124,49 @@ fn install_one_skill(
         return Ok(format!("{skill} (already current)"));
     }
 
+    // Something differs. Whether that matters depends on WHO changed it, and a
+    // whole-tree compare cannot tell: the bank is designed to be appended to
+    // (the skill's own close-the-loop rule writes new `### Q:` pairs into it),
+    // so "the operator added answers" and "the release shipped a new bank" look
+    // identical here. The recorded hash of the bank as last shipped separates
+    // them, and the two cases deserve different words — never silence.
+    let locally_modified = bank_locally_modified(&dest);
     let backup = dest_root.join(format!(
         "{skill}.bak-{}",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     ));
     std::fs::rename(&dest, &backup)?;
     std::fs::rename(&staging, &dest)?;
-    Ok(format!(
-        "{skill} ({count} files, {source}; previous kept at {})",
-        backup.display()
-    ))
+    if locally_modified {
+        Ok(format!(
+            "{skill} ({count} files, {source}) — YOUR EDITED Q&A BANK was replaced; your copy is kept in full at {}",
+            backup.display()
+        ))
+    } else {
+        Ok(format!(
+            "{skill} ({count} files, {source}; previous kept at {})",
+            backup.display()
+        ))
+    }
+}
+
+/// Did the operator edit the installed Q&A bank since it was last shipped?
+///
+/// Compares the bank on disk against the hash recorded in `manifest.toml` at its
+/// last install. No recorded hash means we cannot tell — report false rather
+/// than crying wolf on every machine that installed before the hash existed.
+/// The backup happens either way; this only decides how loudly to say so.
+fn bank_locally_modified(dest: &Path) -> bool {
+    let Some(recorded) = Manifest::load()
+        .and_then(|m| m.components.get("base-help").map(|c| c.content_hash.clone()))
+        .filter(|h| !h.is_empty())
+    else {
+        return false;
+    };
+    let Ok(current) = std::fs::read(dest.join("references").join("qa.md")) else {
+        return false;
+    };
+    manifest::hash_bytes(&current) != recorded
 }
 
 /// Locate `claude/skills/` relative to the running binary, mirroring the search
@@ -1439,6 +1472,33 @@ Each app keeps its own self-contained map at `<app>/.base-ast/ast.ttl`, register
 - Built by Chris Kahler · Chris AI Systems · https://www.skool.com/claude-code-titans-9203
 "#;
 
+/// Register the installed base-help coach in the manifest.
+///
+/// Records the base version its Q&A bank is stamped to (NOT this binary's — see
+/// `manifest::detect_base_help`) plus a hash of the bank as shipped. Together
+/// those give `base doctor` something to compare, so a coach lagging the binary
+/// is reportable instead of invisible, and give the installer a way to tell an
+/// operator-edited bank from a bank the release changed.
+pub(crate) fn record_base_help(manifest: &mut Manifest, now: &str) {
+    let Some(home) = crate::home::home_root() else {
+        return;
+    };
+    if let Some(entry) = manifest::detect_base_help(&home, now) {
+        manifest.components.insert("base-help".to_string(), entry);
+    }
+}
+
+/// Refresh just the `base-help` manifest entry and save. Used after the update
+/// path replaces the skill, where the full `base install` manifest write does
+/// not run. Best-effort: a manifest that cannot be written must not fail an
+/// update whose binary swap already committed.
+pub(crate) fn record_base_help_after_update() {
+    let mut manifest = Manifest::load().unwrap_or_default();
+    let now = chrono::Local::now().to_rfc3339();
+    record_base_help(&mut manifest, &now);
+    let _ = manifest.save();
+}
+
 // ─── Step 8: Write manifest ─────────────────────────────────
 
 fn write_manifest(global_dir: &Path, full: bool) -> Result<()> {
@@ -1461,8 +1521,10 @@ fn write_manifest(global_dir: &Path, full: bool) -> Result<()> {
             .get("base")
             .map(|c| c.installed_at.clone())
             .unwrap_or_else(|| now.clone()),
+        content_hash: String::new(),
     };
     manifest.components.insert("base".to_string(), base_entry);
+    record_base_help(&mut manifest, &now);
 
     if full {
         // Detect and register all framework components
@@ -1482,6 +1544,7 @@ fn write_manifest(global_dir: &Path, full: bool) -> Result<()> {
                         version: entry.version,
                         path: entry.path,
                         installed_at,
+                        content_hash: entry.content_hash,
                     },
                 );
                 println!("\n   ✓ {name} v{}", manifest.components[*name].version);
@@ -1901,5 +1964,108 @@ mod skill_refresh_tests {
             None,
             "TagOnly must ignore a local checkout"
         );
+    }
+}
+
+#[cfg(test)]
+mod skill_dod_tests {
+    use super::*;
+
+    /// Build a skill fixture: SKILL.md plus a bank with the given stamp.
+    fn fixture(root: &Path, stamp: &str, extra_pair: &str) -> std::path::PathBuf {
+        let skill = root.join("base-help");
+        let refs = skill.join("references");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: base-help\n---\n").unwrap();
+        std::fs::write(
+            refs.join("qa.md"),
+            format!("**Verified against base v{stamp} on 2026-08-19.**\n{extra_pair}"),
+        )
+        .unwrap();
+        skill
+    }
+
+    fn bank(dest_root: &Path) -> String {
+        std::fs::read_to_string(dest_root.join("base-help").join("references").join("qa.md"))
+            .unwrap()
+    }
+
+    /// DoD line 1, refresh half: installing over an older skill replaces it with
+    /// the incoming tag's content.
+    #[test]
+    fn update_refreshes_the_skill_to_the_incoming_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest_root = tmp.path().join("skills");
+        std::fs::create_dir_all(&dest_root).unwrap();
+
+        let old = fixture(&tmp.path().join("old"), "0.12.3", "");
+        install_one_skill("base-help", Some(&old), &dest_root, "0.12.3").unwrap();
+        assert!(bank(&dest_root).contains("v0.12.3"));
+
+        let new = fixture(&tmp.path().join("new"), "0.13.2", "### Q: a new pair\n");
+        let msg = install_one_skill("base-help", Some(&new), &dest_root, "0.13.2").unwrap();
+
+        let after = bank(&dest_root);
+        assert!(after.contains("v0.13.2"), "refreshed to the incoming bank");
+        assert!(after.contains("a new pair"), "new content is present");
+        assert!(msg.contains("previous kept at"), "outcome names the backup: {msg}");
+    }
+
+    /// An unchanged skill is left alone entirely — no churn, no backup dir.
+    #[test]
+    fn an_unchanged_skill_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest_root = tmp.path().join("skills");
+        std::fs::create_dir_all(&dest_root).unwrap();
+        let src = fixture(&tmp.path().join("src"), "0.13.2", "");
+
+        install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
+        let msg = install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
+
+        assert!(msg.contains("already current"), "got: {msg}");
+        let backups: Vec<_> = std::fs::read_dir(&dest_root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
+            .collect();
+        assert!(backups.is_empty(), "an identical skill must not spawn a backup");
+    }
+
+    /// DoD line 2: a modified bank is never destroyed. The operator's bytes
+    /// survive in full, and the outcome line says so rather than staying quiet
+    /// about it — `base update`'s background path has no other reader.
+    #[test]
+    fn a_modified_bank_is_preserved_and_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest_root = tmp.path().join("skills");
+        std::fs::create_dir_all(&dest_root).unwrap();
+
+        let src = fixture(&tmp.path().join("src"), "0.12.3", "");
+        install_one_skill("base-help", Some(&src), &dest_root, "0.12.3").unwrap();
+
+        // The operator appends a pair, exactly as the skill's close-the-loop
+        // rule instructs.
+        let live = dest_root.join("base-help").join("references").join("qa.md");
+        let mine = format!("{}\n### Q: my own hard-won pair\n", std::fs::read_to_string(&live).unwrap());
+        std::fs::write(&live, &mine).unwrap();
+
+        let new = fixture(&tmp.path().join("new"), "0.13.2", "");
+        let msg = install_one_skill("base-help", Some(&new), &dest_root, "0.13.2").unwrap();
+
+        // The incoming bank is live …
+        assert!(bank(&dest_root).contains("v0.13.2"));
+        // … and the operator's copy survives byte-for-byte in the backup.
+        let backup = std::fs::read_dir(&dest_root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().contains(".bak-"))
+            .expect("a backup must exist");
+        assert_eq!(
+            std::fs::read_to_string(backup.join("references").join("qa.md")).unwrap(),
+            mine,
+            "the operator's edited bank must survive byte-for-byte"
+        );
+        assert!(msg.contains("previous kept at"), "never silent: {msg}");
     }
 }
