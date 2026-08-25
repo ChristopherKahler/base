@@ -23,6 +23,7 @@ use std::process::Command;
 use crate::extension::{self, ExtensionDef};
 
 pub mod dist;
+mod paths;
 pub mod scaffold;
 
 // ─── Reserved core command names ─────────────────────────────
@@ -172,16 +173,19 @@ pub fn build_registry(exts: &[ExtensionDef]) -> CommandRegistry {
 /// Resolve a handler path: tilde-expand; absolute used as-is; relative resolved
 /// against `framework_dir`, else the extension file's own directory, else left
 /// relative (exec will fail loud if it can't be found).
+///
+/// The result is manifest-shaped — `/`-separated on every platform — so one
+/// manifest yields one string on Windows and unix alike. See [`paths`].
 fn resolve_handler(handler: &str, ext: &ExtensionDef) -> PathBuf {
     let expanded = expand_tilde(handler);
-    let path = if expanded.is_absolute() {
-        expanded
+    let path = if paths::is_manifest_absolute(&expanded) {
+        paths::to_manifest_path(&expanded)
     } else if let Some(fw) = &ext.framework_dir {
-        expand_tilde(fw).join(&expanded)
+        paths::join_manifest(&expand_tilde(fw), &expanded)
     } else if let Some(parent) = ext.source_path.as_ref().and_then(|p| p.parent()) {
-        parent.join(&expanded)
+        paths::join_manifest(parent, &expanded)
     } else {
-        expanded
+        paths::to_manifest_path(&expanded)
     };
     windows_exe_fixup(path)
 }
@@ -221,12 +225,18 @@ fn expand_tilde(path: &str) -> PathBuf {
 /// `framework_dir = "."` install correctly from anywhere.
 fn resolve_framework_dir(manifest_path: &Path, fw: &str) -> PathBuf {
     let expanded = expand_tilde(fw);
-    if expanded.is_absolute() {
-        return expanded;
+    if paths::is_manifest_absolute(&expanded) {
+        return paths::to_manifest_path(&expanded);
     }
     let base = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    let joined = base.join(&expanded);
-    std::fs::canonicalize(&joined).unwrap_or(joined)
+    let joined = paths::join_manifest(base, &expanded);
+    // `canonicalize` returns a verbatim (`\\?\`) path on Windows, and this value is
+    // written into the installed manifest by `install_linked`. Verbatim paths
+    // reject `/`, so carrying one into a manifest breaks every `bin/x` handler
+    // declared in it — normalise here, where the path is created.
+    std::fs::canonicalize(&joined)
+        .map(|p| paths::to_manifest_path(&p))
+        .unwrap_or(joined)
 }
 
 // ─── Executor + env contract ─────────────────────────────────
@@ -475,7 +485,7 @@ pub fn install_linked(manifest_path: &Path) -> anyhow::Result<LinkedOutcome> {
     // Resolve a relative/"." framework_dir to absolute — the installed copy lives
     // in extensions/, not the app, so a relative path would otherwise break.
     let resolved_text = match &ext.framework_dir {
-        Some(fw) if !expand_tilde(fw).is_absolute() => {
+        Some(fw) if !paths::is_manifest_absolute(&expand_tilde(fw)) => {
             let abs = resolve_framework_dir(manifest_path, fw);
             rewrite_framework_dir(&original, &abs.to_string_lossy())?
         }
@@ -897,12 +907,23 @@ DUP=second
         // var + its first two args, then exits with a code derived from arg 3.
         // Proves: args forwarded, env contract reaches the child, exit propagates.
         let dir = tempfile::tempdir().unwrap();
-        let handler = dir.path().join("handler.sh");
-        std::fs::write(
-            &handler,
+        // The fixture has to be something the host can actually exec: a shebang'd
+        // shell script on unix, a batch file on Windows, which has no shebang
+        // support and where a real plugin handler is a `.cmd` or `.exe` anyway.
+        // The platform split stops at the fixture — every assertion below is
+        // identical on both.
+        #[cfg(not(windows))]
+        let (name, body) = (
+            "handler.sh",
             "#!/usr/bin/env bash\necho \"WS=$BASE_WORKSPACE\"\necho \"KEY=$INJECTED_KEY\"\necho \"ARGS=$1 $2\"\nexit ${3:-0}\n",
-        )
-        .unwrap();
+        );
+        #[cfg(windows)]
+        let (name, body) = (
+            "handler.cmd",
+            "@echo off\r\necho WS=%BASE_WORKSPACE%\r\necho KEY=%INJECTED_KEY%\r\necho ARGS=%1 %2\r\nexit /b %3\r\n",
+        );
+        let handler = dir.path().join(name);
+        std::fs::write(&handler, body).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -992,7 +1013,10 @@ DUP=second
         std::fs::write(&manifest, "x").unwrap();
         // "." → the manifest's own directory (canonicalized)
         let got = resolve_framework_dir(&manifest, ".");
-        let want = std::fs::canonicalize(dir.path()).unwrap();
+        // Same normaliser on both sides: `canonicalize` is verbatim on Windows and
+        // `resolve_framework_dir` strips that, so the expected value has to be put
+        // through the identical transform. Byte-identical to the raw value on unix.
+        let want = paths::to_manifest_path(&std::fs::canonicalize(dir.path()).unwrap());
         assert_eq!(got, want);
         // absolute used as-is
         assert_eq!(resolve_framework_dir(&manifest, "/opt/x"), PathBuf::from("/opt/x"));
