@@ -4,8 +4,41 @@ use serde::Deserialize;
 
 // ─── Workspace discovery ─────────────────────────────────────
 
+/// The global tier's `.base/` directory — `<home>/.base-gbl/.base`.
+///
+/// Constructed, never searched for: the global tier has exactly one location, so
+/// "not found" is not a state it can be in. `None` only when there is no home.
+pub fn global_base_dir() -> Option<PathBuf> {
+    crate::home::home_root().map(|h| h.join(".base-gbl").join(".base"))
+}
+
+/// The global tier root — the path `-g/--global` swaps cwd for (`cli::tier_cwd`).
+fn global_tier_root() -> Option<PathBuf> {
+    crate::home::home_root().map(|h| h.join(".base-gbl"))
+}
+
 /// Find the workspace `.base/` directory by walking up from cwd.
+///
+/// `--global` is not a search. `cli::tier_cwd` swaps cwd for `<home>/.base-gbl`,
+/// whose `.base` is at a known path, so it is returned directly — existing or
+/// not — and the walk is skipped.
+///
+/// Walking it was a silent wrong-tier write. Nothing in the crate creates
+/// `<home>/.base-gbl/.base` (`install::create_global_tier` makes `.base-gbl` and
+/// stops), so on a fresh install the walk climbed past the tier to `<home>` and
+/// took `<home>/.base` — the WORKSPACE tier — and every `-g` verb reported
+/// success against the wrong graph. Reproduced on both platforms; see the fork
+/// `base-sync-client-surface`.
+///
+/// The workspace tier keeps the walk and keeps refusing when it finds nothing:
+/// there, no known correct location exists, which is the whole reason
+/// `crud::require_base_for_write` never auto-creates (issue #8).
 pub fn find_workspace_base(cwd: &Path) -> Option<PathBuf> {
+    if let Some(root) = global_tier_root()
+        && cwd == root
+    {
+        return global_base_dir();
+    }
     walk_up(cwd, |dir| {
         let base = dir.join(".base");
         base.is_dir().then_some(base)
@@ -737,5 +770,64 @@ mod tests {
         // Explicit opt-out is honored.
         let c: BaseConfig = toml::from_str("[update]\nauto = false\n").unwrap();
         assert!(!c.update.auto);
+    }
+
+    // ─── Global tier resolution ──────────────────────────────
+
+    /// The decoy `<home>/.base` is the thing the old walk-up climbed into, and
+    /// it is what makes this fire on Linux as well as Windows.
+    #[test]
+    fn the_global_tier_resolves_directly_instead_of_walking_into_the_workspace_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+            let root = tmp.path().join(".base-gbl");
+            std::fs::create_dir_all(&root).unwrap();
+            assert!(!root.join(".base").exists(), "precondition: the tier is not created yet");
+
+            assert_eq!(
+                find_workspace_base(&root),
+                Some(root.join(".base")),
+                "--global must resolve its own tier, never the workspace tier above it"
+            );
+        });
+    }
+
+    /// A first pull arrives before anything has created the tier, so resolution
+    /// cannot depend on it already being there.
+    #[test]
+    fn the_global_tier_resolves_before_it_exists_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let root = tmp.path().join(".base-gbl");
+            assert!(!root.exists(), "precondition: nothing on disk at all");
+            assert_eq!(find_workspace_base(&root), Some(root.join(".base")));
+        });
+    }
+
+    /// The workspace tier is a genuine search and stays one.
+    #[test]
+    fn an_ordinary_workspace_cwd_still_walks_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let ws = tmp.path().join("proj");
+            std::fs::create_dir_all(ws.join(".base")).unwrap();
+            let deep = ws.join("src").join("nested");
+            std::fs::create_dir_all(&deep).unwrap();
+
+            assert_eq!(find_workspace_base(&deep), Some(ws.join(".base")));
+        });
+    }
+
+    /// Outside a workspace there is no known correct location, so the answer
+    /// stays `None` — `require_base_for_write` depends on it (issue #8).
+    #[test]
+    fn a_cwd_outside_any_workspace_still_resolves_to_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let orphan = tmp.path().join("no").join("workspace").join("here");
+            std::fs::create_dir_all(&orphan).unwrap();
+            assert_eq!(find_workspace_base(&orphan), None);
+        });
     }
 }
