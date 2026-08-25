@@ -7,7 +7,7 @@ use oxigraph::io::{RdfFormat, RdfSerializer};
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 
-use crate::changelog::{AppliedOp, Change};
+use crate::changelog::{AppliedOp, Change, DeltaGap};
 
 /// The canonical RDF format for graph persistence.
 /// NQuads is immune to the graph-block split corruption bug in oxigraph's
@@ -287,6 +287,123 @@ pub fn snapshot_graphs(store: &Store, graphs: &[String]) -> std::collections::Ha
         );
     }
     out
+}
+
+// ─── The SPARQL write seam ───────────────────────────────────
+
+/// Whether a write is knowledge the team needs, or a per-machine signal.
+///
+/// Stated at the call site because only the author knows which it is, and the
+/// two hottest writers in base (`lastRead` on every recall, `lastActive` on
+/// every tool call) must never pay for a diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    Knowledge,
+    Housekeeping,
+}
+
+/// Marker the desktop app writes at pairing and removes at unpair.
+///
+/// Deliberately NOT the doorbell: the doorbell says the app is running *right
+/// now*, and a paused or crashed app must not silently drop deltas that cannot
+/// be reconstructed afterwards. Absent means base skips every diff, so an
+/// install with no app is exactly as fast as it was before R1b.
+///
+/// Resolved through [`crate::home::home_root`], so `BASE_HOME` isolates it and
+/// the test suite is never gated on the operator's real marker.
+pub fn sync_enabled() -> bool {
+    crate::home::home_root().is_some_and(|h| h.join(".base-gbl").join("sync-enabled").exists())
+}
+
+/// How much of the store a write's delta has to be diffed against.
+///
+/// The split exists because "diff the whole store" is affordable for a human
+/// clicking delete in the dashboard and ruinous on a path that fires for every
+/// tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Diff only the one graph the update names. An update that spans graphs
+    /// records an honest gap instead — for hot paths (CRUD, hooks) that must
+    /// never pay for the whole store.
+    Target,
+    /// Diff the named graph, or the whole store when the update spans graphs.
+    ///
+    /// For rare, destructive writes — deletes and purges, whose `DELETE … WHERE
+    /// { GRAPH ?g … }` cannot name a target. A retraction that never ships
+    /// leaves the deleted fact alive in the team's graph forever, so here the
+    /// cost is worth paying. Scoping such a delete to a guessed graph would be
+    /// worse than either: an incomplete delta that looks complete.
+    Wide,
+}
+
+/// Apply a SPARQL update and persist it, capturing the delta when one is owed.
+///
+/// The **only** sanctioned path from a SPARQL mutation to disk:
+/// [`Change::SparqlWithDelta`] and [`Change::SparqlNoDelta`] are constructible
+/// nowhere else, so "every knowledge write ships its delta" holds by
+/// construction instead of by 26 authors remembering. `tests/guard_test.rs`
+/// keeps it that way.
+pub fn update_and_write(
+    store: &Store,
+    path: &Path,
+    sparql: &str,
+    scope: Scope,
+    intent: Intent,
+) -> Result<()> {
+    mutate_and_write(store, path, sparql, scope, intent, |s| {
+        s.update(sparql).with_context(|| format!("SPARQL update failed: {sparql}"))?;
+        Ok(Some(sparql.to_string()))
+    })
+}
+
+/// The seam's general form, for writers that apply several statements
+/// best-effort and only then know what to log.
+///
+/// `apply` returns the text to record, or `None` when nothing landed and no
+/// write should happen. The snapshot is taken before `apply` runs — which is the
+/// whole reason this is a closure and not "call update, then hand us the text".
+pub fn mutate_and_write(
+    store: &Store,
+    path: &Path,
+    hint: &str,
+    scope: Scope,
+    intent: Intent,
+    apply: impl FnOnce(&Store) -> Result<Option<String>>,
+) -> Result<()> {
+    // One stat, not two: the marker must not be re-read between the decision to
+    // snapshot and the decision to record a gap, or a pairing that lands mid-write
+    // produces a record claiming a delta it never captured.
+    let enabled = sync_enabled();
+    let capture = intent == Intent::Knowledge && enabled;
+
+    // Resolve the scope BEFORE mutating, or there is nothing to diff against.
+    let graphs: Option<Vec<String>> = if !capture {
+        None
+    } else {
+        match (crate::changelog::derive_graph_iri(hint), scope) {
+            (Some(g), _) => Some(vec![g]),
+            (None, Scope::Wide) => Some(Vec::new()), // empty ⇒ the whole store
+            (None, Scope::Target) => None,
+        }
+    };
+    let before = graphs.as_ref().map(|g| snapshot_graphs(store, g));
+
+    let Some(log_text) = apply(store)? else { return Ok(()) };
+
+    match (graphs, before) {
+        (Some(g), Some(before)) => {
+            let ops = delta_since(store, &g, before).to_ops();
+            write_back(store, path, Change::SparqlWithDelta(&log_text, &ops))
+        }
+        _ => {
+            let gap = match intent {
+                Intent::Housekeeping => DeltaGap::Housekeeping,
+                Intent::Knowledge if !enabled => DeltaGap::SyncDisabled,
+                Intent::Knowledge => DeltaGap::MultiGraph,
+            };
+            write_back(store, path, Change::SparqlNoDelta(&log_text, gap))
+        }
+    }
 }
 
 /// What changed in `graphs` since `before` was taken.

@@ -35,7 +35,6 @@ use oxigraph::store::Store;
 
 use crate::config::{BaseConfig, NamespaceConfig};
 use crate::crud;
-use crate::changelog::Change;
 use crate::store;
 
 /// Statuses that count as "working" — eligible to decay to `deferred` when cold.
@@ -245,10 +244,22 @@ pub fn apply(store: &Store, ns: &NamespaceConfig, trig_path: &Path, decisions: &
     }
 
     if !ops.is_empty() {
-        for op in &ops {
-            let _ = store.update(&format!("{pfx}\n{op}"));
-        }
-        store::write_back(store, trig_path, Change::Sparql(&ops.join(";\n")))?;
+        // The closure form exists for exactly this shape: the ops are applied
+        // best-effort one at a time, so the snapshot has to be taken before the
+        // first one rather than handed over afterwards.
+        store::mutate_and_write(
+            store,
+            trig_path,
+            "",
+            store::Scope::Wide,
+            store::Intent::Knowledge,
+            |s| {
+                for op in &ops {
+                    let _ = s.update(&format!("{pfx}\n{op}"));
+                }
+                Ok(Some(ops.join(";\n")))
+            },
+        )?;
     }
     Ok(stats)
 }

@@ -18,7 +18,6 @@ use anyhow::{Context, Result};
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 
-use crate::changelog::Change;
 use crate::config::NamespaceConfig;
 
 // ─── IRI building ────────────────────────────────────────────
@@ -166,10 +165,16 @@ pub fn load_workspace_store(cwd: &Path) -> Result<(Store, PathBuf)> {
 pub fn load_and_mutate(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<()> {
     let (store, trig_path) = load_workspace_store(cwd)?;
     let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
-    store
-        .update(&full_sparql)
-        .with_context(|| format!("SPARQL update failed: {full_sparql}"))?;
-    crate::store::write_back(&store, &trig_path, Change::Sparql(&full_sparql))
+    // Scope::Target, not Wide: this is the hot path — 40 CRUD callers, and the
+    // hooks behind them fire on every tool call. Its SPARQL always names its
+    // graph, so the target is derivable and a whole-store diff is never needed.
+    crate::store::update_and_write(
+        &store,
+        &trig_path,
+        &full_sparql,
+        crate::store::Scope::Target,
+        crate::store::Intent::Knowledge,
+    )
 }
 
 /// Load workspace graph and run a SPARQL SELECT query.
@@ -305,7 +310,13 @@ pub fn repair_edges(cwd: &Path, ns: &NamespaceConfig) -> Result<usize> {
         "Task", "project", "hasTask",
     )?);
 
-    crate::store::write_back(&store, &trig_path, Change::Sparql(&applied.join(";\n")))?;
+    crate::store::update_and_write(
+        &store,
+        &trig_path,
+        &applied.join(";\n"),
+        crate::store::Scope::Target,
+        crate::store::Intent::Knowledge,
+    )?;
     Ok(applied.len())
 }
 

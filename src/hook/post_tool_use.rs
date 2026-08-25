@@ -5,7 +5,6 @@ use chrono::Local;
 
 use crate::config::BaseConfig;
 use crate::crud;
-use crate::changelog::Change;
 use crate::store;
 
 pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Result<super::HookEventData> {
@@ -61,7 +60,18 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         }
 
         if !applied.is_empty() {
-            store::write_back(&graph, tp, Change::Sparql(&applied.join(";\n")))?;
+            // Housekeeping: `lastActive` is a per-machine usage signal, and this
+            // path runs on EVERY tool call — the one place a diff must never be
+            // taken. The statements are already applied above, so the seam is
+            // handed a no-op closure and records the gap honestly.
+            store::mutate_and_write(
+                &graph,
+                tp,
+                "",
+                store::Scope::Target,
+                store::Intent::Housekeeping,
+                |_| Ok(Some(applied.join(";\n"))),
+            )?;
         }
     }
 

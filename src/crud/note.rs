@@ -4,7 +4,6 @@ use anyhow::Result;
 use oxigraph::sparql::QueryResults;
 
 use crate::config::NamespaceConfig;
-use crate::changelog::Change;
 use crate::crud;
 
 /// Create a note (memory entry) with optional relational edges.
@@ -291,8 +290,15 @@ pub fn stamp_last_read(cwd: &Path, ns: &NamespaceConfig, note_iris: &[String]) -
         ));
     }
     let update = format!("{}\n{}", crud::prefixes(ns), stmts.join(";\n"));
-    store.update(&update)?;
-    crate::store::write_back(&store, &trig_path, Change::Sparql(&update))?;
+    // A per-machine usage signal, not knowledge: this fires on every `base
+    // recall`, and shipping it would push a fact op to the team each time.
+    crate::store::update_and_write(
+        &store,
+        &trig_path,
+        &update,
+        crate::store::Scope::Target,
+        crate::store::Intent::Housekeeping,
+    )?;
     Ok(note_iris.len())
 }
 
@@ -420,8 +426,15 @@ pub fn remove(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<bool> {
         "{}\nDELETE WHERE {{ GRAPH <{graph}> {{ <{iri}> ?p ?o }} }}",
         crud::prefixes(ns)
     );
-    store.update(&delete)?;
-    crate::store::write_back(&store, &trig_path, Change::Sparql(&delete))?;
+    // Wide: a retraction that never ships leaves the deleted note alive in the
+    // team's graph forever.
+    crate::store::update_and_write(
+        &store,
+        &trig_path,
+        &delete,
+        crate::store::Scope::Wide,
+        crate::store::Intent::Knowledge,
+    )?;
     Ok(true)
 }
 
@@ -455,8 +468,13 @@ pub fn update_text(cwd: &Path, ns: &NamespaceConfig, slug: &str, new_text: &str)
          WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:noteText ?old }} }}",
         crud::prefixes(ns)
     );
-    store.update(&update)?;
-    crate::store::write_back(&store, &trig_path, Change::Sparql(&update))?;
+    crate::store::update_and_write(
+        &store,
+        &trig_path,
+        &update,
+        crate::store::Scope::Wide,
+        crate::store::Intent::Knowledge,
+    )?;
     Ok(true)
 }
 

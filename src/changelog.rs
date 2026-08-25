@@ -52,12 +52,6 @@ pub const LOG_FILE: &str = "changes.jsonl";
 /// are hundreds of bytes — completely intact.
 pub const SPARQL_MAX_BYTES: usize = 64 * 1024;
 
-/// What produced a graph write.
-///
-/// [`crate::store::write_back`] takes this by value, so a new write path cannot
-/// compile without saying which it is. That is the point: hand-wiring the ~100
-/// existing writers would leave a gap the day someone adds the next one, and that
-/// gap surfaces as the reader quietly missing writes.
 /// One fact-shaped delta carried in a change record's `ops[]`.
 ///
 /// The same shape the desktop client ships to the portal, so a reader never has
@@ -113,11 +107,52 @@ impl AppliedOp {
     }
 }
 
+/// Why a record carries no `ops[]`.
+///
+/// Absent is not empty and not zero (law 7): a client that cannot see *why* a
+/// write has no delta renders a confident, wrong "everything is synced". Every
+/// delta-free SPARQL record names its reason instead.
+#[derive(Debug, Clone, Copy)]
+pub enum DeltaGap {
+    /// No app is paired — `<home>/.base-gbl/sync-enabled` is absent, so the diff
+    /// was never taken and this write cannot be reconstructed later.
+    SyncDisabled,
+    /// A per-machine usage signal (`lastRead`, `lastActive`) that is delta-free
+    /// by intent. Shipping these would push a fact op on every recall and every
+    /// tool call — churn, not knowledge.
+    Housekeeping,
+    /// The update spans more than one named graph, so the target could not be
+    /// derived and diffing would have cost the whole store.
+    MultiGraph,
+}
+
+impl DeltaGap {
+    pub fn reason(self) -> &'static str {
+        match self {
+            DeltaGap::SyncDisabled => "sync_disabled",
+            DeltaGap::Housekeeping => "housekeeping",
+            DeltaGap::MultiGraph => "multi_graph",
+        }
+    }
+}
+
+/// What produced a graph write.
+///
+/// [`crate::store::write_back`] takes this by value, so a new write path cannot
+/// compile without saying which it is. That is the point: hand-wiring the write
+/// sites would leave a gap the day someone adds the next one, and that gap
+/// surfaces as the reader quietly missing writes. The SPARQL variants go one
+/// further and are constructible only inside `store`'s seam, so the choice is
+/// made in one place rather than at 26 call sites.
 #[derive(Debug, Clone, Copy)]
 pub enum Change<'a> {
-    /// A SPARQL UPDATE was applied to the store before this write. The string is
-    /// the exact update text, and it *is* the delta.
-    Sparql(&'a str),
+    /// A SPARQL UPDATE that carries its resolved fact-shaped delta, so a client
+    /// never parses SPARQL. Constructed only by `store::mutate_and_write` — the
+    /// seam is what makes "every knowledge write ships" true by construction
+    /// rather than by 26 authors remembering.
+    SparqlWithDelta(&'a str, &'a [AppliedOp]),
+    /// A SPARQL UPDATE with no delta, and the reason why. Never a silent gap.
+    SparqlNoDelta(&'a str, DeltaGap),
     /// A whole-store rewrite with no SPARQL delta — compaction, repair, restore,
     /// bulk extraction. The string names the caller (`"graph.compact"`), so the
     /// reader still sees that a write happened. A silent write is worse than an
@@ -146,7 +181,10 @@ impl Change<'_> {
     fn origin(&self) -> &'static str {
         match self {
             Change::RemoteOps(_) => "remote",
-            Change::Sparql(_) | Change::Op(_) | Change::OpWithDelta(..) => "local",
+            Change::SparqlWithDelta(..)
+            | Change::SparqlNoDelta(..)
+            | Change::Op(_)
+            | Change::OpWithDelta(..) => "local",
         }
     }
 }
@@ -241,16 +279,15 @@ fn record_line(graph_path: &Path, change: Change<'_>) -> String {
     rec.insert("origin".into(), change.origin().into());
 
     match change {
-        Change::Sparql(sparql) => {
-            if let Some(g) = derive_graph_iri(sparql) {
-                rec.insert("graph".into(), g.into());
-            }
-            let (body, truncated) = clamp(sparql);
-            rec.insert("sparql".into(), body.into());
-            if truncated {
-                rec.insert("sparql_truncated".into(), true.into());
-                rec.insert("sparql_bytes".into(), sparql.len().into());
-            }
+        Change::SparqlWithDelta(sparql, ops) => {
+            insert_sparql(&mut rec, sparql);
+            insert_ops(&mut rec, ops);
+        }
+        Change::SparqlNoDelta(sparql, gap) => {
+            insert_sparql(&mut rec, sparql);
+            // Say why, always. A reader that cannot tell "nothing changed" from
+            // "the delta was never taken" cannot report sync state honestly.
+            rec.insert("delta_unavailable".into(), gap.reason().into());
         }
         Change::Op(op) => {
             // No delta to record — name the caller so the write is still visible.
@@ -269,6 +306,20 @@ fn record_line(graph_path: &Path, change: Change<'_>) -> String {
     let mut line = serde_json::Value::Object(rec).to_string();
     line.push('\n');
     line
+}
+
+/// Attach the update text to a record, bounded, with its target graph when the
+/// text names exactly one.
+fn insert_sparql(rec: &mut serde_json::Map<String, serde_json::Value>, sparql: &str) {
+    if let Some(g) = derive_graph_iri(sparql) {
+        rec.insert("graph".into(), g.into());
+    }
+    let (body, truncated) = clamp(sparql);
+    rec.insert("sparql".into(), body.into());
+    if truncated {
+        rec.insert("sparql_truncated".into(), true.into());
+        rec.insert("sparql_bytes".into(), sparql.len().into());
+    }
 }
 
 /// Attach a delta to a record, bounded.
@@ -320,7 +371,7 @@ fn clamp(sparql: &str) -> (&str, bool) {
 /// Reads `GRAPH <iri>` occurrences. A `GRAPH ?var` form contributes nothing, and
 /// two *different* IRIs mean the write spans graphs — both cases omit the field
 /// rather than guess, which is what "if derivable" buys the reader.
-fn derive_graph_iri(sparql: &str) -> Option<String> {
+pub(crate) fn derive_graph_iri(sparql: &str) -> Option<String> {
     // `to_ascii_lowercase` is byte-length preserving, so offsets index both.
     let lower = sparql.to_ascii_lowercase();
     let mut found: Option<String> = None;
@@ -448,7 +499,8 @@ mod tests {
     #[test]
     fn oversize_sparql_is_clamped_and_flagged() {
         let big = "x".repeat(SPARQL_MAX_BYTES + 500);
-        let line = record_line(Path::new("/w/.base/graph.nq"), Change::Sparql(&big));
+        let line =
+            record_line(Path::new("/w/.base/graph.nq"), Change::SparqlNoDelta(&big, DeltaGap::SyncDisabled));
         assert!(line.ends_with('\n'));
         let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(v["sparql_truncated"], serde_json::json!(true));
@@ -463,7 +515,8 @@ mod tests {
         // Never absent — the echo guard depends on being able to ask.
         let g = Path::new("/w/.base/graph.nq");
         for (change, want) in [
-            (Change::Sparql("INSERT DATA { }"), "local"),
+            (Change::SparqlWithDelta("INSERT DATA { }", &[]), "local"),
+            (Change::SparqlNoDelta("INSERT DATA { }", DeltaGap::Housekeeping), "local"),
             (Change::Op("graph.compact"), "local"),
             (Change::RemoteOps(&[]), "remote"),
         ] {

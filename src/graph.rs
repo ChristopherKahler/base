@@ -233,8 +233,17 @@ pub fn purge_stale(path: &Path, ns: &NamespaceConfig, days: i64, apply: bool) ->
         stmts.push(format!("DELETE WHERE {{ GRAPH ?g {{ ?s ?p2 <{iri}> }} }}"));
     }
     let update = format!("{}\n{}", crate::crud::prefixes(ns), stmts.join(";\n"));
-    store.update(&update)?;
-    store::write_back(&store, path, Change::Sparql(&update))?;
+    // Wide: purge deletes notes across every graph they touch, so its
+    // `DELETE WHERE { GRAPH ?g ... }` names no target. It still owes a delta —
+    // a purge that does not ship leaves the note alive in the team's graph
+    // forever. Rare and destructive, so the whole-store diff is worth its cost.
+    store::update_and_write(
+        &store,
+        path,
+        &update,
+        store::Scope::Wide,
+        store::Intent::Knowledge,
+    )?;
 
     Ok(PurgeOutcome {
         path: path.display().to_string(),

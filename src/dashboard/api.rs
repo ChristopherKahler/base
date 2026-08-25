@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
-use crate::changelog::Change;
+use crate::store::{Intent, Scope};
 
 use super::server::AppState;
 
@@ -384,12 +384,8 @@ pub async fn add_note(
          }}"
     );
 
-    if store.update(&sparql).is_err() {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
     // Persist to disk
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&sparql))
+    crate::store::update_and_write(&store, &state.trig_path, &sparql, Scope::Wide, Intent::Knowledge)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(NoteEntry {
@@ -442,11 +438,7 @@ pub async fn update_note(
          WHERE {{ GRAPH <{graph}> {{ <{note_iri}> {p}:text ?old }} }}"
     );
 
-    if store.update(&sparql).is_err() {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&sparql))
+    crate::store::update_and_write(&store, &state.trig_path, &sparql, Scope::Wide, Intent::Knowledge)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Get created_at for response
@@ -498,11 +490,7 @@ pub async fn delete_note(
          DELETE WHERE {{ GRAPH <{graph}> {{ <{decoded_iri}> {p}:operatorNote <{note_iri}> }} }}"
     );
 
-    if store.update(&sparql).is_err() {
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
-
-    if crate::store::write_back(&store, &state.trig_path, Change::Sparql(&sparql)).is_err() {
+    if crate::store::update_and_write(&store, &state.trig_path, &sparql, Scope::Wide, Intent::Knowledge).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR;
     }
     StatusCode::NO_CONTENT
@@ -726,8 +714,7 @@ pub async fn create_decision(
         body.name.replace('"', "\\\""),
         rationale.replace('"', "\\\"").replace('\n', "\\n"),
     );
-    store.update(&insert).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&insert))
+    crate::store::update_and_write(&store, &state.trig_path, &insert, Scope::Wide, Intent::Knowledge)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({ "iri": iri, "name": body.name })))
@@ -751,58 +738,62 @@ pub async fn update_decision(
     let pfx = crate::crud::prefixes(ns);
     let store = state.store_guard();
 
-    // Fields are optional, so the delta is whichever updates actually ran.
-    let mut applied: Vec<String> = Vec::new();
+    crate::store::mutate_and_write(&store, &state.trig_path, "", Scope::Wide, Intent::Knowledge, |s| {
+        // Fields are optional, so the delta is whichever updates actually ran.
+        let mut applied: Vec<String> = Vec::new();
 
-    if let Some(ref name) = body.name {
-        let u = format!(
-            "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> {p}:name ?old }} }}\n\
-             INSERT {{ GRAPH ?g {{ <{iri}> {p}:name \"{}\" }} }}\n\
-             WHERE  {{ GRAPH ?g {{ <{iri}> {p}:name ?old }} }}",
-            name.replace('"', "\\\"")
-        );
-        store.update(&u).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        applied.push(u);
-    }
-    if let Some(ref rationale) = body.rationale {
-        let escaped = rationale.replace('"', "\\\"").replace('\n', "\\n");
-        let del = format!(
-            "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> {p}:rationale ?old }} }}\n\
-             WHERE  {{ GRAPH ?g {{ <{iri}> {p}:rationale ?old }} }}"
-        );
-        let _ = store.update(&del);
-        applied.push(del);
-        if !rationale.is_empty() {
-            let graph = crate::crud::workspace_graph_iri(ns, &crate::crud::workspace_slug(&state.cwd));
-            let ins = format!(
-                "{pfx}\nINSERT DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:rationale \"{escaped}\" }} }}"
+        if let Some(ref name) = body.name {
+            let u = format!(
+                "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> {p}:name ?old }} }}\n\
+                 INSERT {{ GRAPH ?g {{ <{iri}> {p}:name \"{}\" }} }}\n\
+                 WHERE  {{ GRAPH ?g {{ <{iri}> {p}:name ?old }} }}",
+                name.replace('"', "\\\"")
             );
-            store.update(&ins).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            applied.push(ins);
+            s.update(&u)?;
+            applied.push(u);
         }
-    }
-    if let Some(ref domain) = body.domain {
-        // Remove old domain edge
-        let del = format!(
-            "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> {p}:hasDomain ?old }} }}\n\
-             WHERE  {{ GRAPH ?g {{ <{iri}> {p}:hasDomain ?old }} }}"
-        );
-        let _ = store.update(&del);
-        applied.push(del);
-        if !domain.is_empty() {
-            let domain_slug = crate::crud::slugify(domain);
-            let domain_iri = crate::crud::build_iri(ns, "domain", &domain_slug);
-            let graph = crate::crud::workspace_graph_iri(ns, &crate::crud::workspace_slug(&state.cwd));
-            let ins = format!(
-                "{pfx}\nINSERT DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:hasDomain <{domain_iri}> }} }}"
+        if let Some(ref rationale) = body.rationale {
+            let escaped = rationale.replace('"', "\\\"").replace('\n', "\\n");
+            let del = format!(
+                "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> {p}:rationale ?old }} }}\n\
+                 WHERE  {{ GRAPH ?g {{ <{iri}> {p}:rationale ?old }} }}"
             );
-            store.update(&ins).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            applied.push(ins);
+            let _ = s.update(&del);
+            applied.push(del);
+            if !rationale.is_empty() {
+                let graph = crate::crud::workspace_graph_iri(ns, &crate::crud::workspace_slug(&state.cwd));
+                let ins = format!(
+                    "{pfx}\nINSERT DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:rationale \"{escaped}\" }} }}"
+                );
+                s.update(&ins)?;
+                applied.push(ins);
+            }
         }
-    }
+        if let Some(ref domain) = body.domain {
+            // Remove old domain edge
+            let del = format!(
+                "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> {p}:hasDomain ?old }} }}\n\
+                 WHERE  {{ GRAPH ?g {{ <{iri}> {p}:hasDomain ?old }} }}"
+            );
+            let _ = s.update(&del);
+            applied.push(del);
+            if !domain.is_empty() {
+                let domain_slug = crate::crud::slugify(domain);
+                let domain_iri = crate::crud::build_iri(ns, "domain", &domain_slug);
+                let graph = crate::crud::workspace_graph_iri(ns, &crate::crud::workspace_slug(&state.cwd));
+                let ins = format!(
+                    "{pfx}\nINSERT DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:hasDomain <{domain_iri}> }} }}"
+                );
+                s.update(&ins)?;
+                applied.push(ins);
+            }
+        }
 
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&applied.join(";\n")))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        // Nothing landed: no write, and therefore no change record for a
+        // request that changed nothing.
+        Ok((!applied.is_empty()).then(|| applied.join(";\n")))
+    })
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({ "iri": iri, "updated": true })))
 }
 
@@ -818,14 +809,16 @@ pub async fn delete_decision(
         "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> ?p ?o }} }}\n\
          WHERE  {{ GRAPH ?g {{ <{iri}> ?p ?o }} }}"
     );
-    store.update(&del).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let del2 = format!(
         "{pfx}\nDELETE {{ GRAPH ?g {{ ?s ?p <{iri}> }} }}\n\
          WHERE  {{ GRAPH ?g {{ ?s ?p <{iri}> }} }}"
     );
-    store.update(&del2).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&format!("{del};\n{del2}")))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    crate::store::mutate_and_write(&store, &state.trig_path, "", Scope::Wide, Intent::Knowledge, |s| {
+        s.update(&del)?;
+        s.update(&del2)?;
+        Ok(Some(format!("{del};\n{del2}")))
+    })
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({ "deleted": true, "iri": iri })))
 }
@@ -872,8 +865,7 @@ pub async fn create_reminder(
          }}\n}}",
         body.name.replace('"', "\\\""),
     );
-    store.update(&insert).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&insert))
+    crate::store::update_and_write(&store, &state.trig_path, &insert, Scope::Wide, Intent::Knowledge)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({ "iri": iri, "name": body.name })))
@@ -894,14 +886,16 @@ pub async fn complete_reminder(
         "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> {p}:status ?old }} }}\n\
          WHERE  {{ GRAPH ?g {{ <{iri}> {p}:status ?old }} }}"
     );
-    let _ = store.update(&del);
     let graph = crate::crud::workspace_graph_iri(ns, &crate::crud::workspace_slug(&state.cwd));
     let ins = format!(
         "{pfx}\nINSERT DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:status \"completed\" }} }}"
     );
-    store.update(&ins).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&format!("{del};\n{ins}")))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    crate::store::mutate_and_write(&store, &state.trig_path, "", Scope::Wide, Intent::Knowledge, |s| {
+        let _ = s.update(&del);
+        s.update(&ins)?;
+        Ok(Some(format!("{del};\n{ins}")))
+    })
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({ "iri": iri, "status": "completed" })))
 }
@@ -918,14 +912,16 @@ pub async fn delete_reminder(
         "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> ?p ?o }} }}\n\
          WHERE  {{ GRAPH ?g {{ <{iri}> ?p ?o }} }}"
     );
-    store.update(&del).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let del2 = format!(
         "{pfx}\nDELETE {{ GRAPH ?g {{ ?s ?p <{iri}> }} }}\n\
          WHERE  {{ GRAPH ?g {{ ?s ?p <{iri}> }} }}"
     );
-    store.update(&del2).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&format!("{del};\n{del2}")))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    crate::store::mutate_and_write(&store, &state.trig_path, "", Scope::Wide, Intent::Knowledge, |s| {
+        s.update(&del)?;
+        s.update(&del2)?;
+        Ok(Some(format!("{del};\n{del2}")))
+    })
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({ "deleted": true, "iri": iri })))
 }
@@ -962,8 +958,7 @@ pub async fn update_project_status(
          WHERE  {{ GRAPH ?g {{ <{iri}> {p}:status ?old }} }}",
         body.status
     );
-    store.update(&update).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&update))
+    crate::store::update_and_write(&store, &state.trig_path, &update, Scope::Wide, Intent::Knowledge)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({ "iri": iri, "status": body.status })))
@@ -1308,10 +1303,8 @@ pub async fn update_task_status(
          WHERE  {{ GRAPH ?g {{ <{iri}> {p}:status ?old }} }}",
         body.status
     );
-    store.update(&update).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
     // Write back to disk
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&update))
+    crate::store::update_and_write(&store, &state.trig_path, &update, Scope::Wide, Intent::Knowledge)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({
@@ -1881,8 +1874,7 @@ pub async fn create_task(
         name = body.name.replace('"', "\\\""),
     );
 
-    store.update(&insert).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&insert))
+    crate::store::update_and_write(&store, &state.trig_path, &insert, Scope::Wide, Intent::Knowledge)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({ "iri": task_iri, "name": body.name, "status": status, "priority": priority })))
@@ -1918,59 +1910,68 @@ pub async fn update_task(
         _ => return Err(StatusCode::NOT_FOUND),
     }
 
-    // Fields are optional, so the delta is whichever updates actually ran.
-    let mut applied: Vec<String> = Vec::new();
-
-    // Update each provided field
-    if let Some(ref name) = body.name {
-        let update = format!(
-            "{pfx}\n\
-             DELETE {{ GRAPH ?g {{ <{iri}> {p}:name ?old }} }}\n\
-             INSERT {{ GRAPH ?g {{ <{iri}> {p}:name \"{}\" }} }}\n\
-             WHERE  {{ GRAPH ?g {{ <{iri}> {p}:name ?old }} }}",
-            name.replace('"', "\\\"")
-        );
-        store.update(&update).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        applied.push(update);
-    }
-
+    // Validated before anything mutates: a rejected value is a request
+    // error, not a half-applied write.
     if let Some(ref priority) = body.priority {
         let valid = ["low", "normal", "high", "urgent"];
         if !valid.contains(&priority.as_str()) {
             return Err(StatusCode::BAD_REQUEST);
         }
-        let update = format!(
-            "{pfx}\n\
-             DELETE {{ GRAPH ?g {{ <{iri}> {p}:priority ?old }} }}\n\
-             INSERT {{ GRAPH ?g {{ <{iri}> {p}:priority \"{priority}\" }} }}\n\
-             WHERE  {{ GRAPH ?g {{ OPTIONAL {{ <{iri}> {p}:priority ?old }} }} }}"
-        );
-        store.update(&update).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        applied.push(update);
     }
 
-    if let Some(ref description) = body.description {
-        let escaped = description.replace('"', "\\\"").replace('\n', "\\n");
-        // Delete any existing description first (may not exist)
-        let del = format!(
-            "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> {p}:description ?old }} }}\n\
-             WHERE  {{ GRAPH ?g {{ <{iri}> {p}:description ?old }} }}"
-        );
-        let _ = store.update(&del);
-        applied.push(del);
-        // Insert new description
-        if !description.is_empty() {
-            let ins = format!(
-                "{pfx}\nINSERT DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:description \"{escaped}\" }} }}",
-                graph = crate::crud::workspace_graph_iri(ns, &crate::crud::workspace_slug(&state.cwd)),
+    crate::store::mutate_and_write(&store, &state.trig_path, "", Scope::Wide, Intent::Knowledge, |s| {
+        // Fields are optional, so the delta is whichever updates actually ran.
+        let mut applied: Vec<String> = Vec::new();
+
+        // Update each provided field
+        if let Some(ref name) = body.name {
+            let update = format!(
+                "{pfx}\n\
+                 DELETE {{ GRAPH ?g {{ <{iri}> {p}:name ?old }} }}\n\
+                 INSERT {{ GRAPH ?g {{ <{iri}> {p}:name \"{}\" }} }}\n\
+                 WHERE  {{ GRAPH ?g {{ <{iri}> {p}:name ?old }} }}",
+                name.replace('"', "\\\"")
             );
-            store.update(&ins).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            applied.push(ins);
+            s.update(&update)?;
+            applied.push(update);
         }
-    }
 
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&applied.join(";\n")))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if let Some(ref priority) = body.priority {
+            let update = format!(
+                "{pfx}\n\
+                 DELETE {{ GRAPH ?g {{ <{iri}> {p}:priority ?old }} }}\n\
+                 INSERT {{ GRAPH ?g {{ <{iri}> {p}:priority \"{priority}\" }} }}\n\
+                 WHERE  {{ GRAPH ?g {{ OPTIONAL {{ <{iri}> {p}:priority ?old }} }} }}"
+            );
+            s.update(&update)?;
+            applied.push(update);
+        }
+
+        if let Some(ref description) = body.description {
+            let escaped = description.replace('"', "\\\"").replace('\n', "\\n");
+            // Delete any existing description first (may not exist)
+            let del = format!(
+                "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> {p}:description ?old }} }}\n\
+                 WHERE  {{ GRAPH ?g {{ <{iri}> {p}:description ?old }} }}"
+            );
+            let _ = s.update(&del);
+            applied.push(del);
+            // Insert new description
+            if !description.is_empty() {
+                let ins = format!(
+                    "{pfx}\nINSERT DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:description \"{escaped}\" }} }}",
+                    graph = crate::crud::workspace_graph_iri(ns, &crate::crud::workspace_slug(&state.cwd)),
+                );
+                s.update(&ins)?;
+                applied.push(ins);
+            }
+        }
+
+        // Nothing landed: no write, and therefore no change record for a
+        // request that changed nothing.
+        Ok((!applied.is_empty()).then(|| applied.join(";\n")))
+    })
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({
         "iri": iri,
@@ -2006,17 +2007,17 @@ pub async fn delete_task(
         "{pfx}\nDELETE {{ GRAPH ?g {{ <{iri}> ?p ?o }} }}\n\
          WHERE  {{ GRAPH ?g {{ <{iri}> ?p ?o }} }}"
     );
-    store.update(&del_subject).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
     // Delete all triples where task is object (hasTask edges from project)
     let del_object = format!(
         "{pfx}\nDELETE {{ GRAPH ?g {{ ?s ?p <{iri}> }} }}\n\
          WHERE  {{ GRAPH ?g {{ ?s ?p <{iri}> }} }}"
     );
-    store.update(&del_object).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&format!("{del_subject};\n{del_object}")))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    crate::store::mutate_and_write(&store, &state.trig_path, "", Scope::Wide, Intent::Knowledge, |s| {
+        s.update(&del_subject)?;
+        s.update(&del_object)?;
+        Ok(Some(format!("{del_subject};\n{del_object}")))
+    })
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({ "deleted": true, "iri": iri })))
 }
@@ -2061,8 +2062,7 @@ pub async fn create_entity(
         name = body.name.replace('"', "\\\""),
     );
 
-    store.update(&insert).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&insert))
+    crate::store::update_and_write(&store, &state.trig_path, &insert, Scope::Wide, Intent::Knowledge)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({ "iri": entity_iri, "name": body.name, "type": body.r#type })))
@@ -2155,8 +2155,7 @@ pub async fn add_rule(
         body.text.replace('"', "\\\""),
     );
 
-    store.update(&insert).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&insert))
+    crate::store::update_and_write(&store, &state.trig_path, &insert, Scope::Wide, Intent::Knowledge)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({ "rule_iri": rule_iri, "domain": body.domain, "text": body.text })))
@@ -2185,8 +2184,7 @@ pub async fn delete_rule(
          DELETE WHERE {{ GRAPH ?g {{ ?s {p}:hasRule <{rule_iri}> }} }}"
     );
 
-    store.update(&delete).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    crate::store::write_back(&store, &state.trig_path, Change::Sparql(&delete))
+    crate::store::update_and_write(&store, &state.trig_path, &delete, Scope::Wide, Intent::Knowledge)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({ "deleted": true })))

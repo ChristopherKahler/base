@@ -79,3 +79,54 @@ fn a_test_build_never_resolves_the_real_global_tier() {
         "integration tests must not resolve the operator's real global tier"
     );
 }
+
+/// Files allowed to name a SPARQL change variant.
+///
+/// `store.rs` is the seam that constructs them. `changelog.rs` owns the enum —
+/// it declares the variants and matches on them to render a record, and it
+/// contains no `write_back` call, so nothing built there can reach a graph file.
+const SPARQL_SEAM: [&str; 2] = ["store.rs", "changelog.rs"];
+
+/// A SPARQL write must go through `store::update_and_write` /
+/// `store::mutate_and_write`, never construct its own change record.
+///
+/// The seam is where the delta is captured, and the capture has to happen
+/// *before* the mutation — so a writer that reaches past it and hands
+/// `write_back` a hand-built record cannot have a delta, and ships nothing. That
+/// failure is silent: the write lands, the log line looks ordinary, and the
+/// team's graph quietly never receives it. Deleting `Change::Sparql` made the
+/// 26 existing sites a compile error; this keeps the 27th one from reappearing.
+#[test]
+fn no_hand_built_sparql_change_outside_the_seam() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+
+    let mut offenders = Vec::new();
+    for f in files {
+        if f.file_name().is_some_and(|n| SPARQL_SEAM.iter().any(|s| n == *s)) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        for (i, line) in text.lines().enumerate() {
+            // The doc-comment references in changelog.rs name the variants to
+            // explain them; only a real construction takes an argument.
+            if line.trim_start().starts_with("///") || line.trim_start().starts_with("//") {
+                continue;
+            }
+            if line.contains("Change::SparqlWithDelta(") || line.contains("Change::SparqlNoDelta(") {
+                offenders.push(format!("{}:{}", f.display(), i + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a SPARQL change record may only be built in {SPARQL_SEAM:?} — call \
+         store::update_and_write or store::mutate_and_write so the delta is \
+         captured before the mutation.\nOffenders:\n  {}",
+        offenders.join("\n  ")
+    );
+}
