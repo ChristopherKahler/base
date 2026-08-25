@@ -1,71 +1,243 @@
-# base command reference (v0.11.0)
+# base command reference (v0.13.2)
 
-Verified against base v0.11.0 on 2026-08-13. If the installed version differs, re-check flags with `base help <sub>` before asserting.
+Full `--help` tree walked at v0.12.3 on 2026-08-19 (140 subcommand paths, every level). Re-checked at v0.13.2 on 2026-08-25 (source sha `7dea613`) for the alias table and the destructive list specifically, not by a full re-walk. If the installed version differs, re-check flags with `base help <sub>` before asserting.
+
+Every shipped subcommand appears somewhere in this file or in `qa.md`. `tests/bank_coverage_test.rs` in the base repo enforces that on every `cargo test`, so a new command cannot ship undocumented.
 
 ## Read-only, safe to run anytime
 
 ```bash
-base doctor                              # graph health across tiers; nonzero exit if unhealthy
+base doctor [--json]                     # graph health across tiers; nonzero exit if unhealthy
+base context "<text>"                    # preview what would inject for that text
+base context --list                      # all context triggers
 base commands list                       # all star commands
 base commands show <name>                # full rules text for one
 base recall --keyword "<term>"           # search notes  (--domain, --slug)
 base decision search --keyword "<term>"  # search past decisions (--json for machine output)
+base memory list                         # graph-backed memory entries
 base handoff list                        # open handoffs (shows tier per entry)
 base fork list                           # open forks
+base operator show                       # operator identity block
+base config get <key>                    # read one config key (dot-notation)
+base config list                         # all config keys
+base secret list                         # secret NAMES only, never values
+```
+
+Projects, milestones, tasks (read side):
+
+```bash
+base project list                        # (--all, --workspace <W>, --unscoped, --json)
+base project get <slug> [--json]         # one project, by slug or display name
+base milestone list [-p <project>] [--json]
+base milestone get <slug> [--json]
+base task list [-p <project>] [-m <milestone>] [--label <l>] [--json]   # --label repeatable, ANDs
+base task get <slug>
+base entity list | base entity get <slug>
+base goal list
+base reminder list
+```
+
+Domains, rules, standards (read side):
+
+```bash
+base rule list --domain X                # rules for a domain (global tier: base rule -g list ...)
+base domain list                         # all domains
+base domain get <name>                   # one domain's triggers and config
+base standards list                      # standards with trigger/annotation counts
+base standards get <id>                  # one standard's full config
+base standards test <file> [--content "<text>"]   # dry-run the matcher: scores + what would inject
+```
+
+Code navigation:
+
+```bash
 base ast list                            # which apps have a code map
 base ast query -c "<name>"               # find entities by name
 base ast query -f "<file>"               # entities in a file
 base ast query --calls "<fn>"            # callers of a function
 base ast query -i "<file>"               # importers of a file
 base ast query -t apps/X -c "<name>"     # query another app's map
-base context "<text>"                    # preview what would inject for that text
-base context --list                      # all context triggers
-base relay board                         # sessions, liveness, pending messages
-base relay sessions                      # titled sessions (targets for *task/*ping)
-base relay tasks                         # inbound relay tasks
-base rule list --domain X                # rules for a domain (global tier: base rule -g list ...)
-base project list                        # registered projects
-base operator show                       # operator identity block
-base changes --cursor                    # graph change log: current end offset (byte offset, not a seq)
-base changes --since <offset>            # every graph write after that offset, as JSON (-g for global tier)
+```
+
+Graph exploration (read side):
+
+```bash
+base graph query "<question>" [--raw]    # GraphRAG retrieve + synthesize (or raw subgraph)
+base graph analyze                       # god nodes, communities, bridges
+base graph get-node "<label>"
+base graph neighbors "<node>" -d <N>
+base graph path "<from>" "<to>"
+```
+
+Relay (read side):
+
+```bash
+base relay board [--project <p>]         # sessions, liveness, claims, pending messages (workspace-scoped)
+base relay sessions                      # titled sessions in the GLOBAL registry (targets for *task/*ping)
+base relay tasks                         # inbound relay tasks across live sessions
+```
+
+Extensions (read side):
+
+```bash
+base extension list                      # installed extensions (alias: base ext list)
+base extension validate <path>           # check a manifest WITHOUT installing it
 ```
 
 ## Mutating: show, don't run
 
+Knowledge capture:
+
+```bash
+base learn --text "..." --domain X --type insight|correction|decision|commitment|shift
+base decision log --domain X --decision "..." --rationale "..." [--recall]
+base decision update <slug> [--name "..."] [--rationale "..."] [--recall "..."] [-s <status>]
+base rule add --domain X --text "..."    # global tier: -g goes on `rule`, BEFORE the verb (base rule -g add ...)
+base rule remove --domain X --index <N>   # by INDEX, not by text; get N from `base rule list --domain X`
+```
+
+Projects, milestones, tasks (write side):
+
+```bash
+base project add -n "..." -p "src/x" [-s <status>] [--stage <stage>]
+base project update <slug> [-s <status>] [-b "<blocked-by>"] [--next-action "..."]
+base project repath <slug> <new-path>    # re-point folder path + domain trigger after a move
+base project peer <slug> -w <workspace> [--remove]   # additive peerWorkspace edge
+base milestone add -p <project> -n "..." [-d "..."]
+base milestone update <slug> [-s <status>] [-d "..."]
+base task add -p <project> -n "..." [--priority <p>] [-m <milestone>]
+base task update <slug> [--name ...] [-s active|completed] [--priority ...] [--description ...]
+                        [--assignee ...] [--due ...] [-p <project>] [-m <milestone>]
+base task done <slug>
+base task tag <slug> --add <label> | --remove <label>    # both repeatable; --add idempotent
+base entity add --name "..." --domain X [--entity-type person|organization] [--project <p>]
+base entity update <slug> [--status ...] [--description ...]
+base goal add --name "..." --target "..."
+base goal update <slug> [--status ...] [--target ...]
+base reminder add --name "..." [--due YYYY-MM-DD] [--at <ISO-8601>] [--in 30s|3m|2h|1d]
+base reminder remove <slug>
+```
+
+Handoffs and forks:
+
 ```bash
 base handoff create --project "<p>" --doc "<abs-path>" [--slug "<title>"]
 base fork    create --project "<p>" --doc "<abs-path>" [--slug "<title>"]
-base handoff archive <slug> | snooze <slug> <days>     # fork has the same verbs
-base learn --text "..." --domain X --type insight|correction|decision|commitment|shift
-base decision log --domain X --decision "..." --rationale "..." [--recall]
-base rule add --domain X --text "..."    # global tier: -g goes on `rule`, BEFORE the verb (base rule -g add ...)
-base project add -n "..." -p "src/x" [-s <status>] [--stage <stage>]
-base milestone add -p <project> -n "..." [-d "..."]
-base task add -p <project> -n "..." [--priority <p>] [-m <milestone>]
-base task done <slug>
-base operator init --name "<name>"       # identity block at session start
+base handoff archive <slug>
+base handoff snooze <slug> <days>        # fork has the same verbs: base fork archive|snooze
+```
+
+Domains and standards (write side):
+
+```bash
+base domain create --name X [--keyword <kw>] [--path <p>]   # writes the GLOBAL domains.toml
+base domain add-trigger --domain X [--keyword <kw>] [--path <p>]      # writes the WORKSPACE domains.toml
+base domain remove-trigger --domain X [--keyword <kw>] [--path <p>]   # reads the GLOBAL one only
+base domain remove <name>                # reads the GLOBAL one only
+base domain sync [--carl <path>]         # one-time carl.json decision migration
+base standards sync                      # MIDAS protocols.md -> standards.toml + graph Standard entities
+```
+
+Tier gotcha: `add-trigger` writes the workspace file while `create`, `remove`, and `remove-trigger`
+only ever touch the global one, so a workspace-tier domain or trigger cannot be removed from the CLI.
+See the domain tier split entry in `qa.md` under Known bugs.
+
+Sync, setup, admin:
+
+```bash
 base sync [--incremental] [--repair]     # markdown -> graph
 base sync --ast [--target apps/X]        # code structure -> graph (per-app .base-ast/ sidecar)
 base scaffold [path]                     # new workspace
-base relay register --as <codename>      # title this session for relay
-base config get|set <key> [value]        # notable keys: devmode.enabled, multimodal.enabled
-base graph extract --target docs/        # LLM pass: markdown -> concepts + edges
-base graph query "<question>" [--raw]    # GraphRAG retrieve + synthesize (or raw subgraph)
-base graph analyze                       # god nodes, communities, bridges
-base graph get-node "<label>" | neighbors "<node>" -d N | path "<from>" "<to>"
+base workspace sync                      # regenerate the registered-workspace block in CLAUDE.md
+base reconcile [--dry-run]               # project active/deferred from real folder last-touch
+base operator init --name "<name>"       # identity block at session start
+base config set <key> <value>            # notable keys: devmode.enabled, multimodal.enabled
+base secret set <NAME>                   # echo-off prompt, writes 0600 ~/.base-gbl/.env
+base commands add --name X --description "..." [--rule "..."]   # --rule repeatable
+base commands remove <name>
+base commands import <file>              # safe again as of v0.12.0 (was corrupting; see qa.md)
+base dashboard [-p <port>]               # Command Center web UI (alias: base dash), default port 3741
+base install                             # build, symlink, wire hooks, write manifest
+base activate                            # enter a Skool classroom key to remove attribution
+base update [--check] [--force] [--snooze]   # --check reports only; --snooze silences the banner 24h
+base graph extract [-t <dir>] [-m <model>] [--multimodal]   # LLM pass: markdown -> concepts + edges
+base hook <event>                        # invoked BY Claude Code, not by you
+```
+
+Relay (write side):
+
+```bash
+base relay init --project <p>            # create the ephemeral relay store
+base relay register --as <codename> [--project <p>] [--phase <n>]   # --project is append-only on the card
+base relay task --to "<title>" --slug "<s>" --summary "<one-line>" --doc "<abs-path>" [--priority high]
+base relay ping --to "<title>" --msg "<short message>"
+base relay done <slug>                   # receiver clears a relayed task
+base relay send --to <T> --type <TYPE> --msg <M>    # claim|release|notify|unblock|contract-change|
+                                                    # ready-to-merge|question|answer
+base relay poll                          # non-blocking read (CONSUMES pending messages)
+base relay wait [--from <s>] [--type <t>] [--timeout <secs>] [--for <title>] [--project <p>]
+base relay claim <resource> [--note "..."] [--ttl <secs>]    # advisory, TTL-bounded (default 3600)
+base relay release <resource> [--force]  # --force breaks another session's claim
+base relay export [--project <p>]        # spool -> inbox.nq read-only snapshot
+```
+
+Extensions (write side):
+
+```bash
+base extension install <path> [--bundle] # copy a validated local manifest into extensions/
+base extension add <path>                # fetch prebuilt binary from the manifest's [dist] GitHub release,
+                                         # verify sha256, unpack; falls back to a source build
+base extension scaffold <name> [--path <dir>] [--into <dir>] [--repo <owner/repo>]
+                               [--build] [--git] [--create-repo] [--bootstrap]
+                                         # --bootstrap == --build --git --create-repo
+                                         # --repo defaults to ChristopherKahler/<name>-cli: override it
+base extension run <name> [args...]      # collision-proof explicit plugin invocation
+base extension remove <name>
 ```
 
 ## Destructive: warn first, never run to demonstrate
 
 ```bash
-base uninstall [--purge]
+base uninstall [--purge]                 # --purge deletes ALL of ~/.base-gbl/ (graph, commands, secrets)
 base memory purge
-base decision delete --keyword "<k>"
-base graph purge | compact | move
+base decision delete --keyword "<k>"     # no dry-run preview
+base secret rm <NAME>
+base project delete <slug> [--force] [--yes]     # --force cascades tasks/milestones/decisions/rules
+base milestone delete <slug> [--force]           # without --force, detaches tasks instead of deleting
+base task delete <slug> [--yes]
+base project move <slug> ... [--yes]     # preview unless --yes
+base graph compact
+base graph purge --stale [--days N] [--apply]    # dry-run unless --apply
+base graph move ... [--yes]              # preview unless --yes; backs up both tiers
+base domain remove <name>
+base relay dispose --project <p> [--force]       # preview unless --force
+base rule remove --domain <D> --index <I>        # no preview, no confirmation
+base commands remove <NAME>                      # no preview, no confirmation
+base extension remove <NAME>                     # no preview, no confirmation
+base reminder remove <SLUG>                      # no preview, no confirmation
 ```
 
-## Other surfaces (exist in v0.11.0; check --help before teaching)
+Preview-by-default is the pattern where it exists: `--yes` / `--apply` / `--force` is the second half
+of a deliberate two-step, not a formality. But it is NOT universal. These delete immediately with no
+preview and no confirmation flag at all: `base uninstall --purge`, `base decision delete`,
+`base rule remove`, `base commands remove`, `base extension remove`, and `base reminder remove`.
+Warn before running any of them.
 
-`goal`, `reminder`, `entity`, `domain`, `standards` (std), `dashboard` (dash), `secret`, `workspace`, `reconcile`, `extension` (ext), `update`, `hook`, `install`, `activate`, `memory list`.
+## Aliases
 
-Never tell the user a capability does not exist without checking `base --help` first.
+Single letters and short forms accepted anywhere the full name is:
+
+`a`=ast · `p`=project · `m`=milestone · `t`=task · `d`=decision · `e`=entity · `g`=goal · `r`=reminder ·
+`std`=standards · `dash`=dashboard · `ext`=extension · `cmd`=commands.
+
+Subcommand aliases are NOT general — only five commands have them:
+`project`, `milestone`, `task` carry `a`=add, `l`=list, `u`=update; `decision` carries `u`=update
+only; `ast` carries `q`=query and `l`=list. So `base a q -c "auth"` is
+`base ast query --contains "auth"`, and `base p l` is `base project list`, but `base rule l` and
+`base handoff l` are errors — those commands have no subcommand aliases at all.
+
+## Where to look next
+
+`qa.md` is the answer bank (176 pairs) and carries the mechanism explanations, the known bugs, and the
+gotchas. This file is the syntax lookup. Never tell the user a capability does not exist without
+checking `base --help` first.

@@ -13,7 +13,7 @@ Their question: **$ARGUMENTS**
 
 This skill is portable and contains **no machine-specific facts**. Machine state lives in a local profile; universal knowledge lives in two reference files next to this one:
 
-- `${CLAUDE_SKILL_DIR}/references/qa.md`: 153 verified Q&A pairs, the primary answer source
+- `${CLAUDE_SKILL_DIR}/references/qa.md`: 176 verified Q&A pairs, the primary answer source (the count grows whenever the close-the-loop rule below appends one)
 - `${CLAUDE_SKILL_DIR}/references/commands.md`: exact command syntax, flags, destructive list
 
 ## STEP 0: local profile (do this first, silently)
