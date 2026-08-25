@@ -334,6 +334,17 @@ pub enum Commands {
 pub enum GraphAction {
     /// Dedup + canonicalize the workspace graph (atomic rewrite, snapshots first)
     Compact,
+    /// Apply inbound fact ops (JSON on stdin) into the local graph.
+    ///
+    /// The pull half of desktop sync. Reads either a bare array of ops or
+    /// `{"ops":[…]}`, applies every assert and retire in ONE transaction, and
+    /// prints `{applied, skipped_duplicate, skipped_unknown}`. If any op is
+    /// invalid it exits non-zero having applied nothing.
+    ApplyOps {
+        /// Apply into the global tier (~/.base-gbl) instead of the workspace
+        #[arg(long)]
+        global: bool,
+    },
     /// Remove notes unread past --days (recency only). PREVIEW unless --apply.
     Purge {
         /// Required: select the stale-note rule (no other purge rules yet)
@@ -3414,6 +3425,35 @@ pub fn run() {
 
         // ─── Graph ────────────────────────────────────────────
         Some(Commands::Graph { action }) => match action {
+            GraphAction::ApplyOps { global } => {
+                let tier = tier_cwd(&cwd, global);
+                let Some(base_dir) = base::config::find_workspace_base(&tier) else {
+                    println!(
+                        "{}",
+                        serde_json::json!({"error": {
+                            "code": "no_workspace",
+                            "message": format!("no .base/ directory found from {}", tier.display()),
+                        }})
+                    );
+                    std::process::exit(1);
+                };
+                let mut input = String::new();
+                if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input) {
+                    println!(
+                        "{}",
+                        serde_json::json!({"error": {
+                            "code": "stdin_read_failed",
+                            "message": e.to_string(),
+                        }})
+                    );
+                    std::process::exit(1);
+                }
+                let (out, code) = base::apply_ops::run(&base_dir.join("graph.nq"), &input);
+                println!("{out}");
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
             GraphAction::Compact => match base::graph::compact(&cwd) {
                 Ok(outcome) => print!("{}", base::graph::format_compact_human(&outcome)),
                 Err(e) => {

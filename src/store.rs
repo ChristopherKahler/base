@@ -231,6 +231,23 @@ pub fn graph_health(path: &Path) -> GraphHealth {
 
 /// Load multiple graph files into a single in-memory store (cross-tier query).
 /// Auto-migrates legacy TriG files if needed.
+/// Drop the sync ledger from a store loaded for READING.
+///
+/// The ledger ([`crate::apply_ops::LEDGER_GRAPH`]) is bookkeeping, not knowledge:
+/// `base recall`, context injection, the dashboard and the hooks must never see
+/// it. Doing it here rather than as a `FILTER` in every query means there is no
+/// per-query exclusion to forget.
+///
+/// Safe **only** because this is a read seam. Writes load through
+/// [`load_graph`] and never reach here — if that ever changes, this would erase
+/// the ledger on the next write_back, so the round-trip is covered by a test.
+fn strip_ledger(store: &Store) {
+    let _ = store.update(&format!(
+        "DROP SILENT GRAPH <{}>",
+        crate::apply_ops::LEDGER_GRAPH
+    ));
+}
+
 pub fn load_graphs(paths: &[&Path]) -> Result<Store> {
     let store = Store::new().context("Failed to create in-memory store")?;
     for path in paths {
@@ -243,6 +260,7 @@ pub fn load_graphs(paths: &[&Path]) -> Result<Store> {
             .load_from_reader(GRAPH_FORMAT, reader)
             .with_context(|| format!("Failed to parse graph from {}", path.display()))?;
     }
+    strip_ledger(&store);
     Ok(store)
 }
 
@@ -299,6 +317,7 @@ pub fn load_merged(cwd: &Path) -> Option<Store> {
             "graph: skipped {total_bad} malformed line(s) across {bad_tiers} tier(s) — run `base doctor --repair`"
         );
     }
+    strip_ledger(&store);
     Some(store)
 }
 

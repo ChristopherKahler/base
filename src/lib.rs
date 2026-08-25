@@ -6,6 +6,7 @@ pub mod graph_query;
 pub mod graph_tools;
 pub mod llm;
 pub mod multimodal;
+pub mod apply_ops;
 pub mod changelog;
 pub mod command;
 pub mod config;

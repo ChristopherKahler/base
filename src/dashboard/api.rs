@@ -182,7 +182,10 @@ pub async fn edges(State(state): State<Arc<AppState>>) -> Json<Vec<GraphEdge>> {
         .join(" || ");
 
     let sparql = format!(
-        "{pfx}\nSELECT ?s ?p ?o WHERE {{ GRAPH ?g {{ ?s ?p ?o . FILTER({filter}) }} }}"
+        "{pfx}\nSELECT ?s ?p ?o WHERE {{ GRAPH ?g {{ ?s ?p ?o . FILTER({filter}) }}\n\
+           FILTER(?g != <{ledger}>)\n\
+         }}",
+        ledger = crate::apply_ops::LEDGER_GRAPH,
     );
 
     let mut edges = Vec::new();
@@ -2276,7 +2279,9 @@ fn build_edges_sparql(ns: &crate::config::NamespaceConfig) -> String {
            GRAPH ?g {{ ?s ?p ?o }}\n\
            FILTER(isIRI(?o))\n\
            FILTER(?p != rdf:type)\n\
-         }}"
+           FILTER(?g != <{ledger}>)\n\
+         }}",
+        ledger = crate::apply_ops::LEDGER_GRAPH,
     )
 }
 
