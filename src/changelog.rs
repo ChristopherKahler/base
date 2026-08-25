@@ -342,7 +342,7 @@ fn insert_ops(rec: &mut serde_json::Map<String, serde_json::Value>, ops: &[Appli
 /// Workspace slug for the tier that owns this graph: `<ws>/.base/graph.nq` → `<ws>`,
 /// `~/.base-gbl/.base/graph.nq` → `base-gbl`. The global tier self-labels, so a
 /// reader can tell the tiers apart from the record alone.
-fn ws_slug(graph_path: &Path) -> String {
+pub(crate) fn ws_slug(graph_path: &Path) -> String {
     graph_path
         .parent()
         .and_then(Path::parent)

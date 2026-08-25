@@ -648,6 +648,10 @@ pub fn write_back(store: &Store, path: &Path, change: Change<'_>) -> Result<()> 
     // failure here is not allowed to fail the user's command.
     crate::changelog::append(path, change);
 
+    // Then tell a running app, if one published an address. Same contract as
+    // the log append: best-effort, after the write landed, never fatal.
+    crate::doorbell::ring(path);
+
     Ok(())
 }
 
