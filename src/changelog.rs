@@ -109,6 +109,23 @@ pub enum Change<'a> {
     RemoteOps(&'a [AppliedOp]),
 }
 
+impl Change<'_> {
+    /// Where this write came from.
+    ///
+    /// `"remote"` for ops applied from another machine, `"local"` for everything
+    /// this machine did itself. Stamped on **every** record and never omitted:
+    /// a reader translating the log into ops for the team graph has to skip what
+    /// it already pulled, and an absent field makes "is this an echo?"
+    /// unanswerable — which is the one bug that would corrupt a shared graph,
+    /// because B re-ships A's fact, A re-ships it back, unbounded.
+    fn origin(&self) -> &'static str {
+        match self {
+            Change::RemoteOps(_) => "remote",
+            Change::Sparql(_) | Change::Op(_) => "local",
+        }
+    }
+}
+
 /// Append one record describing a completed write to `graph_path`'s sibling log.
 ///
 /// Best-effort by contract: never returns, never panics, never fails the caller.
@@ -196,6 +213,7 @@ fn record_line(graph_path: &Path, change: Change<'_>) -> String {
     let mut rec = serde_json::Map::new();
     rec.insert("at".into(), crate::crud::now_iso().into());
     rec.insert("ws".into(), ws_slug(graph_path).into());
+    rec.insert("origin".into(), change.origin().into());
 
     match change {
         Change::Sparql(sparql) => {
@@ -215,7 +233,6 @@ fn record_line(graph_path: &Path, change: Change<'_>) -> String {
         }
         Change::RemoteOps(ops) => {
             rec.insert("kind".into(), "graph.apply-ops".into());
-            rec.insert("origin".into(), "remote".into());
             let arr: Vec<_> = ops.iter().map(AppliedOp::to_json).collect();
             let body = serde_json::Value::Array(arr);
             // Same single-syscall bound the SPARQL body gets: an unbounded line is
@@ -405,6 +422,21 @@ mod tests {
         assert_eq!(v["sparql"].as_str().unwrap().len(), SPARQL_MAX_BYTES);
         // The whole line still fits one write syscall.
         assert!(line.len() < SPARQL_MAX_BYTES + 4096);
+    }
+
+    #[test]
+    fn every_record_states_its_origin() {
+        // Never absent — the echo guard depends on being able to ask.
+        let g = Path::new("/w/.base/graph.nq");
+        for (change, want) in [
+            (Change::Sparql("INSERT DATA { }"), "local"),
+            (Change::Op("graph.compact"), "local"),
+            (Change::RemoteOps(&[]), "remote"),
+        ] {
+            let v: serde_json::Value =
+                serde_json::from_str(record_line(g, change).trim()).unwrap();
+            assert_eq!(v["origin"], want, "origin for {change:?}");
+        }
     }
 
     #[test]
