@@ -7,7 +7,7 @@ use oxigraph::io::{RdfFormat, RdfSerializer};
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 
-use crate::changelog::Change;
+use crate::changelog::{AppliedOp, Change};
 
 /// The canonical RDF format for graph persistence.
 /// NQuads is immune to the graph-block split corruption bug in oxigraph's
@@ -229,8 +229,79 @@ pub fn graph_health(path: &Path) -> GraphHealth {
     }
 }
 
-/// Load multiple graph files into a single in-memory store (cross-tier query).
-/// Auto-migrates legacy TriG files if needed.
+// ─── Write deltas ────────────────────────────────────────────
+
+/// The quads an operation added and removed.
+///
+/// Captured by snapshotting before and diffing after, because a SPARQL UPDATE
+/// reports nothing about what it changed and `DELETE … WHERE` cannot be read off
+/// the update text without evaluating it against the store. The client has no
+/// store, so base resolves it here or the client cannot ship the write at all.
+#[derive(Debug, Default)]
+pub struct GraphDelta {
+    pub added: Vec<oxigraph::model::Quad>,
+    pub removed: Vec<oxigraph::model::Quad>,
+}
+
+impl GraphDelta {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+
+    /// Fact-shaped ops for the change log. Removals first: a replace reads as
+    /// remove-then-add, and applying them in that order is what a consumer wants.
+    ///
+    /// No fact ids — this machine minted none. See [`AppliedOp`].
+    pub fn to_ops(&self) -> Vec<AppliedOp> {
+        let line = |q: &oxigraph::model::Quad| format!("{q} .");
+        let mut ops = Vec::new();
+        if !self.removed.is_empty() {
+            ops.push(AppliedOp::local_retire(self.removed.iter().map(line).collect()));
+        }
+        if !self.added.is_empty() {
+            ops.push(AppliedOp::local_assert(self.added.iter().map(line).collect()));
+        }
+        ops
+    }
+}
+
+/// Quads currently in `graphs` — or the whole store when `graphs` is empty.
+///
+/// Scoping to the graphs a writer targets is what keeps this affordable: hooks
+/// fire on every tool call, and diffing the entire store each time would not be.
+/// A writer whose target graphs are not known until it runs passes an empty slice
+/// and pays for the whole store.
+pub fn snapshot_graphs(store: &Store, graphs: &[String]) -> std::collections::HashSet<oxigraph::model::Quad> {
+    use oxigraph::model::{GraphNameRef, NamedNodeRef};
+
+    if graphs.is_empty() {
+        return store.iter().filter_map(Result::ok).collect();
+    }
+    let mut out = std::collections::HashSet::new();
+    for g in graphs {
+        let Ok(node) = NamedNodeRef::new(g.as_str()) else { continue };
+        out.extend(
+            store
+                .quads_for_pattern(None, None, None, Some(GraphNameRef::NamedNode(node)))
+                .filter_map(Result::ok),
+        );
+    }
+    out
+}
+
+/// What changed in `graphs` since `before` was taken.
+pub fn delta_since(
+    store: &Store,
+    graphs: &[String],
+    before: std::collections::HashSet<oxigraph::model::Quad>,
+) -> GraphDelta {
+    let after = snapshot_graphs(store, graphs);
+    GraphDelta {
+        added: after.difference(&before).cloned().collect(),
+        removed: before.difference(&after).cloned().collect(),
+    }
+}
+
 /// Drop the sync ledger from a store loaded for READING.
 ///
 /// The ledger ([`crate::apply_ops::LEDGER_GRAPH`]) is bookkeeping, not knowledge:
@@ -248,6 +319,10 @@ fn strip_ledger(store: &Store) {
     ));
 }
 
+/// Load multiple graph files into a single in-memory store (cross-tier query).
+/// Auto-migrates legacy TriG files if needed.
+///
+/// A READ seam: the sync ledger is dropped before the store is returned.
 pub fn load_graphs(paths: &[&Path]) -> Result<Store> {
     let store = Store::new().context("Failed to create in-memory store")?;
     for path in paths {
@@ -543,6 +618,76 @@ mod tests {
         let mut f = fs::File::create(&p).unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         p
+    }
+
+    // ─── Write deltas ────────────────────────────────────────
+
+    const G: &str = "urn:g/ws";
+
+    fn insert(store: &Store, sparql: &str) {
+        store.update(sparql).unwrap();
+    }
+
+    #[test]
+    fn a_delta_reports_what_an_update_added() {
+        let store = Store::new().unwrap();
+        let before = snapshot_graphs(&store, std::slice::from_ref(&G.to_string()));
+        insert(&store, &format!("INSERT DATA {{ GRAPH <{G}> {{ <urn:s/1> <urn:p/n> \"Ada\" }} }}"));
+
+        let d = delta_since(&store, std::slice::from_ref(&G.to_string()), before);
+        assert_eq!(d.added.len(), 1);
+        assert!(d.removed.is_empty());
+
+        let ops = d.to_ops();
+        assert_eq!(ops.len(), 1, "an addition alone is one assert op");
+    }
+
+    #[test]
+    fn a_delta_reports_a_delete_where_that_no_client_could_evaluate() {
+        // The case that makes this whole seam necessary: the update text names no
+        // quads, only a pattern, so nothing but the store can say what it removed.
+        let store = Store::new().unwrap();
+        insert(&store, &format!("INSERT DATA {{ GRAPH <{G}> {{ <urn:s/1> <urn:p/n> \"Ada\" . <urn:s/2> <urn:p/n> \"Grace\" }} }}"));
+
+        let before = snapshot_graphs(&store, std::slice::from_ref(&G.to_string()));
+        insert(&store, &format!("DELETE WHERE {{ GRAPH <{G}> {{ <urn:s/1> ?p ?o }} }}"));
+
+        let d = delta_since(&store, std::slice::from_ref(&G.to_string()), before);
+        assert_eq!(d.removed.len(), 1, "the resolved victim, not a pattern");
+        assert!(d.removed[0].to_string().contains("<urn:s/1>"));
+        assert!(d.added.is_empty());
+    }
+
+    #[test]
+    fn a_replace_orders_the_retire_before_the_assert() {
+        let store = Store::new().unwrap();
+        insert(&store, &format!("INSERT DATA {{ GRAPH <{G}> {{ <urn:s/1> <urn:p/n> \"Ada\" }} }}"));
+        let before = snapshot_graphs(&store, std::slice::from_ref(&G.to_string()));
+        insert(&store, &format!("DELETE WHERE {{ GRAPH <{G}> {{ <urn:s/1> ?p ?o }} }}"));
+        insert(&store, &format!("INSERT DATA {{ GRAPH <{G}> {{ <urn:s/1> <urn:p/n> \"Ada Lovelace\" }} }}"));
+
+        let ops = delta_since(&store, std::slice::from_ref(&G.to_string()), before).to_ops();
+        assert_eq!(ops.len(), 2, "a replace is a retire and an assert");
+        let line = format!("{:?}", ops[0]);
+        assert!(line.contains("retire"), "removals come first: {line}");
+    }
+
+    #[test]
+    fn a_delta_ignores_graphs_the_writer_did_not_target() {
+        let store = Store::new().unwrap();
+        let before = snapshot_graphs(&store, std::slice::from_ref(&G.to_string()));
+        insert(&store, "INSERT DATA { GRAPH <urn:g/other> { <urn:s/9> <urn:p/n> \"elsewhere\" } }");
+
+        let d = delta_since(&store, std::slice::from_ref(&G.to_string()), before);
+        assert!(d.is_empty(), "scoping to the target graph is what keeps this cheap");
+    }
+
+    #[test]
+    fn an_empty_graph_list_watches_the_whole_store() {
+        let store = Store::new().unwrap();
+        let before = snapshot_graphs(&store, &[]);
+        insert(&store, "INSERT DATA { GRAPH <urn:g/anywhere> { <urn:s/9> <urn:p/n> \"x\" } }");
+        assert_eq!(delta_since(&store, &[], before).added.len(), 1);
     }
 
     #[test]

@@ -2620,6 +2620,22 @@ pub fn run() {
                             Err(_) => skipped += 1,
                         }
                     }
+                    // A record either carries its delta or it does not, and the
+                    // count of the ones that do not is reported rather than left
+                    // for the reader to discover: a write this version of base
+                    // cannot express as ops is still in the local graph and NOT in
+                    // the team's, and a client that cannot see that number would
+                    // render a confident, wrong "everything is synced".
+                    let mut delta_free = 0usize;
+                    for v in &mut parsed {
+                        let has_ops = v.get("ops").is_some_and(serde_json::Value::is_array);
+                        if !has_ops {
+                            delta_free += 1;
+                        }
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert("has_ops".into(), has_ops.into());
+                        }
+                    }
                     println!(
                         "{}",
                         serde_json::json!({
@@ -2627,6 +2643,7 @@ pub fn run() {
                             "reset": page.reset,
                             "count": parsed.len(),
                             "skipped": skipped,
+                            "delta_free_count": delta_free,
                             "changes": parsed,
                         })
                     );

@@ -65,29 +65,50 @@ pub const SPARQL_MAX_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone)]
 pub struct AppliedOp {
     kind: &'static str,
-    fact_id: String,
+    /// Present only when base genuinely knows the id — i.e. for ops it applied
+    /// FROM another machine.
+    ///
+    /// A locally-produced delta has none, and base must not invent one. The
+    /// portal keys idempotency on `unique(author_device_id, author_counter)` and
+    /// fact ids are client-minted ULIDs paired with the client's own durable
+    /// counter; a base-minted id would collide with the one key the client has.
+    /// So base reports WHAT CHANGED and the client stamps identity onto it when
+    /// it ships — which still means the client never parses SPARQL, which was
+    /// the point.
+    fact_id: Option<String>,
     quads: Vec<String>,
 }
 
 impl AppliedOp {
+    /// An assert whose fact id base learned from the machine that sent it.
     pub fn assert(fact_id: String, quads: Vec<String>) -> Self {
-        Self { kind: "assert", fact_id, quads }
+        Self { kind: "assert", fact_id: Some(fact_id), quads }
     }
 
+    /// A retire naming the fact it supersedes.
     pub fn retire(fact_id: String, quads: Vec<String>) -> Self {
-        Self { kind: "retire", fact_id, quads }
+        Self { kind: "retire", fact_id: Some(fact_id), quads }
+    }
+
+    /// Quads a local write added. No fact id: this machine did not mint one.
+    pub fn local_assert(quads: Vec<String>) -> Self {
+        Self { kind: "assert", fact_id: None, quads }
+    }
+
+    /// Quads a local write removed.
+    pub fn local_retire(quads: Vec<String>) -> Self {
+        Self { kind: "retire", fact_id: None, quads }
     }
 
     fn to_json(&self) -> serde_json::Value {
         let mut m = serde_json::Map::new();
         m.insert("type".into(), self.kind.into());
-        // A retire names the fact it supersedes; an assert names the fact it is.
-        let id_field = if self.kind == "retire" { "supersedes_fact_id" } else { "fact_id" };
-        m.insert(id_field.into(), self.fact_id.clone().into());
-        m.insert(
-            "payload".into(),
-            serde_json::json!({ "quads": self.quads }),
-        );
+        if let Some(id) = &self.fact_id {
+            // A retire names the fact it supersedes; an assert names the fact it is.
+            let field = if self.kind == "retire" { "supersedes_fact_id" } else { "fact_id" };
+            m.insert(field.into(), id.clone().into());
+        }
+        m.insert("payload".into(), serde_json::json!({ "quads": self.quads }));
         serde_json::Value::Object(m)
     }
 }
@@ -102,6 +123,10 @@ pub enum Change<'a> {
     /// reader still sees that a write happened. A silent write is worse than an
     /// unlabelled one.
     Op(&'a str),
+    /// A labelled write that also carries its fact-shaped delta — the same
+    /// label [`Change::Op`] gives, plus what actually changed, so a reader never
+    /// has to parse SPARQL to ship a local write to a team graph.
+    OpWithDelta(&'a str, &'a [AppliedOp]),
     /// A write produced by applying inbound ops from another machine
     /// (`base graph apply-ops`). Carries the fact-shaped delta, and is the one
     /// variant whose record is tagged `origin: "remote"` — the primary guard
@@ -121,7 +146,7 @@ impl Change<'_> {
     fn origin(&self) -> &'static str {
         match self {
             Change::RemoteOps(_) => "remote",
-            Change::Sparql(_) | Change::Op(_) => "local",
+            Change::Sparql(_) | Change::Op(_) | Change::OpWithDelta(..) => "local",
         }
     }
 }
@@ -231,27 +256,36 @@ fn record_line(graph_path: &Path, change: Change<'_>) -> String {
             // No delta to record — name the caller so the write is still visible.
             rec.insert("kind".into(), op.into());
         }
+        Change::OpWithDelta(op, ops) => {
+            rec.insert("kind".into(), op.into());
+            insert_ops(&mut rec, ops);
+        }
         Change::RemoteOps(ops) => {
             rec.insert("kind".into(), "graph.apply-ops".into());
-            let arr: Vec<_> = ops.iter().map(AppliedOp::to_json).collect();
-            let body = serde_json::Value::Array(arr);
-            // Same single-syscall bound the SPARQL body gets: an unbounded line is
-            // the one case `write_all` can split and let a concurrent appender
-            // interleave. Over the bound the delta is dropped and *said* to be
-            // dropped, never silently shortened into a plausible-looking one.
-            let bytes = body.to_string().len();
-            if bytes <= SPARQL_MAX_BYTES {
-                rec.insert("ops".into(), body);
-            } else {
-                rec.insert("ops_omitted".into(), true.into());
-                rec.insert("ops_bytes".into(), bytes.into());
-            }
+            insert_ops(&mut rec, ops);
         }
     }
 
     let mut line = serde_json::Value::Object(rec).to_string();
     line.push('\n');
     line
+}
+
+/// Attach a delta to a record, bounded.
+///
+/// Same single-syscall bound the SPARQL body gets: an unbounded line is the one
+/// case `write_all` can split and let a concurrent appender interleave. Over the
+/// bound the delta is dropped and *said* to be dropped, never silently shortened
+/// into a plausible-looking one.
+fn insert_ops(rec: &mut serde_json::Map<String, serde_json::Value>, ops: &[AppliedOp]) {
+    let body = serde_json::Value::Array(ops.iter().map(AppliedOp::to_json).collect());
+    let bytes = body.to_string().len();
+    if bytes <= SPARQL_MAX_BYTES {
+        rec.insert("ops".into(), body);
+    } else {
+        rec.insert("ops_omitted".into(), true.into());
+        rec.insert("ops_bytes".into(), bytes.into());
+    }
 }
 
 /// Workspace slug for the tier that owns this graph: `<ws>/.base/graph.nq` → `<ws>`,

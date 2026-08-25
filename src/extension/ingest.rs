@@ -68,6 +68,9 @@ pub fn ingest_extension(
     let ns = &config.namespace;
     let ws_slug = crud::workspace_slug(cwd);
     let graph_iri = crud::workspace_graph_iri(ns, &ws_slug);
+
+    // Snapshot the target graph so the record carries the delta, not just a label.
+    let before = store::snapshot_graphs(&graph_store, std::slice::from_ref(&graph_iri));
     let pfx = crud::prefixes(ns);
     let p = &ns.prefix;
 
@@ -122,7 +125,9 @@ pub fn ingest_extension(
     // Write back if we changed anything
     if graph_dirty {
         let op = format!("extension.ingest:{}", ext.name);
-        store::write_back(&graph_store, &trig_path, Change::Op(&op))
+        let delta = store::delta_since(&graph_store, std::slice::from_ref(&graph_iri), before);
+        let ops = delta.to_ops();
+        store::write_back(&graph_store, &trig_path, Change::OpWithDelta(&op, &ops))
             .with_context(|| format!("Failed to write back graph after ext:{} ingest", ext.name))?;
     }
 

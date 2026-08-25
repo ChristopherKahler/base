@@ -128,6 +128,12 @@ pub fn ingest_paul_projects(
 ) -> Result<IngestStats> {
     let ns = &config.namespace;
     let (store, trig_path) = crud::load_workspace_store(cwd)?;
+
+    // Whole-store snapshot, not a per-graph one: this writer picks a target graph
+    // per project as it goes (a project can be scoped to another workspace), so
+    // the set is not known until the loop has run. It is affordable here because
+    // this runs when a paul.toml changes, not on every tool call.
+    let before = crate::store::snapshot_graphs(&store, &[]);
     // Per-project home routing: a project's named graph comes from where it physically
     // lives (scope::home of its discovered dir), NOT the CWD slug — so the tag is correct
     // and CWD-independent (re-running session-start never re-pollutes). Unscoped → CWD slug.
@@ -251,7 +257,9 @@ pub fn ingest_paul_projects(
         registered += 1;
     }
 
-    crate::store::write_back(&store, &trig_path, Change::Op("extract.paul_toml"))?;
+    let delta = crate::store::delta_since(&store, &[], before);
+    let ops = delta.to_ops();
+    crate::store::write_back(&store, &trig_path, Change::OpWithDelta("extract.paul_toml", &ops))?;
 
     Ok(IngestStats {
         scanned: projects.len(),

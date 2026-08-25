@@ -41,6 +41,11 @@ fn sync_domain_list(
     let (store, trig_path) = crud::load_workspace_store(cwd)?;
     let ws_slug = crud::workspace_slug(cwd);
     let graph = crud::workspace_graph_iri(ns, &ws_slug);
+    // Snapshot the one graph this writer targets, so the record can carry what
+    // actually changed instead of only a label. Scoped to the target graph
+    // because this runs often and diffing the whole store would not be free.
+    let before = crate::store::snapshot_graphs(&store, std::slice::from_ref(&graph));
+
     let pfx = crud::prefixes(ns);
     let p = &ns.prefix;
 
@@ -173,7 +178,9 @@ fn sync_domain_list(
     };
     total_rules += carl_rules;
 
-    crate::store::write_back(&store, &trig_path, Change::Op("domain.sync"))?;
+    let delta = crate::store::delta_since(&store, std::slice::from_ref(&graph), before);
+    let ops = delta.to_ops();
+    crate::store::write_back(&store, &trig_path, Change::OpWithDelta("domain.sync", &ops))?;
 
     Ok(SyncStats {
         domains: domains.len(),
