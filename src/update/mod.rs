@@ -239,6 +239,43 @@ fn copy_tree(src: &Path, dest: &Path) -> usize {
     n
 }
 
+/// Refresh the bundled Claude skills after a successful binary swap.
+///
+/// `install_skills` had exactly one caller — `base install` — so updating the
+/// binary left `~/.claude/skills/base-help/` frozen at whatever release last ran
+/// a full install. The coach then confidently describes the previous version of
+/// the CLI, which is the drift this exists to close.
+///
+/// Two things make this correct rather than just a call:
+///
+/// - `version` is the binary that was JUST installed, not this process. The tag
+///   is what pins the skill to the CLI it documents, and during an update this
+///   process is the outgoing version.
+/// - The source is tag-only. The operator is installing a release; resolving a
+///   local checkout here would install whatever tree the cwd happens to be.
+///
+/// Best-effort, exactly like `refresh_scripts`: the binary swap has already
+/// committed and a skill that cannot be fetched (offline, rate-limited, tag not
+/// yet published) must never turn a successful update into a failure. Drift that
+/// results is reported by `base doctor`, which is the only reader the background
+/// path has.
+fn refresh_skills(version: &str, report: crate::install::SkillReport) {
+    let Some(home) = crate::home::home_root() else {
+        return;
+    };
+    let binary_path = std::env::current_exe().unwrap_or_default();
+    if let Err(e) = crate::install::install_skills(
+        &binary_path,
+        &home,
+        version,
+        crate::install::SkillSource::TagOnly,
+        report,
+    ) && report != crate::install::SkillReport::Silent
+    {
+        println!("  (Claude skills not refreshed — {e}; run `base install` to retry)");
+    }
+}
+
 /// `<binary> --version` → the version token (e.g. "base 0.9.0" → "0.9.0").
 fn binary_version(bin: &Path) -> Option<String> {
     let out = std::process::Command::new(bin).arg("--version").output().ok()?;
@@ -400,6 +437,8 @@ fn run_quiet(force: bool) -> Result<()> {
         }
         atomic_swap(&new_bin, &auto_install_dest()?)?;
         refresh_scripts(&work.join("x"));
+        let skill_ver = if new_ver.is_empty() { latest.clone() } else { new_ver.clone() };
+        refresh_skills(&skill_ver, crate::install::SkillReport::Silent);
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(&work);
@@ -438,13 +477,17 @@ fn run_verbose(check_only: bool, force: bool) -> Result<()> {
 
         let dest = install_dest()?;
         atomic_swap(&new_bin, &dest)?;
+        // The skill tag needs a real version. `shown` may be the "(new)"
+        // placeholder, so fall back to the release tag rather than that.
+        let skill_ver = if new_ver.is_empty() { latest.clone() } else { new_ver.clone() };
         let shown = if new_ver.is_empty() { "(new)".to_string() } else { new_ver };
         println!("✓ updated: {} is now base {shown}", dest.display());
         let n = refresh_scripts(&work.join("x"));
         if n > 0 {
             println!("✓ refreshed {n} shipped script file(s) in ~/.base-gbl/scripts/");
         }
-        println!("  (hooks and docs are unchanged — run `base install` if a release adds new ones.)");
+        refresh_skills(&skill_ver, crate::install::SkillReport::Line);
+        println!("  (hooks are unchanged — run `base install` if a release adds new ones.)");
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(&work);

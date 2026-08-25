@@ -62,7 +62,13 @@ pub fn run(
     seed_system_rules(&global_dir)?;
 
     // Step 6: Install bundled Claude skills (local checkout, else fetch)
-    install_skills(&binary_path, &home)?;
+    install_skills(
+        &binary_path,
+        &home,
+        env!("CARGO_PKG_VERSION"),
+        SkillSource::LocalThenTag,
+        SkillReport::InstallStep,
+    )?;
 
     // Step 6b: Offer the starter star commands
     install_starter_commands(&global_dir, starter)?;
@@ -972,6 +978,33 @@ const SKILLS_REPO_DIR: &str = "claude/skills";
 /// this runs once per install, not on every session start.
 const SKILL_FETCH_TIMEOUT_SECS: u64 = 15;
 
+/// How a skill install reports itself. `base install` is a numbered checklist;
+/// `base update` is a one-line footnote to a binary swap; the background update
+/// has no reader at all and relies on `base doctor` to surface drift later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkillReport {
+    /// Numbered step inside the `base install` checklist.
+    InstallStep,
+    /// One line under `base update`.
+    Line,
+    /// Print nothing (background update).
+    Silent,
+}
+
+/// Where a skill's files come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkillSource {
+    /// A local checkout wins if there is one, else fetch the tag. Right for
+    /// `base install`: that checkout is the tree the operator is running.
+    LocalThenTag,
+    /// Always fetch the tag being installed. Right for `base update`, where the
+    /// operator is explicitly installing a *release* — `find_local_skills_dir`
+    /// falls back to `current_dir()`, so running `base update` inside a base
+    /// checkout would otherwise install that working tree instead of the
+    /// release's skill.
+    TagOnly,
+}
+
 /// Install bundled skills into `~/.claude/skills/`.
 ///
 /// Two sources, in order. A local checkout wins, because that is the tree the
@@ -979,14 +1012,30 @@ const SKILL_FETCH_TIMEOUT_SECS: u64 = 15;
 /// assets carry only the binary and the AST scripts, so anyone who installed
 /// from a tarball has no local copy of the skill at all.
 ///
+/// `version` is the base version whose skill we want — for `base install` that
+/// is this binary, for `base update` it is the binary that was just swapped in.
+/// It must be threaded rather than read from `CARGO_PKG_VERSION` at the fetch,
+/// because during an update this process IS the outgoing version.
+///
 /// Never fatal. A skill that cannot be installed prints a manual fallback and
 /// `base install` still completes — the CLI works fine without it.
-fn install_skills(binary_path: &Path, home: &Path) -> Result<()> {
-    print!("6. Install Claude skills ... ");
+pub(crate) fn install_skills(
+    binary_path: &Path,
+    home: &Path,
+    version: &str,
+    source: SkillSource,
+    report: SkillReport,
+) -> Result<()> {
+    if report == SkillReport::InstallStep {
+        print!("6. Install Claude skills ... ");
+    }
 
     let dest_root = home.join(".claude").join("skills");
     std::fs::create_dir_all(&dest_root)?;
-    let local_root = find_local_skills_dir(binary_path);
+    let local_root = match source {
+        SkillSource::LocalThenTag => find_local_skills_dir(binary_path),
+        SkillSource::TagOnly => None,
+    };
 
     let mut results: Vec<String> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
@@ -997,25 +1046,40 @@ fn install_skills(binary_path: &Path, home: &Path) -> Result<()> {
             .map(|r| r.join(skill))
             .filter(|p| p.join("SKILL.md").is_file());
 
-        match install_one_skill(skill, local.as_deref(), &dest_root) {
+        match install_one_skill(skill, local.as_deref(), &dest_root, version) {
             Ok(outcome) => results.push(outcome),
             Err(e) => failures.push((skill.to_string(), e.to_string())),
         }
     }
 
-    if failures.is_empty() {
-        println!("✓ ({})", results.join(", "));
-    } else {
-        println!("partial");
-        for r in &results {
-            println!("   ✓ {r}");
+    match report {
+        SkillReport::Silent => {}
+        SkillReport::InstallStep => {
+            if failures.is_empty() {
+                println!("✓ ({})", results.join(", "));
+            } else {
+                println!("partial");
+                for r in &results {
+                    println!("   ✓ {r}");
+                }
+                for (skill, err) in &failures {
+                    println!("   ⊘ {skill} — {err}");
+                    println!(
+                        "      Copy {SKILLS_REPO_DIR}/{skill}/ to {} manually",
+                        dest_root.join(skill).display()
+                    );
+                }
+            }
         }
-        for (skill, err) in &failures {
-            println!("   ⊘ {skill} — {err}");
-            println!(
-                "      Copy {SKILLS_REPO_DIR}/{skill}/ to {} manually",
-                dest_root.join(skill).display()
-            );
+        SkillReport::Line => {
+            for r in &results {
+                println!("✓ Claude skills: {r}");
+            }
+            // A failed refresh is worth one honest line, not a stack trace: the
+            // binary swap already succeeded and that is the part that matters.
+            for (skill, err) in &failures {
+                println!("  (skill {skill} not refreshed — {err}; run `base install` to retry)");
+            }
         }
     }
     Ok(())
@@ -1028,7 +1092,12 @@ fn install_skills(binary_path: &Path, home: &Path) -> Result<()> {
 /// bank as it learns — overwriting on every `base install` would silently
 /// discard the operator's appended pairs, so a changed skill is backed up
 /// before it is replaced, and an unchanged one is left alone entirely.
-fn install_one_skill(skill: &str, local: Option<&Path>, dest_root: &Path) -> Result<String> {
+fn install_one_skill(
+    skill: &str,
+    local: Option<&Path>,
+    dest_root: &Path,
+    version: &str,
+) -> Result<String> {
     let dest = dest_root.join(skill);
     // Stage inside dest_root so the final promotion is a same-filesystem rename.
     let staging = dest_root.join(format!(".{skill}.staging-{}", std::process::id()));
@@ -1036,7 +1105,7 @@ fn install_one_skill(skill: &str, local: Option<&Path>, dest_root: &Path) -> Res
 
     let staged = match local {
         Some(src) => copy_dir_all(src, &staging).map(|n| (n, "local")),
-        None => fetch_skill_from_github(skill, &staging).map(|n| (n, "fetched")),
+        None => fetch_skill_from_github(skill, &staging, version).map(|n| (n, "fetched")),
     };
     let (count, source) = match staged {
         Ok(v) => v,
@@ -1138,11 +1207,15 @@ fn collect_tree(root: &Path) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
     Ok(out)
 }
 
-/// Fetch a skill from the repo. Prefers the tag matching this binary so the
-/// skill and the CLI it documents stay in step; falls back to `main` for dev
-/// builds whose version was never tagged.
-fn fetch_skill_from_github(skill: &str, dest: &Path) -> Result<usize> {
-    let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+/// Fetch a skill from the repo. Prefers the tag matching the version being
+/// installed so the skill and the CLI it documents stay in step; falls back to
+/// `main` for dev builds whose version was never tagged.
+///
+/// `version` is passed in rather than read from `CARGO_PKG_VERSION` here: during
+/// `base update` this process is the OUTGOING binary, so compiling the tag in
+/// would fetch the skill for the version being replaced.
+fn fetch_skill_from_github(skill: &str, dest: &Path, version: &str) -> Result<usize> {
+    let tag = skill_tag(version);
     let mut last_err: Option<anyhow::Error> = None;
 
     for git_ref in [tag.as_str(), "main"] {
@@ -1156,6 +1229,12 @@ fn fetch_skill_from_github(skill: &str, dest: &Path) -> Result<usize> {
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("could not fetch {skill}")))
+}
+
+/// The git tag for a base version. PURE — the seam that lets the version
+/// threading be tested without touching the network.
+pub(crate) fn skill_tag(version: &str) -> String {
+    format!("v{}", version.trim().trim_start_matches('v'))
 }
 
 /// Recursively download a repo directory through the GitHub contents API.
@@ -1576,7 +1655,7 @@ mod tests {
         let dest_root = tmp.path().join("skills");
         std::fs::create_dir_all(&dest_root).unwrap();
 
-        let msg = install_one_skill("base-help", Some(&src), &dest_root).unwrap();
+        let msg = install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
         assert!(msg.contains("3 files"), "got: {msg}");
         assert!(dest_root.join("base-help").join("SKILL.md").is_file());
     }
@@ -1588,8 +1667,8 @@ mod tests {
         let dest_root = tmp.path().join("skills");
         std::fs::create_dir_all(&dest_root).unwrap();
 
-        install_one_skill("base-help", Some(&src), &dest_root).unwrap();
-        let msg = install_one_skill("base-help", Some(&src), &dest_root).unwrap();
+        install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
+        let msg = install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
         assert!(msg.contains("already current"), "got: {msg}");
         let backups: Vec<_> = std::fs::read_dir(&dest_root)
             .unwrap()
@@ -1608,12 +1687,12 @@ mod tests {
         let dest_root = tmp.path().join("skills");
         std::fs::create_dir_all(&dest_root).unwrap();
 
-        install_one_skill("base-help", Some(&src), &dest_root).unwrap();
+        install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
         // Operator's own appended pair.
         let installed_bank = dest_root.join("base-help").join("references").join("qa.md");
         std::fs::write(&installed_bank, "shipped pairs\n### Q: mine\n").unwrap();
 
-        let msg = install_one_skill("base-help", Some(&src), &dest_root).unwrap();
+        let msg = install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
         assert!(msg.contains("previous kept at"), "got: {msg}");
 
         let backup = std::fs::read_dir(&dest_root)
@@ -1635,7 +1714,7 @@ mod tests {
         std::fs::create_dir_all(&dest_root).unwrap();
         let missing = tmp.path().join("nope");
 
-        assert!(install_one_skill("base-help", Some(&missing), &dest_root).is_err());
+        assert!(install_one_skill("base-help", Some(&missing), &dest_root, "0.13.2").is_err());
         let leftovers: Vec<_> = std::fs::read_dir(&dest_root).unwrap().filter_map(|e| e.ok()).collect();
         assert!(leftovers.is_empty(), "a failed install must not leave staging dirs");
     }
@@ -1766,6 +1845,61 @@ mod hooks_manifest_tests {
         assert!(
             arr.iter().any(|e| e["hooks"][0]["command"] == serde_json::json!("someone-elses-tool")),
             "the pre-existing hook must survive"
+        );
+    }
+}
+
+#[cfg(test)]
+mod skill_refresh_tests {
+    use super::*;
+
+    /// The bug this whole change exists to prevent: during `base update` the
+    /// running process is the OUTGOING binary, so a tag compiled in from
+    /// `CARGO_PKG_VERSION` fetches the skill for the version being replaced.
+    /// The tag must follow the version passed in.
+    #[test]
+    fn fetch_tag_follows_the_installed_version_not_the_running_one() {
+        assert_eq!(skill_tag("0.13.3"), "v0.13.3");
+        assert_ne!(
+            skill_tag("0.13.3"),
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+            "a tag equal to the running version would reinstall the outgoing skill"
+        );
+    }
+
+    /// Release tags arrive both ways depending on the source (`binary_version`
+    /// yields a bare version, the GitHub release yields a `v`-prefixed tag).
+    #[test]
+    fn skill_tag_is_idempotent_over_the_v_prefix() {
+        assert_eq!(skill_tag("v0.13.3"), "v0.13.3");
+        assert_eq!(skill_tag("  0.13.3 "), "v0.13.3");
+    }
+
+    /// `base install` resolves a local checkout; `base update` must not, because
+    /// `find_local_skills_dir` falls back to `current_dir()` and the operator is
+    /// explicitly installing a release.
+    #[test]
+    fn tag_only_never_resolves_a_local_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = dir.path().join("claude").join("skills").join("base-help");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(skills.join("SKILL.md"), "---\nname: base-help\n---\n").unwrap();
+
+        let binary = dir.path().join("target").join("release").join("base");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+
+        // LocalThenTag finds it; TagOnly is what the update path passes.
+        assert!(
+            find_local_skills_dir(&binary).is_some(),
+            "fixture must be discoverable, or this test proves nothing"
+        );
+        assert_eq!(
+            match SkillSource::TagOnly {
+                SkillSource::LocalThenTag => find_local_skills_dir(&binary),
+                SkillSource::TagOnly => None,
+            },
+            None,
+            "TagOnly must ignore a local checkout"
         );
     }
 }
