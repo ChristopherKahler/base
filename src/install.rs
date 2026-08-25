@@ -728,6 +728,74 @@ description = "One-line description of what this extension does"  # Required.
 
 // ─── Step 3: Wire hooks ─────────────────────────────────────
 
+/// Every hook base needs wired, and the command that serves it.
+///
+/// ONE table, two consumers: [`wire_hooks`] merges it into a host's
+/// `settings.json`, and [`hooks_manifest`] publishes it so another installer —
+/// the desktop app, which owns host-config merging — wires exactly the same
+/// thing. A second hand-maintained copy is the whole failure this constant
+/// exists to prevent: it would drift, and the drift would surface as hooks that
+/// look installed and never fire.
+pub const HOOK_TABLE: [(&str, &str); 5] = [
+    ("SessionStart", "base hook session-start"),
+    ("UserPromptSubmit", "base hook user-prompt-submit"),
+    ("PreToolUse", "base hook pre-tool-use"),
+    ("PostToolUse", "base hook post-tool-use"),
+    ("Stop", "base hook stop"),
+];
+
+/// The object base pushes into `settings.hooks[event]` for one hook.
+///
+/// Public because the manifest publishes it verbatim: an external installer
+/// merges the SAME value base would have written, not its own reading of a
+/// description of it.
+pub fn hook_entry(command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hooks": [ { "type": "command", "command": command } ]
+    })
+}
+
+/// The hook command table as JSON, for an installer outside base.
+///
+/// base deliberately does not merge host configs itself — see the fork
+/// `base-sync-client-surface` R4. Two implementations of merge-never-overwrite
+/// is one too many on the platform where a bad merge costs someone their editor
+/// config, so base publishes the table and the app owns the merge.
+///
+/// `binary` is this executable's resolved path, for a host that cannot rely on
+/// `PATH`. `command` is what base itself writes and is PATH-relative; an
+/// installer that needs an absolute command substitutes `binary` for the
+/// leading `base` token.
+/// How an external installer must merge [`hooks_manifest`], in one string so
+/// the documented rule and the tested rule cannot drift apart.
+pub fn manifest_merge_rule() -> &'static str {
+    "append the `entry` object to the array at settings.hooks[event]; \
+     skip when an entry with the same `command` is already present"
+}
+
+pub fn hooks_manifest() -> serde_json::Value {
+    let hooks: Vec<serde_json::Value> = HOOK_TABLE
+        .iter()
+        .map(|(event, command)| {
+            serde_json::json!({
+                "event": event,
+                "command": command,
+                "entry": hook_entry(command),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "version": 1,
+        "binary": std::env::current_exe()
+            .ok()
+            .map(|p| p.display().to_string()),
+        "settings_key": "hooks",
+        "merge": manifest_merge_rule(),
+        "hooks": hooks,
+    })
+}
+
 fn wire_hooks(settings_path: &Path) -> Result<()> {
     print!("3. Wire hooks → {} ... ", settings_path.display());
 
@@ -740,16 +808,9 @@ fn wire_hooks(settings_path: &Path) -> Result<()> {
     let mut settings: serde_json::Value = serde_json::from_str(&content)
         .context("Failed to parse settings.json")?;
 
-    // All hooks BASE needs wired
-    let hook_entries = [
-        ("SessionStart", "base hook session-start"),
-        ("UserPromptSubmit", "base hook user-prompt-submit"),
-        ("PreToolUse", "base hook pre-tool-use"),
-        ("PostToolUse", "base hook post-tool-use"),
-        ("Stop", "base hook stop"),
-    ];
+    let hook_entries = HOOK_TABLE;
 
-    // Check if already fully wired (all 4 present)
+    // Check if already fully wired
     let all_present = hook_entries.iter().all(|(_, cmd)| content.contains(cmd));
     if all_present {
         println!("✓ (already wired)");
@@ -784,14 +845,9 @@ fn wire_hooks(settings_path: &Path) -> Result<()> {
 
         let arr = event_hooks.as_array_mut().unwrap();
 
-        arr.push(serde_json::json!({
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": command
-                }
-            ]
-        }));
+        // The manifest publishes this exact value; build it in one place so an
+        // external installer cannot merge something base would not have written.
+        arr.push(hook_entry(command));
 
         added.push(*event);
     }
@@ -1617,6 +1673,99 @@ mod tests {
         assert!(
             body.contains("never write a handoff to the global tier"),
             "handoff must forbid the global fallback"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hooks_manifest_tests {
+    use super::*;
+
+    /// Wire a fresh settings.json and hand back what landed under `hooks`.
+    fn wired() -> serde_json::Map<String, serde_json::Value> {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        wire_hooks(&settings).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        v["hooks"].as_object().expect("hooks object").clone()
+    }
+
+    /// The property the whole verb exists for.
+    ///
+    /// The app merges `entry` verbatim. If it were assembled separately from
+    /// what `wire_hooks` writes, the two would drift and the drift would surface
+    /// as hooks that look installed and never fire — silently, because a hook
+    /// that is not called reports nothing.
+    #[test]
+    fn the_manifest_publishes_exactly_what_the_installer_writes() {
+        let hooks = wired();
+        let manifest = hooks_manifest();
+
+        for h in manifest["hooks"].as_array().unwrap() {
+            let event = h["event"].as_str().unwrap();
+            let installed = hooks[event].as_array().unwrap();
+            assert_eq!(installed.len(), 1, "{event}: one entry per fresh wire");
+            assert_eq!(
+                installed[0], h["entry"],
+                "{event}: the manifest must publish the value the installer writes"
+            );
+        }
+    }
+
+    #[test]
+    fn the_manifest_covers_every_hook_and_invents_none() {
+        let manifest = hooks_manifest();
+        let listed: Vec<&str> =
+            manifest["hooks"].as_array().unwrap().iter().map(|h| h["event"].as_str().unwrap()).collect();
+        let expected: Vec<&str> = HOOK_TABLE.iter().map(|(e, _)| *e).collect();
+        assert_eq!(listed, expected, "manifest and table must not diverge");
+
+        // A consumer keys off these; renaming one silently unwires that hook.
+        assert_eq!(manifest["version"], serde_json::json!(1));
+        assert_eq!(manifest["settings_key"], serde_json::json!("hooks"));
+    }
+
+    /// The skip rule the manifest documents is the one the installer applies.
+    #[test]
+    fn wiring_twice_adds_nothing_which_is_the_rule_the_manifest_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+
+        wire_hooks(&settings).unwrap();
+        let once = std::fs::read_to_string(&settings).unwrap();
+        wire_hooks(&settings).unwrap();
+        let twice = std::fs::read_to_string(&settings).unwrap();
+
+        assert_eq!(once, twice, "an installer that re-runs must not duplicate hooks");
+        assert!(
+            manifest_merge_rule().contains("skip when an entry with the same `command`"),
+            "the manifest must state the rule the installer actually follows"
+        );
+    }
+
+    /// A host config that already carries unrelated hooks keeps them.
+    #[test]
+    fn wiring_preserves_hooks_base_did_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"someone-elses-tool"}]}]}}"#,
+        )
+        .unwrap();
+
+        wire_hooks(&settings).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let arr = v["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "base appends, never replaces");
+        assert!(
+            arr.iter().any(|e| e["hooks"][0]["command"] == serde_json::json!("someone-elses-tool")),
+            "the pre-existing hook must survive"
         );
     }
 }

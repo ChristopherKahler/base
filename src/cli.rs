@@ -24,11 +24,22 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+pub enum HooksAction {
+    /// Print the hook command table as JSON, for an installer outside base
+    Manifest,
+}
+
+#[derive(Subcommand)]
 pub enum Commands {
     /// Handle Claude Code hook events (session-start, post-tool-use, user-prompt-submit)
     Hook {
         /// Hook event type
         event: String,
+    },
+    /// Publish base's hook wiring for an external installer (JSON)
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
     },
     /// Query AST codebase graph (entities, calls, imports)
     #[command(visible_alias = "a")]
@@ -1358,6 +1369,19 @@ pub fn run() {
 
     match cli.command {
         Some(Commands::Hook { event }) => hook::dispatch(&event),
+
+        // ─── Hooks manifest ─────────────────────────────────
+        // Machine-readable only: stdout is one JSON object, because the sole
+        // consumer is another installer parsing it.
+        Some(Commands::Hooks { action }) => match action {
+            HooksAction::Manifest => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&base::install::hooks_manifest())
+                        .unwrap_or_else(|_| "{}".into())
+                );
+            }
+        },
 
         // ─── AST Query ──────────────────────────────────
         Some(Commands::Ast { action }) => match action {
