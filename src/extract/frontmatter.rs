@@ -10,12 +10,18 @@ pub fn extract_with_project(content: &str, file_path: &str, ns: &NamespaceConfig
         return None;
     }
 
+    // Normalized here rather than relying on the caller, so this function is
+    // correct for any path it is handed — including the `/`-splitting below,
+    // which on Windows would otherwise fail to split at all and name the
+    // document `service\CONFIG-KEYS` instead of `CONFIG-KEYS`.
+    let file_path = &crate::crud::normalize_path_sep(file_path);
+
     let p = &ns.prefix;
     let mut triples = Vec::new();
 
     // Always: type and path
     triples.push(("rdf:type".into(), format!("{p}:Document")));
-    triples.push((format!("{p}:path"), format!("\"{file_path}\"")));
+    triples.push((format!("{p}:path"), format!("\"{}\"", escape(file_path))));
 
     // Map frontmatter fields to predicates
     for (key, value) in &fm {

@@ -45,11 +45,16 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
     for file_path in &files {
         report.scanned += 1;
 
-        let rel_path = file_path
-            .strip_prefix(cwd)
-            .unwrap_or(file_path)
-            .to_string_lossy()
-            .to_string();
+        // Normalize separators at the one seam where the OS hands us a path.
+        // Everything downstream — the IRI slug, the `:path` literal, and the
+        // `/`-splitting in frontmatter and paul_md — then behaves identically
+        // on every platform instead of only on the one that uses `/`.
+        let rel_path = crud::normalize_path_sep(
+            &file_path
+                .strip_prefix(cwd)
+                .unwrap_or(file_path)
+                .to_string_lossy(),
+        );
 
         let file_iri = file_iri_from_path(ns, &rel_path);
 
@@ -199,11 +204,12 @@ fn discover_files(cwd: &Path, sync_config: &crate::config::SyncConfig) -> Vec<st
         if let Ok(paths) = glob::glob(&full_pattern) {
             for entry in paths.flatten() {
                 // Check excludes
-                let rel = entry
-                    .strip_prefix(cwd)
-                    .unwrap_or(&entry)
-                    .to_string_lossy()
-                    .to_string();
+                // Same seam: `exclude` patterns are written with `/`, so the
+                // candidate has to be normalized or nothing is ever excluded
+                // below the workspace root on Windows.
+                let rel = crate::crud::normalize_path_sep(
+                    &entry.strip_prefix(cwd).unwrap_or(&entry).to_string_lossy(),
+                );
                 let excluded = sync_config
                     .exclude
                     .iter()

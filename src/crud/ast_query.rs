@@ -79,8 +79,11 @@ pub fn file(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Result<()> {
     let store = load_ast_store(cwd)?;
     let pfx = ast_prefixes(ns);
 
-    // Normalize: accept "src/cli.rs" or "cli.rs" — match by CONTAINS on sourceFile
-    let file_lower = file_path
+    // Normalize: accept "src/cli.rs" or "cli.rs" — match by CONTAINS on sourceFile.
+    // Separators first: `sourceFile` literals are forward-slash, so a Windows
+    // probe has to be reduced to the same form before it is compared.
+    let normalized = crud::normalize_path_sep(file_path);
+    let file_lower = normalized
         .trim_start_matches("src/")
         .trim_start_matches("./");
 
@@ -207,7 +210,7 @@ pub fn calls(cwd: &Path, ns: &NamespaceConfig, name: &str) -> Result<()> {
 pub fn imports(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Result<()> {
     let store = load_ast_store(cwd)?;
     let pfx = ast_prefixes(ns);
-    let file_lower = file_path
+    let file_lower = crud::normalize_path_sep(file_path)
         .trim_start_matches("src/")
         .trim_start_matches("./")
         .to_lowercase();
@@ -267,11 +270,14 @@ pub fn file_map_compact(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Op
     let pfx = ast_prefixes(ns);
     // Hook passes absolute paths; strip to app-root-relative for CONTAINS matching.
     // AST graph stores paths like "src/hook/pre_tool_use.rs".
-    let relative = app_root
-        .to_str()
-        .and_then(|root| file_path.strip_prefix(root))
+    // Both sides normalized: on Windows the root and the probe are backslashed,
+    // so `strip_prefix` would still work but `trim_start_matches('/')` would not.
+    let file_norm = crud::normalize_path_sep(file_path);
+    let root_norm = crud::normalize_path_sep(&app_root.to_string_lossy());
+    let relative = file_norm
+        .strip_prefix(&root_norm)
         .map(|p| p.trim_start_matches('/'))
-        .unwrap_or(file_path);
+        .unwrap_or(&file_norm);
     let file_lower = relative
         .trim_start_matches("./")
         .to_lowercase();
@@ -382,11 +388,12 @@ pub fn section_entities(
 ) -> Option<String> {
     let store = load_ast_store(cwd).ok()?;
     let pfx = ast_prefixes(ns);
-    let file_lower = file_path
+    let file_lower = crud::normalize_path_sep(file_path)
         .trim_start_matches("src/")
         .trim_start_matches("./")
         .to_lowercase();
-    let filename = file_lower.rsplit('/').next().unwrap_or(&file_lower);
+    let filename =
+        crud::escape_sparql_literal(file_lower.rsplit('/').next().unwrap_or(&file_lower));
     let end_line = offset + limit;
 
     let sparql = format!(
@@ -625,7 +632,9 @@ fn query_callers(store: &oxigraph::store::Store, ns: &NamespaceConfig, entity_ir
 
 fn query_file_imports(store: &oxigraph::store::Store, ns: &NamespaceConfig, file_lower: &str) -> Vec<String> {
     let pfx = ast_prefixes(ns);
-    let filename = file_lower.rsplit('/').next().unwrap_or(file_lower);
+    let normalized = crud::normalize_path_sep(file_lower);
+    let filename =
+        crud::escape_sparql_literal(normalized.rsplit('/').next().unwrap_or(&normalized));
     let sparql = format!(
         "{pfx}\n\
          SELECT DISTINCT ?target_label WHERE {{\n\
@@ -640,7 +649,9 @@ fn query_file_imports(store: &oxigraph::store::Store, ns: &NamespaceConfig, file
 
 fn query_file_importers(store: &oxigraph::store::Store, ns: &NamespaceConfig, file_lower: &str) -> Vec<String> {
     let pfx = ast_prefixes(ns);
-    let filename = crud::escape_sparql_literal(file_lower.rsplit('/').next().unwrap_or(file_lower));
+    let normalized = crud::normalize_path_sep(file_lower);
+    let filename =
+        crud::escape_sparql_literal(normalized.rsplit('/').next().unwrap_or(&normalized));
     let sparql = format!(
         "{pfx}\n\
          SELECT DISTINCT ?importer_file WHERE {{\n\

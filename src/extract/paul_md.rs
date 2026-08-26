@@ -16,6 +16,8 @@ pub fn is_paul_artifact(rel_path: &str) -> bool {
 /// Returns (predicate, value) triples under the document IRI, plus
 /// additional entity triples for decisions, patterns, file changes, and ACs.
 pub fn extract(content: &str, rel_path: &str, ns: &NamespaceConfig) -> Option<Vec<(String, String)>> {
+    // `plan_id_from_path` and the summary/plan pairing below both split on `/`.
+    let rel_path = &crate::crud::normalize_path_sep(rel_path);
     let p = &ns.prefix;
     let mut triples = Vec::new();
 

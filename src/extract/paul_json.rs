@@ -13,7 +13,10 @@ pub fn extract(content: &str, file_path: &str, ns: &NamespaceConfig) -> Option<V
     // Legacy paul.json projects get the same IRI scheme as paul.toml
     triples.push(("rdf:type".into(), format!("{p}:Project")));
     triples.push((format!("{p}:name"), format!("\"{}\"", name)));
-    triples.push((format!("{p}:path"), format!("\"{}\"", file_path)));
+    triples.push((
+        format!("{p}:path"),
+        format!("\"{}\"", crate::crud::path_literal(file_path)),
+    ));
 
     // Version
     if let Some(version) = json.get("version").and_then(|v| v.as_str()) {

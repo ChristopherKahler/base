@@ -59,6 +59,27 @@ pub fn escape_sparql_literal(s: &str) -> String {
         .replace('\t', "\\t")
 }
 
+/// Normalize an OS path separator to the graph's canonical form: forward slash.
+///
+/// A relative path reaches the graph twice — as a `:path` literal and as the
+/// slugified subject IRI. Windows hands it over backslash-separated, which is
+/// both an invalid SPARQL string escape and a *different literal* from the one
+/// every other platform stores for the same file. [`slugify`] already collapses
+/// `/` and `\` to the same `-`, so normalizing rewrites literals without moving
+/// a single subject IRI — which is what makes re-sync a replace, not an append.
+pub fn normalize_path_sep(s: &str) -> String {
+    s.replace('\\', "/")
+}
+
+/// Normalize a path's separators, then escape it for a SPARQL literal.
+///
+/// Order matters: escaping first turns `\` into `\\` and the separator is no
+/// longer there to normalize. Use this for every path that becomes a literal —
+/// stored or probed — so both sides of a comparison reduce to the same form.
+pub fn path_literal(s: &str) -> String {
+    escape_sparql_literal(&normalize_path_sep(s))
+}
+
 /// Convert a name to a URL-safe slug: lowercase, non-alphanumeric→hyphens, deduped.
 pub fn slugify(name: &str) -> String {
     let full: String = name.to_lowercase()

@@ -7,6 +7,11 @@ use crate::config::BaseConfig;
 use crate::crud;
 use crate::store;
 
+/// SPARQL expression normalizing a stored `?path` literal's separators to `/`.
+/// The doubled backslashes are a SPARQL string escape wrapping a regex escape:
+/// the pattern it compiles to is a single literal `\`.
+const PATH_SEP_NORM: &str = r#"REPLACE(STR(?path), "\\\\", "/")"#;
+
 pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Result<super::HookEventData> {
     let mut data = super::HookEventData::default();
 
@@ -45,13 +50,20 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
                  WHERE {{\n\
                    GRAPH ?g {{\n\
                      ?entity {p}:path ?path .\n\
-                     FILTER(STRSTARTS(\"{file}\", STR(?path)))\n\
+                     FILTER(STRSTARTS(\"{file}\", {norm}))\n\
                      OPTIONAL {{ ?entity {p}:lastActive ?old }}\n\
                    }}\n\
                  }}",
                 p = config.namespace.prefix,
                 u = config.namespace.uri,
-                file = file_path.display(),
+                // The probe is a live absolute tool path; `?path` here is an
+                // absolute Project path, stored with whatever separator the
+                // machine that registered it used. Reduce BOTH sides to `/` so
+                // the prefix match survives a graph written on either platform
+                // — normalizing only the probe would break every Windows graph
+                // whose project paths are already stored backslashed.
+                file = crud::path_literal(&file_path.to_string_lossy()),
+                norm = PATH_SEP_NORM,
             );
 
             if graph.update(&sparql).is_ok() {

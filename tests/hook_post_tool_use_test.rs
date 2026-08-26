@@ -6,7 +6,13 @@ use base::config::BaseConfig;
 use base::hook::post_tool_use;
 
 /// Helper: create a workspace graph (NQuads) with a project that has ops:path set.
+///
+/// The path is escaped, not interpolated raw: on Windows a tempdir path is
+/// `C:\Users\...`, and an unescaped backslash makes the FIXTURE ITSELF invalid
+/// N-Quads, so the strict `load_graph` fails before the assertion under test is
+/// ever reached.
 fn write_trig_with_path(dir: &Path, project_path: &str) {
+    let project_path = base::crud::escape_sparql_literal(project_path);
     let base_dir = dir.join(".base");
     std::fs::create_dir_all(&base_dir).unwrap();
     std::fs::write(

@@ -587,6 +587,11 @@ fn query_paul_context(store: &oxigraph::store::Store, config: &BaseConfig, file_
 
     // Normalize: strip leading ./ and match against filePath values
     let clean = file_path.trim_start_matches("./");
+    // The stored `:filePath` values come from PAUL summary docs — workspace
+    // relative and forward-slash. A live tool path on Windows arrives
+    // backslashed, so normalize before escaping: escaping alone yields a probe
+    // that parses and then matches nothing, which is this same bug one layer up.
+    let probe = crud::path_literal(clean);
 
     // Query file changes that reference this path
     let fc_sparql = format!(
@@ -598,7 +603,7 @@ fn query_paul_context(store: &oxigraph::store::Store, config: &BaseConfig, file_
                  {p}:fromPlan ?plan ;\n\
                  {p}:changeType ?change .\n\
              OPTIONAL {{ ?fc {p}:purpose ?purpose }}\n\
-             FILTER(CONTAINS(STR(?path), \"{clean}\"))\n\
+             FILTER(CONTAINS(STR(?path), \"{probe}\"))\n\
            }}\n\
          }} LIMIT 5"
     );
