@@ -55,9 +55,26 @@ fn sync_domain_list(
         let domain_slug = crud::slugify(&domain_def.name);
         let domain_iri = crud::build_iri(ns, "domain", &domain_slug);
 
-        // UPSERT domain metadata — never delete. Graph is additive.
-        // Sync only ensures the domain entity exists with current trigger config.
-        // Rules, decisions, notes are graph-native and never touched by sync.
+        // UPSERT domain metadata. Rules, decisions, notes are graph-native and
+        // never touched by sync.
+        //
+        // The re-asserted properties below (name/status/promptKeyword/
+        // fileKeyword/triggerPath) are idempotent in RDF — duplicate INSERT DATA
+        // triples don't duplicate-store. updatedAt is the one non-idempotent
+        // triple in the block: its value changes every sync, so it accumulates a
+        // new byte-distinct quad on every run instead of upserting. GC it first,
+        // scoped to exactly the properties this block re-asserts, so it can never
+        // reach rdf:type or hasRule.
+        let domain_gc = format!(
+            "{pfx}\n\
+             DELETE {{ GRAPH <{graph}> {{ <{domain_iri}> ?p ?o . }} }}\n\
+             WHERE  {{ GRAPH <{graph}> {{ <{domain_iri}> ?p ?o .\n\
+                      FILTER(?p IN ({p}:name, {p}:status, {p}:promptKeyword,\n\
+                                    {p}:fileKeyword, {p}:triggerPath, {p}:updatedAt)) }} }}"
+        );
+        store
+            .update(&domain_gc)
+            .with_context(|| format!("Failed to GC stale domain metadata for '{}'", domain_def.name))?;
 
         // Insert domain entity (upsert via INSERT DATA — duplicates are idempotent in RDF)
         let prompt_kw_triples: String = domain_def
