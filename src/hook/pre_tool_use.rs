@@ -70,10 +70,15 @@ pub fn handle(
         // on Stop → next touch sees the updated call graph.
         if is_mutating_tool(event) {
             for fp in &file_paths {
-                if let Some(root) = crate::config::ast_app_root(fp).and_then(|r| r.to_str().map(String::from))
-                    && session.mark_dirty_app(&root)
-                {
-                    session_dirty = true;
+                if let Some(root) = crate::config::ast_app_root(fp).and_then(|r| r.to_str().map(String::from)) {
+                    // Twice, deliberately: the cwd-scoped copy the Stop hook
+                    // has always drained, and the global-tier copy it drains
+                    // as of 0.13.8 — because cwd can differ between this call
+                    // and the Stop that follows it (see mark_dirty_app_global).
+                    if session.mark_dirty_app(&root) {
+                        session_dirty = true;
+                    }
+                    SessionState::mark_dirty_app_global(&root);
                 }
             }
         }

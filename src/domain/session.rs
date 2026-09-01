@@ -428,6 +428,53 @@ impl SessionState {
         self.dirty_apps.insert(self.scoped(app_root))
     }
 
+    /// Mark an app dirty in the state file under `base_dir`, saving only when
+    /// the mark is new. See [`mark_dirty_app_global`] for why a second copy of
+    /// the mark exists at all.
+    pub fn mark_dirty_app_in(base_dir: &Path, app_root: &str) -> bool {
+        let mut s = SessionState::load(base_dir);
+        let added = s.mark_dirty_app(app_root);
+        if added {
+            let _ = s.save(base_dir);
+        }
+        added
+    }
+
+    /// Drain THIS session's dirty apps from the state file under `base_dir`.
+    pub fn take_dirty_apps_in(base_dir: &Path) -> Vec<String> {
+        let mut s = SessionState::load(base_dir);
+        let mine = s.take_dirty_apps();
+        if !mine.is_empty() {
+            let _ = s.save(base_dir);
+        }
+        mine
+    }
+
+    /// The GLOBAL-TIER copy of the dirty mark.
+    ///
+    /// The pre-tool-use hook writes the mark into `find_workspace_base(cwd)`'s
+    /// `.session`, and the Stop hook drains `find_workspace_base(cwd)` too — but
+    /// `cwd` is whatever the session has at THAT moment, and it drifts: a Bash
+    /// `cd` into the app moves it, the next tool call from the home dir moves
+    /// it back. Measured 2026-09-01: a session running from `C:\Users\Chris`
+    /// edited `dev/logos-wall` with cwd inside the app, the mark landed in
+    /// `logos-wall/.base/.session`, the turn ended with cwd at home, the Stop
+    /// hook drained `C:\Users\Chris\.base\.session`, found nothing, and the
+    /// map stayed stale. One global set, still keyed per session, cannot be
+    /// stranded by a cwd change.
+    pub fn mark_dirty_app_global(app_root: &str) {
+        if let Some(g) = crate::config::global_base_dir() {
+            Self::mark_dirty_app_in(&g, app_root);
+        }
+    }
+
+    /// Drain this session's global-tier dirty apps (see [`mark_dirty_app_global`]).
+    pub fn take_dirty_apps_global() -> Vec<String> {
+        crate::config::global_base_dir()
+            .map(|g| Self::take_dirty_apps_in(&g))
+            .unwrap_or_default()
+    }
+
     /// Drain THIS session's edited-app set (the Stop hook refreshes these maps).
     /// Scoped so one session's Stop hook cannot steal another's pending refreshes.
     pub fn take_dirty_apps(&mut self) -> Vec<String> {

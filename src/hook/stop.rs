@@ -39,6 +39,11 @@ pub fn handle(_config: &BaseConfig, cwd: &Path) -> anyhow::Result<()> {
             roots.push(PathBuf::from(app));
         }
     }
+    // And the global-tier copy: a mark written while cwd was inside the app is
+    // invisible to the cwd-scoped drain above once cwd has moved (0.13.8).
+    for app in SessionState::take_dirty_apps_global() {
+        roots.push(PathBuf::from(app));
+    }
 
     roots.sort();
     roots.dedup();
@@ -54,6 +59,12 @@ pub fn handle(_config: &BaseConfig, cwd: &Path) -> anyhow::Result<()> {
         }
     }
 
+    // Requeue into the global tier, which is where the next Stop looks
+    // whatever its cwd is; the cwd-scoped copy is kept for older binaries
+    // that still drain only there.
+    for app in &requeue {
+        SessionState::mark_dirty_app_global(app);
+    }
     if let (Some(s), Some(bd)) = (session.as_mut(), base_dir.as_deref()) {
         for app in requeue {
             s.mark_dirty_app(&app);
