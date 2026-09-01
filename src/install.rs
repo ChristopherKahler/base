@@ -206,8 +206,9 @@ pub fn uninstall(purge: bool) -> Result<()> {
         println!("3. Binary not found at {} — skipped", binary.display());
     }
 
-    // 4. Remove bundled skills. Backups (<skill>.bak-*) are the operator's own
-    //    customised copies, so they survive uninstall deliberately.
+    // 4. Remove bundled skills. Backups (<skill>.bak-* under
+    //    ~/.base-gbl/backups/skills) are the operator's own customised copies,
+    //    so they survive uninstall deliberately.
     let skills_root = home.join(".claude").join("skills");
     let mut removed_skills = Vec::new();
     for skill in BUNDLED_SKILLS {
@@ -1061,7 +1062,7 @@ pub(crate) fn install_skills(
             .map(|r| r.join(skill))
             .filter(|p| p.join("SKILL.md").is_file());
 
-        match install_one_skill(skill, local.as_deref(), &dest_root, version) {
+        match install_one_skill(skill, local.as_deref(), &dest_root, &skill_backup_root(home), version) {
             Ok(outcome) => results.push(outcome),
             Err(e) => failures.push((skill.to_string(), e.to_string())),
         }
@@ -1106,6 +1107,11 @@ pub(crate) fn install_skills(
     Ok(())
 }
 
+/// Where a replaced skill's previous copy is parked: `~/.base-gbl/backups/skills`.
+pub(crate) fn skill_backup_root(home: &Path) -> std::path::PathBuf {
+    home.join(".base-gbl").join("backups").join("skills")
+}
+
 /// Where bundled skills live: `$BASE_SKILLS_DIR` when set, else
 /// `~/.claude/skills`. Claude Code only loads skills from the latter, so the
 /// override is for setups that manage that directory themselves (issue #12: a
@@ -1147,6 +1153,7 @@ fn install_one_skill(
     skill: &str,
     local: Option<&Path>,
     dest_root: &Path,
+    backup_root: &Path,
     version: &str,
 ) -> Result<String> {
     let dest = dest_root.join(skill);
@@ -1182,11 +1189,20 @@ fn install_one_skill(
     // identical here. The recorded hash of the bank as last shipped separates
     // them, and the two cases deserve different words — never silence.
     let locally_modified = bank_locally_modified(&dest);
-    let backup = dest_root.join(format!(
+    // The backup must not live under ~/.claude/skills: Claude Code registers
+    // every subdirectory there as a skill, so a `base-help.bak-*` beside the
+    // real one shows up as a second, stale base-help. Park it under
+    // ~/.base-gbl/backups/skills instead (rename when same-volume, copy otherwise).
+    std::fs::create_dir_all(backup_root)
+        .with_context(|| format!("creating {}", backup_root.display()))?;
+    let backup = backup_root.join(format!(
         "{skill}.bak-{}",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     ));
-    std::fs::rename(&dest, &backup)?;
+    if std::fs::rename(&dest, &backup).is_err() {
+        copy_dir_all(&dest, &backup)?;
+        std::fs::remove_dir_all(&dest)?;
+    }
     std::fs::rename(&staging, &dest)?;
     if locally_modified {
         Ok(format!(
@@ -1797,9 +1813,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = make_skill_src(&tmp.path().join("repo"), "pairs\n");
         let dest_root = tmp.path().join("skills");
+        let backup_root = tmp.path().join("backups");
         std::fs::create_dir_all(&dest_root).unwrap();
 
-        let msg = install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
+        let msg = install_one_skill("base-help", Some(&src), &dest_root, &backup_root, "0.13.2").unwrap();
         assert!(msg.contains("3 files"), "got: {msg}");
         assert!(dest_root.join("base-help").join("SKILL.md").is_file());
     }
@@ -1809,17 +1826,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = make_skill_src(&tmp.path().join("repo"), "pairs\n");
         let dest_root = tmp.path().join("skills");
+        let backup_root = tmp.path().join("backups");
         std::fs::create_dir_all(&dest_root).unwrap();
 
-        install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
-        let msg = install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
+        install_one_skill("base-help", Some(&src), &dest_root, &backup_root, "0.13.2").unwrap();
+        let msg = install_one_skill("base-help", Some(&src), &dest_root, &backup_root, "0.13.2").unwrap();
         assert!(msg.contains("already current"), "got: {msg}");
-        let backups: Vec<_> = std::fs::read_dir(&dest_root)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
-            .collect();
+        let backups: Vec<_> = std::fs::read_dir(&backup_root)
+            .map(|d| d.filter_map(|e| e.ok()).collect())
+            .unwrap_or_default();
         assert!(backups.is_empty(), "an unchanged reinstall must not leave backups");
+        assert!(
+            !std::fs::read_dir(&dest_root).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(".bak-")),
+            "nothing named .bak- may ever land in the skills dir"
+        );
     }
 
     /// base-help appends to its own Q&A bank as it learns. A reinstall must not
@@ -1829,21 +1849,26 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = make_skill_src(&tmp.path().join("repo"), "shipped pairs\n");
         let dest_root = tmp.path().join("skills");
+        let backup_root = tmp.path().join("backups");
         std::fs::create_dir_all(&dest_root).unwrap();
 
-        install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
+        install_one_skill("base-help", Some(&src), &dest_root, &backup_root, "0.13.2").unwrap();
         // Operator's own appended pair.
         let installed_bank = dest_root.join("base-help").join("references").join("qa.md");
         std::fs::write(&installed_bank, "shipped pairs\n### Q: mine\n").unwrap();
 
-        let msg = install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
+        let msg = install_one_skill("base-help", Some(&src), &dest_root, &backup_root, "0.13.2").unwrap();
         assert!(msg.contains("previous kept at"), "got: {msg}");
 
-        let backup = std::fs::read_dir(&dest_root)
+        let backup = std::fs::read_dir(&backup_root)
             .unwrap()
             .filter_map(|e| e.ok())
             .find(|e| e.file_name().to_string_lossy().contains(".bak-"))
             .expect("edited skill must be backed up");
+        assert!(
+            !std::fs::read_dir(&dest_root).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(".bak-")),
+            "the backup must not sit inside the skills dir (Claude Code would load it as a skill)"
+        );
         let saved =
             std::fs::read_to_string(backup.path().join("references").join("qa.md")).unwrap();
         assert!(saved.contains("### Q: mine"), "operator's pair must survive");
@@ -1855,10 +1880,11 @@ mod tests {
     fn install_one_skill_leaves_nothing_behind_when_source_is_bad() {
         let tmp = tempfile::tempdir().unwrap();
         let dest_root = tmp.path().join("skills");
+        let backup_root = tmp.path().join("backups");
         std::fs::create_dir_all(&dest_root).unwrap();
         let missing = tmp.path().join("nope");
 
-        assert!(install_one_skill("base-help", Some(&missing), &dest_root, "0.13.2").is_err());
+        assert!(install_one_skill("base-help", Some(&missing), &dest_root, &backup_root, "0.13.2").is_err());
         let leftovers: Vec<_> = std::fs::read_dir(&dest_root).unwrap().filter_map(|e| e.ok()).collect();
         assert!(leftovers.is_empty(), "a failed install must not leave staging dirs");
     }
@@ -2083,14 +2109,15 @@ mod skill_dod_tests {
     fn update_refreshes_the_skill_to_the_incoming_content() {
         let tmp = tempfile::tempdir().unwrap();
         let dest_root = tmp.path().join("skills");
+        let backup_root = tmp.path().join("backups");
         std::fs::create_dir_all(&dest_root).unwrap();
 
         let old = fixture(&tmp.path().join("old"), "0.12.3", "");
-        install_one_skill("base-help", Some(&old), &dest_root, "0.12.3").unwrap();
+        install_one_skill("base-help", Some(&old), &dest_root, &backup_root, "0.12.3").unwrap();
         assert!(bank(&dest_root).contains("v0.12.3"));
 
         let new = fixture(&tmp.path().join("new"), "0.13.2", "### Q: a new pair\n");
-        let msg = install_one_skill("base-help", Some(&new), &dest_root, "0.13.2").unwrap();
+        let msg = install_one_skill("base-help", Some(&new), &dest_root, &backup_root, "0.13.2").unwrap();
 
         let after = bank(&dest_root);
         assert!(after.contains("v0.13.2"), "refreshed to the incoming bank");
@@ -2103,18 +2130,17 @@ mod skill_dod_tests {
     fn an_unchanged_skill_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let dest_root = tmp.path().join("skills");
+        let backup_root = tmp.path().join("backups");
         std::fs::create_dir_all(&dest_root).unwrap();
         let src = fixture(&tmp.path().join("src"), "0.13.2", "");
 
-        install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
-        let msg = install_one_skill("base-help", Some(&src), &dest_root, "0.13.2").unwrap();
+        install_one_skill("base-help", Some(&src), &dest_root, &backup_root, "0.13.2").unwrap();
+        let msg = install_one_skill("base-help", Some(&src), &dest_root, &backup_root, "0.13.2").unwrap();
 
         assert!(msg.contains("already current"), "got: {msg}");
-        let backups: Vec<_> = std::fs::read_dir(&dest_root)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
-            .collect();
+        let backups: Vec<_> = std::fs::read_dir(&backup_root)
+            .map(|d| d.flatten().collect())
+            .unwrap_or_default();
         assert!(backups.is_empty(), "an identical skill must not spawn a backup");
     }
 
@@ -2125,10 +2151,11 @@ mod skill_dod_tests {
     fn a_modified_bank_is_preserved_and_reported() {
         let tmp = tempfile::tempdir().unwrap();
         let dest_root = tmp.path().join("skills");
+        let backup_root = tmp.path().join("backups");
         std::fs::create_dir_all(&dest_root).unwrap();
 
         let src = fixture(&tmp.path().join("src"), "0.12.3", "");
-        install_one_skill("base-help", Some(&src), &dest_root, "0.12.3").unwrap();
+        install_one_skill("base-help", Some(&src), &dest_root, &backup_root, "0.12.3").unwrap();
 
         // The operator appends a pair, exactly as the skill's close-the-loop
         // rule instructs.
@@ -2137,12 +2164,12 @@ mod skill_dod_tests {
         std::fs::write(&live, &mine).unwrap();
 
         let new = fixture(&tmp.path().join("new"), "0.13.2", "");
-        let msg = install_one_skill("base-help", Some(&new), &dest_root, "0.13.2").unwrap();
+        let msg = install_one_skill("base-help", Some(&new), &dest_root, &backup_root, "0.13.2").unwrap();
 
         // The incoming bank is live …
         assert!(bank(&dest_root).contains("v0.13.2"));
         // … and the operator's copy survives byte-for-byte in the backup.
-        let backup = std::fs::read_dir(&dest_root)
+        let backup = std::fs::read_dir(&backup_root)
             .unwrap()
             .flatten()
             .map(|e| e.path())
