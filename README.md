@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-PolyForm_Noncommercial-0B63D6?style=flat-square" alt="License: PolyForm Noncommercial 1.0.0"></a>
-  <img src="https://img.shields.io/badge/version-0.13.3-12263A?style=flat-square" alt="Version 0.13.3">
+  <img src="https://img.shields.io/badge/version-0.13.4-12263A?style=flat-square" alt="Version 0.13.4">
   <img src="https://img.shields.io/badge/rust-single_binary-2F4A63?style=flat-square&logo=rust&logoColor=white" alt="Rust, single binary">
   <img src="https://img.shields.io/badge/built_for-Claude_Code-C2551F?style=flat-square" alt="Built for Claude Code">
 </p>
@@ -124,6 +124,8 @@ The graph remembers between sessions — and between agents.
 These are star commands — typed straight into the chat, defined in `commands.toml`, fully customizable (`base commands list` shows what's loaded). Open handoffs resurface automatically at the next session start.
 
 Multiple live sessions coordinate through the relay: `base relay` gives titled sessions, instant pings, briefed task hand-offs that fire inside the receiving session's hooks, and an operator board of who's alive and what's pending.
+
+base updates itself at session start from the GitHub releases of this repo (pin a machine with `base config set update.auto false`). Every swap or failure is appended to `~/.base-gbl/update.log`; an up-to-date no-op is not. A Windows install older than 0.13.4 cannot replace its own running binary: bootstrap it once with the release zip or `npx chrisai`, after which it updates in place.
 
 The relay is on by default and entirely local. Each session gets a codename, and the hooks ask it to keep a Monitor on its own inbox folder under `~/.base-gbl/.base/relay-inbox/<title>/`, plus a one-line `.status` file the board reads. Nothing leaves the machine. `base config set relay.enabled false` turns it off; `base config set relay.wake_nudge false` keeps titles and pings but drops the arming block.
 
