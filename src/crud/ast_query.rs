@@ -102,10 +102,11 @@ pub fn file(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Result<()> {
              rdfs:label ?label ;\n\
              ops:sourceFile ?file .\n\
            OPTIONAL {{ ?entity ops:sourceLine ?line }}\n\
-           FILTER(CONTAINS(LCASE(STR(?file)), \"{}\"))\n\
+           FILTER(CONTAINS({norm}, \"{}\"))\n\
          }}\n\
          ORDER BY ?line",
-        crud::escape_sparql_literal(&file_lower.to_lowercase())
+        crud::escape_sparql_literal(&file_lower.to_lowercase()),
+        norm = norm_file_expr("file")
     );
 
     let results = crate::store::query(&store, &sparql)?;
@@ -299,9 +300,10 @@ pub fn file_map_compact(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Op
              rdfs:label ?label ;\n\
              ops:sourceFile ?file .\n\
            OPTIONAL {{ ?entity ops:sourceLine ?line }}\n\
-           FILTER(CONTAINS(LCASE(STR(?file)), \"{escaped}\"))\n\
+           FILTER(CONTAINS({norm}, \"{escaped}\"))\n\
          }}\n\
-         ORDER BY ?line"
+         ORDER BY ?line",
+        norm = norm_file_expr("file")
     );
 
     let results = crate::store::query(&store, &sparql).ok()?;
@@ -396,12 +398,21 @@ pub fn section_entities(
 ) -> Option<String> {
     let store = load_ast_store(cwd).ok()?;
     let pfx = ast_prefixes(ns);
-    let file_lower = crud::normalize_path_sep(file_path)
+    // App-root-relative when the root is known (the hook passes absolute
+    // paths), else whatever was given; the tail match in file_match_expr() covers a
+    // map rooted differently. Until 2026-09-01 this compared the BASENAME for
+    // equality against a stored relative path, which matched only files at
+    // the app root.
+    let file_norm_probe = crud::normalize_path_sep(file_path);
+    let relative = crate::config::ast_app_root(Path::new(file_path))
+        .map(|r| crud::normalize_path_sep(&r.to_string_lossy()))
+        .and_then(|root| file_norm_probe.strip_prefix(&root).map(|p| p.trim_start_matches('/').to_string()))
+        .unwrap_or_else(|| file_norm_probe.clone());
+    let file_lower = relative
         .trim_start_matches("src/")
         .trim_start_matches("./")
         .to_lowercase();
-    let filename =
-        crud::escape_sparql_literal(file_lower.rsplit('/').next().unwrap_or(&file_lower));
+    let probe = crud::escape_sparql_literal(&file_lower);
     let end_line = offset + limit;
 
     let sparql = format!(
@@ -411,10 +422,11 @@ pub fn section_entities(
              rdfs:label ?label ;\n\
              ops:sourceFile ?file ;\n\
              ops:sourceLine ?line .\n\
-           FILTER(LCASE(STR(?file)) = \"{filename}\")\n\
+           FILTER({is_file})\n\
            FILTER(?line >= {offset} && ?line <= {end_line})\n\
          }}\n\
-         ORDER BY ?line"
+         ORDER BY ?line",
+        is_file = file_match_expr("file", &probe)
     );
 
     let results = crate::store::query(&store, &sparql).ok()?;
@@ -509,6 +521,28 @@ pub fn code_graph(
 }
 
 // ─── Internal helpers ────────────────────────────────────────
+
+/// The stored `ops:sourceFile` literal with its separators reduced to `/`, as
+/// a SPARQL expression. The extractor writes OS-native separators — `ui\deck.js`
+/// on Windows — while every probe below is normalised to `/` before it is
+/// compared, so until 2026-09-01 no path with a directory in it matched on
+/// Windows: the hook injected a file map for ROOT-LEVEL files only, and
+/// `--file ui/deck.js` found nothing while `--file deck.js` found 72 entities.
+/// Normalising the stored side here keeps every existing map valid on both
+/// OSes. REPLACE takes a regex; the SPARQL literal `"\\\\"` is the regex `\\`,
+/// one backslash.
+fn norm_file_expr(var: &str) -> String {
+    format!("LCASE(REPLACE(STR(?{var}), \"\\\\\\\\\", \"/\"))")
+}
+
+/// A probe against the normalised stored path: equal to it, or its tail after
+/// a `/`. Probes arrive app-root-relative (the hook) or as whatever the
+/// operator typed (`deck.js`, `ui/deck.js`), and a map may be rooted one
+/// level differently from the probe, so a tail match is the honest test.
+fn file_match_expr(var: &str, probe_lower_escaped: &str) -> String {
+    let norm = norm_file_expr(var);
+    format!("({norm} = \"{probe_lower_escaped}\" || STRENDS({norm}, \"/{probe_lower_escaped}\"))")
+}
 
 fn ast_prefixes(ns: &NamespaceConfig) -> String {
     format!(
@@ -649,8 +683,9 @@ fn query_file_imports(store: &oxigraph::store::Store, ns: &NamespaceConfig, file
            ?entity ops:sourceFile ?file ;\n\
              ops:importsFrom ?target .\n\
            ?target rdfs:label ?target_label .\n\
-           FILTER(LCASE(STR(?file)) = \"{filename}\")\n\
-         }}"
+           FILTER({is_file})\n\
+         }}",
+        is_file = file_match_expr("file", &filename.to_lowercase())
     );
     extract_labels(store, &sparql, "target_label")
 }
