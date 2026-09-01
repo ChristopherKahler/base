@@ -87,13 +87,21 @@ pub fn file(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Result<()> {
         .trim_start_matches("src/")
         .trim_start_matches("./");
 
+    // `ops:sourceFile` sits INSIDE the first basic graph pattern, before the
+    // OPTIONAL, exactly as file_map_compact() writes it. Measured 2026-09-01 on
+    // a 25,303-entity map: with the sourceFile pattern placed AFTER the OPTIONAL
+    // the algebra becomes Join(LeftJoin(BGP, line), BGP{sourceFile}) and
+    // oxigraph 0.4 evaluates that join without the index — 112 s for one
+    // `base ast query --file`, against 0.3 s for the compact form on the same
+    // data and 1.1 s for --contains / --imports. Same map, same file, one line
+    // moved. Keep the FILTER's pattern in the BGP it filters.
     let sparql = format!(
         "{pfx}\n\
          SELECT ?entity ?label ?line ?type WHERE {{\n\
            ?entity rdf:type ?type ;\n\
-             rdfs:label ?label .\n\
+             rdfs:label ?label ;\n\
+             ops:sourceFile ?file .\n\
            OPTIONAL {{ ?entity ops:sourceLine ?line }}\n\
-           ?entity ops:sourceFile ?file .\n\
            FILTER(CONTAINS(LCASE(STR(?file)), \"{}\"))\n\
          }}\n\
          ORDER BY ?line",
