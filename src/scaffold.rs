@@ -91,8 +91,12 @@ pub fn run(target: &Path) -> Result<()> {
 
     // Step 4: Register in ~/.base-gbl/base.toml
     print!("4. Register workspace ... ");
+    // `canonicalize` is verbatim (`\\?\C:\...`) on Windows. That is not the
+    // path the operator typed, and written raw into TOML its backslashes are
+    // invalid escapes that break every later parse of base.toml (issue #13).
     let target_str = target
         .canonicalize()
+        .map(|p| crate::plugin::paths::to_manifest_path(&p))
         .unwrap_or_else(|_| target.to_path_buf())
         .to_string_lossy()
         .to_string();
@@ -156,8 +160,9 @@ fn registered_workspace_paths() -> Vec<String> {
 }
 
 fn tildify(path: &str, home: &Path) -> String {
-    let h = home.to_string_lossy();
-    path.strip_prefix(h.as_ref())
+    // Registry paths are `/`-shaped on every platform; match home the same way.
+    let h = home.to_string_lossy().replace('\\', "/");
+    path.strip_prefix(h.as_str())
         .map(|rest| format!("~{rest}"))
         .unwrap_or_else(|| path.to_string())
 }
@@ -237,17 +242,13 @@ fn register_workspace(path: &str) -> Result<()> {
 
     let content = std::fs::read_to_string(&global_toml)?;
 
-    // Check if already registered — exact path match on the toml value,
-    // not substring (contains() would falsely match "/a/project" against
-    // "/a/project-v2"; AUDIT Q11).
-    let path_line = format!("path = \"{path}\"");
-    if content.lines().any(|l| l.trim() == path_line) {
+    if workspace_is_registered(&content, path) {
         println!("already registered");
         return Ok(());
     }
 
     // Append [[workspace]] entry
-    let entry = format!("\n[[workspace]]\npath = \"{path}\"\n");
+    let entry = workspace_entry(path);
     let mut new_content = content;
     new_content.push_str(&entry);
 
@@ -257,4 +258,64 @@ fn register_workspace(path: &str) -> Result<()> {
 
     println!("✓ (added to ~/.base-gbl/base.toml)");
     Ok(())
+}
+
+/// Is `path` already a `[[workspace]]` entry? Exact match on the parsed value —
+/// not substring ("/a/project" vs "/a/project-v2"; AUDIT Q11), and not the raw
+/// line, because a path TOML has to escape never equals its own spelling. A
+/// file that no longer parses falls back to the raw-line compare.
+fn workspace_is_registered(content: &str, path: &str) -> bool {
+    match content.parse::<toml::Value>() {
+        Ok(doc) => doc
+            .get("workspace")
+            .and_then(|w| w.as_array())
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|e| e.get("path").and_then(|p| p.as_str()) == Some(path))
+            }),
+        Err(_) => {
+            let raw = format!("path = \"{path}\"");
+            content.lines().any(|l| l.trim() == raw)
+        }
+    }
+}
+
+/// The `[[workspace]]` block for `path`, the value emitted by the TOML
+/// serializer so anything that needs escaping is escaped.
+fn workspace_entry(path: &str) -> String {
+    format!("\n[[workspace]]\npath = {}\n", toml::Value::String(path.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_entry_round_trips_a_backslash_path() {
+        let p = r"C:\Users\ops\00 Products\my-sys";
+        let entry = workspace_entry(p);
+        let doc: toml::Value = entry.parse().expect("entry must be valid TOML");
+        assert_eq!(doc["workspace"][0]["path"].as_str(), Some(p));
+        assert!(workspace_is_registered(&entry, p));
+        assert!(!workspace_is_registered(&entry, r"C:\Users\ops\00 Products\my-sys-v2"));
+    }
+
+    #[test]
+    fn registered_check_survives_an_unparseable_file() {
+        // The legacy write: a verbatim Windows path pasted raw. `\?` is not a
+        // TOML escape, so the whole file stops parsing.
+        let broken = "[[workspace]]\npath = \"\\\\?\\E:\\x\"\n\n[[workspace]]\npath = \"/home/a\"\n";
+        assert!(broken.parse::<toml::Value>().is_err(), "precondition: legacy write breaks TOML");
+        assert!(workspace_is_registered(broken, "/home/a"));
+        assert!(!workspace_is_registered(broken, "/home/b"));
+    }
+
+    #[test]
+    fn tildify_matches_a_slashed_home_on_windows_shapes() {
+        let home = Path::new(r"C:\Users\ops");
+        assert_eq!(tildify("C:/Users/ops/work", home), "~/work");
+        assert_eq!(tildify("/home/ops/work", Path::new("/home/ops")), "~/work");
+        assert_eq!(tildify("/srv/x", Path::new("/home/ops")), "/srv/x");
+    }
 }

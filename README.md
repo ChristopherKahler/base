@@ -125,6 +125,8 @@ These are star commands — typed straight into the chat, defined in `commands.t
 
 Multiple live sessions coordinate through the relay: `base relay` gives titled sessions, instant pings, briefed task hand-offs that fire inside the receiving session's hooks, and an operator board of who's alive and what's pending.
 
+The relay is on by default and entirely local. Each session gets a codename, and the hooks ask it to keep a Monitor on its own inbox folder under `~/.base-gbl/.base/relay-inbox/<title>/`, plus a one-line `.status` file the board reads. Nothing leaves the machine. `base config set relay.enabled false` turns it off; `base config set relay.wake_nudge false` keeps titles and pings but drops the arming block.
+
 ## Ask it things
 
 ```bash

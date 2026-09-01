@@ -32,7 +32,7 @@ pub(super) fn is_manifest_absolute(p: &Path) -> bool {
 
 /// Normalise a path into manifest shape: no Windows verbatim prefix, `/`
 /// throughout. Identity on a path that is already `/`-shaped.
-pub(super) fn to_manifest_path(p: &Path) -> PathBuf {
+pub fn to_manifest_path(p: &Path) -> PathBuf {
     PathBuf::from(slashed(p))
 }
 

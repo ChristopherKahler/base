@@ -104,35 +104,77 @@ done"#
 }
 
 /// The arming block injected into hook context (and printed by `relay
-/// register`) when a title's sentinel is stale. A mandatory-first-action
-/// contract, not a suggestion.
+/// register`) when a title's sentinel is stale. It is the operator's standing
+/// instruction from `[relay]` in base.toml, so it says what it is, where it
+/// comes from, and how to switch it off — it never asks the model to act
+/// without telling the operator.
 pub fn arm_block(title: &str) -> Option<String> {
+    arm_block_for(title, &operator_name())
+}
+
+/// `arm_block` with the operator label supplied — the pure half, so the text
+/// can be tested without a profile on disk.
+fn arm_block_for(title: &str, operator: &str) -> Option<String> {
     let inbox_disp = title_dir(title)?.to_string_lossy().replace('\\', "/");
     let script = watch_script(title)?;
     let indented: String = script.lines().map(|l| format!("    {l}\n")).collect();
     Some(format!(
-        "=== RELAY WAKE CONTRACT ({title}) — arm NOW, before your next action ===\n\
-         No live wake monitor for your relay title \"{title}\" (sentinel stale or missing). \
-         Call the Monitor tool ONCE, exactly as below, then continue your task. If Monitor is a \
-         deferred tool in your harness, load it FIRST (ToolSearch \"select:Monitor\") — a direct \
-         call fails with InputValidationError until the schema is loaded; do not give up on that \
-         error, load and retry. Do not ask permission, do not verify beyond the tool call \
-         succeeding, do not send test pings. \
-         If THIS session already runs a monitor for \"{title}\" armed with THIS script (its loop \
-         touches .watching), skip — never arm a duplicate. If your running monitor is an older \
-         script that does not touch the sentinel, TaskStop it first, then arm this one.\n\n\
+        "=== RELAY WAKE CONTRACT ({title}) ===\n\
+         This session holds the relay title \"{title}\" and has no live wake monitor (sentinel \
+         stale or missing). The relay is base's local multi-session layer, on by way of \
+         `[relay]` in ~/.base-gbl/base.toml: `base config set relay.wake_nudge false` stops \
+         this block, `base config set relay.enabled false` stops the auto-codename too. \
+         Everything below stays on this machine — the monitor watches one local inbox folder, \
+         and the sentinel it touches is what `base relay board` reads.\n\
+         To arm it, call the Monitor tool once with the script below, then continue your task. \
+         If Monitor is a deferred tool in your harness, load it first (ToolSearch \
+         \"select:Monitor\") — a direct call fails with InputValidationError until the schema \
+         is loaded. No test ping is needed. If THIS session already runs a monitor for \
+         \"{title}\" armed with THIS script (its loop touches .watching), skip — never arm a \
+         duplicate. If your running monitor is an older script that does not touch the \
+         sentinel, TaskStop it first, then arm this one.\n\n\
          \x20 description: relay wake: {title}\n\
          \x20 persistent: true\n\
          \x20 command:\n{indented}\n\
-         While the monitor runs, its loop touches the .watching sentinel every 5s poll — that is \
-         your compliance proof (`base relay board` shows it) and this nudge repeats until it is fresh.\n\
+         While the monitor runs, its loop touches the .watching sentinel every 5s poll; \
+         `base relay board` shows that as Watching, and this block repeats (at most once per \
+         3 minutes) until the sentinel is fresh.\n\
          STATUS LINE: whenever what you are working on changes, write one short line to \
-         {inbox_disp}/.status (e.g. `echo \"building X\" > .../.status`) — the ping hub shows it \
-         on your session card so Chris sees live work state at a glance.\n\
+         {inbox_disp}/.status (e.g. `echo \"building X\" > .../.status`). It is a local file \
+         the operator's ping hub shows on this session's card, so {operator} sees live work \
+         state at a glance.\n\
          PROJECT TAG: the moment you know which project this session serves (and again whenever \
          it changes), run `base relay register --as {title} --project <project-name>` — every \
-         project ever named stays on your hub card as a filter keyword; nothing is removed.\n"
+         project ever named stays on the session's hub card as a filter keyword; nothing is removed.\n"
     ))
+}
+
+/// Who the status line is for: the `base operator init` profile's name, or a
+/// generic label when no profile is set — never a name baked into the binary.
+fn operator_name() -> String {
+    crate::operator::load()
+        .map(|p| p.name)
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "the operator".to_string())
+}
+
+/// Bring a throttle file's mtime to now. A zero-byte `fs::write` over an
+/// existing zero-byte file leaves the mtime alone on Windows — observed as a
+/// six-day-old `.watch-nudge` while the nudge fired on every tool call (the
+/// "every single tool call" of issue #13) — so the time is set explicitly.
+fn stamp(path: &std::path::Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(f) = std::fs::File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = f.set_modified(std::time::SystemTime::now());
 }
 
 /// Stale-sentinel scan across every title this session holds. Returns the
@@ -158,10 +200,7 @@ pub fn arm_blocks_for(session_id: &str, force: bool) -> Option<String> {
             continue;
         }
         if let Some(p) = nudge_path(&title) {
-            if let Some(dir) = p.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(&p, b"");
+            stamp(&p);
         }
         if let Some(block) = arm_block(&title) {
             out.push_str(&block);
@@ -192,11 +231,36 @@ mod tests {
     #[test]
     fn arm_block_carries_sentinel_touch_and_persistent_flag() {
         // title_dir needs a home dir; any real home works — content only.
-        if let Some(block) = arm_block("wake-test-title") {
+        if let Some(block) = arm_block_for("wake-test-title", "Pat") {
             assert!(block.contains("touch \"$INBOX/.watching\""));
             assert!(block.contains("persistent: true"));
             assert!(block.contains("relay-inbox"));
             assert!(block.contains("never arm a duplicate"));
+            // Issue #11 / #13: the operator comes from the profile, never the
+            // binary, and the block explains itself instead of demanding.
+            assert!(block.contains("so Pat sees live work state"));
+            assert!(!block.contains("Chris sees"), "the home path may contain a name; the sentence must not");
+            assert!(!block.contains("Do not ask permission"));
+            assert!(!block.contains("arm NOW"));
+            assert!(block.contains("relay.wake_nudge false"));
+            assert!(block.contains("relay.enabled false"));
         }
+    }
+
+    #[test]
+    fn stamp_moves_a_stale_throttle_file_to_now() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join(".watch-nudge");
+        std::fs::write(&p, b"").unwrap();
+        let old = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(NUDGE_COOLDOWN_SECS * 10);
+        std::fs::File::options().write(true).open(&p).unwrap().set_modified(old).unwrap();
+        assert!(age_secs(&p).unwrap() >= NUDGE_COOLDOWN_SECS, "precondition: stale");
+        stamp(&p);
+        assert!(age_secs(&p).unwrap() < NUDGE_COOLDOWN_SECS, "stamp must read as just touched");
+        // Through a missing parent too — the first nudge for a fresh title.
+        let deep = tmp.path().join("a").join("b").join(".watch-nudge");
+        stamp(&deep);
+        assert!(age_secs(&deep).is_some());
     }
 }

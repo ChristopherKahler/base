@@ -191,6 +191,8 @@ pub struct BaseConfig {
     #[serde(default)]
     pub standards: StandardsConfig,
     #[serde(default)]
+    pub relay: RelayConfig,
+    #[serde(default)]
     pub workspace: Vec<WorkspaceEntry>,
 }
 
@@ -362,6 +364,34 @@ impl Default for BracketConfig {
 pub struct DevmodeConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+// ─── Relay Config ───────────────────────────────────────────
+
+/// Multi-session relay (`base relay`): titled sessions, pings, task hand-offs,
+/// and the hook-injected wake contract that keeps an idle session pingable.
+/// Everything it writes stays under `~/.base-gbl/.base/relay-inbox/`.
+///
+/// `enabled = false` stops the hooks from drawing a codename for every session
+/// and from injecting the wake contract; a session that runs `base relay
+/// register` itself still takes part. `wake_nudge = false` keeps titles and
+/// pings but never injects the Monitor arming block — for harnesses without a
+/// Monitor tool, or operators who arm it by hand. `BASE_NO_AUTONAME` and
+/// `BASE_NO_WAKE_NUDGE` remain the per-process equivalents.
+///
+/// `base config set relay.enabled false` / `base config set relay.wake_nudge false`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub wake_nudge: bool,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self { enabled: true, wake_nudge: true }
+    }
 }
 
 // ─── Update Config ──────────────────────────────────────────
