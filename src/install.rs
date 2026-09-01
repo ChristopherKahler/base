@@ -2003,10 +2003,16 @@ mod skill_refresh_tests {
     /// The tag must follow the version passed in.
     #[test]
     fn fetch_tag_follows_the_installed_version_not_the_running_one() {
-        assert_eq!(skill_tag("0.13.3"), "v0.13.3");
+        // Derive the "incoming" version from the running one so this can never
+        // collide with a real release bump (it did, the day the crate became
+        // the version the fixture had hardcoded).
+        let running = env!("CARGO_PKG_VERSION");
+        let (head, patch) = running.rsplit_once('.').expect("semver has a patch");
+        let incoming = format!("{head}.{}", patch.parse::<u64>().expect("numeric patch") + 1);
+        assert_eq!(skill_tag(&incoming), format!("v{incoming}"));
         assert_ne!(
-            skill_tag("0.13.3"),
-            format!("v{}", env!("CARGO_PKG_VERSION")),
+            skill_tag(&incoming),
+            format!("v{running}"),
             "a tag equal to the running version would reinstall the outgoing skill"
         );
     }
