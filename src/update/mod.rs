@@ -303,9 +303,17 @@ fn install_dest() -> Result<PathBuf> {
         .context("cannot resolve home directory")
 }
 
-/// Atomic swap: stage beside the target, set the exec bit, rename over it. rename
-/// over a running binary succeeds (the live process keeps its inode); a plain copy
-/// over it fails with ETXTBSY ("Text file busy").
+/// Atomic swap: stage beside the target, set the exec bit, rename over it.
+///
+/// Unix: rename over a running binary succeeds (the live process keeps its
+/// inode); a plain copy over it fails with ETXTBSY ("Text file busy").
+///
+/// Windows: a running image cannot be renamed OVER, and the background updater
+/// is that image whenever it lands on its own path — every hook-spawned update
+/// since 0.13.0 staged the download and then died on "Access is denied", which
+/// the silent path swallowed. A running image CAN be renamed aside, so the swap
+/// is dest → dest.old, staged → dest, rolled back if the second rename fails.
+/// The .old cannot be deleted while it still runs; the next swap removes it.
 fn atomic_swap(new_bin: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -320,9 +328,75 @@ fn atomic_swap(new_bin: &Path, dest: &Path) -> Result<()> {
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
             .context("setting exec bit on staged binary")?;
     }
+    #[cfg(windows)]
+    if dest.exists() {
+        let old = aside_path(dest);
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(dest, &old).with_context(|| {
+            format!("moving the running {} aside to {}", dest.display(), old.display())
+        })?;
+        if let Err(e) = std::fs::rename(&staged, dest) {
+            let _ = std::fs::rename(&old, dest);
+            return Err(e).with_context(|| {
+                format!("atomic rename {} → {}", staged.display(), dest.display())
+            });
+        }
+        return Ok(());
+    }
     std::fs::rename(&staged, dest)
         .with_context(|| format!("atomic rename {} → {}", staged.display(), dest.display()))?;
     Ok(())
+}
+
+/// Where a running Windows image is parked during a swap: `base.exe` →
+/// `base.exe.old`, an extensionless `base` → `base.old`.
+#[cfg(any(windows, test))]
+fn aside_path(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "base".to_string());
+    dest.with_file_name(format!("{name}.old"))
+}
+
+/// Some Windows machines keep two copies side by side: `base.exe` for cmd,
+/// PowerShell and the hooks, and an extensionless `base` that Git Bash
+/// resolves. Only one of them is the running updater, so after the running one
+/// is swapped, bring the other up to the same binary. No sibling: nothing to do.
+#[cfg(windows)]
+fn refresh_sibling(new_bin: &Path, dest: &Path) -> Option<PathBuf> {
+    let name = dest.file_name()?.to_string_lossy().into_owned();
+    let sibling_name = match name.strip_suffix(".exe") {
+        Some(stem) => stem.to_string(),
+        None => format!("{name}.exe"),
+    };
+    let sibling = dest.with_file_name(sibling_name);
+    if !sibling.is_file() {
+        return None;
+    }
+    atomic_swap(new_bin, &sibling).ok().map(|_| sibling)
+}
+
+#[cfg(not(windows))]
+fn refresh_sibling(_new_bin: &Path, _dest: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// One line per outcome that matters, appended to `~/.base-gbl/update.log`: a
+/// swap, or a failure. An up-to-date no-op is not logged — that would be a
+/// line per session start. This is the only trace the silent path leaves.
+fn log_outcome(line: &str) {
+    let Some(home) = crate::home::home_root() else {
+        return;
+    };
+    let path = home.join(".base-gbl").join("update.log");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{} {line}", chrono::Local::now().to_rfc3339());
+    }
 }
 
 /// Marker for an in-flight background update. Without it, every session start
@@ -394,10 +468,21 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     if background {
         clear_inflight();
     }
-    out
+    let mode = if background { "background" } else { "manual" };
+    match &out {
+        Ok(Some(new_ver)) => log_outcome(&format!(
+            "updated {} -> {new_ver} ({mode})",
+            env!("CARGO_PKG_VERSION")
+        )),
+        Ok(None) => {}
+        Err(e) => log_outcome(&format!("failed ({mode}): {e:#}")),
+    }
+    out.map(|_| ())
 }
 
-fn run_inner(check_only: bool, force: bool, quiet: bool) -> Result<()> {
+/// `Ok(Some(version))` when a binary was swapped in, `Ok(None)` when there was
+/// nothing to do (already current, or `--check`).
+fn run_inner(check_only: bool, force: bool, quiet: bool) -> Result<Option<String>> {
     if quiet {
         return run_quiet(force);
     }
@@ -426,32 +511,34 @@ fn auto_install_dest() -> Result<PathBuf> {
 }
 
 /// The background path: no output, no ceremony, just get current.
-fn run_quiet(force: bool) -> Result<()> {
+fn run_quiet(force: bool) -> Result<Option<String>> {
     let current = env!("CARGO_PKG_VERSION");
     let (latest, url) = fetch_latest_release()?;
     if !force && is_current(current, &latest) {
-        return Ok(());
+        return Ok(None);
     }
     let work = std::env::temp_dir().join(format!("base-update-{}", std::process::id()));
     std::fs::create_dir_all(&work)?;
-    let outcome = (|| -> Result<()> {
+    let outcome = (|| -> Result<Option<String>> {
         let archive = download_asset(&url, &work)?;
         let new_bin = extract_and_locate(&archive, &work.join("x"))?;
         let new_ver = binary_version(&new_bin).unwrap_or_default();
         if !force && !new_ver.is_empty() && is_current(current, &new_ver) {
-            return Ok(());
+            return Ok(None);
         }
-        atomic_swap(&new_bin, &auto_install_dest()?)?;
+        let dest = auto_install_dest()?;
+        atomic_swap(&new_bin, &dest)?;
+        let _ = refresh_sibling(&new_bin, &dest);
         refresh_scripts(&work.join("x"));
         let skill_ver = if new_ver.is_empty() { latest.clone() } else { new_ver.clone() };
         refresh_skills(&skill_ver, crate::install::SkillReport::Silent);
-        Ok(())
+        Ok(Some(skill_ver))
     })();
     let _ = std::fs::remove_dir_all(&work);
     outcome
 }
 
-fn run_verbose(check_only: bool, force: bool) -> Result<()> {
+fn run_verbose(check_only: bool, force: bool) -> Result<Option<String>> {
     let current = env!("CARGO_PKG_VERSION");
     println!("base {current} — checking GitHub releases …");
 
@@ -459,17 +546,17 @@ fn run_verbose(check_only: bool, force: bool) -> Result<()> {
 
     if !force && is_current(current, &latest) {
         println!("✓ already up to date (base {current}).");
-        return Ok(());
+        return Ok(None);
     }
     println!("→ update available: {current} → {latest}");
     if check_only {
         println!("(--check) not installing.");
-        return Ok(());
+        return Ok(None);
     }
 
     let work = std::env::temp_dir().join(format!("base-update-{}", std::process::id()));
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
-    let outcome = (|| -> Result<()> {
+    let outcome = (|| -> Result<Option<String>> {
         let archive = download_asset(&url, &work)?;
         let new_bin = extract_and_locate(&archive, &work.join("x"))?;
 
@@ -478,7 +565,7 @@ fn run_verbose(check_only: bool, force: bool) -> Result<()> {
         let new_ver = binary_version(&new_bin).unwrap_or_default();
         if !force && !new_ver.is_empty() && is_current(current, &new_ver) {
             println!("✓ already running the latest base ({current}).");
-            return Ok(());
+            return Ok(None);
         }
 
         let dest = install_dest()?;
@@ -488,13 +575,16 @@ fn run_verbose(check_only: bool, force: bool) -> Result<()> {
         let skill_ver = if new_ver.is_empty() { latest.clone() } else { new_ver.clone() };
         let shown = if new_ver.is_empty() { "(new)".to_string() } else { new_ver };
         println!("✓ updated: {} is now base {shown}", dest.display());
+        if let Some(sibling) = refresh_sibling(&new_bin, &dest) {
+            println!("✓ refreshed the side-by-side copy at {}", sibling.display());
+        }
         let n = refresh_scripts(&work.join("x"));
         if n > 0 {
             println!("✓ refreshed {n} shipped script file(s) in ~/.base-gbl/scripts/");
         }
         refresh_skills(&skill_ver, crate::install::SkillReport::Line);
         println!("  (hooks are unchanged — run `base install` if a release adds new ones.)");
-        Ok(())
+        Ok(Some(skill_ver))
     })();
     let _ = std::fs::remove_dir_all(&work);
     outcome
@@ -503,6 +593,52 @@ fn run_verbose(check_only: bool, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aside_path_appends_old_to_the_whole_file_name() {
+        assert_eq!(aside_path(Path::new("/u/bin/base.exe")).file_name().unwrap(), "base.exe.old");
+        assert_eq!(aside_path(Path::new("/home/u/.local/bin/base")).file_name().unwrap(), "base.old");
+    }
+
+    #[test]
+    fn atomic_swap_replaces_an_existing_dest_and_leaves_no_staging_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let new_bin = tmp.path().join("fresh");
+        let dest = tmp.path().join("bin").join(if cfg!(windows) { "base.exe" } else { "base" });
+        std::fs::write(&new_bin, b"new").unwrap();
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+
+        atomic_swap(&new_bin, &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert!(!dest.with_file_name(".base.update.new").exists(), "staging file must not linger");
+        if cfg!(windows) {
+            // The previous image is parked aside, never deleted out from under
+            // a process that may still be running it.
+            assert_eq!(std::fs::read(aside_path(&dest)).unwrap(), b"old");
+            // A second swap replaces the parked copy rather than failing on it.
+            std::fs::write(&new_bin, b"newer").unwrap();
+            atomic_swap(&new_bin, &dest).unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), b"newer");
+            assert_eq!(std::fs::read(aside_path(&dest)).unwrap(), b"new");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refresh_sibling_updates_the_extensionless_copy_and_only_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let new_bin = tmp.path().join("fresh");
+        std::fs::write(&new_bin, b"new").unwrap();
+        let exe = tmp.path().join("base.exe");
+        std::fs::write(&exe, b"new").unwrap();
+        assert!(refresh_sibling(&new_bin, &exe).is_none(), "no sibling, nothing to do");
+        let plain = tmp.path().join("base");
+        std::fs::write(&plain, b"old").unwrap();
+        assert_eq!(refresh_sibling(&new_bin, &exe), Some(plain.clone()));
+        assert_eq!(std::fs::read(&plain).unwrap(), b"new");
+    }
 
     #[test]
     fn semver_compares_numerically_not_lexically() {
