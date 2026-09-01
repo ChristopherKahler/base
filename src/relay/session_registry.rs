@@ -184,13 +184,20 @@ const WORDLIST: &[&str] = &[
 /// and keep its liveness fresh. Returns the session's primary title. Called from
 /// boundary hooks (session-start, prompt). Honors `BASE_NO_AUTONAME` to opt out.
 pub fn touch(session_id: &str, cwd: &Path) -> Option<String> {
+    touch_with(session_id, cwd, true)
+}
+
+/// `touch` with the auto-codename switchable: `auto_name = false` (the
+/// `[relay] enabled = false` setting) refreshes a title the session already
+/// holds and never draws one for it.
+pub fn touch_with(session_id: &str, cwd: &Path, auto_name: bool) -> Option<String> {
     if let Some(t) = titles_for(session_id).into_iter().next() {
         if should_heartbeat(session_id) {
             heartbeat(session_id);
         }
         return Some(t);
     }
-    if std::env::var_os("BASE_NO_AUTONAME").is_some() {
+    if !auto_name || std::env::var_os("BASE_NO_AUTONAME").is_some() {
         return None;
     }
     auto_register(session_id, cwd).ok()

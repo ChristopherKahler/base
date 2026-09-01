@@ -23,7 +23,7 @@ use std::process::Command;
 use crate::extension::{self, ExtensionDef};
 
 pub mod dist;
-mod paths;
+pub mod paths;
 pub mod scaffold;
 
 // ─── Reserved core command names ─────────────────────────────

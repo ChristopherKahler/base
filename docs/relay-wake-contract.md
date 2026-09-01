@@ -65,3 +65,22 @@ in-band block on `relay register` still prints; it is output, not context.
 | Hook emission (forced/throttled) | `src/hook/mod.rs::relay_task_tick` |
 | In-band arm on register + ping warning | `src/cli.rs` (RelayAction::Register / Ping) |
 | Board column | `src/relay/board.rs` |
+
+## Switching it off
+
+The contract is on by default; `[relay]` in `~/.base-gbl/base.toml` governs it:
+
+| Key | Default | Effect when `false` |
+|---|---|---|
+| `relay.enabled` | `true` | No auto-codename, no arming block. A session that runs `base relay register` itself still takes part. |
+| `relay.wake_nudge` | `true` | Titles and pings stay; the arming block is never injected. |
+
+`base config set relay.enabled false` / `base config set relay.wake_nudge false`.
+`BASE_NO_AUTONAME` and `BASE_NO_WAKE_NUDGE` are the per-process equivalents.
+
+Everything the contract touches is local: the inbox folder, the `.watching`
+sentinel, the `.watch-nudge` throttle and the `.status` line all live under
+`~/.base-gbl/.base/relay-inbox/<title>/`. The block names the operator from
+`base operator init`'s profile (or says "the operator"), says where it comes
+from and how to turn it off, and never asks the model to skip telling the
+operator anything.

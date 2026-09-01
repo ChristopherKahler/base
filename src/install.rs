@@ -87,6 +87,10 @@ pub fn run(
     println!("  1. Open a new Claude Code session");
     println!("  2. Type a prompt that matches a domain keyword");
     println!("  3. Verify rules inject from the graph\n");
+    println!("Relay (multi-session coordination) is on: each session gets a codename and a");
+    println!("hook-injected wake contract, all local to ~/.base-gbl/.base/relay-inbox/.");
+    println!("  base config set relay.enabled false      # turn it off");
+    println!("  base config set relay.wake_nudge false   # keep titles + pings, drop the arming block\n");
     if carl_json_path.is_none() {
         println!("Optional: migrate CARL decisions:");
         println!("  base install --carl ~/.carl/carl.json\n");
@@ -1030,8 +1034,19 @@ pub(crate) fn install_skills(
         print!("6. Install Claude skills ... ");
     }
 
-    let dest_root = home.join(".claude").join("skills");
+    let dest_root = installed_skills_dir(home);
     std::fs::create_dir_all(&dest_root)?;
+    // Issue #12: a `~/.claude/skills` that is a symlink into a version-controlled
+    // tree gets base's skills written straight through it. Say so, with the
+    // resolved target, rather than land an untracked directory in silence.
+    let symlink_note = skills_symlink(home, &dest_root).map(|(link, target)| {
+        format!(
+            "{} is a symlink → {}; bundled skills are written through it \
+             (set BASE_SKILLS_DIR to put them elsewhere)",
+            link.display(),
+            target.display()
+        )
+    });
     let local_root = match source {
         SkillSource::LocalThenTag => find_local_skills_dir(binary_path),
         SkillSource::TagOnly => None,
@@ -1070,10 +1085,16 @@ pub(crate) fn install_skills(
                     );
                 }
             }
+            if let Some(note) = &symlink_note {
+                println!("   · {note}");
+            }
         }
         SkillReport::Line => {
             for r in &results {
                 println!("✓ Claude skills: {r}");
+            }
+            if let Some(note) = &symlink_note {
+                println!("  ({note})");
             }
             // A failed refresh is worth one honest line, not a stack trace: the
             // binary swap already succeeded and that is the part that matters.
@@ -1083,6 +1104,36 @@ pub(crate) fn install_skills(
         }
     }
     Ok(())
+}
+
+/// Where bundled skills live: `$BASE_SKILLS_DIR` when set, else
+/// `~/.claude/skills`. Claude Code only loads skills from the latter, so the
+/// override is for setups that manage that directory themselves (issue #12: a
+/// symlink into a version-controlled tree) and link individual skills back in.
+pub(crate) fn installed_skills_dir(home: &Path) -> std::path::PathBuf {
+    std::env::var_os("BASE_SKILLS_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude").join("skills"))
+}
+
+/// The first symlink on the way into the skills dir — `~/.claude` (only when
+/// the skills dir sits under it) or the dir itself — with where it points.
+/// `None` when the path is made of real directories.
+fn skills_symlink(home: &Path, dest_root: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let claude = home.join(".claude");
+    let mut candidates = Vec::new();
+    if dest_root.starts_with(&claude) {
+        candidates.push(claude);
+    }
+    candidates.push(dest_root.to_path_buf());
+    candidates
+        .into_iter()
+        .find(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
+        .map(|link| {
+            let target = std::fs::read_link(&link).unwrap_or_else(|_| link.clone());
+            (link, target)
+        })
 }
 
 /// Stage a skill, then reconcile it against whatever is already installed.
@@ -1709,6 +1760,36 @@ mod tests {
         assert!(dirs_identical(&a, &b));
         std::fs::write(b.join("references").join("qa.md"), "different\n").unwrap();
         assert!(!dirs_identical(&a, &b), "a nested change must not read as identical");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skills_symlink_reports_a_linked_skills_dir_and_not_a_real_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let real = tmp.path().join("repo").join("skills");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let link = home.join(".claude").join("skills");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (l, t) = skills_symlink(&home, &link).expect("symlink must be reported");
+        assert_eq!(l, link);
+        assert_eq!(t, real);
+
+        let plain = tmp.path().join("plain");
+        let plain_skills = plain.join(".claude").join("skills");
+        std::fs::create_dir_all(&plain_skills).unwrap();
+        assert!(skills_symlink(&plain, &plain_skills).is_none());
+    }
+
+    #[test]
+    fn skills_dir_defaults_under_claude_home() {
+        let home = std::path::Path::new("/tmp/h");
+        // Only assert the default shape; the env override is read at call time
+        // and other tests in this binary must not see a leaked BASE_SKILLS_DIR.
+        if std::env::var_os("BASE_SKILLS_DIR").is_none() {
+            assert_eq!(installed_skills_dir(home), home.join(".claude").join("skills"));
+        }
     }
 
     #[test]

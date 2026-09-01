@@ -104,7 +104,7 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
             // Session-targeted task relay: refresh liveness + announce any tasks
             // assigned to this session (loud, re-announced on each new session).
             if let Some(sid) = session_id.as_deref()
-                && let Some(block) = relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::SessionStart, true)
+                && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::SessionStart, true)
             {
                 print!("{block}");
             }
@@ -119,7 +119,7 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
             // immediately so an autonomous run picks it up without waiting for
             // the next prompt.
             if let Some(sid) = session_id.as_deref()
-                && let Some(block) = relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::Tool, false)
+                && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Tool, false)
             {
                 context.push('\n');
                 context.push_str(&block);
@@ -165,7 +165,7 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
             }
             // Session-targeted task relay: refresh liveness + deliver assigned tasks.
             if let Some(sid) = session_id.as_deref()
-                && let Some(block) = relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::Prompt, true)
+                && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Prompt, true)
             {
                 print!("{block}");
             }
@@ -176,7 +176,7 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
             stop::handle(&config, &cwd)?;
             // End-of-turn nudge for any still-open relayed task (terse, throttled).
             if let Some(sid) = session_id.as_deref()
-                && let Some(block) = relay_task_tick(sid, &cwd, crate::relay::task_inbox::Phase::Stop, false)
+                && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Stop, false)
             {
                 print!("{block}");
             }
@@ -195,11 +195,14 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
 fn relay_task_tick(
     session_id: &str,
     cwd: &std::path::Path,
+    relay: &crate::config::RelayConfig,
     phase: crate::relay::task_inbox::Phase,
     boundary: bool,
 ) -> Option<String> {
     if boundary {
-        let _ = crate::relay::session_registry::touch(session_id, cwd);
+        // `[relay] enabled = false` stops the auto-codename; a session that
+        // registered itself still keeps its liveness fresh.
+        let _ = crate::relay::session_registry::touch_with(session_id, cwd, relay.enabled);
     }
     let delivered = crate::relay::task_inbox::deliver(session_id, phase);
     // Star commands inside relayed pings resolve exactly like typed prompts
@@ -222,8 +225,11 @@ fn relay_task_tick(
     // Wake contract: any of this session's titles with a stale .watching
     // sentinel gets its Monitor arming block re-injected — forced at
     // session-start, throttled mid-turn. Stop is excluded: arming belongs at
-    // starts of activity, not turn ends.
-    let wake = (!matches!(phase, crate::relay::task_inbox::Phase::Stop))
+    // starts of activity, not turn ends. `[relay] wake_nudge = false` (or
+    // `enabled = false`) never injects it.
+    let wake = (relay.enabled
+        && relay.wake_nudge
+        && !matches!(phase, crate::relay::task_inbox::Phase::Stop))
         .then(|| {
             crate::relay::wake::arm_blocks_for(
                 session_id,
