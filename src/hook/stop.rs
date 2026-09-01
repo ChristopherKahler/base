@@ -2,9 +2,13 @@
 //! live by spawning a backgrounded `base sync --ast` for the cwd's app.
 //!
 //! Three guards keep this cheap and safe:
-//!   1. Opt-in — only apps already mapped once (`.base-ast/ast.ttl` exists) are
-//!      auto-refreshed, so a Stop in a never-mapped dir (or the workspace root,
-//!      which trips the file-count threshold) does nothing.
+//!   1. Never the home directory — an app root that IS the operator's home
+//!      would map every project on the machine into one file, so it is the
+//!      one root no hook ever syncs. Every other app root gets a map the first
+//!      time a session opens in it or a turn edits it (Chris, 2026-09-01:
+//!      "it should make a map every time an app is started, period"); before
+//!      0.13.9 this was opt-in and a new project stayed unmapped until someone
+//!      ran `base sync --ast` by hand.
 //!   2. Debounced — at most one refresh per `DEBOUNCE_SECS`, so rapid turns
 //!      don't pile up overlapping syncs.
 //!   3. Detached — the sync is spawned and never waited on, so the turn never
@@ -52,7 +56,7 @@ pub fn handle(_config: &BaseConfig, cwd: &Path) -> anyhow::Result<()> {
     // instead of being silently dropped.
     let mut requeue: Vec<String> = Vec::new();
     for root in &roots {
-        if !refresh_app(root) && root.join(".base-ast").join("ast.ttl").is_file()
+        if ensure_app_map(root) == MapPlan::Debounced
             && let Some(s) = root.to_str()
         {
             requeue.push(s.to_string());
@@ -74,22 +78,54 @@ pub fn handle(_config: &BaseConfig, cwd: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Refresh one app's AST map (opt-in + debounced). Returns true if a sync was
-/// spawned, false if skipped (not mapped, or within the debounce window).
-fn refresh_app(root: &Path) -> bool {
-    let base_ast = root.join(".base-ast");
-    let ttl = base_ast.join("ast.ttl");
-    if !ttl.is_file() {
-        return false; // opt-in: only keep already-mapped apps fresh
-    }
-    let marker = base_ast.join(".last-sync");
-    if recently_synced(&marker) {
-        return false;
-    }
-    let _ = std::fs::write(&marker, b"");
-    spawn_sync(root);
-    true
+/// What a hook does about an app root's code map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapPlan {
+    /// The root is the operator's home directory: never mapped by a hook.
+    SkipHome,
+    /// A sync ran within the debounce window; the caller may requeue.
+    Debounced,
+    /// No `.base-ast/ast.ttl` yet: build the first map, registered.
+    Build,
+    /// A map exists: refresh it in the background, unregistered.
+    Refresh,
 }
+
+/// The decision, with every input explicit so it can be tested without a
+/// filesystem: `home` is the operator's home, `mapped` whether `ast.ttl`
+/// exists, `debounced` whether `.last-sync` is fresher than the window.
+pub fn plan_map(root: &Path, home: Option<&Path>, mapped: bool, debounced: bool) -> MapPlan {
+    if home.is_some_and(|h| h == root) {
+        return MapPlan::SkipHome;
+    }
+    if debounced {
+        return MapPlan::Debounced;
+    }
+    if mapped { MapPlan::Refresh } else { MapPlan::Build }
+}
+
+/// Make sure `root` has a code map and that it is fresh: build it on first
+/// contact, refresh it afterwards, debounced, never for the home directory.
+/// Returns what was decided; `Build` and `Refresh` mean a detached sync is
+/// now running. Used by session-start (first contact with an app) and by the
+/// Stop hook (apps edited this turn).
+pub fn ensure_app_map(root: &Path) -> MapPlan {
+    let base_ast = root.join(".base-ast");
+    let mapped = base_ast.join("ast.ttl").is_file();
+    let marker = base_ast.join(".last-sync");
+    let home = crate::home::real_home();
+    let plan = plan_map(root, home.as_deref(), mapped, recently_synced(&marker));
+    match plan {
+        MapPlan::Build | MapPlan::Refresh => {
+            let _ = std::fs::create_dir_all(&base_ast);
+            let _ = std::fs::write(&marker, b"");
+            spawn_sync(root, plan == MapPlan::Build);
+        }
+        MapPlan::SkipHome | MapPlan::Debounced => {}
+    }
+    plan
+}
+
 
 /// True if a refresh ran within the debounce window — skip this one.
 fn recently_synced(marker: &Path) -> bool {
@@ -102,18 +138,22 @@ fn recently_synced(marker: &Path) -> bool {
 }
 
 /// Spawn a detached, backgrounded per-app AST sync. Never waited on.
-fn spawn_sync(app_root: &Path) {
+/// `register` is true for a FIRST map, so it lands in `base ast list`; a
+/// background refresh skips the workspace-graph registration write so
+/// frequent turns don't churn graph.nq.
+fn spawn_sync(app_root: &Path, register: bool) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let _ = Command::new(exe)
-        .arg("sync")
+    let mut cmd = Command::new(exe);
+    cmd.arg("sync")
         .arg("--ast")
         .arg("--target")
-        .arg(app_root)
-        // Background refresh only touches the ttl — skip the workspace-graph
-        // registration write so frequent turns don't churn graph.nq.
-        .env("BASE_AST_SKIP_REGISTER", "1")
+        .arg(app_root);
+    if !register {
+        cmd.env("BASE_AST_SKIP_REGISTER", "1");
+    }
+    let _ = cmd
         .current_dir(app_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
