@@ -11,10 +11,13 @@ The user typed `/base-help $ARGUMENTS` (or asked a base question). They want to 
 
 Their question: **$ARGUMENTS**
 
-This skill is portable and contains **no machine-specific facts**. Machine state lives in a local profile; universal knowledge lives in two reference files next to this one:
+This skill is portable and contains **no machine-specific facts**. Machine state lives in a local profile; universal knowledge lives in three reference files next to this one:
 
-- `${CLAUDE_SKILL_DIR}/references/qa.md`: 176 verified Q&A pairs, the primary answer source (the count grows whenever the close-the-loop rule below appends one)
-- `${CLAUDE_SKILL_DIR}/references/commands.md`: exact command syntax, flags, destructive list
+- `${CLAUDE_SKILL_DIR}/references/qa.md`: 179 verified Q&A pairs, the primary answer source (the count grows whenever the close-the-loop rule below appends one)
+- `${CLAUDE_SKILL_DIR}/references/commands.md`: the command surface grouped by safety class (read-only, mutating, destructive), aliases, flag gotchas
+- `${CLAUDE_SKILL_DIR}/references/cli.md`: the verbatim `--help` of every subcommand, generated from the binary at each release; the authority for an exact flag
+
+All three are stamped to a base release and the stamp is enforced by the base repo's test suite, so when the stamp matches `base --version` every flag in them is real.
 
 ## STEP 0: local profile (do this first, silently)
 
@@ -37,8 +40,8 @@ Try 2-3 keyword variants (the user's words, plus the base term for the concept: 
 
 - **Bank hit + universal question** → answer from the pair directly, in coach format (below). Near-instant, no searching.
 - **Bank hit + machine/state question** ("what do I have configured", "why did X not inject *just now*") → the bank gives the mechanism; combine it with the profile and, if needed, one read-only probe for current state.
-- **Bank miss, or installed version differs from the bank's stamp** → verify live: `base help <sub>`, `base commands show <name>`, `references/commands.md`, or the source checkout recorded in the profile. Then close the loop (below).
-- **Exact syntax questions** → `references/commands.md` is faster than the bank.
+- **Bank miss, or installed version differs from the bank's stamp** → verify live: `base help <sub>`, `base commands show <name>`, `references/cli.md`, or the source checkout recorded in the profile. Then close the loop (below).
+- **Exact syntax questions** → `references/cli.md` (the binary's own `--help`, grep for `## base <sub>`) is faster than the bank; `references/commands.md` says whether the command is safe to run.
 
 Trust order when they disagree: live CLI output > source code > qa.md > memory. If the bank is wrong, fix the pair, don't just answer around it.
 

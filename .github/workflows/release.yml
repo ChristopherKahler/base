@@ -9,7 +9,20 @@ permissions:
   contents: write
 
 jobs:
+  # The base-help coach is fetched from this tag by every `base update`, so a
+  # tag whose coach lags the binary ships stale documentation to every machine.
+  # src/help_docs.rs holds the coach to the CLI; refuse to build if it fails.
+  docs-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: base-help coach matches this binary
+        run: cargo test --bin base help_docs
+
   build:
+    needs: docs-gate
     strategy:
       matrix:
         include:
