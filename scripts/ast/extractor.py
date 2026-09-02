@@ -7826,6 +7826,12 @@ def extract(
     }
 
 
+def _is_app_root(d: Path) -> bool:
+    """A folder that is an app on its own: a repo (or submodule gitlink), a
+    PAUL project, or one that already carries a code map."""
+    return (d / ".git").exists() or (d / ".paul").is_dir() or (d / ".base-ast").is_dir()
+
+
 def _git_kept(target: Path) -> set[Path] | None:
     """The files git keeps under `target`: tracked, plus untracked that no
     .gitignore excludes. None outside a git work tree, or when git is missing
@@ -7881,14 +7887,22 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
             return True
         return bool(patterns and _is_ignored(p, ignore_root, patterns))
 
+    def _keep_dir(parent: Path, name: str) -> bool:
+        # Noise dirs never; a subfolder that is an app of its own (.git, .paul,
+        # .base-ast) never — it maps itself, the parent never swallows it. Git
+        # already lists a nested repo as one entry; this is the same rule for
+        # a parent that is not a repo (a .paul workspace holding two apps).
+        return not _is_noise_dir(name) and not _is_app_root(parent / name)
+
     if not follow_symlinks:
         results: list[Path] = []
-        for ext in sorted(_EXTENSIONS):
-            results.extend(
-                p for p in target.rglob(f"*{ext}")
-                if not any(_is_noise_dir(part) for part in p.parts)
-                and not _ignored(p)
-            )
+        for dirpath, dirnames, filenames in os.walk(target):
+            dp = Path(dirpath)
+            dirnames[:] = [d for d in dirnames if _keep_dir(dp, d)]
+            for fname in filenames:
+                p = dp / fname
+                if p.suffix in _EXTENSIONS and not _ignored(p):
+                    results.append(p)
         return sorted(results)
     # Walk with symlink following + cycle detection
     results = []
@@ -7900,7 +7914,7 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
                 dirnames.clear()
                 continue
         dp = Path(dirpath)
-        dirnames[:] = [d for d in dirnames if not _is_noise_dir(d)]
+        dirnames[:] = [d for d in dirnames if _keep_dir(dp, d)]
         for fname in filenames:
             p = dp / fname
             if p.suffix in _EXTENSIONS and not _ignored(p):

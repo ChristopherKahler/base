@@ -11,16 +11,24 @@
 //!     marks it yet (a folder of source files nobody has `git init`ed is still
 //!     an app: adopting it creates `.base-ast/`, which marks it from then on);
 //!   * pre-tool-use — the first Read / Edit / Write / Grep of a file inside an
-//!     app that has no map, whatever the session's cwd;
+//!     app that has no map, whatever the session's cwd — and the first Bash
+//!     command that `cd`s into one or names a path inside one, because a
+//!     session booted in a workspace navigates with the shell;
+//!   * a Windows session reaching a WSL tree through `wsl …` hands the same
+//!     check to the WSL base (`base ast ensure`), since no Windows hook can
+//!     see a Linux path;
 //!   * Stop — the cwd's app and every app edited this turn, refreshed;
 //!   * `base scaffold` and `base project add --path` — the folder they just
 //!     registered.
 //!
 //! What a hook never maps: the home directory, a filesystem root, the
 //! well-known user folders (Desktop, Documents, Downloads, a cloud-drive root),
-//! and a folder that only HOLDS apps — a `.base` workspace whose children are
-//! the repos. Mapping one of those walks every project on the machine into a
-//! single file, which is the one failure worse than a missing map.
+//! and a folder that only HOLDS apps — a `.base` workspace whose repos sit one
+//! or two levels down (`~/ops-sys/toolbox` keeps fifty under `frameworks/`,
+//! `apps/`, …). Mapping one of those walks every project on the machine into
+//! a single file, which is the one failure worse than a missing map. A marked
+//! app that contains other marked apps maps only its own tree: the extractor
+//! skips any subfolder carrying `.git`, `.paul` or `.base-ast`.
 //!
 //! Every build is detached and debounced; a hook never waits. An unattended
 //! build never stops to ask about the file-count threshold (`base sync --ast
@@ -108,11 +116,18 @@ pub fn ensure_app_map(root: &Path) -> MapPlan {
     let mapped = base_ast.join("ast.ttl").is_file();
     let marker = base_ast.join(".last-sync");
     let home = crate::home::real_home();
-    let plan = plan_map(root, home.as_deref(), mapped, recently_synced(&marker));
+    // One build at a time per app: a 13,000-file tree takes minutes, and
+    // session-start, first contact and Stop all arrive inside that window.
+    // `.building` is written before the spawn and removed by `base sync`
+    // when it finishes, success or failure; a lock older than BUILD_LOCK_SECS
+    // is a crashed build and no longer counts.
+    let building = recently(&base_ast.join(".building"), BUILD_LOCK_SECS);
+    let plan = plan_map(root, home.as_deref(), mapped, building || recently_synced(&marker));
     match plan {
         MapPlan::Build | MapPlan::Refresh => {
             let _ = std::fs::create_dir_all(&base_ast);
             let _ = std::fs::write(&marker, b"");
+            let _ = std::fs::write(base_ast.join(".building"), b"");
             spawn_sync(root, plan == MapPlan::Build);
         }
         MapPlan::SkipHome | MapPlan::SkipHub | MapPlan::Debounced => {}
@@ -268,15 +283,242 @@ fn is_marked(dir: &Path) -> bool {
     has_strong_marker(dir) || dir.join(".base").is_dir()
 }
 
-/// A direct child of `dir` is itself a marked folder.
+/// A marked folder sits within two levels below `dir`. Two, not one: a
+/// workspace usually groups its repos (`frameworks/x`, `apps/y`), and a probe
+/// that only saw direct children called `~/ops-sys/toolbox` an app the moment
+/// its one directly-marked child went away. Bounded like the code probe.
 pub fn has_child_apps(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
+    holds_apps(dir, HUB_DEPTH)
+}
+
+const HUB_DEPTH: usize = 2;
+
+fn holds_apps(dir: &Path, depth: usize) -> bool {
+    let mut seen = 0usize;
+    let mut stack: Vec<(PathBuf, usize)> = vec![(dir.to_path_buf(), 0)];
+    while let Some((d, lvl)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > PROBE_ENTRIES {
+                return false;
+            }
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            if is_marked(&path) {
+                return true;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if lvl + 1 < depth && !name.starts_with('.') && !NOISE_DIRS.contains(&name.as_ref()) {
+                stack.push((path, lvl + 1));
+            }
+        }
+    }
+    false
+}
+
+/// First contact through any path: the app that contains `path` gets a map
+/// if it has none. `None` when the path is in no app or the app is mapped.
+pub fn first_contact(path: &Path) -> Option<MapPlan> {
+    let root = crate::config::ast_app_root(path)?;
+    ensure_first_map(&root)
+}
+
+/// First contact that builds in the FOREGROUND and returns when the map has
+/// landed. For a caller whose process must outlive the build: a `wsl -e sh`
+/// invocation from Windows ends the moment its shell exits and takes every
+/// detached child with it, so a delegated build has to run inside it.
+/// Same decisions as [`first_contact`]; only the spawn differs.
+pub fn first_contact_wait(path: &Path) -> Option<MapPlan> {
+    let root = crate::config::ast_app_root(path)?;
+    let base_ast = root.join(".base-ast");
+    if base_ast.join("ast.ttl").is_file() {
+        return None;
+    }
+    if is_workspace_hub(&root) {
+        return Some(MapPlan::SkipHub);
+    }
+    let home = crate::home::real_home();
+    if recently(&base_ast.join(".building"), BUILD_LOCK_SECS) {
+        return Some(MapPlan::Debounced);
+    }
+    let plan = plan_map(&root, home.as_deref(), false, false);
+    if plan != MapPlan::Build {
+        return Some(plan);
+    }
+    let _ = std::fs::create_dir_all(&base_ast);
+    let _ = std::fs::write(base_ast.join(".last-sync"), b"");
+    let _ = std::fs::write(base_ast.join(".building"), b"");
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = Command::new(exe)
+            .arg("sync").arg("--ast").arg("--yes").arg("--target").arg(&root)
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    Some(MapPlan::Build)
+}
+
+/// The paths a Bash command touches, as far as text can tell: `cd` targets
+/// (which also re-base what follows them), and every token that looks like a
+/// path. Pure — the caller keeps the ones that exist. `~` is `home`; a Git
+/// Bash `/c/…` becomes `C:/…` on Windows; relative tokens resolve against the
+/// last `cd` in the command, else `cwd`.
+pub fn bash_paths(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    const MAX_TOKENS: usize = 48;
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut base = cwd.to_path_buf();
+    let mut seen = 0usize;
+    for segment in command.split(|c| c == ';' || c == '\n' || c == '|' || c == '&') {
+        let mut tokens = segment.split_whitespace().map(|t| t.trim_matches(|c| c == '"' || c == '\'' || c == '(' || c == ')'));
+        let mut first = tokens.next();
+        // skip leading env assignments: FOO=bar cmd …
+        while first.is_some_and(|t| t.contains('=') && !t.starts_with('-') && !t.contains('/')) {
+            first = tokens.next();
+        }
+        let Some(first) = first else { continue };
+        let rest: Vec<&str> = tokens.collect();
+        if first == "cd" || first == "pushd" {
+            if let Some(target) = rest.first().and_then(|t| resolve_token(t, &base, home)) {
+                base = target.clone();
+                push_unique(&mut out, target);
+            }
+            continue;
+        }
+        for tok in std::iter::once(first).chain(rest) {
+            seen += 1;
+            if seen > MAX_TOKENS {
+                return out;
+            }
+            if let Some(p) = resolve_token(tok, &base, home) {
+                push_unique(&mut out, p);
+            }
+        }
+    }
+    out
+}
+
+fn push_unique(out: &mut Vec<PathBuf>, p: PathBuf) {
+    if !out.contains(&p) {
+        out.push(p);
+    }
+}
+
+/// A token that reads as a path, resolved; flags, globs, variables and URLs
+/// are not paths.
+fn resolve_token(tok: &str, base: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let t = tok.trim_end_matches(|c| c == ',' || c == ':');
+    if t.is_empty() || t.starts_with('-') || t.contains("://") || t.contains(['*', '$', '{', '`']) {
+        return None;
+    }
+    let looks_like_path = t.contains('/') || t.contains('\\') || t == "." || t == ".." || t.starts_with('~');
+    if !looks_like_path {
+        return None;
+    }
+    if t == "~" || t.starts_with("~/") {
+        return home.map(|h| h.join(t.trim_start_matches('~').trim_start_matches('/')));
+    }
+    // Git Bash spells C:\ as /c/ — a Windows binary must see the drive.
+    if cfg!(windows)
+        && let Some(rest) = t.strip_prefix('/')
+        && let Some((drive, tail)) = rest.split_once('/')
+        && drive.len() == 1
+        && drive.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return Some(PathBuf::from(format!("{}:/{}", drive.to_ascii_uppercase(), tail)));
+    }
+    let p = Path::new(t);
+    Some(if p.is_absolute() { p.to_path_buf() } else { base.join(p) })
+}
+
+/// Linux-side paths named in a command that runs through `wsl`: what a
+/// Windows session hands to the WSL base for its own first-contact check.
+pub fn linux_paths(command: &str) -> Vec<String> {
+    const MAX: usize = 8;
+    let mut out: Vec<String> = Vec::new();
+    if !command.split_whitespace().any(|t| t.trim_matches('"') == "wsl" || t.ends_with("wsl.exe")) {
+        return out;
+    }
+    for raw in command.split(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&' || c == '(' || c == ')' || c == '"' || c == '\'') {
+        let t = raw.trim_end_matches(|c| c == ',' || c == ':');
+        if (t.starts_with("~/") || t.starts_with("/home/") || t.starts_with("/mnt/")) && !t.contains(['*', '$', '{', '`']) {
+            let s = t.to_string();
+            if !out.contains(&s) {
+                out.push(s);
+                if out.len() == MAX {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Windows only: ask the WSL base to give each Linux path's app a map if it
+/// has none. Detached, one `wsl` process per path, and a path is asked about
+/// at most once per `WSL_CONTACT_SECS` (a marker under `~/.base-gbl/`), so a
+/// session full of `wsl` commands costs nothing after the first.
+pub fn delegate_wsl_contact(paths: &[String]) {
+    if !cfg!(windows) || paths.is_empty() || std::env::var_os(NO_SPAWN_ENV).is_some() {
+        return;
+    }
+    let Some(dir) = crate::home::home_root().map(|h| h.join(".base-gbl").join(".wsl-contact")) else {
+        return;
     };
-    entries
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .any(|e| is_marked(&e.path()))
+    let _ = std::fs::create_dir_all(&dir);
+    for p in paths {
+        let marker = dir.join(fingerprint(p));
+        if recently(&marker, WSL_CONTACT_SECS) {
+            continue;
+        }
+        let _ = std::fs::write(&marker, p.as_bytes());
+        let script = wsl_script(p);
+        let _ = Command::new("wsl")
+            .args(["-e", "sh", "-lc", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+const WSL_CONTACT_SECS: u64 = 600;
+
+/// The one-liner the WSL shell runs for a Linux path. `~/x` must reach the
+/// shell as `"$HOME/x"` — inside single quotes a tilde is a tilde, and the
+/// WSL base would be asked about a folder that does not exist.
+pub fn wsl_script(path: &str) -> String {
+    let quoted = match path.strip_prefix("~/") {
+        Some(rest) => format!("\"$HOME/{}\"", rest.replace(['"', '$', '`'], "")),
+        None => format!("'{}'", path.replace('\u{27}', "")),
+    };
+    format!("b=\"$HOME/.local/bin/base\"; [ -x \"$b\" ] || b=base; \"$b\" ast ensure --wait {quoted} >/dev/null 2>&1")
+}
+
+/// A `.building` lock older than this is a crashed build, not a running one.
+const BUILD_LOCK_SECS: u64 = 30 * 60;
+
+fn fingerprint(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+fn recently(marker: &Path, secs: u64) -> bool {
+    std::fs::metadata(marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|e| e < Duration::from_secs(secs))
+        .unwrap_or(false)
 }
 
 /// The deepest folder at or above `start`, stopping BEFORE home, for which

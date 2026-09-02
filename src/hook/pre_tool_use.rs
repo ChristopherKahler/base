@@ -52,6 +52,24 @@ pub fn handle(
         output.push('\n');
     }
 
+    // ─── Bash first contact ──────────────────────────────────
+    // A session booted in a workspace navigates with the shell: `cd app &&
+    // cat src/x` names paths the tool_input never does. Existing paths in
+    // the command (and cd targets) are contact; a `wsl …` command from
+    // Windows hands the same check to the WSL base, which alone can see
+    // a Linux path.
+    if event.get("tool_name").and_then(|v| v.as_str()) == Some("Bash")
+        && let Some(cmd) = event.get("tool_input").and_then(|t| t.get("command")).and_then(|v| v.as_str())
+    {
+        let home = crate::home::home_root();
+        for p in crate::hook::automap::bash_paths(cmd, cwd, home.as_deref()) {
+            if p.exists() {
+                crate::hook::automap::first_contact(&p);
+            }
+        }
+        crate::hook::automap::delegate_wsl_contact(&crate::hook::automap::linux_paths(cmd));
+    }
+
     // ─── Domain rule injection (file path match) ─────────────
     let file_paths = extract_file_paths(event);
     if !file_paths.is_empty() {

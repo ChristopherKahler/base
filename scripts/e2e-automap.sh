@@ -8,7 +8,7 @@ fails=0
 pass() { echo "PASS $1"; }
 fail() { echo "FAIL $1"; fails=$((fails+1)); }
 
-rm -rf "$ROOT"; mkdir -p "$ROOT/.base" "$ROOT/home/.base-gbl/scripts/ast" "$ROOT/home/.claude" "$ROOT/home/dev"
+rm -rf "$ROOT"; mkdir -p "$ROOT/home/.base" "$ROOT/home/.base-gbl/scripts/ast" "$ROOT/home/.claude" "$ROOT/home/dev"
 H="$ROOT/home"
 cp "$REPO"/scripts/ast/*.py "$H/.base-gbl/scripts/ast/"
 printf '[update]\nauto = false\n\n[relay]\nenabled = false\n' > "$H/.base-gbl/base.toml"
@@ -21,6 +21,9 @@ else
   PYLESS_PATH="$(dirname "$BIN"):/nonexistent"
 fi
 export BASE_HOME="$(winp "$H")"
+# hooks write under the workspace tier of their PROCESS cwd; the scratch home carries that
+# tier (like a real home does), so every write stays inside BASE_HOME and off the real tiers
+cd "$H"
 
 # hook <event> <cwd> [session] [extra-json]
 hook() {
@@ -117,6 +120,51 @@ out=$(hook session-start "$Hn" e2e-h)
 printf 'def newborn():\n    pass\n' > "$Hn/main.py"
 hook stop "$Hn" e2e-h >/dev/null
 wait_map "$Hn" && pass "H2 Stop adopted the folder once code existed" || fail "H2 Stop did not adopt"
+
+# I. a .base workspace whose repos sit two levels down is a hub, never mapped
+I="$H/dev/toolbox"; mkdir -p "$I/.base" "$I/frameworks/kit"; git -C "$I/frameworks/kit" init -q; printf 'def loose():\n    pass\n' > "$I/loose.py"
+out=$(hook session-start "$I"); hook stop "$I" >/dev/null; sleep 3
+[ -e "$I/.base-ast" ] && fail "I1 two-level hub mapped as one app" || pass "I1 repos two levels down make a hub"
+
+# J. a marked parent (.paul, no git) maps only its own tree; nested apps map themselves
+J="$H/dev/parent"; mkdir -p "$J/.paul" "$J/src" "$J/child/src"; printf 'def parent_fn():\n    pass\n' > "$J/src/main.py"; git -C "$J/child" init -q; printf 'def child_fn():\n    pass\n' > "$J/child/src/c.py"
+out=$(hook session-start "$J"); wait_map "$J" && pass "J1 parent mapped" || fail "J1 parent not mapped"
+grep -q "parent_fn" "$J/.base-ast/ast.ttl" && pass "J2 parent map has its own code" || fail "J2 parent code missing"
+grep -q "child_fn" "$J/.base-ast/ast.ttl" && fail "J3 parent swallowed the nested app" || pass "J3 nested app left to itself"
+
+# K. Bash-only navigation from a workspace boot is first contact
+K="$H/dev/bashonly"; mkapp "$K"
+hook pre-tool-use "$H" e2e-k ",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cd $(winp "$K") && cat src/main.py | head -3\"}" >/dev/null
+wait_map "$K" && pass "K1 'cd app && cat' built the map" || fail "K1 bash contact did nothing"
+K2="$H/dev/bashabs"; mkapp "$K2"
+hook pre-tool-use "$H" e2e-k2 ",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"sed -n 1,5p $(winp "$K2/src/main.py")\"}" >/dev/null
+wait_map "$K2" && pass "K2 an absolute path in a command built the map" || fail "K2 absolute path contact did nothing"
+
+# L. the hook event log records the cwd the host sent
+grep -q '"cwd":"' "$H/.base/hook-events.jsonl" 2>/dev/null && pass "L1 hook events carry cwd" || fail "L1 no cwd in hook events"
+
+# M. what Claude RECEIVES: one map block per file, from the deepest app only, never twice
+#    (parent J is a .paul app with nested repo child; both mapped above)
+wait_map "$J/child" 5 || hook pre-tool-use "$H" e2e-m0 ",\"tool_name\":\"Read\",\"tool_input\":{\"file_path\":\"$(winp "$J/child/src/c.py")\"}" >/dev/null
+wait_map "$J/child" && pass "M0 nested app mapped on its own" || fail "M0 nested app never mapped"
+inj=$(hook pre-tool-use "$H" e2e-m1 ",\"tool_name\":\"Read\",\"tool_input\":{\"file_path\":\"$(winp "$J/child/src/c.py")\"}")
+n=$(printf '%s' "$inj" | grep -o '\[AST\] [^ ]*' | wc -l)
+[ "$n" = "1" ] && pass "M1 exactly one [AST] block for a nested-app file" || fail "M1 $n [AST] blocks: $(printf '%s' "$inj" | cut -c1-200)"
+printf '%s' "$inj" | grep -q "child_fn" && pass "M2 the block comes from the nested app's own map" || fail "M2 nested entity missing: $(printf '%s' "$inj" | cut -c1-200)"
+printf '%s' "$inj" | grep -q "parent_fn" && fail "M3 parent entities leaked into the nested file's block" || pass "M3 no parent entities in it"
+inj2=$(hook pre-tool-use "$H" e2e-m1 ",\"tool_name\":\"Read\",\"tool_input\":{\"file_path\":\"$(winp "$J/child/src/c.py")\"}")
+printf '%s' "$inj2" | grep -q '\[AST\]' && fail "M4 same file, same session: injected twice" || pass "M4 second Read of an unchanged file injects nothing"
+inj3=$(hook pre-tool-use "$H" e2e-m2 ",\"tool_name\":\"Read\",\"tool_input\":{\"file_path\":\"$(winp "$J/src/main.py")\"}")
+printf '%s' "$inj3" | grep -q "parent_fn" && pass "M5 a parent file gets the parent's map" || fail "M5 parent map missing: $(printf '%s' "$inj3" | cut -c1-200)"
+printf '%s' "$inj3" | grep -q "child_fn" && fail "M6 nested entities leaked into the parent's block" || pass "M6 no nested entities in the parent's block"
+
+# N. one build at a time: a live .building lock holds session-start off; released, it builds
+N="$H/dev/locked"; mkapp "$N"; mkdir -p "$N/.base-ast"; : > "$N/.base-ast/.building"
+out=$(hook session-start "$N"); sleep 6
+[ -s "$N/.base-ast/ast.ttl" ] && fail "N1 built despite a live .building lock" || pass "N1 a live build lock holds the next build off"
+rm -f "$N/.base-ast/.building"; out=$(hook session-start "$N")
+wait_map "$N" && pass "N2 lock released → built" || fail "N2 no build after lock release"
+[ -f "$N/.base-ast/.building" ] && fail "N3 lock not released after the build" || pass "N3 sync releases the lock when done"
 
 echo "== failures: $fails"
 exit "$fails"

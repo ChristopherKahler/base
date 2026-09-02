@@ -8,9 +8,9 @@
 //! project never mapped it, and a `.base` workspace of repos could be mapped
 //! as one giant app.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use base::hook::automap::{ensure_first_map, plan_root, session_root, RootFacts, RootPlan};
+use base::hook::automap::{bash_paths, ensure_first_map, linux_paths, plan_root, session_root, wsl_script, RootFacts, RootPlan};
 use base::hook::stop::{plan_map, MapPlan};
 
 #[test]
@@ -120,6 +120,25 @@ fn first_contact_on_disk_adopts_a_bare_folder_once() {
         assert_eq!(session_root(&app), RootPlan::Marked(app.clone()));
         assert_eq!(ensure_first_map(&app), Some(MapPlan::Debounced));
 
+        // A build in flight holds every later caller off, even after the
+        // 20 s debounce has passed — the lock, not the marker, is the guard.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let touch_old = |p: &Path| {
+            let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.set_modified(old).unwrap();
+        };
+        touch_old(&app.join(".base-ast").join(".last-sync"));
+        assert_eq!(ensure_first_map(&app), Some(MapPlan::Debounced), ".building holds the second build off");
+        std::fs::remove_file(app.join(".base-ast").join(".building")).unwrap();
+        assert_eq!(ensure_first_map(&app), Some(MapPlan::Build), "lock released → the next build may start");
+        assert!(app.join(".base-ast").join(".building").is_file(), "…and takes the lock");
+        // A stale lock (crashed build) no longer counts.
+        touch_old(&app.join(".base-ast").join(".building"));
+        touch_old(&app.join(".base-ast").join(".last-sync"));
+        let f = std::fs::OpenOptions::new().write(true).open(app.join(".base-ast").join(".building")).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60)).unwrap();
+        assert_eq!(ensure_first_map(&app), Some(MapPlan::Build), "a 31-minute-old lock is a crashed build");
+
         // Once the map lands, first contact costs one stat and does nothing.
         std::fs::write(app.join(".base-ast").join("ast.ttl"), "# map\n").unwrap();
         assert_eq!(ensure_first_map(&app), None);
@@ -133,5 +152,55 @@ fn first_contact_on_disk_adopts_a_bare_folder_once() {
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(session_root(&empty), RootPlan::Empty);
         assert!(!empty.join(".base-ast").exists());
+
+        // A .base workspace whose repos sit two levels down (toolbox/frameworks/x)
+        // is a hub even with no directly-marked child.
+        let hub = home.join("dev").join("toolbox");
+        std::fs::create_dir_all(hub.join(".base")).unwrap();
+        std::fs::create_dir_all(hub.join("frameworks").join("kit").join(".git")).unwrap();
+        std::fs::write(hub.join("loose.py"), "x = 1\n").unwrap();
+        assert_eq!(session_root(&hub), RootPlan::Hub, "repos two levels down make it a hub");
+        // …and a loose file in it resolves to the hub, which first contact refuses.
+        assert_eq!(ensure_first_map(&hub), Some(MapPlan::SkipHub));
     });
+}
+
+/// What a Bash command touches: cd targets re-base what follows; `~`, Git
+/// Bash drive paths, flags, globs and URLs are handled the way a shell reads
+/// them. Pure: existence is the caller's job.
+#[test]
+fn bash_commands_name_the_paths_they_touch() {
+    let cwd = Path::new("/home/u/ws");
+    let home = Path::new("/home/u");
+    let got = bash_paths("cd ~/ops-sys/toolbox/frameworks/kit && cargo test --release 2>&1 | tail -5", cwd, Some(home));
+    assert_eq!(got, vec![PathBuf::from("/home/u/ops-sys/toolbox/frameworks/kit")]);
+
+    let got = bash_paths("cat src/main.rs; sed -n '1,5p' ../other/lib.rs", cwd, Some(home));
+    assert_eq!(got, vec![PathBuf::from("/home/u/ws/src/main.rs"), PathBuf::from("/home/u/ws/../other/lib.rs")]);
+
+    let got = bash_paths("cd apps/x && grep -rn foo src/", cwd, Some(home));
+    assert_eq!(got, vec![PathBuf::from("/home/u/ws/apps/x"), PathBuf::from("/home/u/ws/apps/x/src/")]);
+
+    // flags, globs, variables, URLs and env assignments are not paths
+    let got = bash_paths("FOO=1 curl -s https://x.y/z --out $HOME/*.txt", cwd, Some(home));
+    assert!(got.is_empty(), "{got:?}");
+
+    if cfg!(windows) {
+        let got = bash_paths("cat /c/Users/Chris/dev/app/a.py", Path::new("C:/w"), Some(Path::new("C:/Users/Chris")));
+        assert_eq!(got, vec![PathBuf::from("C:/Users/Chris/dev/app/a.py")]);
+    }
+}
+
+#[test]
+fn wsl_commands_hand_their_linux_paths_over() {
+    assert_eq!(
+        linux_paths("wsl -e bash -lc 'cd ~/ops-sys/toolbox/frameworks/kit && cat /home/u/x.rs'"),
+        vec!["~/ops-sys/toolbox/frameworks/kit".to_string(), "/home/u/x.rs".to_string()]
+    );
+    assert!(linux_paths("cat ~/notes.md").is_empty(), "no wsl, nothing to delegate");
+    assert!(linux_paths("wsl -e bash -lc 'echo $HOME'").is_empty());
+
+    // A tilde path reaches the WSL shell as "$HOME/…", where it expands; an absolute one is quoted as-is.
+    assert!(wsl_script("~/ops-sys/toolbox/frameworks/kit").contains("ast ensure --wait \"$HOME/ops-sys/toolbox/frameworks/kit\""));
+    assert!(wsl_script("/home/u/x.rs").contains("ast ensure --wait '/home/u/x.rs'"));
 }

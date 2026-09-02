@@ -71,7 +71,30 @@ def test_outside_git_the_walk_decides_alone():
             del os.environ["GIT_CEILING_DIRECTORIES"]
 
 
+def test_nested_apps_map_themselves():
+    with _fixture_dir() as d:
+        os.environ["GIT_CEILING_DIRECTORIES"] = d
+        try:
+            root = Path(d) / "parent"
+            (root / ".paul").mkdir(parents=True)
+            (root / "src").mkdir()
+            (root / "src" / "own.py").write_text("def own():\n    pass\n")
+            child = root / "child"
+            (child / ".git").mkdir(parents=True)          # a repo of its own
+            (child / "c.py").write_text("def child_only():\n    pass\n")
+            deck = root / "deck"
+            (deck / ".paul").mkdir(parents=True)          # a PAUL project of its own
+            (deck / "d.py").write_text("def deck_only():\n    pass\n")
+            # a parent that is not a repo keeps only its own tree
+            assert _names(root) == ["src/own.py"], _names(root)
+            # and each nested app still collects on its own
+            assert _names(child) == ["c.py"], _names(child)
+        finally:
+            del os.environ["GIT_CEILING_DIRECTORIES"]
+
+
 if __name__ == "__main__":
     test_gitignored_files_stay_out_of_a_git_repo()
     test_outside_git_the_walk_decides_alone()
+    test_nested_apps_map_themselves()
     print("ok")

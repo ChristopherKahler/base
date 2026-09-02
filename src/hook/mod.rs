@@ -28,6 +28,10 @@ pub struct HookEventData {
     pub file_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The cwd the host reported for this event — whether it follows a
+    /// session's `cd` is a question the log can now answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Pre-tool-use: AST file map was injected for this file
     pub ast_injected: bool,
     /// Pre-tool-use: grep/find was intercepted with ast-hint
@@ -185,6 +189,10 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
         }
         _ => Ok(HookEventData::default()),
     }
+    .map(|mut data| {
+        data.cwd = Some(cwd.display().to_string());
+        data
+    })
 }
 
 /// Session-targeted task-relay tick: on boundary events (session-start, prompt)
@@ -263,6 +271,7 @@ fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>) {
         "ts": ts,
         "hook": hook,
         "success": success,
+        "cwd": data.and_then(|d| d.cwd.clone()),
         "domains_matched": data.map(|d| &d.domains_matched).unwrap_or(&empty),
         "rules_injected": data.map(|d| d.rules_injected).unwrap_or(0),
         "suppressed": data.map(|d| d.suppressed).unwrap_or(0),

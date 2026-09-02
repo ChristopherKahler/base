@@ -638,6 +638,17 @@ pub enum AstAction {
     /// List registered per-app code maps (name, entities, path, last synced)
     #[command(visible_alias = "l")]
     List,
+    /// Make sure the app containing PATH has a code map: build one in the
+    /// background if it has none, do nothing if it has (what the hooks do on
+    /// first contact; the Windows hooks call this inside WSL for Linux paths)
+    Ensure {
+        /// A file or folder inside the app
+        path: String,
+        /// Build in the foreground and return when the map has landed (for a
+        /// caller whose process must outlive the build, e.g. `wsl -e sh`)
+        #[arg(long)]
+        wait: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1414,6 +1425,22 @@ pub fn run() {
             AstAction::List => {
                 if let Err(e) = crud::ast_query::list(&cwd, &config.namespace) { die("Error", e); }
             }
+            AstAction::Ensure { path, wait } => {
+                let p = std::path::Path::new(&path);
+                let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+                use base::hook::automap::{first_contact, first_contact_wait, MapPlan};
+                let outcome = if wait { first_contact_wait(&abs) } else { first_contact(&abs) };
+                match outcome {
+                    None if base::config::ast_app_root(&abs).is_none() => println!("{}: not inside an app (no .git / .paul / .base-ast / .base above it)", abs.display()),
+                    None => println!("{}: already mapped", abs.display()),
+                    Some(MapPlan::Build) if wait => println!("{}: built", abs.display()),
+                    Some(MapPlan::Build) => println!("{}: no map yet — building in the background", abs.display()),
+                    Some(MapPlan::Debounced) => println!("{}: a build is already in flight", abs.display()),
+                    Some(MapPlan::SkipHome) => println!("{}: the home directory is never mapped", abs.display()),
+                    Some(MapPlan::SkipHub) => println!("{}: a workspace of apps — each app maps itself", abs.display()),
+                    Some(MapPlan::Refresh) => println!("{}: refreshing", abs.display()),
+                }
+            }
         },
 
         // ─── Project ─────────────────────────────────────
@@ -1996,6 +2023,8 @@ pub fn run() {
                     extractor.status()
                 };
 
+                // Whatever happened, this build is over: the hooks may start the next.
+                let _ = std::fs::remove_file(ast_ttl.with_file_name(".building"));
                 match status {
                     Ok(s) if s.success() => {
                         let _ = std::fs::remove_file(&last_error);
