@@ -1,6 +1,6 @@
 [package]
 name = "base"
-version = "0.13.12"
+version = "0.13.13"
 edition = "2024"
 description = "Proactive context-injection engine for Claude Code"
 
