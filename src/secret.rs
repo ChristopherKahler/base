@@ -69,6 +69,29 @@ pub fn upsert(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read one key's value from the store, `None` when absent. For base's own
+/// rails (Slack) that need a secret in-process; the value never gets printed.
+pub fn get(key: &str) -> Result<Option<String>> {
+    let path = env_path()?;
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    for raw in text.lines() {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let stripped = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        if let Some((k, v)) = stripped.split_once('=')
+            && k.trim() == key
+        {
+            let v = v.trim().trim_matches('"').trim_matches('\u{27}');
+            return Ok(Some(v.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 /// Remove a key. Returns true if a line was removed.
 pub fn remove(key: &str) -> Result<bool> {
     let path = env_path()?;
