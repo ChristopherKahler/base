@@ -118,6 +118,24 @@ pub fn run(target: &Path) -> Result<()> {
         Err(_) => println!("✓ (empty graph initialized)"),
     }
 
+    // Step 6: Code map. A scaffolded folder that IS an app (code under it,
+    // not a workspace of repos) gets its map now rather than at the next
+    // session start; a workspace of repos is left to its apps.
+    print!("6. Code map ... ");
+    match crate::hook::automap::session_root(target) {
+        crate::hook::automap::RootPlan::Marked(root) | crate::hook::automap::RootPlan::Adopt(root) => {
+            match crate::hook::automap::ensure_first_map(&root) {
+                Some(crate::hook::automap::MapPlan::Build) => println!("✓ building in the background → {}/.base-ast/", root.display()),
+                Some(crate::hook::automap::MapPlan::Debounced) => println!("✓ (build already in flight)"),
+                None => println!("✓ (already mapped)"),
+                Some(_) => println!("⊘ (not an app folder)"),
+            }
+        }
+        crate::hook::automap::RootPlan::Hub => println!("⊘ (a workspace of apps — each app maps itself)"),
+        crate::hook::automap::RootPlan::Home => println!("⊘ (home is never mapped)"),
+        crate::hook::automap::RootPlan::Empty => println!("⊘ (no source files yet — the first session here maps it)"),
+    }
+
     println!("\n═══════════════════════════════════════");
     println!("✓ Workspace scaffolded");
     println!("═══════════════════════════════════════\n");

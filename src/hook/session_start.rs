@@ -37,19 +37,26 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
     // Scan and ingest paul.toml projects into graph (idempotent)
     ingest_paul_projects(config, cwd);
 
-    // Every app gets a code map the first time a session opens in it, and a
-    // refresh when it has one (Chris, 2026-09-01: "anytime a dev project is
-    // started, it auto creates the AST map ... base needs to drive this
-    // completely"). Detached and debounced like the Stop hook; the home
-    // directory is never mapped. Only a FIRST build is announced.
-    if let Some(root) = crate::config::ast_app_root(cwd)
-        && crate::hook::stop::ensure_app_map(&root) == crate::hook::stop::MapPlan::Build
-    {
+    // A release that adds a hook wires it here, once per version. The
+    // auto-update swaps the binary and touches nothing else, and a hook that
+    // is not in settings.json never fires — silently.
+    let added = crate::install::ensure_hooks_wired();
+    if !added.is_empty() {
         println!(
-            "[AST] no code map for {} yet — building one now in the background \
-             (base sync --ast); `base ast query` and the file-map injection answer once it lands.",
-            root.display()
+            "[hooks] wired base hook {} into ~/.claude/settings.json (new in this release; live from the next session).",
+            added.join(", ")
         );
+    }
+
+    // Every app gets a code map the first time a session opens in it — a
+    // marked repo, or a bare folder of source files nobody has `git init`ed
+    // yet — and a refresh when it has one (Chris, 2026-09-01: "anytime a dev
+    // project is started, it auto creates the AST map ... no app should ever
+    // go without one"). Detached and debounced; never the home directory, a
+    // user folder, or a workspace that only holds other apps. The rules live
+    // in `hook::automap`; only a FIRST build, or a failing one, is announced.
+    if let Some(line) = crate::hook::automap::session_start_notice(cwd) {
+        println!("{line}");
     }
 
     // Mechanical reconcile (task-artifact protocol): replace hook-stamped lastActive

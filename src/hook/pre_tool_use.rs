@@ -83,6 +83,16 @@ pub fn handle(
             }
         }
 
+        // First contact builds: the first Read / Edit / Grep of a file inside
+        // an app with no code map yet starts one, whatever the session's cwd.
+        // A session opened at home that only READ a project used to leave it
+        // unmapped until something edited it. One stat per path once mapped.
+        for fp in &file_paths {
+            if let Some(root) = crate::config::ast_app_root(fp) {
+                crate::hook::automap::ensure_first_map(&root);
+            }
+        }
+
         let domains = domain::load_domains(cwd);
         let file_path_strings: Vec<String> = file_paths
             .iter()

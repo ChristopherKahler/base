@@ -85,6 +85,7 @@ base update                         # or drive it by hand any time
 base p a -n "My App" -p "src"
 
 # 2. map the codebase — tree-sitter across 35+ languages
+#    (you never have to: every app maps itself — see below. This is the by-hand form.)
 base sync --ast --target src
 
 # 3. ask the graph instead of grepping
@@ -94,6 +95,18 @@ base a q -f "main.rs"           # what's in this file?
 
 # 4. teach it one rule
 base rule add --domain myapp --text "Migrations always run through the CLI, never raw SQL"
+```
+
+**The code map is automatic.** The first session opened in an app builds its
+map in the background — a repo, or a bare folder of source files nobody has
+`git init`ed yet — the first Read of a file inside an app that has no map
+builds that app's, and every turn that edits an app refreshes it. `.gitignore`
+is honoured, an unattended build never stops to ask about the file count, and
+a build that fails says why at the next session start (`.base-ast/.last-error`).
+Never mapped by a hook: your home directory, Desktop / Documents / Downloads, a
+cloud-drive root, or a workspace folder that only holds other apps.
+
+```bash
 ```
 
 Then open Claude Code and touch a mapped file. The file's shape arrives in the turn before its content does. Type a prompt that matches the domain and the rule arrives with it. That loop — teach the graph, watch it come back on its own — is the whole product.

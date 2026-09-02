@@ -810,9 +810,54 @@ pub fn hooks_manifest() -> serde_json::Value {
 fn wire_hooks(settings_path: &Path) -> Result<()> {
     print!("3. Wire hooks → {} ... ", settings_path.display());
 
-    if !settings_path.exists() {
-        println!("⊘ settings.json not found, skipped");
+    if !settings_path.exists() && !settings_path.parent().is_some_and(|d| d.is_dir()) {
+        println!("⊘ no ~/.claude directory (is Claude Code installed?), skipped");
         return Ok(());
+    }
+
+    let added = wire_hooks_quiet(settings_path)?;
+    if added.is_empty() {
+        println!("✓ (already wired)");
+    } else {
+        println!("✓ (added base hook {})", added.join(", "));
+    }
+    Ok(())
+}
+
+/// Session start: wire any hook this release added that the host's
+/// settings.json lacks, once per version. The auto-update swaps the binary and
+/// touches nothing else, so without this a release that adds a hook ships a
+/// hook that never fires until someone re-runs `base install` by hand
+/// (measured 2026-09-01: `base hook stop` waited four releases). Returns the
+/// events added, for a one-line notice.
+pub fn ensure_hooks_wired() -> Vec<&'static str> {
+    let Some(home) = crate::home::home_root() else {
+        return Vec::new();
+    };
+    let stamp = home
+        .join(".base-gbl")
+        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")));
+    if stamp.exists() {
+        return Vec::new();
+    }
+    let settings = home.join(".claude").join("settings.json");
+    let added = wire_hooks_quiet(&settings).unwrap_or_default();
+    let _ = std::fs::write(&stamp, b"");
+    added
+}
+
+/// Merge every hook in [`HOOK_TABLE`] that `settings_path` lacks and return
+/// the events added. The file is created when its directory exists and it
+/// does not — a fresh Claude Code install has `~/.claude/` before it has a
+/// settings.json — and left alone when the directory is missing too.
+/// Append-only: entries base did not write are never touched.
+pub fn wire_hooks_quiet(settings_path: &Path) -> Result<Vec<&'static str>> {
+    if !settings_path.exists() {
+        match settings_path.parent() {
+            Some(dir) if dir.is_dir() => std::fs::write(settings_path, "{}\n")
+                .with_context(|| format!("creating {}", settings_path.display()))?,
+            _ => return Ok(Vec::new()),
+        }
     }
 
     let content = std::fs::read_to_string(settings_path)?;
@@ -824,8 +869,7 @@ fn wire_hooks(settings_path: &Path) -> Result<()> {
     // Check if already fully wired
     let all_present = hook_entries.iter().all(|(_, cmd)| content.contains(cmd));
     if all_present {
-        println!("✓ (already wired)");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let hooks = settings
@@ -869,12 +913,7 @@ fn wire_hooks(settings_path: &Path) -> Result<()> {
     std::fs::write(&tmp_path, &formatted)?;
     std::fs::rename(&tmp_path, settings_path)?;
 
-    if added.is_empty() {
-        println!("✓ (already wired)");
-    } else {
-        println!("✓ (added base hook {})", added.join(", "));
-    }
-    Ok(())
+    Ok(added)
 }
 
 // ─── Step 4: Migrate CARL ───────────────────────────────────

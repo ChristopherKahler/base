@@ -50,7 +50,7 @@ fn install_hook(app_root: &Path, name: &str, branch_switch_only: bool) {
     // Background + skip registration: a teammate just wants a fresh local map,
     // not to write into a workspace graph they may not have.
     let body = format!(
-        "#!/bin/sh\n{MARKER}\n{guard}BASE_AST_SKIP_REGISTER=1 base sync --ast --target . >/dev/null 2>&1 &\n"
+        "#!/bin/sh\n{MARKER}\n{guard}BASE_AST_SKIP_REGISTER=1 base sync --ast --yes --target . >/dev/null 2>&1 &\n"
     );
     if std::fs::write(&path, &body).is_ok() {
         #[cfg(unix)]

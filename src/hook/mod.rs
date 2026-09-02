@@ -1,3 +1,4 @@
+pub mod automap;
 pub mod flow;
 pub mod memory;
 pub mod post_tool_use;

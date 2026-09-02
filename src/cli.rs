@@ -119,6 +119,10 @@ pub enum Commands {
         /// Target directory for AST extraction (defaults to cwd)
         #[arg(long)]
         target: Option<String>,
+        /// Unattended: proceed past the extractor's file-count safety threshold
+        /// without asking (what the hooks pass — nobody is there to answer)
+        #[arg(long)]
+        yes: bool,
         /// Repair missing edges (backfill decision→domain, milestone→project, task→project links)
         #[arg(long)]
         repair: bool,
@@ -1429,7 +1433,21 @@ pub fn run() {
                 let resolved_path = path.or_else(|| provisioned.as_ref().map(|(f, _)| f.clone()));
                 match resolved_path {
                     Some(rp) => match crud::project::add_with_stage(&cwd, &config.namespace, &name, &status, Some(&rp), resolved_stage.as_deref()) {
-                        Ok(slug) => println!("Project '{name}' created (slug: {slug}, path: {rp})"),
+                        Ok(slug) => {
+                            println!("Project '{name}' created (slug: {slug}, path: {rp})");
+                            // A registered project is an app: its code map starts
+                            // now, not at the next session start.
+                            let folder = {
+                                let p = std::path::Path::new(&rp);
+                                if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
+                            };
+                            if let base::hook::automap::RootPlan::Marked(root) | base::hook::automap::RootPlan::Adopt(root) =
+                                base::hook::automap::session_root(&folder)
+                                && base::hook::automap::ensure_first_map(&root) == Some(base::hook::automap::MapPlan::Build)
+                            {
+                                println!("   Code map: building in the background → {}/.base-ast/", root.display());
+                            }
+                        }
                         Err(e) => die("Failed", e),
                     },
                     None => die("Failed", anyhow::anyhow!("--path is required, or enable [protocol] with a stage in base.toml")),
@@ -1900,7 +1918,7 @@ pub fn run() {
         },
 
         // ─── Sync ────────────────────────────────────────
-        Some(Commands::Sync { incremental, ast, target, repair }) => {
+        Some(Commands::Sync { incremental, ast, target, yes, repair }) => {
             if repair {
                 match base::crud::repair_edges(&cwd, &config.namespace) {
                     Ok(count) => println!("Repair complete: {count} edges backfilled"),
@@ -1948,16 +1966,39 @@ pub fn run() {
                 // AST data lives ONLY in ast.ttl. Never write it into graph.nq —
                 // Turtle appended to an NQuads file corrupts the whole graph (AUDIT C10).
                 println!("AST extraction: {} → {}", target_dir, ast_ttl.display());
-                let status = std::process::Command::new(base::multimodal::python_bin())
+                let mut extractor = std::process::Command::new(base::multimodal::python_bin());
+                extractor
                     .arg(&ast_script)
                     .arg(target_dir)
                     .arg("--full")
                     .arg("--out")
-                    .arg(&ast_ttl)
-                    .status();
+                    .arg(&ast_ttl);
+                if yes {
+                    // Unattended (a hook, a git hook, `--yes` by hand): nobody is
+                    // there to answer the file-count prompt, so answer it.
+                    extractor.arg("--confirm");
+                }
+                // A failed build explains itself at the next session start
+                // (`.base-ast/.last-error`) instead of vanishing with a detached
+                // process; a successful one clears the record.
+                let last_error = ast_ttl.with_file_name(".last-error");
+                let status = if yes {
+                    extractor
+                        .stdin(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::piped());
+                    extractor.output().map(|o| {
+                        if !o.status.success() {
+                            let _ = std::fs::write(&last_error, base::hook::automap::stderr_tail(&o.stderr));
+                        }
+                        o.status
+                    })
+                } else {
+                    extractor.status()
+                };
 
                 match status {
                     Ok(s) if s.success() => {
+                        let _ = std::fs::remove_file(&last_error);
                         println!("AST extraction complete → {}", ast_ttl.display());
                         // Register a pointer to this map in the workspace graph so
                         // it's discoverable outside a dev session. Foreground syncs
@@ -1974,8 +2015,19 @@ pub fn run() {
                             }
                         }
                     }
-                    Ok(s) => eprintln!("AST extraction exited with code {:?}", s.code()),
-                    Err(e) => eprintln!("Failed to run AST extractor: {e}"),
+                    Ok(s) => {
+                        eprintln!("AST extraction exited with code {:?}", s.code());
+                        if !yes {
+                            let _ = std::fs::write(&last_error, format!("extractor exited with code {:?}\n", s.code()));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to run AST extractor: {e}");
+                        let _ = std::fs::write(
+                            &last_error,
+                            format!("failed to run the AST extractor ({}): {e}\n", base::multimodal::python_bin()),
+                        );
+                    }
                 }
             } else {
                 match base::extract::sync(&cwd, &config, incremental) {

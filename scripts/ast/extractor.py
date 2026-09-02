@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 import re
+import subprocess
 import sys
 import unicodedata
 from dataclasses import dataclass, field
@@ -7825,6 +7826,47 @@ def extract(
     }
 
 
+def _git_kept(target: Path) -> set[Path] | None:
+    """The files git keeps under `target`: tracked, plus untracked that no
+    .gitignore excludes. None outside a git work tree, or when git is missing
+    or slow — then the walk decides alone.
+
+    This is how .gitignore is honoured: git does the matching, so every rule
+    form git accepts is accepted here, and a vendored tree the repo already
+    ignores never inflates the map or trips the file-count threshold. A
+    submodule is listed as one gitlink, so its files stay out of the parent's
+    map — it is its own app with its own map.
+    """
+    try:
+        top = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "--show-toplevel"],
+            capture_output=True, timeout=15,
+        )
+        if top.returncode != 0:
+            return None
+        toplevel = Path(top.stdout.decode("utf-8", "surrogateescape").strip())
+        if toplevel.resolve() != target.resolve():
+            # The target sits inside a bigger repo. If that repo ignores the
+            # target itself (a home dotfiles repo with `*`, a `Documents/`
+            # rule), the folder is on its own and the walk decides alone;
+            # honouring the parent's rules would map it as nothing.
+            ignored = subprocess.run(
+                ["git", "-C", str(target), "check-ignore", "-q", "--", str(target)],
+                capture_output=True, timeout=15,
+            )
+            if ignored.returncode == 0:
+                return None
+        out = subprocess.run(
+            ["git", "-C", str(target), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return {target / rel for rel in out.stdout.decode("utf-8", "surrogateescape").split("\0") if rel}
+
+
 def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | None = None) -> list[Path]:
     if target.is_file():
         return [target]
@@ -7832,8 +7874,11 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
     from detect import _load_baseignore, _is_ignored, _is_noise_dir
     ignore_root = root if root is not None else target
     patterns = _load_baseignore(ignore_root)
+    kept = _git_kept(target)
 
     def _ignored(p: Path) -> bool:
+        if kept is not None and p not in kept:
+            return True
         return bool(patterns and _is_ignored(p, ignore_root, patterns))
 
     if not follow_symlinks:
