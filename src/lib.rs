@@ -30,7 +30,6 @@ pub mod relay;
 pub mod scaffold;
 pub mod scope;
 pub mod secret;
-pub mod slack;
 pub mod signal;
 pub mod standards;
 pub mod store;

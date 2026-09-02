@@ -337,43 +337,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: SecretAction,
     },
-    /// Post to, read from, or list the workspace's Slack — one bot token
-    /// (`base secret set SLACK_BOT_TOKEN`), no MCP, works from any session
-    Slack {
-        #[command(subcommand)]
-        action: SlackAction,
-    },
     /// Drop-in command plugins from extensions (`base <foo>` → handler).
     /// Any unrecognized subcommand is captured here and routed to the plugin
     /// dispatcher (git's `git-foo` external-subcommand model). Core commands
     /// always resolve first — a plugin can never shadow a built-in.
     #[command(external_subcommand)]
     External(Vec<String>),
-}
-
-#[derive(Subcommand)]
-pub enum SlackAction {
-    /// Post a message. --to takes a channel id (C…), a #name, or a message
-    /// permalink (replies in that thread)
-    Post {
-        #[arg(long)]
-        to: String,
-        /// The message (Slack mrkdwn)
-        #[arg(long)]
-        text: String,
-        /// Reply in this thread (parent ts) instead of the channel
-        #[arg(long)]
-        thread: Option<String>,
-    },
-    /// Read recent messages from a channel, or a whole thread from a permalink
-    Read {
-        #[arg(long)]
-        to: String,
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-    },
-    /// List the channels the app can see (id, #name, private, member)
-    Channels,
 }
 
 #[derive(Subcommand)]
@@ -3698,30 +3667,6 @@ pub fn run() {
         },
 
         // ─── Secret ───────────────────────────────────────────
-        Some(Commands::Slack { action }) => {
-            let token = match base::slack::token() {
-                Ok(t) => t,
-                Err(e) => die("Slack", e),
-            };
-            match action {
-                SlackAction::Post { to, text, thread } => {
-                    match base::slack::resolve(&token, &to, thread.as_deref()).and_then(|t| base::slack::post(&token, &t, &text)) {
-                        Ok(link) => println!("{link}"),
-                        Err(e) => die("Slack", e),
-                    }
-                }
-                SlackAction::Read { to, limit } => {
-                    match base::slack::resolve(&token, &to, None).and_then(|t| base::slack::read(&token, &t, limit)) {
-                        Ok(lines) => { for l in lines { println!("{l}"); } }
-                        Err(e) => die("Slack", e),
-                    }
-                }
-                SlackAction::Channels => match base::slack::channels(&token) {
-                    Ok(lines) => { for l in lines { println!("{l}"); } }
-                    Err(e) => die("Slack", e),
-                },
-            }
-        }
         Some(Commands::Secret { action }) => match action {
             SecretAction::Set { key } => {
                 if let Err(e) = base::secret::set_interactive(&key) {
