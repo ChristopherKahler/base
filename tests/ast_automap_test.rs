@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use base::hook::automap::{
-    bash_paths, ensure_first_map, is_noise_dir, linux_paths, never_map_reason_with, plan_root,
-    session_root, wsl_script, RootFacts, RootPlan,
+    bash_paths, ensure_first_map, is_noise_dir, linux_paths, measure_tree, never_map_reason_with,
+    plan_root, session_root, wsl_script, RootFacts, RootPlan,
 };
 use base::hook::stop::{plan_map, MapPlan};
 
@@ -336,4 +336,82 @@ fn noise_directories_match_whatever_the_case() {
     for name in ["src", "lib", "tests", "buildscripts", "tempo"] {
         assert!(!is_noise_dir(name), "{name} is not noise");
     }
+}
+
+
+/// The backstop for whatever the never-map list misses. Chris, 2026-09-03:
+/// "Base is set to automatically make graphs, this will blow up people's
+/// computers." A tree too big to extract unattended is not extracted at all —
+/// `--yes` from a hook cannot get past this, because the fuse decides before
+/// anything is spawned.
+#[test]
+fn a_tree_too_big_to_build_unattended_is_not_built() {
+    // SAFETY: single-process test env; every test in this crate tolerates it set.
+    unsafe { std::env::set_var("BASE_AST_NO_SPAWN", "1") };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let huge = home.join("dev").join("huge");
+    std::fs::create_dir_all(&huge).unwrap();
+    for i in 0..6_000 {
+        std::fs::write(huge.join(format!("m{i}.py")), "x = 1\n").unwrap();
+    }
+
+    base::home::with_thread_home(&home, || {
+        assert_eq!(ensure_first_map(&huge), Some(MapPlan::NeedsConfirm), "6,000 source files: ask first");
+
+        let note = std::fs::read_to_string(huge.join(".base-ast").join(".needs-confirm"))
+            .expect("the fuse records why");
+        assert!(note.contains("5000"), "the limit is named: {note}");
+        assert!(note.contains("source files"), "the counts are named: {note}");
+        assert!(
+            note.contains(&format!("base sync --ast --target {}", huge.display())),
+            "the exact command to run by hand is spelled out: {note}"
+        );
+
+        // Nothing was spawned and no build was recorded — the fuse decides
+        // ahead of every write `ensure_app_map` would otherwise make.
+        assert!(!huge.join(".base-ast").join(".last-sync").exists(), "no build was recorded");
+        assert!(!huge.join(".base-ast").join(".building").exists(), "no build lock was taken");
+
+        // A tripped fuse is believed rather than re-walked every turn.
+        assert_eq!(ensure_first_map(&huge), Some(MapPlan::NeedsConfirm));
+    });
+}
+
+/// The fuse measures what the extractor will actually read: noise directories
+/// and dot-directories skipped, nested marked apps left to their own maps.
+/// Otherwise a repo with a vendored `node_modules` would be fused off its map.
+#[test]
+fn the_fuse_measures_what_the_extractor_will_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = tmp.path().join("app");
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    for i in 0..5 {
+        std::fs::write(app.join("src").join(format!("s{i}.rs")), "fn f() {}\n").unwrap();
+    }
+
+    let bare = measure_tree(&app);
+    assert_eq!(bare.sources, 5);
+    assert!(!bare.over_fuse());
+
+    // A vendored dependency tree does not count — the extractor never walks it.
+    std::fs::create_dir_all(app.join("node_modules").join("react")).unwrap();
+    for i in 0..50 {
+        std::fs::write(app.join("node_modules").join("react").join(format!("r{i}.js")), "1\n").unwrap();
+    }
+    // Nor does a nested repo, which keeps its own map.
+    let nested = app.join("vendored-repo");
+    std::fs::create_dir_all(nested.join(".git")).unwrap();
+    for i in 0..50 {
+        std::fs::write(nested.join(format!("n{i}.rs")), "fn g() {}\n").unwrap();
+    }
+    // Nor does a build directory, whatever its case.
+    std::fs::create_dir_all(app.join("Target")).unwrap();
+    for i in 0..50 {
+        std::fs::write(app.join("Target").join(format!("t{i}.rs")), "fn h() {}\n").unwrap();
+    }
+
+    let after = measure_tree(&app);
+    assert_eq!(after.sources, 5, "150 skipped files stayed out of the count");
 }

@@ -127,6 +127,9 @@ pub fn run(target: &Path) -> Result<()> {
             match crate::hook::automap::ensure_first_map(&root) {
                 Some(crate::hook::automap::MapPlan::Build) => println!("✓ building in the background → {}/.base-ast/", root.display()),
                 Some(crate::hook::automap::MapPlan::Debounced) => println!("✓ (build already in flight)"),
+                Some(crate::hook::automap::MapPlan::NeedsConfirm) => {
+                    println!("⊘ (too large to build unattended — see {}/.base-ast/.needs-confirm)", root.display())
+                }
                 None => println!("✓ (already mapped)"),
                 Some(_) => println!("⊘ (not an app folder)"),
             }

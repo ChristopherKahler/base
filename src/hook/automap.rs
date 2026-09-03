@@ -21,8 +21,10 @@
 //!   * `base scaffold` and `base project add --path` — the folder they just
 //!     registered.
 //!
-//! What a hook never maps: the home directory, a filesystem root, the
-//! well-known user folders (Desktop, Documents, Downloads, a cloud-drive root),
+//! What a hook never maps: the OS temp directory, the caches, `AppData`,
+//! `node_modules`, `~/.claude`, `~/.base-gbl`, the home directory — this OS's
+//! or, across a WSL boundary, the other's — a filesystem root, the well-known
+//! user folders (Desktop, Documents, Downloads, a cloud-drive root),
 //! and a folder that only HOLDS apps — a `.base` workspace whose repos sit one
 //! or two levels down (`~/ops-sys/toolbox` keeps fifty under `frameworks/`,
 //! `apps/`, …). Mapping one of those walks every project on the machine into
@@ -30,10 +32,18 @@
 //! app that contains other marked apps maps only its own tree: the extractor
 //! skips any subfolder carrying `.git`, `.paul` or `.base-ast`.
 //!
-//! Every build is detached and debounced; a hook never waits. An unattended
-//! build never stops to ask about the file-count threshold (`base sync --ast
-//! --yes`), and a failed one leaves `.base-ast/.last-error` behind so the next
-//! session start can say why instead of promising a map that never lands.
+//! Every build is detached and debounced; a hook never waits. A failed build
+//! leaves `.base-ast/.last-error` behind so the next session start can say why
+//! instead of promising a map that never lands.
+//!
+//! An unattended build passes `--yes`, so it never stops at the extractor's own
+//! file-count prompt — which is why the size fuse decides BEFORE the spawn
+//! rather than relying on it. A first build measures the tree, and a root over
+//! `FUSE_SOURCE_FILES` / `FUSE_ENTRIES` is not built at all: the counts and the
+//! exact by-hand command go into `.base-ast/.needs-confirm` and the next
+//! session start prints them. Chris, 2026-09-03, after a hook spent thirty
+//! minutes extracting `%TEMP%`: "Base is set to automatically make graphs, this
+//! will blow up people's computers."
 
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -93,6 +103,17 @@ const TEMP_SEGMENTS: &[&str] = &["tmp", "temp"];
 /// so a project folder merely called `Local` is not caught.
 const APPDATA_CHILDREN: &[&str] = &["local", "locallow", "roaming"];
 
+/// A hook builds no tree larger than this without being asked first. Measured
+/// 2026-09-03 against the largest real app on the machine this fork came from
+/// (`~/ops-sys/toolbox/frameworks/05-exp-cadre`: 209 source files, 10,853
+/// entries), so both fuses sit several times above anything real here.
+/// Tripping one costs a prompt, never a map, so erring low is cheap.
+const FUSE_SOURCE_FILES: usize = 5_000;
+const FUSE_ENTRIES: usize = 50_000;
+
+/// How long a tripped fuse is believed before the tree is measured again.
+const NEEDS_CONFIRM_SECS: u64 = 24 * 60 * 60;
+
 /// How deep and how far the "does this folder hold code" probe looks.
 const PROBE_DEPTH: usize = 3;
 const PROBE_ENTRIES: usize = 2000;
@@ -111,6 +132,10 @@ pub enum MapPlan {
     SkipNeverMap(&'static str),
     /// A sync ran within the debounce window; the caller may requeue.
     Debounced,
+    /// The tree is too large to extract unattended. Nothing was spawned;
+    /// `.base-ast/.needs-confirm` holds the counts and the exact command to
+    /// run by hand, and the session-start notice prints it.
+    NeedsConfirm,
     /// No `.base-ast/ast.ttl` yet: build the first map, registered.
     Build,
     /// A map exists: refresh it in the background, unregistered.
@@ -167,6 +192,12 @@ pub fn ensure_app_map(root: &Path) -> MapPlan {
     // is a crashed build and no longer counts.
     let building = recently(&base_ast.join(".building"), BUILD_LOCK_SECS);
     let plan = plan_map(root, home.as_deref(), never, mapped, building || recently_synced(&marker));
+    // The fuse, on a FIRST build only. An existing map means the extractor
+    // already got through this tree once; re-measuring up to 50,000 entries on
+    // every Stop-hook refresh would cost more than the bug it guards against.
+    if plan == MapPlan::Build && fuse_blocks(root, &base_ast) {
+        return MapPlan::NeedsConfirm;
+    }
     match plan {
         MapPlan::Build | MapPlan::Refresh => {
             let _ = std::fs::create_dir_all(&base_ast);
@@ -174,7 +205,11 @@ pub fn ensure_app_map(root: &Path) -> MapPlan {
             let _ = std::fs::write(base_ast.join(".building"), b"");
             spawn_sync(root, plan == MapPlan::Build);
         }
-        MapPlan::SkipHome | MapPlan::SkipHub | MapPlan::SkipNeverMap(_) | MapPlan::Debounced => {}
+        MapPlan::SkipHome
+        | MapPlan::SkipHub
+        | MapPlan::SkipNeverMap(_)
+        | MapPlan::NeedsConfirm
+        | MapPlan::Debounced => {}
     }
     plan
 }
@@ -320,6 +355,14 @@ pub fn session_start_notice(cwd: &Path) -> Option<String> {
             root.display(),
             base_ast.display()
         )),
+        (MapPlan::NeedsConfirm, _) => Some(format!(
+            "[AST] no code map for {}: {}",
+            root.display(),
+            std::fs::read_to_string(base_ast.join(".needs-confirm"))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        )),
         (MapPlan::Build, false) => Some(format!(
             "[AST] no code map for {} yet — building one now in the background \
              (base sync --ast); `base ast query` and the file-map injection answer once it lands.",
@@ -410,6 +453,9 @@ pub fn first_contact_wait(path: &Path) -> Option<MapPlan> {
     let home = crate::home::real_home();
     if recently(&base_ast.join(".building"), BUILD_LOCK_SECS) {
         return Some(MapPlan::Debounced);
+    }
+    if fuse_blocks(&root, &base_ast) {
+        return Some(MapPlan::NeedsConfirm);
     }
     let plan = plan_map(&root, home.as_deref(), None, false, false);
     if plan != MapPlan::Build {
@@ -833,6 +879,100 @@ pub fn has_code_files(dir: &Path) -> bool {
         }
     }
     false
+}
+
+/// What a bounded walk of a candidate root found. Counting stops the instant a
+/// fuse trips, so both numbers are lower bounds once [`TreeSize::over_fuse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeSize {
+    pub sources: usize,
+    pub entries: usize,
+}
+
+impl TreeSize {
+    pub fn over_fuse(&self) -> bool {
+        self.sources > FUSE_SOURCE_FILES || self.entries > FUSE_ENTRIES
+    }
+}
+
+/// Measure `root` the way the extractor will read it: noise directories and
+/// dot-directories skipped, nested marked apps left to their own maps.
+///
+/// Unlike the `PROBE_ENTRIES` probes this walk is not capped at 2,000 — it has
+/// to be able to count as far as [`FUSE_ENTRIES`] — but it stops the moment a
+/// fuse trips, so the worst case is ~50,000 stats, and it is paid once, on a
+/// first build, never on a refresh.
+pub fn measure_tree(root: &Path) -> TreeSize {
+    let mut size = TreeSize { sources: 0, entries: 0 };
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            size.entries += 1;
+            if size.over_fuse() {
+                return size;
+            }
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if ft.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') || is_noise_dir(&name) || has_strong_marker(&path) {
+                    continue;
+                }
+                stack.push(path);
+            } else if ft.is_file()
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| CODE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+            {
+                size.sources += 1;
+                if size.over_fuse() {
+                    return size;
+                }
+            }
+        }
+    }
+    size
+}
+
+/// True when `root` is too large to extract unattended. Records the counts and
+/// the exact command in `.base-ast/.needs-confirm` on the way out, and believes
+/// a fresh one rather than re-measuring the same tree every turn.
+///
+/// `base sync --ast --yes` from a hook cannot get past this: the fuse decides
+/// before anything is spawned, so `--yes` never reaches the extractor's own
+/// file-count prompt. A human running `base sync --ast` by hand is unaffected
+/// and still gets that prompt.
+fn fuse_blocks(root: &Path, base_ast: &Path) -> bool {
+    if recently(&base_ast.join(".needs-confirm"), NEEDS_CONFIRM_SECS) {
+        return true;
+    }
+    let size = measure_tree(root);
+    if !size.over_fuse() {
+        return false;
+    }
+    let _ = std::fs::create_dir_all(base_ast);
+    let _ = std::fs::write(base_ast.join(".needs-confirm"), needs_confirm_text(root, &size));
+    true
+}
+
+/// The one line `.needs-confirm` holds, and the session-start notice reads back.
+pub fn needs_confirm_text(root: &Path, size: &TreeSize) -> String {
+    format!(
+        "at least {} source files across {} entries, over the {}/{} a hook will build unattended. \
+         Run `base sync --ast --target {}` to build it by hand.",
+        size.sources,
+        size.entries,
+        FUSE_SOURCE_FILES,
+        FUSE_ENTRIES,
+        root.display()
+    )
 }
 
 /// The last line the failed extractor wrote, for a one-line notice.
