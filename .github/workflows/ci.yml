@@ -24,6 +24,16 @@ jobs:
       - name: cargo test
         run: cargo test
 
+  # Every changelog.py command line the release assembles, run with the argv it
+  # assembles. 0.13.16 nearly died on one that every other test had missed.
+  release-invocations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: ./scripts/test-release-invocations.sh
+
   # Advisory until the three pre-existing never_loop denies in src/crud are
   # cleared; then drop continue-on-error and it becomes a required check.
   clippy:
