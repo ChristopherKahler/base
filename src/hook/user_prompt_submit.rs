@@ -465,8 +465,9 @@ fn ensure_domain_sync(config: &BaseConfig, cwd: &Path) {
         }
 }
 
-/// Check if a domains.toml is newer than its sync marker.
-fn needs_sync_check(domains_toml: &Path, marker: &Path) -> bool {
+/// Check if a domains.toml is newer than its sync marker. Pure and path-scoped
+/// (the test seam): `true` when the marker is missing or unreadable.
+pub fn needs_sync_check(domains_toml: &Path, marker: &Path) -> bool {
     if marker.exists() {
         match (
             std::fs::metadata(domains_toml).and_then(|m| m.modified()),
