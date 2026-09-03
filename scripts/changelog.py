@@ -285,19 +285,30 @@ def cmd_extract(args):
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--notes-dir", default=str(Path(__file__).parent / "changelog-notes"))
-    p.add_argument("--date", help="override the release date (default: the tag's own date)")
+    # `--notes-dir` and `--date` belong to the subcommands that render a section,
+    # not to the program. Declared on the parent parser alone, argparse only
+    # accepts them *before* the subcommand, which is not where anyone writes
+    # them: `release.sh` put `--date` at the end of its line and the release
+    # aborted on an unrecognized argument.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--notes-dir", default=str(Path(__file__).parent / "changelog-notes"))
+    common.add_argument("--date", help="override the release date (default: the tag's own date)")
+
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        parents=[common],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("section", help="one release's block")
+    s = sub.add_parser("section", parents=[common], help="one release's block")
     s.add_argument("from_ref")
     s.add_argument("to_ref")
     s.add_argument("version")
     s.add_argument("--prepend", metavar="FILE", help="insert into FILE under its header")
     s.set_defaults(func=cmd_section)
 
-    f = sub.add_parser("file", help="the whole file, from a list of consecutive tags")
+    f = sub.add_parser("file", parents=[common], help="the whole file, from a list of consecutive tags")
     f.add_argument("tags", nargs="+")
     f.set_defaults(func=cmd_file)
 
