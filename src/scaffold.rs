@@ -133,6 +133,7 @@ pub fn run(target: &Path) -> Result<()> {
         }
         crate::hook::automap::RootPlan::Hub => println!("⊘ (a workspace of apps — each app maps itself)"),
         crate::hook::automap::RootPlan::Home => println!("⊘ (home is never mapped)"),
+        crate::hook::automap::RootPlan::NeverMap(why) => println!("⊘ ({why} — never mapped)"),
         crate::hook::automap::RootPlan::Empty => println!("⊘ (no source files yet — the first session here maps it)"),
     }
 

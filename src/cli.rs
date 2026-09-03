@@ -1438,6 +1438,7 @@ pub fn run() {
                     Some(MapPlan::Debounced) => println!("{}: a build is already in flight", abs.display()),
                     Some(MapPlan::SkipHome) => println!("{}: the home directory is never mapped", abs.display()),
                     Some(MapPlan::SkipHub) => println!("{}: a workspace of apps — each app maps itself", abs.display()),
+                    Some(MapPlan::SkipNeverMap(why)) => println!("{}: never mapped — {why}", abs.display()),
                     Some(MapPlan::Refresh) => println!("{}: refreshing", abs.display()),
                 }
             }

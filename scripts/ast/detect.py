@@ -21,7 +21,7 @@ _NOISE_DIRS = frozenset({
 
 def _is_noise_dir(name: str) -> bool:
     """Check if a directory name is noise that should be skipped."""
-    return name in _NOISE_DIRS or name.startswith(".")
+    return name.lower() in _NOISE_DIRS or name.startswith(".")
 
 
 def _load_baseignore(root: Path) -> list[str]:
