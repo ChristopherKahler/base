@@ -54,6 +54,13 @@ fi
 # `release.sh` refuses to run off main, and CI checks out a detached HEAD.
 git -C "$CLONE" checkout -q -B main "$HEAD_SHA"
 
+# `release.sh` commits, and a CI runner has no git identity, so the commit dies
+# with "Author identity unknown" after the version bump -- the same half-released
+# shape this test exists to catch, from the environment rather than the script.
+# Set here rather than globally: it reaches only this temporary clone.
+git -C "$CLONE" config user.name "release rehearsal"
+git -C "$CLONE" config user.email "rehearsal@invalid"
+
 # One compile, not two: the rehearsal shares whatever target directory the
 # caller is already using, so in CI it reuses the suite's and locally it reuses
 # this checkout's.
