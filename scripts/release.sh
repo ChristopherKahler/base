@@ -58,14 +58,18 @@ if ! grep -A1 '^name = "base"$' Cargo.lock | grep -q "version = \"$NEW\""; then
   echo "Cargo.lock did not pick up $NEW"; exit 1
 fi
 
-echo "==> regenerate the base-help coach for $NEW"
-BASE_REGEN_DOCS=1 cargo test --quiet --bin base help_docs
-
 # The tag does not exist yet, so the range ends at HEAD and the date is today's
-# rather than the last commit's. src/help_docs.rs fails the suite below if this
-# step did not run, which is the whole reason it sits above the tests.
+# rather than the last commit's. This has to precede the regeneration below, not
+# merely the suite: `changelog_has_a_section_for_this_version` is one of the
+# help_docs tests, and it is the single check BASE_REGEN_DOCS deliberately
+# cannot write its way out of. Regenerating first fails on it and aborts the
+# release after the version bump and before the tag, which is exactly how
+# 0.13.16's first attempt died.
 echo "==> write the $NEW section of CHANGELOG.md"
 python3 scripts/changelog.py section "v$OLD" HEAD "$NEW" --date "$(date +%F)" --prepend CHANGELOG.md
+
+echo "==> regenerate the base-help coach for $NEW"
+BASE_REGEN_DOCS=1 cargo test --quiet --bin base help_docs
 
 echo "==> test"
 if [ "$QUICK" = 1 ]; then
