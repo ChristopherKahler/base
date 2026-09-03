@@ -35,7 +35,7 @@
 //! --yes`), and a failed one leaves `.base-ast/.last-error` behind so the next
 //! session start can say why instead of promising a map that never lands.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -72,6 +72,27 @@ const CLOUD_ROOTS: &[&str] = &[
     "OneDrive", "Dropbox", "Google Drive", "GoogleDrive", "iCloud Drive", "iCloudDrive", "Nextcloud", "Box",
 ];
 
+/// Path components that make a folder unmappable wherever one appears, matched
+/// case-insensitively on every platform. This half of the rule is what works
+/// across the WSL boundary: a Windows `%TEMP%` reaches a WSL hook as
+/// `/mnt/c/Users/<name>/AppData/Local/Temp`, where not one of the environment
+/// variables in [`temp_roots`] is set.
+const NEVER_MAP_SEGMENTS: &[(&str, &str)] = &[
+    ("node_modules", "a node_modules tree"),
+    (".cache", "a cache directory"),
+    (".claude", "the Claude Code state directory"),
+    (".base-gbl", "base's own global tier"),
+];
+
+/// `tmp` / `temp` as a path component. Held apart from [`NEVER_MAP_SEGMENTS`]
+/// because every test fixture workspace is built under the system temp dir —
+/// see [`never_map_reason`].
+const TEMP_SEGMENTS: &[&str] = &["tmp", "temp"];
+
+/// The children of `AppData` that are never mapped. Matched as an ordered pair
+/// so a project folder merely called `Local` is not caught.
+const APPDATA_CHILDREN: &[&str] = &["local", "locallow", "roaming"];
+
 /// How deep and how far the "does this folder hold code" probe looks.
 const PROBE_DEPTH: usize = 3;
 const PROBE_ENTRIES: usize = 2000;
@@ -83,6 +104,11 @@ pub enum MapPlan {
     SkipHome,
     /// The root is a workspace that only holds other apps: never mapped.
     SkipHub,
+    /// The root is, or sits under, a location a hook never maps — the OS temp
+    /// directory, a cache, `AppData`, `node_modules`, the other OS's home.
+    /// Never built AND never refreshed: a single bad adoption plants
+    /// `.base-ast/`, and without this the marker would make itself permanent.
+    SkipNeverMap(&'static str),
     /// A sync ran within the debounce window; the caller may requeue.
     Debounced,
     /// No `.base-ast/ast.ttl` yet: build the first map, registered.
@@ -92,11 +118,23 @@ pub enum MapPlan {
 }
 
 /// The build/refresh decision, with every input explicit so it can be tested
-/// without a filesystem: `home` is the operator's home, `mapped` whether
+/// without a filesystem: `home` is the operator's home, `never` the reason
+/// this root is off limits (see [`never_map_reason`]), `mapped` whether
 /// `ast.ttl` exists, `debounced` whether `.last-sync` is fresher than the window.
-pub fn plan_map(root: &Path, home: Option<&Path>, mapped: bool, debounced: bool) -> MapPlan {
+pub fn plan_map(
+    root: &Path,
+    home: Option<&Path>,
+    never: Option<&'static str>,
+    mapped: bool,
+    debounced: bool,
+) -> MapPlan {
     if home.is_some_and(|h| h == root) {
         return MapPlan::SkipHome;
+    }
+    // Before `mapped` and before `debounced`, deliberately: an `ast.ttl` that
+    // already sits inside a never-mapped root must not license a refresh.
+    if let Some(why) = never {
+        return MapPlan::SkipNeverMap(why);
     }
     if debounced {
         return MapPlan::Debounced;
@@ -109,6 +147,12 @@ pub fn plan_map(root: &Path, home: Option<&Path>, mapped: bool, debounced: bool)
 /// a workspace hub. Returns what was decided; `Build` and `Refresh` mean a
 /// detached sync is now running.
 pub fn ensure_app_map(root: &Path) -> MapPlan {
+    // First, and before any filesystem probing: a never-mapped root must not
+    // even be walked, and must never have `.base-ast/` written into it.
+    let never = never_map_reason(root);
+    if never.is_some() {
+        return plan_map(root, crate::home::real_home().as_deref(), never, false, false);
+    }
     if is_workspace_hub(root) {
         return MapPlan::SkipHub;
     }
@@ -122,7 +166,7 @@ pub fn ensure_app_map(root: &Path) -> MapPlan {
     // when it finishes, success or failure; a lock older than BUILD_LOCK_SECS
     // is a crashed build and no longer counts.
     let building = recently(&base_ast.join(".building"), BUILD_LOCK_SECS);
-    let plan = plan_map(root, home.as_deref(), mapped, building || recently_synced(&marker));
+    let plan = plan_map(root, home.as_deref(), never, mapped, building || recently_synced(&marker));
     match plan {
         MapPlan::Build | MapPlan::Refresh => {
             let _ = std::fs::create_dir_all(&base_ast);
@@ -130,7 +174,7 @@ pub fn ensure_app_map(root: &Path) -> MapPlan {
             let _ = std::fs::write(base_ast.join(".building"), b"");
             spawn_sync(root, plan == MapPlan::Build);
         }
-        MapPlan::SkipHome | MapPlan::SkipHub | MapPlan::Debounced => {}
+        MapPlan::SkipHome | MapPlan::SkipHub | MapPlan::SkipNeverMap(_) | MapPlan::Debounced => {}
     }
     plan
 }
@@ -158,6 +202,8 @@ pub enum RootPlan {
     Home,
     /// A user folder, a filesystem root, or a folder that holds other apps.
     Hub,
+    /// The cwd is, or sits under, a location a hook never maps.
+    NeverMap(&'static str),
     /// No source files under it yet. The Stop hook looks again every turn.
     Empty,
 }
@@ -175,6 +221,9 @@ pub struct RootFacts<'a> {
     /// That `.base` root directly contains other marked folders — a workspace
     /// of apps rather than an app.
     pub weak_is_hub: bool,
+    /// Why the cwd is off limits entirely (temp, a cache, `AppData`,
+    /// `node_modules`, the other OS's home), or `None`.
+    pub never: Option<&'static str>,
     /// cwd is home, a filesystem root, Desktop / Documents / Downloads /
     /// Pictures / Music / Videos / Public, or a cloud drive's root.
     pub user_folder: bool,
@@ -188,6 +237,10 @@ pub struct RootFacts<'a> {
 pub fn plan_root(f: &RootFacts<'_>) -> RootPlan {
     if f.home.is_some_and(|h| h == f.cwd) {
         return RootPlan::Home;
+    }
+    // Before the markers: a `.git` inside the temp dir is still the temp dir.
+    if let Some(why) = f.never {
+        return RootPlan::NeverMap(why);
     }
     if let Some(s) = f.strong {
         return RootPlan::Marked(s.to_path_buf());
@@ -224,6 +277,7 @@ pub fn session_root(cwd: &Path) -> RootPlan {
         strong: strong.as_deref(),
         weak: weak.as_deref(),
         weak_is_hub: weak.as_deref().is_some_and(has_child_apps),
+        never: never_map_reason(cwd),
         user_folder: is_user_folder(cwd, home),
         child_apps: has_child_apps(cwd),
         sources: has_code_files(cwd),
@@ -238,6 +292,13 @@ pub fn session_start_notice(cwd: &Path) -> Option<String> {
     let (root, adopted) = match session_root(cwd) {
         RootPlan::Marked(r) => (r, false),
         RootPlan::Adopt(r) => (r, true),
+        RootPlan::NeverMap(why) => {
+            return Some(format!(
+                "[AST] {} is never mapped ({why}) — no code map is built here. \
+                 Run `base sync --ast --target <path>` by hand if you really want one.",
+                cwd.display()
+            ));
+        }
         RootPlan::Home | RootPlan::Hub | RootPlan::Empty => return None,
     };
     let outcome = ensure_app_map(&root);
@@ -314,7 +375,7 @@ fn holds_apps(dir: &Path, depth: usize) -> bool {
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if lvl + 1 < depth && !name.starts_with('.') && !NOISE_DIRS.contains(&name.as_ref()) {
+            if lvl + 1 < depth && !name.starts_with('.') && !is_noise_dir(&name) {
                 stack.push((path, lvl + 1));
             }
         }
@@ -336,6 +397,9 @@ pub fn first_contact(path: &Path) -> Option<MapPlan> {
 /// Same decisions as [`first_contact`]; only the spawn differs.
 pub fn first_contact_wait(path: &Path) -> Option<MapPlan> {
     let root = crate::config::ast_app_root(path)?;
+    if let Some(why) = never_map_reason(&root) {
+        return Some(MapPlan::SkipNeverMap(why));
+    }
     let base_ast = root.join(".base-ast");
     if base_ast.join("ast.ttl").is_file() {
         return None;
@@ -347,7 +411,7 @@ pub fn first_contact_wait(path: &Path) -> Option<MapPlan> {
     if recently(&base_ast.join(".building"), BUILD_LOCK_SECS) {
         return Some(MapPlan::Debounced);
     }
-    let plan = plan_map(&root, home.as_deref(), false, false);
+    let plan = plan_map(&root, home.as_deref(), None, false, false);
     if plan != MapPlan::Build {
         return Some(plan);
     }
@@ -474,6 +538,11 @@ pub fn delegate_wsl_contact(paths: &[String]) {
     };
     let _ = std::fs::create_dir_all(&dir);
     for p in paths {
+        // A Linux path the WSL base would refuse anyway: do not pay for a
+        // `wsl` process to be told no.
+        if never_map_reason(Path::new(p)).is_some() {
+            continue;
+        }
         let marker = dir.join(fingerprint(p));
         if recently(&marker, WSL_CONTACT_SECS) {
             continue;
@@ -575,6 +644,159 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     norm(a) == norm(b)
 }
 
+/// A directory name that is never walked. Case-insensitive: Windows spells
+/// the same folder `Temp` and `temp`, `Build` and `build`, and "has code" here
+/// has to agree with "has files to extract" in `scripts/ast/detect.py`.
+pub fn is_noise_dir(name: &str) -> bool {
+    NOISE_DIRS.iter().any(|d| d.eq_ignore_ascii_case(name))
+}
+
+/// Why a hook never maps `root`, or `None` when it may.
+///
+/// Chris, 2026-09-03, after a hook spent thirty minutes extracting `%TEMP%`:
+/// "just make it not ast parse shit it obviously shouldn't." A root that IS or
+/// sits UNDER one of these is never built and never refreshed — an `ast.ttl`
+/// already inside one buys nothing, because a single bad adoption plants
+/// `.base-ast/` and would otherwise make itself permanent.
+///
+/// Deliberately NOT wired into [`crate::config::ast_app_root`]: resolution
+/// stays honest about which folder owns a path, and only the decision to build
+/// changes. An explicit `base sync --ast --target <path>` from a human still
+/// runs, with the extractor's own prompt.
+pub fn never_map_reason(root: &Path) -> Option<&'static str> {
+    never_map_reason_with(root, crate::home::isolation_active())
+}
+
+/// [`never_map_reason`] with the sandbox exemption as an explicit input, so
+/// both halves are testable from a test binary — which is itself isolated, and
+/// could otherwise never observe the temp rule it depends on.
+pub fn never_map_reason_with(root: &Path, isolated: bool) -> Option<&'static str> {
+    let parts = lower_components(root);
+
+    // Always armed, in tests too.
+    for (i, name) in parts.iter().enumerate() {
+        if let Some(&(_, why)) = NEVER_MAP_SEGMENTS.iter().find(|(n, _)| n == name) {
+            return Some(why);
+        }
+        if i > 0 && parts[i - 1] == "appdata" && APPDATA_CHILDREN.contains(&name.as_str()) {
+            return Some("a Windows AppData directory");
+        }
+    }
+    if is_foreign_home(&parts) {
+        return Some("the other OS's home directory");
+    }
+    if let Some(why) = under_any(root, &state_roots()) {
+        return Some(why);
+    }
+
+    // The system temp directory is also where every test builds its fixture
+    // workspaces, and `home::within_sandbox` already defines it as this
+    // process's sandbox. Disarm this half — and only this half — while
+    // isolated. `isolation_active` is off for every `cargo build` and
+    // `cargo run`, so production keeps the guard.
+    if isolated {
+        return None;
+    }
+    if parts.iter().any(|p| TEMP_SEGMENTS.contains(&p.as_str())) {
+        return Some("a temp directory");
+    }
+    under_any(root, &temp_roots())
+}
+
+/// `/mnt/c/Users/<name>` — a Windows home seen from a WSL hook, which its own
+/// `real_home()` (`/home/<user>`) cannot recognise, so `SkipHome` never fires.
+/// Matched EXACTLY, never as a prefix: real projects live under that home and
+/// must keep mapping normally.
+fn is_foreign_home(parts: &[String]) -> bool {
+    matches!(
+        parts,
+        [mnt, drive, users, _name]
+            if mnt == "mnt"
+                && users == "users"
+                && drive.len() == 1
+                && drive.chars().all(|c| c.is_ascii_alphabetic())
+    )
+}
+
+/// Caches and per-user state that hold no project of anyone's: never mapped,
+/// isolated process or not.
+fn state_roots() -> Vec<(PathBuf, &'static str)> {
+    let mut v: Vec<(PathBuf, &'static str)> = Vec::new();
+    if let Some(p) = dirs::cache_dir() {
+        v.push((p, "a cache directory"));
+    }
+    // Only on Windows: `dirs` maps these to `~/.config` and `~/.local/share`
+    // on Linux, which are not what `%APPDATA%` means and not on the list.
+    if cfg!(windows) {
+        for p in [dirs::config_dir(), dirs::data_dir(), dirs::data_local_dir()].into_iter().flatten() {
+            v.push((p, "a Windows AppData directory"));
+        }
+        for key in ["LOCALAPPDATA", "APPDATA"] {
+            if let Some(val) = std::env::var_os(key)
+                && !val.is_empty()
+            {
+                v.push((PathBuf::from(val), "a Windows AppData directory"));
+            }
+        }
+    }
+    if let Some(h) = crate::home::real_home() {
+        v.push((h.join(".cache"), "a cache directory"));
+        v.push((h.join(".claude"), "the Claude Code state directory"));
+        v.push((h.join(".base-gbl"), "base's own global tier"));
+    }
+    v
+}
+
+/// Every spelling of "the temp directory" this process can see.
+fn temp_roots() -> Vec<(PathBuf, &'static str)> {
+    let mut v: Vec<(PathBuf, &'static str)> = vec![(std::env::temp_dir(), "the OS temp directory")];
+    for key in ["TMPDIR", "TEMP", "TMP"] {
+        if let Some(val) = std::env::var_os(key)
+            && !val.is_empty()
+        {
+            v.push((PathBuf::from(val), "the OS temp directory"));
+        }
+    }
+    v.push((PathBuf::from("/tmp"), "the OS temp directory"));
+    v.push((PathBuf::from("/var/tmp"), "the OS temp directory"));
+    v
+}
+
+fn under_any(root: &Path, roots: &[(PathBuf, &'static str)]) -> Option<&'static str> {
+    roots.iter().find(|(anc, _)| is_under(root, anc)).map(|(_, why)| *why)
+}
+
+/// `root` is `anc` or sits inside it, compared at a component boundary so
+/// `/tmpfoo` is not under `/tmp`. Both sides are canonicalised when that
+/// succeeds — which is what makes `%TEMP%`'s 8.3 short form
+/// `C:\Users\CHRIS~1\AppData\Local\Temp` match the long spelling — and
+/// compared raw when it does not, since a candidate root need not exist yet.
+fn is_under(root: &Path, anc: &Path) -> bool {
+    let norm = |p: &Path| {
+        let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = real.to_string_lossy().replace('\\', "/");
+        let s = s.trim_end_matches('/').to_string();
+        if cfg!(windows) { s.to_lowercase() } else { s }
+    };
+    let (r, a) = (norm(root), norm(anc));
+    if a.is_empty() {
+        return false;
+    }
+    r == a || r.starts_with(&format!("{a}/"))
+}
+
+/// A path's normal components, lowercased. Case folding is unconditional: every
+/// name matched against them is either a canonical lowercase dot-directory or a
+/// Windows name, and no project is legitimately called `node_modules`.
+fn lower_components(p: &Path) -> Vec<String> {
+    p.components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// At least one code file under `dir`, looking `PROBE_DEPTH` deep and at most
 /// `PROBE_ENTRIES` entries, skipping the noise directories. Bounded so a huge
 /// folder costs a few milliseconds, not a walk.
@@ -597,7 +819,7 @@ pub fn has_code_files(dir: &Path) -> bool {
             if ft.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if depth + 1 < PROBE_DEPTH && !name.starts_with('.') && !NOISE_DIRS.contains(&name.as_ref()) {
+                if depth + 1 < PROBE_DEPTH && !name.starts_with('.') && !is_noise_dir(&name) {
                     stack.push((path, depth + 1));
                 }
             } else if ft.is_file()
