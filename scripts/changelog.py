@@ -18,7 +18,7 @@ subjects:
     fix(scope): ...         Fixed, with every issue its body closes linked
     Revert "<subject>"      dropped, together with the commit it names
     chore(release): ...     dropped
-    test(...): ...          dropped
+    test(...), fix(tests)   dropped -- nothing a reader can act on
     Merge ...               dropped
     anything else           Changed
 
@@ -119,7 +119,10 @@ def classify(subject):
     m = CONVENTIONAL.match(subject)
     if m:
         kind, scope, rest = m.group("type"), m.group("scope"), m.group("rest")
-        if kind == "test":
+        # Test work is dropped by type and by scope. `fix(tests): isolate cargo
+        # test from the real global graph` is a real fix and belongs in the
+        # history, but there is nothing a reader of a changelog can do with it.
+        if kind == "test" or scope in ("test", "tests"):
             return None, None
         if kind == "chore" and scope == "release":
             return None, None

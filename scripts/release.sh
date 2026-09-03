@@ -72,6 +72,12 @@ echo "==> committed $(git rev-parse --short HEAD), tagged v$NEW"
 if [ "$PUSH" = 1 ]; then
   git push origin main "v$NEW"
   echo "==> pushed; the Release workflow builds the binaries and base update picks them up"
+  # `fixed-in:<version>`, not the close, is what flips an entry on the docs
+  # site's Known issues page. Never fatal: the release is already out, and this
+  # can be re-run by hand.
+  echo "==> label issues closed since the previous release"
+  python3 scripts/label-fixed-in.py "$NEW" || echo "    (labelling failed; re-run: scripts/label-fixed-in.py $NEW)"
 else
   echo "push with: git push origin main v$NEW"
+  echo "then label the issues it fixed: scripts/label-fixed-in.py $NEW"
 fi
