@@ -39,6 +39,15 @@ if git rev-parse -q --verify "refs/tags/v$NEW" >/dev/null; then
   echo "tag v$NEW already exists"; exit 2
 fi
 
+# Cheap, and it runs the exact line below against a scratch copy first. A broken
+# invocation then stops the release before the version bump instead of after it.
+echo "==> check the release's own command lines"
+./scripts/test-release-invocations.sh > /dev/null || {
+  echo "a command line this script assembles does not run; details:"
+  ./scripts/test-release-invocations.sh
+  exit 1
+}
+
 echo "==> $OLD -> $NEW"
 # The [package] version is the first `version = ` line in Cargo.toml.
 sed -i "0,/^version = \"$OLD\"/s//version = \"$NEW\"/" Cargo.toml
