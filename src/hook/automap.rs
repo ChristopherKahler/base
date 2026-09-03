@@ -728,13 +728,6 @@ pub fn is_noise_dir(name: &str) -> bool {
 /// changes. An explicit `base sync --ast --target <path>` from a human still
 /// runs, with the extractor's own prompt.
 pub fn never_map_reason(root: &Path) -> Option<&'static str> {
-    never_map_reason_with(root, crate::home::isolation_active())
-}
-
-/// [`never_map_reason`] with the sandbox exemption as an explicit input, so
-/// both halves are testable from a test binary — which is itself isolated, and
-/// could otherwise never observe the temp rule it depends on.
-pub fn never_map_reason_with(root: &Path, isolated: bool) -> Option<&'static str> {
     let parts = lower_components(root);
 
     // Always armed, in tests too.
@@ -754,17 +747,33 @@ pub fn never_map_reason_with(root: &Path, isolated: bool) -> Option<&'static str
     }
 
     // The system temp directory is also where every test builds its fixture
-    // workspaces, and `home::within_sandbox` already defines it as this
-    // process's sandbox. Disarm this half — and only this half — while
-    // isolated. `isolation_active` is off for every `cargo build` and
-    // `cargo run`, so production keeps the guard.
-    if isolated {
+    // workspaces, so this half — and only this half — stands down inside a
+    // sandbox: a process whose HOME has itself been redirected under temp.
+    //
+    // Deliberately NOT keyed on `home::isolation_active()`, which was the first
+    // attempt. `isolation-guard` reaches the ordinary binary through the
+    // self-dev-dependency, so that version disarmed the temp rule in a plain
+    // `base` too — measured 2026-09-03 on `target/debug/base`, which skipped a
+    // `node_modules` path correctly while happily mapping a marked directory
+    // under `/tmp`. A production guard never keys on a compile-time feature.
+    if in_sandbox_home(root) {
         return None;
     }
     if parts.iter().any(|p| TEMP_SEGMENTS.contains(&p.as_str())) {
         return Some("a temp directory");
     }
     under_any(root, &temp_roots())
+}
+
+/// True when `root` sits inside a home that has itself been redirected under a
+/// temp root — a test's fixture workspace rather than a real tree. In
+/// production `home_root()` is the operator's home and is never under temp, so
+/// this is false however the crate's features happen to resolve.
+fn in_sandbox_home(root: &Path) -> bool {
+    let Some(home) = crate::home::home_root() else {
+        return false;
+    };
+    under_any(&home, &temp_roots()).is_some() && is_under(root, &home)
 }
 
 /// `/mnt/c/Users/<name>` — a Windows home seen from a WSL hook, which its own
