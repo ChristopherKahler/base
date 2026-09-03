@@ -1439,6 +1439,13 @@ pub fn run() {
                     Some(MapPlan::SkipHome) => println!("{}: the home directory is never mapped", abs.display()),
                     Some(MapPlan::SkipHub) => println!("{}: a workspace of apps — each app maps itself", abs.display()),
                     Some(MapPlan::SkipNeverMap(why)) => println!("{}: never mapped — {why}", abs.display()),
+                    Some(MapPlan::NeedsConfirm) => println!(
+                        "{}: {}",
+                        abs.display(),
+                        std::fs::read_to_string(abs.join(".base-ast").join(".needs-confirm"))
+                            .unwrap_or_else(|_| "too large to build unattended".into())
+                            .trim()
+                    ),
                     Some(MapPlan::Refresh) => println!("{}: refreshing", abs.display()),
                 }
             }
