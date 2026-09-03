@@ -1,0 +1,31 @@
+name: Tell the docs site an issue changed
+
+# The Known issues page is rendered from this tracker, so anything that changes
+# which issues are `bug` + `confirmed`, or which carry a `fixed-in:` label, has
+# to reach the docs repository. It polls daily as well, so a missed dispatch
+# costs a day rather than a stale page.
+
+on:
+  issues:
+    types: [opened, closed, reopened, labeled, unlabeled, edited, deleted]
+
+permissions: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch to basemode-docs
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "DOCS_DISPATCH_TOKEN is not set; the docs site will pick this up on its"
+            echo "daily render instead. Skipping."
+            exit 0
+          fi
+          curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/ChristopherKahler/basemode-docs/dispatches \
+            -d '{"event_type":"base-issues"}'

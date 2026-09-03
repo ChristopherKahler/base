@@ -1,0 +1,43 @@
+name: Triage a bug report
+
+# A bug report gets a reasoned comment and exactly one of `confirmed`,
+# `needs-info` or `not-a-bug`. The label is what matters: the docs site renders
+# its Known issues page from `bug` + `confirmed` issues, so this is what puts a
+# real bug in front of readers and keeps a misfiled one off the page.
+#
+# It never closes an issue, and it stops on `human-verdict`, which is how a
+# person freezes automation on a report.
+
+on:
+  issues:
+    types: [opened, edited, labeled]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: triage-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    if: contains(github.event.issue.labels.*.name, 'bug')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet anthropic
+
+      - name: Read the report against this release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: python3 scripts/triage-issue.py

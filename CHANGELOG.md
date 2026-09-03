@@ -117,5 +117,3 @@ Windows installs older than 0.13.4: see the v0.13.4 notes for the one-time boots
 - **tier**: resolve --global directly instead of walking up into the workspace tier
 - **sync**: let a first pull create graph.nq instead of refusing
 - **plugin**: resolve manifest paths to one shape on Windows and unix
-- **tests**: stop workspace resolution walking out of the sandbox
-- **tests**: isolate cargo test from the real global graph
