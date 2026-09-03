@@ -439,7 +439,7 @@ fn ensure_domain_sync(config: &BaseConfig, cwd: &Path) {
                 let needs_sync = needs_sync_check(&domains_toml, &marker);
                 if needs_sync
                     && domain::sync::sync_domains_to_graph(config, &global_dir, None).is_ok() {
-                        let _ = std::fs::write(&marker, "");
+                        let _ = touch_sync_marker(&marker);
                     }
             }
         }
@@ -461,8 +461,20 @@ fn ensure_domain_sync(config: &BaseConfig, cwd: &Path) {
     let needs_sync = needs_sync_check(&domains_toml, &marker);
     if needs_sync
         && domain::sync::sync_domains_to_graph(config, cwd, None).is_ok() {
-            let _ = std::fs::write(&marker, "");
+            let _ = touch_sync_marker(&marker);
         }
+}
+
+/// Close the guard: the marker must land NEWER than `domains.toml` on every
+/// filesystem, and an empty write does not do that. On NTFS, `fs::write(path, "")`
+/// onto an existing empty file leaves LastWriteTime exactly where it was (measured
+/// 2026-09-03 with a compiled probe on a copy of a real marker; the guard had been
+/// open on that machine since June, costing two full graph rewrites per prompt).
+/// A non-empty write moves it everywhere. The content is the sync time, so the
+/// file also says when the last good sync ran.
+fn touch_sync_marker(marker: &Path) -> std::io::Result<()> {
+    let stamp = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    std::fs::write(marker, format!("{stamp}\n"))
 }
 
 /// Check if a domains.toml is newer than its sync marker. Pure and path-scoped
