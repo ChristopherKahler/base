@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use base::hook::automap::{
-    bash_paths, ensure_first_map, is_noise_dir, linux_paths, measure_tree, never_map_reason_with,
-    plan_root, session_root, wsl_script, RootFacts, RootPlan,
+    bash_first_contact, bash_paths, ensure_first_map, is_noise_dir, linux_paths, measure_tree,
+    never_map_reason_with, plan_root, session_root, wsl_script, RootFacts, RootPlan,
 };
 use base::hook::stop::{plan_map, MapPlan};
 
@@ -414,4 +414,46 @@ fn the_fuse_measures_what_the_extractor_will_read() {
 
     let after = measure_tree(&app);
     assert_eq!(after.sources, 5, "150 skipped files stayed out of the count");
+}
+
+
+/// A command's `cd` is transient; a session's cwd is a choice. Walking through
+/// an unmarked folder never adopts it — but booting a session in that same
+/// folder still does, because Chris's 2026-09-01 rule outranks this one.
+#[test]
+fn a_cd_never_adopts_an_unmarked_folder_but_a_session_cwd_still_does() {
+    // SAFETY: single-process test env; every test in this crate tolerates it set.
+    unsafe { std::env::set_var("BASE_AST_NO_SPAWN", "1") };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let loose = home.join("dev").join("passing-through");
+    std::fs::create_dir_all(&loose).unwrap();
+    std::fs::write(loose.join("main.py"), "x = 1\n").unwrap();
+
+    base::home::with_thread_home(&home, || {
+        // The path a `cd` names, exactly as pre-tool-use derives it.
+        let named = bash_paths(
+            &format!("cd {} && python main.py", loose.display()),
+            &home,
+            Some(&home),
+        );
+        assert_eq!(named, vec![loose.clone()], "the cd target is what gets contacted");
+
+        assert_eq!(bash_first_contact(&loose), None, "walking through it adopts nothing");
+        assert!(!loose.join(".base-ast").exists(), "…and leaves no marker behind");
+
+        // THE NEGATIVE CONTROL. The same folder, as the session's own cwd, is
+        // still adopted — this rule must not narrow session-start adoption.
+        assert_eq!(session_root(&loose), RootPlan::Adopt(loose.clone()));
+        assert_eq!(ensure_first_map(&loose), Some(MapPlan::Build));
+    });
+
+    // Once something marks it, a `cd` reaches it like any other app.
+    let marked = home.join("dev").join("real-repo");
+    std::fs::create_dir_all(marked.join(".git")).unwrap();
+    std::fs::write(marked.join("main.py"), "x = 1\n").unwrap();
+    base::home::with_thread_home(&home, || {
+        assert_eq!(bash_first_contact(&marked), Some(MapPlan::Build), "a marked repo is contacted normally");
+    });
 }
