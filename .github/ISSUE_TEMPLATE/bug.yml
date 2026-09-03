@@ -1,0 +1,54 @@
+name: Bug report
+description: Something base does that it should not, or does not do that it should.
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: base version
+      description: Paste the output of `base --version`.
+      placeholder: base 0.13.15
+    validations:
+      required: true
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host and OS
+      options:
+        - Claude Code on Windows
+        - Claude Code on WSL or Linux
+        - Claude Code on macOS
+        - Codex
+        - Antigravity
+        - Other (say which below)
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you saw. Paste the exact output or error text.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The commands, in order, from a state someone else can reach.
+      placeholder: |
+        base scaffold /tmp/x
+        cd /tmp/x
+        base rule add --domain x --text "..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Workaround, if you found one
+      description: This line is shown on the Known issues page while the bug is open.
