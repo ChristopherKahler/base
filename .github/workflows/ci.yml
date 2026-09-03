@@ -17,12 +17,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        # `release.sh` reads `v$OLD..HEAD`, so the rehearsal below needs tags.
+        with:
+          fetch-depth: 0
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: cargo test
         run: cargo test
+      # Cut a whole release in a throwaway clone. It runs here rather than in a
+      # job of its own because it reuses this one's target directory and cargo
+      # registry; on its own it would pay for both again. 0.13.16's first
+      # attempt died on a step order every other test passed.
+      - name: release rehearsal
+        run: ./scripts/test-release-rehearsal.sh
 
   # Every changelog.py command line the release assembles, run with the argv it
   # assembles. 0.13.16 nearly died on one that every other test had missed.
