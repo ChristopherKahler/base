@@ -433,6 +433,24 @@ pub fn first_contact(path: &Path) -> Option<MapPlan> {
     ensure_first_map(&root)
 }
 
+/// First contact from a path a Bash command merely NAMED. Same decisions as
+/// [`first_contact`], except the resolved root must already be marked: a
+/// command's `cd` is transient, a session's cwd is a choice. Booting a session
+/// in an unmarked folder of source still adopts it (Chris, 2026-09-01) — but
+/// passing through one on the way to somewhere else does not.
+///
+/// `config::ast_app_root` happens to require a marker today, so the check here
+/// is belt and braces. That is deliberate: the rule now lives somewhere it can
+/// be tested, instead of being an accident of resolution that a later change to
+/// `ast_app_root` could quietly undo.
+pub fn bash_first_contact(path: &Path) -> Option<MapPlan> {
+    let root = crate::config::ast_app_root(path)?;
+    if !is_marked(&root) {
+        return None;
+    }
+    ensure_first_map(&root)
+}
+
 /// First contact that builds in the FOREGROUND and returns when the map has
 /// landed. For a caller whose process must outlive the build: a `wsl -e sh`
 /// invocation from Windows ends the moment its shell exits and takes every

@@ -64,7 +64,9 @@ pub fn handle(
         let home = crate::home::home_root();
         for p in crate::hook::automap::bash_paths(cmd, cwd, home.as_deref()) {
             if p.exists() {
-                crate::hook::automap::first_contact(&p);
+                // Marked roots only — a `cd` through a folder is not the same
+                // choice as booting a session in it. See `bash_first_contact`.
+                crate::hook::automap::bash_first_contact(&p);
             }
         }
         crate::hook::automap::delegate_wsl_contact(&crate::hook::automap::linux_paths(cmd));
