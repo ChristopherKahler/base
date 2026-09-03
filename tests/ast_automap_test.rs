@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use base::hook::automap::{
     bash_first_contact, bash_paths, ensure_first_map, is_noise_dir, linux_paths, measure_tree,
-    never_map_reason_with, plan_root, session_root, wsl_script, RootFacts, RootPlan,
+    never_map_reason, plan_root, session_root, wsl_script, RootFacts, RootPlan,
 };
 use base::hook::stop::{plan_map, MapPlan};
 
@@ -215,13 +215,15 @@ fn wsl_commands_hand_their_linux_paths_over() {
 /// the other OS's home are never mapped — from any hook, marked or not.
 #[test]
 fn the_places_a_hook_never_maps() {
-    let why = |p: &str| never_map_reason_with(Path::new(p), false);
+    // Called with this process's REAL home, which is not under temp, so both
+    // halves are armed exactly as they are in production.
+    let why = |p: &str| never_map_reason(Path::new(p));
 
     // 1. The OS temp directory itself, and a path three levels under it.
     let tmp = std::env::temp_dir();
     assert!(why(&tmp.to_string_lossy()).is_some(), "the temp dir itself: {}", tmp.display());
     let deep = tmp.join("claude").join("sess").join("scratchpad");
-    assert!(never_map_reason_with(&deep, false).is_some(), "three levels under temp");
+    assert!(never_map_reason(&deep).is_some(), "three levels under temp");
     // The exact shape the 11:43 run walked, seen from a WSL hook — where not
     // one of %TEMP% / %TMP% / TMPDIR is set, so only the segment rule fires.
     assert_eq!(why("/mnt/c/Users/Chris/AppData/Local/Temp"), Some("a Windows AppData directory"));
@@ -257,23 +259,38 @@ fn the_places_a_hook_never_maps() {
     assert_eq!(why("/home/u/dev/Local/app"), None, "Local without AppData above it is a project");
 }
 
-/// The sandbox exemption, both directions. Every test in this suite builds its
-/// fixture workspace under the system temp dir, and `home::within_sandbox`
-/// already defines that dir as the sandbox — so the temp half, and only the
-/// temp half, stands down while isolated.
+/// The sandbox exemption, both directions. Every test here builds its fixture
+/// under the system temp dir, so the temp half has to stand down somewhere —
+/// but ONLY for a process whose home is itself redirected under temp. Keying it
+/// on the `isolation-guard` feature instead was the first attempt and was
+/// wrong: that feature reaches the ordinary binary through the crate's
+/// self-dev-dependency, and disarmed the guard in a plain `base` too.
 #[test]
-fn the_temp_rule_stands_down_inside_the_test_sandbox() {
+fn the_temp_rule_stands_down_only_inside_a_redirected_home() {
     let tmp = tempfile::tempdir().unwrap();
-    let app = tmp.path().join("home").join("dev").join("app");
+    let home = tmp.path().join("home");
+    let app = home.join("dev").join("app");
 
-    assert_eq!(never_map_reason_with(&app, true), None, "a fixture workspace is mappable while isolated");
-    assert!(never_map_reason_with(&app, false).is_some(), "…and never mappable in production");
+    // Outside any redirected home this process's home is the real one, so the
+    // guard is armed exactly as it is in a shipped binary.
+    assert!(never_map_reason(&app).is_some(), "a temp path is never mappable in production");
 
-    // The segment rules stay armed even in the sandbox: a node_modules inside
-    // a fixture is still a node_modules.
-    let vendored = app.join("node_modules").join("react");
-    assert_eq!(never_map_reason_with(&vendored, true), Some("a node_modules tree"));
-    assert_eq!(never_map_reason_with(&app.join(".claude"), true), Some("the Claude Code state directory"));
+    // Inside a home that has itself been redirected under temp, the temp half
+    // stands down so fixtures can be adopted — and nothing else does.
+    base::home::with_thread_home(&home, || {
+        assert_eq!(never_map_reason(&app), None, "a fixture inside the sandbox home is mappable");
+        assert_eq!(
+            never_map_reason(&app.join("node_modules").join("react")),
+            Some("a node_modules tree"),
+            "the segment rules stay armed in the sandbox too"
+        );
+        assert_eq!(never_map_reason(&app.join(".claude")), Some("the Claude Code state directory"));
+
+        // A temp path OUTSIDE the sandbox home is still refused, even from an
+        // isolated process: the exemption is this sandbox, not the temp dir.
+        let elsewhere = std::env::temp_dir().join("some-other-tree");
+        assert!(never_map_reason(&elsewhere).is_some(), "only this sandbox is exempt");
+    });
 }
 
 /// A map that already exists inside a never-mapped root buys nothing. This is
@@ -284,7 +301,7 @@ fn the_temp_rule_stands_down_inside_the_test_sandbox() {
 fn an_existing_map_inside_a_never_mapped_root_is_not_refreshed() {
     let home = Path::new("/home/u");
     let temp_app = Path::new("/mnt/c/Users/Chris/AppData/Local/Temp");
-    let never = never_map_reason_with(temp_app, false);
+    let never = never_map_reason(temp_app);
     assert!(never.is_some());
 
     assert_eq!(plan_map(temp_app, Some(home), never, false, false), MapPlan::SkipNeverMap("a Windows AppData directory"));
