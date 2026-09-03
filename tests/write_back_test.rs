@@ -171,3 +171,122 @@ fn every_write_appends_exactly_one_changelog_record() {
     store::write_back(&store_with(2), &path, Change::Op("test.log-2")).unwrap();
     assert_eq!(log_lines(&path), 2);
 }
+
+// ─── the failure paths: an error is an error, the original survives ─────────
+
+/// A sink that accepts `limit` bytes and then fails every write — a full disk,
+/// a yanked drive, a permission that vanished mid-dump.
+struct FailAfter<W: std::io::Write> {
+    inner: W,
+    left: usize,
+}
+
+impl<W: std::io::Write> std::io::Write for FailAfter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Err(std::io::Error::other("sink failed after its byte budget"));
+        }
+        let n = buf.len().min(self.left);
+        let n = self.inner.write(&buf[..n])?;
+        self.left -= n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A seeded graph on disk: (path, its bytes, its mtime, its changelog length).
+fn seeded(root: &Path) -> (PathBuf, Vec<u8>, SystemTime, usize) {
+    let path = graph_path(root);
+    store::write_back(&store_with(200), &path, Change::Op("test.seed")).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    (path.clone(), bytes, mtime, log_lines(&path))
+}
+
+fn assert_original_survived(path: &Path, bytes: &[u8], mtime: SystemTime, log: usize, what: &str) {
+    assert_eq!(fs::read(path).unwrap(), bytes, "{what}: the original file is byte-identical");
+    assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), mtime, "{what}: the original file was not rewritten");
+    assert!(tmp_files(path.parent().unwrap()).is_empty(), "{what}: no temp file is left behind");
+    assert_eq!(log_lines(path), log, "{what}: nothing was logged for a write that did not land");
+}
+
+#[test]
+fn a_sink_that_fails_mid_dump_is_an_error_and_the_original_survives() {
+    // 0: the very first write fails. 4096: inside the first buffer flush.
+    // 1 MiB + 17: the second buffer flush, past the first full chunk.
+    for limit in [0usize, 4096, (1 << 20) + 17] {
+        let root = tempfile::tempdir().unwrap();
+        let (path, bytes, mtime, log) = seeded(root.path());
+        let big = store_with(60_000); // ~3.6 MB of N-Quads, several buffer flushes
+
+        let result = store::write_back_seamed(
+            &big,
+            &path,
+            Change::Op("test.fail"),
+            |file| FailAfter { inner: file, left: limit },
+            None,
+        );
+
+        let err = result.expect_err("a failed write must surface as an error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("sink failed after its byte budget"), "the sink's own error is in the chain, got: {msg}");
+        assert_original_survived(&path, &bytes, mtime, log, &format!("limit={limit}"));
+    }
+}
+
+#[test]
+fn a_flush_failure_after_a_clean_dump_is_an_error_and_the_original_survives() {
+    // The dump fits the 1 MiB buffer entirely, so the sink sees its first byte —
+    // and fails — only at the explicit flush. This is the "tmp cut at a line
+    // boundary parses clean" case the buffer must not be allowed to hide.
+    let root = tempfile::tempdir().unwrap();
+    let (path, bytes, mtime, log) = seeded(root.path());
+
+    let result = store::write_back_seamed(
+        &store_with(1_000),
+        &path,
+        Change::Op("test.flush"),
+        |file| FailAfter { inner: file, left: 0 },
+        None,
+    );
+
+    let msg = format!("{:#}", result.expect_err("the flush error must propagate"));
+    assert!(msg.contains("Failed to flush"), "the flush step names itself, got: {msg}");
+    assert_original_survived(&path, &bytes, mtime, log, "flush");
+}
+
+#[test]
+fn a_quad_count_mismatch_is_an_error_naming_both_counts_and_the_original_survives() {
+    let root = tempfile::tempdir().unwrap();
+    let (path, bytes, mtime, log) = seeded(root.path());
+
+    let result = store::write_back_seamed(&store_with(1_000), &path, Change::Op("test.count"), |file| file, Some(999));
+
+    let msg = format!("{:#}", result.expect_err("a short file must not be renamed into place"));
+    assert!(msg.contains("999") && msg.contains("1000"), "both counts are named, got: {msg}");
+    assert_original_survived(&path, &bytes, mtime, log, "count");
+}
+
+#[test]
+fn the_seam_with_no_injection_behaves_exactly_like_write_back() {
+    let root = tempfile::tempdir().unwrap();
+    let path = graph_path(root.path());
+    store::write_back_seamed(&store_with(1_000), &path, Change::Op("test.identity"), |file| file, None).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), raw_dump(&store_with(1_000)));
+    assert_eq!(log_lines(&path), 1);
+}
+
+// ─── Q4: what the count costs ────────────────────────────────
+
+#[test]
+#[ignore = "measurement, run with --ignored; prints Store::len() cost on 60k quads"]
+fn measure_store_len_cost_on_sixty_thousand_quads() {
+    let store = store_with(60_000);
+    let t = std::time::Instant::now();
+    let n = store.len().unwrap();
+    let elapsed = t.elapsed();
+    println!("Store::len() on {n} quads: {elapsed:?}");
+    assert_eq!(n, 60_000);
+}

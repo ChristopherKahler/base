@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -570,6 +570,40 @@ pub fn query_union(store: &Store, sparql: &str) -> Result<QueryResults> {
 /// that forgets to log is indistinguishable, to the reader, from no write at all;
 /// requiring it makes that a compile error instead of a silent gap.
 pub fn write_back(store: &Store, path: &Path, change: Change<'_>) -> Result<()> {
+    write_back_inner(store, path, change, |file| file, None)
+}
+
+/// `write_back` with its two failure paths exposed for tests: `wrap` sees the
+/// freshly created temp file before the serializer writes a byte (a sink that
+/// fails after K bytes is how a flush failure is provoked), and `validation_len`
+/// stands in for the validation store's quad count. Compiled only with the
+/// `isolation-guard` feature, which the self dev-dependency turns on for every
+/// test build and nothing turns on for `cargo build`. One implementation serves
+/// both entries; production passes the identity wrapper and `None`.
+#[cfg(feature = "isolation-guard")]
+pub fn write_back_seamed<W: Write>(
+    store: &Store,
+    path: &Path,
+    change: Change<'_>,
+    wrap: impl FnOnce(fs::File) -> W,
+    validation_len: Option<usize>,
+) -> Result<()> {
+    write_back_inner(store, path, change, wrap, validation_len)
+}
+
+/// Bytes the dump is buffered in before each write syscall. oxrdfio's serializer
+/// writes unbuffered — one syscall per term — and Windows charged ~9 s of kernel
+/// time per dump of a 13 MB graph for it. 1 MiB is thirteen syscalls for that
+/// file; the store it came from is already in memory many times over.
+const DUMP_BUFFER_BYTES: usize = 1 << 20;
+
+fn write_back_inner<W: Write>(
+    store: &Store,
+    path: &Path,
+    change: Change<'_>,
+    wrap: impl FnOnce(fs::File) -> W,
+    validation_len: Option<usize>,
+) -> Result<()> {
     crate::home::assert_isolated_write(path);
     let parent = path
         .parent()
@@ -610,29 +644,15 @@ pub fn write_back(store: &Store, path: &Path, change: Change<'_>) -> Result<()> 
         }
     }
 
-    let mut tmp_file = fs::File::create(&tmp_path)
+    let tmp_file = fs::File::create(&tmp_path)
         .with_context(|| format!("Failed to create temp file {}", tmp_path.display()))?;
 
-    store
-        .dump_to_writer(RdfSerializer::from_format(GRAPH_FORMAT), &mut tmp_file)
-        .context("Failed to serialize store to NQuads")?;
-
-    // Flush and close the file handle before validation.
-    drop(tmp_file);
-
-    // Validate: re-parse the written file to catch serializer corruption.
-    {
-        let check_file = fs::File::open(&tmp_path)
-            .with_context(|| format!("Failed to re-open {} for validation", tmp_path.display()))?;
-        let check_reader = BufReader::new(check_file);
-        let check_store = Store::new().context("Failed to create validation store")?;
-        if let Err(e) = check_store.load_from_reader(GRAPH_FORMAT, check_reader) {
-            let _ = fs::remove_file(&tmp_path);
-            anyhow::bail!(
-                "write_back validation failed — serializer produced invalid output, \
-                 original file preserved. Parse error: {e}"
-            );
-        }
+    // From here on the temp file exists, so every failure removes it before it
+    // surfaces: a temp cut short at a line boundary parses clean, and a stale one
+    // is a trap for the next reader. The original graph is never touched.
+    if let Err(e) = dump_and_validate(store, &tmp_path, wrap(tmp_file), validation_len) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
     }
 
     // Atomic rename
@@ -652,6 +672,60 @@ pub fn write_back(store: &Store, path: &Path, change: Change<'_>) -> Result<()> 
     // the log append: best-effort, after the write landed, never fatal.
     crate::doorbell::ring(path);
 
+    Ok(())
+}
+
+/// Dump the store into `sink` through a buffer, close it, and prove the file
+/// holds every quad. Any `Err` here means the temp file must not be trusted.
+fn dump_and_validate<W: Write>(
+    store: &Store,
+    tmp_path: &Path,
+    sink: W,
+    validation_len: Option<usize>,
+) -> Result<()> {
+    let mut writer = BufWriter::with_capacity(DUMP_BUFFER_BYTES, sink);
+    store
+        .dump_to_writer(RdfSerializer::from_format(GRAPH_FORMAT), &mut writer)
+        .context("Failed to serialize store to NQuads")?;
+    // An explicit flush, propagated: `BufWriter`'s Drop flushes too but swallows
+    // the error, and a swallowed flush error is the one way a short file gets past
+    // the parse below. `into_inner` cannot fail after a successful flush; it is
+    // here because it is the only way to get the file back without a Drop.
+    writer
+        .flush()
+        .with_context(|| format!("Failed to flush {}", tmp_path.display()))?;
+    let sink = writer
+        .into_inner()
+        .map_err(|e| e.into_error())
+        .with_context(|| format!("Failed to flush {}", tmp_path.display()))?;
+    // Close the file handle before validation.
+    drop(sink);
+
+    // Validate: re-parse the written file to catch serializer corruption.
+    let check_file = fs::File::open(tmp_path)
+        .with_context(|| format!("Failed to re-open {} for validation", tmp_path.display()))?;
+    let check_reader = BufReader::new(check_file);
+    let check_store = Store::new().context("Failed to create validation store")?;
+    if let Err(e) = check_store.load_from_reader(GRAPH_FORMAT, check_reader) {
+        anyhow::bail!(
+            "write_back validation failed — serializer produced invalid output, \
+             original file preserved. Parse error: {e}"
+        );
+    }
+
+    // And that it holds every quad: a file that parses clean but stops early is
+    // exactly what a lost flush error would leave behind.
+    let want = store.len().context("Failed to count the store's quads")?;
+    let got = match validation_len {
+        Some(n) => n,
+        None => check_store.len().context("Failed to count the written file's quads")?,
+    };
+    if got != want {
+        anyhow::bail!(
+            "write_back validation failed — the written file holds {got} quads but the \
+             store holds {want}, original file preserved"
+        );
+    }
     Ok(())
 }
 
