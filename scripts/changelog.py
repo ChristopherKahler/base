@@ -9,6 +9,7 @@ it and nobody would have noticed until it shipped.
 
     scripts/changelog.py section v0.13.15 HEAD 0.13.16 [--date D] [--prepend F]
     scripts/changelog.py file v0.13.2 v0.13.3 ... v0.13.15 > CHANGELOG.md
+    scripts/changelog.py extract 0.13.16 > release-notes.md
 
 Classification of each commit subject, which is why the repo writes conventional
 subjects:
@@ -264,6 +265,22 @@ def cmd_file(args):
     print(HEADER.rstrip() + "\n\n" + "\n".join(reversed(blocks)).rstrip() + "\n", end="")
 
 
+def cmd_extract(args):
+    """The one section for a version, verbatim, for the GitHub release body."""
+    text = Path(args.file).read_text(encoding="utf-8")
+    want = f"## {args.version} "
+    lines = text.splitlines()
+    start = next((i for i, l in enumerate(lines) if l.startswith(want)), None)
+    if start is None:
+        sys.exit(
+            f"{args.file} has no section for {args.version}. "
+            "`cargo test` gates this on every release, so a tag that reaches here without one "
+            "was not cut by scripts/release.sh."
+        )
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    print("\n".join(lines[start:end]).rstrip())
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--notes-dir", default=str(Path(__file__).parent / "changelog-notes"))
@@ -280,6 +297,11 @@ def main():
     f = sub.add_parser("file", help="the whole file, from a list of consecutive tags")
     f.add_argument("tags", nargs="+")
     f.set_defaults(func=cmd_file)
+
+    e = sub.add_parser("extract", help="print one version's existing section")
+    e.add_argument("version")
+    e.add_argument("--file", default="CHANGELOG.md")
+    e.set_defaults(func=cmd_extract)
 
     args = p.parse_args()
     args.func(args)

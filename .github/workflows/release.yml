@@ -90,8 +90,31 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
+
+      # Every release body but three was this install template and nothing else,
+      # so the tag was the only record of what changed. CHANGELOG.md now carries
+      # that record, and `cargo test` refuses a version that has no section, so
+      # this step cannot find nothing.
+      - name: Release notes for this tag
+        run: |
+          python3 scripts/changelog.py extract "${GITHUB_REF_NAME#v}" > release-notes.md
+          cat >> release-notes.md <<'FOOTER'
+
+          ---
+          ## Install
+
+          ```bash
+          npx chrisai
+          ```
+
+          Or download the binary for your platform below.
+
+          **Chris AI Systems** · https://www.skool.com/claude-code-titans-9203
+          FOOTER
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -101,13 +124,30 @@ jobs:
             base-windows-x86_64.zip/base-windows-x86_64.zip
             base-darwin-aarch64.tar.gz/base-darwin-aarch64.tar.gz
             base-darwin-x86_64.tar.gz/base-darwin-x86_64.tar.gz
-          body: |
-            ## Install
+          body_path: release-notes.md
 
-            ```bash
-            npx chrisai
-            ```
-
-            Or download the binary for your platform below.
-
-            **Chris AI Systems** · https://www.skool.com/claude-code-titans-9203
+  # Tell the docs site a release happened. It fetches the coach's reference files
+  # and this changelog at the tag and opens its own pull request; nothing is
+  # pushed from here. Skipped rather than failed when the token is absent, so a
+  # release never fails on the docs half.
+  notify-docs:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch to basemode-docs
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+        run: |
+          # Tested in the shell rather than in an `if:` expression: the secrets
+          # context is not available to step conditions, and a skip that says why
+          # in the log beats one that silently evaluates to false.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "DOCS_DISPATCH_TOKEN is not set on this repository; the docs site will"
+            echo "pick this release up on its hourly poll instead. Skipping."
+            exit 0
+          fi
+          curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/ChristopherKahler/basemode-docs/dispatches \
+            -d "{\"event_type\":\"base-release\",\"client_payload\":{\"tag\":\"${GITHUB_REF_NAME}\",\"sha\":\"${GITHUB_SHA}\"}}"

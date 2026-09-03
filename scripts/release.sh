@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Cut a base release: bump, regenerate the base-help coach, test, commit, tag.
 #
-#   scripts/release.sh 0.13.15            bump + regen + full test suite + commit + tag
+#   scripts/release.sh 0.13.15            bump + regen + changelog + full suite + commit + tag
 #   scripts/release.sh 0.13.15 --push     ...then push main and the tag (CI builds the binaries)
 #   scripts/release.sh 0.13.15 --quick    gate on the help_docs tests only, skip the full suite
 #
 # Why a script: 0.13.13 shipped a Cargo.lock that cargo could not parse (a hand
-# bump), and twelve releases shipped a base-help coach stamped v0.13.2 because
-# nothing regenerated it. Every step here is one that was skipped at least once.
+# bump), twelve releases shipped a base-help coach stamped v0.13.2 because
+# nothing regenerated it, and thirteen shipped with no changelog entry at all.
+# Every step here is one that was skipped at least once.
 set -euo pipefail
 
-usage() { sed -n '2,10p' "$0"; exit 2; }
+usage() { sed -n '2,6p' "$0"; exit 2; }
 [ $# -ge 1 ] || usage
 NEW="$1"; shift
 PUSH=0; QUICK=0
@@ -51,6 +52,12 @@ fi
 echo "==> regenerate the base-help coach for $NEW"
 BASE_REGEN_DOCS=1 cargo test --quiet --bin base help_docs
 
+# The tag does not exist yet, so the range ends at HEAD and the date is today's
+# rather than the last commit's. src/help_docs.rs fails the suite below if this
+# step did not run, which is the whole reason it sits above the tests.
+echo "==> write the $NEW section of CHANGELOG.md"
+python3 scripts/changelog.py section "v$OLD" HEAD "$NEW" --date "$(date +%F)" --prepend CHANGELOG.md
+
 echo "==> test"
 if [ "$QUICK" = 1 ]; then
   cargo test --quiet --bin base help_docs
@@ -58,7 +65,7 @@ else
   cargo test --quiet
 fi
 
-git add Cargo.toml Cargo.lock README.md claude/skills/base-help
+git add Cargo.toml Cargo.lock README.md CHANGELOG.md claude/skills/base-help
 git commit --quiet -m "chore(release): $NEW"
 git tag -a "v$NEW" -m "v$NEW"
 echo "==> committed $(git rev-parse --short HEAD), tagged v$NEW"

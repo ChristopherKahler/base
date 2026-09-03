@@ -16,6 +16,10 @@
 //! 4. Every `base ...` invocation the skill shows a reader resolves against
 //!    this binary: the subcommand path exists (aliases included) and every flag
 //!    it names is real and sits on the right command.
+//! 5. `CHANGELOG.md` has a section for the version in `Cargo.toml`. That one is
+//!    about the release rather than the coach, and it lives here because this is
+//!    the file that already refuses to let a release ship out of step with
+//!    itself: thirteen releases went out with no changelog entry at all.
 //!
 //! 1 and 2 are generated: `BASE_REGEN_DOCS=1 cargo test --bin base help_docs`
 //! rewrites them, and `scripts/release.sh` does that on every release. 3 and 4
@@ -47,6 +51,8 @@ const README_MD: &str = "README.md";
 const QA_MD: &str = "references/qa.md";
 const COMMANDS_MD: &str = "references/commands.md";
 const CLI_MD: &str = "references/cli.md";
+/// Not part of the skill; it sits at the repository root.
+const CHANGELOG_MD: &str = "CHANGELOG.md";
 
 const COMMANDS_TITLE: &str = "# base command reference (v";
 const SKILL_COUNT_PHRASE: &str = " verified Q&A pairs";
@@ -73,6 +79,19 @@ fn write(rel: &str, text: &str) {
     std::fs::write(&tmp, text).unwrap_or_else(|e| panic!("cannot write {}: {e}", tmp.display()));
     std::fs::rename(&tmp, &path)
         .unwrap_or_else(|e| panic!("cannot replace {}: {e}", path.display()));
+}
+
+fn changelog() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CHANGELOG_MD);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
+}
+
+/// The version of the newest section, i.e. the first `## ` line in the file.
+fn newest_changelog_version(text: &str) -> Option<&str> {
+    let heading = text.lines().find(|l| l.starts_with("## "))?;
+    heading[3..].split_whitespace().next()
 }
 
 fn regen_requested() -> bool {
@@ -701,6 +720,22 @@ mod tests {
              `base doctor` reports exactly this drift on every machine that installs the release.\n{HOW_TO_REGEN}\n",
             wrong.join("\n  ")
         );
+    }
+
+    #[test]
+    fn changelog_has_a_section_for_this_version() {
+        let text = changelog();
+        match newest_changelog_version(&text) {
+            Some(v) if v == VERSION => {}
+            other => panic!(
+                "\n{CHANGELOG_MD} has no entry for v{VERSION}; its newest section is {other:?}.\n\
+                 A release with no changelog entry is one nobody can read afterwards, and thirteen\n\
+                 of them shipped that way before this check existed.\n\
+                 `scripts/release.sh` writes the section as part of cutting a release. To write it\n\
+                 by hand for the version already in Cargo.toml:\n\
+                 \x20 python3 scripts/changelog.py section v<previous> HEAD {VERSION} --prepend {CHANGELOG_MD}\n"
+            ),
+        }
     }
 
     #[test]
