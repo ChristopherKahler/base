@@ -389,7 +389,7 @@ pub fn remove_trigger(
 }
 
 /// List all domains (for CLI output).
-pub fn list_domains(cwd: &Path) {
+pub fn list_domains(cwd: &Path, ns: &crate::config::NamespaceConfig) {
     let domains = load_domains(cwd);
     if domains.is_empty() {
         eprintln!("No domains configured.");
@@ -405,13 +405,40 @@ pub fn list_domains(cwd: &Path) {
             d.prompt_keywords.len(),
             d.file_keywords.len(),
             d.paths.len(),
-            d.rules.len(),
+            {
+                let (declared, added) = rules_of(cwd, ns, d);
+                declared.len() + added.len()
+            },
         );
     }
 }
 
+/// Every rule a domain injects: the ones declared in `domains.toml`, and the
+/// ones added with `base rule add`.
+///
+/// The two live in different stores by design. A CLI-added rule is written to
+/// the graph at `rule/<slug>/cli-N`, in its own IRI namespace, so that a
+/// `base sync` rebuilding a domain from `domains.toml` cannot delete it. The
+/// cost of that split was this: the readers only ever looked at the file, so
+/// `base domain get` answered `Rules (0)` for a domain whose rules were being
+/// injected on every matching tool call, and the natural reading of that is
+/// that `base rule add` had failed (#38).
+///
+/// A missing or unreadable graph yields the file half alone rather than an
+/// error: these are display commands, and a domain's declared rules are still
+/// worth showing outside a workspace.
+pub fn rules_of(
+    cwd: &Path,
+    ns: &crate::config::NamespaceConfig,
+    d: &DomainDef,
+) -> (Vec<String>, Vec<(u32, String)>) {
+    let declared: Vec<String> = d.rules.iter().map(|r| r.render()).collect();
+    let added = crate::crud::rule::fetch(cwd, ns, &d.name).unwrap_or_default();
+    (declared, added)
+}
+
 /// Show a specific domain's full config (for CLI output).
-pub fn get_domain(cwd: &Path, name: &str) {
+pub fn get_domain(cwd: &Path, ns: &crate::config::NamespaceConfig, name: &str) {
     let domains = load_domains(cwd);
     match domains.iter().find(|d| d.name == name) {
         Some(d) => {
@@ -445,9 +472,15 @@ pub fn get_domain(cwd: &Path, name: &str) {
             if let Some(fmt) = &d.format {
                 println!("Format: {fmt}");
             }
-            println!("Rules ({}):", d.rules.len());
-            for (i, rule) in d.rules.iter().enumerate() {
-                println!("  {i}. {}", rule.render());
+            let (declared, added) = rules_of(cwd, ns, d);
+            println!("Rules ({}):", declared.len() + added.len());
+            for (i, rule) in declared.iter().enumerate() {
+                println!("  {i}. {rule}");
+            }
+            // Numbered by their own index, which is what `base rule remove
+            // --index` takes; the two stores number independently.
+            for (n, text) in &added {
+                println!("  [cli-{n}] {text}");
             }
         }
         None => eprintln!("Domain '{name}' not found."),
