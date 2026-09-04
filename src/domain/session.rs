@@ -324,18 +324,18 @@ impl SessionState {
             return Bracket::Moderate; // default when brackets disabled
         }
 
-        if config.is_percent_mode() {
-            if let Some(pct) = context_pct {
-                return if pct <= config.fresh_until_pct {
-                    Bracket::Fresh
-                } else if pct <= config.moderate_until_pct {
-                    Bracket::Moderate
-                } else if pct <= config.depleted_until_pct {
-                    Bracket::Depleted
-                } else {
-                    Bracket::Critical
-                };
-            }
+        if config.is_percent_mode()
+            && let Some(pct) = context_pct
+        {
+            return if pct <= config.fresh_until_pct {
+                Bracket::Fresh
+            } else if pct <= config.moderate_until_pct {
+                Bracket::Moderate
+            } else if pct <= config.depleted_until_pct {
+                Bracket::Depleted
+            } else {
+                Bracket::Critical
+            };
         }
 
         let count = self.prompt_count_for(session_id);
@@ -571,8 +571,7 @@ mod tests {
 
     #[test]
     fn percent_mode_overrides_turn_count() {
-        let mut config = BracketConfig::default();
-        config.mode = Some("percent".into());
+        let config = BracketConfig { mode: Some("percent".into()), ..Default::default() };
         let mut state = SessionState::default();
         // 40 prompts would be CRITICAL on turns; 10% context says FRESH.
         state.prompt_counts.insert("s1".into(), 40);
@@ -622,10 +621,12 @@ mod tests {
         alpha.mark_standard_injected("std-1", 7);
         alpha.mark_ast_injected("src/main.rs", 3);
 
-        let mut beta = SessionState::default();
-        beta.injected = std::mem::take(&mut alpha.injected);
-        beta.standards_injected = std::mem::take(&mut alpha.standards_injected);
-        beta.ast_injected = std::mem::take(&mut alpha.ast_injected);
+        let mut beta = SessionState {
+            injected: std::mem::take(&mut alpha.injected),
+            standards_injected: std::mem::take(&mut alpha.standards_injected),
+            ast_injected: std::mem::take(&mut alpha.ast_injected),
+            ..Default::default()
+        };
         beta.set_active(Some("beta"));
 
         assert!(!beta.is_standard_injected("std-1", 7));
@@ -638,8 +639,7 @@ mod tests {
         alpha.mark_injected("shared-domain", 1);
         let stash = std::mem::take(&mut alpha.injected);
 
-        let mut beta = SessionState::default();
-        beta.injected = stash;
+        let mut beta = SessionState { injected: stash, ..Default::default() };
         beta.set_active(Some("beta"));
         beta.mark_injected("shared-domain", 1);
         beta.clear_dedup();
@@ -659,8 +659,7 @@ mod tests {
         alpha.mark_dirty_app("/repo/app-a");
         let stash = std::mem::take(&mut alpha.dirty_apps);
 
-        let mut beta = SessionState::default();
-        beta.dirty_apps = stash;
+        let mut beta = SessionState { dirty_apps: stash, ..Default::default() };
         beta.set_active(Some("beta"));
         beta.mark_dirty_app("/repo/app-b");
 

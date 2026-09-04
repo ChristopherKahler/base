@@ -157,21 +157,21 @@ pub fn get_data(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<Option<M
     );
 
     let results = crud::load_and_query(cwd, ns, &sparql)?;
-    if let QueryResults::Solutions(solutions) = results {
-        for row in solutions.filter_map(|r| r.ok()) {
-            let lit = |k: &str| row.get(k).map(|t| crud::term_display(t.into()));
-            let iri_s = |k: &str| row.get(k).map(|t| crud::slug_of(&crud::term_display(t.into())));
-            return Ok(Some(MilestoneRecord {
-                id: slug.to_string(),
-                name: lit("name").unwrap_or_default(),
-                status: lit("status").unwrap_or_default(),
-                description: lit("description"),
-                project: iri_s("proj"),
-                created: lit("created"),
-                updated: lit("updated"),
-                last_active: lit("lastActive"),
-            }));
-        }
+    if let QueryResults::Solutions(solutions) = results
+        && let Some(row) = solutions.filter_map(|r| r.ok()).next()
+    {
+        let lit = |k: &str| row.get(k).map(|t| crud::term_display(t.into()));
+        let iri_s = |k: &str| row.get(k).map(|t| crud::slug_of(&crud::term_display(t.into())));
+        return Ok(Some(MilestoneRecord {
+            id: slug.to_string(),
+            name: lit("name").unwrap_or_default(),
+            status: lit("status").unwrap_or_default(),
+            description: lit("description"),
+            project: iri_s("proj"),
+            created: lit("created"),
+            updated: lit("updated"),
+            last_active: lit("lastActive"),
+        }));
     }
     Ok(None)
 }

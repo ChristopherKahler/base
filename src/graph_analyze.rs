@@ -39,7 +39,7 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, top_n: usize) -> Result<()> {
         groups.entry(*c).or_default().push(id);
     }
     let mut group_vec: Vec<(usize, Vec<&String>)> = groups.into_iter().collect();
-    group_vec.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    group_vec.sort_by_key(|g| std::cmp::Reverse(g.1.len()));
 
     // ── Surprising connections: edges that bridge two communities ──
     let mut bridges: Vec<(String, String)> = Vec::new();
@@ -123,11 +123,11 @@ fn label_propagation(
             // Most frequent label; ties broken by smallest label id (determinism).
             let mut ranked: Vec<(usize, usize)> = counts.into_iter().collect();
             ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            if let Some((best, _)) = ranked.first() {
-                if label.get(*k) != Some(best) {
-                    label.insert((*k).clone(), *best);
-                    changed = true;
-                }
+            if let Some((best, _)) = ranked.first()
+                && label.get(*k) != Some(best)
+            {
+                label.insert((*k).clone(), *best);
+                changed = true;
             }
         }
         if !changed {

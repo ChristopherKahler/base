@@ -350,23 +350,23 @@ pub fn get_data(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<Option<P
     );
 
     let results = crud::load_and_query(cwd, ns, &sparql)?;
-    if let QueryResults::Solutions(solutions) = results {
-        for row in solutions.filter_map(|r| r.ok()) {
-            let cell = |k: &str| row.get(k).map(|t| crud::term_display(t.into()));
-            return Ok(Some(ProjectRecord {
-                id: slug.to_string(),
-                name: cell("name").unwrap_or_default(),
-                status: cell("status").unwrap_or_default(),
-                priority: cell("priority"),
-                path: cell("path"),
-                stage: cell("stage"),
-                blocked_by: cell("blockedBy"),
-                next_action: cell("nextAction"),
-                created: cell("created"),
-                updated: cell("updated"),
-                last_active: cell("lastActive"),
-            }));
-        }
+    if let QueryResults::Solutions(solutions) = results
+        && let Some(row) = solutions.filter_map(|r| r.ok()).next()
+    {
+        let cell = |k: &str| row.get(k).map(|t| crud::term_display(t.into()));
+        return Ok(Some(ProjectRecord {
+            id: slug.to_string(),
+            name: cell("name").unwrap_or_default(),
+            status: cell("status").unwrap_or_default(),
+            priority: cell("priority"),
+            path: cell("path"),
+            stage: cell("stage"),
+            blocked_by: cell("blockedBy"),
+            next_action: cell("nextAction"),
+            created: cell("created"),
+            updated: cell("updated"),
+            last_active: cell("lastActive"),
+        }));
     }
     Ok(None)
 }

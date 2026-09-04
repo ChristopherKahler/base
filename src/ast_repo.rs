@@ -36,10 +36,10 @@ fn install_hook(app_root: &Path, name: &str, branch_switch_only: bool) {
         return;
     }
     let path = hooks_dir.join(name);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        if !existing.contains(MARKER) {
-            return; // respect a pre-existing user hook
-        }
+    if let Ok(existing) = std::fs::read_to_string(&path)
+        && !existing.contains(MARKER)
+    {
+        return; // respect a pre-existing user hook
     }
     // post-checkout args: <old-ref> <new-ref> <branch-flag>; 1 == branch switch.
     let guard = if branch_switch_only {

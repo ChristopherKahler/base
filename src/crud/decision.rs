@@ -177,7 +177,6 @@ pub fn update(
     if let Some(v) = rationale { field("rationale", v); }
     if let Some(v) = recall { field("recall", v); }
     if let Some(v) = status { field("status", v); }
-    drop(field);
 
     updates.push(crud::field_update(&graph, &iri, &format!("{p}:updatedAt"), &format!("\"{now}\"^^xsd:dateTime")));
     updates.push(crud::field_update(&graph, &iri, &format!("{p}:lastActive"), &format!("\"{now}\"^^xsd:dateTime")));
