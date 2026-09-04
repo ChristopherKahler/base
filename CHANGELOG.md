@@ -7,6 +7,32 @@ fails when the version in `Cargo.toml` has no entry here.
 
 Releases before 0.13.3 are tagged in the repository but are not written up.
 
+## 0.13.16 (2026-09-04)
+
+### Added
+
+- **automap**: a size fuse before any unattended build
+- **triage**: vet bug reports and label the release that fixed them ([#24](https://github.com/ChristopherKahler/base/issues/24))
+- **release**: write the changelog entry at release time, and refuse a release without one ([#23](https://github.com/ChristopherKahler/base/issues/23))
+
+### Fixed
+
+- **automap**: the sandbox exemption covers the segments the sandbox itself sits under
+- **hook**: write the sync time into .domain-sync-ts so the guard closes on NTFS
+- **store**: buffer the write_back dump, propagate the flush, and count the quads it wrote
+- **automap**: key the temp exemption on the sandbox, never on a feature flag
+- **automap**: a shell `cd` never adopts an unmarked folder
+- **automap**: never map temp, caches, AppData, node_modules or the other OS's home
+- **release**: give the rehearsal clone a git identity
+- **release**: write the changelog before regenerating the coach ([#27](https://github.com/ChristopherKahler/base/issues/27))
+- **clippy**: the 26 lints rustc 1.98.1 raises, so CI's clippy job is green again
+- **changelog**: accept --date and --notes-dir after the subcommand ([#25](https://github.com/ChristopherKahler/base/issues/25))
+
+### Changed
+
+- **changelog**: CHANGELOG.md, generated from the tags by scripts/changelog.py ([#17](https://github.com/ChristopherKahler/base/issues/17))
+- CI on every PR, a bug issue form, triage labels, and the process in CONTRIBUTING.md ([#16](https://github.com/ChristopherKahler/base/issues/16))
+
 ## 0.13.15 (2026-09-03)
 
 ### Fixed
