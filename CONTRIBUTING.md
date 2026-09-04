@@ -15,6 +15,15 @@ Labels the pipeline reads:
 | `needs-info` | cannot be reproduced from what was given |
 | `not-a-bug` | works as designed; say why in a comment |
 | `fixed-in:<version>` | applied at release time to every issue closed since the previous tag |
+| `human-verdict` | a person has ruled; triage leaves the issue alone from then on |
+
+A verdict label is applied by `scripts/triage-issue.py --poll`, which a maintainer runs on their own
+machine — hourly here. It reads each untriaged report against the release's generated command
+reference with `claude -p`, posts one comment saying how it got there, and applies exactly one
+verdict. It never closes an issue. This is deliberately not a GitHub Action: a runner has no Claude
+login, and giving it one means keeping a billable credential in a repository secret to answer a
+handful of reports a week. The cost of it running on a machine instead is latency, which for this
+volume is an hour.
 
 ## Changes
 
