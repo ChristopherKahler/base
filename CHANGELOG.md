@@ -7,6 +7,15 @@ fails when the version in `Cargo.toml` has no entry here.
 
 Releases before 0.13.3 are tagged in the repository but are not written up.
 
+## 0.13.17 (2026-09-04)
+
+### Fixed
+
+- **domain**: count the rules a domain actually injects, not just the file's ([#38](https://github.com/ChristopherKahler/base/issues/38))
+- **triage**: read reports with the Claude Code CLI, polled from a machine
+- **rule**: the listing counts up too, and a test that fails on the old code ([#30](https://github.com/ChristopherKahler/base/issues/30))
+- **rule**: compare rule numbers as integers, not text
+
 ## 0.13.16 (2026-09-04)
 
 ### Added

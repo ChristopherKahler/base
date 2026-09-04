@@ -1,4 +1,4 @@
-# base CLI reference (v0.13.16)
+# base CLI reference (v0.13.17)
 
 Generated from this release's own command tree: the verbatim `--help` of every subcommand, exactly as the binary prints it. `src/help_docs.rs` in the base repo regenerates this file on every release and fails `cargo test` when it is behind the code, so when the version above matches `base --version`, every flag here is real. Do not edit by hand; regenerate with `BASE_REGEN_DOCS=1 cargo test --bin base help_docs`.
 
