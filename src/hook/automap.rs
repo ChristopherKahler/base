@@ -361,7 +361,6 @@ pub fn session_start_notice(cwd: &Path) -> Option<String> {
             std::fs::read_to_string(base_ast.join(".needs-confirm"))
                 .unwrap_or_default()
                 .trim()
-                .to_string()
         )),
         (MapPlan::Build, false) => Some(format!(
             "[AST] no code map for {} yet — building one now in the background \
@@ -730,19 +729,38 @@ pub fn is_noise_dir(name: &str) -> bool {
 pub fn never_map_reason(root: &Path) -> Option<&'static str> {
     let parts = lower_components(root);
 
-    // Always armed, in tests too.
-    for (i, name) in parts.iter().enumerate() {
+    // Inside a sandbox (see `sandbox_home`) the segment rules read only the
+    // part of the path BELOW the redirected home. The sandbox's own path is
+    // `%TEMP%`, which on Windows sits under `AppData\Local`: read whole, every
+    // fixture carried the `appdata`/`local` pair and was refused before the
+    // exemption below could stand the temp half down. Measured 2026-09-03 on
+    // the Windows mirror at b72703a: 5 of 13 automap tests failed for exactly
+    // this, while Linux passed because `/tmp` has no such segment.
+    let sandbox = sandbox_home(root);
+    let own_parts = match &sandbox {
+        Some(home) => fixture_components(root, home),
+        None => parts.clone(),
+    };
+
+    // Always armed, in tests too — on the fixture's own segments in a sandbox.
+    for (i, name) in own_parts.iter().enumerate() {
         if let Some(&(_, why)) = NEVER_MAP_SEGMENTS.iter().find(|(n, _)| n == name) {
             return Some(why);
         }
-        if i > 0 && parts[i - 1] == "appdata" && APPDATA_CHILDREN.contains(&name.as_str()) {
+        if i > 0 && own_parts[i - 1] == "appdata" && APPDATA_CHILDREN.contains(&name.as_str()) {
             return Some("a Windows AppData directory");
         }
     }
     if is_foreign_home(&parts) {
         return Some("the other OS's home directory");
     }
-    if let Some(why) = under_any(root, &state_roots()) {
+    // A state root the sandbox itself sits under (on Windows `%LOCALAPPDATA%`
+    // holds `%TEMP%`) is the sandbox's location, not the fixture's.
+    let state: Vec<(PathBuf, &'static str)> = state_roots()
+        .into_iter()
+        .filter(|(anc, _)| sandbox.as_ref().is_none_or(|home| !is_under(home, anc)))
+        .collect();
+    if let Some(why) = under_any(root, &state) {
         return Some(why);
     }
 
@@ -756,7 +774,7 @@ pub fn never_map_reason(root: &Path) -> Option<&'static str> {
     // `base` too — measured 2026-09-03 on `target/debug/base`, which skipped a
     // `node_modules` path correctly while happily mapping a marked directory
     // under `/tmp`. A production guard never keys on a compile-time feature.
-    if in_sandbox_home(root) {
+    if sandbox.is_some() {
         return None;
     }
     if parts.iter().any(|p| TEMP_SEGMENTS.contains(&p.as_str())) {
@@ -765,15 +783,29 @@ pub fn never_map_reason(root: &Path) -> Option<&'static str> {
     under_any(root, &temp_roots())
 }
 
-/// True when `root` sits inside a home that has itself been redirected under a
-/// temp root — a test's fixture workspace rather than a real tree. In
-/// production `home_root()` is the operator's home and is never under temp, so
-/// this is false however the crate's features happen to resolve.
-fn in_sandbox_home(root: &Path) -> bool {
-    let Some(home) = crate::home::home_root() else {
-        return false;
-    };
-    under_any(&home, &temp_roots()).is_some() && is_under(root, &home)
+/// The redirected home `root` sits inside, when this process's home has itself
+/// been redirected under a temp root — a test's fixture workspace rather than a
+/// real tree. In production `home_root()` is the operator's home and is never
+/// under temp, so this is `None` however the crate's features happen to resolve.
+fn sandbox_home(root: &Path) -> Option<PathBuf> {
+    let home = crate::home::home_root()?;
+    (under_any(&home, &temp_roots()).is_some() && is_under(root, &home)).then_some(home)
+}
+
+/// The components of `root` below the sandbox `home`, lower-cased. Tried raw
+/// first, then with both sides canonicalised (an 8.3 `%TEMP%` against its long
+/// spelling); when neither strips, the whole path stands so the rules refuse
+/// more rather than less.
+fn fixture_components(root: &Path, home: &Path) -> Vec<String> {
+    if let Ok(rest) = root.strip_prefix(home) {
+        return lower_components(rest);
+    }
+    if let (Ok(r), Ok(h)) = (std::fs::canonicalize(root), std::fs::canonicalize(home))
+        && let Ok(rest) = r.strip_prefix(&h)
+    {
+        return lower_components(rest);
+    }
+    lower_components(root)
 }
 
 /// `/mnt/c/Users/<name>` — a Windows home seen from a WSL hook, which its own
@@ -848,6 +880,15 @@ fn is_under(root: &Path, anc: &Path) -> bool {
     let norm = |p: &Path| {
         let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let s = real.to_string_lossy().replace('\\', "/");
+        // On Windows `canonicalize` answers in verbatim form (`\\?\C:\...`,
+        // `\\?\UNC\host\share\...`) and a path that does not exist yet stays
+        // raw, so a fixture's parent canonicalised against its own not-yet-
+        // created child never matched: measured 2026-09-04 on the Windows
+        // mirror, where every sandbox test compared `//?/c:/...` with `c:/...`.
+        let s = match s.strip_prefix("//?/UNC/") {
+            Some(rest) => format!("//{rest}"),
+            None => s.strip_prefix("//?/").unwrap_or(&s).to_string(),
+        };
         let s = s.trim_end_matches('/').to_string();
         if cfg!(windows) { s.to_lowercase() } else { s }
     };

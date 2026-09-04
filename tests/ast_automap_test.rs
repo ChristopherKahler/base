@@ -293,6 +293,33 @@ fn the_temp_rule_stands_down_only_inside_a_redirected_home() {
     });
 }
 
+/// The Windows shape of the sandbox, on every platform: `%TEMP%` sits under
+/// `AppData\Local`, so a fixture's full path carries the `appdata`/`local`
+/// pair. That pair belongs to the sandbox, not the fixture, and must not refuse
+/// it — while the same pair, or any never-mapped segment, INSIDE the fixture
+/// still does. 5 of 13 tests in this file failed on the Windows mirror at
+/// b72703a for exactly this reason (2026-09-03); Linux never saw it.
+#[test]
+fn the_sandbox_exemption_covers_the_segments_the_sandbox_itself_sits_under() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("AppData").join("Local").join("Temp").join("sandbox-home");
+    let app = home.join("dev").join("app");
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    std::fs::write(app.join("src").join("main.py"), "def f():\n    pass\n").unwrap();
+
+    assert!(never_map_reason(&app).is_some(), "outside any sandbox the AppData segments refuse it");
+    base::home::with_thread_home(&home, || {
+        assert_eq!(never_map_reason(&app), None, "the sandbox's own AppData/Local/Temp segments do not count");
+        assert_eq!(
+            never_map_reason(&app.join("AppData").join("Local").join("x")),
+            Some("a Windows AppData directory"),
+            "the same pair inside the fixture still refuses"
+        );
+        assert_eq!(never_map_reason(&app.join("node_modules").join("react")), Some("a node_modules tree"));
+        assert_eq!(session_root(&app), RootPlan::Adopt(app.clone()), "and the fixture is adopted");
+    });
+}
+
 /// A map that already exists inside a never-mapped root buys nothing. This is
 /// the loop measured on this machine: the 11:43 run planted `.base-ast/` in
 /// `%TEMP%`, which made `ast_app_root` resolve every later temp path to Temp,
