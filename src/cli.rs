@@ -2091,8 +2091,8 @@ pub fn run() {
                     Err(e) => die("Failed", e),
                 }
             }
-            DomainAction::List => domain::list_domains(&cwd),
-            DomainAction::Get { name } => domain::get_domain(&cwd, &name),
+            DomainAction::List => domain::list_domains(&cwd, &config.namespace),
+            DomainAction::Get { name } => domain::get_domain(&cwd, &config.namespace, &name),
             DomainAction::Sync { carl } => {
                 let carl_path = carl.as_ref().map(std::path::Path::new);
                 match domain::sync::sync_domains_to_graph(&config, &cwd, carl_path) {
