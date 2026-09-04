@@ -31,7 +31,7 @@ pub fn query_domain_from_graph(
              OPTIONAL {{ ?rule {p}:rationale ?rationale }}\n\
            }}\n\
          }}\n\
-         ORDER BY ?pri"
+         ORDER BY xsd:integer(?pri)"
     );
 
     let rules_text = match crate::store::query(store, &rules_sparql) {

@@ -145,7 +145,8 @@ pub fn remove(cwd: &Path, ns: &NamespaceConfig, domain_name: &str, index: u32) -
 fn next_rule_index(cwd: &Path, ns: &NamespaceConfig, domain_iri: &str) -> Result<u32> {
     let p = &ns.prefix;
     let sparql = format!(
-        "SELECT (MAX(?idx) AS ?max_idx) WHERE {{\n\
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+         SELECT (MAX(xsd:integer(?idx)) AS ?max_idx) WHERE {{\n\
            GRAPH ?g {{\n\
              <{domain_iri}> {p}:hasRule ?rule .\n\
              ?rule {p}:index ?idx .\n\
