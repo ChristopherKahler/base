@@ -80,6 +80,9 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, question: &str, opts: &Options) -> 
     Ok(())
 }
 
+/// The concept map and its undirected adjacency list, as `load_graph` returns them.
+pub type GraphMaps = (HashMap<String, Node>, HashMap<String, Vec<(String, String)>>);
+
 /// Pull labelled nodes and the concept edge-set from graph.nq into memory.
 /// Edges come from reified semantic edges (ops:from/ops:to); traversal is
 /// undirected so BFS reaches both callers and callees of a concept.
@@ -87,7 +90,7 @@ pub fn load_graph(
     cwd: &Path,
     ns: &NamespaceConfig,
     include_ast: bool,
-) -> Result<(HashMap<String, Node>, HashMap<String, Vec<(String, String)>>)> {
+) -> Result<GraphMaps> {
     let p = &ns.prefix;
 
     let node_q = format!(

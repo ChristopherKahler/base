@@ -2033,14 +2033,14 @@ pub fn run() {
                         // it's discoverable outside a dev session. Foreground syncs
                         // only — the Stop hook sets BASE_AST_SKIP_REGISTER to keep
                         // frequent background refreshes off graph.nq.
-                        if std::env::var("BASE_AST_SKIP_REGISTER").is_err() {
-                            if let Some(app_root) = ast_ttl.parent().and_then(|p| p.parent()) {
-                                base::ast_repo::ensure_repo_wiring(app_root);
-                                if let Err(e) = crud::ast_map::register(
-                                    &cwd, &config.namespace, app_root, &ast_ttl,
-                                ) {
-                                    eprintln!("(ast map registration skipped: {e})");
-                                }
+                        if std::env::var("BASE_AST_SKIP_REGISTER").is_err()
+                            && let Some(app_root) = ast_ttl.parent().and_then(|p| p.parent())
+                        {
+                            base::ast_repo::ensure_repo_wiring(app_root);
+                            if let Err(e) = crud::ast_map::register(
+                                &cwd, &config.namespace, app_root, &ast_ttl,
+                            ) {
+                                eprintln!("(ast map registration skipped: {e})");
                             }
                         }
                     }

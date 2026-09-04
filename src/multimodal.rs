@@ -52,8 +52,8 @@ pub fn classify(path: &Path) -> Option<Modality> {
 
 // ─── Dependency bootstrap (NO sudo) ──────────────────────────
 
-/// An external tool a modality needs. Install hierarchy is in-process > user-space
-/// > system — so every dep here installs WITHOUT sudo (pip --user / pipx). PDF is
+/// An external tool a modality needs. Install hierarchy is in-process, then
+/// user-space, then system — so every dep here installs WITHOUT sudo (pip --user / pipx). PDF is
 /// not a Dep at all: it's handled in-process by the `pdf-extract` crate.
 struct Dep {
     bin: &'static str,

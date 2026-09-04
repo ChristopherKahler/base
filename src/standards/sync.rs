@@ -530,7 +530,6 @@ pub fn seed_file() -> StandardsFile {
                 content: svec(&["env(", "environ.get", "getenv"]),
                 semantic: svec(&["config"]),
                 paths: svec(&["config/", "settings.py"]),
-                ..Default::default()
             },
             &[
                 ("laravel", "env('X') ?: $default — never env('X', $default); an empty string is 'set' and defeats the second arg."),
@@ -682,7 +681,7 @@ pub fn test_standard_match(config: &BaseConfig, cwd: &Path, file: &str, content:
         .iter()
         .filter_map(|s| super::matcher::score(s, &ctx).map(|sc| (s, sc)))
         .collect();
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|s| std::cmp::Reverse(s.1));
 
     if scored.is_empty() {
         println!("No standards scored above zero.");

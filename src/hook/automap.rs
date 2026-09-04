@@ -376,8 +376,8 @@ pub fn bash_paths(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf
     let mut out: Vec<PathBuf> = Vec::new();
     let mut base = cwd.to_path_buf();
     let mut seen = 0usize;
-    for segment in command.split(|c| c == ';' || c == '\n' || c == '|' || c == '&') {
-        let mut tokens = segment.split_whitespace().map(|t| t.trim_matches(|c| c == '"' || c == '\'' || c == '(' || c == ')'));
+    for segment in command.split([';', '\n', '|', '&']) {
+        let mut tokens = segment.split_whitespace().map(|t| t.trim_matches(['"', '\'', '(', ')']));
         let mut first = tokens.next();
         // skip leading env assignments: FOO=bar cmd …
         while first.is_some_and(|t| t.contains('=') && !t.starts_with('-') && !t.contains('/')) {
@@ -414,7 +414,7 @@ fn push_unique(out: &mut Vec<PathBuf>, p: PathBuf) {
 /// A token that reads as a path, resolved; flags, globs, variables and URLs
 /// are not paths.
 fn resolve_token(tok: &str, base: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    let t = tok.trim_end_matches(|c| c == ',' || c == ':');
+    let t = tok.trim_end_matches([',', ':']);
     if t.is_empty() || t.starts_with('-') || t.contains("://") || t.contains(['*', '$', '{', '`']) {
         return None;
     }
@@ -447,7 +447,7 @@ pub fn linux_paths(command: &str) -> Vec<String> {
         return out;
     }
     for raw in command.split(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&' || c == '(' || c == ')' || c == '"' || c == '\'') {
-        let t = raw.trim_end_matches(|c| c == ',' || c == ':');
+        let t = raw.trim_end_matches([',', ':']);
         if (t.starts_with("~/") || t.starts_with("/home/") || t.starts_with("/mnt/")) && !t.contains(['*', '$', '{', '`']) {
             let s = t.to_string();
             if !out.contains(&s) {

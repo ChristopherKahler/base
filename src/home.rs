@@ -32,18 +32,17 @@ pub fn home_root() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(over));
     }
+    // Test builds never fall through to the real home. `cfg(test)` cannot
+    // do this job: `tests/*.rs` link the library compiled WITHOUT
+    // `cfg(test)`, so an integration test that forgot to isolate would read
+    // the real home with nothing to stop it. The feature is enabled by the
+    // self-dev-dependency in Cargo.toml, so it covers both test binaries
+    // and is off for every `cargo build` / `cargo run`.
     #[cfg(feature = "isolation-guard")]
-    {
-        // Test builds never fall through to the real home. `cfg(test)` cannot
-        // do this job: `tests/*.rs` link the library compiled WITHOUT
-        // `cfg(test)`, so an integration test that forgot to isolate would read
-        // the real home with nothing to stop it. The feature is enabled by the
-        // self-dev-dependency in Cargo.toml, so it covers both test binaries
-        // and is off for every `cargo build` / `cargo run`.
-        return Some(test_root());
-    }
+    let home = Some(test_root());
     #[cfg(not(feature = "isolation-guard"))]
-    real_home()
+    let home = real_home();
+    home
 }
 
 /// The OS home directory with no override applied.

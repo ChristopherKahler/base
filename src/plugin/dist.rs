@@ -71,17 +71,17 @@ fn token_from_env_file() -> Option<String> {
             continue;
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
-        if let Some((k, v)) = line.split_once('=') {
-            if k.trim() == "GITHUB_TOKEN" || k.trim() == "GH_TOKEN" {
-                let mut val = v.trim();
-                if val.len() >= 2
-                    && ((val.starts_with('"') && val.ends_with('"')) || (val.starts_with('\'') && val.ends_with('\'')))
-                {
-                    val = &val[1..val.len() - 1];
-                }
-                if !val.is_empty() {
-                    return Some(val.to_string());
-                }
+        if let Some((k, v)) = line.split_once('=')
+            && (k.trim() == "GITHUB_TOKEN" || k.trim() == "GH_TOKEN")
+        {
+            let mut val = v.trim();
+            if val.len() >= 2
+                && ((val.starts_with('"') && val.ends_with('"')) || (val.starts_with('\'') && val.ends_with('\'')))
+            {
+                val = &val[1..val.len() - 1];
+            }
+            if !val.is_empty() {
+                return Some(val.to_string());
             }
         }
     }
@@ -105,10 +105,10 @@ fn token_from_gh_cli() -> Option<String> {
 /// the unauthenticated public-download path.
 fn github_token() -> Option<String> {
     for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
-                return Some(v);
-            }
+        if let Ok(v) = std::env::var(var)
+            && !v.is_empty()
+        {
+            return Some(v);
         }
     }
     token_from_env_file().or_else(token_from_gh_cli)

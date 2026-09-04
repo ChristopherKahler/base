@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(
             crate::store::query_union(&store, any_sync)
                 .ok()
-                .and_then(|r| first_count(r)),
+                .and_then(first_count),
             Some(0),
             "no ledger predicate reaches a union read"
         );
