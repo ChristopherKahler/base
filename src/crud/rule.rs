@@ -69,7 +69,13 @@ pub fn add(
 }
 
 /// List rules for a domain from the graph.
-pub fn list(cwd: &Path, ns: &NamespaceConfig, domain_name: &str) -> Result<()> {
+/// A domain's CLI rules, lowest number first.
+///
+/// Ordered by the number rather than by its text: `ORDER BY ?pri` compares
+/// `"10"` against `"2"` as strings and puts the eleventh rule second. Same
+/// comparison that gave every rule past the tenth the index 10 (#29), one query
+/// further on, so it outlived that fix and is pinned by `rule_index_test`.
+pub fn fetch(cwd: &Path, ns: &NamespaceConfig, domain_name: &str) -> Result<Vec<(u32, String)>> {
     let p = &ns.prefix;
     let domain_slug = crud::slugify(domain_name);
     let domain_iri = crud::build_iri(ns, "domain", &domain_slug);
@@ -82,29 +88,36 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig, domain_name: &str) -> Result<()> {
              OPTIONAL {{ ?rule {p}:priority ?pri }}\n\
            }}\n\
          }}\n\
-         ORDER BY ?pri"
+         ORDER BY xsd:integer(?pri)"
     );
 
-    let results = crud::load_and_query(cwd, ns, &sparql)?;
-    if let QueryResults::Solutions(solutions) = results {
-        let rules: Vec<(String, String)> = solutions
-            .filter_map(|r| r.ok())
-            .filter_map(|row| {
-                let text = row.get("text").map(|t| crud::term_display(t.into()))?;
-                let pri = row.get("pri").map(|t| crud::term_display(t.into())).unwrap_or_default();
-                Some((pri, text))
-            })
-            .collect();
+    let QueryResults::Solutions(solutions) = crud::load_and_query(cwd, ns, &sparql)? else {
+        return Ok(Vec::new());
+    };
+    Ok(solutions
+        .filter_map(|r| r.ok())
+        .filter_map(|row| {
+            let text = row.get("text").map(|t| crud::term_display(t.into()))?;
+            let pri = row
+                .get("pri")
+                .map(|t| crud::term_display(t.into()))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            Some((pri, text))
+        })
+        .collect())
+}
 
-        if rules.is_empty() {
-            println!("No rules for domain '{domain_name}'.");
-            return Ok(());
-        }
+pub fn list(cwd: &Path, ns: &NamespaceConfig, domain_name: &str) -> Result<()> {
+    let rules = fetch(cwd, ns, domain_name)?;
+    if rules.is_empty() {
+        println!("No rules for domain '{domain_name}'.");
+        return Ok(());
+    }
 
-        println!("[{domain_name}] {} rules:", rules.len());
-        for (pri, text) in &rules {
-            println!("  {pri}. {text}");
-        }
+    println!("[{domain_name}] {} rules:", rules.len());
+    for (pri, text) in &rules {
+        println!("  {pri}. {text}");
     }
     Ok(())
 }
@@ -145,8 +158,7 @@ pub fn remove(cwd: &Path, ns: &NamespaceConfig, domain_name: &str, index: u32) -
 fn next_rule_index(cwd: &Path, ns: &NamespaceConfig, domain_iri: &str) -> Result<u32> {
     let p = &ns.prefix;
     let sparql = format!(
-        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
-         SELECT (MAX(xsd:integer(?idx)) AS ?max_idx) WHERE {{\n\
+        "SELECT (MAX(xsd:integer(?idx)) AS ?max_idx) WHERE {{\n\
            GRAPH ?g {{\n\
              <{domain_iri}> {p}:hasRule ?rule .\n\
              ?rule {p}:index ?idx .\n\
