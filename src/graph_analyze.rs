@@ -39,26 +39,15 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, top_n: usize) -> Result<()> {
         groups.entry(*c).or_default().push(id);
     }
     let mut group_vec: Vec<(usize, Vec<&String>)> = groups.into_iter().collect();
-    group_vec.sort_by_key(|g| std::cmp::Reverse(g.1.len()));
+    for (_, members) in group_vec.iter_mut() {
+        members.sort();
+    }
+    // Largest first; equal sizes by their first member, so `[3]` names the same
+    // community on every run instead of whichever the map iterated first.
+    group_vec.sort_by(|x, y| y.1.len().cmp(&x.1.len()).then_with(|| x.1.first().cmp(&y.1.first())));
 
     // ── Surprising connections: edges that bridge two communities ──
-    let mut bridges: Vec<(String, String)> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (a, neighbors) in &adj {
-        for (b, _) in neighbors {
-            if comm.get(a) != comm.get(b) {
-                let key = if a < b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
-                if seen.insert(key) {
-                    bridges.push((a.clone(), b.clone()));
-                }
-            }
-        }
-    }
-    bridges.sort_by(|x, y| {
-        let dx = degree.get(&x.0).unwrap_or(&0) + degree.get(&x.1).unwrap_or(&0);
-        let dy = degree.get(&y.0).unwrap_or(&0) + degree.get(&y.1).unwrap_or(&0);
-        dy.cmp(&dx)
-    });
+    let bridges = bridge_pairs(&adj, &comm, &degree);
 
     // ── Report ──
     let edge_count: usize = adj.values().map(|v| v.len()).sum::<usize>() / 2;
@@ -85,14 +74,65 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, top_n: usize) -> Result<()> {
     if !bridges.is_empty() {
         println!("\n## Surprising connections (bridges across communities)");
         for (a, b) in bridges.iter().take(top_n) {
-            println!("  {}  <->  {}", label_of(&nodes, a), label_of(&nodes, b));
+            let (la, lb) = (label_of(&nodes, a), label_of(&nodes, b));
+            if la == lb {
+                // Two records really do share this name (`domain/base` ↔ `project/base`).
+                // The edge is real; printing it twice under one name reads as a bug.
+                println!("  {}  <->  {}", typed_label(&nodes, a), typed_label(&nodes, b));
+            } else {
+                println!("  {la}  <->  {lb}");
+            }
         }
     }
     Ok(())
 }
 
+/// Edges whose ends sit in different communities, busiest pair first. Each pair is
+/// stored low id first and ties break on the ids, so the list — and which end
+/// prints on the left — is the same on every run. The edge set came out of a
+/// HashMap walk before, and the same bridge printed as `A <-> B` or `B <-> A`
+/// depending on which end the map visited first.
+fn bridge_pairs(
+    adj: &HashMap<String, Vec<(String, String)>>,
+    comm: &HashMap<String, usize>,
+    degree: &HashMap<&String, usize>,
+) -> Vec<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut bridges: Vec<(String, String)> = Vec::new();
+    for (a, neighbors) in adj {
+        for (b, _) in neighbors {
+            if comm.get(a) != comm.get(b) {
+                let pair = if a < b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
+                if seen.insert(pair.clone()) {
+                    bridges.push(pair);
+                }
+            }
+        }
+    }
+    let weight = |p: &(String, String)| degree.get(&p.0).unwrap_or(&0) + degree.get(&p.1).unwrap_or(&0);
+    bridges.sort_by(|x, y| weight(y).cmp(&weight(x)).then_with(|| x.cmp(y)));
+    bridges
+}
+
 fn label_of(nodes: &HashMap<String, crate::graph_query::Node>, id: &str) -> String {
     nodes.get(id).map(|n| n.label.clone()).unwrap_or_else(|| id.to_string())
+}
+
+/// `base (Domain)` — the label plus its RDF class, for the one place two records
+/// sharing a name would otherwise print as the same word twice. A store written
+/// before records carried `rdf:type` has no class to show, so the kind is read
+/// off the IRI instead (`domain/base` → `base (domain)`).
+fn typed_label(nodes: &HashMap<String, crate::graph_query::Node>, id: &str) -> String {
+    let label = label_of(nodes, id);
+    let kind = nodes
+        .get(id)
+        .map(|n| n.ntype.clone())
+        .filter(|t| !t.is_empty())
+        .or_else(|| crate::graph_query::iri_kind(id).map(str::to_string));
+    match kind {
+        Some(k) => format!("{label} ({k})"),
+        None => label,
+    }
 }
 
 /// Label propagation: each node iteratively adopts the most common label among
@@ -135,4 +175,68 @@ fn label_propagation(
         }
     }
     label
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+    use crate::graph_query::Node;
+
+    const U: &str = "http://t.local/o#";
+
+    fn node(label: &str, ntype: &str) -> Node {
+        Node { label: label.into(), ntype: ntype.into(), source: String::new(), summary: String::new() }
+    }
+
+    /// Two communities joined by one bridge, built in a varying insertion order and
+    /// with a fresh hash seed each time.
+    fn two_clusters(rotate: usize) -> crate::graph_query::GraphMaps {
+        let ids = ["domain/alpha", "project/alpha", "note/a1", "note/a2", "note/p1", "note/p2"];
+        let mut edges: Vec<(&str, &str)> = vec![
+            ("domain/alpha", "note/a1"),
+            ("domain/alpha", "note/a2"),
+            ("project/alpha", "note/p1"),
+            ("project/alpha", "note/p2"),
+            ("domain/alpha", "project/alpha"),
+        ];
+        let len = edges.len();
+        edges.rotate_left(rotate % len);
+        let mut nodes = HashMap::new();
+        for id in ids {
+            let (kind, _) = id.split_once('/').unwrap();
+            nodes.insert(format!("<{U}{id}>"), node("alpha", if kind == "note" { "Note" } else { "" }));
+        }
+        let mut adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (a, b) in edges {
+            let (a, b) = (format!("<{U}{a}>"), format!("<{U}{b}>"));
+            adj.entry(a.clone()).or_default().push((b.clone(), "relatedTo".into()));
+            adj.entry(b).or_default().push((a, "relatedTo".into()));
+        }
+        (nodes, adj)
+    }
+
+    #[test]
+    fn bridge_pairs_print_the_same_way_round_every_run() {
+        let mut seen: std::collections::HashSet<Vec<(String, String)>> = std::collections::HashSet::new();
+        for i in 0..20 {
+            let (nodes, adj) = two_clusters(i);
+            let degree: HashMap<&String, usize> =
+                nodes.keys().map(|id| (id, adj.get(id).map(|v| v.len()).unwrap_or(0))).collect();
+            let comm = label_propagation(&nodes, &adj);
+            seen.insert(bridge_pairs(&adj, &comm, &degree));
+        }
+        assert_eq!(seen.len(), 1, "bridge order varied across runs: {seen:?}");
+        for (a, b) in seen.into_iter().next().unwrap() {
+            assert!(a < b, "pair stored low id first: {a} {b}");
+        }
+    }
+
+    #[test]
+    fn a_same_name_pair_on_an_untyped_store_is_still_qualified_by_iri_kind() {
+        let (nodes, _) = two_clusters(0);
+        assert_eq!(typed_label(&nodes, &format!("<{U}domain/alpha>")), "alpha (domain)");
+        assert_eq!(typed_label(&nodes, &format!("<{U}project/alpha>")), "alpha (project)");
+        // A typed record still shows its class, which is the nicer of the two.
+        assert_eq!(typed_label(&nodes, &format!("<{U}note/a1>")), "alpha (Note)");
+    }
 }
