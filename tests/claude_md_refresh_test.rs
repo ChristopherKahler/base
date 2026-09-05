@@ -121,6 +121,30 @@ fn two_sections_are_reported_and_nothing_is_touched() {
 }
 
 #[test]
+fn session_start_does_not_stamp_until_the_text_is_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    base::home::with_thread_home(tmp.path(), || {
+        fs::create_dir_all(tmp.path().join(".base-gbl")).unwrap();
+        let stamp = tmp.path().join(".base-gbl").join(claude_md_stamp_name());
+
+        // No file yet: reported, not stamped.
+        assert_eq!(ensure_claude_md_current(), Some(ClaudeMdRefresh::Missing));
+        assert!(!stamp.exists());
+
+        // Two sections: reported, not stamped.
+        let p = claude_md(tmp.path(), &format!("{OLD_SECTION}\n{OLD_SECTION}"));
+        assert_eq!(ensure_claude_md_current(), Some(ClaudeMdRefresh::Duplicate(2)));
+        assert!(!stamp.exists());
+
+        // The user fixes it: the refresh still happens, and only now is it stamped.
+        fs::write(&p, format!("{ABOVE}{OLD_SECTION}{BELOW}")).unwrap();
+        assert_eq!(ensure_claude_md_current(), Some(ClaudeMdRefresh::Refreshed));
+        assert!(stamp.exists());
+        assert_eq!(ensure_claude_md_current(), None);
+    });
+}
+
+#[test]
 fn session_start_refreshes_once_per_version_and_stamps_it() {
     let tmp = tempfile::tempdir().unwrap();
     base::home::with_thread_home(tmp.path(), || {

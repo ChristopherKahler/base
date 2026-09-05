@@ -1838,7 +1838,13 @@ pub fn ensure_claude_md_current() -> Option<ClaudeMdRefresh> {
         return None;
     }
     let result = refresh_claude_md_section(&home.join(".claude").join("CLAUDE.md")).ok()?;
-    let _ = std::fs::write(&stamp, b"");
+    // Stamp only once the text is on disk. A missing file, a file without the
+    // section, or two sections all leave the contract uninstalled; stamping there
+    // would mean a user who later creates the file, runs `base install`, or
+    // removes their duplicate never gets this text. Retrying costs one stat.
+    if matches!(result, ClaudeMdRefresh::Current | ClaudeMdRefresh::Refreshed) {
+        let _ = std::fs::write(&stamp, b"");
+    }
     Some(result)
 }
 
