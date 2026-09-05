@@ -1818,7 +1818,10 @@ pub fn claude_md_stamp_name() -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     BASE_CLI_SECTION.hash(&mut h);
-    format!(".claude-md-{:016x}", h.finish())
+    // `md2`: 0.13.18 stamped `.claude-md-<hash>` on Missing, NotInstalled and
+    // Duplicate too, so a user stamped in one of those states must be looked at
+    // once more; the same text under the old name would have been skipped forever.
+    format!(".claude-md2-{:016x}", h.finish())
 }
 
 /// Session start: bring the CLAUDE.md contract up to the text this binary
@@ -1838,7 +1841,13 @@ pub fn ensure_claude_md_current() -> Option<ClaudeMdRefresh> {
         return None;
     }
     let result = refresh_claude_md_section(&home.join(".claude").join("CLAUDE.md")).ok()?;
-    let _ = std::fs::write(&stamp, b"");
+    // Stamp only once the text is on disk. A missing file, a file without the
+    // section, or two sections all leave the contract uninstalled; stamping there
+    // would mean a user who later creates the file, runs `base install`, or
+    // removes their duplicate never gets this text. Retrying costs one stat.
+    if matches!(result, ClaudeMdRefresh::Current | ClaudeMdRefresh::Refreshed) {
+        let _ = std::fs::write(&stamp, b"");
+    }
     Some(result)
 }
 
