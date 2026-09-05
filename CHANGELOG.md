@@ -7,6 +7,18 @@ fails when the version in `Cargo.toml` has no entry here.
 
 Releases before 0.13.3 are tagged in the repository but are not written up.
 
+## 0.13.18 (2026-09-05)
+
+This release makes the relational graph commands read the edges base writes for itself, makes `sync --repair` actually write the repairs it prints, and refreshes the installed CLAUDE.md contract once per version at session start, so an agent on an old install stops running an old contract.
+
+**Windows installs older than 0.13.4 cannot receive this or any update.** That version fixed self-update on Windows, and the fix ships inside the update those installs cannot apply; `base update` on them prints "Run: base update" and cannot succeed. Bootstrap once with the release zip or `npx chrisai`, after which base updates itself in place.
+
+### Fixed
+
+- **update**: refresh the installed CLAUDE.md contract once per version ([#47](https://github.com/ChristopherKahler/base/issues/47)) ([#45](https://github.com/ChristopherKahler/base/issues/45))
+- **sync**: --repair writes the repairs it prints, one statement at a time ([#46](https://github.com/ChristopherKahler/base/issues/46)) ([#44](https://github.com/ChristopherKahler/base/issues/44))
+- **graph**: read the edges base writes for itself, and resolve names the same way every run ([#43](https://github.com/ChristopherKahler/base/issues/43)) ([#42](https://github.com/ChristopherKahler/base/issues/42))
+
 ## 0.13.17 (2026-09-04)
 
 ### Fixed
