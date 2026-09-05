@@ -1818,7 +1818,10 @@ pub fn claude_md_stamp_name() -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     BASE_CLI_SECTION.hash(&mut h);
-    format!(".claude-md-{:016x}", h.finish())
+    // `md2`: 0.13.18 stamped `.claude-md-<hash>` on Missing, NotInstalled and
+    // Duplicate too, so a user stamped in one of those states must be looked at
+    // once more; the same text under the old name would have been skipped forever.
+    format!(".claude-md2-{:016x}", h.finish())
 }
 
 /// Session start: bring the CLAUDE.md contract up to the text this binary

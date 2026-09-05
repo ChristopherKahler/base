@@ -121,6 +121,25 @@ fn two_sections_are_reported_and_nothing_is_touched() {
 }
 
 #[test]
+fn a_stamp_left_by_0_13_18_does_not_suppress_the_refresh() {
+    // 0.13.18 stamped `.claude-md-<hash>` even when nothing was installed. That
+    // name must not count: this release looks once more under a new name.
+    let tmp = tempfile::tempdir().unwrap();
+    base::home::with_thread_home(tmp.path(), || {
+        let gbl = tmp.path().join(".base-gbl");
+        fs::create_dir_all(&gbl).unwrap();
+        let old_name = claude_md_stamp_name().replacen(".claude-md2-", ".claude-md-", 1);
+        assert_ne!(old_name, claude_md_stamp_name());
+        fs::write(gbl.join(&old_name), b"").unwrap();
+        let p = claude_md(tmp.path(), &format!("{ABOVE}{OLD_SECTION}{BELOW}"));
+
+        assert_eq!(ensure_claude_md_current(), Some(ClaudeMdRefresh::Refreshed));
+        assert!(fs::read_to_string(&p).unwrap().contains(current()));
+        assert!(gbl.join(claude_md_stamp_name()).exists());
+    });
+}
+
+#[test]
 fn session_start_does_not_stamp_until_the_text_is_on_disk() {
     let tmp = tempfile::tempdir().unwrap();
     base::home::with_thread_home(tmp.path(), || {
