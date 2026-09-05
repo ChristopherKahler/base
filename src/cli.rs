@@ -1955,8 +1955,15 @@ pub fn run() {
         // ─── Sync ────────────────────────────────────────
         Some(Commands::Sync { incremental, ast, target, yes, repair }) => {
             if repair {
+                // The lines print after the write has landed: a repair that is on
+                // stdout is on disk.
                 match base::crud::repair_edges(&cwd, &config.namespace) {
-                    Ok(count) => println!("Repair complete: {count} edges backfilled"),
+                    Ok(lines) => {
+                        for line in &lines {
+                            println!("  + {line}");
+                        }
+                        println!("Repair complete: {} edges backfilled", lines.len());
+                    }
                     Err(e) => die("Repair failed", e),
                 }
                 return;

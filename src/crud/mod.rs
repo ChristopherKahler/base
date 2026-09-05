@@ -301,48 +301,92 @@ pub fn term_display(term: oxigraph::model::TermRef<'_>) -> String {
     }
 }
 
+/// One edge `sync --repair` found missing: the statement that adds it, and the line
+/// a person reads once it has landed.
+struct Repair {
+    line: String,
+    insert: String,
+}
+
 /// Backfill missing relationship edges for existing entities.
 /// Parses entity slugs to infer parent relationships and creates edges where missing.
-pub fn repair_edges(cwd: &Path, ns: &NamespaceConfig) -> Result<usize> {
+///
+/// The repairs are computed first, then applied one statement at a time inside a
+/// single `mutate_and_write`, so the snapshot the change record diffs against is
+/// taken before any of them lands. Nothing prints until the write has reached disk.
+///
+/// 0.13.17 and earlier applied each INSERT to the in-memory store, printed it as
+/// done, then joined every statement — each carrying its own `PREFIX` block — into
+/// ONE update for the write. SPARQL allows one prologue, so the batch died at the
+/// second `PREFIX`: exit 1, thirteen `+` lines already on stdout, store byte-identical.
+/// Returns the human lines for the edges written, in the order they were applied.
+pub fn repair_edges(cwd: &Path, ns: &NamespaceConfig) -> Result<Vec<String>> {
+    // Absent is not empty: `load_workspace_store` starts an empty store when the
+    // file is missing, which is right for a first `base learn` and wrong here — a
+    // repair of nothing would report success and leave a new, empty graph.nq
+    // where a moved or deleted store used to be.
+    let missing = require_base_for_write(cwd)?.join("graph.nq");
+    if !missing.exists() {
+        anyhow::bail!(
+            "no graph at {}: nothing to repair (run `base scaffold`, or restore the store)",
+            missing.display()
+        );
+    }
     let (store, trig_path) = load_workspace_store(cwd)?;
     let ws_slug = workspace_slug(cwd);
     let graph = workspace_graph_iri(ns, &ws_slug);
     let p = &ns.prefix;
     let pfx = prefixes(ns);
-    // Each repair applies its own INSERT DATA; collect them so the change log
-    // carries the actual delta rather than an opaque "a repair happened".
-    let mut applied: Vec<String> = Vec::new();
+    let mut repairs: Vec<Repair> = Vec::new();
 
     // 1. Decisions → domain edges (slug format: {domain}.{decision})
-    applied.extend(repair_entity_edges(
+    repairs.extend(missing_parent_edges(
         &store, &pfx, &graph, ns, p,
         "Decision", "domain", "hasDecision",
     )?);
 
     // 2. Milestones → project edges (slug format: {project}.{milestone})
-    applied.extend(repair_entity_edges(
+    repairs.extend(missing_parent_edges(
         &store, &pfx, &graph, ns, p,
         "Milestone", "project", "hasMilestone",
     )?);
 
     // 3. Tasks → project edges (slug format: {project}.{task})
-    applied.extend(repair_entity_edges(
+    repairs.extend(missing_parent_edges(
         &store, &pfx, &graph, ns, p,
         "Task", "project", "hasTask",
     )?);
 
-    crate::store::update_and_write(
+    if repairs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // The change record carries the statements themselves, so it says which edges
+    // were added rather than "a repair happened". They are logged joined and
+    // executed separately; the join is text, never a single update.
+    let log_text = repairs.iter().map(|r| r.insert.as_str()).collect::<Vec<_>>().join(";\n");
+    crate::store::mutate_and_write(
         &store,
         &trig_path,
-        &applied.join(";\n"),
+        &log_text,
         crate::store::Scope::Target,
         crate::store::Intent::Knowledge,
+        |s| {
+            for r in &repairs {
+                // One failure aborts the batch before the write, so the disk never
+                // holds half a repair and the exit code says so.
+                s.update(&r.insert).with_context(|| format!("applying repair {}", r.line))?;
+            }
+            Ok(Some(log_text.clone()))
+        },
     )?;
-    Ok(applied.len())
+    Ok(repairs.into_iter().map(|r| r.line).collect())
 }
 
+/// The `{parent} --predicate--> {entity}` edges missing for one entity type,
+/// computed without touching the store.
 #[allow(clippy::too_many_arguments)] // internal helper, params are query fragments
-fn repair_entity_edges(
+fn missing_parent_edges(
     store: &Store,
     pfx: &str,
     graph: &str,
@@ -351,16 +395,17 @@ fn repair_entity_edges(
     type_name: &str,
     parent_type: &str,
     predicate: &str,
-) -> Result<Vec<String>> {
-    // Find all entities of this type (check both named graph and any graph)
+) -> Result<Vec<Repair>> {
+    // Find all entities of this type (check both named graph and any graph). The
+    // UNION can yield one entity twice; DISTINCT keeps each repair to one line.
     let sparql = format!(
-        "{pfx}\nSELECT ?s WHERE {{ {{ GRAPH <{graph}> {{ ?s rdf:type {p}:{type_name} }} }} UNION {{ GRAPH ?g {{ ?s rdf:type {p}:{type_name} }} }} }}"
+        "{pfx}\nSELECT DISTINCT ?s WHERE {{ {{ GRAPH <{graph}> {{ ?s rdf:type {p}:{type_name} }} }} UNION {{ GRAPH ?g {{ ?s rdf:type {p}:{type_name} }} }} }}"
     );
 
-    let mut applied: Vec<String> = Vec::new();
+    let mut repairs: Vec<Repair> = Vec::new();
 
     if let Ok(QueryResults::Solutions(solutions)) = store.query(&sparql) {
-        let iris: Vec<String> = solutions
+        let mut iris: Vec<String> = solutions
             .filter_map(|r| r.ok())
             .filter_map(|row| row.get("s").map(|t| {
                 match t.into() {
@@ -369,6 +414,8 @@ fn repair_entity_edges(
                 }
             }))
             .collect();
+        iris.sort();
+        iris.dedup();
 
         for iri in &iris {
             // Extract slug from IRI (everything after the last /)
@@ -400,20 +447,19 @@ fn repair_entity_edges(
                 continue; // Parent doesn't exist
             }
 
-            // Create edge
+            // The edge to add — applied later, inside the write seam, never here.
             let insert = format!(
                 "{pfx}\nINSERT DATA {{ GRAPH <{graph}> {{ <{parent_iri}> {p}:{predicate} <{iri}> }} }}"
             );
-
-            if store.update(&insert).is_ok() {
-                applied.push(insert);
-                let short_slug = slug.split('.').next_back().unwrap_or(slug);
-                println!("  + {parent_slug} → {predicate} → {short_slug}");
-            }
+            let short_slug = slug.split('.').next_back().unwrap_or(slug);
+            repairs.push(Repair {
+                line: format!("{parent_slug} → {predicate} → {short_slug}"),
+                insert,
+            });
         }
     }
 
-    Ok(applied)
+    Ok(repairs)
 }
 
 #[cfg(test)]
