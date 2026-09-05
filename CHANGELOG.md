@@ -7,6 +7,14 @@ fails when the version in `Cargo.toml` has no entry here.
 
 Releases before 0.13.3 are tagged in the repository but are not written up.
 
+## 0.13.19 (2026-09-05)
+
+A follow-up to 0.13.18's CLAUDE.md contract refresh. 0.13.18 marked the refresh done even when it had installed nothing (no CLAUDE.md, no `## BASE CLI` section, or two of them), so a user who fixed that later never received the current section. This release looks once more at the next session start: a current section is left alone, a missing or duplicated one is reported every session until it is resolved, and the refresh lands as soon as it can.
+
+### Fixed
+
+- **install**: stamp the CLAUDE.md refresh only once the text is on disk ([#48](https://github.com/ChristopherKahler/base/issues/48))
+
 ## 0.13.18 (2026-09-05)
 
 This release makes the relational graph commands read the edges base writes for itself, makes `sync --repair` actually write the repairs it prints, and refreshes the installed CLAUDE.md contract once per version at session start, so an agent on an old install stops running an old contract.
