@@ -48,6 +48,19 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
         );
     }
 
+    // The installed CLAUDE.md contract refreshes here, once per version, for the
+    // same reason: the process that runs `base update` is the outgoing binary and
+    // carries the old text, so only the new binary's first session can write its own.
+    match crate::install::ensure_claude_md_current() {
+        Some(crate::install::ClaudeMdRefresh::Refreshed) => {
+            println!("[contract] refreshed the BASE CLI section of ~/.claude/CLAUDE.md to this release.");
+        }
+        Some(crate::install::ClaudeMdRefresh::Duplicate(n)) => {
+            println!("[contract] ~/.claude/CLAUDE.md carries {n} '## BASE CLI' sections; base refreshes none until one remains.");
+        }
+        _ => {}
+    }
+
     // Every app gets a code map the first time a session opens in it — a
     // marked repo, or a bare folder of source files nobody has `git init`ed
     // yet — and a refresh when it has one (Chris, 2026-09-01: "anytime a dev

@@ -1492,7 +1492,10 @@ fn seed_system_rules(global_dir: &Path) -> Result<()> {
 
 // ─── Step 7: CLAUDE.md integration ──────────────────────────
 
-const BASE_CLI_SECTION: &str = r#"
+/// The contract `base install` writes into `~/.claude/CLAUDE.md` and
+/// `refresh_claude_md_section` keeps current. Public so a test can hold the
+/// installed text against it.
+pub const BASE_CLI_SECTION: &str = r#"
 ## BASE CLI — Proactive Context Engine
 
 The `base` binary is on PATH. Use these commands proactively during sessions — they write to a knowledge graph that persists across sessions and surfaces context automatically.
@@ -1691,7 +1694,12 @@ fn append_claude_md(claude_md_path: &Path) -> Result<()> {
     let content = std::fs::read_to_string(claude_md_path)?;
 
     if content.contains("## BASE CLI") {
-        println!("already present");
+        // Present from an earlier release: bring it to this one instead of
+        // leaving whatever contract the install date happened to carry.
+        match refresh_claude_md_section(claude_md_path)? {
+            ClaudeMdRefresh::Refreshed => println!("✓ (refreshed BASE CLI section to this release)"),
+            _ => println!("already present"),
+        }
         return Ok(());
     }
 
@@ -1707,6 +1715,131 @@ fn append_claude_md(claude_md_path: &Path) -> Result<()> {
 
     println!("✓ (appended BASE CLI section)");
     Ok(())
+}
+
+/// What `refresh_claude_md_section` found, and did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeMdRefresh {
+    /// `~/.claude/CLAUDE.md` does not exist. `base install` creates it; an update does not.
+    Missing,
+    /// The file carries no `## BASE CLI` section: removed on purpose, or never
+    /// installed. Left alone; `base install` adds one.
+    NotInstalled,
+    /// The section already matches this release's text. Nothing written.
+    Current,
+    /// The section was replaced with this release's text; nothing outside it moved.
+    Refreshed,
+    /// More than one `## BASE CLI` heading. Nothing touched: refreshing the first
+    /// would leave the others as stale duplicates, silently, on every run.
+    Duplicate(usize),
+}
+
+/// Bring the `## BASE CLI` section of `claude_md_path` up to this release's text,
+/// touching nothing outside it.
+///
+/// `base update` refreshed the binary, `scripts/` and the coach skill, and never
+/// the installed CLAUDE.md contract, so every change to it since a user's install
+/// date stayed on disk as the day they installed. The section is bounded the way
+/// `remove_claude_md_section` bounds it — from the `## BASE CLI` heading to the
+/// line before the next `## ` heading, or the end of the file — and only that
+/// span is rewritten: the section is base's, so non-blank text a user wrote INSIDE
+/// it is rewritten with it; blank lines before the user's own next heading are
+/// theirs and stay. A file that uses CRLF keeps CRLF; a leading BOM stays. Idempotent:
+/// a section that already matches is not rewritten, so repeat updates do not churn
+/// the file. Two `## BASE CLI` headings are reported, not resolved.
+pub fn refresh_claude_md_section(claude_md_path: &Path) -> Result<ClaudeMdRefresh> {
+    if !claude_md_path.exists() {
+        return Ok(ClaudeMdRefresh::Missing);
+    }
+    let content = std::fs::read_to_string(claude_md_path)
+        .with_context(|| format!("reading {}", claude_md_path.display()))?;
+    // A BOM would hide a heading on the first line from `starts_with`.
+    let bom = if content.starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 };
+    let headings = content[bom..]
+        .lines()
+        .filter(|l| l.trim_end_matches('\r').starts_with("## BASE CLI"))
+        .count();
+    if headings > 1 {
+        return Ok(ClaudeMdRefresh::Duplicate(headings));
+    }
+    let Some((start, end)) = base_cli_span(&content[bom..]) else {
+        return Ok(ClaudeMdRefresh::NotInstalled);
+    };
+    let (start, end) = (start + bom, end + bom);
+    let current = BASE_CLI_SECTION.trim();
+    if content[start..end].replace("\r\n", "\n") == current {
+        return Ok(ClaudeMdRefresh::Current);
+    }
+    let crlf = content.contains("\r\n");
+    let body = if crlf { current.replace('\n', "\r\n") } else { current.to_string() };
+    let mut out = String::with_capacity(content.len() + body.len());
+    out.push_str(&content[..start]);
+    out.push_str(&body);
+    out.push_str(&content[end..]);
+    let tmp = claude_md_path.with_extension("md.tmp");
+    std::fs::write(&tmp, &out).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, claude_md_path)
+        .with_context(|| format!("replacing {}", claude_md_path.display()))?;
+    Ok(ClaudeMdRefresh::Refreshed)
+}
+
+/// Byte span `[start, end)` of the installed section: from the `## BASE CLI`
+/// heading through the last non-blank line before the next `## ` heading (a
+/// `### ` sub-heading belongs to the section) or the end of the file. `end` sits
+/// before that last line's newline.
+fn base_cli_span(content: &str) -> Option<(usize, usize)> {
+    let mut start = None;
+    let mut end = None;
+    let mut pos = 0usize;
+    for line in content.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        if start.is_none() {
+            if text.starts_with("## BASE CLI") {
+                start = Some(pos);
+                end = Some(pos + text.len());
+            }
+        } else if text.starts_with("## ") {
+            break;
+        } else if !text.trim().is_empty() {
+            end = Some(pos + text.len());
+        }
+        pos += line.len();
+    }
+    Some((start?, end?))
+}
+
+/// The stamp `ensure_claude_md_current` leaves: keyed on the section TEXT this
+/// binary carries, not on the version. Two builds can share a version and differ
+/// in text (a dev build beside the release of the same number, on one machine);
+/// keyed on the version, whichever ran first would stamp and the other would be
+/// skipped for good. `DefaultHasher::new()` is SipHash with fixed keys, so the
+/// name is the same for the same text on every run and every machine.
+pub fn claude_md_stamp_name() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    BASE_CLI_SECTION.hash(&mut h);
+    format!(".claude-md-{:016x}", h.finish())
+}
+
+/// Session start: bring the CLAUDE.md contract up to the text this binary
+/// carries, once per text — the shape of `ensure_hooks_wired`, for the same
+/// reason. The auto-update swaps the binary and touches nothing else, and the
+/// process that runs `base update` is the OUTGOING binary, whose section text is
+/// the old contract; only the new binary can write its own. Returns what
+/// happened, for a one-line notice, or `None` when this text has already run.
+/// The stamp is written only after a successful attempt (the inverse of
+/// `auto_compact_tiers`, deliberately: a retry here costs one stat and one read),
+/// so a transient read error retries at the next session instead of being
+/// skipped for a whole release.
+pub fn ensure_claude_md_current() -> Option<ClaudeMdRefresh> {
+    let home = crate::home::home_root()?;
+    let stamp = home.join(".base-gbl").join(claude_md_stamp_name());
+    if stamp.exists() {
+        return None;
+    }
+    let result = refresh_claude_md_section(&home.join(".claude").join("CLAUDE.md")).ok()?;
+    let _ = std::fs::write(&stamp, b"");
+    Some(result)
 }
 
 #[cfg(test)]

@@ -583,7 +583,7 @@ fn run_verbose(check_only: bool, force: bool) -> Result<Option<String>> {
             println!("✓ refreshed {n} shipped script file(s) in ~/.base-gbl/scripts/");
         }
         refresh_skills(&skill_ver, crate::install::SkillReport::Line);
-        println!("  (any hook this release adds is wired at the next session start.)");
+        println!("  (any hook this release adds is wired, and the CLAUDE.md section refreshed, at the next session start.)");
         Ok(Some(skill_ver))
     })();
     let _ = std::fs::remove_dir_all(&work);
