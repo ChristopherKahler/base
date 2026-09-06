@@ -90,7 +90,11 @@ pub fn query_domain_from_graph(
         _ => format_toml_rules(domain_def),
     };
 
-    // Query 2: 1-hop neighborhood (decisions linked to this domain, projects with hasDomain)
+    // Query 2: 1-hop neighborhood (decisions linked to this domain, projects with hasDomain).
+    // `?related` is dropped if it is session traffic — one list, four readers
+    // (`ontology::transient`), so widening this union can never leak pings into
+    // the prompt.
+    let no_transient = crate::ontology::transient::sparql_exclude(ns, "related");
     let neighborhood_sparql = format!(
         "{pfx}\n\
          SELECT ?name ?type WHERE {{\n\
@@ -105,6 +109,7 @@ pub fn query_domain_from_graph(
                  {p}:name ?name .\n\
                BIND({p}:Project AS ?type)\n\
              }}\n\
+             {no_transient}\
            }}\n\
          }}\n\
          ORDER BY ?type ?name"

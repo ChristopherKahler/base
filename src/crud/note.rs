@@ -66,6 +66,9 @@ pub fn recall_to_string(
     domain: Option<&str>,
 ) -> String {
     let p = &ns.prefix;
+    // Session traffic is excluded from every read surface by one list
+    // (`ontology::transient`), never by a per-command filter.
+    let no_transient = crate::ontology::transient::sparql_exclude(ns, "n");
 
     let sparql = match (keyword, domain) {
         (Some(kw), Some(dom)) => {
@@ -82,6 +85,7 @@ pub fn recall_to_string(
                         OPTIONAL {{ ?n {p}:createdAt ?created }}\n\
                      }}\n\
                      ?n {p}:status \"active\" .\n\
+                     {no_transient}\
                    }}\n\
                  }}"
             )
@@ -140,6 +144,7 @@ pub fn recall_to_string(
                      ?n a {p}:Note ; {p}:noteText ?text ; {p}:noteType ?type ; {p}:status \"active\" ;\n\
                        {p}:relatedTo <{domain_iri}> .\n\
                      OPTIONAL {{ ?n {p}:createdAt ?created }}\n\
+                     {no_transient}\
                    }}\n\
                  }}"
             )
@@ -246,7 +251,9 @@ pub fn recalled_note_iris(
         (None, None) => return Vec::new(),
     };
 
-    let sparql = format!("SELECT DISTINCT ?n WHERE {{ GRAPH ?g {{ {where_clause} }} }}");
+    let no_transient = crate::ontology::transient::sparql_exclude(ns, "n");
+    let sparql =
+        format!("SELECT DISTINCT ?n WHERE {{ GRAPH ?g {{ {where_clause}\n{no_transient} }} }}");
     let results = match crud::load_and_query(cwd, ns, &sparql) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
@@ -490,6 +497,7 @@ pub fn list_notes(cwd: &Path, ns: &NamespaceConfig, type_filter: Option<&str>, d
         let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(d));
         filters.push(format!("?n {p}:relatedTo <{domain_iri}> ."));
     }
+    filters.push(crate::ontology::transient::sparql_exclude(ns, "n"));
 
     let filter_block = filters.join("\n             ");
 

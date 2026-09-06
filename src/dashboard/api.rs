@@ -124,6 +124,8 @@ pub async fn nodes(State(state): State<Arc<AppState>>) -> Json<Vec<GraphNode>> {
     let pfx = crate::crud::prefixes(ns);
     let store = state.store_guard();
 
+    // Session traffic never renders — one list, four readers (`ontology::transient`).
+    let no_transient = crate::ontology::transient::sparql_exclude(ns, "s");
     let sparql = format!(
         "{pfx}\n\
          SELECT ?s ?type ?name ?status ?path ?docType WHERE {{\n\
@@ -135,6 +137,7 @@ pub async fn nodes(State(state): State<Arc<AppState>>) -> Json<Vec<GraphNode>> {
              OPTIONAL {{ ?s {p}:status ?status }}\n\
              OPTIONAL {{ ?s {p}:path ?path }}\n\
              OPTIONAL {{ ?s {p}:documentType ?docType }}\n\
+             {no_transient}\
            }}\n\
          }}"
     );
@@ -181,8 +184,12 @@ pub async fn edges(State(state): State<Arc<AppState>>) -> Json<Vec<GraphEdge>> {
         .collect::<Vec<_>>()
         .join(" || ");
 
+    // An edge touching session traffic is not an edge, at either end.
+    let no_transient_s = crate::ontology::transient::sparql_exclude(ns, "s");
+    let no_transient_o = crate::ontology::transient::sparql_exclude(ns, "o");
     let sparql = format!(
-        "{pfx}\nSELECT ?s ?p ?o WHERE {{ GRAPH ?g {{ ?s ?p ?o . FILTER({filter}) }}\n\
+        "{pfx}\nSELECT ?s ?p ?o WHERE {{ GRAPH ?g {{ ?s ?p ?o . FILTER({filter})\n\
+             {no_transient_s}{no_transient_o} }}\n\
            FILTER(?g != <{ledger}>)\n\
          }}",
         ledger = crate::apply_ops::LEDGER_GRAPH,
