@@ -147,17 +147,11 @@ pub fn run(target: &Path) -> Result<()> {
     println!("  Config: .base/base.toml");
     println!("  Domains: .base/domains.toml");
     println!("  Graph: .base/graph.nq\n");
-    println!("Next:");
-    println!("  Add workspace-specific domain triggers to .base/domains.toml");
-    println!("  Add rules: base rule add --domain MY-DOMAIN --text \"...\"");
-
-    println!("\n───────────────────────────────────────");
-    println!("BASE — Built by Chris Kahler");
-    println!("Chris AI Systems");
-    println!();
-    println!("Community & support:");
-    println!("  https://www.skool.com/claude-code-titans-9203");
-    println!("───────────────────────────────────────");
+    // The same message install prints, byte for byte. The workspace-specific
+    // advice this used to give moved to `base help getting-started`, which is
+    // where someone looks once they have a reason to, rather than at the moment
+    // they have done nothing yet.
+    print!("{}", crate::first_run::text());
 
     Ok(())
 }

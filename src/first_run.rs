@@ -161,6 +161,46 @@ pub fn markdown() -> String {
     s
 }
 
+/// Everything the install and scaffold banners used to print at people before
+/// they had done anything: relay, the CARL migration, the star commands, the
+/// workspace-specific next steps. None of it belongs in a first-run message --
+/// it is what you read once you have a reason to.
+///
+/// A const rather than a built String, so clap can carry it as the
+/// `getting-started` long help and `base help getting-started` is the address
+/// the first-run message can honestly hand out.
+pub const GETTING_STARTED: &str = "\
+What to read once base is installed.
+
+Working in a workspace
+
+  base scaffold                    set a folder up as a workspace
+  base domain create               add a trigger for this workspace
+  base rule add --domain X --text  give that trigger something to say
+
+  Workspace triggers live in .base/domains.toml. The rules themselves live in
+  the graph, so they are searchable rather than pasted.
+
+Running more than one session
+
+  Relay is on. Every session gets a codename and a wake contract, and all of it
+  stays in ~/.base-gbl/.base/relay-inbox/ on this machine.
+
+  base config set relay.enabled false      turn it off
+  base config set relay.wake_nudge false   keep pings, drop the arming block
+
+Star commands
+
+  Short operator commands you type as *name. base install offers a starter pack;
+  base commands list shows what you have.
+
+Coming from CARL
+
+  base install --carl ~/.carl/carl.json    bring old decisions across
+
+The rest: https://docs.basemode.ai";
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

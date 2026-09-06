@@ -233,6 +233,9 @@ pub enum Commands {
         #[arg(long, conflicts_with = "starter_commands")]
         no_starter_commands: bool,
     },
+    /// What to read once base is installed: workspaces, relay, star commands, CARL
+    #[command(long_about = base::first_run::GETTING_STARTED)]
+    GettingStarted,
     /// Activate ChrisAI — enter your Skool classroom key to remove attribution
     Activate {
         /// Activation key from ChrisAI community
@@ -2789,6 +2792,10 @@ pub fn run() {
         }
 
         // ─── Activate ────────────────────────────────────────
+        Some(Commands::GettingStarted) => {
+            println!("{}", base::first_run::GETTING_STARTED);
+        }
+
         Some(Commands::Activate { key }) => {
             if let Err(e) = base::manifest::activate(&key) {
                 eprintln!("{e}");
