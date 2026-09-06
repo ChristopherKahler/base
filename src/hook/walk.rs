@@ -57,18 +57,28 @@ fn hops_for(kind: &str) -> usize {
     if matches!(kind, "project" | "domain") { 2 } else { 1 }
 }
 
-/// Candidate spans from a prompt, longest first, each consuming its span.
+/// Candidate spans from a prompt: longest match wins, per start position.
 ///
-/// A bare lowercase single word never resolves on its own: `base` in the middle
-/// of a sentence is a preposition-shaped noun, not a reference. Quoting it,
-/// backticking it, capitalising it, giving it a path shape, or using two or more
-/// words all read as naming something, and all resolve.
-pub fn candidates(prompt: &str) -> Vec<String> {
+/// `known` answers "is this a name the graph has?". Without it there is nothing
+/// to be longest-match ABOUT, and the first version of this function proved it:
+/// it partitioned the prompt into n-grams blindly, so `how is first client kit
+/// going` came out as `[how is first client][kit going]` -- a span nobody named,
+/// and the real name lost between two windows. Consuming a span has to be
+/// conditional on it HITTING, or it is just a partition with extra steps.
+///
+/// So: at each start position try n = 4 down to 1; on a hit, take it and jump
+/// past it; on no hit, advance one word and try again.
+///
+/// A bare lowercase single word never resolves on its own: `base` mid-sentence
+/// is a word, not a reference. Quoting it, backticking it, capitalising it,
+/// giving it a path shape, or using two or more words all read as naming
+/// something.
+pub fn candidates(prompt: &str, known: &dyn Fn(&str) -> bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    let push = |c: String, out: &mut Vec<String>, seen: &mut HashSet<String>| {
-        let c = c.trim().trim_matches(|ch: char| ch == ',' || ch == '.' || ch == ':' || ch == ';');
+    let mut push = |c: &str, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+        let c = c.trim().trim_matches(|ch: char| ",.;:!?".contains(ch));
         if c.is_empty() || c.len() > 120 {
             return;
         }
@@ -77,13 +87,14 @@ pub fn candidates(prompt: &str) -> Vec<String> {
         }
     };
 
-    // Quoted and backticked spans are explicit: whatever is inside was named.
-    for (open, close) in [('`', '`'), ('"', '"'), ('\'', '\'')] {
+    // Quoted and backticked spans are explicit: whatever is inside was named,
+    // so they are taken whether or not the graph knows them yet.
+    for (open, close) in [('`', '`'), ('"', '"')] {
         let mut rest = prompt;
         while let Some(a) = rest.find(open) {
             let after = &rest[a + open.len_utf8()..];
             let Some(b) = after.find(close) else { break };
-            push(after[..b].to_string(), &mut out, &mut seen);
+            push(&after[..b].to_string(), &mut out, &mut seen);
             rest = &after[b + close.len_utf8()..];
         }
     }
@@ -91,37 +102,37 @@ pub fn candidates(prompt: &str) -> Vec<String> {
     // Path-shaped tokens.
     for tok in prompt.split_whitespace() {
         let t = tok.trim_matches(|c: char| ",.;:()[]".contains(c));
-        if t.contains('/') || t.contains('\\') || (t.contains('.') && !t.ends_with('.')) {
-            push(t.to_string(), &mut out, &mut seen);
+        if t.contains('/') || t.contains('\\') {
+            push(t, &mut out, &mut seen);
         }
     }
 
-    // Word n-grams, longest first, so `first client kit` is tried before its
-    // parts and consumes them.
+    // Longest match per start position, against the index.
     let words: Vec<&str> = prompt
-        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.'))
         .filter(|w| !w.is_empty())
         .collect();
-    let mut consumed = vec![false; words.len()];
-    for n in (1..=4).rev() {
-        if words.len() < n {
-            continue;
-        }
-        for i in 0..=words.len() - n {
-            if consumed[i..i + n].iter().any(|c| *c) {
+
+    let mut i = 0usize;
+    while i < words.len() {
+        let mut took = 0usize;
+        for n in (1..=4).rev() {
+            if i + n > words.len() {
                 continue;
             }
             let span = words[i..i + n].join(" ");
-            // The single-word rule: only a capitalised one stands alone here.
-            // Quoted / backticked / path-shaped ones were already taken above.
+            // The single-word rule. Quoted / backticked / path-shaped words were
+            // already taken above and do not come through here.
             if n == 1 && span.chars().next().is_some_and(char::is_lowercase) {
                 continue;
             }
-            for k in i..i + n {
-                consumed[k] = true;
+            if known(&span) {
+                push(&span, &mut out, &mut seen);
+                took = n;
+                break;
             }
-            push(span, &mut out, &mut seen);
         }
+        i += if took > 0 { took } else { 1 };
     }
 
     out
@@ -144,7 +155,16 @@ pub fn walk(
     let mut out = Vec::new();
     let mut emitted: HashSet<String> = already_served.clone();
 
-    for name in candidates(prompt) {
+    // The index the longest-match runs against: every label the graph carries,
+    // normalised once. Built from maps the hook already holds, so a candidate
+    // check is a hash lookup, not a scan.
+    let mut index: HashSet<String> = HashSet::new();
+    for n in nodes.values() {
+        index.insert(n.label.to_lowercase());
+    }
+    let known = |span: &str| index.contains(&span.to_lowercase());
+
+    for name in candidates(prompt, &known) {
         let Some((id, ties)) = crate::graph_tools::resolve_strict(nodes, adj, ns, &name) else {
             continue;
         };
@@ -241,38 +261,56 @@ pub fn render(walked: &[(Resolved, Vec<Record>)], budget: usize) -> (String, usi
 mod tests {
     use super::*;
 
-    fn names(p: &str) -> Vec<String> {
-        candidates(p)
+    /// The index a test resolves against. Longest-match is meaningless without
+    /// one, which is what the first version of `candidates` got wrong.
+    fn idx(known: &[&str]) -> impl Fn(&str) -> bool + '_ {
+        move |s: &str| known.iter().any(|k| k.eq_ignore_ascii_case(s))
+    }
+
+    fn names(p: &str, known: &[&str]) -> Vec<String> {
+        candidates(p, &idx(known))
     }
 
     #[test]
     fn a_bare_lowercase_word_never_stands_alone() {
-        assert!(!names("what did we decide about base").contains(&"base".to_string()));
+        assert!(!names("what did we decide about base", &["base"]).contains(&"base".to_string()));
     }
 
     #[test]
     fn quoting_backticking_or_capitalising_makes_it_a_name() {
-        assert!(names("what about `base`").contains(&"base".to_string()));
-        assert!(names("what about \"base\"").contains(&"base".to_string()));
-        assert!(names("what about Base").contains(&"Base".to_string()));
+        assert!(names("what about `base`", &["base"]).contains(&"base".to_string()));
+        assert!(names("what about \"base\"", &["base"]).contains(&"base".to_string()));
+        assert!(names("what about Base", &["Base"]).contains(&"Base".to_string()));
     }
 
+    /// kite's case. The old positional partition took `how is first client` at
+    /// i=0 and left `kit going`, losing the name entirely.
     #[test]
-    fn two_words_stand_alone_without_ceremony() {
-        assert!(names("how is first client going").contains(&"first client".to_string()));
+    fn a_name_in_the_middle_of_a_sentence_is_found_whole() {
+        let n = names("how is first client kit going", &["first client kit"]);
+        assert_eq!(n, vec!["first client kit".to_string()], "got {n:?}");
     }
 
+    /// kite's case. Nothing in the index means nothing named.
     #[test]
-    fn the_longest_span_consumes_its_parts() {
-        let n = names("status of First Client Kit please");
-        assert!(n.contains(&"First Client Kit please".to_string()) || n.iter().any(|s| s.contains("First Client Kit")));
-        // "First" alone must not also appear as its own candidate.
-        assert!(!n.contains(&"First".to_string()));
+    fn a_sentence_naming_nothing_yields_nothing() {
+        assert!(names("how is everything going today", &["first client kit"]).is_empty());
+    }
+
+    /// kite's case. The longer name wins at the position both start at, and the
+    /// walk resumes AFTER it rather than re-reading its tail.
+    #[test]
+    fn the_longer_name_wins_and_the_scan_resumes_after_it() {
+        let n = names(
+            "compare first client kit and Renda today",
+            &["first client", "first client kit", "Renda"],
+        );
+        assert_eq!(n, vec!["first client kit".to_string(), "Renda".to_string()], "got {n:?}");
     }
 
     #[test]
     fn a_path_shaped_token_is_a_name() {
-        assert!(names("look at src/graph_query.rs").contains(&"src/graph_query.rs".to_string()));
+        assert!(names("look at src/graph_query.rs", &[]).contains(&"src/graph_query.rs".to_string()));
     }
 
     #[test]

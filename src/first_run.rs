@@ -72,6 +72,49 @@ fn platform_lines() -> (String, Option<String>) {
     (on, off)
 }
 
+/// The stamp that says this home has already been welcomed.
+///
+/// Three paths print the same message and only one of them should, once. The
+/// installers print it because they are the moment it happened; session start
+/// prints it for the home that got base some other way -- an `npx` bootstrap, a
+/// release zip, a binary copied in -- and never saw either installer.
+fn shown_stamp() -> Option<std::path::PathBuf> {
+    crate::home::home_root().map(|h| h.join(".base-gbl").join(".first-run-shown"))
+}
+
+/// Record that this home has seen the message. Called by whichever path printed
+/// it, so the others stay quiet.
+pub fn mark_shown() {
+    if let Some(p) = shown_stamp() {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&p, b"");
+    }
+}
+
+/// The message for a session start, or `None` when this home has already been
+/// welcomed or is mid-upgrade.
+///
+/// An upgrade is not a first run: `update.log` naming a swap means the user has
+/// been using base for a while and wants the "you were updated" line instead,
+/// not an introduction. Both would be worse than either.
+pub fn session_start_message() -> Option<String> {
+    let stamp = shown_stamp()?;
+    if stamp.exists() {
+        return None;
+    }
+    let home = crate::home::home_root()?;
+    let log = home.join(".base-gbl").join("update.log");
+    if std::fs::read_to_string(&log).map(|s| s.contains(" updated ")).unwrap_or(false) {
+        // Been here before, just arrived on a new version. Not a first run.
+        mark_shown();
+        return None;
+    }
+    mark_shown();
+    Some(text())
+}
+
 /// The message as a terminal prints it.
 pub fn text() -> String {
     let (on, off) = platform_lines();

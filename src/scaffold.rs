@@ -151,6 +151,7 @@ pub fn run(target: &Path) -> Result<()> {
     // where someone looks once they have a reason to, rather than at the moment
     // they have done nothing yet.
     print!("{}", crate::first_run::text());
+    crate::first_run::mark_shown();
 
     Ok(())
 }
