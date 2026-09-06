@@ -425,11 +425,14 @@ mod tests {
     fn a_transient_record_is_never_walked_into() {
         let mut nodes: HashMap<String, Node> = HashMap::new();
         nodes.insert(node("<x/project/kit>", "first client kit"));
-        nodes.insert(node("<x/ping/p1>", "a ping"));
+        // A real ping IRI under the real namespace, judged by the real seam: the
+        // hook passes `ontology::transient::is_transient_iri`, so the test does too.
+        let ping = format!("<{}ping/p1>", ns().uri);
+        nodes.insert(node(&ping, "a ping"));
         let mut adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        adj.insert("<x/project/kit>".into(), vec![("<x/ping/p1>".into(), "mentions".into())]);
+        adj.insert("<x/project/kit>".into(), vec![(ping.clone(), "mentions".into())]);
         let maps = (nodes, adj);
-        let transient = |id: &str| id.contains("ping/");
+        let transient = |id: &str| crate::ontology::transient::is_transient_iri(&ns(), id);
         let out = walk(&maps, &ns(), "`first client kit`", &HashSet::new(), &transient, &no);
         assert!(out[0].1.is_empty(), "a ping reached the prompt: {:?}", out[0].1.len());
     }

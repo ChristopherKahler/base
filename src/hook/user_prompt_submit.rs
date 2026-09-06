@@ -312,10 +312,10 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
                     &config.namespace,
                     &prompt,
                     &domain_served,
-                    // TODO(rebase onto PR 50): swap for
-                    // `ontology::transient::is_transient_iri`. This substring
-                    // test must not survive to the PR.
-                    &|id: &str| id.contains("ping/"),
+                    // One list, every reader (ruling 4): the same seam the graph
+                    // commands, recall, the domain block and the dashboard consult.
+                    // A substring test stood here until PR #50 landed (kite F4).
+                    &|id: &str| crate::ontology::transient::is_transient_iri(&config.namespace, id),
                     &|_id: &str| false,
                 )
             }),
