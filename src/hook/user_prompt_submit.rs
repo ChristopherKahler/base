@@ -130,34 +130,6 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // Determine if we're in lean mode (FRESH, first 2 prompts — rules only, skip neighborhood)
     let lean_mode = bracket == Bracket::Fresh && prompt_num <= 2;
 
-    // ─── Prompt-time traversal ───────────────────────────────────────────
-    // The record-level layer under the domain-level one above: resolve the
-    // things this prompt NAMES to graph nodes and walk out from each. Skipped in
-    // lean mode with the neighbourhood, for the same reason.
-    //
-    // `maps_from_store` and not `graph_query::load_graph`: the store is already
-    // parsed a few lines up, and load_graph would parse it a second time AND
-    // read the workspace graph only, so this layer would disagree with the
-    // domain layer beside it about what the graph contains.
-    let walked = match (&graph_store, lean_mode) {
-        (Some(store), false) => crate::graph_query::maps_from_store(store, cwd, &config.namespace, true)
-            .ok()
-            .map(|maps| {
-                crate::hook::walk::walk(
-                    &maps,
-                    &config.namespace,
-                    &prompt,
-                    &std::collections::HashSet::new(),
-                    // TODO(rebase onto PR 50): swap both for `ontology::transient`
-                    // and the supersedes predicate that fork lands. Written as
-                    // closures so the swap is one line each, not a rewrite.
-                    &|id: &str| id.contains("/ping/") || id.contains("ping/"),
-                    &|_id: &str| false,
-                )
-            }),
-        _ => None,
-    };
-
     // Track injection metadata for DEVMODE
     let mut loaded_domains: Vec<(String, String, usize)> = Vec::new(); // (name, match_reason, rule_count)
     let mut deduped_count = 0usize;
@@ -165,6 +137,9 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // and remember whether any fresh content was injected (gates the grounding block).
     let mut injected_commands: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut injected_any = false;
+    // Every record IRI the domain blocks serve this prompt. The walk below dedups
+    // against it, so a record cannot arrive twice under two headings.
+    let mut domain_served: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Format and emit matched rules
     for dm in &matched {
@@ -173,7 +148,8 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         // Try graph-backed injection first, fall back to TOML rules
         let (rules_text, neighborhood_text) = match &graph_store {
             Some(store) => {
-                let (r, n) = query_domain_from_graph(store, config, domain_def);
+                let (r, n, served) = query_domain_from_graph(store, config, domain_def);
+                domain_served.extend(served);
                 if lean_mode {
                     (r, String::new()) // skip neighborhood in lean mode
                 } else {
@@ -313,10 +289,65 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         session.mark_injected(&domain_def.name, combined_hash);
     }
 
+    // ─── Prompt-time traversal ───────────────────────────────────────────
+    // AFTER the domain loop, not before: it dedups against the IRIs those
+    // blocks served, and it cannot do that before they have run. Skipped in
+    // lean mode with the neighbourhood, for the same reason.
+    //
+    // `maps_from_store` and not `graph_query::load_graph`: the store is already
+    // parsed above, and load_graph would parse it a second time AND read the
+    // workspace graph only, so this layer would disagree with the domain layer
+    // beside it about what the graph contains.
+    //
+    // include_ast = false. The CLI passes true because `base graph neighbors`
+    // is expected to walk into call graphs; this walk resolves projects,
+    // decisions, people and documents, and parsing a 23.6 MB AST sidecar on
+    // every prompt to serve none of it is the kind of cost nobody sees.
+    let walked = match (&graph_store, lean_mode) {
+        (Some(store), false) => crate::graph_query::maps_from_store(store, cwd, &config.namespace, false)
+            .ok()
+            .map(|maps| {
+                crate::hook::walk::walk(
+                    &maps,
+                    &config.namespace,
+                    &prompt,
+                    &domain_served,
+                    // TODO(rebase onto PR 50): swap for
+                    // `ontology::transient::is_transient_iri`. This substring
+                    // test must not survive to the PR.
+                    &|id: &str| id.contains("ping/"),
+                    &|_id: &str| false,
+                )
+            }),
+        _ => None,
+    };
+
     // The walk's block rides after the domain blocks, so a reader sees the
     // configured layer first and the named-thing layer as the specific addition.
     let mut walk_note = String::new();
-    if let Some(ref walked) = walked {
+    if let Some(walked) = walked {
+        // Once per session per node, not once per prompt. Naming the same
+        // project in five consecutive prompts is one context, not five: the
+        // domain layer above has always worked this way and the record layer
+        // has no reason to be noisier. Keyed on the resolved IRI rather than the
+        // spelling, so "First Client Kit" and "first-client-kit" are one entry.
+        let mut fresh: Vec<(crate::hook::walk::Resolved, Vec<crate::hook::walk::Record>)> = Vec::new();
+        let mut walk_deduped = 0usize;
+        for (r, recs) in walked {
+            let key = format!("walk:{}", r.id);
+            let h = crate::domain::session::rules_hash(&[r.id.clone()]);
+            if session.is_injected(&key, h) {
+                walk_deduped += 1;
+                continue;
+            }
+            session.mark_injected(&key, h);
+            fresh.push((r, recs));
+        }
+        let walked = fresh;
+        if config.devmode.enabled && walk_deduped > 0 {
+            walk_note.push_str(&format!("  walk: {walk_deduped} name(s) already injected this session\n"));
+        }
+        let walked = &walked;
         let (block, dropped) = crate::hook::walk::render(walked, config.injection.walk_budget);
         if !block.is_empty() {
             output.push_str(&block);

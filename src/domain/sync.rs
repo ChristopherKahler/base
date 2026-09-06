@@ -719,7 +719,10 @@ rules = [{ text = "Never lie", rationale = "trust is load-bearing" }, "Be terse"
         // bare rule unchanged.
         let store = crate::store::load_graph(&base_dir.join("graph.nq")).unwrap();
         let (rules_text, _) =
-            crate::domain::query::query_domain_from_graph(&store, &config, &domains[0]);
+            {
+                let (r, n, _served) = crate::domain::query::query_domain_from_graph(&store, &config, &domains[0]);
+                (r, n)
+            };
         assert!(
             rules_text.contains("Never lie — because trust is load-bearing"),
             "rationale rendered: {rules_text}"
