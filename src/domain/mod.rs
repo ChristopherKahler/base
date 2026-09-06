@@ -1,3 +1,4 @@
+pub mod link;
 pub mod matcher;
 pub mod query;
 pub mod session;

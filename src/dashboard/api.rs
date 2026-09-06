@@ -171,11 +171,15 @@ pub async fn edges(State(state): State<Arc<AppState>>) -> Json<Vec<GraphEdge>> {
     let pfx = crate::crud::prefixes(ns);
     let store = state.store_guard();
 
+    // `hasDomain` was missing from this allowlist since it was written, so the
+    // graph view has never drawn the 49 project→domain edges in Chris's store
+    // (hawk C11). A hardcoded list goes blind to every predicate added after it —
+    // this one is now the whole domain-link vocabulary, from `domain::link`.
     let edge_predicates = [
         "relatedTo", "references", "hasRule", "hasDecision",
         "hasMilestone", "hasTask", "calls", "importsFrom",
         "contains", "hasMethod", "belongsTo", "hasTag",
-        "hasSection", "operatorNote",
+        "hasSection", "operatorNote", crate::domain::link::CANONICAL,
     ];
 
     let filter = edge_predicates
@@ -1362,6 +1366,7 @@ fn is_edge_predicate(pred: &str, prefix: &str) -> bool {
         "hasMilestone", "hasTask", "calls", "importsFrom",
         "contains", "hasMethod", "belongsTo", "operatorNote",
         "hasFileChange", "hasACResult", "hasAC", "dependsOn", "affects",
+        crate::domain::link::CANONICAL,
     ];
     edge_preds.iter().any(|ep| pred.contains(&format!("{prefix}:{ep}")) || pred.ends_with(&format!("#{ep}")))
 }

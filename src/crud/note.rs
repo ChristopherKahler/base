@@ -25,11 +25,19 @@ pub fn learn(
 
     let escaped_text = crud::escape_sparql_literal(text);
 
-    // Build relatedTo edges
+    // Build relational edges. The domain link is written under BOTH predicates
+    // for the 0.14.0 overlap: `hasDomain` is what every other record kind already
+    // uses (`crud/project.rs`, `crud/entity.rs`, `extract/paul_toml.rs`) and what
+    // N+1 keeps; `relatedTo` is what every 0.13.x reader still looks for, and
+    // dropping it now would blind a rolled-back binary to notes written meanwhile.
+    // See `domain::link` for the window.
     let mut edge_triples = String::new();
     if let Some(d) = domain {
         let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(d));
-        edge_triples.push_str(&format!("      <{iri}> {p}:relatedTo <{domain_iri}> .\n"));
+        let canonical = crate::domain::link::CANONICAL;
+        let legacy = crate::domain::link::LEGACY;
+        edge_triples.push_str(&format!("      <{iri}> {p}:{canonical} <{domain_iri}> .\n"));
+        edge_triples.push_str(&format!("      <{iri}> {p}:{legacy} <{domain_iri}> .\n"));
     }
     if let Some(proj) = project {
         let proj_iri = crud::build_iri(ns, "project", &crud::slugify(proj));
@@ -69,19 +77,32 @@ pub fn recall_to_string(
     // Session traffic is excluded from every read surface by one list
     // (`ontology::transient`), never by a per-command filter.
     let no_transient = crate::ontology::transient::sparql_exclude(ns, "n");
+    // A note's domain link is `hasDomain` from 0.14.0 and `relatedTo` before it.
+    // Reading only one of them is how `base recall --domain` goes silently empty —
+    // an empty SPARQL result is indistinguishable from "no notes in that domain".
+    // `links_to` is an EXISTS test, not a triple pattern: during the overlap a note
+    // carries both predicates and a pattern would return it twice.
 
     let sparql = match (keyword, domain) {
         (Some(kw), Some(dom)) => {
             let kw_lower = crud::escape_sparql_literal(&kw.to_lowercase());
             let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(dom));
+            let dlink = crate::domain::link::links_to(ns, "n", &domain_iri);
+            // DISTINCT because the two arms are not disjoint: a note that contains
+            // the keyword AND belongs to the domain satisfies both and is returned
+            // twice. Pre-existing in 0.13.x — the arms have never been deduped —
+            // and it only got easier to hit, so it is fixed here rather than left
+            // in a read this fork is already rewriting. It cannot merge two real
+            // notes: a note's IRI is `slugify(text)`, so equal text is one record.
             format!(
-                "SELECT ?text ?type ?created WHERE {{\n\
+                "SELECT DISTINCT ?text ?type ?created WHERE {{\n\
                    GRAPH ?g {{\n\
                      {{ ?n a {p}:Note ; {p}:noteText ?text ; {p}:noteType ?type .\n\
                         OPTIONAL {{ ?n {p}:createdAt ?created }}\n\
                         FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
                      }} UNION {{\n\
-                        ?n a {p}:Note ; {p}:noteText ?text ; {p}:noteType ?type ; {p}:relatedTo <{domain_iri}> .\n\
+                        ?n a {p}:Note ; {p}:noteText ?text ; {p}:noteType ?type .\n\
+                        {dlink}\n\
                         OPTIONAL {{ ?n {p}:createdAt ?created }}\n\
                      }}\n\
                      ?n {p}:status \"active\" .\n\
@@ -138,11 +159,12 @@ pub fn recall_to_string(
         }
         (None, Some(dom)) => {
             let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(dom));
+            let dlink = crate::domain::link::links_to(ns, "n", &domain_iri);
             format!(
                 "SELECT ?text ?type ?created WHERE {{\n\
                    GRAPH ?g {{\n\
-                     ?n a {p}:Note ; {p}:noteText ?text ; {p}:noteType ?type ; {p}:status \"active\" ;\n\
-                       {p}:relatedTo <{domain_iri}> .\n\
+                     ?n a {p}:Note ; {p}:noteText ?text ; {p}:noteType ?type ; {p}:status \"active\" .\n\
+                     {dlink}\n\
                      OPTIONAL {{ ?n {p}:createdAt ?created }}\n\
                      {no_transient}\
                    }}\n\
@@ -230,11 +252,12 @@ pub fn recalled_note_iris(
         (Some(kw), Some(dom)) => {
             let kw_lower = crud::escape_sparql_literal(&kw.to_lowercase());
             let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(dom));
+            let dlink = crate::domain::link::links_to(ns, "n", &domain_iri);
             format!(
                 "{{ ?n a {p}:Note ; {p}:noteText ?text ; {p}:status \"active\" .\n\
                     FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\")) }}\n\
                  UNION\n\
-                 {{ ?n a {p}:Note ; {p}:status \"active\" ; {p}:relatedTo <{domain_iri}> }}"
+                 {{ ?n a {p}:Note ; {p}:status \"active\" . {dlink} }}"
             )
         }
         (Some(kw), None) => {
@@ -246,7 +269,8 @@ pub fn recalled_note_iris(
         }
         (None, Some(dom)) => {
             let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(dom));
-            format!("?n a {p}:Note ; {p}:status \"active\" ; {p}:relatedTo <{domain_iri}>")
+            let dlink = crate::domain::link::links_to(ns, "n", &domain_iri);
+            format!("?n a {p}:Note ; {p}:status \"active\" . {dlink}")
         }
         (None, None) => return Vec::new(),
     };
@@ -495,7 +519,7 @@ pub fn list_notes(cwd: &Path, ns: &NamespaceConfig, type_filter: Option<&str>, d
     }
     if let Some(d) = domain_filter {
         let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(d));
-        filters.push(format!("?n {p}:relatedTo <{domain_iri}> ."));
+        filters.push(crate::domain::link::links_to(ns, "n", &domain_iri));
     }
     filters.push(crate::ontology::transient::sparql_exclude(ns, "n"));
 
