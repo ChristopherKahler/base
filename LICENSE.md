@@ -1,4 +1,4 @@
-Required Notice: Copyright Chris Kahler, Chris AI Systems (https://chrisai.cv)
+Required Notice: Copyright Chris Kahler (https://basemode.ai)
 
 # PolyForm Noncommercial License 1.0.0
 
