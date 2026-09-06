@@ -13,7 +13,7 @@ Their question: **$ARGUMENTS**
 
 This skill is portable and contains **no machine-specific facts**. Machine state lives in a local profile; universal knowledge lives in three reference files next to this one:
 
-- `${CLAUDE_SKILL_DIR}/references/qa.md`: 179 verified Q&A pairs, the primary answer source (the count grows whenever the close-the-loop rule below appends one)
+- `${CLAUDE_SKILL_DIR}/references/qa.md`: 180 verified Q&A pairs, the primary answer source (the count grows whenever the close-the-loop rule below appends one)
 - `${CLAUDE_SKILL_DIR}/references/commands.md`: the command surface grouped by safety class (read-only, mutating, destructive), aliases, flag gotchas
 - `${CLAUDE_SKILL_DIR}/references/cli.md`: the verbatim `--help` of every subcommand, generated from the binary at each release; the authority for an exact flag
 
