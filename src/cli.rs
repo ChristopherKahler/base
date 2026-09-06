@@ -14,9 +14,8 @@ use base::scope;
     version,
     about = "BASE — Proactive context-injection engine for Claude Code",
     after_help = "Drop-in plugin commands (from extensions): run `base ext list`\n\n\
-                  Built by Chris Kahler · Chris AI Systems\n\
-                  Community & support: https://www.skool.com/claude-code-titans-9203\n\
-                  Tutorials: https://www.youtube.com/@chris-ai-systems"
+                  Docs: https://docs.basemode.ai\n\
+                  Built by Chris Kahler"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -223,7 +222,7 @@ pub enum Commands {
         /// Skip hook wiring in settings.json
         #[arg(long)]
         skip_hooks: bool,
-        /// Register all ChrisAI components (PAUL, SEED, SKILLSMITH) in manifest
+        /// Register the bundled components (PAUL, SEED, SKILLSMITH) in manifest
         #[arg(long)]
         full: bool,
         /// Install the starter star commands without asking (*handoff, *fork, *base, *end)
@@ -236,9 +235,9 @@ pub enum Commands {
     /// What to read once base is installed: workspaces, relay, star commands, CARL
     #[command(long_about = base::first_run::GETTING_STARTED)]
     GettingStarted,
-    /// Activate ChrisAI — enter your Skool classroom key to remove attribution
+    /// Retired. Kept parseable so a scripted `base activate <key>` is not an error
     Activate {
-        /// Activation key from ChrisAI community
+        /// Ignored. Activation removed an attribution that no longer exists
         key: String,
     },
     /// Self-update the base binary from public GitHub releases (or snooze the banner)

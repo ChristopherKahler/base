@@ -318,20 +318,17 @@ fn check_and_banner() {
         let _ = manifest.save();
     }
 
-    let activated = manifest.is_activated();
     let pending = &manifest.update_check.pending_update;
 
-    // If updates already known...
+    // Activation used to suppress this banner: it was the paid removal of an
+    // attribution that no longer exists. With the gate gone the snooze is the
+    // only thing that quiets the banner, which is what the snooze is for.
     if !pending.is_empty() {
-        if !activated && !crate::manifest::is_snoozed(&manifest) {
-            // Inject banner for non-activated, non-snoozed installs
+        if !crate::manifest::is_snoozed(&manifest) {
             print!("{}", crate::manifest::format_update_banner(pending));
         }
-        // Don't also run HTTP check — we already know about updates.
-        // Still fall through for activated installs to keep manifest current.
-        if !activated {
-            return;
-        }
+        // The update is already known; no HTTP check this session.
+        return;
     }
 
     // Version check (weekly, HTTP call)
@@ -345,11 +342,10 @@ fn check_and_banner() {
     // Save manifest regardless (updates last_checked)
     let _ = manifest.save();
 
-    // If updates found and not activated, show banner
-    if let Ok(Some(ref pending)) = result
-        && !activated {
-            print!("{}", crate::manifest::format_update_banner(pending));
-        }
+    // The activation gate that used to sit here is gone with the feature.
+    if let Ok(Some(ref pending)) = result {
+        print!("{}", crate::manifest::format_update_banner(pending));
+    }
 }
 
 /// Mechanical active⇄deferred reconcile (task-artifact protocol). Fail-open: any

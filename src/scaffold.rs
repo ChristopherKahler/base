@@ -36,8 +36,7 @@ pub fn run(target: &Path) -> Result<()> {
             &domains_path,
             format!(
                 r#"# BASE — Workspace domain triggers for {ws_name}
-# Built by Chris Kahler · Chris AI Systems
-# Community: https://www.skool.com/claude-code-titans-9203
+# Built by Chris Kahler
 #
 # Workspace-specific triggers. Rules live in the graph (base rule add/list/remove).
 # Global domains in ~/.base-gbl/domains.toml apply everywhere.

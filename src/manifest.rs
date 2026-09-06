@@ -5,11 +5,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 
-// ─── Activation Key ─────────────────────────────────────────
-// SHA-256 hash of the activation key. The actual key never appears in source or binary.
-// Distributed via Skool classroom only.
-const ACTIVATION_KEY_HASH: &str = "389858f21ff026eb17ed26be72d02929d26c0485cbfe2e8e63e980ee3df49d7c";
-
 // ─── Manifest Structs ───────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,8 +55,10 @@ pub struct UpdateCheck {
     pub dismissed_until: String,
 }
 
+/// Retired with activation. A manifest written before this still carries
+/// whatever it recorded; nothing writes the field again.
 fn default_source() -> String {
-    "https://www.skool.com/claude-code-titans-9203".into()
+    String::new()
 }
 
 fn default_ttl() -> u64 {
@@ -126,18 +123,6 @@ impl Manifest {
         Ok(())
     }
 
-    /// Check if this install is activated (token hash matches compiled hash).
-    pub fn is_activated(&self) -> bool {
-        !self.chrisai.token.is_empty() && hash_key(&self.chrisai.token) == ACTIVATION_KEY_HASH
-    }
-}
-
-/// SHA-256 hash a key string, return hex.
-fn hash_key(key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(key.trim().as_bytes());
-    let result = hasher.finalize();
-    result.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 // ─── Component Detection ────────────────────────────────────
@@ -298,33 +283,16 @@ fn read_package_version(dir: &Path) -> Option<String> {
 
 // ─── Activation ─────────────────────────────────────────────
 
-/// Validate an activation key and write token to manifest.
-pub fn activate(key: &str) -> Result<()> {
-    let key = key.trim();
-
-    if hash_key(key) != ACTIVATION_KEY_HASH {
-        println!("════════════════════════════════════════");
-        println!("⛔ Invalid activation key.\n");
-        println!("Get your key at https://www.skool.com/claude-code-titans-9203");
-        println!("════════════════════════════════════════");
-        anyhow::bail!("Invalid activation key");
-    }
-
-    let mut manifest = Manifest::load().unwrap_or_default();
-    manifest.chrisai.token = key.to_string();
-
-    if manifest.chrisai.installed_at.is_empty() {
-        manifest.chrisai.installed_at = chrono::Local::now().to_rfc3339();
-    }
-
-    manifest.save()?;
-
-    println!("════════════════════════════════════════════════════════════════");
-    println!("✓ Activated — attribution removed.\n");
-    println!("Thank you for being a ChrisAI member.");
-    println!("Chris AI Systems · https://www.skool.com/claude-code-titans-9203");
-    println!("════════════════════════════════════════════════════════════════");
-
+/// Retired. The only thing activation ever did was remove an attribution
+/// block, and there is no longer an attribution block to remove.
+///
+/// The subcommand still parses and still exits 0, because somewhere there is a
+/// provisioning script that runs `base activate $KEY` and turning that into a
+/// usage error would break a machine to make a point. The key is ignored, the
+/// manifest is not written, and `token`/`source` on an existing manifest are
+/// read without complaint and never written again.
+pub fn activate(_key: &str) -> Result<()> {
+    println!("Activation is no longer required; base carries no attribution.");
     Ok(())
 }
 
@@ -445,12 +413,11 @@ pub fn check_for_updates(manifest: &mut Manifest) -> Result<Option<String>> {
 pub fn format_update_banner(pending: &str) -> String {
     format!(
         "\n═══════════════════════════════════════════════════════════════════\n\
-         🔄 ChrisAI update available\n\
+         🔄 base update available\n\
          \x20  {pending}\n\
          \n\
          \x20  Run: base update\n\
          \x20  Snooze 24h: base update --snooze\n\
-         \x20  Chris AI Systems · https://www.skool.com/claude-code-titans-9203\n\
          ═══════════════════════════════════════════════════════════════════\n"
     )
 }
@@ -525,7 +492,7 @@ mod tests {
         let manifest = Manifest {
             chrisai: ChrisAiSection {
                 installed_at: "2026-06-03T15:00:00-05:00".to_string(),
-                source: "https://www.skool.com/claude-code-titans-9203".to_string(),
+                source: String::new(),
                 token: String::new(),
             },
             components,
@@ -555,31 +522,26 @@ mod tests {
         );
     }
 
+    /// Activation is retired, but the manifests it wrote are still on disk and a
+    /// manifest is precisely the file an update must not break. `token` and
+    /// `source` are read without complaint and never written again.
     #[test]
-    fn hash_key_is_deterministic() {
-        let h1 = hash_key("test-input");
-        let h2 = hash_key("test-input");
-        assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 64); // SHA-256 = 64 hex chars
-        assert_ne!(h1, hash_key("different-input"));
+    fn a_manifest_from_an_activated_install_still_parses() {
+        let toml = r#"
+[chrisai]
+installed_at = "2026-06-03T15:00:00-05:00"
+source = "https://www.skool.com/claude-code-titans-9203"
+token = "some-activation-key"
+"#;
+        let m: Manifest = toml::from_str(toml).expect("an activation-era manifest must still load");
+        assert_eq!(m.chrisai.token, "some-activation-key");
+        assert_eq!(m.chrisai.installed_at, "2026-06-03T15:00:00-05:00");
     }
 
     #[test]
-    fn is_activated_with_empty_token() {
-        let manifest = Manifest::default();
-        assert!(!manifest.is_activated());
-    }
-
-    #[test]
-    fn is_activated_with_wrong_token() {
-        let manifest = Manifest {
-            chrisai: ChrisAiSection {
-                token: "wrong-key".to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(!manifest.is_activated());
+    fn activate_is_a_notice_and_never_writes() {
+        // No manifest is loaded or saved, so this is safe with no HOME at all.
+        assert!(activate("any-key-at-all").is_ok());
     }
 
     #[test]

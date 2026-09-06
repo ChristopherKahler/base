@@ -1,6 +1,6 @@
 //! Self-update from public GitHub releases.
 //!
-//! This used to run through a license-gated channel at chrisai.cv: every check
+//! This used to run through a license-gated channel: every check
 //! POSTed `license_key`, `email`, `claude_max_email`, `machine_id`, `version`, and
 //! an `activation_token`, and refused to install without a valid entitlement.
 //!
