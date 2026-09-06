@@ -150,16 +150,40 @@ pub fn load_graph(
     ns: &NamespaceConfig,
     include_ast: bool,
 ) -> Result<GraphMaps> {
-    let p = &ns.prefix;
-
     // One parse, four queries. `crud::load_and_query` re-reads and re-parses graph.nq
     // on every call, so the old two-query loader paid for the 13 MB store twice and
     // this four-query one would pay four times.
     let base_dir = crate::config::find_workspace_base(cwd)
         .context("no .base/ directory found. Use --global for global rules, or run `base scaffold` to create a workspace.")?;
     let store = crate::store::load_graph(&base_dir.join("graph.nq"))?;
+    maps_from_store(&store, cwd, ns, include_ast)
+}
+
+/// The projection half of [`load_graph`], over a store the caller already has.
+///
+/// `load_graph` finds the workspace and parses `graph.nq` itself. That is right
+/// for `base graph *`, which starts with nothing but a cwd, and wrong for the
+/// prompt hook, which has already parsed a store by the time it wants a walk --
+/// going back through `load_graph` there would parse the whole thing a SECOND
+/// time on every prompt.
+///
+/// It also matters WHICH store. `load_graph` reads the workspace graph only and
+/// errors outside a workspace; the hook's `store::load_merged` reads the global
+/// tier as well. Two retrieval layers in one prompt disagreeing about what the
+/// graph contains is the failure that looks fine in the output, so the hook
+/// passes its own merged store in here and both layers see the same graph.
+///
+/// `cwd` is still taken because the AST sidecar is per-app and lives on disk,
+/// not in the store.
+pub fn maps_from_store(
+    store: &oxigraph::store::Store,
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    include_ast: bool,
+) -> Result<GraphMaps> {
+    let p = &ns.prefix;
     let pfx = crud::prefixes(ns);
-    let ask = |q: &str| crate::store::query(&store, &format!("{pfx}\n{q}"));
+    let ask = |q: &str| crate::store::query(store, &format!("{pfx}\n{q}"));
 
     // `conceptType` is written only by `graph extract`; a store that has never run it
     // has none, so fall back to the RDF class every record carries. Without this every

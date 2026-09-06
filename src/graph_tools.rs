@@ -71,7 +71,14 @@ fn resolve(nodes: &HashMap<String, Node>, adj: &Adjacency, ns: &NamespaceConfig,
 /// choice cannot come out of hash iteration — before this, two domains both named
 /// `alpha` resolved to either one, run to run. A tie inside one kind is still a
 /// data smell, so it is said on stderr; the caller still gets an answer.
-fn pick(mut cands: Vec<&String>, nodes: &HashMap<String, Node>, adj: &Adjacency, input: &str) -> Option<String> {
+fn pick(cands: Vec<&String>, nodes: &HashMap<String, Node>, adj: &Adjacency, input: &str) -> Option<String> {
+    pick_quiet(cands, nodes, adj, input, false)
+}
+
+/// `pick`, with the tie note suppressible. The note is right for a CLI and wrong
+/// for the prompt hook, where stderr is operator-visible noise on every prompt --
+/// there the same information goes in the devmode block instead.
+fn pick_quiet(mut cands: Vec<&String>, nodes: &HashMap<String, Node>, adj: &Adjacency, input: &str, quiet: bool) -> Option<String> {
     if cands.is_empty() {
         return None;
     }
@@ -82,13 +89,54 @@ fn pick(mut cands: Vec<&String>, nodes: &HashMap<String, Node>, adj: &Adjacency,
     let chosen = cands[0];
     let kind = iri_kind(chosen).unwrap_or("record");
     let same_kind = cands.iter().filter(|c| iri_kind(c) == iri_kind(chosen)).count();
-    if same_kind > 1 {
+    if same_kind > 1 && !quiet {
         eprintln!(
             "note: {same_kind} {kind} records are named '{input}'; using the busiest ({}). Name the slug to pick another.",
             chosen.trim_matches(['<', '>'])
         );
     }
     Some(chosen.clone())
+}
+
+/// The prompt-time resolver: slug, then exact label, and nothing else.
+///
+/// `resolve` falls through to substring matching, which is right for a human
+/// typing one name at a CLI and wrong run over every candidate span in a
+/// sentence -- the token `base` alone is a substring of the domain, the project
+/// and every handoff carrying the word, so a prompt would drag the graph in.
+///
+/// Ambiguity is handled identically to `resolve`: the same `pick` total order
+/// decides, so the same input names the same record on every run, and a name
+/// that resolves to nothing is skipped rather than guessed. Returns the id and
+/// how many records of the chosen kind answered to the name, so the caller can
+/// report a tie in devmode instead of on stderr.
+pub(crate) fn resolve_strict(
+    nodes: &HashMap<String, Node>,
+    adj: &Adjacency,
+    ns: &NamespaceConfig,
+    input: &str,
+) -> Option<(String, usize)> {
+    let slug = crud::slugify(input);
+    let (head, tail) = (format!("<{}", ns.uri), format!("/{slug}>"));
+    let by_slug: Vec<&String> =
+        nodes.keys().filter(|id| id.starts_with(&head) && id.ends_with(&tail)).collect();
+    if let Some(hit) = pick_quiet(by_slug.clone(), nodes, adj, input, true) {
+        return Some((hit.clone(), same_kind_count(&by_slug, &hit)));
+    }
+
+    let want = input.trim().to_lowercase();
+    let exact: Vec<&String> = nodes
+        .iter()
+        .filter(|(_, n)| n.label.to_lowercase() == want)
+        .map(|(id, _)| id)
+        .collect();
+    let hit = pick_quiet(exact.clone(), nodes, adj, input, true)?;
+    let ties = same_kind_count(&exact, &hit);
+    Some((hit, ties))
+}
+
+fn same_kind_count(cands: &[&String], chosen: &str) -> usize {
+    cands.iter().filter(|c| iri_kind(c) == iri_kind(chosen)).count()
 }
 
 fn label<'a>(nodes: &'a HashMap<String, Node>, id: &'a str) -> &'a str {

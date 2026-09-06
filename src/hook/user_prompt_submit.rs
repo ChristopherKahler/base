@@ -130,6 +130,34 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // Determine if we're in lean mode (FRESH, first 2 prompts — rules only, skip neighborhood)
     let lean_mode = bracket == Bracket::Fresh && prompt_num <= 2;
 
+    // ─── Prompt-time traversal ───────────────────────────────────────────
+    // The record-level layer under the domain-level one above: resolve the
+    // things this prompt NAMES to graph nodes and walk out from each. Skipped in
+    // lean mode with the neighbourhood, for the same reason.
+    //
+    // `maps_from_store` and not `graph_query::load_graph`: the store is already
+    // parsed a few lines up, and load_graph would parse it a second time AND
+    // read the workspace graph only, so this layer would disagree with the
+    // domain layer beside it about what the graph contains.
+    let walked = match (&graph_store, lean_mode) {
+        (Some(store), false) => crate::graph_query::maps_from_store(store, cwd, &config.namespace, true)
+            .ok()
+            .map(|maps| {
+                crate::hook::walk::walk(
+                    &maps,
+                    &config.namespace,
+                    &prompt,
+                    &std::collections::HashSet::new(),
+                    // TODO(rebase onto PR 50): swap both for `ontology::transient`
+                    // and the supersedes predicate that fork lands. Written as
+                    // closures so the swap is one line each, not a rewrite.
+                    &|id: &str| id.contains("/ping/") || id.contains("ping/"),
+                    &|_id: &str| false,
+                )
+            }),
+        _ => None,
+    };
+
     // Track injection metadata for DEVMODE
     let mut loaded_domains: Vec<(String, String, usize)> = Vec::new(); // (name, match_reason, rule_count)
     let mut deduped_count = 0usize;
@@ -285,6 +313,33 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         session.mark_injected(&domain_def.name, combined_hash);
     }
 
+    // The walk's block rides after the domain blocks, so a reader sees the
+    // configured layer first and the named-thing layer as the specific addition.
+    let mut walk_note = String::new();
+    if let Some(ref walked) = walked {
+        let (block, dropped) = crate::hook::walk::render(walked, config.injection.walk_budget);
+        if !block.is_empty() {
+            output.push_str(&block);
+            injected_any = true;
+        }
+        if config.devmode.enabled {
+            for (r, recs) in walked {
+                walk_note.push_str(&format!(
+                    "  walk: {} → {} ({}) {} hop(s), {} record(s){}\n",
+                    r.name,
+                    r.id.trim_matches(['<', '>']),
+                    r.kind,
+                    r.hops,
+                    recs.len(),
+                    if r.ties > 1 { format!(", {} same-kind ties", r.ties) } else { String::new() },
+                ));
+            }
+            if dropped > 0 {
+                walk_note.push_str(&format!("  walk: {dropped} record(s) dropped by walk_budget\n"));
+            }
+        }
+    }
+
     // Grounding (Phase 30): when enabled, ride a source-verification block on any
     // fresh injection this prompt. Skipped on dedup-only prompts (already grounded).
     if config.grounding.enabled && injected_any {
@@ -300,6 +355,9 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             session.prompt_count,
             deduped_count,
         ));
+        if !walk_note.is_empty() {
+            output.push_str(&walk_note);
+        }
     }
 
     // Save updated session state
