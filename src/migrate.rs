@@ -415,7 +415,8 @@ impl Facts {
                 }
             }
         }
-        triggers.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        // Stable, so an equal-length tie keeps `load_domains` order.
+        triggers.sort_by_key(|t| std::cmp::Reverse(t.1.len()));
 
         let mut project_paths: Vec<(String, String)> = Vec::new();
         for iri in class_subjects(store, ns, "Project") {
@@ -430,7 +431,7 @@ impl Facts {
                 project_paths.push((iri, rel));
             }
         }
-        project_paths.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        project_paths.sort_by_key(|p| std::cmp::Reverse(p.1.len()));
 
         Facts { root, index, known, by_class, path_of, name_of, project_lit, parents, triggers, project_paths }
     }
