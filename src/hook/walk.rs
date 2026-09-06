@@ -468,6 +468,34 @@ mod tests {
         );
     }
 
+    /// The rendered shape. The relation is not decoration: it is the answer to
+    /// "why is this line here", and an agent that cannot see it has to guess.
+    #[test]
+    fn each_block_names_the_thing_and_shows_the_relation() {
+        let walked = vec![(
+            Resolved {
+                name: "first client kit".into(),
+                id: "<x/project/kit>".into(),
+                kind: "project".into(),
+                hops: 2,
+                ties: 1,
+            },
+            vec![Record {
+                kind: "decision".into(),
+                label: "stripe over paddle".into(),
+                relation: "belongsTo".into(),
+                id: "<x/decision/d1>".into(),
+                touched: "2026-09-01T00:00:00Z".into(),
+            }],
+        )];
+        let (block, dropped) = render(&walked, 4000);
+        assert_eq!(dropped, 0);
+        assert!(block.starts_with("<base-context name=\"first client kit\" kind=\"project\" hops=\"2\">"), "{block}");
+        assert!(block.contains("stripe over paddle"), "{block}");
+        assert!(block.contains("belongsTo"), "the relation is missing: {block}");
+        assert!(block.trim_end().ends_with("</base-context>"), "{block}");
+    }
+
     #[test]
     fn an_empty_walk_renders_nothing() {
         assert_eq!(render(&[], 1000).0, "");

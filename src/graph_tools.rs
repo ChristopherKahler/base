@@ -328,3 +328,71 @@ mod resolve_tests {
         assert!(err.contains("ambiguous (2 matches)"), "{err}");
     }
 }
+
+#[cfg(test)]
+mod strict_tests {
+    use super::*;
+
+    fn ns() -> NamespaceConfig {
+        NamespaceConfig::default()
+    }
+
+    fn nodes(pairs: &[(&str, &str)]) -> HashMap<String, Node> {
+        pairs
+            .iter()
+            .map(|(id, label)| {
+                (
+                    (*id).to_string(),
+                    Node {
+                        label: (*label).to_string(),
+                        ntype: String::new(),
+                        source: String::new(),
+                        summary: String::new(),
+                        touched: String::new(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The whole point of the strict resolver: `resolve` falls through to
+    /// substring matching, which is right for a human typing one name at a CLI
+    /// and ruinous run over every span in a sentence.
+    #[test]
+    fn a_substring_never_resolves() {
+        let n = nodes(&[("<http://ops-sys.local/ontology#project/basemode>", "basemode")]);
+        let adj = Adjacency::new();
+        assert!(
+            resolve_strict(&n, &adj, &ns(), "base").is_none(),
+            "a substring resolved; the prompt would drag the graph in"
+        );
+        assert!(
+            resolve_strict(&n, &adj, &ns(), "basemode").is_some(),
+            "the exact label did not resolve"
+        );
+    }
+
+    /// Ambiguity is decided, not guessed, and decided the SAME way every run.
+    /// Before `pick`, two records sharing a name resolved to either one
+    /// depending on hash iteration order.
+    #[test]
+    fn one_name_on_many_records_resolves_the_same_way_every_time() {
+        let n = nodes(&[
+            ("<http://ops-sys.local/ontology#domain/alpha>", "alpha"),
+            ("<http://ops-sys.local/ontology#project/alpha>", "alpha"),
+            ("<http://ops-sys.local/ontology#handoff/alpha>", "alpha"),
+        ]);
+        let adj = Adjacency::new();
+        let first = resolve_strict(&n, &adj, &ns(), "alpha").expect("should resolve");
+        for _ in 0..15 {
+            let again = resolve_strict(&n, &adj, &ns(), "alpha").expect("should resolve");
+            assert_eq!(first.0, again.0, "resolution moved between runs");
+        }
+    }
+
+    #[test]
+    fn a_name_nothing_answers_to_is_skipped_not_guessed() {
+        let n = nodes(&[("<http://ops-sys.local/ontology#project/kit>", "kit")]);
+        assert!(resolve_strict(&n, &Adjacency::new(), &ns(), "nothing here").is_none());
+    }
+}
