@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn auto_compact_disabled_is_a_noop() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = crate::config::GraphConfig { auto_compact: false, compact_threshold_mb: 0, compact_cooldown_hours: 24 };
+        let cfg = crate::config::GraphConfig { auto_compact: false, compact_threshold_mb: 0, compact_cooldown_hours: 24, auto_migrate: false };
         assert!(auto_compact_tiers(&cfg, dir.path()).is_empty());
     }
 }

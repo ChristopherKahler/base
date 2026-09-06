@@ -459,6 +459,11 @@ pub struct GraphConfig {
     /// Minimum hours between auto-compactions of the same tier (anti-churn).
     #[serde(default = "default_compact_cooldown_hours")]
     pub compact_cooldown_hours: i64,
+    /// Master switch for the one-time domain migration (opt-out). On by default
+    /// because Chris's ruling is that it lands automatically with the update and
+    /// nobody straggles; off is for an operator who wants to run it by hand.
+    #[serde(default = "default_true")]
+    pub auto_migrate: bool,
 }
 
 fn default_compact_threshold_mb() -> u64 { 12 }
@@ -470,6 +475,7 @@ impl Default for GraphConfig {
             auto_compact: true,
             compact_threshold_mb: default_compact_threshold_mb(),
             compact_cooldown_hours: default_compact_cooldown_hours(),
+            auto_migrate: true,
         }
     }
 }

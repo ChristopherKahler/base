@@ -37,6 +37,26 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
     // Scan and ingest paul.toml projects into graph (idempotent)
     ingest_paul_projects(config, cwd);
 
+    // Every record carries a domain link (Chris, 2026-09-04). One-time and
+    // idempotent: the work is recomputed from the store on every run where the
+    // stamp is absent, and the stamp lands in the SAME write_back as the data, so
+    // a `.bak` restore re-migrates correctly instead of skipping forever.
+    //
+    // Placed after domain sync and paul ingest on purpose: a backfill links only
+    // to a domain record that already exists, and both of those create some.
+    //
+    // Affordable here, measured: one full snapshot+parse+rewrite of the real
+    // 13.4 MB store costs 1.25-1.51 s against a hook that already spends 5.0-7.9 s
+    // and already rewrites the store in `auto_compact_tiers` (hawk C2). One time,
+    // not every session.
+    if config.graph.auto_migrate {
+        let notice =
+            crate::migrate::format_outcomes(&crate::migrate::migrate_tiers(cwd, &config.namespace));
+        if !notice.is_empty() {
+            print!("{notice}");
+        }
+    }
+
     // A release that adds a hook wires it here, once per version. The
     // auto-update swaps the binary and touches nothing else, and a hook that
     // is not in settings.json never fires — silently.
