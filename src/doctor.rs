@@ -48,6 +48,14 @@ pub struct TierReport {
     pub stale_tmp: bool,
     /// rdf:type → count, populated only when the tier parses (status == "healthy").
     pub entity_composition: Vec<(String, usize)>,
+    /// The schema version this tier's graph claims, e.g. `"domain-1"`. `None` on a
+    /// tier the domain migration has not reached — which is what makes a skipped
+    /// migration visible instead of silent (C4).
+    pub schema_version: Option<String>,
+    /// Covered classes that still carry no domain link, highest first. Non-empty
+    /// after a migration is not a fault: `base sync` writes a Document with no
+    /// domain, so the count climbs again until every write path carries the link.
+    pub domain_orphans: Vec<(String, usize)>,
     pub latest_backup: Option<BackupCompare>,
 }
 
@@ -93,6 +101,8 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
             ends_with_newline: true,
             stale_tmp,
             entity_composition: Vec::new(),
+            schema_version: None,
+            domain_orphans: Vec::new(),
             latest_backup: None,
         };
     }
@@ -105,6 +115,20 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
         entity_composition(path)
     } else {
         Vec::new()
+    };
+
+    // Namespace from THIS tier's own base.toml (`<root>/.base/graph.nq` → `<root>`),
+    // so a workspace with a custom prefix is read with its own vocabulary rather
+    // than the default. Keeps `diagnose_tier` path-scoped — the test-isolation seam.
+    let (schema_version, domain_orphans) = if status == "healthy" {
+        let root = path.parent().and_then(Path::parent).unwrap_or(path);
+        let ns = crate::config::BaseConfig::load(root).namespace;
+        match store::load_graph(path) {
+            Ok(s) => (crate::migrate::stamp_of_tier(&s, &ns), crate::migrate::orphan_counts(&s, &ns)),
+            Err(_) => (None, Vec::new()),
+        }
+    } else {
+        (None, Vec::new())
     };
 
     let latest_backup = newest_backup(path).map(|bpath| {
@@ -127,6 +151,8 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
         ends_with_newline,
         stale_tmp,
         entity_composition,
+        schema_version,
+        domain_orphans,
         latest_backup,
     }
 }
@@ -218,6 +244,32 @@ pub fn format_human(report: &DoctorReport) -> String {
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect();
             out.push_str(&format!("   composition: {}\n", comp.join(", ")));
+        }
+
+        // The domain schema, always stated when the tier parses. A migration that
+        // never ran must not look the same as one that ran and found nothing.
+        if t.status == "healthy" {
+            let orphans: usize = t.domain_orphans.iter().map(|(_, n)| n).sum();
+            match t.schema_version.as_deref() {
+                Some(v) => out.push_str(&format!("   schema: {v}\n")),
+                None => out.push_str(
+                    "   schema: not migrated — the domain backfill runs at the next session start\n",
+                ),
+            }
+            if orphans > 0 {
+                let top: Vec<String> = t
+                    .domain_orphans
+                    .iter()
+                    .take(6)
+                    .map(|(k, n)| format!("{k}={n}"))
+                    .collect();
+                let more = t.domain_orphans.len().saturating_sub(6);
+                out.push_str(&format!(
+                    "   without a domain: {orphans} record(s) — {}{}\n",
+                    top.join(", "),
+                    if more > 0 { format!(", +{more} more kind(s)") } else { String::new() },
+                ));
+            }
         }
 
         if let Some(b) = &t.latest_backup {

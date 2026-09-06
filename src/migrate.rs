@@ -230,6 +230,45 @@ pub fn stamp_of(store: &Store, ns: &NamespaceConfig, graph_iri: &str) -> Option<
         .next()
 }
 
+/// Covered records that still carry no domain link, per class, highest first.
+///
+/// `base doctor` reports this so a migration that skipped, or a store that has
+/// drifted since one ran, is never invisible (C4). Drift is expected and is not a
+/// fault: `base sync` writes a Document with no domain, so the count climbs again
+/// after a migration until every write path carries the link.
+pub fn orphan_counts(store: &Store, ns: &NamespaceConfig) -> Vec<(String, usize)> {
+    let index = link::domain_index(store, ns);
+    let by_class = covered_subjects(store, ns);
+    let mut counts: Vec<(String, usize)> = COVERED
+        .iter()
+        .map(|c| {
+            let n = by_class
+                .get(c.class)
+                .map(|subs| subs.iter().filter(|s| !index.contains_key(*s)).count())
+                .unwrap_or(0);
+            (c.class.to_string(), n)
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    counts
+}
+
+/// The schema version a tier claims, without the caller having to know its graph
+/// IRI. The stamp's subject IS its graph, so the store describes itself.
+pub fn stamp_of_tier(store: &Store, ns: &NamespaceConfig) -> Option<String> {
+    let p = &ns.prefix;
+    let pfx = crate::crud::prefixes(ns);
+    let q = format!("{pfx}\nSELECT ?v WHERE {{ GRAPH ?g {{ ?g {p}:schemaVersion ?v }} }}");
+    let QueryResults::Solutions(sols) = store::query(store, &q).ok()? else { return None };
+    sols.filter_map(|r| r.ok())
+        .filter_map(|row| match row.get("v")? {
+            Term::Literal(l) => Some(l.value().to_string()),
+            _ => None,
+        })
+        .next()
+}
+
 // ─── the pass ────────────────────────────────────────────────────────────────
 
 /// Migrate one tier's graph file. Path-scoped and pure of the operator's
@@ -343,9 +382,9 @@ impl Facts {
         let index = link::domain_index(store, ns);
         let known = existing_domains(store, ns);
 
-        let mut by_class = HashMap::new();
-        for cov in COVERED {
-            by_class.insert(cov.class, orphans_of(store, ns, cov.class, &index));
+        let mut by_class = covered_subjects(store, ns);
+        for subs in by_class.values_mut() {
+            subs.retain(|s| !index.contains_key(s));
         }
 
         let path_of = literal_map(store, ns, "path");
@@ -564,25 +603,47 @@ fn frontmatter_domain(root: &Path, rel: &str) -> Option<String> {
 
 // ─── store reads ─────────────────────────────────────────────────────────────
 
-/// Subjects of `class` carrying no domain link in either direction, minus session
-/// traffic. The transient filter is the shared one — adding a kind to
-/// `ontology::transient::TRANSIENT_KINDS` excludes it from the migration too.
-fn orphans_of(
-    store: &Store,
-    ns: &NamespaceConfig,
-    class: &str,
-    index: &HashMap<String, String>,
-) -> Vec<String> {
-    class_subjects(store, ns, class).into_iter().filter(|s| !index.contains_key(s)).collect()
-}
-
-fn class_subjects(store: &Store, ns: &NamespaceConfig, class: &str) -> Vec<String> {
-    let p = &ns.prefix;
+/// Subjects of every covered class, bucketed, minus session traffic.
+///
+/// ONE scan of the typed subjects rather than a query per class. Eighteen separate
+/// `?s a ops:<Class>` queries against a 13 MB store is the shape that put 11
+/// seconds into a `base doctor` run on a temp fixture; the migration and doctor
+/// both ask this question, and both ask it on the session-start path.
+///
+/// The transient filter is the shared one — adding a kind to
+/// `ontology::transient::TRANSIENT_KINDS` excludes it from the migration and from
+/// doctor's orphan count at the same time.
+fn covered_subjects(store: &Store, ns: &NamespaceConfig) -> HashMap<&'static str, Vec<String>> {
     let pfx = crate::crud::prefixes(ns);
     let no_transient = crate::ontology::transient::sparql_exclude(ns, "s");
     let q = format!(
-        "{pfx}\nSELECT DISTINCT ?s WHERE {{ GRAPH ?g {{ ?s a {p}:{class} .\n{no_transient}}} }}"
+        "{pfx}\nSELECT DISTINCT ?s ?t WHERE {{ GRAPH ?g {{ ?s a ?t .\n{no_transient}}} }}"
     );
+    let mut out: HashMap<&'static str, Vec<String>> = HashMap::new();
+    let Ok(QueryResults::Solutions(sols)) = store::query(store, &q) else { return out };
+    let want: HashMap<String, &'static str> =
+        COVERED.iter().map(|c| (format!("{}{}", ns.uri, c.class), c.class)).collect();
+    for row in sols.filter_map(|r| r.ok()) {
+        let (Some(Term::NamedNode(s)), Some(Term::NamedNode(t))) = (row.get("s"), row.get("t"))
+        else {
+            continue;
+        };
+        let Some(class) = want.get(t.as_str()) else { continue };
+        out.entry(class).or_default().push(s.as_str().to_string());
+    }
+    for subs in out.values_mut() {
+        subs.sort();
+        subs.dedup();
+    }
+    out
+}
+
+/// Subjects of one class, for the callers that want exactly one — `Project` paths
+/// and the domain inventory.
+fn class_subjects(store: &Store, ns: &NamespaceConfig, class: &str) -> Vec<String> {
+    let p = &ns.prefix;
+    let pfx = crate::crud::prefixes(ns);
+    let q = format!("{pfx}\nSELECT DISTINCT ?s WHERE {{ GRAPH ?g {{ ?s a {p}:{class} }} }}");
     let Ok(QueryResults::Solutions(sols)) = store::query(store, &q) else { return Vec::new() };
     let mut out: Vec<String> = sols
         .filter_map(|r| r.ok())
