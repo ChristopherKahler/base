@@ -113,7 +113,7 @@ jobs:
 
           Or download the binary for your platform below.
 
-          **Chris AI Systems** · https://www.skool.com/claude-code-titans-9203
+          Docs: https://docs.basemode.ai
           FOOTER
 
       - name: Create Release
