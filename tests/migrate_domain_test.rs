@@ -240,12 +240,18 @@ fn a_pass_with_nothing_to_link_takes_no_snapshot() {
     assert_eq!(out.backup, None, "and takes NO snapshot");
     assert!(snapshots(cwd).is_empty(), "nothing on disk either: {:?}", snapshots(cwd));
 
-    // The control: a pass with work to do DOES snapshot.
-    plant_orphan(cwd, "goal", "Goal", "ship-the-thing");
-    let out = migrate_manual(cwd);
+    // The control: a FIRST migration with work to do does snapshot. On a tier that is
+    // already stamped, later work is a delta pass, which takes none by design: it only
+    // adds quads onto a store already at this schema (e2a5d4d, vole's amendment to
+    // kite F7), so the control has to be a fresh, unstamped tier.
+    let tmp2 = workspace();
+    let cwd2 = tmp2.path();
+    plant_orphan(cwd2, "goal", "Goal", "ship-the-thing");
+    let out = migrate(cwd2);
     assert_eq!(out.total_linked(), 1);
+    assert!(!out.delta, "a first migration is not a delta: {out:?}");
     assert!(out.backup.is_some(), "real work is protected: {out:?}");
-    assert_eq!(snapshots(cwd).len(), 1);
+    assert_eq!(snapshots(cwd2).len(), 1);
 }
 
 #[test]
@@ -260,6 +266,13 @@ fn the_manual_command_re_plans_past_the_stamp() {
 
     // Drift: something writes an unlinked record after the migration ran.
     plant_orphan(cwd, "goal", "Goal", "written-later");
+    // Pin the delta marker newer than the store, so the hook's mtime gate reads "nothing
+    // wrote since I last looked" and takes the fast path. That is the state this test is
+    // about: a stamped tier the hook has no reason to re-plan, and drift that only the
+    // operator's own command goes looking for. (With the store newer than the marker the
+    // hook would file it itself — `a_record_written_after_the_migration_is_linked_at_the_next_session`.)
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(cwd.join(".base").join(".last-domain-delta"), "pinned by the test").unwrap();
 
     let hook = migrate(cwd);
     assert!(hook.already_migrated, "the hook still takes the fast path: {hook:?}");
