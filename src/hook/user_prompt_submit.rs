@@ -340,7 +340,11 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
                 walk_deduped += 1;
                 continue;
             }
-            session.mark_injected(&key, h);
+            // NOT marked here. Marking before the render means a name whose
+            // records are all cut by the byte budget is recorded as injected and
+            // never shown again this session -- the budget quietly becoming a
+            // permanent suppression, which looks exactly like dedup working.
+            // Marked below, against what actually rendered.
             fresh.push((r, recs));
         }
         let walked = fresh;
@@ -352,6 +356,14 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         if !block.is_empty() {
             output.push_str(&block);
             injected_any = true;
+        }
+        // Mark only what the reader actually got. A name the budget squeezed out
+        // entirely was not served, so it must be free to come back next prompt.
+        for (r, _) in walked {
+            if block.contains(&format!("name=\"{}\"", r.name)) {
+                let key = format!("walk:{}", r.id);
+                session.mark_injected(&key, crate::domain::session::rules_hash(&[r.id.clone()]));
+            }
         }
         if config.devmode.enabled {
             for (r, recs) in walked {

@@ -163,8 +163,16 @@ pub fn walk(
     let mut index: HashSet<String> = HashSet::new();
     for n in nodes.values() {
         index.insert(n.label.to_lowercase());
+        // The slug too. `resolve_strict` tries the slug BEFORE the label, so an
+        // index of labels alone leaves that half of the resolver unreachable:
+        // `first-client-kit` in prose would fail this gate and never be offered
+        // to the resolver that knows how to read it.
+        index.insert(crate::crud::slugify(&n.label));
     }
-    let known = |span: &str| index.contains(&span.to_lowercase());
+    let known = |span: &str| {
+        let s = span.to_lowercase();
+        index.contains(&s) || index.contains(&crate::crud::slugify(span))
+    };
 
     for name in candidates(prompt, &known) {
         let Some((id, ties)) = crate::graph_tools::resolve_strict(nodes, adj, ns, &name) else {
@@ -494,6 +502,24 @@ mod tests {
         assert!(block.contains("stripe over paddle"), "{block}");
         assert!(block.contains("belongsTo"), "the relation is missing: {block}");
         assert!(block.trim_end().ends_with("</base-context>"), "{block}");
+    }
+
+    /// F18. `resolve_strict` tries the slug BEFORE the label, so an index of
+    /// labels alone left that half of the resolver unreachable from the hook:
+    /// `first-client-kit` in prose failed the gate before the resolver that
+    /// knows how to read it ever saw it. Two halves that did not meet.
+    #[test]
+    fn a_node_is_found_by_its_slug_as_well_as_its_label() {
+        let mut nodes: HashMap<String, Node> = HashMap::new();
+        nodes.insert(node("<x/project/kit>", "First Client Kit"));
+        let adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let maps = (nodes, adj);
+
+        for spelling in ["`First Client Kit`", "`first-client-kit`", "First Client Kit"] {
+            let out = walk(&maps, &ns(), spelling, &HashSet::new(), &no, &no);
+            assert_eq!(out.len(), 1, "{spelling:?} resolved to {} things", out.len());
+            assert_eq!(out[0].id, "<x/project/kit>", "{spelling:?}");
+        }
     }
 
     #[test]
