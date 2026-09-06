@@ -85,6 +85,7 @@ pub fn run(
     println!("═══════════════════════════════════════\n");
     // One message, one source, every install path. See `crate::first_run`.
     print!("{}", crate::first_run::text());
+    crate::first_run::mark_shown();
 
     Ok(())
 }
