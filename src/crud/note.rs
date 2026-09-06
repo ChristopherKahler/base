@@ -164,6 +164,7 @@ pub fn recall_to_string(
                        FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
                      }}\n\
                    }}\n\
+                   {no_transient}\
                  }}\n\
                  ORDER BY DESC(?created) ?text"
             )

@@ -216,6 +216,18 @@ fn recall_by_domain_drops_a_transient_note() {
         "`recall --keyword --domain` must drop a Ping too — got {by_both:?}"
     );
 
+    // `recall --keyword` with no `--domain` is a DIFFERENT query — five UNION arms
+    // over Note, Decision, FileChange and AcceptanceCriteriaResult — and it
+    // consulted the list nowhere (kite F16). "Four readers, one list" was true of
+    // `recall --domain` and false of the surface right beside it.
+    let by_keyword = crud::note::recall_to_string(cwd, &ns(), Some("transient"), None);
+    assert!(
+        !by_keyword.contains("lark transient probe"),
+        "`recall --keyword` must drop a Ping too — got {by_keyword:?}"
+    );
+    let control = crud::note::recall_to_string(cwd, &ns(), Some("real note"), None);
+    assert!(control.contains("a real note in probe"), "the control still recalls: {control:?}");
+
     let iris = crud::note::recalled_note_iris(cwd, &ns(), None, Some("probe"));
     assert!(
         !iris.iter().any(|i| i.contains("#ping/")),
