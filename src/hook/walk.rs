@@ -36,6 +36,8 @@ pub struct Record {
     pub label: String,
     pub relation: String,
     pub id: String,
+    /// ISO 8601, or empty. Empty sorts LAST rather than sorting as ancient.
+    pub touched: String,
 }
 
 /// Kind priority for ranking. Lower sorts first.
@@ -194,6 +196,7 @@ pub fn walk(
                         label: label_of(nodes, nb),
                         relation: rel.clone(),
                         id: nb.clone(),
+                        touched: nodes.get(nb).map(|n| n.touched.clone()).unwrap_or_default(),
                     });
                 }
             }
@@ -203,10 +206,16 @@ pub fn walk(
             frontier = next;
         }
 
+        // Kind, then recency, then id. A record with no timestamp sorts after
+        // every record that has one -- "unknown" is not "old", and guessing
+        // either way would put it somewhere it does not belong. The id tail
+        // makes the order total, so the same graph renders the same block on
+        // every run.
         found.sort_by(|a, b| {
             kind_priority(&a.kind)
                 .cmp(&kind_priority(&b.kind))
-                .then_with(|| a.label.cmp(&b.label))
+                .then_with(|| a.touched.is_empty().cmp(&b.touched.is_empty()))
+                .then_with(|| b.touched.cmp(&a.touched))
                 .then_with(|| a.id.cmp(&b.id))
         });
 
@@ -269,6 +278,7 @@ mod tests {
                 ntype: String::new(),
                 source: String::new(),
                 summary: String::new(),
+                touched: String::new(),
             },
         )
     }
@@ -414,6 +424,48 @@ mod tests {
         let transient = |id: &str| id.contains("ping/");
         let out = walk(&maps, &ns(), "`first client kit`", &HashSet::new(), &transient, &no);
         assert!(out[0].1.is_empty(), "a ping reached the prompt: {:?}", out[0].1.len());
+    }
+
+    /// The recency row of the design-to-code map. Kind first, then most
+    /// recently touched, then id. A record with no timestamp sorts AFTER every
+    /// record that has one: unknown is not old, and guessing either way puts it
+    /// somewhere it does not belong.
+    #[test]
+    fn records_rank_by_kind_then_recency_with_undated_last() {
+        let mut nodes: HashMap<String, Node> = HashMap::new();
+        nodes.insert(node("<x/project/kit>", "first client kit"));
+        for (id, label, touched) in [
+            ("<x/decision/old>", "an old decision", "2026-01-01T00:00:00Z"),
+            ("<x/decision/new>", "a new decision", "2026-09-01T00:00:00Z"),
+            ("<x/decision/undated>", "an undated decision", ""),
+            ("<x/doc/recent>", "a very recent doc", "2026-09-05T00:00:00Z"),
+        ] {
+            let (k, mut n) = node(id, label);
+            n.touched = touched.to_string();
+            nodes.insert(k, n);
+        }
+        let mut adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        adj.insert(
+            "<x/project/kit>".into(),
+            vec![
+                ("<x/decision/old>".into(), "belongsTo".into()),
+                ("<x/decision/new>".into(), "belongsTo".into()),
+                ("<x/decision/undated>".into(), "belongsTo".into()),
+                ("<x/doc/recent>".into(), "documents".into()),
+            ],
+        );
+        let out = walk(&(nodes, adj), &ns(), "`first client kit`", &HashSet::new(), &no, &no);
+        let ids: Vec<&str> = out[0].1.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "<x/decision/new>",     // decisions outrank docs
+                "<x/decision/old>",     // newer decision first
+                "<x/decision/undated>", // undated sorts after both dated ones
+                "<x/doc/recent>",       // a doc, however recent, ranks below decisions
+            ],
+            "got {ids:?}"
+        );
     }
 
     #[test]

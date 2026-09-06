@@ -19,6 +19,11 @@ pub struct Node {
     pub ntype: String,
     pub source: String,
     pub summary: String,
+    /// When this record was last touched: `updatedAt` if the store has one,
+    /// else `createdAt`, else empty. Ranking uses it, so it is a string in ISO
+    /// 8601 and compared as one -- a record with no timestamp sorts last rather
+    /// than sorting as though it were ancient.
+    pub touched: String,
 }
 
 /// The record a bare name denotes when several kinds answer to it, in preference
@@ -192,12 +197,14 @@ pub fn maps_from_store(
     // One list, four readers — see `ontology::transient`.
     let no_transient = crate::ontology::transient::sparql_exclude(ns, "s");
     let node_q = format!(
-        "SELECT ?s ?label ?type ?rdftype ?src ?summary WHERE {{ GRAPH ?g {{\n\
+        "SELECT ?s ?label ?type ?rdftype ?src ?summary ?created ?updated WHERE {{ GRAPH ?g {{\n\
            ?s {p}:name ?label .\n\
            OPTIONAL {{ ?s {p}:conceptType ?type }}\n\
            OPTIONAL {{ ?s a ?rdftype }}\n\
            OPTIONAL {{ ?s {p}:sourceDoc ?src }}\n\
            OPTIONAL {{ ?s {p}:summary ?summary }}\n\
+           OPTIONAL {{ ?s {p}:createdAt ?created }}\n\
+           OPTIONAL {{ ?s {p}:updatedAt ?updated }}\n\
          {no_transient}\
          }} }}"
     );
@@ -214,6 +221,13 @@ pub fn maps_from_store(
                     .unwrap_or_default(),
                 source: row.get("src").map(|t| crud::term_display(t.into())).unwrap_or_default(),
                 summary: row.get("summary").map(|t| crud::term_display(t.into())).unwrap_or_default(),
+                // Touched beats created: the question ranking asks is "how
+                // recently did this matter", not "how old is it".
+                touched: row
+                    .get("updated")
+                    .or_else(|| row.get("created"))
+                    .map(|t| crud::term_display(t.into()))
+                    .unwrap_or_default(),
             });
         }
     }
@@ -265,6 +279,7 @@ pub fn maps_from_store(
                         .unwrap_or_default(),
                     source: row.get("src").map(|t| crud::term_display(t.into())).unwrap_or_default(),
                     summary: String::new(),
+                    touched: String::new(),
                 },
             );
         }
@@ -329,7 +344,7 @@ pub fn maps_from_store(
         let Some((kind, label)) = kind_and_label_from_iri(&id, ns) else { continue };
         nodes.insert(
             id,
-            Node { label, ntype: kind, source: String::new(), summary: String::new() },
+            Node { label, ntype: kind, source: String::new(), summary: String::new(), touched: String::new() },
         );
     }
 
@@ -345,6 +360,7 @@ pub fn maps_from_store(
                 ntype,
                 source: file,
                 summary: String::new(),
+                touched: String::new(),
             });
         }
         for (a, b, rel) in code_edges {
@@ -818,7 +834,7 @@ mod seed_tests {
     const U: &str = "http://t.local/o#";
 
     fn node(label: &str, ntype: &str) -> Node {
-        Node { label: label.into(), ntype: ntype.into(), source: String::new(), summary: String::new() }
+        Node { label: label.into(), ntype: ntype.into(), source: String::new(), summary: String::new(), touched: String::new() }
     }
 
     type Maps = (HashMap<String, Node>, HashMap<String, Vec<(String, String)>>);
