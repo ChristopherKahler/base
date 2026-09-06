@@ -419,6 +419,84 @@ fn a_record_carrying_two_covered_types_is_filed_once() {
 }
 
 #[test]
+fn a_domain_that_already_has_a_name_does_not_get_a_second_one() {
+    // A domain's DECLARED name need not equal its slug — `domains.toml` says
+    // `name = "Probe Domain"`, the IRI is `domain/probe-domain`. Writing the slug
+    // unconditionally therefore adds a SECOND `ops:name`, and a record with two
+    // names is one every reader answers about differently depending on which it
+    // binds. It happened twice on Chris's real store, to `content` and
+    // `development`.
+    let tmp = workspace_with(
+        "[[domain]]\nname = \"Probe Domain\"\nmode = \"triggered\"\nkeywords = []\nrules = [\"r\"]\n",
+    );
+    let cwd = tmp.path();
+    let dom = crud::build_iri(&ns(), "domain", "probe-domain");
+    assert_eq!(count_names(cwd, &dom), 1, "the fixture starts with exactly one name");
+    assert_eq!(
+        name_values(cwd, &dom),
+        vec!["Probe Domain".to_string()],
+        "and it is the DECLARED name, not the slug"
+    );
+
+    // Route a record at it so `ensure_domain` runs on an existing domain.
+    plant_project(cwd, "p", "probe-domain", None);
+    let t = crud::build_iri(&ns(), "task", "p.a-task");
+    insert(cwd, &format!("<{t}> rdf:type ops:Task ; ops:name \"a task\" .\n"));
+    insert(cwd, &format!("<{}> ops:hasTask <{t}> .\n", crud::build_iri(&ns(), "project", "p")));
+
+    let out = migrate(cwd);
+    assert_eq!(out.total_linked(), 1, "{out:?}");
+    assert_eq!(
+        name_values(cwd, &dom),
+        vec!["Probe Domain".to_string()],
+        "still one name, still the declared one"
+    );
+
+    // A domain the migration DOES create is named once, from its slug.
+    let unfiled = crud::build_iri(&ns(), "domain", migrate::CATCHALL);
+    assert_eq!(count_names(cwd, &unfiled), 0, "nothing needed the catchall here");
+    let g = crud::build_iri(&ns(), "goal", "g0");
+    insert(cwd, &format!("<{g}> rdf:type ops:Goal ; ops:name \"g0\" .\n"));
+    let iri = graph_iri(cwd);
+    crud::load_and_mutate(
+        cwd,
+        &ns(),
+        &format!("DELETE WHERE {{ GRAPH <{iri}> {{ <{iri}> ops:schemaVersion ?v }} }}"),
+    )
+    .unwrap();
+    migrate(cwd);
+    assert_eq!(name_values(cwd, &unfiled), vec![migrate::CATCHALL.to_string()]);
+}
+
+/// The `ops:name` literals a record carries, sorted.
+fn name_values(cwd: &Path, iri: &str) -> Vec<String> {
+    let q = format!("SELECT ?n WHERE {{ GRAPH ?g {{ <{iri}> ops:name ?n }} }}");
+    let oxigraph::sparql::QueryResults::Solutions(sols) =
+        crud::load_and_query(cwd, &ns(), &q).unwrap()
+    else {
+        return Vec::new();
+    };
+    let mut v: Vec<String> = sols
+        .filter_map(|r| r.ok())
+        .filter_map(|row| match row.get("n")? {
+            oxigraph::model::Term::Literal(l) => Some(l.value().to_string()),
+            _ => None,
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// How many `ops:name` literals a record carries.
+fn count_names(cwd: &Path, iri: &str) -> usize {
+    let q = format!("SELECT ?n WHERE {{ GRAPH ?g {{ <{iri}> ops:name ?n }} }}");
+    match crud::load_and_query(cwd, &ns(), &q).unwrap() {
+        oxigraph::sparql::QueryResults::Solutions(s) => s.filter_map(|r| r.ok()).count(),
+        _ => 0,
+    }
+}
+
+#[test]
 fn arm_labels_are_stable() {
     // The migration log is the operator's only view of why a record landed where
     // it did; renaming an arm silently changes what a past log meant.

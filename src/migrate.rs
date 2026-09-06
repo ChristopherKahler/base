@@ -739,8 +739,18 @@ fn apply(
 }
 
 /// Create a domain record if it is not already there, with the same shape
-/// `domain sync` writes. Idempotent by construction: the store is a set, so a
-/// re-insert of an existing quad changes nothing.
+/// `domain sync` writes.
+///
+/// The `rdf:type` quad is written unconditionally — the store is a set, so a
+/// re-insert changes nothing, and it types a domain that until now existed only
+/// as the object of an edge.
+///
+/// `ops:name` is NOT. A domain's declared name need not equal its slug:
+/// `domains.toml` declares `content` and `development` with names that slugify to
+/// those but are not byte-equal, and writing the slug unconditionally left both
+/// records carrying TWO `ops:name` literals on Chris's real store. A record with
+/// two names is a record every reader answers about differently depending on
+/// which one it binds. So: only name a domain this migration actually created.
 fn ensure_domain(store: &Store, ns: &NamespaceConfig, graph: NamedNodeRef<'_>, slug: &str) -> Result<()> {
     let iri = crate::crud::build_iri(ns, "domain", slug);
     let subject = NamedNodeRef::new(&iri)?;
@@ -751,7 +761,16 @@ fn ensure_domain(store: &Store, ns: &NamespaceConfig, graph: NamedNodeRef<'_>, s
     let name_pred = NamedNodeRef::new(&name_pred)?;
     let g = GraphNameRef::NamedNode(graph);
     store.insert(QuadRef::new(subject, rdf_type, class, g))?;
-    store.insert(QuadRef::new(subject, name_pred, LiteralRef::new_simple_literal(slug), g))?;
+
+    // Any graph, not just this tier's: a domain synced into the global graph is
+    // still that domain, and naming it twice is the defect either way.
+    let already_named = store
+        .quads_for_pattern(Some(subject.into()), Some(name_pred), None, None)
+        .next()
+        .is_some();
+    if !already_named {
+        store.insert(QuadRef::new(subject, name_pred, LiteralRef::new_simple_literal(slug), g))?;
+    }
     Ok(())
 }
 
