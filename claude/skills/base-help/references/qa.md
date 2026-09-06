@@ -816,6 +816,10 @@ Forks are additive, registering a new one never archives existing forks or the p
 - `base decision delete --keyword <kw>`: deletes decisions matching a keyword. `--keyword` is required (no accidental delete-everything), but there's no dry-run preview shown before the delete happens.
 <!-- v0.12.3 | verified: cli-help|reference -->
 
+### Q: What is `base graph migrate`, and do I ever need to run it?
+**A:** It gives every covered record a domain link, once per tier, and you normally never run it: it runs itself at session start and prints nothing when there is nothing to do. Run it by hand in one case — a tier whose graph was unhealthy when the hook tried is skipped, so `base doctor` keeps reporting `schema: not migrated` until you `base doctor --repair` and then `base graph migrate`. `--dry-run` shows what would be linked and by which source, and writes nothing. It is idempotent the hard way: the work is recomputed from the store on every run, and the schema stamp is written inside the *same* atomic rewrite as the links, so restoring a pre-migration `.bak` correctly re-migrates and restoring a post-migration one correctly does nothing. Where each record's domain came from is reported per source — frontmatter, path-trigger, project-path, fixed, parent, or `unfiled` — so the catchall is a visible line rather than a silent remainder. `base doctor` reports each tier's `schema:` and `without a domain: N` so a migration that never ran is never invisible.
+<!-- v0.13.19 | verified: cli-help -->
+
 ### Q: What does `base graph compact` / `base graph purge` / `base graph move` actually do?
 **A:** `compact` dedups and canonicalizes a workspace graph in an atomic rewrite, snapshotting first. `purge --stale [--days N] [--apply]` removes notes that haven't been read in more than N days (default 21); it's a dry-run preview unless you pass `--apply`. `move` relocates a subgraph between workspace graphs, rewriting its named-graph stamp; it previews by default and requires `--yes` to actually execute, backing up both source and destination tiers with rollback support.
 <!-- v0.12.3 | verified: cli-help -->

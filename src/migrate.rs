@@ -779,6 +779,56 @@ fn write_stamp(store: &Store, ns: &NamespaceConfig, graph_iri: &str) -> Result<(
 
 // ─── reporting ───────────────────────────────────────────────────────────────
 
+/// What a migration WOULD do, per tier, without writing anything.
+///
+/// The plan is computed the same way the real pass computes it, so a dry run and
+/// the run that follows it cannot disagree about the work — they call the same
+/// function over the same store.
+pub fn format_dry_run(cwd: &Path, ns: &NamespaceConfig) -> String {
+    let mut s = String::new();
+    for root in tier_roots(cwd) {
+        let path = root.join(".base").join("graph.nq");
+        if !path.exists() {
+            continue;
+        }
+        s.push_str(&format!("{}\n", path.display()));
+        if !matches!(store::graph_health(&path), GraphHealth::Healthy) {
+            s.push_str("   not healthy — run `base doctor --repair` first\n");
+            continue;
+        }
+        let Ok(store) = store::load_graph(&path) else {
+            s.push_str("   could not be read\n");
+            continue;
+        };
+        match stamp_of_tier(&store, ns) {
+            Some(v) => s.push_str(&format!("   schema: {v} (already migrated)\n")),
+            None => s.push_str("   schema: not migrated\n"),
+        }
+        let facts = Facts::gather(&store, ns, root.clone());
+        let plan = plan_backfill(&facts, ns);
+        if plan.is_empty() {
+            s.push_str("   nothing to link\n");
+            continue;
+        }
+        let mut by_arm: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut by_class: BTreeMap<&str, usize> = BTreeMap::new();
+        for a in &plan {
+            *by_arm.entry(a.arm.label()).or_default() += 1;
+            *by_class.entry(a.class.as_str()).or_default() += 1;
+        }
+        s.push_str(&format!("   would link {} record(s)\n", plan.len()));
+        s.push_str(&format!(
+            "   by source: {}\n",
+            by_arm.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ")
+        ));
+        s.push_str(&format!(
+            "   by kind:   {}\n",
+            by_class.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    s
+}
+
 /// One line per tier for the session-start notice, naming what each arm filed.
 ///
 /// The per-arm breakdown is the point, not decoration: `unfiled` appears as one

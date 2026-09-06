@@ -83,6 +83,15 @@ pub fn recall_to_string(
     // `links_to` is an EXISTS test, not a triple pattern: during the overlap a note
     // carries both predicates and a pattern would return it twice.
 
+    // Every branch below ends in a TOTAL order. Without one, oxigraph returns
+    // solutions in store order, so `base recall` reshuffles its rows after any
+    // rewrite — compact, purge, or this fork's migration — and two runs over the
+    // same knowledge disagree. Measured on a copy of Chris's store: the 80 rows of
+    // `recall --domain base` were identical as a SET before and after the
+    // migration, and in a different order. `graph_query::load_graph` already sorts
+    // its adjacency for exactly this reason; these reads never did. DESC(?created)
+    // keeps the newest-first reading store order happened to give, and `?text`
+    // breaks ties — a note's IRI is slugify(text), so it is unique per note.
     let sparql = match (keyword, domain) {
         (Some(kw), Some(dom)) => {
             let kw_lower = crud::escape_sparql_literal(&kw.to_lowercase());
@@ -108,7 +117,8 @@ pub fn recall_to_string(
                      ?n {p}:status \"active\" .\n\
                      {no_transient}\
                    }}\n\
-                 }}"
+                 }}\n\
+                 ORDER BY DESC(?created) ?text"
             )
         }
         (Some(kw), None) => {
@@ -154,7 +164,8 @@ pub fn recall_to_string(
                        FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
                      }}\n\
                    }}\n\
-                 }}"
+                 }}\n\
+                 ORDER BY DESC(?created) ?text"
             )
         }
         (None, Some(dom)) => {
@@ -168,7 +179,8 @@ pub fn recall_to_string(
                      OPTIONAL {{ ?n {p}:createdAt ?created }}\n\
                      {no_transient}\
                    }}\n\
-                 }}"
+                 }}\n\
+                 ORDER BY DESC(?created) ?text"
             )
         }
         (None, None) => return String::new(),

@@ -72,6 +72,7 @@ base graph analyze                       # god nodes, communities, bridges
 base graph get-node "<label>"
 base graph neighbors "<node>" -d <N>
 base graph path "<from>" "<to>"
+base graph migrate --dry-run             # what the domain backfill would link, by source
 ```
 
 Relay (read side):
@@ -213,6 +214,7 @@ base milestone delete <slug> [--force]           # without --force, detaches tas
 base task delete <slug> [--yes]
 base project move <slug> ... [--yes]     # preview unless --yes
 base graph compact
+base graph migrate                       # one-time domain backfill; snapshots, then atomic rewrite
 base graph purge --stale [--days N] [--apply]    # dry-run unless --apply
 base graph move ... [--yes]              # preview unless --yes; backs up both tiers
 base domain remove <name>
