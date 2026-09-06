@@ -261,6 +261,26 @@ pub fn render(walked: &[(Resolved, Vec<Record>)], budget: usize) -> (String, usi
 mod tests {
     use super::*;
 
+    fn node(id: &str, label: &str) -> (String, Node) {
+        (
+            id.to_string(),
+            Node {
+                label: label.to_string(),
+                ntype: String::new(),
+                source: String::new(),
+                summary: String::new(),
+            },
+        )
+    }
+
+    fn ns() -> NamespaceConfig {
+        NamespaceConfig::default()
+    }
+
+    fn no(_id: &str) -> bool {
+        false
+    }
+
     /// The index a test resolves against. Longest-match is meaningless without
     /// one, which is what the first version of `candidates` got wrong.
     fn idx(known: &[&str]) -> impl Fn(&str) -> bool + '_ {
@@ -348,6 +368,52 @@ mod tests {
         let (block, dropped) = render(&walked, 300);
         assert!(block.len() <= 300, "budget blown: {}", block.len());
         assert!(dropped > 0, "nothing reported as dropped");
+    }
+
+    /// F3, first half. A record the domain block already served must not arrive
+    /// a second time under a `<base-context>` heading. `already_served` is the
+    /// IRIs those blocks printed; before this it was an empty set, which meant
+    /// the dedup the design promised did not exist.
+    #[test]
+    fn a_record_the_domain_block_served_is_not_served_again() {
+        let mut nodes: HashMap<String, Node> = HashMap::new();
+        nodes.insert(node("<x/project/kit>", "first client kit"));
+        nodes.insert(node("<x/decision/d1>", "stripe over paddle"));
+        nodes.insert(node("<x/decision/d2>", "weekly invoicing"));
+        let mut adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        adj.insert(
+            "<x/project/kit>".into(),
+            vec![
+                ("<x/decision/d1>".into(), "belongsTo".into()),
+                ("<x/decision/d2>".into(), "belongsTo".into()),
+            ],
+        );
+        let maps = (nodes, adj);
+        let ns = ns();
+
+        // Nothing served yet: both decisions come through.
+        let all = walk(&maps, &ns, "`first client kit`", &HashSet::new(), &no, &no);
+        assert_eq!(all[0].1.len(), 2, "expected both decisions, got {:?}", all[0].1.len());
+
+        // d1 already served by the domain block: only d2 comes through.
+        let served: HashSet<String> = HashSet::from(["<x/decision/d1>".to_string()]);
+        let some = walk(&maps, &ns, "`first client kit`", &served, &no, &no);
+        assert_eq!(some[0].1.len(), 1, "domain-served record was served twice");
+        assert_eq!(some[0].1[0].id, "<x/decision/d2>");
+    }
+
+    /// A transient record never reaches a prompt, whatever it is attached to.
+    #[test]
+    fn a_transient_record_is_never_walked_into() {
+        let mut nodes: HashMap<String, Node> = HashMap::new();
+        nodes.insert(node("<x/project/kit>", "first client kit"));
+        nodes.insert(node("<x/ping/p1>", "a ping"));
+        let mut adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        adj.insert("<x/project/kit>".into(), vec![("<x/ping/p1>".into(), "mentions".into())]);
+        let maps = (nodes, adj);
+        let transient = |id: &str| id.contains("ping/");
+        let out = walk(&maps, &ns(), "`first client kit`", &HashSet::new(), &transient, &no);
+        assert!(out[0].1.is_empty(), "a ping reached the prompt: {:?}", out[0].1.len());
     }
 
     #[test]

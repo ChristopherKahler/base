@@ -13,7 +13,13 @@ pub fn query_domain_from_graph(
     store: &oxigraph::store::Store,
     config: &BaseConfig,
     domain_def: &domain::DomainDef,
-) -> (String, String) {
+) -> (String, String, Vec<String>) {
+    // The IRIs this domain block actually served. Prompt-time traversal walks
+    // from the things the prompt NAMES and would otherwise re-serve records the
+    // domain block just printed; it dedups against this list. Returned rather
+    // than re-derived, because re-deriving it means running these queries twice
+    // and getting a second chance to disagree with the first.
+    let mut served: Vec<String> = Vec::new();
     let ns = &config.namespace;
     let p = &ns.prefix;
     let domain_slug = crud::slugify(&domain_def.name);
@@ -23,7 +29,7 @@ pub fn query_domain_from_graph(
     // Query 1: Get rules ordered by priority, with optional rationale (Phase 26)
     let rules_sparql = format!(
         "{pfx}\n\
-         SELECT ?text ?rationale WHERE {{\n\
+         SELECT ?rule ?text ?rationale WHERE {{\n\
            GRAPH ?g {{\n\
              <{domain_iri}> {p}:hasRule ?rule .\n\
              ?rule {p}:ruleText ?text .\n\
@@ -53,6 +59,9 @@ pub fn query_domain_from_graph(
                         }
                         _ => None,
                     });
+                    if let Some(iri) = row.get("rule").map(|t| crud::term_display(t.into())) {
+                        served.push(iri);
+                    }
                     Some(domain::render_rule(&text, rationale.as_deref()))
                 })
                 .collect();
@@ -125,6 +134,9 @@ pub fn query_domain_from_graph(
                         _ => String::new(),
                     })?;
                     let type_label = row.get("type").map(|t| crud::term_display(t.into()))?;
+                    if let Some(iri) = row.get("related").map(|t| crud::term_display(t.into())) {
+                        served.push(iri);
+                    }
                     if name.is_empty() {
                         None
                     } else {
@@ -146,7 +158,7 @@ pub fn query_domain_from_graph(
         _ => String::new(),
     };
 
-    (rules_text, neighborhood_text)
+    (rules_text, neighborhood_text, served)
 }
 
 /// Resolve a query name to a `.sparql` file, read it, run it, format results.
@@ -310,7 +322,10 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
         let domain_def = dm.domain;
 
         let (rules_text, neighborhood_text) = match &graph_store {
-            Some(store) => query_domain_from_graph(store, config, domain_def),
+            Some(store) => {
+                let (r, n, _served) = query_domain_from_graph(store, config, domain_def);
+                (r, n)
+            }
             None => (format_toml_rules(domain_def), String::new()),
         };
 
