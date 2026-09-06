@@ -48,6 +48,12 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
         );
     }
 
+    // Same cluster, same reason: this is the new binary's first session, and it
+    // is the only process that can say what it is now running.
+    if let Some(notice) = crate::update::session_start_notice() {
+        println!("{notice}");
+    }
+
     // The installed CLAUDE.md contract refreshes here, once per version, for the
     // same reason: the process that runs `base update` is the outgoing binary and
     // carries the old text, so only the new binary's first session can write its own.

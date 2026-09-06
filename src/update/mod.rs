@@ -706,3 +706,157 @@ mod tests {
         assert!(find_base_binary(tmp.path(), 2).is_none());
     }
 }
+
+// ─── The "you were updated" notice ──────────────────────────────────────────
+
+/// The one line `run_quiet` deliberately does not print.
+///
+/// The background update is silent by design: nobody should eat a download or a
+/// paragraph in the middle of a session. But silence all the way through means a
+/// user's tool changes underneath them and never says so. Chris's session on
+/// 2026-09-06 printed "update available" and then nothing at all when the swap
+/// landed seconds later.
+///
+/// So the *next* session says it. That session is running the new binary, which
+/// is the only process that knows what it is, and `~/.base-gbl/update.log`
+/// already records every swap. Together they answer both halves: what am I
+/// running, and did it just change.
+///
+/// Once per version, on the same stamp pattern as `ensure_hooks_wired` and
+/// `ensure_claude_md_current`, for the same reason: the update swaps the binary
+/// and touches nothing else, so first-run-of-this-version is the only hook there
+/// is.
+pub fn session_start_notice() -> Option<String> {
+    let home = crate::home::home_root()?;
+    let stamp = home
+        .join(".base-gbl")
+        .join(format!(".update-noticed-{}", env!("CARGO_PKG_VERSION")));
+    if stamp.exists() {
+        return None;
+    }
+
+    let log = std::fs::read_to_string(home.join(".base-gbl").join("update.log")).unwrap_or_default();
+    let notice = notice_from_log(&log, env!("CARGO_PKG_VERSION"));
+
+    // Stamped whether or not anything printed. A fresh install has no log line
+    // naming this version and never will -- it got the first-run message
+    // instead -- so re-reading the file every session would buy nothing.
+    let _ = std::fs::write(&stamp, b"");
+    notice
+}
+
+/// Decide the notice from the log text alone, so every case in the matrix is a
+/// unit test rather than a fake home.
+///
+/// Only the LAST line counts: it is the most recent outcome, and an older line
+/// naming this version is a swap the user was already told about under a
+/// previous stamp. A `failed (...)` line last means the swap did not happen, so
+/// there is nothing to announce.
+fn notice_from_log(log: &str, version: &str) -> Option<String> {
+    let last = log.lines().rev().find(|l| !l.trim().is_empty())?;
+
+    // `<rfc3339> updated <from> -> <to> (<mode>)`
+    let (stamp, rest) = last.split_once(" updated ")?;
+    let (from, rest) = rest.split_once(" -> ")?;
+    let (to, mode) = rest.split_once(" (")?;
+    let mode = mode.strip_suffix(')')?;
+
+    if to.trim() != version {
+        return None;
+    }
+
+    let anchor = version.replace('.', "-");
+    let when = clock_time(stamp);
+    let how = match (mode, when) {
+        ("background", Some(hhmm)) => format!(", automatically at {hhmm}"),
+        ("background", None) => ", automatically".to_string(),
+        _ => String::new(),
+    };
+
+    Some(format!(
+        "base updated to {version} (from {}{how}).\nWhat changed: https://docs.basemode.ai/changelog#{anchor}",
+        from.trim()
+    ))
+}
+
+/// `HH:MM` out of an RFC 3339 stamp, without taking a date library along for a
+/// string slice. `None` rather than a guess if it is not the shape we wrote.
+fn clock_time(stamp: &str) -> Option<&str> {
+    let time = stamp.split('T').nth(1)?;
+    let hhmm = time.get(..5)?;
+    let mut chars = hhmm.chars();
+    let ok = matches!(
+        (chars.next(), chars.next(), chars.next(), chars.next(), chars.next()),
+        (Some(a), Some(b), Some(':'), Some(c), Some(d))
+            if a.is_ascii_digit() && b.is_ascii_digit() && c.is_ascii_digit() && d.is_ascii_digit()
+    );
+    ok.then_some(hhmm)
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::notice_from_log;
+
+    const BG: &str = "2026-09-06T06:07:32-05:00 updated 0.13.17 -> 0.13.19 (background)";
+
+    #[test]
+    fn a_background_swap_to_this_version_announces_itself() {
+        let n = notice_from_log(BG, "0.13.19").expect("should announce");
+        assert_eq!(
+            n,
+            "base updated to 0.13.19 (from 0.13.17, automatically at 06:07).\n\
+             What changed: https://docs.basemode.ai/changelog#0-13-19"
+        );
+    }
+
+    #[test]
+    fn a_manual_run_says_so_without_the_automatically_clause() {
+        let line = "2026-09-06T06:07:32-05:00 updated 0.13.17 -> 0.13.19 (manual)";
+        let n = notice_from_log(line, "0.13.19").expect("should announce");
+        assert!(n.starts_with("base updated to 0.13.19 (from 0.13.17)."), "{n}");
+        assert!(!n.contains("automatically"), "{n}");
+    }
+
+    #[test]
+    fn no_log_at_all_is_silent() {
+        assert!(notice_from_log("", "0.13.19").is_none());
+    }
+
+    #[test]
+    fn a_swap_to_a_different_version_is_silent() {
+        assert!(notice_from_log(BG, "0.14.0").is_none());
+    }
+
+    #[test]
+    fn only_the_last_line_counts() {
+        let log = format!("{BG}\n2026-09-06T09:00:00-05:00 updated 0.13.19 -> 0.14.0 (background)\n");
+        // The 0.13.19 swap is older news, already announced under its own stamp.
+        assert!(notice_from_log(&log, "0.13.19").is_none());
+        assert!(notice_from_log(&log, "0.14.0").is_some());
+    }
+
+    #[test]
+    fn a_failed_update_announces_nothing() {
+        let log = format!("{BG}\n2026-09-06T09:00:00-05:00 failed (background): network unreachable");
+        assert!(notice_from_log(&log, "0.13.19").is_none());
+        assert!(notice_from_log(&log, "0.14.0").is_none());
+    }
+
+    #[test]
+    fn trailing_blank_lines_do_not_hide_the_outcome() {
+        assert!(notice_from_log(&format!("{BG}\n\n\n"), "0.13.19").is_some());
+    }
+
+    #[test]
+    fn a_stamp_we_did_not_write_degrades_to_no_clock_rather_than_a_wrong_one() {
+        let line = "not-a-timestamp updated 0.13.17 -> 0.13.19 (background)";
+        let n = notice_from_log(line, "0.13.19").expect("should still announce");
+        assert!(n.contains(", automatically)."), "{n}");
+        assert!(!n.contains(" at "), "{n}");
+    }
+
+    #[test]
+    fn a_line_that_is_not_an_outcome_is_ignored() {
+        assert!(notice_from_log("something else entirely", "0.13.19").is_none());
+    }
+}

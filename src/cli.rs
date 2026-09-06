@@ -3398,9 +3398,18 @@ pub fn run() {
                         eprintln!("Key must be section.field (e.g. memory.mode)");
                         return;
                     }
+                    // A key absent from base.toml is not an absent key: nearly
+                    // every one of them has a default that is what the machine
+                    // actually does. `base config get update.auto` used to say
+                    // "not found" about a setting whose default is true, which
+                    // reads as "there is no such thing" rather than "you have
+                    // not overridden it".
                     match val.get(parts[0]).and_then(|s| s.get(parts[1])) {
                         Some(v) => println!("{v}"),
-                        None => eprintln!("Key '{key}' not found"),
+                        None => match base::config::default_value(parts[0], parts[1]) {
+                            Some(v) => println!("{v} (default)"),
+                            None => eprintln!("Key '{key}' not found"),
+                        },
                     }
                 }
                 ConfigAction::Set { key, value } => {
