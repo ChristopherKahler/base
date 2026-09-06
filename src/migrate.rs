@@ -215,6 +215,9 @@ pub struct Outcome {
     pub catchall: usize,
     /// True when the store now carries the stamp because THIS pass wrote it.
     pub stamped: bool,
+    /// True when this was a delta pass over an already-stamped tier, rather than
+    /// the first migration. A delta takes no snapshot.
+    pub delta: bool,
 }
 
 impl Outcome {
@@ -318,7 +321,14 @@ pub fn migrate_tier(
     // pre-migration backup migrates again and a restored post-migration backup is
     // already correct. `Trigger::Manual` never takes it: an operator who typed the
     // command gets the real answer, not the stamp's.
-    if stamped && trigger == Trigger::SessionStart {
+    //
+    // "Every record carries a domain" was false one write later (kite F7): `base
+    // sync` and the PAUL ingest manufacture unlinked records every session, and a
+    // stamped tier used to skip them forever. So a stamped tier still re-plans —
+    // but only when the store has actually changed since the last time this pass
+    // looked, which is ONE `stat` against a marker file rather than a 13.4 MB
+    // parse. A session that wrote nothing costs nothing.
+    if stamped && trigger == Trigger::SessionStart && !changed_since_last_delta(path) {
         out.already_migrated = true;
         return Ok(out);
     }
@@ -332,8 +342,15 @@ pub fn migrate_tier(
     // 13.4 MB store to change nothing.
     if plan.is_empty() && stamped {
         out.already_migrated = true;
+        stamp_delta_marker(path);
         return Ok(out);
     }
+    // A delta pass on an already-stamped tier: additive quads onto a store that is
+    // already at this schema. No snapshot — `write_back` is temp-plus-rename, the
+    // pass only ever ADDS `hasDomain` links, and the ten-slot backup pool belongs
+    // to the operations that can lose something (vole's amendment to F7). The
+    // first migration still snapshots, below.
+    let is_delta = stamped;
 
     // C1: snapshot first, sharing the `BACKUP_KEEP = 10` pool with compact — but
     // only when there is data to protect. A pass that writes nothing but the stamp
@@ -341,17 +358,50 @@ pub fn migrate_tier(
     // comment, `docs/graph-durability.md` and the outcome's own `backup: None`
     // have always claimed and what the code did not do (kite, PR #50).
     if !plan.is_empty() {
-        out.backup = Some(store::snapshot(path, "migrate")?.display().to_string());
+        if !is_delta {
+            out.backup = Some(store::snapshot(path, "migrate")?.display().to_string());
+        }
         apply(&store, ns, graph_iri, &plan, &mut out)?;
     }
 
     write_stamp(&store, ns, graph_iri)?;
     out.stamped = true;
+    out.delta = is_delta;
 
-    store::write_back(&store, path, Change::Op("migrate.domain-1"))
+    let label = if is_delta { "migrate.domain-1.delta" } else { "migrate.domain-1" };
+    store::write_back(&store, path, Change::Op(label))
         .context("migration write-back failed — the store is unchanged")?;
+    stamp_delta_marker(path);
 
     Ok(out)
+}
+
+/// Has anything written this tier since the delta pass last looked?
+///
+/// One `stat` per tier, the `auto_compact_tiers` marker shape, and deliberately
+/// mtime-versus-mtime rather than a time cooldown: a cooldown would make the
+/// promise "records are filed at the next session start" false for however long
+/// it ran, and would still pay the parse on a tier nobody touched. This skips
+/// exactly the sessions where there is provably nothing to find.
+///
+/// Missing marker means never run, so: yes. Unreadable metadata means yes — the
+/// pass is idempotent, and doing it needlessly is cheaper than not doing it.
+fn changed_since_last_delta(path: &Path) -> bool {
+    let marker = path.with_file_name(".last-domain-delta");
+    let (Ok(g), Ok(m)) = (std::fs::metadata(path), std::fs::metadata(&marker)) else {
+        return true;
+    };
+    match (g.modified(), m.modified()) {
+        (Ok(gt), Ok(mt)) => gt > mt,
+        _ => true,
+    }
+}
+
+/// Record that the delta pass has seen the store in its current shape.
+/// Best-effort: a marker that cannot be written costs one needless pass next
+/// session, which is the safe direction to fail.
+fn stamp_delta_marker(path: &Path) {
+    let _ = std::fs::write(path.with_file_name(".last-domain-delta"), crate::crud::now_iso());
 }
 
 /// Every tier under `cwd`, workspace then global, the `auto_compact_tiers` shape.
@@ -912,6 +962,14 @@ pub fn format_outcomes(outcomes: &[Outcome]) -> String {
         }
         let arms: Vec<String> = o.by_arm.iter().map(|(k, n)| format!("{k} {n}")).collect();
         let kinds: Vec<String> = o.linked.iter().map(|(k, n)| format!("{k} {n}")).collect();
+        if o.delta {
+            s.push_str(&format!(
+                "base: domain — {} new record(s) linked since the last session.\n  by source: {}\n",
+                o.total_linked(),
+                arms.join(", "),
+            ));
+            continue;
+        }
         s.push_str(&format!(
             "base: domain migration — {} record(s) now carry a domain.\n  by source: {}\n  by kind:   {}\n",
             o.total_linked(),

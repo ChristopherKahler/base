@@ -321,6 +321,74 @@ fn a_manual_run_with_nothing_to_do_still_writes_nothing() {
 }
 
 #[test]
+fn a_record_written_after_the_migration_is_linked_at_the_next_session() {
+    // "Every record carries a domain" was false one write later (kite F7):
+    // `base sync` and the PAUL ingest manufacture unlinked records every session,
+    // and a stamped tier used to skip them forever.
+    let tmp = workspace();
+    let cwd = tmp.path();
+    plant_orphan(cwd, "goal", "Goal", "ship-the-thing");
+    let first = migrate(cwd);
+    assert_eq!(first.total_linked(), 1);
+    assert!(!first.delta, "the first pass is a migration, not a delta");
+
+    // Something writes an unlinked record afterwards.
+    plant_orphan(cwd, "document", "Document", "written-later");
+
+    let second = migrate(cwd);
+    assert!(second.delta, "an already-stamped tier does a DELTA pass: {second:?}");
+    assert_eq!(second.total_linked(), 1, "and finds the new record");
+    assert_eq!(second.backup, None, "a delta adds quads only — no snapshot");
+    assert!(snapshots(cwd).len() == 1, "still just the first migration's: {:?}", snapshots(cwd));
+    let doc = crud::build_iri(&ns(), "document", "written-later");
+    assert!(ask(cwd, &format!("<{doc}> ops:hasDomain ?d")));
+
+    // The claim, stated as a test: nothing is left unlinked.
+    let left: usize = base::doctor::diagnose_tier("workspace", &graph_path(cwd))
+        .domain_orphans
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(left, 0);
+}
+
+#[test]
+fn a_session_that_wrote_nothing_costs_no_parse() {
+    // The delta pass must not re-plan a 13.4 MB store every session start. It is
+    // gated on the store's own mtime against a marker — one `stat` — so a session
+    // that changed nothing is skipped outright.
+    let tmp = workspace();
+    let cwd = tmp.path();
+    plant_orphan(cwd, "goal", "Goal", "ship-the-thing");
+    migrate(cwd);
+
+    let before = bytes(&graph_path(cwd));
+    let out = migrate(cwd);
+    assert!(out.already_migrated, "nothing wrote, so nothing was looked at: {out:?}");
+    assert!(!out.delta);
+    assert_eq!(out.total_linked(), 0);
+    assert_eq!(before, bytes(&graph_path(cwd)), "and the store is byte-identical");
+    assert!(
+        cwd.join(".base").join(".last-domain-delta").exists(),
+        "the marker is what makes the skip possible"
+    );
+}
+
+#[test]
+fn the_delta_pass_reruns_once_the_store_moves_again() {
+    let tmp = workspace();
+    let cwd = tmp.path();
+    migrate(cwd);
+    assert!(migrate(cwd).already_migrated, "quiet session, skipped");
+
+    // A write moves the store's mtime past the marker.
+    plant_orphan(cwd, "reminder", "Reminder", "call-someone");
+    let out = migrate(cwd);
+    assert!(out.delta, "the store moved, so the pass ran: {out:?}");
+    assert_eq!(out.total_linked(), 1);
+}
+
+#[test]
 fn a_ping_is_never_given_a_domain() {
     let tmp = workspace();
     let cwd = tmp.path();
