@@ -71,12 +71,65 @@ pub fn binds_domain(ns: &NamespaceConfig, subj_var: &str, obj_var: &str) -> Stri
     )
 }
 
-/// `FILTER NOT EXISTS { … }` — matches a record that carries no domain link in
-/// either era. This is what the migration means by "still unmigrated": it is
-/// computed from the store, never from a stamp (G0 verdict A2).
-pub fn no_domain_link(ns: &NamespaceConfig, subj_var: &str) -> String {
-    let inner = binds_domain(ns, subj_var, "__dom");
-    format!("FILTER NOT EXISTS {{ {inner} }}\n")
+/// Every record that already has a domain, in EITHER direction, as
+/// `record IRI -> domain slug`.
+///
+/// Direction is the trap. `crud/decision.rs:47` writes `<domain> ops:hasDecision
+/// <decision>` — the domain is the SUBJECT — and `domain sync` writes
+/// `<domain> ops:hasRule <rule>` the same way. A subject-side-only test therefore
+/// reads all 420 decisions and all 79 rules in Chris's store as orphans, and a
+/// migration built on it would write 342 redundant links to the wrong domain.
+/// hawk measured both directions (C-RE, "decisions are 65% covered, not 0%");
+/// this reads both.
+///
+/// One pass over the store rather than a query per record: the migration asks this
+/// of every covered record, and 4,000 SPARQL round trips inside a session-start
+/// hook is not a budget. Ties resolve to the lexicographically first slug so two
+/// runs of the same store agree.
+pub fn domain_index(
+    store: &oxigraph::store::Store,
+    ns: &NamespaceConfig,
+) -> std::collections::HashMap<String, String> {
+    use oxigraph::model::Term;
+    use oxigraph::sparql::QueryResults;
+
+    let p = &ns.prefix;
+    let pfx = crate::crud::prefixes(ns);
+    let dom = domain_iri_prefix(ns);
+    let path = path(ns);
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    let mut absorb = |q: &str| {
+        let Ok(QueryResults::Solutions(sols)) = crate::store::query(store, q) else { return };
+        for row in sols.filter_map(|r| r.ok()) {
+            let (Some(Term::NamedNode(r)), Some(Term::NamedNode(d))) = (row.get("r"), row.get("d"))
+            else {
+                continue;
+            };
+            let Some(slug) = d.as_str().strip_prefix(dom.as_str()) else { continue };
+            let key = r.as_str().to_string();
+            match out.get(&key) {
+                Some(existing) if existing.as_str() <= slug => {}
+                _ => {
+                    out.insert(key, slug.to_string());
+                }
+            }
+        }
+    };
+
+    // Record -> domain: `note relatedTo domain/x`, `project hasDomain domain/x`.
+    absorb(&format!(
+        "{pfx}\nSELECT ?r ?d WHERE {{ GRAPH ?g {{ ?r {path} ?d .\n\
+           FILTER(isIRI(?r) && isIRI(?d) && STRSTARTS(STR(?d), \"{dom}\")) }} }}"
+    ));
+    // Domain -> record: `domain hasDecision decision/x`, `domain hasRule rule/x`,
+    // and any predicate a later release adds — matched by the SUBJECT's IRI kind,
+    // not by an allowlist that would go stale.
+    absorb(&format!(
+        "{pfx}\nSELECT ?r ?d WHERE {{ GRAPH ?g {{ ?d ?p ?r .\n\
+           FILTER(isIRI(?r) && isIRI(?d) && STRSTARTS(STR(?d), \"{dom}\") && ?p != {p}:hasDomain) }} }}"
+    ));
+    out
 }
 
 #[cfg(test)]
@@ -121,9 +174,36 @@ mod tests {
     }
 
     #[test]
-    fn no_domain_link_wraps_the_binding_in_not_exists() {
-        let f = no_domain_link(&ns(), "s");
-        assert!(f.starts_with("FILTER NOT EXISTS {"));
-        assert!(f.contains("?s (ops:hasDomain|ops:relatedTo) ?__dom"));
+    fn domain_index_reads_both_directions() {
+        use oxigraph::store::Store;
+        let ns = ns();
+        let u = &ns.uri;
+        let g = format!("{u}graph/ws/t");
+        let store = Store::new().unwrap();
+        let nq = format!(
+            "<{u}domain/base> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{u}Domain> <{g}> .\n\
+             <{u}note/n1> <{u}relatedTo> <{u}domain/base> <{g}> .\n\
+             <{u}project/p1> <{u}hasDomain> <{u}domain/base> <{g}> .\n\
+             <{u}domain/base> <{u}hasDecision> <{u}decision/d1> <{g}> .\n\
+             <{u}domain/base> <{u}hasRule> <{u}rule/r1> <{g}> .\n\
+             <{u}note/n2> <{u}relatedTo> <{u}entity/e1> <{g}> .\n"
+        );
+        store.load_from_reader(oxigraph::io::RdfFormat::NQuads, nq.as_bytes()).unwrap();
+
+        let idx = domain_index(&store, &ns);
+        assert_eq!(idx.get(&format!("{u}note/n1")).map(String::as_str), Some("base"));
+        assert_eq!(idx.get(&format!("{u}project/p1")).map(String::as_str), Some("base"));
+        assert_eq!(
+            idx.get(&format!("{u}decision/d1")).map(String::as_str),
+            Some("base"),
+            "domain --hasDecision--> decision IS a domain link; missing it reads 420 \
+             already-linked decisions as orphans"
+        );
+        assert_eq!(idx.get(&format!("{u}rule/r1")).map(String::as_str), Some("base"));
+        assert!(
+            !idx.contains_key(&format!("{u}note/n2")),
+            "relatedTo to an entity is not a domain link"
+        );
+        assert!(!idx.contains_key(&format!("{u}entity/e1")));
     }
 }
