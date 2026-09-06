@@ -181,6 +181,22 @@ pub const COVERED: &[Covered] = &[
     Covered { class: "Task", source: Source::ParentOf("hasTask"), stage: 2 },
 ];
 
+/// Who asked. The stamp is session-start's fast path and NOTHING else.
+///
+/// kite, reviewing PR #50: on a stamped tier `base graph migrate` printed
+/// "Nothing to migrate" while `base doctor` reported `without a domain: N` on the
+/// same tier, in the same second. Both cannot be true. The migration is
+/// idempotent and recomputes its work from the store, so the stamp buys one
+/// thing — not re-planning a 13.4 MB store on every session start — and it must
+/// never be allowed to answer a question the operator asked directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// The session-start hook. Takes the stamp as a fast path.
+    SessionStart,
+    /// `base graph migrate`. Always re-plans; the operator asked.
+    Manual,
+}
+
 /// What one tier's migration did.
 #[derive(Debug, Default, Serialize)]
 pub struct Outcome {
@@ -277,7 +293,12 @@ pub fn stamp_of_tier(store: &Store, ns: &NamespaceConfig) -> Option<String> {
 /// `graph_iri` is the tier's own named graph — the stamp's subject and the graph
 /// every backfilled triple is written into. The tier root (`<root>/.base/graph.nq`)
 /// is what a document's relative `ops:path` resolves against.
-pub fn migrate_tier(path: &Path, graph_iri: &str, ns: &NamespaceConfig) -> Result<Outcome> {
+pub fn migrate_tier(
+    path: &Path,
+    graph_iri: &str,
+    ns: &NamespaceConfig,
+    trigger: Trigger,
+) -> Result<Outcome> {
     let mut out = Outcome { path: path.display().to_string(), ..Default::default() };
 
     // C1: `compact_tier` refuses an unhealthy graph and a migration that reuses
@@ -290,10 +311,14 @@ pub fn migrate_tier(path: &Path, graph_iri: &str, ns: &NamespaceConfig) -> Resul
 
     let store = store::load_graph(path)?;
 
-    // Fast path. Not a truth source — the work below is recomputed from the store
-    // every time the stamp is absent, so a restored pre-migration backup migrates
-    // again and a restored post-migration backup is already correct.
-    if stamp_of(&store, ns, graph_iri).as_deref() == Some(SCHEMA_VERSION) {
+    let stamped = stamp_of(&store, ns, graph_iri).as_deref() == Some(SCHEMA_VERSION);
+
+    // The fast path, and ONLY for the hook. Not a truth source — the work below is
+    // recomputed from the store whenever it is not taken, so a restored
+    // pre-migration backup migrates again and a restored post-migration backup is
+    // already correct. `Trigger::Manual` never takes it: an operator who typed the
+    // command gets the real answer, not the stamp's.
+    if stamped && trigger == Trigger::SessionStart {
         out.already_migrated = true;
         return Ok(out);
     }
@@ -302,12 +327,24 @@ pub fn migrate_tier(path: &Path, graph_iri: &str, ns: &NamespaceConfig) -> Resul
     let facts = Facts::gather(&store, ns, root);
     let plan = plan_backfill(&facts, ns);
 
-    // C1: snapshot first, sharing the `BACKUP_KEEP = 10` pool with compact. Only
-    // once there is a write to protect — a pure re-stamp of an already-clean store
-    // must not evict a compact backup.
-    out.backup = Some(store::snapshot(path, "migrate")?.display().to_string());
+    // Re-planned and there is genuinely nothing to do. Return without touching the
+    // file at all: a manual run on an already-migrated tier must not rewrite a
+    // 13.4 MB store to change nothing.
+    if plan.is_empty() && stamped {
+        out.already_migrated = true;
+        return Ok(out);
+    }
 
-    apply(&store, ns, graph_iri, &plan, &mut out)?;
+    // C1: snapshot first, sharing the `BACKUP_KEEP = 10` pool with compact — but
+    // only when there is data to protect. A pass that writes nothing but the stamp
+    // must not evict a compact backup from a pool of ten, which is what the
+    // comment, `docs/graph-durability.md` and the outcome's own `backup: None`
+    // have always claimed and what the code did not do (kite, PR #50).
+    if !plan.is_empty() {
+        out.backup = Some(store::snapshot(path, "migrate")?.display().to_string());
+        apply(&store, ns, graph_iri, &plan, &mut out)?;
+    }
+
     write_stamp(&store, ns, graph_iri)?;
     out.stamped = true;
 
@@ -319,7 +356,7 @@ pub fn migrate_tier(path: &Path, graph_iri: &str, ns: &NamespaceConfig) -> Resul
 
 /// Every tier under `cwd`, workspace then global, the `auto_compact_tiers` shape.
 /// Errors are per-tier: one unmigratable tier must not stop the other.
-pub fn migrate_tiers(cwd: &Path, ns: &NamespaceConfig) -> Vec<Outcome> {
+pub fn migrate_tiers(cwd: &Path, ns: &NamespaceConfig, trigger: Trigger) -> Vec<Outcome> {
     tier_roots(cwd)
         .into_iter()
         .filter_map(|root| {
@@ -328,7 +365,7 @@ pub fn migrate_tiers(cwd: &Path, ns: &NamespaceConfig) -> Vec<Outcome> {
                 return None;
             }
             let iri = crate::crud::workspace_graph_iri(ns, &crate::crud::workspace_slug(&root));
-            migrate_tier(&path, &iri, ns).ok()
+            migrate_tier(&path, &iri, ns, trigger).ok()
         })
         .filter(|o| o.total_linked() > 0 || o.skipped_unhealthy)
         .collect()
@@ -820,8 +857,11 @@ pub fn format_dry_run(cwd: &Path, ns: &NamespaceConfig) -> String {
             s.push_str("   could not be read\n");
             continue;
         };
+        // Both branches re-plan below. `--dry-run` and the run it previews must
+        // agree with each other AND with `base doctor` on the same tier — three
+        // surfaces answering one question, so they cannot be allowed to differ.
         match stamp_of_tier(&store, ns) {
-            Some(v) => s.push_str(&format!("   schema: {v} (already migrated)\n")),
+            Some(v) => s.push_str(&format!("   schema: {v}\n")),
             None => s.push_str("   schema: not migrated\n"),
         }
         let facts = Facts::gather(&store, ns, root.clone());

@@ -3628,7 +3628,14 @@ pub fn run() {
                 if dry_run {
                     print!("{}", base::migrate::format_dry_run(&cwd, &config.namespace));
                 } else {
-                    let outcomes = base::migrate::migrate_tiers(&cwd, &config.namespace);
+                    // Manual: always re-plans past the stamp. `base doctor` reporting
+                    // orphans while this printed "nothing to migrate" was a false
+                    // statement to the operator (kite, PR #50).
+                    let outcomes = base::migrate::migrate_tiers(
+                        &cwd,
+                        &config.namespace,
+                        base::migrate::Trigger::Manual,
+                    );
                     let notice = base::migrate::format_outcomes(&outcomes);
                     if notice.is_empty() {
                         println!("Nothing to migrate — every covered record already carries a domain.");

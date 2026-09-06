@@ -60,7 +60,13 @@ fn insert(cwd: &Path, triples: &str) {
 }
 
 fn migrate(cwd: &Path) -> migrate::Outcome {
-    migrate::migrate_tier(&cwd.join(".base").join("graph.nq"), &graph_iri(cwd), &ns()).unwrap()
+    migrate::migrate_tier(
+        &cwd.join(".base").join("graph.nq"),
+        &graph_iri(cwd),
+        &ns(),
+        migrate::Trigger::SessionStart,
+    )
+    .unwrap()
 }
 
 /// The domain slug a record ended up with, read back off disk.

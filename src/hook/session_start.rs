@@ -50,8 +50,11 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
     // and already rewrites the store in `auto_compact_tiers` (hawk C2). One time,
     // not every session.
     if config.graph.auto_migrate {
-        let notice =
-            crate::migrate::format_outcomes(&crate::migrate::migrate_tiers(cwd, &config.namespace));
+        let notice = crate::migrate::format_outcomes(&crate::migrate::migrate_tiers(
+            cwd,
+            &config.namespace,
+            crate::migrate::Trigger::SessionStart,
+        ));
         if !notice.is_empty() {
             print!("{notice}");
         }

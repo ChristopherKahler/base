@@ -50,8 +50,29 @@ fn graph_iri(cwd: &Path) -> String {
     crud::workspace_graph_iri(&ns(), &crud::workspace_slug(cwd))
 }
 
+/// The session-start path: takes the stamp as a fast path.
 fn migrate(cwd: &Path) -> migrate::Outcome {
-    migrate::migrate_tier(&graph_path(cwd), &graph_iri(cwd), &ns()).unwrap()
+    migrate::migrate_tier(&graph_path(cwd), &graph_iri(cwd), &ns(), migrate::Trigger::SessionStart)
+        .unwrap()
+}
+
+/// `base graph migrate`: always re-plans past the stamp.
+fn migrate_manual(cwd: &Path) -> migrate::Outcome {
+    migrate::migrate_tier(&graph_path(cwd), &graph_iri(cwd), &ns(), migrate::Trigger::Manual)
+        .unwrap()
+}
+
+/// The `.bak-migrate-*` snapshots on disk.
+fn snapshots(cwd: &Path) -> Vec<String> {
+    let dir = cwd.join(".base");
+    let mut v: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".bak-migrate-"))
+        .collect();
+    v.sort();
+    v
 }
 
 fn insert(cwd: &Path, triples: &str) {
@@ -201,6 +222,103 @@ fn a_restored_post_migration_backup_does_not_re_migrate() {
 }
 
 // ─── what it must not touch ──────────────────────────────────────────────────
+
+#[test]
+fn a_pass_with_nothing_to_link_takes_no_snapshot() {
+    // The comment, `docs/graph-durability.md` and the outcome's own `backup: None`
+    // all say a no-op takes no snapshot. The code took one anyway, and the test
+    // that looked like it covered this passed only because the STAMP fast path
+    // returned first — so the unstamped-empty-plan case was never exercised
+    // (kite, PR #50). Snapshots share one pool of ten with compact; a pass that
+    // writes nothing but the stamp must not evict a real backup.
+    let tmp = workspace();
+    let cwd = tmp.path();
+
+    let out = migrate(cwd);
+    assert_eq!(out.total_linked(), 0, "nothing to link in a fresh workspace: {out:?}");
+    assert!(out.stamped, "it still stamps, so session start takes the fast path next time");
+    assert_eq!(out.backup, None, "and takes NO snapshot");
+    assert!(snapshots(cwd).is_empty(), "nothing on disk either: {:?}", snapshots(cwd));
+
+    // The control: a pass with work to do DOES snapshot.
+    plant_orphan(cwd, "goal", "Goal", "ship-the-thing");
+    let out = migrate_manual(cwd);
+    assert_eq!(out.total_linked(), 1);
+    assert!(out.backup.is_some(), "real work is protected: {out:?}");
+    assert_eq!(snapshots(cwd).len(), 1);
+}
+
+#[test]
+fn the_manual_command_re_plans_past_the_stamp() {
+    // `base graph migrate` printed "Nothing to migrate" on a stamped tier while
+    // `base doctor` reported `without a domain: N` on the same tier in the same
+    // second. Both cannot be true (kite, PR #50). The stamp is session start's
+    // fast path and must never answer a question the operator asked directly.
+    let tmp = workspace();
+    let cwd = tmp.path();
+    migrate(cwd);
+
+    // Drift: something writes an unlinked record after the migration ran.
+    plant_orphan(cwd, "goal", "Goal", "written-later");
+
+    let hook = migrate(cwd);
+    assert!(hook.already_migrated, "the hook still takes the fast path: {hook:?}");
+    assert_eq!(hook.total_linked(), 0);
+
+    let manual = migrate_manual(cwd);
+    assert!(!manual.already_migrated, "the operator asked, so it re-planned: {manual:?}");
+    assert_eq!(manual.total_linked(), 1, "and found the drift");
+    let goal = crud::build_iri(&ns(), "goal", "written-later");
+    assert!(ask(cwd, &format!("<{goal}> ops:hasDomain ?d")));
+}
+
+#[test]
+fn the_manual_run_agrees_with_doctor_on_the_same_tier() {
+    // Three surfaces answer one question — doctor, `--dry-run`, and the run —
+    // and they are not allowed to differ.
+    let tmp = workspace();
+    let cwd = tmp.path();
+    migrate(cwd);
+    for n in 0..3 {
+        plant_orphan(cwd, "goal", "Goal", &format!("later-{n}"));
+    }
+
+    let reported: usize = base::doctor::diagnose_tier("workspace", &graph_path(cwd))
+        .domain_orphans
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(reported, 3, "doctor sees the drift");
+
+    let dry = base::migrate::format_dry_run(cwd, &ns());
+    assert!(dry.contains("would link 3 record(s)"), "the dry run agrees: {dry}");
+
+    let manual = migrate_manual(cwd);
+    assert_eq!(manual.total_linked(), reported, "and so does the run: {manual:?}");
+
+    let after: usize = base::doctor::diagnose_tier("workspace", &graph_path(cwd))
+        .domain_orphans
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(after, 0, "doctor is clean afterwards");
+}
+
+#[test]
+fn a_manual_run_with_nothing_to_do_still_writes_nothing() {
+    // Re-planning past the stamp must not cost a 13.4 MB rewrite for no change.
+    let tmp = workspace();
+    let cwd = tmp.path();
+    plant_orphan(cwd, "goal", "Goal", "ship-the-thing");
+    migrate(cwd);
+
+    let before = bytes(&graph_path(cwd));
+    let out = migrate_manual(cwd);
+    assert!(out.already_migrated, "re-planned, found nothing: {out:?}");
+    assert!(!out.stamped);
+    assert_eq!(out.backup, None);
+    assert_eq!(before, bytes(&graph_path(cwd)), "byte-identical");
+}
 
 #[test]
 fn a_ping_is_never_given_a_domain() {

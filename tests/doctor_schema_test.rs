@@ -46,7 +46,8 @@ fn insert(cwd: &Path, triples: &str) {
 
 fn migrate(cwd: &Path) -> base::migrate::Outcome {
     let g = crud::workspace_graph_iri(&ns(), &crud::workspace_slug(cwd));
-    base::migrate::migrate_tier(&graph_path(cwd), &g, &ns()).unwrap()
+    base::migrate::migrate_tier(&graph_path(cwd), &g, &ns(), base::migrate::Trigger::SessionStart)
+        .unwrap()
 }
 
 #[test]
