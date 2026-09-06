@@ -111,6 +111,8 @@ pub fn create(
     let iri = crud::build_iri(ns, "handoff", &slug);
     let (path, graph) = write_tier(cwd, ns)?;
     let p = &ns.prefix;
+    // The project this handoff names, as the IRI its domain hangs off (kite F7b).
+    let project_iri = crud::build_iri(ns, "project", &crud::slugify(project));
     let project = crud::escape_sparql_literal(project);
     let doc = crud::escape_sparql_literal(doc_path);
 
@@ -146,7 +148,9 @@ pub fn create(
          }} }}"
     );
 
-    mutate_file(&path, ns, &format!("{archive_prior};\n{clean_target};\n{insert}"))?;
+    // 4. The handoff takes the domain of the project it names, in the same write.
+    let inherit = crate::domain::link::inherit_update(ns, &graph, &iri, &project_iri);
+    mutate_file(&path, ns, &format!("{archive_prior};\n{clean_target};\n{insert};\n{inherit}"))?;
     Ok(slug)
 }
 
@@ -167,6 +171,8 @@ pub fn create_fork(
     let iri = crud::build_iri(ns, "handoff", &slug);
     let (path, graph) = write_tier(cwd, ns)?;
     let p = &ns.prefix;
+    // The project this handoff names, as the IRI its domain hangs off (kite F7b).
+    let project_iri = crud::build_iri(ns, "project", &crud::slugify(project));
     let project = crud::escape_sparql_literal(project);
     let name = crud::escape_sparql_literal(&slug);
     let doc = crud::escape_sparql_literal(doc_path);
@@ -188,7 +194,9 @@ pub fn create_fork(
          }} }}"
     );
 
-    mutate_file(&path, ns, &insert)?;
+    // The fork takes the domain of the project it names, in the same write (kite F7b).
+    let inherit = crate::domain::link::inherit_update(ns, &graph, &iri, &project_iri);
+    mutate_file(&path, ns, &format!("{insert};\n{inherit}"))?;
     Ok(slug)
 }
 

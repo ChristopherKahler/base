@@ -132,6 +132,33 @@ pub fn domain_index(
     out
 }
 
+/// A SPARQL UPDATE that gives `subject_iri` the domain its `parent_iri` already carries,
+/// in `graph_iri`, at creation time: a Task takes its project's domain, a Handoff the
+/// domain of the project it names (kite F7b, vole's ruling of 2026-09-06 that the claim
+/// "every record carries a domain" must not wait for the next session start when the
+/// parent already knows the answer).
+///
+/// Nothing is written when the parent has no domain. Inventing the catchall here would
+/// give two places ownership of `unfiled`; the session-start delta pass (`migrate.rs`)
+/// files such a record exactly as it files everything else that arrived without a link.
+/// The object filter keeps `relatedTo`'s entity and project links out, as everywhere
+/// else in this module.
+pub fn inherit_update(
+    ns: &NamespaceConfig,
+    graph_iri: &str,
+    subject_iri: &str,
+    parent_iri: &str,
+) -> String {
+    let p = &ns.prefix;
+    let path = path(ns);
+    let dom = domain_iri_prefix(ns);
+    format!(
+        "INSERT {{ GRAPH <{graph_iri}> {{ <{subject_iri}> {p}:{CANONICAL} ?d }} }}\n\
+         WHERE {{ GRAPH <{graph_iri}> {{ <{parent_iri}> {path} ?d .\n\
+           FILTER(isIRI(?d) && STRSTARTS(STR(?d), \"{dom}\")) }} }}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +198,17 @@ mod tests {
         let ns = NamespaceConfig { prefix: "mybase".into(), uri: "http://example.com/base#".into() };
         assert_eq!(path(&ns), "(mybase:hasDomain|mybase:relatedTo)");
         assert_eq!(domain_iri_prefix(&ns), "http://example.com/base#domain/");
+    }
+
+    #[test]
+    fn inherit_update_writes_the_canonical_predicate_from_the_parents_domain() {
+        let u = inherit_update(&ns(), "g", "s", "parent");
+        assert!(u.starts_with("INSERT { GRAPH <g> { <s> ops:hasDomain ?d } }"), "{u}");
+        assert!(u.contains("WHERE { GRAPH <g> { <parent> (ops:hasDomain|ops:relatedTo) ?d ."), "{u}");
+        assert!(
+            u.contains("STRSTARTS(STR(?d), \"http://ops-sys.local/ontology#domain/\")"),
+            "relatedTo also carries entity and project links; the object filter must be there: {u}"
+        );
     }
 
     #[test]
