@@ -14,9 +14,8 @@ use base::scope;
     version,
     about = "BASE — Proactive context-injection engine for Claude Code",
     after_help = "Drop-in plugin commands (from extensions): run `base ext list`\n\n\
-                  Built by Chris Kahler · Chris AI Systems\n\
-                  Community & support: https://www.skool.com/claude-code-titans-9203\n\
-                  Tutorials: https://www.youtube.com/@chris-ai-systems"
+                  Docs: https://docs.basemode.ai\n\
+                  Built by Chris Kahler"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -223,7 +222,7 @@ pub enum Commands {
         /// Skip hook wiring in settings.json
         #[arg(long)]
         skip_hooks: bool,
-        /// Register all ChrisAI components (PAUL, SEED, SKILLSMITH) in manifest
+        /// Register the bundled components (PAUL, SEED, SKILLSMITH) in manifest
         #[arg(long)]
         full: bool,
         /// Install the starter star commands without asking (*handoff, *fork, *base, *end)
@@ -233,9 +232,12 @@ pub enum Commands {
         #[arg(long, conflicts_with = "starter_commands")]
         no_starter_commands: bool,
     },
-    /// Activate ChrisAI — enter your Skool classroom key to remove attribution
+    /// What to read once base is installed: workspaces, relay, star commands, CARL
+    #[command(long_about = base::first_run::GETTING_STARTED)]
+    GettingStarted,
+    /// Retired. Kept parseable so a scripted `base activate <key>` is not an error
     Activate {
-        /// Activation key from ChrisAI community
+        /// Ignored. Activation removed an attribution that no longer exists
         key: String,
     },
     /// Self-update the base binary from public GitHub releases (or snooze the banner)
@@ -2789,6 +2791,10 @@ pub fn run() {
         }
 
         // ─── Activate ────────────────────────────────────────
+        Some(Commands::GettingStarted) => {
+            println!("{}", base::first_run::GETTING_STARTED);
+        }
+
         Some(Commands::Activate { key }) => {
             if let Err(e) = base::manifest::activate(&key) {
                 eprintln!("{e}");
@@ -3392,9 +3398,18 @@ pub fn run() {
                         eprintln!("Key must be section.field (e.g. memory.mode)");
                         return;
                     }
+                    // A key absent from base.toml is not an absent key: nearly
+                    // every one of them has a default that is what the machine
+                    // actually does. `base config get update.auto` used to say
+                    // "not found" about a setting whose default is true, which
+                    // reads as "there is no such thing" rather than "you have
+                    // not overridden it".
                     match val.get(parts[0]).and_then(|s| s.get(parts[1])) {
                         Some(v) => println!("{v}"),
-                        None => eprintln!("Key '{key}' not found"),
+                        None => match base::config::default_value(parts[0], parts[1]) {
+                            Some(v) => println!("{v} (default)"),
+                            None => eprintln!("Key '{key}' not found"),
+                        },
                     }
                 }
                 ConfigAction::Set { key, value } => {

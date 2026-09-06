@@ -1,6 +1,19 @@
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// The value `section.field` has when `base.toml` says nothing about it.
+///
+/// Serialises `BaseConfig::default()` and reads the answer back out of it, so
+/// this cannot drift from the defaults themselves: a new field with a
+/// `#[serde(default = ...)]` is covered the moment it exists, and a field that
+/// is renamed stops answering rather than answering wrongly.
+///
+/// `None` means no such key, which is the only case that deserves "not found".
+pub fn default_value(section: &str, field: &str) -> Option<toml::Value> {
+    let effective = toml::Value::try_from(BaseConfig::default()).ok()?;
+    effective.get(section)?.get(field).cloned()
+}
 
 // ─── Workspace discovery ─────────────────────────────────────
 
@@ -136,7 +149,7 @@ pub fn find_ast_ttl(cwd: &Path) -> Option<PathBuf> {
 
 // ─── Namespace Config ────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamespaceConfig {
     #[serde(default = "default_prefix")]
     pub prefix: String,
@@ -162,7 +175,7 @@ impl Default for NamespaceConfig {
 
 // ─── Base Config (base.toml) ─────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BaseConfig {
     #[serde(default)]
     pub namespace: NamespaceConfig,
@@ -201,7 +214,7 @@ pub struct BaseConfig {
 /// Context-triggered best-practice injection on PreToolUse Edit/Write.
 /// The budget fields keep injection scarce — whole-catalog injection is
 /// context pollution and gets tuned out.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StandardsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -228,7 +241,7 @@ impl Default for StandardsConfig {
 
 // ─── Workspace Registry ─────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceEntry {
     pub path: String,
 }
@@ -244,7 +257,7 @@ pub struct WorkspaceEntry {
 /// prompt count fires early in conversation and late in heavy work. The turn
 /// thresholds are retained and still used whenever the transcript is unreadable
 /// (first prompt of a session, missing path), so the bracket never goes blind.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BracketConfig {
     #[serde(default = "default_fresh_until")]
     pub fresh_until: u32,
@@ -291,7 +304,7 @@ pub struct BracketConfig {
 ///
 /// The tiered buckets are additive with `always`, not exclusive: at DEPLETED a
 /// prompt receives `always` + `depleted`.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BracketRules {
     /// Injected every prompt at every tier. For rules that must not erode —
     /// the layer that survives a long session because it is re-sent, not remembered.
@@ -360,7 +373,7 @@ impl Default for BracketConfig {
 
 // ─── Devmode Config ─────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DevmodeConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -380,7 +393,7 @@ pub struct DevmodeConfig {
 /// `BASE_NO_WAKE_NUDGE` remain the per-process equivalents.
 ///
 /// `base config set relay.enabled false` / `base config set relay.wake_nudge false`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -403,7 +416,7 @@ impl Default for RelayConfig {
 /// rename, so the running process keeps its inode and the next session is new.
 ///
 /// Pin a machine with `base config set update.auto false`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateConfig {
     #[serde(default = "default_auto_update")]
     pub auto: bool,
@@ -424,7 +437,7 @@ impl Default for UpdateConfig {
 /// System-level toggle (like devmode). When enabled, every prompt-time hook
 /// injection carries a `<grounding>` block instructing source-verification of
 /// factual claims. Settable via `base config set grounding.enabled true`.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GroundingConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -435,7 +448,7 @@ pub struct GroundingConfig {
 /// Graph-hygiene policy. Auto-compaction runs from the session-start guard (a
 /// low-frequency path — NOT the hook hot path) when a tier graph exceeds the size
 /// threshold, so graphs never balloon on a user's machine.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphConfig {
     /// Master switch for proactive auto-compaction (opt-out).
     #[serde(default = "default_true")]
@@ -470,7 +483,7 @@ impl Default for GraphConfig {
 /// audio/video pull `whisper`+`ffmpeg`, installed once via `pip install --user`
 /// (marker-gated, never again) the first time such a corpus is ingested with this
 /// enabled. Flip on with `base config set multimodal.enabled true`.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MultimodalConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -478,7 +491,7 @@ pub struct MultimodalConfig {
 
 // ─── Flow Config ────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowConfig {
     /// Master switch — opt-in feature, default false
     #[serde(default)]
@@ -514,7 +527,7 @@ impl Default for FlowConfig {
 
 // ─── Memory Config ──────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
     /// Master switch — opt-in feature, default false
     #[serde(default)]
@@ -541,7 +554,7 @@ impl Default for MemoryConfig {
 /// and whether tasks must declare a produced artifact. Set by os-config in the global
 /// `~/.base-gbl/base.toml`; inherited by every workspace via the config overlay
 /// (set once, every scaffolded workspace conforms). base stays agnostic.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtocolConfig {
     /// Opt-in master switch (default off so base works unconfigured).
     #[serde(default)]
@@ -581,7 +594,7 @@ impl ProtocolConfig {
 }
 
 /// One project lifecycle stage and the folder its artifacts live in.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageDef {
     /// Stage name (e.g. "planning", "project").
     pub name: String,
@@ -594,7 +607,7 @@ pub struct StageDef {
 
 // ─── Signal Config ───────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalConfig {
     #[serde(default = "default_max_chars")]
     pub max_chars: usize,
@@ -622,7 +635,7 @@ impl Default for SignalConfig {
 
 // ─── Sync Config ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncConfig {
     #[serde(default = "default_include")]
     pub include: Vec<String>,
@@ -702,7 +715,7 @@ fn merge_toml_tables(base: toml::Table, overlay: toml::Table) -> toml::Table {
 
 // ─── Query Config (queries.toml) ─────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryDef {
     pub name: String,
     #[serde(default)]
@@ -788,6 +801,21 @@ mod tests {
     #[test]
     fn auto_update_defaults_on_and_survives_absent_config() {
         assert!(UpdateConfig::default().auto);
+    }
+
+    /// `base config get update.auto` used to say "not found" about a setting
+    /// whose default is true, because `get` reads the file and the file says
+    /// nothing until you have overridden it.
+    #[test]
+    fn default_value_answers_for_a_key_the_file_never_mentions() {
+        assert_eq!(default_value("update", "auto"), Some(toml::Value::Boolean(true)));
+        assert_eq!(
+            default_value("graph", "auto_compact"),
+            Some(toml::Value::Boolean(true))
+        );
+        // Only a key that genuinely does not exist deserves "not found".
+        assert_eq!(default_value("update", "nosuchfield"), None);
+        assert_eq!(default_value("nosuchsection", "auto"), None);
 
         // Absent [update] section entirely.
         let c: BaseConfig = toml::from_str("").expect("empty config must parse");

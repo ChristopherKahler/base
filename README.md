@@ -233,9 +233,9 @@ Going deeper: [hook configuration](docs/settings-hook-config.md) · [workspace s
 
 ## License
 
-basemode is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You can use it, study it, and modify it for any noncommercial purpose. Commercial use — including reselling, repackaging, or building it into a product — requires a separate commercial license granted individually, with approval and terms. Reach out via [chrisai.cv](https://chrisai.cv).
+basemode is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You can use it, study it, and modify it for any noncommercial purpose. Commercial use — including reselling, repackaging, or building it into a product — requires a separate commercial license granted individually, with approval and terms. Reach out via [basemode.ai](https://basemode.ai).
 
 ---
 
 Built by Chris Kahler
-[Chris AI Systems](https://chrisai.cv) / [Community](https://www.skool.com/claude-code-titans-9203) / [YouTube](https://www.youtube.com/@chris-ai-systems)
+[Docs](https://docs.basemode.ai) / [Issues](https://github.com/ChristopherKahler/base/issues)

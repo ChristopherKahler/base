@@ -83,28 +83,8 @@ pub fn run(
     println!("═══════════════════════════════════════");
     println!("✓ Install complete");
     println!("═══════════════════════════════════════\n");
-    println!("Next steps:");
-    println!("  1. Open a new Claude Code session");
-    println!("  2. Type a prompt that matches a domain keyword");
-    println!("  3. Verify rules inject from the graph\n");
-    println!("Relay (multi-session coordination) is on: each session gets a codename and a");
-    println!("hook-injected wake contract, all local to ~/.base-gbl/.base/relay-inbox/.");
-    println!("  base config set relay.enabled false      # turn it off");
-    println!("  base config set relay.wake_nudge false   # keep titles + pings, drop the arming block\n");
-    if carl_json_path.is_none() {
-        println!("Optional: migrate CARL decisions:");
-        println!("  base install --carl ~/.carl/carl.json\n");
-    }
-    println!("───────────────────────────────────────");
-    println!("ChrisAI — Built by Chris Kahler");
-    println!("Chris AI Systems");
-    println!();
-    println!("Community & support:");
-    println!("  https://www.skool.com/claude-code-titans-9203");
-    println!();
-    println!("Tutorials:");
-    println!("  https://www.youtube.com/@chris-ai-systems");
-    println!("───────────────────────────────────────");
+    // One message, one source, every install path. See `crate::first_run`.
+    print!("{}", crate::first_run::text());
 
     Ok(())
 }
@@ -446,8 +426,7 @@ fn create_global_tier(global_dir: &Path) -> Result<()> {
         std::fs::write(
             &base_toml,
             r#"# BASE — Proactive context-injection engine for Claude Code
-# Built by Chris Kahler · Chris AI Systems
-# Community: https://www.skool.com/claude-code-titans-9203
+# Built by Chris Kahler
 
 # Each [section] documents what it does, what it runs at session-start, and what
 # every knob controls. Set enabled = false to silence a whole section.
@@ -563,8 +542,7 @@ stale_days = 7            # a working project untouched this many days → auto-
         std::fs::write(
             &domains_toml,
             r#"# BASE — Domain configuration
-# Built by Chris Kahler · Chris AI Systems
-# Community: https://www.skool.com/claude-code-titans-9203
+# Built by Chris Kahler
 #
 # Global domains — loaded in every workspace.
 # Workspace-specific domains go in {workspace}/.base/domains.toml
@@ -630,8 +608,7 @@ rules = []
 # Only [extension] section is required. All [hooks.*] sections are optional.
 # Declare only the hooks your framework needs.
 #
-# Built by Chris Kahler · Chris AI Systems
-# Community: https://www.skool.com/claude-code-titans-9203
+# Built by Chris Kahler
 # ═══════════════════════════════════════════════════════════
 
 [extension]
@@ -1578,7 +1555,7 @@ Each app keeps its own self-contained map at `<app>/.base-ast/ast.ttl`, register
 - Rules, decisions, notes, and projects are graph entities with relational edges
 - `domains.toml` defines triggers only (keywords, paths) — rule content lives in the graph
 - `~/.base-gbl/` = global tier, `{workspace}/.base/` = workspace tier
-- Built by Chris Kahler · Chris AI Systems · https://www.skool.com/claude-code-titans-9203
+- Built by Chris Kahler · https://docs.basemode.ai
 "#;
 
 /// Register the installed base-help coach in the manifest.

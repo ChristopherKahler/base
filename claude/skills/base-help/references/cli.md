@@ -103,6 +103,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base rule list`
 - `base rule remove`
 - `base install`
+- `base getting-started`
 - `base activate`
 - `base update`
 - `base uninstall`
@@ -161,44 +162,45 @@ BASE — Proactive context-injection engine for Claude Code
 Usage: base [COMMAND]
 
 Commands:
-  hook       Handle Claude Code hook events (session-start, post-tool-use, user-prompt-submit)
-  hooks      Publish base's hook wiring for an external installer (JSON)
-  ast        Query AST codebase graph (entities, calls, imports) [aliases: a]
-  project    Manage projects [aliases: p]
-  milestone  Manage milestones (epics within a project) [aliases: m]
-  task       Manage tasks [aliases: t]
-  decision   Log and search decisions [aliases: d]
-  entity     Manage entities (people, organizations) [aliases: e]
-  goal       Manage goals [aliases: g]
-  reminder   Manage reminders [aliases: r]
-  handoff    Manage session handoffs (resume docs surfaced at session start)
-  fork       Manage parallel side-work forks (build-specs surfaced at session start)
-  sync       Sync file-owned data into the graph
-  domain     Manage domain matching rules
-  standards  Manage context-triggered standards (MIDAS protocols injected on edit) [aliases: std]
-  relay      Session-to-session message relay (parallel PAUL workers, Cadre firm members)
-  learn      Graph-backed structured memory
-  recall     Search notes by keyword, domain, or slug
-  changes    Read the graph change log — every successful graph write, as JSON
-  rule       Manage rules in the graph (add, list, remove)
-  install    Install base globally: build, symlink, create ~/.base-gbl, wire hooks, write manifest
-  activate   Activate ChrisAI — enter your Skool classroom key to remove attribution
-  update     Self-update the base binary from public GitHub releases (or snooze the banner)
-  uninstall  Uninstall base: remove hooks from settings.json, remove binary, remove CLAUDE.md section
-  dashboard  Launch the Command Center Dashboard (local web UI) [aliases: dash]
-  scaffold   Scaffold a new workspace: create .base/, write configs, register globally
-  reconcile  Reconcile project active/deferred state from real folder last-touch
-  workspace  Registered-workspace registry (sync CLAUDE.md from base.toml)
-  operator   Operator identity profile (init, show)
-  extension  Manage extensions (list, validate, install, remove) [aliases: ext]
-  commands   List and inspect star commands (*BLUNT, *AUDIT, etc.) [aliases: cmd]
-  memory     Manage graph-backed memory (migrate flat files, purge)
-  config     Read and write base.toml configuration (dot-notation: section.key)
-  context    Pull targeted graph context on demand (same engine as hook injection)
-  doctor     Diagnose graph health across tiers (parser-independent). Exits nonzero when unhealthy
-  graph      First-class graph maintenance (atomic, backs up first — never hand-edit graph.nq)
-  secret     Securely manage API keys / secrets in ~/.base-gbl/.env (echo-off, 0600). Plugins read these from their environment — never type secrets into chat
-  help       Print this message or the help of the given subcommand(s)
+  hook             Handle Claude Code hook events (session-start, post-tool-use, user-prompt-submit)
+  hooks            Publish base's hook wiring for an external installer (JSON)
+  ast              Query AST codebase graph (entities, calls, imports) [aliases: a]
+  project          Manage projects [aliases: p]
+  milestone        Manage milestones (epics within a project) [aliases: m]
+  task             Manage tasks [aliases: t]
+  decision         Log and search decisions [aliases: d]
+  entity           Manage entities (people, organizations) [aliases: e]
+  goal             Manage goals [aliases: g]
+  reminder         Manage reminders [aliases: r]
+  handoff          Manage session handoffs (resume docs surfaced at session start)
+  fork             Manage parallel side-work forks (build-specs surfaced at session start)
+  sync             Sync file-owned data into the graph
+  domain           Manage domain matching rules
+  standards        Manage context-triggered standards (MIDAS protocols injected on edit) [aliases: std]
+  relay            Session-to-session message relay (parallel PAUL workers, Cadre firm members)
+  learn            Graph-backed structured memory
+  recall           Search notes by keyword, domain, or slug
+  changes          Read the graph change log — every successful graph write, as JSON
+  rule             Manage rules in the graph (add, list, remove)
+  install          Install base globally: build, symlink, create ~/.base-gbl, wire hooks, write manifest
+  getting-started  What to read once base is installed: workspaces, relay, star commands, CARL
+  activate         Retired. Kept parseable so a scripted `base activate <key>` is not an error
+  update           Self-update the base binary from public GitHub releases (or snooze the banner)
+  uninstall        Uninstall base: remove hooks from settings.json, remove binary, remove CLAUDE.md section
+  dashboard        Launch the Command Center Dashboard (local web UI) [aliases: dash]
+  scaffold         Scaffold a new workspace: create .base/, write configs, register globally
+  reconcile        Reconcile project active/deferred state from real folder last-touch
+  workspace        Registered-workspace registry (sync CLAUDE.md from base.toml)
+  operator         Operator identity profile (init, show)
+  extension        Manage extensions (list, validate, install, remove) [aliases: ext]
+  commands         List and inspect star commands (*BLUNT, *AUDIT, etc.) [aliases: cmd]
+  memory           Manage graph-backed memory (migrate flat files, purge)
+  config           Read and write base.toml configuration (dot-notation: section.key)
+  context          Pull targeted graph context on demand (same engine as hook injection)
+  doctor           Diagnose graph health across tiers (parser-independent). Exits nonzero when unhealthy
+  graph            First-class graph maintenance (atomic, backs up first — never hand-edit graph.nq)
+  secret           Securely manage API keys / secrets in ~/.base-gbl/.env (echo-off, 0600). Plugins read these from their environment — never type secrets into chat
+  help             Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -209,9 +211,8 @@ Options:
 
 Drop-in plugin commands (from extensions): run `base ext list`
 
-Built by Chris Kahler · Chris AI Systems
-Community & support: https://www.skool.com/claude-code-titans-9203
-Tutorials: https://www.youtube.com/@chris-ai-systems
+Docs: https://docs.basemode.ai
+Built by Chris Kahler
 ```
 
 ## base hook
@@ -2145,7 +2146,7 @@ Options:
           Skip hook wiring in settings.json
 
       --full
-          Register all ChrisAI components (PAUL, SEED, SKILLSMITH) in manifest
+          Register the bundled components (PAUL, SEED, SKILLSMITH) in manifest
 
       --starter-commands
           Install the starter star commands without asking (*handoff, *fork, *base, *end)
@@ -2157,16 +2158,56 @@ Options:
           Print help
 ```
 
+## base getting-started
+
+```text
+What to read once base is installed.
+
+Working in a workspace
+
+  base scaffold                    set a folder up as a workspace
+  base domain create               add a trigger for this workspace
+  base rule add --domain X --text  give that trigger something to say
+
+  Workspace triggers live in .base/domains.toml. The rules themselves live in
+  the graph, so they are searchable rather than pasted.
+
+Running more than one session
+
+  Relay is on. Every session gets a codename and a wake contract, and all of it
+  stays in ~/.base-gbl/.base/relay-inbox/ on this machine.
+
+  base config set relay.enabled false      turn it off
+  base config set relay.wake_nudge false   keep pings, drop the arming block
+
+Star commands
+
+  Short operator commands you type as *name. base install offers a starter pack;
+  base commands list shows what you have.
+
+Coming from CARL
+
+  base install --carl ~/.carl/carl.json    bring old decisions across
+
+The rest: https://docs.basemode.ai
+
+Usage: base getting-started
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
 ## base activate
 
 ```text
-Activate ChrisAI — enter your Skool classroom key to remove attribution
+Retired. Kept parseable so a scripted `base activate <key>` is not an error
 
 Usage: base activate <KEY>
 
 Arguments:
   <KEY>
-          Activation key from ChrisAI community
+          Ignored. Activation removed an attribution that no longer exists
 
 Options:
   -h, --help
