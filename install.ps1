@@ -80,8 +80,23 @@ finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 
+# ── the .exe that Windows needs ───────────────────────────────────────────────
+# `base install` copies the binary to ~\.local\bin\base with no extension
+# (install.rs:1605, one path shared with Unix). The file is a valid PE image, but
+# PATHEXT means cmd.exe answers "'base' is not recognized" and PowerShell runs it
+# to no effect, so a fresh install reports success and then does nothing. Give
+# Windows the name it can resolve.
+$binHome = if ($env:BASE_HOME) { $env:BASE_HOME } else { $HOME }
+$binDir  = Join-Path $binHome '.local\bin'
+$plain   = Join-Path $binDir 'base'
+$withExe = Join-Path $binDir 'base.exe'
+if ((Test-Path $plain) -and -not (Test-Path $withExe)) {
+    Copy-Item $plain $withExe -Force
+    Say "base: wrote base.exe alongside base (Windows needs the extension to run it by name)"
+}
+
 # ── PATH check, after the fact so it never blocks the install ─────────────────
-$bindir = Join-Path $HOME '.local\bin'
+$bindir = Join-Path $binHome '.local\bin'
 $onPath = ($env:PATH -split ';') -contains $bindir
 if (-not $onPath) {
     Say ''
@@ -99,7 +114,7 @@ if (-not $onPath) {
 # never wired. Test settings.json rather than the directory: `base install`
 # creates ~\.claude itself to hold the bundled skill, so the directory always
 # exists afterwards and cannot tell us anything.
-if (-not (Test-Path (Join-Path $HOME '.claude\settings.json'))) {
+if (-not (Test-Path (Join-Path $binHome '.claude\settings.json'))) {
     Say ''
     Say 'base: no ~\.claude directory, so the hooks were not wired and base will'
     Say '  not do anything yet. Install Claude Code, then run:'
