@@ -193,9 +193,12 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
     warnings.extend(leaked_global_handoffs());
     warnings.extend(coach_drift());
     // #20: a failed hook is invisible everywhere else (fail-open by design); doctor names it.
+    // The cwd PARAM, not the process cwd: `diagnose` is called with a path and
+    // shadowing it with `std::env::current_dir()` made this section untestable and
+    // wrong for any caller that does not chdir first.
     let mut hooks_broken = false;
-    if let Ok(cwd) = std::env::current_dir() {
-        for (tier, base_dir) in crate::hook::hook_log_dirs(&cwd) {
+    {
+        for (tier, base_dir) in crate::hook::hook_log_dirs(cwd) {
             if let Some(t) = crate::hook::hook_failure_summary(&base_dir) {
                 warnings.push(format!("{tier} tier {}", t.summary));
                 // Only a hook that is failing NOW is a fault; an older failure with
