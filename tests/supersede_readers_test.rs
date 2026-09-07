@@ -135,7 +135,8 @@ fn the_prompt_injection_carries_only_the_live_decision() {
         .into_iter()
         .find(|d| d.name == "probe")
         .expect("the probe domain is declared");
-    let (rules, neighborhood) = base::domain::query::query_domain_from_graph(&store, &config, &def);
+    let (rules, neighborhood, _extra) =
+        base::domain::query::query_domain_from_graph(&store, &config, &def);
     let block = format!("{rules}\n{neighborhood}");
 
     assert!(

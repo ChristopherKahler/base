@@ -256,8 +256,7 @@ pub fn audit(store: &Store, ns: &NamespaceConfig) -> Audit {
         seen.insert(start.clone());
         let mut cur = start.clone();
         let mut hops = 0usize;
-        loop {
-            let Ok(subject) = NamedNodeRef::new(&cur) else { break };
+        while let Ok(subject) = NamedNodeRef::new(&cur) {
             let next = store
                 .quads_for_pattern(Some(subject.into()), Some(sup_by), None, None)
                 .filter_map(|q| q.ok())

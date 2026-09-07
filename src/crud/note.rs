@@ -27,6 +27,10 @@ pub fn learn(
 ///
 /// The note and its supersession edges are applied in ONE update against ONE load,
 /// so a correction and the edge saying what it corrects land together or not at all.
+// Eight, one past clippy's default. Seven of them are `learn`'s existing shape and
+// the eighth is `--supersedes`; collapsing the one-line delegates into this is the
+// agreed follow-up, and reshaping the signature to satisfy a lint is not it.
+#[allow(clippy::too_many_arguments)]
 pub fn learn_with(
     cwd: &Path,
     ns: &NamespaceConfig,
