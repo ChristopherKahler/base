@@ -245,7 +245,7 @@ irrevocable and it lives in the license text.
 Extensions and adapters you write against base's documented interfaces are your
 own work under an explicit exception, and you may license them however you like,
 including commercially. Full detail, including what happens to versions released
-before v0.14.1, is in [LICENSING.md](LICENSING.md).
+up to and including v0.14.1, is in [LICENSING.md](LICENSING.md).
 
 ---
 

@@ -16,7 +16,7 @@ promise on a web page.
 | The engine — everything in `src/`, the `base` binary, `Cargo.toml`, `tests/` | [FSL-1.1-ALv2](LICENSE.md), converting to Apache-2.0 two years after each version ships |
 | Extensions, adapters and skills published by this project | [Apache-2.0](LICENSE-APACHE-2.0) |
 | Extensions and adapters written by anyone else | Yours. You own them. See the exception below |
-| Your graph, your notes, your code, anything base reads or writes on your machine | Yours. No licence is asserted over your data, and none is needed |
+| Your graph, your notes, your code, anything base reads or writes on your machine | Yours. No license is asserted over your data, and none is needed |
 
 ## Plain-English guide to the engine license
 

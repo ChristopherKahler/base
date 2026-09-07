@@ -2,6 +2,7 @@
 name = "base"
 version = "0.14.1"
 edition = "2024"
+license = "FSL-1.1-ALv2"
 description = "Proactive context-injection engine for Claude Code"
 
 [dependencies]
