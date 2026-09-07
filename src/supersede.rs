@@ -423,3 +423,112 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    fn ns() -> NamespaceConfig {
+        NamespaceConfig::default()
+    }
+
+    fn store_with(nq: &str) -> Store {
+        let store = Store::new().unwrap();
+        store
+            .load_from_reader(oxigraph::io::RdfFormat::NQuads, nq.as_bytes())
+            .unwrap();
+        store
+    }
+
+    fn edge(u: &str, g: &str, a: &str, b: &str) -> String {
+        format!("<{u}{a}> <{u}{PRED_SUPERSEDED_BY}> <{u}{b}> <{g}> .\n")
+    }
+
+    fn status(u: &str, g: &str, a: &str) -> String {
+        format!("<{u}{a}> <{u}status> \"{STATUS_SUPERSEDED}\" <{g}> .\n")
+    }
+
+    #[test]
+    fn a_store_that_never_used_the_feature_is_silent() {
+        // The whole point: `base doctor` on a pre-0.14.0 store must print exactly
+        // what it printed before, so its output is byte-comparable across the upgrade.
+        let ns = ns();
+        let u = &ns.uri;
+        let g = format!("{u}graph/ws/t");
+        let nq = format!("<{u}note/a> <{u}noteText> \"plain\" <{g}> .\n");
+        let a = audit(&store_with(&nq), &ns);
+        assert!(a.is_silent(), "{a:?}");
+        assert_eq!(a, Audit::default());
+    }
+
+    #[test]
+    fn the_two_disagreements_are_counted_apart() {
+        // Summing them would hide which happened: status-without-edge is a
+        // pre-0.14.0 artefact, edge-without-status is a writer that half-ran.
+        let ns = ns();
+        let u = &ns.uri;
+        let g = format!("{u}graph/ws/t");
+        let nq = format!(
+            "{}{}{}",
+            status(u, &g, "note/orphan-status"),
+            edge(u, &g, "note/bare-edge", "note/live"),
+            status(u, &g, "note/both") + &edge(u, &g, "note/both", "note/live2"),
+        );
+        let a = audit(&store_with(&nq), &ns);
+        assert_eq!(a.superseded, 2, "bare-edge and both carry the edge: {a:?}");
+        assert_eq!(a.status_without_edge, 1, "{a:?}");
+        assert_eq!(a.edge_without_status, 1, "{a:?}");
+        assert!(!a.is_silent());
+    }
+
+    #[test]
+    fn a_chain_of_three_is_not_long_and_a_chain_of_four_is() {
+        let ns = ns();
+        let u = &ns.uri;
+        let g = format!("{u}graph/ws/t");
+
+        let three = format!(
+            "{}{}{}",
+            edge(u, &g, "note/a", "note/b"),
+            edge(u, &g, "note/b", "note/c"),
+            edge(u, &g, "note/c", "note/d"),
+        );
+        assert!(
+            audit(&store_with(&three), &ns).long_chains.is_empty(),
+            "three hops is exactly the limit, not past it"
+        );
+
+        let four = three + &edge(u, &g, "note/d", "note/e");
+        let a = audit(&store_with(&four), &ns);
+        assert_eq!(a.long_chains, vec![format!("{u}note/a")], "{a:?}");
+    }
+
+    #[test]
+    fn a_cycle_is_reported_and_the_audit_still_terminates() {
+        let ns = ns();
+        let u = &ns.uri;
+        let g = format!("{u}graph/ws/t");
+        let nq = format!("{}{}", edge(u, &g, "note/a", "note/b"), edge(u, &g, "note/b", "note/a"));
+        let a = audit(&store_with(&nq), &ns);
+        assert_eq!(a.cycles.len(), 2, "both members see the loop: {a:?}");
+        assert_eq!(a.superseded, 2);
+    }
+
+    #[test]
+    fn a_correction_naming_nothing_is_counted_and_one_naming_something_is_not() {
+        let ns = ns();
+        let u = &ns.uri;
+        let g = format!("{u}graph/ws/t");
+        let nq = format!(
+            "<{u}note/loose> <{u}noteType> \"correction\" <{g}> .\n\
+             <{u}note/tied> <{u}noteType> \"correction\" <{g}> .\n\
+             <{u}note/tied> <{u}{PRED_SUPERSEDES}> <{u}note/old> <{g}> .\n\
+             <{u}note/plain> <{u}noteType> \"insight\" <{g}> .\n"
+        );
+        let a = audit(&store_with(&nq), &ns);
+        assert_eq!(
+            a.corrections_naming_nothing, 1,
+            "only the correction that names nothing counts, and an insight never does: {a:?}"
+        );
+    }
+}
