@@ -132,7 +132,7 @@ pub fn query_domain_from_graph(
 
     let neighborhood_text = match crate::store::query(store, &neighborhood_sparql) {
         Ok(oxigraph::sparql::QueryResults::Solutions(solutions)) => {
-            let neighbors: Vec<(String, String)> = solutions
+            let neighbors: Vec<(String, String, Option<String>)> = solutions
                 .filter_map(|r| r.ok())
                 .filter_map(|row| {
                     let name = row.get("name").map(|t| match t.into() {
@@ -140,22 +140,29 @@ pub fn query_domain_from_graph(
                         _ => String::new(),
                     })?;
                     let type_label = row.get("type").map(|t| crud::term_display(t.into()))?;
-                    if let Some(iri) = row.get("related").map(|t| crud::term_display(t.into())) {
-                        served.push(iri);
-                    }
+                    let iri = row.get("related").map(|t| crud::term_display(t.into()));
                     if name.is_empty() {
                         None
                     } else {
-                        Some((type_label, name))
+                        Some((type_label, name, iri))
                     }
                 })
                 .collect();
 
-            if neighbors.is_empty() {
+            // Stub guard (F29): a block whose only rows are the domain's own project —
+            // `- Project: <domain>`, the record `project add` links to the domain it
+            // auto-creates — tells the reader nothing the header did not. Five such
+            // blocks reached one prompt on the operator's store. Not emitted, and its
+            // records are not marked served, so the walk may still resolve them.
+            let only_own_project = neighbors
+                .iter()
+                .all(|(type_label, name, _)| type_label == "Project" && name.eq_ignore_ascii_case(&domain_def.name));
+            if neighbors.is_empty() || only_own_project {
                 String::new()
             } else {
+                served.extend(neighbors.iter().filter_map(|(_, _, iri)| iri.clone()));
                 let mut out = format!("[{} CONTEXT]\n", domain_def.name);
-                for (type_label, name) in &neighbors {
+                for (type_label, name, _) in &neighbors {
                     out.push_str(&format!("  - {type_label}: {name}\n"));
                 }
                 out
