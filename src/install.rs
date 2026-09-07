@@ -33,10 +33,22 @@ pub fn run(
     println!("BASE v2 — Global Install");
     println!("═══════════════════════════════════════\n");
 
-    // Step 1: Copy binary to ~/.local/bin/base
+    // Step 1: Copy binary to every name it must answer to in ~/.local/bin
     let local_bin = home.join(".local").join("bin");
-    let dest_path = local_bin.join("base");
-    install_binary(&binary_path, &dest_path, &local_bin)?;
+    let names = crate::home::base_binary_names();
+    let dest_path = local_bin.join(&names[0]);
+    let dests: Vec<_> = names.iter().map(|n| local_bin.join(n)).collect();
+    println!(
+        "1. Install binary → {} ... ",
+        dests
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for dest in &dests {
+        install_binary(&binary_path, dest, &local_bin)?;
+    }
 
     // Step 2: Create ~/.base-gbl/ with defaults
     let global_dir = home.join(".base-gbl");
@@ -169,11 +181,14 @@ pub fn uninstall(purge: bool) -> Result<()> {
     let claude_md = home.join(".claude").join("CLAUDE.md");
     remove_claude_md_section(&claude_md)?;
 
-    // 3. Remove binary (try both base and base.exe for Windows compatibility)
-    let binary = home.join(".local").join("bin").join("base");
-    let binary_exe = home.join(".local").join("bin").join("base.exe");
+    // 3. Remove the binary under every name install writes.
+    let bin_dir = home.join(".local").join("bin");
+    let binaries: Vec<_> = crate::home::base_binary_names()
+        .iter()
+        .map(|n| bin_dir.join(n))
+        .collect();
     let mut removed_any = false;
-    for bin in [&binary, &binary_exe] {
+    for bin in &binaries {
         if bin.exists() {
             if !removed_any {
                 print!("3. Remove binary ... ");
@@ -316,7 +331,8 @@ fn remove_claude_md_section(claude_md_path: &Path) -> Result<()> {
 // ─── Step 1: Install binary ─────────────────────────────────
 
 fn install_binary(binary: &Path, dest: &Path, bin_dir: &Path) -> Result<()> {
-    print!("1. Install binary → {} ... ", dest.display());
+    // The caller announces the step and every destination; this runs once per
+    // name, so printing here would repeat the heading on Windows.
 
     std::fs::create_dir_all(bin_dir)
         .with_context(|| format!("Creating {}", bin_dir.display()))?;
@@ -1599,7 +1615,7 @@ fn write_manifest(global_dir: &Path, full: bool) -> Result<()> {
     // Always update/create BASE component
     let base_entry = manifest::ComponentEntry {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        path: "~/.local/bin/base".to_string(),
+        path: crate::home::base_binary_display(),
         installed_at: manifest
             .components
             .get("base")
@@ -2217,7 +2233,11 @@ mod skill_refresh_tests {
         std::fs::create_dir_all(&skills).unwrap();
         std::fs::write(skills.join("SKILL.md"), "---\nname: base-help\n---\n").unwrap();
 
-        let binary = dir.path().join("target").join("release").join("base");
+        let binary = dir
+            .path()
+            .join("target")
+            .join("release")
+            .join(crate::home::base_binary_name());
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
 
         // LocalThenTag finds it; TagOnly is what the update path passes.
