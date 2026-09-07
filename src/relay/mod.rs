@@ -581,6 +581,32 @@ pub fn env_session_id() -> Option<String> {
 
 // ─── Helpers ─────────────────────────────────────────────────
 
+/// A ping slug that cannot collide with another ping's.
+///
+/// `ping-<millis>` alone did. Two pings inside one millisecond shared a slug, and both
+/// the inbox alert file name (`task_inbox::enqueue`) and the graph IRI
+/// (`crud::build_iri(ns, "ping", slug)`) are built from it, where the write is a DELETE
+/// followed by an INSERT at a fixed IRI. So the earlier ping was replaced, with nothing
+/// on either side to show it had ever existed, while its sender saw `Ping → target` and
+/// a zero exit. Measured on 0.14.1: eight concurrent pings left three inbox files.
+///
+/// The discriminator carries both halves because neither covers both shapes on its own:
+/// the process-local counter separates two pings from ONE process, which a pid cannot,
+/// and the pid separates two processes that sampled the same millisecond, which a
+/// counter cannot. Four hex digits keeps it short, and the millisecond prefix stays
+/// fixed width, so ordering by name is still ordering by time. Nothing parses the tail —
+/// `relay done` and both graph mirrors take the slug whole.
+pub fn ping_slug() -> String {
+    static PING_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = PING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let disc = ((std::process::id() & 0xff) << 8) | (seq & 0xff);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("ping-{millis}-{disc:04x}")
+}
+
 pub fn now_iso() -> String {
     chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z").to_string()
 }

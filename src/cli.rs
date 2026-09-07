@@ -2737,32 +2737,7 @@ pub fn run() {
                     let answered =
                         base::relay::task_inbox::clear_pings_from(&config.namespace, &to, &my_titles);
                     let kind = if answered > 0 { "reply" } else { "ping" };
-                    // #86: `ping-<millis>` alone collides. Two pings inside one
-                    // millisecond shared a slug, and both the inbox alert file name and
-                    // the graph IRI are built from it, where the write is a DELETE
-                    // followed by an INSERT at a fixed IRI — so the earlier ping was
-                    // replaced with nothing on either side to show it had existed.
-                    // Measured on 0.14.1: 8 concurrent pings left 3 inbox files.
-                    //
-                    // The discriminator covers both shapes the collision has, because
-                    // neither half covers both: a process-local counter separates two
-                    // pings from ONE process, which a pid cannot, and the pid separates
-                    // two processes that sampled the same millisecond, which a counter
-                    // cannot. Four hex digits keeps the slug short, and the millisecond
-                    // prefix stays fixed width, so ordering by name is still ordering by
-                    // time. Nothing parses the slug's tail — `done` and the graph
-                    // mirrors take it whole.
-                    static PING_SEQ: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
-                    let seq = PING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let disc = ((std::process::id() & 0xff) << 8) | (seq & 0xff);
-                    let id = format!(
-                        "ping-{}-{disc:04x}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis())
-                            .unwrap_or(0)
-                    );
+                    let id = base::relay::ping_slug();
                     let ping = base::relay::task_inbox::InboxTask {
                         slug: id.clone(),
                         summary: msg.clone(),

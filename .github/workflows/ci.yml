@@ -48,6 +48,9 @@ jobs:
           fetch-depth: 0
       - run: ./scripts/test-release-invocations.sh
       - run: ./scripts/test-release-packaging.sh
+      # #95: the attribute is what decides what a Windows clone materialises, and
+      # this runner is ubuntu — so the check reads `git check-attr`, not the checkout.
+      - run: ./scripts/test-crlf-attributes.sh
 
   # Advisory until the three pre-existing never_loop denies in src/crud are
   # cleared; then drop continue-on-error and it becomes a required check.
