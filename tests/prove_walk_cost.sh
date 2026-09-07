@@ -97,6 +97,31 @@ case "$B" in
     exit 2 ;;
 esac
 
+# The mirror of the baseline check, and its absence is I7. `cargo build` in a
+# target dir another worktree warmed can report "Finished in 0.28s" and leave
+# someone else's binary in place: cargo freshness is mtime-based, and outputs
+# newer than sources read as fresh. That binary then walks through every leg
+# below, because nothing here asks whether it is the thing under test.
+#
+# BASE_BIN must HAVE exactly what the baseline must LACK.
+branch_binary_has_fork() {
+  local bin="$1" a b
+  a=$(nm -C "$bin" 2>/dev/null | grep -c maps_from_store)
+  b=$(nm -C "$bin" 2>/dev/null | grep -c resolve_strict)
+  printf '  binary identity:   maps_from_store=%s resolve_strict=%s (both want >0)\n' "$a" "$b"
+  [ "$a" -gt 0 ] && [ "$b" -gt 0 ]
+}
+if ! branch_binary_has_fork "$B"; then
+  echo "BASE_BIN=$B does not contain this fork. A stale target dir handed you another build." >&2
+  echo "Run: cargo clean -p base --release && cargo build --release --bin base" >&2
+  exit 2
+fi
+if [ -n "${BASELINE:-}" ] && [ -x "${BASELINE:-}" ] \
+   && [ "$(md5sum "$B" | cut -d' ' -f1)" = "$(md5sum "$BASELINE" | cut -d' ' -f1)" ]; then
+  echo "BASE_BIN and BASELINE are the same file. Nothing below could ever fail." >&2
+  exit 2
+fi
+
 # ── the run root ────────────────────────────────────────────────────────────
 [ -f "$FROZEN/gbl/.base-gbl/.base/graph.nq" ] || { echo "no frozen global store at $FROZEN" >&2; exit 2; }
 [ -f "$FROZEN/ws/.base/graph.nq" ]            || { echo "no frozen workspace store at $FROZEN" >&2; exit 2; }

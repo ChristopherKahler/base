@@ -256,7 +256,13 @@ mod resolve_tests {
     }
 
     fn node(label: &str, ntype: &str) -> Node {
-        Node { label: label.into(), ntype: ntype.into(), source: String::new(), summary: String::new() }
+        Node {
+            label: label.into(),
+            ntype: ntype.into(),
+            source: String::new(),
+            summary: String::new(),
+            touched: String::new(),
+        }
     }
 
     fn id(local: &str) -> String {

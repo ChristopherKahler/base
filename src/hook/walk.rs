@@ -79,7 +79,7 @@ pub fn candidates(prompt: &str, known: &dyn Fn(&str) -> bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    let mut push = |c: &str, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+    let push = |c: &str, out: &mut Vec<String>, seen: &mut HashSet<String>| {
         let c = c.trim().trim_matches(|ch: char| ",.;:!?".contains(ch));
         if c.is_empty() || c.len() > 120 {
             return;
