@@ -24,8 +24,21 @@
 # the harness still exits non-zero if anything it DID run failed.
 set -uo pipefail
 
-TARGET=${CARGO_TARGET_DIR:-/home/chriskahler/ops-sys/toolbox/frameworks/00-kit-base/target}
-B=${BASE_BIN:-$TARGET/debug/base}
+B=${BASE_BIN:-}
+if [ -z "$B" ]; then
+  cat >&2 <<'EOF'
+BASE_BIN is required. Point it at a binary you copied aside, not at a path
+inside CARGO_TARGET_DIR: `cargo test` rewrites that tree underneath a running
+harness, and a debug build measures the optimiser rather than the change.
+
+  cargo build --release --bin base
+  cp "$CARGO_TARGET_DIR/release/base" /tmp/base-branch
+  BASE_BIN=/tmp/base-branch bash tests/prove_walk_cost.sh
+
+EOF
+  exit 2
+fi
+[ -x "$B" ] || { echo "BASE_BIN=$B is not executable" >&2; exit 2; }
 BASELINE=${BASELINE:-}
 FROZEN=${FROZEN:-$HOME/.cache/kite-frozen}
 ASTSRC=${ASTSRC:-$HOME/chris-ai-systems/.base-ast/ast.ttl}
@@ -33,11 +46,13 @@ R=/tmp/plover-cost
 
 fail=0
 skipped=0
+# A release build is what ships and what F23 was measured on. Detected by
+# path rather than asserted, and only the timing leg depends on it.
+is_release() { case "$1" in */release/*|*-release|*/base-main-*|*/base-branch*) return 0;; esac; return 1; }
 ok()   { printf '  ok    %s\n' "$*"; }
 bad()  { printf '  FAIL  %s\n' "$*"; fail=$((fail + 1)); }
 skip() { printf '  SKIP  %s\n' "$*"; skipped=$((skipped + 1)); }
 
-[ -x "$B" ] || { echo "no binary at $B — run cargo build --bin base first"; exit 2; }
 
 # ── the run root ────────────────────────────────────────────────────────────
 # HOME and cwd both under /tmp. The frozen store is COPIED, not linked: base
@@ -62,7 +77,7 @@ if [ -f "$ASTSRC" ]; then
 fi
 
 echo "base $("$B" --version | awk '{print $NF}') — walk cost harness"
-echo "  run root   $R   (HOME=$R/home, cwd=$R/ws)"
+echo "  run root   $R   (BASE_HOME=$R/home, cwd=$R/ws)"
 echo "  frozen     $FROZEN"
 echo "  global md5 $(md5sum "$R/home/.base-gbl/.base/graph.nq" | cut -d' ' -f1)  $(du -h "$R/home/.base-gbl/.base/graph.nq" | cut -f1)"
 echo "  ws     md5 $(md5sum "$R/ws/.base/graph.nq" | cut -d' ' -f1)  $(du -h "$R/ws/.base/graph.nq" | cut -f1)"
@@ -74,7 +89,7 @@ echo
 # leg 3 is entirely about which one the tie note came out on.
 fire() { # fire <prompt> <session> <outfile> <errfile>
   printf '{"session_id":"%s","prompt":"%s"}' "$2" "$1" \
-    | ( cd "$R/ws" && HOME="$R/home" BASE_NO_AUTO_UPDATE=1 "$B" hook user-prompt-submit ) \
+    | ( cd "$R/ws" && BASE_HOME="$R/home" BASE_NO_AUTO_UPDATE=1 "$B" hook user-prompt-submit ) \
         > "$3" 2> "$4"
 }
 
@@ -167,8 +182,8 @@ else
     diffs=0
     run_both() { # run_both <tag> <args...>
       local tag="$1"; shift
-      ( cd "$R/ws" && HOME="$R/home" "$B"        "$@" ) > "$R/new.$tag" 2> "$R/new.$tag.err"
-      ( cd "$R/ws" && HOME="$R/home" "$BASELINE" "$@" ) > "$R/old.$tag" 2> "$R/old.$tag.err"
+      ( cd "$R/ws" && BASE_HOME="$R/home" "$B"        "$@" ) > "$R/new.$tag" 2> "$R/new.$tag.err"
+      ( cd "$R/ws" && BASE_HOME="$R/home" "$BASELINE" "$@" ) > "$R/old.$tag" 2> "$R/old.$tag.err"
       if ! diff -u "$R/old.$tag" "$R/new.$tag" > "$R/d.$tag"; then
         diffs=$((diffs + 1))
         printf '  FAIL  %s moved:\n' "$tag"
@@ -201,6 +216,11 @@ echo
 echo "── test 5b: hook wall time, this branch vs the merge base ──"
 if [ -z "$BASELINE" ] || [ ! -x "$BASELINE" ]; then
   skip "BASELINE unset — timing needs a before as well as an after"
+elif ! is_release "$B" || ! is_release "$BASELINE"; then
+  # A debug build against a release baseline would report the optimiser
+  # as this fork's cost. Byte-identity above is unaffected -- opt level
+  # does not change what a command prints -- so only this leg gates.
+  skip "timing needs BOTH sides release-built (B=$B baseline=$BASELINE)"
 else
   time_hook() { # time_hook <binary> <runs> -> median ms
     local bin="$1" runs="$2" i t0 t1 ms
@@ -208,7 +228,7 @@ else
     for i in $(seq 1 "$runs"); do
       t0=$(date +%s%N)
       printf '{"session_id":"t%s","prompt":"where are we on `basemode`"}' "$i" \
-        | ( cd "$R/ws" && HOME="$R/home" BASE_NO_AUTO_UPDATE=1 "$bin" hook user-prompt-submit ) \
+        | ( cd "$R/ws" && BASE_HOME="$R/home" BASE_NO_AUTO_UPDATE=1 "$bin" hook user-prompt-submit ) \
             > /dev/null 2>&1
       t1=$(date +%s%N)
       all+=( $(( (t1 - t0) / 1000000 )) )

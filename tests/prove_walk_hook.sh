@@ -6,7 +6,21 @@
 # because what is being checked is what the HOOK does with the walk, not what
 # the walk returns.
 set -uo pipefail
-B=/home/chriskahler/ops-sys/toolbox/frameworks/00-kit-base/target/debug/base
+B=${BASE_BIN:-}
+if [ -z "$B" ]; then
+  cat >&2 <<'EOF'
+BASE_BIN is required. Point it at a binary you copied aside, not at a path
+inside CARGO_TARGET_DIR: `cargo test` rewrites that tree underneath a running
+harness, and a debug build measures the optimiser rather than the change.
+
+  cargo build --release --bin base
+  cp "$CARGO_TARGET_DIR/release/base" /tmp/base-branch
+  BASE_BIN=/tmp/base-branch bash tests/prove_walk_hook.sh
+
+EOF
+  exit 2
+fi
+[ -x "$B" ] || { echo "BASE_BIN=$B is not executable" >&2; exit 2; }
 OUT=/tmp/walkhook; rm -rf "$OUT"; mkdir -p "$OUT"
 
 fail=0
@@ -31,7 +45,7 @@ NQ
 fire() {
   local h="$1" prompt="$2" sid="$3"
   printf '{"session_id":"%s","prompt":"%s"}' "$sid" "$prompt" \
-    | HOME="$h" BASE_NO_AUTO_UPDATE=1 "$B" hook user-prompt-submit 2>&1
+    | BASE_HOME="$h" BASE_NO_AUTO_UPDATE=1 "$B" hook user-prompt-submit 2>&1
 }
 
 echo "── row: the walk reads the GLOBAL tier, not the workspace only ──"
