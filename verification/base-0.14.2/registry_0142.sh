@@ -44,8 +44,15 @@ fresh () {                       # fresh <tag>  -> echoes the workspace dir
   mkdir -p "$d/home" "$d/ws/.base" "$d/docs" "$OUT"
   printf '%s' "$d"
 }
+count_in () {                    # count_in <file> <pattern>  -> a number, always
+  # grep -c prints the count AND exits 1 when it is zero. Taking the `||` branch
+  # on a real zero appended a second "0" and every later arithmetic broke on it.
+  local n
+  n=$(grep -c "$2" "$1" 2>/dev/null) || true
+  printf '%s' "${n:-0}"
+}
 rows_typed () {                  # rows_typed <graph> <slug-prefix>
-  grep -c "handoff/$2.*22-rdf-syntax-ns#type" "$1" 2>/dev/null || printf '0'
+  count_in "$1" "handoff/$2.*22-rdf-syntax-ns#type"
 }
 
 # ── R10: concurrent create must not lose rows ────────────────
@@ -232,12 +239,59 @@ for cmd in "fork archive" "fork snooze" "handoff archive" "handoff snooze"; do
   fi
 done
 
+# ── R13: the production shape — registry writes vs relay pings ──
+# On 2026-09-07 the global graph took five writes between 15:07:14 and 15:07:15:
+# an ops:Ping INSERT and four archive UPDATEs. The interleaving writer was
+# `relay ping`, not a registry command, which is why a registry-only lock would
+# have left the reported incident standing. This row is that shape.
+say "=== R13  8 concurrent 'fork -g archive' interleaved with 8 'relay ping' ==="
+d=$(fresh r13); export BASE_HOME="$d/home"
+export CLAUDE_CODE_SESSION_ID="00000000-0000-0000-0000-00000000r13a"
+( cd "$d/ws" && "$BIN" relay register --as r13target ) >/dev/null 2>&1
+for i in $(seq 1 8); do
+  printf '#\n' > "$d/docs/g-$i.md"
+  ( cd "$d/ws" && "$BIN" fork -g create --project r13 --doc "$d/docs/g-$i.md" ) >/dev/null 2>&1
+done
+G="$d/home/.base-gbl/.base/graph.nq"
+seeded=$(count_in "$G" "handoff/g-.*22-rdf-syntax-ns#type")
+pids=""
+for i in $(seq 1 8); do
+  ( cd "$d/ws" && "$BIN" fork -g archive "g-$i" >"$OUT/r13-a$i.out" 2>&1 ) & pids="$pids $!"
+  ( cd "$d/ws" && "$BIN" relay ping --to r13target --from r13send --msg "p$i" \
+      >"$OUT/r13-p$i.out" 2>&1 ) & pids="$pids $!"
+done
+for p in $pids; do wait "$p"; done
+arch=0
+for i in $(seq 1 8); do
+  grep -q "handoff/g-$i> <http://ops-sys.local/ontology#status> \"archived\"" "$G" && arch=$((arch+1))
+done
+# The ping half is asserted as an INVARIANT, not a count of 8.
+# A ping's slug is `ping-<epoch millis>`, so eight pings fired inside two
+# milliseconds collapse onto two slugs by construction — measured on the branch:
+# 8 commands, 8 changelog INSERTs, 2 inbox files, 2 graph rows, the two slugs one
+# millisecond apart. That is the slug scheme, not a lost write, and it is its own
+# defect (reported separately). What the lock owes is that every ping which got
+# an inbox alert also kept its graph row: inbox files are one-file-per-ping and
+# never whole-file rewritten, so they are the ground truth for how many distinct
+# pings existed.
+inbox=$(ls "$d/home/.base-gbl/.base/relay-inbox/r13target/" 2>/dev/null | grep -c json) || true
+graph_pings=$(grep -o "ontology#ping/[a-z0-9-]*" "$G" 2>/dev/null | sort -u | wc -l)
+say "  seeded=$seeded archived=$arch of 8   distinct pings: graph=$graph_pings inbox=${inbox:-0}"
+[ "$arch" = "8" ] && ok "R13 all 8 archives survived the ping traffic" \
+                  || bad "R13 only $arch of 8 archived alongside relay pings"
+if [ "${inbox:-0}" -gt 0 ] && [ "$graph_pings" = "${inbox:-0}" ]; then
+  ok "R13 every ping that alerted also kept its graph row ($graph_pings)"
+else
+  bad "R13 graph holds $graph_pings ping rows for ${inbox:-0} alerted pings"
+fi
+unset CLAUDE_CODE_SESSION_ID
+
 # ── Isolation tripwire: the real graphs must be untouched ────
 say "=== isolation ==="
 leak=0
 for g in /mnt/c/Users/Chris/.base/graph.nq /mnt/c/Users/Chris/.base-gbl/.base/graph.nq; do
   [ -f "$g" ] || continue
-  if grep -q "handoff/s-1>\|handoff/a-1>\|handoff/t1>\|handoff/n-1>\|handoff/HANDOFF-A>\|handoff/HANDOFF-G>\|handoff/XT>\|handoff/REAL>" "$g"; then
+  if grep -q "handoff/s-1>\|handoff/a-1>\|handoff/t1>\|handoff/n-1>\|handoff/HANDOFF-A>\|handoff/HANDOFF-G>\|handoff/XT>\|handoff/REAL>\|handoff/g-1>" "$g"; then
     leak=1; say "  LEAK into $g"
   fi
 done
