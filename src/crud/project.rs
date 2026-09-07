@@ -127,11 +127,19 @@ pub fn provision_folder(
 /// Auto-create a domain trigger entry in the nearest domains.toml.
 /// Default: path-based matching. No keywords unless user adds them later.
 fn auto_create_domain(cwd: &Path, project_name: &str, project_path: &str) -> Result<()> {
-    // Add a path trigger via the existing add_trigger mechanism
-    // false: a project registered in a workspace files its domain there,
-    // which is what this always did before the tier seam made it explicit.
-    crate::domain::add_trigger(cwd, false, project_name, None, Some(project_path))?;
-    Ok(())
+    // Add a path trigger via the existing add_trigger mechanism. false: a project
+    // registered in a workspace files its domain there, which is what this always did
+    // before the tier seam made it explicit. A refused trigger (F29 step 6: the path
+    // covers other registered projects) leaves the project registered, creates no
+    // domain, and says why; any other failure still propagates.
+    match crate::domain::add_trigger(cwd, false, project_name, None, Some(project_path)) {
+        Ok(_) => Ok(()),
+        Err(e) if e.downcast_ref::<crate::domain::TriggerRefused>().is_some() => {
+            eprintln!("base: project {project_name}: {e}; no domain was created");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // Canonicalization logic lives once in `scope` (the shared FS wrappers); these are thin

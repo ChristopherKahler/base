@@ -219,6 +219,19 @@ fn rooted(mut domains: Vec<DomainDef>, root: Option<&Path>) -> Vec<DomainDef> {
     domains
 }
 
+/// `add_trigger` refused a path trigger that could never fire (F29 step 6). Typed so
+/// `project add` can tell this apart from an I/O or parse failure and degrade to a warning.
+#[derive(Debug)]
+pub struct TriggerRefused(pub String);
+
+impl std::fmt::Display for TriggerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TriggerRefused {}
+
 /// One tier's domains.toml, rooted at that tier (F29): the reader doctor uses to judge a
 /// tier on its own. Absent or unparsable is empty; the loaders fail open by design and
 /// doctor reports a corrupt file through `config_errors`.
@@ -322,6 +335,18 @@ pub fn add_trigger(
             domain: Vec::new(),
         }
     };
+
+    // A trigger that cannot fire is refused before anything is written (F29 step 6): an
+    // unrooted path, or one that covers two or more registered projects.
+    if let Some(p) = path {
+        // The tier root is the parent of the tier dir the file sits in: `~/.base-gbl/
+        // domains.toml` roots at home, `<ws>/.base/domains.toml` at the workspace.
+        let root = toml_path.parent().and_then(Path::parent).map(|r| r.display().to_string());
+        let ctx = trigger_context(cwd);
+        if let Some(fault) = matcher::trigger_fault(p, root.as_deref(), &ctx) {
+            return Err(TriggerRefused(matcher::fault_sentence(domain_name, p, &fault)).into());
+        }
+    }
 
     // Find or create domain
     let domain = if let Some(pos) = file.domain.iter().position(|d| d.name == domain_name) {
