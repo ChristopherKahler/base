@@ -278,17 +278,24 @@ pub fn render(walked: &[(Resolved, Vec<Record>)], budget: usize) -> (String, usi
 mod tests {
     use super::*;
 
-    fn node(id: &str, label: &str) -> (String, Node) {
-        (
-            id.to_string(),
-            Node {
-                label: label.to_string(),
-                ntype: String::new(),
-                source: String::new(),
-                summary: String::new(),
-                touched: String::new(),
-            },
-        )
+    fn mknode(label: &str, touched: &str) -> Node {
+        Node {
+            label: label.to_string(),
+            ntype: String::new(),
+            source: String::new(),
+            summary: String::new(),
+            touched: touched.to_string(),
+        }
+    }
+
+    /// Insert a node under `id`. Returns nothing, because every caller wants the
+    /// map populated rather than the pair.
+    fn put(map: &mut HashMap<String, Node>, id: &str, label: &str) {
+        map.insert(id.to_string(), mknode(label, ""));
+    }
+
+    fn put_dated(map: &mut HashMap<String, Node>, id: &str, label: &str, touched: &str) {
+        map.insert(id.to_string(), mknode(label, touched));
     }
 
     fn ns() -> NamespaceConfig {
@@ -301,7 +308,7 @@ mod tests {
 
     /// The index a test resolves against. Longest-match is meaningless without
     /// one, which is what the first version of `candidates` got wrong.
-    fn idx(known: &[&str]) -> impl Fn(&str) -> bool + '_ {
+    fn idx<'a>(known: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
         move |s: &str| known.iter().any(|k| k.eq_ignore_ascii_case(s))
     }
 
@@ -380,6 +387,7 @@ mod tests {
                     label: format!("decision number {i}"),
                     relation: "belongsTo".into(),
                     id: format!("<x/d{i}>"),
+                    touched: String::new(),
                 })
                 .collect(),
         )];
@@ -395,9 +403,9 @@ mod tests {
     #[test]
     fn a_record_the_domain_block_served_is_not_served_again() {
         let mut nodes: HashMap<String, Node> = HashMap::new();
-        nodes.insert(node("<x/project/kit>", "first client kit"));
-        nodes.insert(node("<x/decision/d1>", "stripe over paddle"));
-        nodes.insert(node("<x/decision/d2>", "weekly invoicing"));
+        put(&mut nodes, "<x/project/kit>", "first client kit");
+        put(&mut nodes, "<x/decision/d1>", "stripe over paddle");
+        put(&mut nodes, "<x/decision/d2>", "weekly invoicing");
         let mut adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
         adj.insert(
             "<x/project/kit>".into(),
@@ -424,11 +432,11 @@ mod tests {
     #[test]
     fn a_transient_record_is_never_walked_into() {
         let mut nodes: HashMap<String, Node> = HashMap::new();
-        nodes.insert(node("<x/project/kit>", "first client kit"));
+        put(&mut nodes, "<x/project/kit>", "first client kit");
         // A real ping IRI under the real namespace, judged by the real seam: the
         // hook passes `ontology::transient::is_transient_iri`, so the test does too.
         let ping = format!("<{}ping/p1>", ns().uri);
-        nodes.insert(node(&ping, "a ping"));
+        put(&mut nodes, &ping, "a ping");
         let mut adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
         adj.insert("<x/project/kit>".into(), vec![(ping.clone(), "mentions".into())]);
         let maps = (nodes, adj);
@@ -444,16 +452,14 @@ mod tests {
     #[test]
     fn records_rank_by_kind_then_recency_with_undated_last() {
         let mut nodes: HashMap<String, Node> = HashMap::new();
-        nodes.insert(node("<x/project/kit>", "first client kit"));
+        put(&mut nodes, "<x/project/kit>", "first client kit");
         for (id, label, touched) in [
             ("<x/decision/old>", "an old decision", "2026-01-01T00:00:00Z"),
             ("<x/decision/new>", "a new decision", "2026-09-01T00:00:00Z"),
             ("<x/decision/undated>", "an undated decision", ""),
             ("<x/doc/recent>", "a very recent doc", "2026-09-05T00:00:00Z"),
         ] {
-            let (k, mut n) = node(id, label);
-            n.touched = touched.to_string();
-            nodes.insert(k, n);
+            put_dated(&mut nodes, id, label, touched);
         }
         let mut adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
         adj.insert(
@@ -514,14 +520,14 @@ mod tests {
     #[test]
     fn a_node_is_found_by_its_slug_as_well_as_its_label() {
         let mut nodes: HashMap<String, Node> = HashMap::new();
-        nodes.insert(node("<x/project/kit>", "First Client Kit"));
+        put(&mut nodes, "<x/project/kit>", "First Client Kit");
         let adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let maps = (nodes, adj);
 
         for spelling in ["`First Client Kit`", "`first-client-kit`", "First Client Kit"] {
             let out = walk(&maps, &ns(), spelling, &HashSet::new(), &no, &no);
             assert_eq!(out.len(), 1, "{spelling:?} resolved to {} things", out.len());
-            assert_eq!(out[0].id, "<x/project/kit>", "{spelling:?}");
+            assert_eq!(out[0].0.id, "<x/project/kit>", "{spelling:?}");
         }
     }
 
