@@ -316,7 +316,9 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
                     // commands, recall, the domain block and the dashboard consult.
                     // A substring test stood here until PR #50 landed (kite F4).
                     &|id: &str| crate::ontology::transient::is_transient_iri(&config.namespace, id),
-                    &|_id: &str| false,
+                    // No drift resolution yet: the drift fork fills this with
+                    // `resolve_head`. `None` means "this record still stands".
+                    &|_id: &str| None,
                 )
             }),
         _ => None,

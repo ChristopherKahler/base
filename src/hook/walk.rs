@@ -145,13 +145,22 @@ pub fn candidates(prompt: &str, known: &dyn Fn(&str) -> bool) -> Vec<String> {
 /// Returns the resolutions in prompt order and the records found, already
 /// deduped against `already_served` (the record IRIs the domain block emitted
 /// this prompt) and against each other.
+/// `head_of` answers "what replaced this record": `None` means it still stands,
+/// `Some(head)` means it is superseded and `head` is the live one.
+///
+/// Not a `bool`. A bool can say "this is stale" and cannot name what replaced
+/// it, which is enough for a neighbour and wrong for the SEED: answering a
+/// named thing with silence is worse than answering with the stale record.
+/// Neighbours substitute through it too rather than vanishing, so a hub keeps
+/// the fact that it is connected to that thing at all. `None` everywhere until
+/// the drift fork fills it (F26, 2026-09-07).
 pub fn walk(
     maps: &GraphMaps,
     ns: &NamespaceConfig,
     prompt: &str,
     already_served: &HashSet<String>,
     is_transient: &dyn Fn(&str) -> bool,
-    is_superseded: &dyn Fn(&str) -> bool,
+    head_of: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(Resolved, Vec<Record>)> {
     let (nodes, adj) = maps;
     let mut out = Vec::new();
@@ -178,6 +187,19 @@ pub fn walk(
         let Some((id, ties)) = crate::graph_tools::resolve_strict(nodes, adj, ns, &name) else {
             continue;
         };
+        // F26. The seed was inserted and walked from without ever meeting the
+        // filters its NEIGHBOURS meet below, so naming a ping directly resolved
+        // it and walked it: "pings never appear" held for everything except the
+        // one case where a person names one.
+        if is_transient(&id) {
+            continue;
+        }
+        // A named record that has been superseded answers with its successor,
+        // not with silence and not with itself.
+        let id = head_of(&id).unwrap_or(id);
+        if is_transient(&id) {
+            continue;
+        }
         if !emitted.insert(id.clone()) {
             continue;
         }
@@ -195,10 +217,19 @@ pub fn walk(
                         continue;
                     }
                     next.push(nb.clone());
-                    if is_transient(nb) || is_superseded(nb) || emitted.contains(nb) {
+                    if is_transient(nb) {
                         continue;
                     }
-                    emitted.insert(nb.clone());
+                    // A superseded NEIGHBOUR substitutes, it does not vanish
+                    // (shrike, drift owner): dropping it loses the fact that the
+                    // hub is connected to that thing at all, when what the reader
+                    // wants is the thing that replaced it. Dedupe after the
+                    // substitution, or two stale records sharing one head arrive
+                    // as the same line twice.
+                    let nb = &head_of(nb).unwrap_or_else(|| nb.clone());
+                    if is_transient(nb) || !emitted.insert(nb.clone()) {
+                        continue;
+                    }
                     found.push(Record {
                         kind: iri_kind(nb).unwrap_or("record").to_string(),
                         label: label_of(nodes, nb),
@@ -256,11 +287,16 @@ pub fn render(walked: &[(Resolved, Vec<Record>)], budget: usize) -> (String, usi
         );
         let mut block = header;
         let mut wrote = 0usize;
-        for rec in records {
+        // F27. `continue` let a shorter, LOWER-priority record slip in after a
+        // longer, higher-priority one had been rejected. The records arrive
+        // ranked, so that inverts the ranking at the budget boundary and the
+        // block stops being "the most important ones that fit". Stop at the
+        // first one that does not fit and count the whole remainder.
+        for (i, rec) in records.iter().enumerate() {
             let line = format!("  {:<9} {} — {}\n", rec.kind, rec.label, rec.relation);
             if out.len() + block.len() + line.len() + 18 > budget {
-                dropped += 1;
-                continue;
+                dropped += records.len() - i;
+                break;
             }
             block.push_str(&line);
             wrote += 1;
@@ -304,6 +340,11 @@ mod tests {
 
     fn no(_id: &str) -> bool {
         false
+    }
+
+    /// `head_of` saying "everything still stands". `None` is the live case.
+    fn live(_id: &str) -> Option<String> {
+        None
     }
 
     /// The index a test resolves against. Longest-match is meaningless without
@@ -418,12 +459,12 @@ mod tests {
         let ns = ns();
 
         // Nothing served yet: both decisions come through.
-        let all = walk(&maps, &ns, "`first client kit`", &HashSet::new(), &no, &no);
+        let all = walk(&maps, &ns, "`first client kit`", &HashSet::new(), &no, &live);
         assert_eq!(all[0].1.len(), 2, "expected both decisions, got {:?}", all[0].1.len());
 
         // d1 already served by the domain block: only d2 comes through.
         let served: HashSet<String> = HashSet::from(["<x/decision/d1>".to_string()]);
-        let some = walk(&maps, &ns, "`first client kit`", &served, &no, &no);
+        let some = walk(&maps, &ns, "`first client kit`", &served, &no, &live);
         assert_eq!(some[0].1.len(), 1, "domain-served record was served twice");
         assert_eq!(some[0].1[0].id, "<x/decision/d2>");
     }
@@ -471,7 +512,7 @@ mod tests {
                 ("<x/doc/recent>".into(), "documents".into()),
             ],
         );
-        let out = walk(&(nodes, adj), &ns(), "`first client kit`", &HashSet::new(), &no, &no);
+        let out = walk(&(nodes, adj), &ns(), "`first client kit`", &HashSet::new(), &no, &live);
         let ids: Vec<&str> = out[0].1.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -534,10 +575,81 @@ mod tests {
         let maps = (nodes, adj);
 
         for spelling in ["`First Client Kit`", "`first-client-kit`", "First Client Kit"] {
-            let out = walk(&maps, &ns(), spelling, &HashSet::new(), &no, &no);
+            let out = walk(&maps, &ns(), spelling, &HashSet::new(), &no, &live);
             assert_eq!(out.len(), 1, "{spelling:?} resolved to {} things", out.len());
             assert_eq!(out[0].0.id, id, "{spelling:?}");
         }
+    }
+
+    /// F26. The seed was inserted and walked from without meeting the filters
+    /// its neighbours meet, so naming a ping directly resolved it and walked it.
+    /// A named superseded record answers with its successor, not with silence:
+    /// `head_of` returns the head, and a bool seam could not have expressed that.
+    #[test]
+    fn a_named_transient_is_skipped_and_a_named_superseded_answers_with_its_head() {
+        let ns = ns();
+        let ping = format!("<{}ping/note>", ns.uri);
+        let old = format!("<{}decision/old-call>", ns.uri);
+        let new = format!("<{}decision/new-call>", ns.uri);
+
+        let mut nodes: HashMap<String, Node> = HashMap::new();
+        put(&mut nodes, &ping, "note");
+        put(&mut nodes, &old, "old call");
+        put(&mut nodes, &new, "new call");
+        let mut adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        adj.insert(new.clone(), vec![(old.clone(), "supersedes".into())]);
+        let maps = (nodes, adj);
+
+        // Naming the ping directly: the seed is transient, so nothing comes back.
+        let is_ping = |id: &str| id.contains("ping/");
+        let out = walk(&maps, &ns, "`note`", &HashSet::new(), &is_ping, &live);
+        assert!(out.is_empty(), "a named ping was walked: {out:?}");
+
+        // Naming the superseded decision: the seed resolves to its head.
+        let old_for_head = old.clone();
+        let new_for_head = new.clone();
+        let head_of = move |id: &str| {
+            (id == old_for_head).then(|| new_for_head.clone())
+        };
+        let out = walk(&maps, &ns, "`old call`", &HashSet::new(), &no, &head_of);
+        assert_eq!(out.len(), 1, "the superseded seed answered with nothing");
+        assert_eq!(out[0].0.id, new, "the seed did not resolve to its head");
+    }
+
+    /// F27. The records arrive ranked, so skipping past an over-budget line and
+    /// carrying on let a shorter LOWER-priority record take the place of a
+    /// longer higher-priority one -- the block silently stopped being "the most
+    /// important ones that fit". The budget stops at the first miss.
+    #[test]
+    fn the_budget_stops_rather_than_letting_a_lesser_record_jump_the_queue() {
+        let r = |kind: &str, label: &str| Record {
+            kind: kind.into(),
+            label: label.into(),
+            relation: "belongsTo".into(),
+            id: format!("<x/{kind}/{label}>"),
+            touched: String::new(),
+        };
+        let seed = Resolved {
+            name: "n".into(),
+            id: "<x/project/n>".into(),
+            kind: "project".into(),
+            hops: 1,
+            ties: 1,
+        };
+        // A long decision first, then a short doc. Ranked, the decision wins.
+        let records = vec![
+            r("decision", "a decision with a deliberately long label that will not fit"),
+            r("doc", "short"),
+        ];
+        let walked = vec![(seed, records)];
+
+        // Budget fits the header plus the SHORT line but not the long one.
+        let (block, dropped) = render(&walked, 120);
+        assert!(
+            !block.contains("short"),
+            "the shorter lower-priority record jumped the queue:\n{block}"
+        );
+        assert_eq!(dropped, 2, "both records should be counted as dropped");
     }
 
     #[test]
