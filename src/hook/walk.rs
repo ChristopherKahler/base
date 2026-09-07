@@ -20,6 +20,7 @@ use crate::config::NamespaceConfig;
 use crate::graph_query::{iri_kind, GraphMaps, Node};
 
 /// A name the prompt used, and what it resolved to.
+#[derive(Debug)]
 pub struct Resolved {
     pub name: String,
     pub id: String,
@@ -31,6 +32,7 @@ pub struct Resolved {
 }
 
 /// One record the walk found, with the relation that led to it.
+#[derive(Debug)]
 pub struct Record {
     pub kind: String,
     pub label: String,
@@ -482,7 +484,7 @@ mod tests {
         adj.insert("<x/project/kit>".into(), vec![(ping.clone(), "mentions".into())]);
         let maps = (nodes, adj);
         let transient = |id: &str| crate::ontology::transient::is_transient_iri(&ns(), id);
-        let out = walk(&maps, &ns(), "`first client kit`", &HashSet::new(), &transient, &no);
+        let out = walk(&maps, &ns(), "`first client kit`", &HashSet::new(), &transient, &live);
         assert!(out[0].1.is_empty(), "a ping reached the prompt: {:?}", out[0].1.len());
     }
 
