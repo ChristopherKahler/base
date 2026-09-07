@@ -656,6 +656,47 @@ mod edge_loading_tests {
         b
     }
 
+    /// Test 11's hazard, pinned where it actually lives.
+    ///
+    /// The traversal fork needed a recency field, so the node query gained
+    /// `OPTIONAL { ?s ops:createdAt ?created }` and `OPTIONAL { ?s ops:updatedAt
+    /// ?updated }`. An OPTIONAL is a join: a subject carrying the predicate
+    /// twice yields two rows where it yielded one, and the map keeps whichever
+    /// row came last. Everything else in the split is a pure refactor -- the
+    /// same projection behind the same caller -- so this is the ONE way the
+    /// change could have moved `base graph get-node` output, and a byte diff
+    /// against a baseline binary would only catch it if the store happened to
+    /// contain a duplicate. This does not leave it to chance.
+    #[test]
+    fn a_record_with_two_timestamps_still_loads_as_one_node() {
+        let u = ns().uri;
+        let g = crate::crud::workspace_graph_iri(&ns(), "t");
+        let mut b = String::new();
+        b += &format!("<{u}decision/dup> <{u}name> \"dup\" <{g}> .\n");
+        b += &format!("<{u}decision/dup> <{RDF_TYPE}> <{u}Decision> <{g}> .\n");
+        b += &format!("<{u}decision/dup> <{u}updatedAt> \"2026-01-01T00:00:00Z\" <{g}> .\n");
+        b += &format!("<{u}decision/dup> <{u}updatedAt> \"2026-09-01T00:00:00Z\" <{g}> .\n");
+        b += &format!("<{u}decision/dup> <{u}createdAt> \"2025-01-01T00:00:00Z\" <{g}> .\n");
+
+        let dir = workspace(&b);
+        let (nodes, _) = load(&dir);
+        let hits: Vec<&String> =
+            nodes.keys().filter(|k| k.ends_with("decision/dup>")).collect();
+        assert_eq!(hits.len(), 1, "two updatedAt triples produced {hits:?}");
+
+        // And the same node on every load: a projection that varies run to run
+        // is a `base graph get-node` whose output varies run to run.
+        let n = &nodes[&id("decision/dup")];
+        let (label, ntype, touched) = (n.label.clone(), n.ntype.clone(), n.touched.clone());
+        for i in 0..5 {
+            let (again, _) = load(&dir);
+            let m = &again[&id("decision/dup")];
+            assert_eq!(m.label, label, "label moved on load {i}");
+            assert_eq!(m.ntype, ntype, "type moved on load {i}");
+            assert_eq!(m.touched, touched, "touched moved on load {i}");
+        }
+    }
+
     /// The reified shape `base graph extract` writes.
     fn semantic_body() -> String {
         let u = ns().uri;
