@@ -22,7 +22,7 @@ fn add_keyword_trigger_to_existing_domain() {
     let tmp = tempfile::tempdir().unwrap();
     write_initial_domains(tmp.path());
 
-    base::domain::add_trigger(tmp.path(), "dev", Some("fix bug"), None).unwrap();
+    base::domain::add_trigger(tmp.path(), false, "dev", Some("fix bug"), None).unwrap();
 
     let domains = base::domain::load_domains(tmp.path());
     let dev = domains.iter().find(|d| d.name == "dev").unwrap();
@@ -41,7 +41,7 @@ fn add_trigger_creates_new_domain() {
     let tmp = tempfile::tempdir().unwrap();
     write_initial_domains(tmp.path());
 
-    base::domain::add_trigger(tmp.path(), "review", Some("audit"), None).unwrap();
+    base::domain::add_trigger(tmp.path(), false, "review", Some("audit"), None).unwrap();
 
     let domains = base::domain::load_domains(tmp.path());
     let review = domains.iter().find(|d| d.name == "review").unwrap();
@@ -54,7 +54,7 @@ fn add_path_trigger() {
     let tmp = tempfile::tempdir().unwrap();
     write_initial_domains(tmp.path());
 
-    base::domain::add_trigger(tmp.path(), "dev", None, Some("src/")).unwrap();
+    base::domain::add_trigger(tmp.path(), false, "dev", None, Some("src/")).unwrap();
 
     let domains = base::domain::load_domains(tmp.path());
     let dev = domains.iter().find(|d| d.name == "dev").unwrap();
@@ -67,7 +67,7 @@ fn add_trigger_no_duplicate_keywords() {
     write_initial_domains(tmp.path());
 
     // Add the same keyword twice
-    base::domain::add_trigger(tmp.path(), "dev", Some("write code"), None).unwrap();
+    base::domain::add_trigger(tmp.path(), false, "dev", Some("write code"), None).unwrap();
 
     let domains = base::domain::load_domains(tmp.path());
     let dev = domains.iter().find(|d| d.name == "dev").unwrap();
@@ -84,7 +84,7 @@ fn add_trigger_creates_base_dir_if_missing() {
     let tmp = tempfile::tempdir().unwrap();
     // No .base/ directory at all
 
-    base::domain::add_trigger(tmp.path(), "new-domain", Some("test"), None).unwrap();
+    base::domain::add_trigger(tmp.path(), false, "new-domain", Some("test"), None).unwrap();
 
     let domains = base::domain::load_domains(tmp.path());
     let new = domains.iter().find(|d| d.name == "new-domain");

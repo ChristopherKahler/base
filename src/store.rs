@@ -974,11 +974,23 @@ mod tests {
         assert!(bad.is_empty());
     }
 
+    /// Contract changed: a missing graph file is an EMPTY tier, not an error.
+    ///
+    /// It used to be `is_err()`. Nothing in production depended on that:
+    /// `doctor` is the only caller and it handles `GraphHealth::Missing`
+    /// explicitly before it ever reaches here, so the lenient path only runs on
+    /// an Unhealthy file, which exists by definition. Meanwhile the error made
+    /// `rule add` refuse to write the first rule into a fresh tier, and
+    /// `rule list -g` die on a home with no global graph. Absent is not empty
+    /// is not zero -- and a tier nobody has written to holds no records, which
+    /// is an answer.
     #[test]
-    fn load_graph_lenient_missing_file_is_err() {
+    fn load_graph_lenient_missing_file_is_an_empty_tier() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("does-not-exist.nq");
-        assert!(load_graph_lenient(&p).is_err());
+        let (store, bad) = load_graph_lenient(&p).expect("a missing tier reads as empty");
+        assert_eq!(store.len().unwrap(), 0);
+        assert!(bad.is_empty(), "a file that is not there has no bad lines");
     }
 
     #[test]
