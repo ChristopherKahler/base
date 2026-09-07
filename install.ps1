@@ -86,12 +86,27 @@
             # scripts\ast by trying two paths relative to the binary and then the
             # working directory, and a release archive satisfies only the third.
             Push-Location $tmp
+            $prevEap = $ErrorActionPreference
             try {
+                # Windows PowerShell 5.1 promotes a native command's stderr to a
+                # TERMINATING NativeCommandError when $ErrorActionPreference is
+                # Stop and stderr is redirected — at exit 0, on output that is
+                # not an error at all. `base install` writes progress there, so
+                # under 5.1 a perfectly good install aborts, and since the catch
+                # now rethrows it aborts loudly. pwsh 7 does not do this, which
+                # is why a pwsh-only harness cannot see it (#96).
+                #
+                # A native command reports failure through $LASTEXITCODE, never
+                # the error stream, so Stop buys nothing here. Drop it for the
+                # call and read the exit code ourselves.
+                $ErrorActionPreference = 'Continue'
                 & $exe @installArgs
-                if ($LASTEXITCODE -ne 0) { Die "base install exited $LASTEXITCODE" }
+                $rc = $LASTEXITCODE
             } finally {
+                $ErrorActionPreference = $prevEap
                 Pop-Location
             }
+            if ($rc -ne 0) { Die "base install exited $rc" }
         }
         finally {
             Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
