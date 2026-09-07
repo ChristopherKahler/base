@@ -1143,6 +1143,11 @@ pub enum RuleAction {
     List {
         #[arg(long)]
         domain: String,
+        /// Show rules that have been superseded, each marked `[superseded]`.
+        /// Off by default: this listing is what the agent receives, so it serves
+        /// the rule that stands. Indices are ids and never renumber.
+        #[arg(long)]
+        include_superseded: bool,
     },
     /// Remove a rule by index from a domain
     Remove {
@@ -2651,8 +2656,10 @@ pub fn run() {
                         Err(e) => die("Failed", e),
                     }
                 }
-                RuleAction::List { domain: name } => {
-                    if let Err(e) = crud::rule::list(&rule_cwd, &config.namespace, &name) {
+                RuleAction::List { domain: name, include_superseded } => {
+                    if let Err(e) =
+                        crud::rule::list(&rule_cwd, &config.namespace, &name, include_superseded)
+                    {
                         eprintln!("Failed: {e}");
                     }
                 }
