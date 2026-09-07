@@ -177,6 +177,54 @@ pub fn list(
     Ok(())
 }
 
+/// Every tier's rules for one domain, labelled, with each tier's OWN index.
+///
+/// #53. `list` prints one tier and says nothing about the other, while the hook
+/// injects the union -- so a rule removed from one tier kept arriving in every
+/// prompt and no command explained why. Measured on a fake home: workspace said
+/// 2, global said 3, the prompt got 5, interleaved and renumbered 0-4.
+///
+/// The per-tier index is deliberate and is the reason this is not just a merged
+/// list: `rule remove --index N` takes a tier-local index, both tiers start at
+/// 0, and the renumbered figure in the injected block belongs to neither.
+pub fn list_all_tiers(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    domain_name: &str,
+    include_superseded: bool,
+) -> Result<()> {
+    let ws_cwd = cwd.to_path_buf();
+    let gbl_cwd = crate::home::home_root()
+        .map(|h| h.join(".base-gbl"))
+        .unwrap_or_else(|| cwd.to_path_buf());
+
+    let mut total = 0usize;
+    let mut shown: Vec<(&str, Vec<(u32, String)>)> = Vec::new();
+    for (label, c) in [("workspace", &ws_cwd), ("global", &gbl_cwd)] {
+        let rules = fetch(c, ns, domain_name, include_superseded).unwrap_or_default();
+        total += rules.len();
+        shown.push((label, rules));
+    }
+
+    if total == 0 {
+        println!("No rules for domain '{domain_name}' in either tier.");
+        return Ok(());
+    }
+
+    println!("[{domain_name}] {total} rules across both tiers:");
+    for (label, rules) in &shown {
+        if rules.is_empty() {
+            println!("  ({label}: none)");
+            continue;
+        }
+        for (pri, text) in rules {
+            println!("  {label:<9} {pri}. {text}");
+        }
+    }
+    println!("\nIndices are per tier; `rule remove` takes the index shown beside its own tier.");
+    Ok(())
+}
+
 /// Remove a rule by index from a domain.
 /// Remove one CLI rule from THIS tier. Returns how many went: 0 means the index
 /// is not in this tier, which is not the same as success.

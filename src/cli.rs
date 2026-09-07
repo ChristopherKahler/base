@@ -2694,9 +2694,18 @@ pub fn run() {
                     }
                 }
                 RuleAction::List { domain: name, include_superseded } => {
-                    if let Err(e) =
+                    // #53. Without --global this shows BOTH tiers, because the
+                    // hook injects both and no single command used to print
+                    // what the agent actually receives. --global keeps the
+                    // single-tier view for scripts that parse it.
+                    // `include_superseded` rides along to both, so drift's flag
+                    // means the same thing whichever tier view you asked for.
+                    let r = if global {
                         crud::rule::list(&rule_cwd, &config.namespace, &name, include_superseded)
-                    {
+                    } else {
+                        crud::rule::list_all_tiers(&cwd, &config.namespace, &name, include_superseded)
+                    };
+                    if let Err(e) = r {
                         eprintln!("Failed: {e}");
                     }
                 }

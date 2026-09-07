@@ -440,11 +440,25 @@ pub fn list_domains(cwd: &Path, ns: &crate::config::NamespaceConfig) {
             d.file_keywords.len(),
             d.paths.len(),
             {
-                let (declared, added) = rules_of(cwd, ns, d);
-                declared.len() + added.len()
+                // Both tiers, because the row above them merges both and the
+                // hook injects both. Counting the cwd tier alone described a
+                // domain that spans tiers with a number that described one.
+                // `declared` comes off the DomainDef, which load_domains has
+                // ALREADY merged across tiers, so counting it per tier would
+                // double it. Only the graph-backed rules are per tier.
+                let (declared, aw) = rules_of(cwd, ns, d);
+                let gbl = crate::home::home_root().map(|h| h.join(".base-gbl"));
+                let ag = match &gbl {
+                    Some(g) if g.as_path() != cwd => rules_of(g, ns, d).1,
+                    _ => Vec::new(),
+                };
+                let w = declared.len() + aw.len();
+                let g = ag.len();
+                if g == 0 { format!("{w}") } else { format!("{w}+{g}") }
             },
         );
     }
+    println!("\nRules column is workspace+global. `base rule list --domain X` shows them labelled.");
 }
 
 /// Every rule a domain injects: the ones declared in `domains.toml`, and the
