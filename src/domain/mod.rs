@@ -4,6 +4,7 @@ pub mod query;
 pub mod session;
 pub mod sync;
 pub mod transcript;
+pub mod tier;
 
 use std::path::Path;
 
@@ -200,15 +201,15 @@ fn merge_domains(base: Vec<DomainDef>, overlay: Vec<DomainDef>) -> Vec<DomainDef
 /// Creates the domain (mode=triggered) if it doesn't exist.
 pub fn add_trigger(
     cwd: &Path,
+    global: bool,
     domain_name: &str,
     keyword: Option<&str>,
     path: Option<&str>,
-) -> anyhow::Result<()> {
-    let base_dir = crate::config::find_workspace_base(cwd)
-        .unwrap_or_else(|| cwd.join(".base"));
-    std::fs::create_dir_all(&base_dir)?;
-
-    let toml_path = base_dir.join("domains.toml");
+) -> anyhow::Result<tier::Changed> {
+    let (toml_path, tier) = tier::domains_toml_for_write(cwd, global);
+    if let Some(parent) = toml_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut file: DomainsFile = if toml_path.exists() {
         let content = std::fs::read_to_string(&toml_path)?;
         toml::from_str(&content)?
@@ -258,7 +259,7 @@ pub fn add_trigger(
     std::fs::write(&tmp_path, &content)?;
     std::fs::rename(&tmp_path, &toml_path)?;
 
-    Ok(())
+    Ok(tier::Changed { tier, count: 1 })
 }
 
 /// Swap a path trigger on a domain: drop `old` (if present), add `new`. Used by
@@ -300,13 +301,19 @@ pub fn repath_trigger(
 }
 
 pub fn create_domain(
-    _cwd: &Path,
+    cwd: &Path,
+    global: bool,
     domain_name: &str,
     keyword: Option<&str>,
     path: Option<&str>,
-) -> anyhow::Result<()> {
-    let home = crate::home::home_root().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    let toml_path = home.join(".base-gbl").join("domains.toml");
+) -> anyhow::Result<tier::Changed> {
+    // #18. This took `_cwd` and hardcoded the global file, so `create` put the
+    // domain somewhere the user was not standing -- which is what made #52 look
+    // like "created without writing anything": it wrote to the other tier.
+    let (toml_path, tier) = tier::domains_toml_for_write(cwd, global);
+    if let Some(parent) = toml_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut file: DomainsFile = if toml_path.exists() {
         toml::from_str(&std::fs::read_to_string(&toml_path)?)?
     } else {
@@ -342,51 +349,77 @@ pub fn create_domain(
     let tmp = toml_path.with_extension("toml.tmp");
     std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
     std::fs::rename(&tmp, &toml_path)?;
-    Ok(())
+    Ok(tier::Changed { tier, count: 1 })
 }
 
-pub fn remove_domain(_cwd: &Path, domain_name: &str) -> anyhow::Result<bool> {
-    let home = crate::home::home_root().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    let toml_path = home.join(".base-gbl").join("domains.toml");
-    if !toml_path.exists() { return Ok(false); }
+pub fn remove_domain(
+    cwd: &Path,
+    global: bool,
+    domain_name: &str,
+) -> anyhow::Result<tier::Changed> {
+    let (toml_path, tier) = tier::domains_toml_for_write(cwd, global);
+    if !toml_path.exists() {
+        return Ok(tier::Changed::none(tier));
+    }
 
     let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(&toml_path)?)?;
     let before = file.domain.len();
     file.domain.retain(|d| !d.name.eq_ignore_ascii_case(domain_name));
-    if file.domain.len() == before { return Ok(false); }
+    let removed = before - file.domain.len();
+    if removed == 0 {
+        return Ok(tier::Changed::none(tier));
+    }
 
     let tmp = toml_path.with_extension("toml.tmp");
     std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
     std::fs::rename(&tmp, &toml_path)?;
-    Ok(true)
+    Ok(tier::Changed { tier, count: removed })
 }
 
 pub fn remove_trigger(
-    _cwd: &Path,
+    cwd: &Path,
+    global: bool,
     domain_name: &str,
     keyword: Option<&str>,
     path: Option<&str>,
-) -> anyhow::Result<()> {
-    let home = crate::home::home_root().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    let toml_path = home.join(".base-gbl").join("domains.toml");
-    if !toml_path.exists() { anyhow::bail!("domains.toml not found"); }
+) -> anyhow::Result<tier::Changed> {
+    let (toml_path, tier) = tier::domains_toml_for_write(cwd, global);
+    if !toml_path.exists() {
+        return Ok(tier::Changed::none(tier));
+    }
 
     let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(&toml_path)?)?;
-    let domain = file.domain.iter_mut()
+    let Some(domain) = file
+        .domain
+        .iter_mut()
         .find(|d| d.name.eq_ignore_ascii_case(domain_name))
-        .ok_or_else(|| anyhow::anyhow!("Domain '{domain_name}' not found"))?;
+    else {
+        return Ok(tier::Changed::none(tier));
+    };
 
+    // Count what actually went. This returned Ok(()) whether or not the trigger
+    // was there, so "Trigger removed" printed for a keyword that never existed
+    // -- and, with a same-named domain in the other tier, for a domain the user
+    // never meant (#18).
+    let mut removed = 0usize;
     if let Some(kw) = keyword {
+        let before = domain.prompt_keywords.len();
         domain.prompt_keywords.retain(|k| k != kw);
+        removed += before - domain.prompt_keywords.len();
     }
     if let Some(p) = path {
+        let before = domain.paths.len();
         domain.paths.retain(|pp| pp != p);
+        removed += before - domain.paths.len();
+    }
+    if removed == 0 {
+        return Ok(tier::Changed::none(tier));
     }
 
     let tmp = toml_path.with_extension("toml.tmp");
     std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
     std::fs::rename(&tmp, &toml_path)?;
-    Ok(())
+    Ok(tier::Changed { tier, count: removed })
 }
 
 /// List all domains (for CLI output).
@@ -407,11 +440,25 @@ pub fn list_domains(cwd: &Path, ns: &crate::config::NamespaceConfig) {
             d.file_keywords.len(),
             d.paths.len(),
             {
-                let (declared, added) = rules_of(cwd, ns, d);
-                declared.len() + added.len()
+                // Both tiers, because the row above them merges both and the
+                // hook injects both. Counting the cwd tier alone described a
+                // domain that spans tiers with a number that described one.
+                // `declared` comes off the DomainDef, which load_domains has
+                // ALREADY merged across tiers, so counting it per tier would
+                // double it. Only the graph-backed rules are per tier.
+                let (declared, aw) = rules_of(cwd, ns, d);
+                let gbl = crate::home::home_root().map(|h| h.join(".base-gbl"));
+                let ag = match &gbl {
+                    Some(g) if g.as_path() != cwd => rules_of(g, ns, d).1,
+                    _ => Vec::new(),
+                };
+                let w = declared.len() + aw.len();
+                let g = ag.len();
+                if g == 0 { format!("{w}") } else { format!("{w}+{g}") }
             },
         );
     }
+    println!("\nRules column is workspace+global. `base rule list --domain X` shows them labelled.");
 }
 
 /// Every rule a domain injects: the ones declared in `domains.toml`, and the
@@ -479,15 +526,33 @@ pub fn get_domain(cwd: &Path, ns: &crate::config::NamespaceConfig, name: &str) {
             if let Some(fmt) = &d.format {
                 println!("Format: {fmt}");
             }
-            let (declared, added) = rules_of(cwd, ns, d);
-            println!("Rules ({}):", declared.len() + added.len());
+            // Both tiers, for the same reason `domain list` counts both: the
+            // hook injects both, so a detail view built from one tier described
+            // a different domain than the one the agent actually receives.
+            // `declared` comes off the DomainDef, which load_domains has ALREADY
+            // merged across tiers, so it is counted once; only the graph-backed
+            // rules are per tier.
+            let (declared, added_ws) = rules_of(cwd, ns, d);
+            let gbl = crate::home::home_root().map(|h| h.join(".base-gbl"));
+            let added_gbl = match &gbl {
+                Some(g) if g.as_path() != cwd => rules_of(g, ns, d).1,
+                _ => Vec::new(),
+            };
+            println!(
+                "Rules ({}):",
+                declared.len() + added_ws.len() + added_gbl.len()
+            );
             for (i, rule) in declared.iter().enumerate() {
                 println!("  {i}. {rule}");
             }
             // Numbered by their own index, which is what `base rule remove
-            // --index` takes; the two stores number independently.
-            for (n, text) in &added {
-                println!("  [cli-{n}] {text}");
+            // --index` takes; the two stores number independently, and so do the
+            // two tiers -- which is why every cli row names the tier it is in.
+            for (n, text) in &added_ws {
+                println!("  [workspace cli-{n}] {text}");
+            }
+            for (n, text) in &added_gbl {
+                println!("  [global cli-{n}] {text}");
             }
         }
         None => eprintln!("Domain '{name}' not found."),

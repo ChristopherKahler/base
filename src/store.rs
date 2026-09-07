@@ -88,6 +88,16 @@ pub fn load_graph(path: &Path) -> Result<Store> {
     migrate_trig_to_nq(path)?;
 
     let store = Store::new().context("Failed to create in-memory store")?;
+
+    // A tier that has never been written has no graph file, and that is an
+    // answer rather than a failure: it holds no records. Before this, `rule
+    // list -g` on a home with no global graph died with "Failed to open …",
+    // and so did `rule add` -- in either tier -- so a fresh tier could not take
+    // its first rule. An empty file already worked; only a missing one did not.
+    if !path.exists() {
+        return Ok(store);
+    }
+
     let file = fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
     store
@@ -109,6 +119,10 @@ pub struct BadLine {
 /// Shared by [`load_graph_lenient`] and the [`load_merged`] read fallback.
 /// Returns Err only for unrecoverable IO (cannot open the file).
 fn load_lenient_into(store: &Store, path: &Path) -> Result<Vec<BadLine>> {
+    // Same rule as `load_graph`: absent is empty, and empty has no bad lines.
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
     let file = fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
 
@@ -960,11 +974,23 @@ mod tests {
         assert!(bad.is_empty());
     }
 
+    /// Contract changed: a missing graph file is an EMPTY tier, not an error.
+    ///
+    /// It used to be `is_err()`. Nothing in production depended on that:
+    /// `doctor` is the only caller and it handles `GraphHealth::Missing`
+    /// explicitly before it ever reaches here, so the lenient path only runs on
+    /// an Unhealthy file, which exists by definition. Meanwhile the error made
+    /// `rule add` refuse to write the first rule into a fresh tier, and
+    /// `rule list -g` die on a home with no global graph. Absent is not empty
+    /// is not zero -- and a tier nobody has written to holds no records, which
+    /// is an answer.
     #[test]
-    fn load_graph_lenient_missing_file_is_err() {
+    fn load_graph_lenient_missing_file_is_an_empty_tier() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("does-not-exist.nq");
-        assert!(load_graph_lenient(&p).is_err());
+        let (store, bad) = load_graph_lenient(&p).expect("a missing tier reads as empty");
+        assert_eq!(store.len().unwrap(), 0);
+        assert!(bad.is_empty(), "a file that is not there has no bad lines");
     }
 
     #[test]

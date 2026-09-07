@@ -1410,7 +1410,7 @@ Options:
 ```text
 Manage domain matching rules
 
-Usage: base domain <COMMAND>
+Usage: base domain [OPTIONS] <COMMAND>
 
 Commands:
   add-trigger     Add a keyword or path trigger to a domain
@@ -1423,8 +1423,13 @@ Commands:
   help            Print this message or the help of the given subcommand(s)
 
 Options:
+      --global
+          Act on the global tier (~/.base-gbl) instead of the workspace you are in.
+          
+          Without it the write commands resolve the workspace, as `add-trigger` alone always did. Before #18 the other three ignored where you stood.
+
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base domain add-trigger
@@ -1438,6 +1443,11 @@ Options:
       --domain <DOMAIN>
           
 
+      --global
+          Act on the global tier (~/.base-gbl) instead of the workspace you are in.
+          
+          Without it the write commands resolve the workspace, as `add-trigger` alone always did. Before #18 the other three ignored where you stood.
+
       --keyword <KEYWORD>
           
 
@@ -1445,7 +1455,7 @@ Options:
           
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base domain list
@@ -1453,11 +1463,16 @@ Options:
 ```text
 List all configured domains
 
-Usage: base domain list
+Usage: base domain list [OPTIONS]
 
 Options:
+      --global
+          Act on the global tier (~/.base-gbl) instead of the workspace you are in.
+          
+          Without it the write commands resolve the workspace, as `add-trigger` alone always did. Before #18 the other three ignored where you stood.
+
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base domain get
@@ -1465,15 +1480,20 @@ Options:
 ```text
 Show a specific domain's full configuration
 
-Usage: base domain get <NAME>
+Usage: base domain get [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
           
 
 Options:
+      --global
+          Act on the global tier (~/.base-gbl) instead of the workspace you are in.
+          
+          Without it the write commands resolve the workspace, as `add-trigger` alone always did. Before #18 the other three ignored where you stood.
+
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base domain sync
@@ -1487,8 +1507,13 @@ Options:
       --carl <CARL>
           Path to carl.json for one-time decision migration
 
+      --global
+          Act on the global tier (~/.base-gbl) instead of the workspace you are in.
+          
+          Without it the write commands resolve the workspace, as `add-trigger` alone always did. Before #18 the other three ignored where you stood.
+
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base domain create
@@ -1499,6 +1524,11 @@ Create a new domain in domains.toml
 Usage: base domain create [OPTIONS] --name <NAME>
 
 Options:
+      --global
+          Act on the global tier (~/.base-gbl) instead of the workspace you are in.
+          
+          Without it the write commands resolve the workspace, as `add-trigger` alone always did. Before #18 the other three ignored where you stood.
+
       --name <NAME>
           
 
@@ -1509,7 +1539,7 @@ Options:
           
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base domain remove
@@ -1517,15 +1547,20 @@ Options:
 ```text
 Remove a domain from domains.toml
 
-Usage: base domain remove <NAME>
+Usage: base domain remove [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
           Domain name (case-insensitive)
 
 Options:
+      --global
+          Act on the global tier (~/.base-gbl) instead of the workspace you are in.
+          
+          Without it the write commands resolve the workspace, as `add-trigger` alone always did. Before #18 the other three ignored where you stood.
+
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base domain remove-trigger
@@ -1539,6 +1574,11 @@ Options:
       --domain <DOMAIN>
           
 
+      --global
+          Act on the global tier (~/.base-gbl) instead of the workspace you are in.
+          
+          Without it the write commands resolve the workspace, as `add-trigger` alone always did. Before #18 the other three ignored where you stood.
+
       --keyword <KEYWORD>
           
 
@@ -1546,7 +1586,7 @@ Options:
           
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base standards
@@ -2082,10 +2122,12 @@ Commands:
 
 Options:
   -g, --global
-          Target the global tier (~/.base-gbl/) instead of workspace
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base rule add
@@ -2099,6 +2141,11 @@ Options:
       --domain <DOMAIN>
           
 
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
       --text <TEXT>
           
 
@@ -2109,7 +2156,7 @@ Options:
           Slug of the record this one replaces: writes the supersession edge pair in the same write, so serving surfaces stop returning the old one
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base rule list
@@ -2123,11 +2170,16 @@ Options:
       --domain <DOMAIN>
           
 
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
       --include-superseded
           Show rules that have been superseded, each marked `[superseded]`. Off by default: this listing is what the agent receives, so it serves the rule that stands. Indices are ids and never renumber
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base rule remove
@@ -2135,17 +2187,22 @@ Options:
 ```text
 Remove a rule by index from a domain
 
-Usage: base rule remove --domain <DOMAIN> --index <INDEX>
+Usage: base rule remove [OPTIONS] --domain <DOMAIN> --index <INDEX>
 
 Options:
       --domain <DOMAIN>
           
 
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
       --index <INDEX>
           
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base install
