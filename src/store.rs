@@ -867,8 +867,9 @@ thread_local! {
     /// timeout on a file it is itself holding — which is a worse failure than
     /// the lost update it was added to prevent.
     ///
-    /// Also read by [`holds_graph_lock`], which the tripwire test uses so a
-    /// writer that forgets the lock fails the suite instead of silently racing.
+    /// Also read by [`holds_graph_lock`], which `tests/lock_tripwire_test.rs`
+    /// uses to assert that every graph writer outside the printed allow-list
+    /// takes the lock.
     static HELD_LOCKS: std::cell::RefCell<Vec<PathBuf>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -896,8 +897,60 @@ impl Drop for GraphLockGuard {
                 h.remove(i);
             }
         });
-        let _ = fs::remove_file(&self.path);
+        // Remove it only while it is still OURS. Deleting by path alone is an
+        // ABA bug: if this lock was reaped as stale and another process took a
+        // fresh one at the same path, an unconditional remove here deletes THAT
+        // holder's lock and puts two writers on one graph — the exact failure
+        // the lock exists to prevent (plover, PR 88 review).
+        if lock_pid(&self.path) == Some(std::process::id()) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
+}
+
+/// The pid recorded in a lock file, when it holds a readable one.
+fn lock_pid(lock: &Path) -> Option<u32> {
+    fs::read_to_string(lock).ok()?.trim().parse().ok()
+}
+
+// Is the process that wrote a lock still running?
+//
+// Answered CONSERVATIVELY: anything that cannot be determined counts as alive. A
+// refusal to reap costs a bounded timeout and a clear error; reaping a live holder
+// puts two writers on one graph silently. Those are not comparable failures, so
+// every unknown resolves the safe way. Reached only when a lock file older than
+// LOCK_STALE was found, never on an ordinary write.
+
+/// Linux (and WSL): the process table is a directory.
+#[cfg(target_os = "linux")]
+fn holder_is_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Other unix: no `/proc`, so use the shell's own liveness probe.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn holder_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(true)
+}
+
+/// Windows: `tasklist` ships with every install.
+#[cfg(windows)]
+fn holder_is_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/NH", "/FI", &format!("PID eq {pid}")])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+        .unwrap_or(true)
+}
+
+/// Anywhere else: never reap.
+#[cfg(not(any(unix, windows)))]
+fn holder_is_alive(_pid: u32) -> bool {
+    true
 }
 
 /// The lock file guarding `graph`: a sibling of it, so the two tiers lock
@@ -994,21 +1047,30 @@ pub fn lock_graph(graph: &Path) -> Result<GraphLockGuard> {
 /// one was reaped, so the caller retries at once instead of sleeping out its
 /// backoff behind a lock nobody holds.
 fn reap_stale_lock(lock: &Path) -> bool {
-    let stale = fs::metadata(lock)
+    let old_enough = fs::metadata(lock)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
         .map(|age| age > LOCK_STALE)
         .unwrap_or(false);
-    if !stale {
+    if !old_enough {
         return false;
     }
-    eprintln!(
-        "base: reaping stale graph lock {} (mtime older than {}s)",
-        lock.display(),
-        LOCK_STALE.as_secs()
-    );
-    fs::remove_file(lock).is_ok()
+    // Age alone is NOT staleness. `graph compact` and `doctor --repair` rewrite a
+    // whole graph and can legitimately hold this lock past LOCK_STALE; reaping
+    // one of those mid-write is how a lock turns into the bug it was preventing.
+    // The pid decides, and an unreadable pid counts as alive.
+    match lock_pid(lock) {
+        Some(pid) if !holder_is_alive(pid) => {
+            eprintln!(
+                "base: reaping stale graph lock {} (pid {pid} is gone, mtime older than {}s)",
+                lock.display(),
+                LOCK_STALE.as_secs()
+            );
+            fs::remove_file(lock).is_ok()
+        }
+        _ => false,
+    }
 }
 
 /// Whether this thread currently holds a graph lock. The tripwire reads it.

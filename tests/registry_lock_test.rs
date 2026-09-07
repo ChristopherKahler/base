@@ -260,3 +260,104 @@ fn a_held_lock_blocks_and_a_stale_one_is_reaped() {
     #[cfg(not(unix))]
     let _ = lock;
 }
+
+// ── Lock 4, the reap's own semantics (PR 88 review, plover) ──
+//
+// Age is not staleness. Reaping by mtime alone kills a LIVE holder — `graph
+// compact` and `doctor --repair` rewrite a whole graph and legitimately hold the
+// lock past the window — and an unconditional remove on drop then lets the
+// reaped holder delete the NEW holder's lock. Both put two writers on one graph,
+// which is the defect the lock exists to prevent.
+
+/// Backdate a file's mtime. Unix only; the shell harness (R15) covers the same
+/// path on Windows, and a test that cannot set the clock reports SKIP by
+/// returning false rather than passing vacuously.
+#[cfg(unix)]
+fn backdate(path: &std::path::Path) -> bool {
+    std::process::Command::new("touch")
+        .args(["-d", "2 hours ago"])
+        .arg(path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn backdate(_path: &std::path::Path) -> bool {
+    false
+}
+
+#[test]
+fn an_old_lock_held_by_a_live_process_is_not_reaped() {
+    let tmp = workspace();
+    let g = graph_of(tmp.path());
+    std::fs::write(&g, "").unwrap();
+    let lock = base::store::lock_path(&g);
+
+    // Our own pid is unimpeachably alive. Old mtime, live holder: keep it.
+    std::fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
+    if !backdate(&lock) {
+        return; // covered by the shell harness on this platform
+    }
+    let err = std::thread::spawn({
+        let g = g.clone();
+        move || base::store::with_graph_lock(&g, || Ok(()))
+    })
+    .join()
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("graph lock"),
+        "an old lock held by a LIVE process was reaped: {err}"
+    );
+    assert!(lock.exists(), "the live holder's lock file was removed");
+}
+
+#[test]
+fn an_old_lock_whose_pid_is_gone_is_reaped() {
+    let tmp = workspace();
+    let g = graph_of(tmp.path());
+    std::fs::write(&g, "").unwrap();
+    let lock = base::store::lock_path(&g);
+
+    // A pid that cannot be running. Old mtime, dead holder: reap and proceed.
+    std::fs::write(&lock, "4294967294\n").unwrap();
+    if !backdate(&lock) {
+        return;
+    }
+    let got = base::store::with_graph_lock(&g, || Ok(9)).unwrap();
+    assert_eq!(got, 9, "a lock whose pid is gone was not reaped");
+}
+
+#[test]
+fn drop_never_removes_another_holders_lock() {
+    // The ABA leg. A guard is taken, its lock is reaped out from under it and
+    // replaced by another holder's file; the first guard's drop must leave that
+    // file alone, because the pid in it is no longer ours.
+    let tmp = workspace();
+    let g = graph_of(tmp.path());
+    std::fs::write(&g, "").unwrap();
+    let lock = base::store::lock_path(&g);
+
+    {
+        let _guard = base::store::lock_graph(&g).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap().trim(),
+            std::process::id().to_string(),
+            "the lock does not record our pid"
+        );
+        // Someone reaped us and took the lock; their pid is in the file now.
+        std::fs::write(&lock, "4294967293\n").unwrap();
+    } // our guard drops here
+
+    assert!(
+        lock.exists(),
+        "drop deleted a lock file this process no longer held"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock).unwrap().trim(),
+        "4294967293",
+        "drop replaced the other holder's lock"
+    );
+    std::fs::remove_file(&lock).unwrap();
+}

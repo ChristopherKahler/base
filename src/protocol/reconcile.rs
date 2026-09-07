@@ -254,19 +254,25 @@ pub fn apply(store: &Store, ns: &NamespaceConfig, trig_path: &Path, decisions: &
         // The closure form exists for exactly this shape: the ops are applied
         // best-effort one at a time, so the snapshot has to be taken before the
         // first one rather than handed over afterwards.
-        store::mutate_and_write(
-            store,
-            trig_path,
-            "",
-            store::Scope::Wide,
-            store::Intent::Knowledge,
-            |s| {
-                for op in &ops {
-                    let _ = s.update(&format!("{pfx}\n{op}"));
-                }
-                Ok(Some(ops.join(";\n")))
-            },
-        )?;
+        // The lock lives with the WRITE, not only with the caller that happens to
+        // load first: `base reconcile` calls this with its own store, so a lock
+        // in `reconcile()` alone left that path unprotected. Re-entrant, so the
+        // nested case costs nothing.
+        store::with_graph_lock(trig_path, || {
+            store::mutate_and_write(
+                store,
+                trig_path,
+                "",
+                store::Scope::Wide,
+                store::Intent::Knowledge,
+                |s| {
+                    for op in &ops {
+                        let _ = s.update(&format!("{pfx}\n{op}"));
+                    }
+                    Ok(Some(ops.join(";\n")))
+                },
+            )
+        })?;
     }
     Ok(stats)
 }

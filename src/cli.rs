@@ -3062,6 +3062,15 @@ pub fn run() {
         // ─── Reconcile ────────────────────────────────────────
         Some(Commands::Reconcile { dry_run }) => {
             let config = base::config::BaseConfig::load(&cwd);
+            // Lock before the load when this may apply: a store read before the
+            // lock is the stale snapshot that loses the other writer's change.
+            // `--dry-run` reads only, and readers never take this lock.
+            let _reconcile_lock = if dry_run {
+                None
+            } else {
+                base::config::find_workspace_base(&cwd)
+                    .and_then(|b| base::store::lock_graph(&b.join("graph.nq")).ok())
+            };
             match base::protocol::reconcile::open_workspace(&cwd) {
                 None => eprintln!("base: no workspace graph found (run from inside a base workspace)"),
                 Some((store, trig_path, ws_root)) => {
