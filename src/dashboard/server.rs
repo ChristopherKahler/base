@@ -17,6 +17,18 @@ pub struct AppState {
     pub config: BaseConfig,
     pub cwd: PathBuf,
     pub trig_path: PathBuf,
+    /// Every graph file the store was loaded from, in load order (#41).
+    pub sources: Vec<PathBuf>,
+    /// `(len, mtime nanos)` of each source at the last load; `None` for a file that was absent.
+    pub loaded: Mutex<Vec<Option<(u64, u128)>>>,
+}
+
+/// The on-disk identity a reload decision is made on: length and mtime in nanoseconds, the
+/// same pair the session-start delta marker uses. One `stat` per file per request.
+pub fn file_identity(path: &std::path::Path) -> Option<(u64, u128)> {
+    let m = std::fs::metadata(path).ok()?;
+    let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
+    Some((m.len(), mtime))
 }
 
 impl AppState {
@@ -27,7 +39,54 @@ impl AppState {
     /// serialized output before the atomic rename), so serving from a recovered guard
     /// is safe.
     pub fn store_guard(&self) -> std::sync::MutexGuard<'_, oxigraph::store::Store> {
-        self.store.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        let mut guard = self.store.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // #41: the snapshot was loaded once at start and every write serialised it back over
+        // `graph.nq`, erasing whatever the CLI had written since. Before any handler touches the
+        // store, compare each source's identity with the one it was loaded at; on a mismatch,
+        // reload from disk first. The dashboard's own write moves the identity too, so the
+        // request after a dashboard write pays one reload; that is the price of never losing a
+        // CLI write, and `write_back` already made a write cost a full serialisation.
+        let now: Vec<Option<(u64, u128)>> = self.sources.iter().map(|p| file_identity(p)).collect();
+        let mut loaded = self.loaded.lock().unwrap_or_else(|p| p.into_inner());
+        if *loaded != now {
+            *guard = Self::load_sources(&self.sources);
+            *loaded = now;
+        }
+        guard
+    }
+
+    /// Load every source that exists into one store, plus each source's sibling `ast.ttl`.
+    pub fn load_sources(sources: &[PathBuf]) -> oxigraph::store::Store {
+        let existing: Vec<&std::path::Path> = sources.iter().filter(|p| p.exists()).map(|p| p.as_path()).collect();
+        let store = if existing.is_empty() {
+            oxigraph::store::Store::new().expect("in-memory store")
+        } else {
+            match crate::store::load_graphs(&existing) {
+                Ok(store) => store,
+                Err(e) => {
+                    eprintln!("Failed to load graphs: {e}");
+                    oxigraph::store::Store::new().expect("in-memory store")
+                }
+            }
+        };
+        for p in sources {
+            if let Some(base_dir) = p.parent() {
+                let ast_path = base_dir.join("ast.ttl");
+                if ast_path.exists()
+                    && let Err(e) = crate::store::load_turtle_into(&store, &ast_path)
+                {
+                    eprintln!("Failed to load {}: {e}", ast_path.display());
+                }
+            }
+        }
+        store
+    }
+
+    /// The state the server runs with: the store loaded from `sources`, identities recorded.
+    pub fn new(config: BaseConfig, cwd: PathBuf, trig_path: PathBuf, sources: Vec<PathBuf>) -> Self {
+        let store = Self::load_sources(&sources);
+        let loaded = sources.iter().map(|p| file_identity(p)).collect();
+        AppState { store: Mutex::new(store), config, cwd, trig_path, sources, loaded: Mutex::new(loaded) }
     }
 }
 
@@ -65,52 +124,15 @@ pub async fn start(port: u16, cwd: PathBuf) {
         }
     }
 
-    let existing_paths: Vec<&std::path::Path> = trig_paths.iter()
-        .filter(|p| p.exists())
-        .map(|p| p.as_path())
-        .collect();
-
-    let store = if existing_paths.is_empty() {
-        eprintln!("No graph.nq files found. Run `base scaffold` then `base sync`.");
-        oxigraph::store::Store::new().expect("in-memory store")
-    } else {
-        println!("Loading {} graph(s):", existing_paths.len());
-        for p in &existing_paths {
-            println!("  • {}", p.display());
-        }
-        match crate::store::load_graphs(&existing_paths) {
-            Ok(store) => store,
-            Err(e) => {
-                eprintln!("Failed to load graphs: {e}");
-                oxigraph::store::Store::new().expect("in-memory store")
-            }
-        }
-    };
-
-    // AST entities live in ast.ttl (never merged into graph.nq — AUDIT C10).
-    // Load each workspace's ast.ttl alongside so the graph explorer sees code entities.
-    for p in &trig_paths {
-        if let Some(base_dir) = p.parent() {
-            let ast_path = base_dir.join("ast.ttl");
-            if ast_path.exists() {
-                if let Err(e) = crate::store::load_turtle_into(&store, &ast_path) {
-                    eprintln!("Failed to load {}: {e}", ast_path.display());
-                } else {
-                    println!("  • {} (AST)", ast_path.display());
-                }
-            }
-        }
+    println!("Loading {} graph(s):", trig_paths.iter().filter(|p| p.exists()).count());
+    for p in trig_paths.iter().filter(|p| p.exists()) {
+        println!("  • {}", p.display());
     }
 
     // Rotate hook event log if oversized
     super::api::rotate_hook_log(&trig_path);
 
-    let state = Arc::new(AppState {
-        store: Mutex::new(store),
-        config,
-        cwd,
-        trig_path,
-    });
+    let state = Arc::new(AppState::new(config, cwd, trig_path, trig_paths));
 
     let app = Router::new()
         .route("/", get(serve_index))
