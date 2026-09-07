@@ -65,7 +65,9 @@ pub const STATUS_SUPERSEDED: &str = "superseded";
 /// already binds `?x` cannot capture it.
 pub fn sparql_exclude_superseded(ns: &NamespaceConfig, var: &str) -> String {
     let p = &ns.prefix;
-    format!("FILTER NOT EXISTS {{ ?{var} {p}:{PRED_SUPERSEDED_BY} ?{var}_supersededBy }}")
+    // Trailing newline, matching `ontology::transient::sparql_exclude`, so the two
+    // interpolate identically inside an arm: `{no_transient}{no_superseded}`.
+    format!("FILTER NOT EXISTS {{ ?{var} {p}:{PRED_SUPERSEDED_BY} ?{var}_supersededBy }}\n")
 }
 
 /// The live end of `iri`'s supersession chain, or `iri` itself when nothing
@@ -187,7 +189,7 @@ mod tests {
     #[test]
     fn the_exclusion_filter_binds_a_variable_derived_from_its_subject() {
         let f = sparql_exclude_superseded(&ns(), "n");
-        assert_eq!(f, "FILTER NOT EXISTS { ?n ops:supersededBy ?n_supersededBy }");
+        assert_eq!(f, "FILTER NOT EXISTS { ?n ops:supersededBy ?n_supersededBy }\n");
         assert!(
             !f.contains("GRAPH"),
             "the filter carries no GRAPH group of its own — the caller must place it \

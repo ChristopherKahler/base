@@ -190,6 +190,9 @@ pub enum Commands {
         /// Filter by linked domain
         #[arg(long)]
         domain: Option<String>,
+        /// Show superseded records too, with the chain, instead of only the live version
+        #[arg(long)]
+        include_superseded: bool,
         /// Look up a specific note by slug
         #[arg(long)]
         slug: Option<String>,
@@ -2721,7 +2724,7 @@ pub fn run() {
         }
 
         // ─── Recall ─────────────────────────────────────────
-        Some(Commands::Recall { keyword, domain, slug }) => {
+        Some(Commands::Recall { keyword, domain, include_superseded, slug }) => {
             // Note IRIs to stamp lastRead on (usage signal for `base graph purge --stale`).
             // Resolved BEFORE printing so an explicit recall marks what it surfaced.
             let mut surfaced: Vec<String> = Vec::new();
@@ -2741,7 +2744,7 @@ pub fn run() {
                     keyword.as_deref(),
                     domain.as_deref(),
                 );
-                if let Err(e) = crud::note::recall(&cwd, &config.namespace, keyword.as_deref(), domain.as_deref()) { die("Error", e); }
+                if let Err(e) = crud::note::recall_with(&cwd, &config.namespace, keyword.as_deref(), domain.as_deref(), include_superseded) { die("Error", e); }
             }
             // Best-effort lastRead stamping (strict write). On a corrupt graph this
             // errs — warn and skip rather than silently lenient-writing (Phase 35).

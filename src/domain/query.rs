@@ -104,6 +104,12 @@ pub fn query_domain_from_graph(
     // (`ontology::transient`), so widening this union can never leak pings into
     // the prompt.
     let no_transient = crate::ontology::transient::sparql_exclude(ns, "related");
+    // Superseded records are dropped here for the same reason transients are: this is
+    // the block injected into the prompt, and injecting a fact a later record corrected
+    // is the drift this fork exists to end. Placed INSIDE the GRAPH group beside the
+    // other filter — outside it the pattern matches the default graph, where base keeps
+    // nothing, so it excludes nothing while reading as a working filter (F16).
+    let no_superseded = crate::supersede::sparql_exclude_superseded(ns, "related");
     let neighborhood_sparql = format!(
         "{pfx}\n\
          SELECT ?name ?type WHERE {{\n\
@@ -118,7 +124,7 @@ pub fn query_domain_from_graph(
                  {p}:name ?name .\n\
                BIND({p}:Project AS ?type)\n\
              }}\n\
-             {no_transient}\
+             {no_transient}{no_superseded}\
            }}\n\
          }}\n\
          ORDER BY ?type ?name"
