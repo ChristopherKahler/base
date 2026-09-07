@@ -146,5 +146,11 @@
         Write-Host ''
         Write-Host "base install failed: $($_.Exception.Message)"
         Write-Host 'Nothing was changed on your PATH. Report at https://github.com/ChristopherKahler/base/issues'
+        # Re-raise. Printing and returning would make a failed install
+        # indistinguishable from a successful one to anything that checks a
+        # status: CI, a wrapper script, or a user chaining `&&`. `throw` is the
+        # right primitive rather than `exit 1` — under `irm | iex` the body runs
+        # in the caller's own session, where `exit` closes their shell.
+        throw
     }
 }

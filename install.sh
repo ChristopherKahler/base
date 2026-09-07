@@ -88,7 +88,11 @@ say "base: installing"
 (cd "$tmp" && ./base install $INSTALL_ARGS)
 
 # ── after the fact, so neither check can block the install ───────────────────
-bindir="$HOME/.local/bin"
+# Follow BASE_HOME when it is set, the way install.ps1 does: base writes to the
+# root it resolves, and these checks have to look where the binary actually
+# landed or they report on the wrong home.
+root="${BASE_HOME:-$HOME}"
+bindir="$root/.local/bin"
 case ":${PATH}:" in
   *":$bindir:"*) ;;
   *)
@@ -107,7 +111,7 @@ esac
 # never wired. Test settings.json rather than the directory: `base install`
 # creates ~/.claude itself to hold the bundled skill, so the directory always
 # exists afterwards and cannot tell us anything.
-if [ ! -f "$HOME/.claude/settings.json" ]; then
+if [ ! -f "$root/.claude/settings.json" ]; then
   say ""
   say "base: no ~/.claude directory, so the hooks were not wired and base will"
   say "  not do anything yet. Install Claude Code, then run:"
