@@ -353,7 +353,7 @@ pub fn session_start_notice(cwd: &Path) -> Option<String> {
             base_ast.join(".last-error").display()
         ));
     }
-    match (outcome, adopted) {
+    let map_line = match (outcome, adopted) {
         (MapPlan::Build, true) => Some(format!(
             "[AST] {} has no .git yet — mapping it anyway: its code map is building in the \
              background under {}/ (git init any time; the map follows).",
@@ -373,7 +373,16 @@ pub fn session_start_notice(cwd: &Path) -> Option<String> {
             root.display()
         )),
         _ => None,
+    };
+    if map_line.is_some() {
+        return map_line;
     }
+
+    // #89: what the LAST build could not do, foreground or background. Last,
+    // because a first build or a failing one outranks "11 files were skipped",
+    // and one line per session start is the whole budget.
+    pending_notices(&base_ast).map(|n| format!("[AST] {} — {n}. `base sync --ast --target {}` rebuilds it.",
+        root.display(), root.display()))
 }
 
 /// A `.base`-only workspace whose direct children are apps: a hub, not an app.
@@ -1118,18 +1127,84 @@ pub fn stderr_tail(bytes: &[u8]) -> String {
 /// until 0.14.2 a SUCCESSFUL build's notices were captured and dropped on the
 /// floor.
 ///
-/// This reaches a person only on a FOREGROUND `--yes` sync. The background
-/// refresh cannot use it: [`spawn_sync`] gives its child `Stdio::null()` for
-/// stdout and stderr, and the git hook written by `ast_repo` redirects to
-/// `/dev/null`, both deliberately, so nothing a hook-driven refresh prints is
-/// visible anywhere. Making these notices survive that path means persisting
-/// them for session start to read, which is a separate change.
+/// This reaches a person only on a FOREGROUND `--yes` sync, and that is still
+/// true: every background path gives its child `Stdio::null()` or redirects to
+/// `/dev/null`, deliberately — [`spawn_sync`], [`first_contact_wait`],
+/// [`delegate_wsl_contact`], and the git hook written by `ast_repo`. What
+/// changed in 0.14.2 (#89) is that the notices no longer depend on being
+/// printed: [`record_notices`] writes them next to the map and
+/// [`pending_notices`] reads them back at session start. All four background
+/// paths spawn the same `base sync --ast --yes`, so the child writes the file
+/// whoever started it, and none of the four had to learn about it.
 pub fn echo_extractor_notices(stderr: &[u8]) {
     for line in String::from_utf8_lossy(stderr).lines() {
         if line.starts_with("# ") {
             eprintln!("{line}");
         }
     }
+}
+
+/// The notices worth keeping: what could not be placed, and what could not be
+/// parsed. `# Extracting N files from ...` is deliberately not one of them — it
+/// is written by every successful run, and keeping it would turn a session-start
+/// line into a permanent banner, which is the outcome #20 and the 0.14.1 work
+/// went out of their way to avoid.
+fn notable_notices(stderr: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|l| {
+            l.starts_with("# ")
+                && (l.contains("attributed to the app root") || l.starts_with("# Skipped "))
+        })
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Write the notices a SUCCESSFUL extraction produced to `.base-ast/.last-notices`.
+///
+/// The mirror of `.last-error`, for the other outcome. A background refresh
+/// prints to nobody by design, so a tree could accumulate skipped files and
+/// unplaceable entities for weeks and say nothing; this is what
+/// [`pending_notices`] reads at the next session start.
+///
+/// A run with nothing to report REMOVES the file rather than writing an empty
+/// one: silence has to stay reachable, or the notice becomes a banner and stops
+/// being read.
+pub fn record_notices(base_ast: &Path, stderr: &[u8]) {
+    let path = base_ast.join(".last-notices");
+    let notices = notable_notices(stderr);
+    if notices.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let _ = std::fs::write(&path, notices.join("\n") + "\n");
+}
+
+/// The notices this session has not been shown yet, if any.
+///
+/// Shown once per distinct set, not once per session: a tree that keeps
+/// reporting the same eleven skipped files should say so when that becomes true
+/// and then be quiet, so `.last-notices-shown` holds what was last surfaced and
+/// an identical set is not repeated. A CHANGED set is new information and is
+/// shown again.
+pub fn pending_notices(base_ast: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(base_ast.join(".last-notices")).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let shown = base_ast.join(".last-notices-shown");
+    if std::fs::read_to_string(&shown).is_ok_and(|s| s == text) {
+        return None;
+    }
+    let _ = std::fs::write(&shown, &text);
+
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let head = lines.first()?.trim_start_matches("# ");
+    Some(if lines.len() == 1 {
+        head.to_string()
+    } else {
+        format!("{head} (+{} more)", lines.len() - 1)
+    })
 }
 
 /// True if a refresh ran within the debounce window — skip this one.

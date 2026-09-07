@@ -2194,8 +2194,12 @@ pub fn run() {
                 }
                 // A failed build explains itself at the next session start
                 // (`.base-ast/.last-error`) instead of vanishing with a detached
-                // process; a successful one clears the record.
+                // process; a successful one clears the record. #89: a SUCCESSFUL
+                // build that could not place or parse everything now leaves
+                // `.last-notices` the same way, because the paths that run most
+                // often print to nobody.
                 let last_error = ast_ttl.with_file_name(".last-error");
+                let base_ast_dir = ast_ttl.parent().map(|p| p.to_path_buf());
                 let status = if yes {
                     extractor
                         .stdin(std::process::Stdio::null())
@@ -2207,6 +2211,15 @@ pub fn run() {
                             // skipped file, the app-root attribution count —
                             // used to be captured and dropped. Echo them.
                             base::hook::automap::echo_extractor_notices(&o.stderr);
+                            // #89: and write them down. Every background refresh
+                            // — the Stop hook's `spawn_sync`, a first contact,
+                            // the WSL delegate, the git hook — runs THIS command
+                            // with `--yes` and discards its output, so the child
+                            // recording its own notices is what reaches all four
+                            // without any of them changing.
+                            if let Some(dir) = base_ast_dir.as_deref() {
+                                base::hook::automap::record_notices(dir, &o.stderr);
+                            }
                         } else {
                             let _ = std::fs::write(&last_error, base::hook::automap::stderr_tail(&o.stderr));
                         }
