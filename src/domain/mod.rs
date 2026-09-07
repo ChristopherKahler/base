@@ -526,15 +526,33 @@ pub fn get_domain(cwd: &Path, ns: &crate::config::NamespaceConfig, name: &str) {
             if let Some(fmt) = &d.format {
                 println!("Format: {fmt}");
             }
-            let (declared, added) = rules_of(cwd, ns, d);
-            println!("Rules ({}):", declared.len() + added.len());
+            // Both tiers, for the same reason `domain list` counts both: the
+            // hook injects both, so a detail view built from one tier described
+            // a different domain than the one the agent actually receives.
+            // `declared` comes off the DomainDef, which load_domains has ALREADY
+            // merged across tiers, so it is counted once; only the graph-backed
+            // rules are per tier.
+            let (declared, added_ws) = rules_of(cwd, ns, d);
+            let gbl = crate::home::home_root().map(|h| h.join(".base-gbl"));
+            let added_gbl = match &gbl {
+                Some(g) if g.as_path() != cwd => rules_of(g, ns, d).1,
+                _ => Vec::new(),
+            };
+            println!(
+                "Rules ({}):",
+                declared.len() + added_ws.len() + added_gbl.len()
+            );
             for (i, rule) in declared.iter().enumerate() {
                 println!("  {i}. {rule}");
             }
             // Numbered by their own index, which is what `base rule remove
-            // --index` takes; the two stores number independently.
-            for (n, text) in &added {
-                println!("  [cli-{n}] {text}");
+            // --index` takes; the two stores number independently, and so do the
+            // two tiers -- which is why every cli row names the tier it is in.
+            for (n, text) in &added_ws {
+                println!("  [workspace cli-{n}] {text}");
+            }
+            for (n, text) in &added_gbl {
+                println!("  [global cli-{n}] {text}");
             }
         }
         None => eprintln!("Domain '{name}' not found."),

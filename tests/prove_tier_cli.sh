@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The tier cluster as commands: #52, #18, #55, #53, and the two unfiled ones.
+# The tier cluster as commands: #52, #18, #55, #53, and the three unfiled ones.
 #
 # Every leg drives the BINARY, so it runs against 0.14.0 and goes red, then
 # against the fix and goes green. Unit tests of the new seam cannot do that --
@@ -111,6 +111,16 @@ grep -qE '\| *2\+3 *\|' <<<"$dl" \
   && ok "domain list counts both tiers (2+3)" \
   || { bad "domain list did not show both tiers"; grep -i myapp <<<"$dl" | sed 's/^/        /'; }
 
+# ── seventh: `domain get` is the third command that counted one tier ──────
+dg=$(run domain get myapp)
+n_get=$(grep -cE 'ws one|ws two|gbl one|gbl two|gbl three' <<<"$dg")
+if grep -qE 'Rules \(5\)' <<<"$dg" && [ "$n_get" = "5" ]; then
+  ok "domain get counts and lists all 5 across both tiers"
+else
+  bad "domain get reported $(grep -oE 'Rules \([0-9]+\)' <<<"$dg" | head -1), listed $n_get of 5"
+  grep -E 'Rules \(|cli-' <<<"$dg" | sed 's/^/        /'
+fi
+
 echo
-[ "$fail" -eq 0 ] && { echo "PASS — all six."; exit 0; }
+[ "$fail" -eq 0 ] && { echo "PASS — all seven."; exit 0; }
 echo "FAIL — $fail leg(s)."; exit 1
