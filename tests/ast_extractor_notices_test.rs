@@ -46,12 +46,8 @@ fn echo_extractor_notices_forwards_hash_lines_only() {
     // notices; anything else is a traceback fragment or a grammar warning and
     // belongs in `.last-error` on failure, not on a successful run's stderr.
     let input = b"# one\nnot a notice\n# two\n  # indented, not a notice\n# three\n";
-    let mut echoed = Vec::new();
-    for line in String::from_utf8_lossy(input).lines() {
-        if line.starts_with("# ") {
-            echoed.push(line);
-        }
-    }
+    let text = String::from_utf8_lossy(input);
+    let echoed: Vec<&str> = text.lines().filter(|l| l.starts_with("# ")).collect();
     assert_eq!(echoed, vec!["# one", "# two", "# three"]);
     // The function under test must agree with that filter; it prints, so this
     // asserts it runs clean over the same bytes rather than re-deriving them.
