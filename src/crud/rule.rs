@@ -199,7 +199,7 @@ pub fn list_all_tiers(
         .unwrap_or_else(|| cwd.to_path_buf());
 
     let mut total = 0usize;
-    let mut shown: Vec<(&str, Vec<(u32, String)>)> = Vec::new();
+    let mut shown: Vec<(&str, Vec<(u32, String, bool)>)> = Vec::new();
     for (label, c) in [("workspace", &ws_cwd), ("global", &gbl_cwd)] {
         let rules = fetch(c, ns, domain_name, include_superseded).unwrap_or_default();
         total += rules.len();
@@ -217,8 +217,9 @@ pub fn list_all_tiers(
             println!("  ({label}: none)");
             continue;
         }
-        for (pri, text) in rules {
-            println!("  {label:<9} {pri}. {text}");
+        for (pri, text, superseded) in rules {
+            let mark = if *superseded { "  [superseded]" } else { "" };
+            println!("  {label:<9} {pri}. {text}{mark}");
         }
     }
     println!("\nIndices are per tier; `rule remove` takes the index shown beside its own tier.");
@@ -235,8 +236,14 @@ pub fn list_all_tiers(
 /// tier-local and both tiers start at 0, so the number a user reads in their
 /// injected context routinely names a different rule here.
 pub fn remove(cwd: &Path, ns: &NamespaceConfig, domain_name: &str, index: u32) -> Result<usize> {
-    // Check before deleting, against the same view `list` prints.
-    if !fetch(cwd, ns, domain_name)?.iter().any(|(pri, _)| *pri == index) {
+    // Check before deleting. `true` deliberately: a superseded rule still
+    // occupies its index in this tier, and refusing to remove one because the
+    // default view hides it would be a fresh false "no rule N" of exactly the
+    // kind #55 is about.
+    if !fetch(cwd, ns, domain_name, true)?
+        .iter()
+        .any(|(pri, _, _)| *pri == index)
+    {
         return Ok(0);
     }
     let p = &ns.prefix;
