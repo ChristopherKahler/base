@@ -140,6 +140,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base doctor`
 - `base graph`
 - `base graph compact`
+- `base graph supersede`
 - `base graph migrate`
 - `base graph apply-ops`
 - `base graph purge`
@@ -893,6 +894,9 @@ Options:
 
       --recall <RECALL>
           
+
+      --supersedes <SUPERSEDES>
+          Slug of the record this one replaces: writes the supersession edge pair in the same write, so serving surfaces stop returning the old one
 
   -h, --help
           Print help
@@ -1994,6 +1998,9 @@ Options:
       --entity <ENTITY>
           Link to an entity (optional additional edge)
 
+      --supersedes <SUPERSEDES>
+          Slug of the record this one replaces: writes the supersession edge pair in the same write, so serving surfaces stop returning the old one
+
       --mention <MENTION>
           Record a mention of an existing note (pass the slug)
 
@@ -2026,6 +2033,9 @@ Options:
 
       --domain <DOMAIN>
           Filter by linked domain
+
+      --include-superseded
+          Show superseded records too, with the chain, instead of only the live version
 
       --slug <SLUG>
           Look up a specific note by slug
@@ -2094,6 +2104,9 @@ Options:
 
       --rationale <RATIONALE>
           Optional rationale — injected as "rule — because rationale" (Phase 26)
+
+      --supersedes <SUPERSEDES>
+          Slug of the record this one replaces: writes the supersession edge pair in the same write, so serving surfaces stop returning the old one
 
   -h, --help
           Print help
@@ -2784,6 +2797,7 @@ Usage: base graph <COMMAND>
 
 Commands:
   compact    Dedup + canonicalize the workspace graph (atomic rewrite, snapshots first)
+  supersede  Record that one record replaces another: `base graph supersede <old> <new>`
   migrate    Give every covered record a domain link, once, per tier
   apply-ops  Apply inbound fact ops (JSON on stdin) into the local graph
   purge      Remove notes unread past --days (recency only). PREVIEW unless --apply
@@ -2811,6 +2825,29 @@ Usage: base graph compact
 Options:
   -h, --help
           Print help
+```
+
+## base graph supersede
+
+```text
+Record that one record replaces another: `base graph supersede <old> <new>`.
+
+Writes `new supersedes old`, its inverse, and `old status "superseded"` in one statement. Serving surfaces (recall, context, the prompt injection) then return only the live version; structure surfaces (analyze, neighbors, path, get-node) keep both and show the edge, because the superseded record IS the drift evidence.
+
+Refuses a slug that matches nothing, a slug that matches more than one record (naming every candidate), a self-reference, and any edge that would close a cycle. Every refusal happens before anything is written.
+
+Usage: base graph supersede <OLD> <NEW>
+
+Arguments:
+  <OLD>
+          Slug of the record being replaced
+
+  <NEW>
+          Slug of the record replacing it
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## base graph migrate
