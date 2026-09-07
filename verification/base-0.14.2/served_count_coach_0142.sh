@@ -61,13 +61,20 @@ rm -rf "$R"; mkdir -p "$R"
 fresh() {
   local fh=$1; local doms=${2:-}
   rm -rf "$fh"; mkdir -p "$fh/.base-gbl/.base" "$fh/.base" "$fh/genai/vp-operators"
-  printf '%s\n' "${doms:-$'[[domain]]\nname = "alpha"\nmode = "triggered"\nprompt_keywords = ["alpha"]\nrules = []'}" > "$fh/.base-gbl/domains.toml"
+  if [ -n "$doms" ]; then printf '%s\n' "$doms" > "$fh/.base-gbl/domains.toml"; else cat > "$fh/.base-gbl/domains.toml" <<'EOF'
+[[domain]]
+name = "alpha"
+mode = "triggered"
+prompt_keywords = ["alpha"]
+rules = []
+EOF
+  fi
   printf '[namespace]\nprefix = "ops"\nuri = "http://ops-sys.local/ontology#"\n' > "$fh/.base/base.toml"
   printf '[update]\nauto = false\n[devmode]\nenabled = true\n' > "$fh/.base-gbl/base.toml"
 }
 run()  { ( cd "$1" && BASE_HOME=$1 "$2" "${@:3}" 2>&1 ); }                       # run <root> <bin> <args...>
 fire() { printf '{"session_id":"%s","cwd":"%s","prompt":"%s"}' "$3" "$1" "$4" | ( cd "$1" && BASE_HOME=$1 "$2" hook user-prompt-submit 2>&1 ); }  # fire <root> <bin> <sid> <prompt>
-third() { fire "$@" >/dev/null; fire "$@" >/dev/null; fire "$@"; }                 # prompts 1-2 lean, 3 full
+third() { fire "$@"; fire "$@"; fire "$@"; }   # all three prompts: a rule-carrying block lands on prompt 1 and is deduped on 2-3; the neighbourhood and the walk land on 3
 touchrow() { printf '{"ts":"2026-09-07T12:00:00-05:00","hook":"pre-tool-use","success":true,"session_id":"%s","tool_name":"Read","file_path":"%s"}\n' "$2" "$3" >> "$1/.base/hook-events.jsonl"; }  # touchrow <root> <sid> <file>
 count() { grep -c -F -- "$2" <<<"$1"; }                                              # count <text> <needle>: lines carrying needle
 
@@ -106,7 +113,7 @@ FH=$R/62d; fresh "$FH"; mkdir -p "$FH/.claude"
 cat > "$FH/.base-gbl/carl.json" <<'EOF'
 { "domains": [ { "name": "alpha", "rules": [ {"text": "carl rule one"} ], "decisions": [ {"decision": "Pick x over y", "rationale": "cheaper"} ] } ] }
 EOF
-out=$(run "$FH" "$B" install --skip-hooks --no-starter-commands | grep -E 'CARL'); echo "    $out"
+out=$(run "$FH" "$B" install --carl "$FH/.base-gbl/carl.json" --skip-hooks --no-starter-commands | grep -E 'CARL'); echo "    $out"
 if [ "$EXPECT" = new ]; then grep -q 'imported from domains.toml and carl.json, 1 decisions imported from carl.json)' <<<"$out" && ok "install print" || bad "install print: $out"
 else grep -qE 'rules, 1 decisions\)' <<<"$out" && ok "0.14.1 install print" || bad "install print: $out"; fi
 
@@ -192,6 +199,17 @@ say "#70-5  exclude vetoes an always-on domain"
 FH=$R/70e; fresh "$FH" $'[[domain]]\nname = "quiet"\nmode = "always"\nexclude = ["haiku"]\nrules = ["The quiet rule"]'
 out=$(third "$FH" "$B" q1 "write a haiku about tea"); [ "$(count "$out" "The quiet rule")" -eq 0 ] && ok "excluded word vetoes the always-on block" || bad "always-on block served despite exclude"
 out=$(third "$FH" "$B" q2 "hello"); [ "$(count "$out" "The quiet rule")" -ge 1 ] && ok "and it serves otherwise" || bad "always-on block absent without the excluded word"
+
+say "#70-6  the tier-split pairs (#61): domain writes act on the tier you stand in and a no-op exits non-zero"
+FH=$R/70f; fresh "$FH"
+out=$(run "$FH" "$B" domain create --name scratch --keyword zz1); echo "    $out"
+grep -q "created (workspace tier)" <<<"$out" && ok "create reports the workspace tier" || bad "create: $out"
+grep -q 'name = "scratch"' "$FH/.base/domains.toml" 2>/dev/null && ok "written to the workspace domains.toml" || bad "scratch not in $FH/.base/domains.toml"
+out=$(run "$FH" "$B" domain add-trigger --domain scratch --keyword zz2); echo "    $out"; grep -q 'zz2' "$FH/.base/domains.toml" && ok "add-trigger wrote the same file" || bad "add-trigger: $out"
+out=$(run "$FH" "$B" domain remove-trigger --domain scratch --keyword zz2); echo "    $out"; grep -q 'zz2' "$FH/.base/domains.toml" && bad "remove-trigger left zz2 in place: $out" || ok "remove-trigger took it back off the same file"
+out=$(run "$FH" "$B" domain remove-trigger --domain scratch --keyword nope); rc=$?; echo "    $out (exit $rc)"; [ "$rc" -ne 0 ] && ok "a no-op remove-trigger exits non-zero" || bad "no-op remove-trigger exited 0"
+out=$(run "$FH" "$B" domain remove scratch); rc=$?; echo "    $out (exit $rc)"; grep -q "removed (workspace tier)" <<<"$out" && [ "$rc" -eq 0 ] && ok "remove reports the workspace tier" || bad "remove: $out (exit $rc)"
+out=$(run "$FH" "$B" domain remove scratch); rc=$?; echo "    $out (exit $rc)"; [ "$rc" -ne 0 ] && grep -qi "tier" <<<"$out" && ok "a second remove names the tier and exits non-zero" || bad "second remove: $out (exit $rc)"
 
 # ── byte identity vs the baseline (the ledger's line 5 for this fork) ─────────────────────────────────
 say "byte identity vs BASELINE: base context, base recall, the prompt hook on the F29 fixture"
