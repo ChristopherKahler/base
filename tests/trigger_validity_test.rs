@@ -104,12 +104,12 @@ fn add_trigger_refuses_an_inert_trigger_and_writes_nothing() {
         let toml_path = root.join(".base").join("domains.toml");
         let before = std::fs::read_to_string(&toml_path).unwrap();
 
-        let err = base::domain::add_trigger(root, "broad", None, Some("Documents")).unwrap_err();
+        let err = base::domain::add_trigger(root, false, "broad", None, Some("Documents")).unwrap_err();
         let text = format!("{err:#}");
         assert!(text.starts_with("path trigger `Documents` on `broad` covers 3 registered projects ("), "{text}");
         assert!(err.downcast_ref::<base::domain::TriggerRefused>().is_some(), "typed, so project add can tell");
 
-        let err = base::domain::add_trigger(root, "glob", None, Some("*.md")).unwrap_err();
+        let err = base::domain::add_trigger(root, false, "glob", None, Some("*.md")).unwrap_err();
         assert_eq!(
             format!("{err:#}"),
             "path trigger `*.md` on `glob` is not a rooted path; write it absolute, ~-relative or relative to the tier root"
@@ -118,7 +118,7 @@ fn add_trigger_refuses_an_inert_trigger_and_writes_nothing() {
         assert_eq!(std::fs::read_to_string(&toml_path).unwrap(), before, "nothing written on refusal");
         assert!(!base::domain::load_domains(root).iter().any(|d| d.name == "broad" || d.name == "glob"));
 
-        base::domain::add_trigger(root, "narrow", None, Some("Documents/Meet Caddy/renda-group")).unwrap();
+        base::domain::add_trigger(root, false, "narrow", None, Some("Documents/Meet Caddy/renda-group")).unwrap();
         let narrow = base::domain::load_domains(root).into_iter().find(|d| d.name == "narrow").unwrap();
         assert_eq!(narrow.paths, vec!["Documents/Meet Caddy/renda-group".to_string()]);
     });
