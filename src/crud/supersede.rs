@@ -32,8 +32,13 @@ use crate::supersede;
 /// operator can retype an unambiguous one; guessing would silently correct the
 /// wrong record.
 pub fn resolve_slug(store: &Store, ns: &NamespaceConfig, input: &str) -> Result<String> {
+    // Two candidate tails, not one. `crud::slugify` is for turning free text into a
+    // slug; applied to a slug that already exists it can change it -- `decision log`
+    // builds `{domain}.{decision}`, and re-slugifying that dotted form matches no
+    // record. So the input is tried VERBATIM as well, which is the form every base
+    // command prints and therefore the form an operator pastes back.
     let slug = crud::slugify(input);
-    let tail = format!("/{slug}");
+    let tails = [format!("/{input}"), format!("/{slug}")];
     let mut hits: Vec<String> = store
         .iter()
         .filter_map(|q| q.ok())
@@ -41,7 +46,7 @@ pub fn resolve_slug(store: &Store, ns: &NamespaceConfig, input: &str) -> Result<
             oxigraph::model::Subject::NamedNode(n) => Some(n.into_string()),
             _ => None,
         })
-        .filter(|s| s.starts_with(&ns.uri) && s.ends_with(&tail))
+        .filter(|s| s.starts_with(&ns.uri) && tails.iter().any(|t| s.ends_with(t)))
         .collect();
     hits.sort();
     hits.dedup();
