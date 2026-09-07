@@ -5,7 +5,7 @@ use oxigraph::model::TermRef;
 
 use crate::config::BaseConfig;
 use crate::domain;
-use crate::domain::matcher::match_domains;
+use crate::domain::matcher::match_domains_auto;
 use crate::domain::query::{query_domain_from_graph, resolve_and_run_query, format_toml_rules};
 use crate::domain::session::{rules_hash, Bracket, SessionState};
 
@@ -105,7 +105,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // Gather active file paths from graph (if available)
     let active_paths = gather_active_paths(config, &graph_store);
 
-    let matched = match_domains(&prompt, &domains, &active_paths);
+    let matched = match_domains_auto(&prompt, &domains, &active_paths);
     if matched.is_empty() {
         // Still save session state (prompt_count) even if nothing matched
         if let Some(ref base_dir) = base_dir {

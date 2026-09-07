@@ -515,6 +515,12 @@ fn match_by_file<'a>(
     domains
         .iter()
         .filter(|d| {
+            // `auto_inject = false` is honoured before any other test (F29 D3): this
+            // hook is the other automatic path, and a tool call under `Documents`
+            // used to serve the same block the prompt hook serves.
+            if !d.auto_inject {
+                return false;
+            }
             // Skip always-on (those fire on user-prompt-submit, not here)
             if d.is_always() {
                 return false;

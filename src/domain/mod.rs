@@ -79,6 +79,12 @@ pub struct DomainDef {
     pub name: String,
     #[serde(default = "default_mode")]
     pub mode: String, // "always" | "triggered"
+    /// `auto_inject = false` keeps this domain out of every automatic injection — the
+    /// prompt hook and the tool hooks — whatever its mode or triggers (F29 D3). Explicit
+    /// readers (`base context`, `base recall`, star commands) still see it. Absent means
+    /// true, and true is not written back, so a round-trip leaves the file as it was.
+    #[serde(default = "default_auto_inject", skip_serializing_if = "is_auto_inject")]
+    pub auto_inject: bool,
     /// Keywords matched against user prompt text (natural language, user-configured).
     /// Backward-compatible: legacy `keywords` field deserializes here via alias.
     #[serde(default, alias = "keywords")]
@@ -119,6 +125,14 @@ pub struct DomainDef {
 
 fn default_mode() -> String {
     "triggered".into()
+}
+
+fn default_auto_inject() -> bool {
+    true
+}
+
+fn is_auto_inject(auto_inject: &bool) -> bool {
+    *auto_inject
 }
 
 fn default_command_activation() -> String {
@@ -226,6 +240,7 @@ pub fn add_trigger(
         file.domain.push(DomainDef {
             name: domain_name.to_string(),
             mode: "triggered".to_string(),
+            auto_inject: true,
             prompt_keywords: Vec::new(),
             file_keywords: Vec::new(),
             paths: Vec::new(),
@@ -332,6 +347,7 @@ pub fn create_domain(
     file.domain.push(DomainDef {
         name: domain_name.to_string(),
         mode: "triggered".to_string(),
+        auto_inject: true,
         prompt_keywords: kws,
         file_keywords: Vec::new(),
         paths: ps,

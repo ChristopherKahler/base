@@ -48,6 +48,21 @@ pub fn match_domains<'a>(
         .collect()
 }
 
+/// The automatic entry — what the prompt hook injects without being asked. A domain
+/// with `auto_inject = false` never reaches it, whatever its mode or triggers (F29 D3).
+/// `match_domains` above stays the pure trigger test for explicit readers such as
+/// `base context`, which the operator invoked on purpose.
+pub fn match_domains_auto<'a>(
+    prompt: &str,
+    domains: &'a [DomainDef],
+    active_paths: &[String],
+) -> Vec<DomainMatch<'a>> {
+    match_domains(prompt, domains, active_paths)
+        .into_iter()
+        .filter(|m| m.domain.auto_inject)
+        .collect()
+}
+
 /// Determine if a domain matches the current context.
 /// Returns Some(reason) on match, None on no match.
 fn is_matched(domain: &DomainDef, prompt_lower: &str, active_paths: &[String]) -> Option<MatchReason> {
@@ -92,6 +107,7 @@ mod tests {
         DomainDef {
             name: name.into(),
             mode: mode.into(),
+            auto_inject: true,
             prompt_keywords: keywords.iter().map(|s| s.to_string()).collect(),
             file_keywords: Vec::new(),
             paths: Vec::new(),
@@ -176,6 +192,22 @@ mod tests {
 
         let matched = match_domains("review only the code", &domains, &[]);
         assert!(matched.is_empty());
+    }
+
+    /// `auto_inject = false` is honoured before any other test, and only on the
+    /// automatic entry: the explicit matcher still reports the domain.
+    #[test]
+    fn auto_inject_false_is_dropped_by_the_automatic_entry_only() {
+        let mut always = make_domain("secret", "always", &[], &["Never say a floor out loud"]);
+        always.auto_inject = false;
+        let mut triggered = make_domain("terms", "triggered", &["terms"], &["Rule"]);
+        triggered.paths = vec!["Documents".into()];
+        triggered.auto_inject = false;
+        let domains = vec![always, triggered];
+        let paths = vec!["Documents/x.md".to_string()];
+
+        assert!(match_domains_auto("what are the terms", &domains, &paths).is_empty());
+        assert_eq!(match_domains("what are the terms", &domains, &paths).len(), 2);
     }
 
     #[test]
