@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::config::BaseConfig;
 use crate::domain;
-use crate::domain::matcher::match_domains_auto;
+use crate::domain::matcher::{match_domains_auto, TriggerContext};
 use crate::domain::query::{query_domain_from_graph, resolve_and_run_query, format_toml_rules};
 use crate::domain::session::{rules_hash, Bracket, SessionState};
 
@@ -104,7 +104,11 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // The paths this session touched (tool-hook log), never the store.
     let active_paths = gather_active_paths(cwd, base_dir.as_deref(), session_id);
 
-    let matched = match_domains_auto(&prompt, &domains, &active_paths);
+    let trigger_ctx = TriggerContext {
+        home: crate::home::home_root().map(|h| h.display().to_string()),
+        ..Default::default()
+    };
+    let matched = match_domains_auto(&prompt, &domains, &active_paths, &trigger_ctx);
     if matched.is_empty() {
         // Still save session state (prompt_count) even if nothing matched
         if let Some(ref base_dir) = base_dir {
@@ -268,7 +272,10 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
 
         // Use the actual match reason from the matcher (only meaningful in DEVMODE)
         let match_reason = if config.devmode.enabled {
-            format!("{}", dm.reason)
+            match &dm.path {
+                Some(p) => format!("{} ({p})", dm.reason),
+                None => format!("{}", dm.reason),
+            }
         } else if domain_def.is_always() {
             "always_on".to_string()
         } else {

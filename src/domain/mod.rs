@@ -85,6 +85,11 @@ pub struct DomainDef {
     /// true, and true is not written back, so a round-trip leaves the file as it was.
     #[serde(default = "default_auto_inject", skip_serializing_if = "is_auto_inject")]
     pub auto_inject: bool,
+    /// The tier root this domain was loaded from (home for the global tier, the
+    /// workspace root for the workspace tier). Relative path triggers resolve against
+    /// it; never read from or written to domains.toml (F29).
+    #[serde(skip)]
+    pub root: Option<String>,
     /// Keywords matched against user prompt text (natural language, user-configured).
     /// Backward-compatible: legacy `keywords` field deserializes here via alias.
     #[serde(default, alias = "keywords")]
@@ -170,30 +175,47 @@ struct DomainsFile {
 pub fn load_domains(cwd: &Path) -> Vec<DomainDef> {
     let mut domains = Vec::new();
 
-    // Global
-    if let Some(home) = crate::home::home_root()
+    // Global — relative path triggers resolve against the home directory.
+    let home = crate::home::home_root();
+    if let Some(home) = &home
         && let Ok(content) =
             std::fs::read_to_string(home.join(".base-gbl").join("domains.toml"))
         && let Ok(file) = toml::from_str::<DomainsFile>(&content)
     {
-        domains = file.domain;
+        domains = rooted(file.domain, Some(home));
     }
 
-    // Workspace (overlays global by name)
+    // Workspace (overlays global by name) — triggers resolve against the workspace root.
+    let ws_root = crate::config::find_workspace_base(cwd).and_then(|b| b.parent().map(Path::to_path_buf));
     if let Some(base_dir) = crate::config::find_workspace_base(cwd)
         && let Ok(content) = std::fs::read_to_string(base_dir.join("domains.toml"))
         && let Ok(file) = toml::from_str::<DomainsFile>(&content)
     {
-        domains = merge_domains(domains, file.domain);
+        domains = merge_domains(domains, rooted(file.domain, ws_root.as_deref()));
     }
 
-    // Extension domains (Phase 22 — merged into normal pool, lowest priority)
+    // Extension domains (Phase 22 — merged into normal pool, lowest priority). Their
+    // triggers name workspace state dirs (`.outpost/`), so they root at the workspace
+    // when there is one, else at home.
     let extensions = crate::extension::load_extensions();
     for ext in &extensions {
-        let ext_domains = crate::extension::extension_domains_to_domain_defs(ext);
+        let ext_domains = rooted(
+            crate::extension::extension_domains_to_domain_defs(ext),
+            ws_root.as_deref().or(home.as_deref()),
+        );
         domains = merge_domains(domains, ext_domains);
     }
 
+    domains
+}
+
+/// Stamp the tier root every domain in `domains` came from (F29): relative path
+/// triggers resolve against it, and a domain with no root has no rooted relative trigger.
+fn rooted(mut domains: Vec<DomainDef>, root: Option<&Path>) -> Vec<DomainDef> {
+    let root = root.map(|r| r.display().to_string());
+    for d in &mut domains {
+        d.root = root.clone();
+    }
     domains
 }
 
@@ -241,6 +263,7 @@ pub fn add_trigger(
             name: domain_name.to_string(),
             mode: "triggered".to_string(),
             auto_inject: true,
+            root: None,
             prompt_keywords: Vec::new(),
             file_keywords: Vec::new(),
             paths: Vec::new(),
@@ -348,6 +371,7 @@ pub fn create_domain(
         name: domain_name.to_string(),
         mode: "triggered".to_string(),
         auto_inject: true,
+        root: None,
         prompt_keywords: kws,
         file_keywords: Vec::new(),
         paths: ps,

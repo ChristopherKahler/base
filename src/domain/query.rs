@@ -312,7 +312,7 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
 
     let graph_store = crate::store::load_merged(cwd);
 
-    let matched = domain::matcher::match_domains(text, &domains, &[]);
+    let matched = domain::matcher::match_domains(text, &domains, &[], &domain::matcher::TriggerContext::default());
     if matched.is_empty() {
         return;
     }

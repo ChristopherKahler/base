@@ -526,11 +526,13 @@ fn match_by_file<'a>(
                 return false;
             }
 
-            // Path match: any file path starts with or contains a domain path trigger
+            // Path match: a touched file lies under a trigger resolved against the tier
+            // the domain came from — the one seam the prompt hook uses (F29), never a
+            // substring test.
+            let home = crate::home::home_root().map(|h| h.display().to_string());
             let path_hit = d.paths.iter().any(|dp| {
-                file_paths
-                    .iter()
-                    .any(|fp| fp.starts_with(dp) || fp.contains(dp))
+                domain::matcher::resolve_trigger(dp, d.root.as_deref(), home.as_deref())
+                    .is_some_and(|t| file_paths.iter().any(|fp| domain::matcher::path_under(fp, &t)))
             });
 
             // File keyword match: check if any file_keywords appear in the file paths

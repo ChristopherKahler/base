@@ -25,6 +25,16 @@ impl std::fmt::Display for MatchReason {
 pub struct DomainMatch<'a> {
     pub domain: &'a DomainDef,
     pub reason: MatchReason,
+    /// The active path that satisfied a path trigger, when one did. Devmode names it,
+    /// so "why did this domain load" has a file for an answer, not a mode (F29).
+    pub path: Option<String>,
+}
+
+/// What the path rules need beyond the domain itself (F29).
+#[derive(Debug, Default, Clone)]
+pub struct TriggerContext {
+    /// The home directory, for `~`-relative triggers.
+    pub home: Option<String>,
 }
 
 /// Match domains against prompt text and active file paths.
@@ -36,14 +46,15 @@ pub fn match_domains<'a>(
     prompt: &str,
     domains: &'a [DomainDef],
     active_paths: &[String],
+    ctx: &TriggerContext,
 ) -> Vec<DomainMatch<'a>> {
     let prompt_lower = prompt.to_lowercase();
 
     domains
         .iter()
         .filter_map(|d| {
-            let reason = is_matched(d, &prompt_lower, active_paths)?;
-            Some(DomainMatch { domain: d, reason })
+            let (reason, path) = is_matched(d, &prompt_lower, active_paths, ctx)?;
+            Some(DomainMatch { domain: d, reason, path })
         })
         .collect()
 }
@@ -56,8 +67,9 @@ pub fn match_domains_auto<'a>(
     prompt: &str,
     domains: &'a [DomainDef],
     active_paths: &[String],
+    ctx: &TriggerContext,
 ) -> Vec<DomainMatch<'a>> {
-    match_domains(prompt, domains, active_paths)
+    match_domains(prompt, domains, active_paths, ctx)
         .into_iter()
         .filter(|m| m.domain.auto_inject)
         .collect()
@@ -65,10 +77,15 @@ pub fn match_domains_auto<'a>(
 
 /// Determine if a domain matches the current context.
 /// Returns Some(reason) on match, None on no match.
-fn is_matched(domain: &DomainDef, prompt_lower: &str, active_paths: &[String]) -> Option<MatchReason> {
+fn is_matched(
+    domain: &DomainDef,
+    prompt_lower: &str,
+    active_paths: &[String],
+    ctx: &TriggerContext,
+) -> Option<(MatchReason, Option<String>)> {
     // Always-on domains always match
     if domain.is_always() {
-        return Some(MatchReason::Always);
+        return Some((MatchReason::Always, None));
     }
 
     // Check exclude patterns first — any match vetoes the domain
@@ -84,18 +101,98 @@ fn is_matched(domain: &DomainDef, prompt_lower: &str, active_paths: &[String]) -
         .iter()
         .any(|kw| prompt_lower.contains(&kw.to_lowercase()));
 
-    // Path match: any active file path starts with any domain path trigger
-    let path_hit = domain.paths.iter().any(|dp| {
-        active_paths
-            .iter()
-            .any(|ap| ap.starts_with(dp) || ap.contains(dp))
+    // Path match: an active path lies under a trigger resolved against the tier the
+    // domain came from. The path that satisfied it rides along so devmode can name
+    // the file.
+    let path_hit = domain.paths.iter().find_map(|dp| {
+        let trigger = resolve_trigger(dp, domain.root.as_deref(), ctx.home.as_deref())?;
+        active_paths.iter().find(|ap| path_under(ap, &trigger)).cloned()
     });
 
-    match (keyword_hit, path_hit) {
-        (true, true) => Some(MatchReason::KeywordAndFilepath),
-        (true, false) => Some(MatchReason::Keyword),
-        (false, true) => Some(MatchReason::Filepath),
-        (false, false) => None,
+    let reason = match (keyword_hit, path_hit.is_some()) {
+        (true, true) => MatchReason::KeywordAndFilepath,
+        (true, false) => MatchReason::Keyword,
+        (false, true) => MatchReason::Filepath,
+        (false, false) => return None,
+    };
+    Some((reason, path_hit))
+}
+
+/// A path as components on `/`, with the shapes this crate meets on one machine folded
+/// together: `\\` is `/`, `/mnt/c/...` is `c:/...` (the WSL install and the Windows
+/// install read one store), empty and `.` components vanish.
+fn components(p: &str) -> Vec<String> {
+    let p = p.replace('\\', "/");
+    let mut out: Vec<String> = p
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .map(String::from)
+        .collect();
+    if p.starts_with("/mnt/")
+        && out.len() >= 2
+        && out[1].len() == 1
+        && out[1].as_bytes()[0].is_ascii_alphabetic()
+    {
+        out.drain(..2);
+        // keep it simple: `/mnt/c/x` -> ["c:", "x"]
+        out.insert(0, format!("{}:", p[5..6].to_ascii_lowercase()));
+    }
+    out
+}
+
+/// A Windows path: a drive letter first, where case does not distinguish files.
+fn windows_shaped(components: &[String]) -> bool {
+    components
+        .first()
+        .is_some_and(|c| c.len() == 2 && c.as_bytes()[1] == b':' && c.as_bytes()[0].is_ascii_alphabetic())
+}
+
+/// Is `p` already rooted on its own: `/x`, `C:/x`, `C:\\x`, `\\\\server\\x`, `/mnt/c/x`?
+pub fn is_absolute(p: &str) -> bool {
+    let s = p.replace('\\', "/");
+    s.starts_with('/') || (s.len() >= 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic())
+}
+
+/// Resolve a path trigger to the absolute path it names: absolute as written, `~` and
+/// `~/x` against `home`, anything else against `root` (the tier the domain came from).
+/// `None` when it cannot be rooted — a glob, or a relative trigger with no root, or a
+/// `~` trigger with no home. Returned as `/`-separated components joined, so two
+/// spellings of one place compare equal (F29).
+pub fn resolve_trigger(trigger: &str, root: Option<&str>, home: Option<&str>) -> Option<String> {
+    let t = trigger.trim();
+    if t.is_empty() || t.contains(['*', '?']) {
+        return None;
+    }
+    let joined = if is_absolute(t) {
+        t.to_string()
+    } else if t == "~" || t.starts_with("~/") || t.starts_with("~\\") {
+        format!("{}/{}", home?, &t[1..])
+    } else {
+        format!("{}/{}", root?, t)
+    };
+    let parts = components(&joined);
+    if parts.is_empty() {
+        return None;
+    }
+    let lead = if joined.replace('\\', "/").starts_with('/') && !windows_shaped(&parts) { "/" } else { "" };
+    Some(format!("{lead}{}", parts.join("/")))
+}
+
+/// Does `active` lie under the resolved trigger `trigger` (itself included)? A prefix
+/// test on path components, never on characters, so `Documents` does not cover
+/// `MyDocuments/a` or `Documents-old/x`; case-blind when either side is a Windows path,
+/// because `Tools` and `tools` are one directory there. `contains` stood here until
+/// 0.14.0 and let a trigger fire on any string holding it (F29).
+pub fn path_under(active: &str, trigger: &str) -> bool {
+    let t = components(trigger);
+    let a = components(active);
+    if t.is_empty() || t.len() > a.len() {
+        return false;
+    }
+    if windows_shaped(&t) || windows_shaped(&a) {
+        a[..t.len()].iter().zip(&t).all(|(x, y)| x.eq_ignore_ascii_case(y))
+    } else {
+        a[..t.len()] == t[..]
     }
 }
 
@@ -103,11 +200,16 @@ fn is_matched(domain: &DomainDef, prompt_lower: &str, active_paths: &[String]) -
 mod tests {
     use super::*;
 
+    fn ctx() -> TriggerContext {
+        TriggerContext { home: Some("/home/u".into()), ..Default::default() }
+    }
+
     fn make_domain(name: &str, mode: &str, keywords: &[&str], rules: &[&str]) -> DomainDef {
         DomainDef {
             name: name.into(),
             mode: mode.into(),
             auto_inject: true,
+            root: None,
             prompt_keywords: keywords.iter().map(|s| s.to_string()).collect(),
             file_keywords: Vec::new(),
             paths: Vec::new(),
@@ -126,7 +228,7 @@ mod tests {
     #[test]
     fn always_on_always_matches() {
         let domains = vec![make_domain("global", "always", &[], &["Rule 1"])];
-        let matched = match_domains("anything", &domains, &[]);
+        let matched = match_domains("anything", &domains, &[], &ctx());
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].domain.name, "global");
         assert_eq!(matched[0].reason, MatchReason::Always);
@@ -136,47 +238,49 @@ mod tests {
     fn keyword_match() {
         let domains = vec![make_domain("dev", "triggered", &["fix bug"], &["Dev rule"])];
 
-        let matched = match_domains("please fix bug in auth", &domains, &[]);
+        let matched = match_domains("please fix bug in auth", &domains, &[], &ctx());
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].reason, MatchReason::Keyword);
 
-        let matched = match_domains("check my calendar", &domains, &[]);
+        let matched = match_domains("check my calendar", &domains, &[], &ctx());
         assert!(matched.is_empty());
     }
 
     #[test]
     fn keyword_case_insensitive() {
         let domains = vec![make_domain("dev", "triggered", &["Fix Bug"], &["Rule"])];
-        let matched = match_domains("FIX BUG please", &domains, &[]);
+        let matched = match_domains("FIX BUG please", &domains, &[], &ctx());
         assert_eq!(matched.len(), 1);
     }
 
+    /// The hooks report absolute tool paths; a relative trigger resolves against the
+    /// tier root the domain came from, and the match names the file.
     #[test]
     fn path_match() {
         let mut domain = make_domain("dev", "triggered", &[], &["Rule"]);
         domain.paths = vec!["src/".into()];
+        domain.root = Some("/home/u/proj".into());
         let domains = vec![domain];
 
-        let matched = match_domains(
-            "hello",
-            &domains,
-            &["src/main.rs".into()],
-        );
+        let matched = match_domains("hello", &domains, &["/home/u/proj/src/main.rs".into()], &ctx());
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].reason, MatchReason::Filepath);
+        assert_eq!(matched[0].path.as_deref(), Some("/home/u/proj/src/main.rs"));
+
+        // The same trigger with no root cannot resolve, so it cannot fire.
+        let mut unrooted = make_domain("dev", "triggered", &[], &["Rule"]);
+        unrooted.paths = vec!["src/".into()];
+        assert!(match_domains("hello", &[unrooted], &["/home/u/proj/src/main.rs".into()], &ctx()).is_empty());
     }
 
     #[test]
     fn both_keyword_and_path() {
         let mut domain = make_domain("dev", "triggered", &["code"], &["Rule"]);
         domain.paths = vec!["src/".into()];
+        domain.root = Some("/home/u/proj".into());
         let domains = vec![domain];
 
-        let matched = match_domains(
-            "write code",
-            &domains,
-            &["src/main.rs".into()],
-        );
+        let matched = match_domains("write code", &domains, &["/home/u/proj/src/main.rs".into()], &ctx());
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].reason, MatchReason::KeywordAndFilepath);
     }
@@ -187,10 +291,10 @@ mod tests {
         domain.exclude = vec!["review only".into()];
         let domains = vec![domain];
 
-        let matched = match_domains("write code for this", &domains, &[]);
+        let matched = match_domains("write code for this", &domains, &[], &ctx());
         assert_eq!(matched.len(), 1);
 
-        let matched = match_domains("review only the code", &domains, &[]);
+        let matched = match_domains("review only the code", &domains, &[], &ctx());
         assert!(matched.is_empty());
     }
 
@@ -206,20 +310,53 @@ mod tests {
         let domains = vec![always, triggered];
         let paths = vec!["Documents/x.md".to_string()];
 
-        assert!(match_domains_auto("what are the terms", &domains, &paths).is_empty());
-        assert_eq!(match_domains("what are the terms", &domains, &paths).len(), 2);
+        assert!(match_domains_auto("what are the terms", &domains, &paths, &ctx()).is_empty());
+        assert_eq!(match_domains("what are the terms", &domains, &paths, &ctx()).len(), 2);
+    }
+
+    /// Resolution: absolute as written, `~` against home, relative against the tier
+    /// root, WSL mounts folded onto the drive letter, globs and rootless triggers refused.
+    #[test]
+    fn triggers_resolve_against_their_tier_root() {
+        let r = |t: &str| resolve_trigger(t, Some("C:/Users/x"), Some("/home/u"));
+        assert_eq!(r("Documents").as_deref(), Some("c:/Users/x/Documents"));
+        assert_eq!(r("Documents\\Meet Caddy/").as_deref(), Some("c:/Users/x/Documents/Meet Caddy"));
+        assert_eq!(r("~/notes").as_deref(), Some("/home/u/notes"));
+        assert_eq!(r("/srv/data").as_deref(), Some("/srv/data"));
+        assert_eq!(r("D:\\vault").as_deref(), Some("d:/vault"));
+        assert_eq!(r("/mnt/c/Users/x/tools").as_deref(), Some("c:/Users/x/tools"));
+        assert_eq!(r("*.md"), None);
+        assert_eq!(resolve_trigger("Documents", None, Some("/home/u")), None);
+        assert_eq!(resolve_trigger("~/x", Some("/proj"), None), None);
+    }
+
+    /// The substring test fired `Documents` on `MyDocuments/a` and on `Documents-old/x`;
+    /// a component-boundary test does not. Windows paths compare case-blind.
+    #[test]
+    fn path_triggers_match_on_component_boundaries() {
+        assert!(path_under("C:\\Users\\x\\Documents\\a.md", "c:/Users/x/Documents"));
+        assert!(path_under("C:/Users/x/Documents", "c:/Users/x/Documents"));
+        assert!(path_under("/home/x/Documents/Meet Caddy/notes.md", "/home/x/Documents/Meet Caddy"));
+        assert!(path_under("C:/Users/x/Tools/stt/a.py", "c:/Users/x/tools"));
+        assert!(path_under("/mnt/c/Users/x/tools/a.py", "c:/Users/x/tools"));
+        assert!(!path_under("C:/Users/x/MyDocuments/a.md", "c:/Users/x/Documents"));
+        assert!(!path_under("C:/Users/x/Documents-old/a.md", "c:/Users/x/Documents"));
+        assert!(!path_under("C:/Users/x", "c:/Users/x/Documents"));
+        assert!(!path_under("/home/x/Src/main.rs", "/home/x/src"));
+        assert!(!path_under("D:/mirror/C:/Users/x/genai/vp/a.md", "c:/Users/x/genai/vp"));
+        assert!(!path_under("anything", ""));
     }
 
     #[test]
     fn no_domains_no_match() {
-        let matched = match_domains("anything", &[], &[]);
+        let matched = match_domains("anything", &[], &[], &ctx());
         assert!(matched.is_empty());
     }
 
     #[test]
     fn no_rules_domain_still_matched_but_empty() {
         let domains = vec![make_domain("empty", "always", &[], &[])];
-        let matched = match_domains("anything", &domains, &[]);
+        let matched = match_domains("anything", &domains, &[], &ctx());
         assert_eq!(matched.len(), 1);
         assert!(matched[0].domain.rules.is_empty());
     }
