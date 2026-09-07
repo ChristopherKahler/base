@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use oxigraph::model::{GraphNameRef, NamedNodeRef, Quad};
+use oxigraph::store::Store;
+
 use crate::config::BaseConfig;
 use crate::changelog::Change;
 use crate::crud;
@@ -100,7 +103,48 @@ pub fn scan_all_workspaces(config: &crate::config::BaseConfig) -> Vec<(PathBuf, 
         }
     }
 
-    results
+    // ONE PROJECT, ONE ENTRY. A `paul.toml` reachable by two paths was returned twice
+    // -- Chris's `My Documents` junction sitting beside `Documents` is the live case --
+    // and the ingest loop then ran twice for one IRI. The two passes overwrote each
+    // other's `path` quad, so `managed_quads` reported a REAL difference on both passes,
+    // both restamped `updatedAt`, `registered` counted two, and every session start
+    // rewrote the whole store to change two timestamps (F25).
+    //
+    // It left no trace in the delta because the second pass put `path` back where the
+    // first found it, so the store ended each session on the value it started with.
+    // That is why three separate whole-quad between-session diffs all reported "only
+    // `updatedAt` moved" and three hypotheses were aimed one level too high; only an
+    // in-process instrument could see the churn.
+    //
+    // Two shapes are dropped, and they are different defects. The same FILE reached by
+    // two paths is caught by `canonicalize`, which resolves the junction or symlink.
+    // Two DIFFERENT directories whose `paul.toml` declare the same name are caught by
+    // the slug, because the IRI is built from the name and one IRI is one project
+    // whatever the disk says. First hit wins; `workspace_roots` is ordered by config
+    // and then cwd, so the survivor is the same on every run of the same machine.
+    let mut seen_file = std::collections::HashSet::new();
+    let mut seen_slug = std::collections::HashSet::new();
+    let mut deduped: Vec<(PathBuf, PaulToml)> = Vec::with_capacity(results.len());
+    for (toml_path, paul) in results {
+        // A path that cannot be canonicalised (a race, a permission) falls back to
+        // itself rather than being dropped: an un-resolvable duplicate is a smaller
+        // problem than a project that silently stops being ingested.
+        let real = std::fs::canonicalize(&toml_path).unwrap_or_else(|_| toml_path.clone());
+        let slug = crud::slugify(&paul.name);
+        if !seen_file.insert(real) || !seen_slug.insert(slug) {
+            if config.devmode.enabled {
+                eprintln!(
+                    "[paul] duplicate of project '{}' ignored: {}",
+                    paul.name,
+                    toml_path.display()
+                );
+            }
+            continue;
+        }
+        deduped.push((toml_path, paul));
+    }
+
+    deduped
 }
 
 fn try_load_paul_toml(project_dir: &Path) -> Option<(PathBuf, PaulToml)> {
@@ -114,6 +158,29 @@ fn try_load_paul_toml(project_dir: &Path) -> Option<(PathBuf, PaulToml)> {
 }
 
 // ─── Graph ingestion ────────────────────────────────────────
+
+/// Every quad the ingest manages for one project, `updatedAt` EXCLUDED.
+///
+/// `updatedAt` is left out on purpose: it is the field the ingest refuses to
+/// refresh when nothing else moved, so counting it would make every project look
+/// changed forever and defeat the whole guard. Scoped to the project's own home
+/// graph, which is the only graph this writer touches for that IRI.
+fn managed_quads(
+    store: &Store,
+    ns: &crate::config::NamespaceConfig,
+    iri: &str,
+    graph_iri: &str,
+) -> std::collections::HashSet<Quad> {
+    let (Ok(subject), Ok(graph)) = (NamedNodeRef::new(iri), NamedNodeRef::new(graph_iri)) else {
+        return std::collections::HashSet::new();
+    };
+    let updated_at = format!("{}updatedAt", ns.uri);
+    store
+        .quads_for_pattern(Some(subject.into()), None, None, Some(GraphNameRef::NamedNode(graph)))
+        .filter_map(|q| q.ok())
+        .filter(|q| q.predicate.as_str() != updated_at)
+        .collect()
+}
 
 pub struct IngestStats {
     pub scanned: usize,
@@ -184,8 +251,13 @@ pub fn ingest_paul_projects(
              WHERE {{ GRAPH <{graph}> {{ <{iri}> ?pp ?oo .\n\
                FILTER(?pp NOT IN (\
                  rdf:type, {p}:status, {p}:lastActive, {p}:deferredReason, \
-                 {p}:resurfaceAt, {p}:createdAt)) }} }}"
+                 {p}:resurfaceAt, {p}:createdAt, {p}:updatedAt)) }} }}"
         );
+        // F25: what the store already holds for this project, `updatedAt` excluded.
+        // Compared against the same set after the re-ingest, it decides whether this
+        // project really changed — and so whether the store is touched at all.
+        let managed_before = managed_quads(&store, ns, &iri, &graph);
+
         let _ = store.update(&delete);
 
         // Build milestone/phase/loop description
@@ -229,8 +301,7 @@ pub fn ingest_paul_projects(
              INSERT DATA {{\n\
                GRAPH <{graph}> {{\n\
                  <{iri}> rdf:type {p}:Project ;\n\
-                   {p}:name \"{}\" ;\n\
-                   {p}:updatedAt \"{now}\"^^xsd:dateTime .\n\
+                   {p}:name \"{}\" .\n\
              {extra_triples}\
                }}\n\
              }}",
@@ -254,10 +325,40 @@ pub fn ingest_paul_projects(
             escape(&paul.status),
         );
         let _ = store.update(&seed);
-        registered += 1;
+
+        // Only a project whose managed set actually moved gets a fresh `updatedAt`,
+        // and only such a project counts as ingested. An unchanged project leaves the
+        // store untouched, which is what keeps `migrate_tiers`' delta gate closed: the
+        // old unconditional refresh moved the store's identity every session, re-opened
+        // that gate, and bought a full re-plan that was then discarded (F25).
+        let managed_after = managed_quads(&store, ns, &iri, &graph);
+        if managed_after != managed_before {
+            let touch = format!(
+                "{pfx}\n\
+                 DELETE {{ GRAPH <{graph}> {{ <{iri}> {p}:updatedAt ?o }} }}\n\
+                 WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:updatedAt ?o }} }};\n\
+                 INSERT DATA {{ GRAPH <{graph}> {{\n\
+                   <{iri}> {p}:updatedAt \"{now}\"^^xsd:dateTime .\n\
+                 }} }}"
+            );
+            let _ = store.update(&touch);
+            registered += 1;
+        }
     }
 
     let delta = crate::store::delta_since(&store, &[], before);
+
+    // F25: nothing moved, so do not rewrite the whole store to change nothing. The
+    // rewrite was unconditional, it moved the store's identity, and
+    // `changed_since_last_delta` (src/migrate.rs) therefore re-opened the delta gate on
+    // every single session. Measured on Chris's frozen copy: 18 session-starts, 18
+    // `extract.paul_toml` entries carrying the same 4 timestamp quads, 0
+    // `migrate.domain-1.delta` entries. This is the call site only; `write_back_inner`
+    // still writes whatever it is asked to write.
+    if delta.is_empty() {
+        return Ok(IngestStats { scanned: projects.len(), registered });
+    }
+
     let ops = delta.to_ops();
     crate::store::write_back(&store, &trig_path, Change::OpWithDelta("extract.paul_toml", &ops))?;
 
