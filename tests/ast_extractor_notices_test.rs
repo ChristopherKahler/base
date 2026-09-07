@@ -67,6 +67,12 @@ fn a_successful_yes_sync_echoes_the_extractors_notices() {
     let app = tempfile::tempdir().unwrap();
     std::fs::write(app.path().join("a.py"), "def f():\n    pass\n").unwrap();
     std::fs::create_dir_all(app.path().join(".git")).unwrap();
+    // `base sync --ast` resolves the extractor as $BASE_HOME/.base-gbl/scripts/ast,
+    // then cwd/scripts/ast (src/cli.rs). Without one of those it never spawns
+    // python at all and the row would be measuring a missing-script message.
+    let scripts = app.path().join("scripts").join("ast");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::write(scripts.join("onto_ast.py"), "# stub; the fake python ignores it\n").unwrap();
 
     let path = format!(
         "{}:{}",
