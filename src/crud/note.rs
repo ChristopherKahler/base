@@ -7,6 +7,10 @@ use crate::config::NamespaceConfig;
 use crate::crud;
 
 /// Create a note (memory entry) with optional relational edges.
+///
+/// Thin delegate to [`learn_with`]. The `--supersedes` flag arrived after ~40 call
+/// sites already existed; one implementation plus a one-line wrapper keeps the
+/// behaviour single while leaving those callers untouched.
 pub fn learn(
     cwd: &Path,
     ns: &NamespaceConfig,
@@ -15,6 +19,23 @@ pub fn learn(
     domain: Option<&str>,
     project: Option<&str>,
     entity: Option<&str>,
+) -> Result<String> {
+    learn_with(cwd, ns, text, note_type, domain, project, entity, None)
+}
+
+/// [`learn`], plus the record this note supersedes.
+///
+/// The note and its supersession edges are applied in ONE update against ONE load,
+/// so a correction and the edge saying what it corrects land together or not at all.
+pub fn learn_with(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    text: &str,
+    note_type: &str,
+    domain: Option<&str>,
+    project: Option<&str>,
+    entity: Option<&str>,
+    supersedes: Option<&str>,
 ) -> Result<String> {
     let slug = crud::slugify(text);
     let iri = crud::build_iri(ns, "note", &slug);
@@ -61,7 +82,10 @@ pub fn learn(
          }}"
     );
 
-    crud::load_and_mutate(cwd, ns, &sparql)?;
+    crud::load_read_then_mutate(cwd, ns, |store| {
+        let clause = crud::supersedes_clause(store, ns, &graph, &iri, supersedes)?;
+        Ok(format!("{sparql}{clause}"))
+    })?;
     Ok(slug)
 }
 

@@ -7,12 +7,26 @@ use crate::config::NamespaceConfig;
 use crate::crud;
 
 /// Add a rule to a domain in the graph, optionally with a rationale (Phase 26).
+///
+/// Thin delegate to [`add_with`] — see the note on `note::learn`.
 pub fn add(
     cwd: &Path,
     ns: &NamespaceConfig,
     domain_name: &str,
     rule_text: &str,
     rationale: Option<&str>,
+) -> Result<u32> {
+    add_with(cwd, ns, domain_name, rule_text, rationale, None)
+}
+
+/// [`add`], plus the rule this one supersedes — rule and edges in one update.
+pub fn add_with(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    domain_name: &str,
+    rule_text: &str,
+    rationale: Option<&str>,
+    supersedes: Option<&str>,
 ) -> Result<u32> {
     let p = &ns.prefix;
     let domain_slug = crud::slugify(domain_name);
@@ -64,7 +78,10 @@ pub fn add(
          }}"
     );
 
-    crud::load_and_mutate(cwd, ns, &sparql)?;
+    crud::load_read_then_mutate(cwd, ns, |store| {
+        let clause = crud::supersedes_clause(store, ns, &graph, &rule_iri, supersedes)?;
+        Ok(format!("{sparql}{clause}"))
+    })?;
     Ok(next_index)
 }
 
