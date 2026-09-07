@@ -130,6 +130,7 @@ pub fn recall_to_string(
                        ?n a {p}:Note ; {p}:noteText ?text ; {p}:noteType ?type ; {p}:status \"active\" .\n\
                        OPTIONAL {{ ?n {p}:createdAt ?created }}\n\
                        FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
+                       {no_transient}\
                      }}\n\
                    }} UNION {{\n\
                      GRAPH ?g {{\n\
@@ -138,6 +139,7 @@ pub fn recall_to_string(
                        OPTIONAL {{ ?n {p}:rationale ?extra }}\n\
                        OPTIONAL {{ ?n {p}:fromPlan ?created }}\n\
                        FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
+                       {no_transient}\
                      }}\n\
                    }} UNION {{\n\
                      GRAPH ?g {{\n\
@@ -146,6 +148,7 @@ pub fn recall_to_string(
                        OPTIONAL {{ ?n {p}:name ?extra }}\n\
                        OPTIONAL {{ ?n {p}:fromPlan ?created }}\n\
                        FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
+                       {no_transient}\
                      }}\n\
                    }} UNION {{\n\
                      GRAPH ?g {{\n\
@@ -154,6 +157,7 @@ pub fn recall_to_string(
                        OPTIONAL {{ ?n {p}:purpose ?extra }}\n\
                        OPTIONAL {{ ?n {p}:fromPlan ?created }}\n\
                        FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
+                       {no_transient}\
                      }}\n\
                    }} UNION {{\n\
                      GRAPH ?g {{\n\
@@ -162,9 +166,9 @@ pub fn recall_to_string(
                        OPTIONAL {{ ?n {p}:status ?extra }}\n\
                        OPTIONAL {{ ?n {p}:fromPlan ?created }}\n\
                        FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
+                       {no_transient}\
                      }}\n\
                    }}\n\
-                   {no_transient}\
                  }}\n\
                  ORDER BY DESC(?created) ?text"
             )
