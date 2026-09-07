@@ -7,6 +7,10 @@ use crate::config::NamespaceConfig;
 use crate::crud;
 
 /// Create a note (memory entry) with optional relational edges.
+///
+/// Thin delegate to [`learn_with`]. The `--supersedes` flag arrived after ~40 call
+/// sites already existed; one implementation plus a one-line wrapper keeps the
+/// behaviour single while leaving those callers untouched.
 pub fn learn(
     cwd: &Path,
     ns: &NamespaceConfig,
@@ -15,6 +19,27 @@ pub fn learn(
     domain: Option<&str>,
     project: Option<&str>,
     entity: Option<&str>,
+) -> Result<String> {
+    learn_with(cwd, ns, text, note_type, domain, project, entity, None)
+}
+
+/// [`learn`], plus the record this note supersedes.
+///
+/// The note and its supersession edges are applied in ONE update against ONE load,
+/// so a correction and the edge saying what it corrects land together or not at all.
+// Eight, one past clippy's default. Seven of them are `learn`'s existing shape and
+// the eighth is `--supersedes`; collapsing the one-line delegates into this is the
+// agreed follow-up, and reshaping the signature to satisfy a lint is not it.
+#[allow(clippy::too_many_arguments)]
+pub fn learn_with(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    text: &str,
+    note_type: &str,
+    domain: Option<&str>,
+    project: Option<&str>,
+    entity: Option<&str>,
+    supersedes: Option<&str>,
 ) -> Result<String> {
     let slug = crud::slugify(text);
     let iri = crud::build_iri(ns, "note", &slug);
@@ -61,7 +86,13 @@ pub fn learn(
          }}"
     );
 
-    crud::load_and_mutate(cwd, ns, &sparql)?;
+    // Named for the refusal: `--supersedes` resolves in the store THIS write
+    // loads and in no other, so the message has to say which one it searched.
+    let tier = crud::tier_label(cwd);
+    crud::load_read_then_mutate(cwd, ns, |store| {
+        let clause = crud::supersedes_clause(store, ns, &graph, &iri, supersedes, &tier)?;
+        Ok(format!("{sparql}{clause}"))
+    })?;
     Ok(slug)
 }
 
@@ -73,10 +104,38 @@ pub fn recall_to_string(
     keyword: Option<&str>,
     domain: Option<&str>,
 ) -> String {
+    recall_to_string_with(cwd, ns, keyword, domain, false)
+}
+
+/// [`recall_to_string`], with the choice of whether superseded records are served.
+///
+/// `include_superseded` is false everywhere except the CLI flag of the same name.
+/// Recall is a SERVING surface: it answers a question, so it answers with the live
+/// version. Structure surfaces (`graph analyze/neighbors/path/get-node`, the
+/// dashboard, the LOGOS export) drop nothing — the superseded record IS the drift
+/// evidence, and deleting it from the view would leave its successor's edge
+/// pointing at something the operator cannot see.
+pub fn recall_to_string_with(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    keyword: Option<&str>,
+    domain: Option<&str>,
+    include_superseded: bool,
+) -> String {
     let p = &ns.prefix;
     // Session traffic is excluded from every read surface by one list
     // (`ontology::transient`), never by a per-command filter.
     let no_transient = crate::ontology::transient::sparql_exclude(ns, "n");
+    // Superseded records are dropped from every arm for the same reason and in the
+    // same place as transients: beside the arm's other filters, INSIDE its `GRAPH ?g`
+    // group. A filter outside every GRAPH group is matched against the default graph,
+    // where base keeps nothing, so it reads as a working filter and excludes nothing
+    // (F16, kite, 2026-09-06). Empty when the operator asked to see the chain.
+    let no_superseded = if include_superseded {
+        String::new()
+    } else {
+        crate::supersede::sparql_exclude_superseded(ns, "n")
+    };
     // A note's domain link is `hasDomain` from 0.14.0 and `relatedTo` before it.
     // Reading only one of them is how `base recall --domain` goes silently empty —
     // an empty SPARQL result is indistinguishable from "no notes in that domain".
@@ -115,7 +174,7 @@ pub fn recall_to_string(
                         OPTIONAL {{ ?n {p}:createdAt ?created }}\n\
                      }}\n\
                      ?n {p}:status \"active\" .\n\
-                     {no_transient}\
+                     {no_transient}{no_superseded}\
                    }}\n\
                  }}\n\
                  ORDER BY DESC(?created) ?text"
@@ -130,7 +189,7 @@ pub fn recall_to_string(
                        ?n a {p}:Note ; {p}:noteText ?text ; {p}:noteType ?type ; {p}:status \"active\" .\n\
                        OPTIONAL {{ ?n {p}:createdAt ?created }}\n\
                        FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
-                       {no_transient}\
+                       {no_transient}{no_superseded}\
                      }}\n\
                    }} UNION {{\n\
                      GRAPH ?g {{\n\
@@ -139,7 +198,7 @@ pub fn recall_to_string(
                        OPTIONAL {{ ?n {p}:rationale ?extra }}\n\
                        OPTIONAL {{ ?n {p}:fromPlan ?created }}\n\
                        FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
-                       {no_transient}\
+                       {no_transient}{no_superseded}\
                      }}\n\
                    }} UNION {{\n\
                      GRAPH ?g {{\n\
@@ -148,7 +207,7 @@ pub fn recall_to_string(
                        OPTIONAL {{ ?n {p}:name ?extra }}\n\
                        OPTIONAL {{ ?n {p}:fromPlan ?created }}\n\
                        FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
-                       {no_transient}\
+                       {no_transient}{no_superseded}\
                      }}\n\
                    }} UNION {{\n\
                      GRAPH ?g {{\n\
@@ -157,7 +216,7 @@ pub fn recall_to_string(
                        OPTIONAL {{ ?n {p}:purpose ?extra }}\n\
                        OPTIONAL {{ ?n {p}:fromPlan ?created }}\n\
                        FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
-                       {no_transient}\
+                       {no_transient}{no_superseded}\
                      }}\n\
                    }} UNION {{\n\
                      GRAPH ?g {{\n\
@@ -166,7 +225,7 @@ pub fn recall_to_string(
                        OPTIONAL {{ ?n {p}:status ?extra }}\n\
                        OPTIONAL {{ ?n {p}:fromPlan ?created }}\n\
                        FILTER(CONTAINS(LCASE(STR(?text)), \"{kw_lower}\"))\n\
-                       {no_transient}\
+                       {no_transient}{no_superseded}\
                      }}\n\
                    }}\n\
                  }}\n\
@@ -182,7 +241,7 @@ pub fn recall_to_string(
                      ?n a {p}:Note ; {p}:noteText ?text ; {p}:noteType ?type ; {p}:status \"active\" .\n\
                      {dlink}\n\
                      OPTIONAL {{ ?n {p}:createdAt ?created }}\n\
-                     {no_transient}\
+                     {no_transient}{no_superseded}\
                    }}\n\
                  }}\n\
                  ORDER BY DESC(?created) ?text"
@@ -239,12 +298,23 @@ pub fn recall(
     keyword: Option<&str>,
     domain: Option<&str>,
 ) -> Result<()> {
+    recall_with(cwd, ns, keyword, domain, false)
+}
+
+/// [`recall`], with `--include-superseded`.
+pub fn recall_with(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    keyword: Option<&str>,
+    domain: Option<&str>,
+    include_superseded: bool,
+) -> Result<()> {
     if keyword.is_none() && domain.is_none() {
         eprintln!("Provide --keyword and/or --domain");
         return Ok(());
     }
 
-    let output = recall_to_string(cwd, ns, keyword, domain);
+    let output = recall_to_string_with(cwd, ns, keyword, domain, include_superseded);
     if output.is_empty() {
         println!("No results found.");
     } else {
@@ -293,8 +363,14 @@ pub fn recalled_note_iris(
     };
 
     let no_transient = crate::ontology::transient::sparql_exclude(ns, "n");
+    // This decides which notes get their `lastRead` stamped, so it must exclude
+    // exactly what `recall_to_string` excluded. A superseded note that recall did
+    // not print must not be marked as read: `graph purge --stale` reads that stamp,
+    // and a note kept alive by a recall that never showed it is a lie the purge
+    // then acts on.
+    let no_superseded = crate::supersede::sparql_exclude_superseded(ns, "n");
     let sparql =
-        format!("SELECT DISTINCT ?n WHERE {{ GRAPH ?g {{ {where_clause}\n{no_transient} }} }}");
+        format!("SELECT DISTINCT ?n WHERE {{ GRAPH ?g {{ {where_clause}\n{no_transient}{no_superseded} }} }}");
     let results = match crud::load_and_query(cwd, ns, &sparql) {
         Ok(r) => r,
         Err(_) => return Vec::new(),

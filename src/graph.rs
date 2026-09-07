@@ -186,6 +186,24 @@ pub fn purge_stale(path: &Path, ns: &NamespaceConfig, days: i64, apply: bool) ->
 
     let store = store::load_graph(path)?;
 
+    // Never purge a member of a supersession chain, at EITHER end (hawk C2). The
+    // superseded record is the evidence the drift claim rests on, and deleting it
+    // would leave its successor's `supersedes` edge pointing at nothing. Inside the
+    // GRAPH group with the staleness filter, for the reason F16 exists.
+    //
+    // BOTH ARMS MUST FACE OPPOSITE WAYS. `link_update` writes `new supersedes old`
+    // and `old supersededBy new`, so a subject of `supersededBy` is the OLD end and a
+    // subject of `supersedes` is the NEW one. The second arm read `?_older {sup} ?n`,
+    // which binds ?n to the old end exactly as the first arm does -- so the live head
+    // of a chain was spared by nothing and `--days 0 --apply` deleted it, leaving the
+    // dangling edge this clause exists to prevent. auk, 2026-09-07, on md5 7bf502c9;
+    // pinned red-first by `purge_spares_every_member_of_a_chain_including_the_live_head`.
+    let sup = &crate::supersede::PRED_SUPERSEDES;
+    let sup_by = &crate::supersede::PRED_SUPERSEDED_BY;
+    let spare_chains = format!(
+        "FILTER NOT EXISTS {{ {{ ?n {p}:{sup_by} ?_newer }} UNION {{ ?n {p}:{sup} ?_older }} }}"
+    );
+
     let select = format!(
         "{prefixes}\n\
          SELECT ?n ?text WHERE {{\n\
@@ -194,6 +212,7 @@ pub fn purge_stale(path: &Path, ns: &NamespaceConfig, days: i64, apply: bool) ->
              OPTIONAL {{ ?n {p}:lastRead ?lr }}\n\
              OPTIONAL {{ ?n {p}:createdAt ?cr }}\n\
              FILTER( COALESCE(?lr, ?cr, \"1970-01-01T00:00:00Z\"^^xsd:dateTime) < \"{cutoff}\"^^xsd:dateTime )\n\
+             {spare_chains}\
            }}\n\
          }}",
         prefixes = crate::crud::prefixes(ns),
@@ -416,6 +435,45 @@ mod tests {
         // Idempotent-ish: a second dry-run now finds zero.
         let again = purge_stale(&p, &ns, 90, false).unwrap();
         assert_eq!(again.candidates, 0);
+    }
+
+    /// auk, 2026-09-07, on md5 7bf502c9. hawk C2's spare clause had BOTH arms
+    /// matching the SAME end of a chain. `link_update` writes `new supersedes old`
+    /// and `old supersededBy new`, so `?_older {sup} ?n` binds `?n` to the OLDER
+    /// record -- exactly what `?n {sup_by} ?_newer` already binds. The LIVE head was
+    /// spared by nothing, and `--days 0 --apply` deleted it, leaving its predecessor's
+    /// `supersedes` edge pointing at a record that no longer exists: the dangling edge
+    /// the clause exists to prevent, produced by the clause itself.
+    #[test]
+    fn purge_spares_every_member_of_a_chain_including_the_live_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let ns = NamespaceConfig::default();
+        let u = &ns.uri;
+        let g = format!("{}graph/ws/test", u);
+
+        // a -> b -> c, every one of them stale and unread, so staleness is not what
+        // spares them. `c` is live: it has `supersedes` and no `supersededBy`.
+        let mut body = String::new();
+        for n in ["a", "b", "c"] {
+            body += &note_quads(u, &g, n, "2020-01-01T00:00:00Z", None, false);
+        }
+        body += &format!("<{u}note/b> <{u}supersedes> <{u}note/a> <{g}> .\n");
+        body += &format!("<{u}note/a> <{u}supersededBy> <{u}note/b> <{g}> .\n");
+        body += &format!("<{u}note/c> <{u}supersedes> <{u}note/b> <{g}> .\n");
+        body += &format!("<{u}note/b> <{u}supersededBy> <{u}note/c> <{g}> .\n");
+        let p = write_file(dir.path(), "graph.nq", &body);
+
+        let out = purge_stale(&p, &ns, 0, true).unwrap();
+        let remaining = fs::read_to_string(&p).unwrap();
+        for n in ["a", "b", "c"] {
+            assert!(
+                remaining.contains(&format!("note/{n}>")),
+                "chain member {n} was purged; deleted={} candidates={}",
+                out.deleted,
+                out.candidates
+            );
+        }
+        assert_eq!(out.deleted, 0, "a chain-only store has nothing to purge");
     }
 
     #[test]

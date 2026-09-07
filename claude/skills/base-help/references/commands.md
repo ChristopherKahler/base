@@ -216,6 +216,7 @@ base project move <slug> ... [--yes]     # preview unless --yes
 base graph compact
 base graph migrate                       # one-time domain backfill; snapshots, then atomic rewrite
 base graph purge --stale [--days N] [--apply]    # dry-run unless --apply
+base graph supersede <old> <new>                 # <new> replaces <old>; refuses a cycle or an ambiguous slug
 base graph move ... [--yes]              # preview unless --yes; backs up both tiers
 base domain remove <name>
 base relay dispose --project <p> [--force]       # preview unless --force

@@ -66,8 +66,8 @@ fn the_listing_orders_by_the_number_not_its_text() {
     let tmp = workspace();
     add_rules(tmp.path(), 12);
 
-    let rules = crud::rule::fetch(tmp.path(), &ns(), "probe").unwrap();
-    let numbers: Vec<u32> = rules.iter().map(|(n, _)| *n).collect();
+    let rules = crud::rule::fetch(tmp.path(), &ns(), "probe", false).unwrap();
+    let numbers: Vec<u32> = rules.iter().map(|(n, _, _)| *n).collect();
     assert_eq!(
         numbers,
         (0..12).collect::<Vec<u32>>(),
@@ -83,10 +83,62 @@ fn a_rule_past_the_tenth_can_still_be_removed() {
     add_rules(tmp.path(), 12);
     crud::rule::remove(tmp.path(), &ns(), "probe", 10).unwrap();
 
-    let left = crud::rule::fetch(tmp.path(), &ns(), "probe").unwrap();
+    let left = crud::rule::fetch(tmp.path(), &ns(), "probe", false).unwrap();
     assert_eq!(left.len(), 11, "one rule gone");
     assert!(
-        !left.iter().any(|(_, t)| t == "rule number 11"),
+        !left.iter().any(|(_, t, _)| t == "rule number 11"),
         "the eleventh rule is the one that went"
     );
+}
+
+/// auk's ruling, 2026-09-07. `rule list` and the domain block the prompt hook injects
+/// are both SERVING surfaces: what the agent receives must be the rule that stands.
+/// Before this, `sparql_exclude_superseded` was called in exactly two places --
+/// `crud/note.rs` (recall) and `domain/query.rs` (injection) -- and a superseded RULE
+/// went on being served by both surfaces that read `fetch`.
+///
+/// The filter lives in `fetch`, the shared reader, so the two cannot drift apart.
+#[test]
+fn a_superseded_rule_leaves_the_listing_and_comes_back_with_the_flag() {
+    let tmp = workspace();
+    add_rules(tmp.path(), 2);
+
+    // Rule 1 replaces rule 0. A rule is addressed by its IRI tail, not by its text.
+    crud::rule::add_with(
+        tmp.path(),
+        &ns(),
+        "probe",
+        "the corrected rule",
+        None,
+        Some("probe/cli-0"),
+    )
+    .unwrap();
+
+    let served = crud::rule::fetch(tmp.path(), &ns(), "probe", false).unwrap();
+    assert!(
+        !served.iter().any(|(_, t, _)| t == "rule number 1"),
+        "the superseded rule is still served: {served:?}"
+    );
+    assert!(
+        served.iter().any(|(_, t, _)| t == "the corrected rule"),
+        "the correction is not served, so the filter took everything: {served:?}"
+    );
+    assert!(
+        served.iter().all(|(_, _, superseded)| !superseded),
+        "a record flagged superseded survived the filter: {served:?}"
+    );
+
+    // Both halves. A filter that hides everything passes the first assert as well as a
+    // correct one does, so the chain must come back whole under the flag.
+    let all = crud::rule::fetch(tmp.path(), &ns(), "probe", true).unwrap();
+    assert_eq!(all.len(), served.len() + 1, "--include-superseded lost or gained a rule");
+    assert!(
+        all.iter().any(|(_, t, superseded)| t == "rule number 1" && *superseded),
+        "the superseded rule came back unmarked: {all:?}"
+    );
+
+    // Indices are ids: hiding one renumbers nothing, so `rule remove --index` keeps
+    // addressing what the operator saw.
+    let n2 = served.iter().find(|(_, t, _)| t == "rule number 2").map(|(n, _, _)| *n);
+    assert_eq!(n2, Some(1), "rule 1's number moved when rule 0 was hidden");
 }

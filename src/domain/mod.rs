@@ -434,7 +434,13 @@ pub fn rules_of(
     d: &DomainDef,
 ) -> (Vec<String>, Vec<(u32, String)>) {
     let declared: Vec<String> = d.rules.iter().map(|r| r.render()).collect();
-    let added = crate::crud::rule::fetch(cwd, ns, &d.name).unwrap_or_default();
+    // false: the domain block is a SERVING surface (auk, 2026-09-07). What the agent
+    // receives is the rule that stands, never the one it replaced.
+    let added: Vec<(u32, String)> = crate::crud::rule::fetch(cwd, ns, &d.name, false)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(pri, text, _)| (pri, text))
+        .collect();
     (declared, added)
 }
 

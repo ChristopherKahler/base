@@ -316,9 +316,23 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
                     // commands, recall, the domain block and the dashboard consult.
                     // A substring test stood here until PR #50 landed (kite F4).
                     &|id: &str| crate::ontology::transient::is_transient_iri(&config.namespace, id),
-                    // No drift resolution yet: the drift fork fills this with
-                    // `resolve_head`. `None` means "this record still stands".
-                    &|_id: &str| None,
+                    // The drift fork's fill. `None` means the record still stands;
+                    // `Some(head)` is the record that replaced it, so the walk
+                    // re-anchors rather than dropping the edge that reached it.
+                    //
+                    // `store` is the one `load_merged` already parsed above — the
+                    // whole reason this closure takes it rather than calling
+                    // `load_graph`. A load here would be a second full parse on
+                    // every prompt, and `store::GRAPH_LOADS` would catch it as a
+                    // red test rather than as a session that got quietly slower.
+                    //
+                    // `graph_query` ids carry angle brackets and `resolve_head`
+                    // walks bare IRIs, so the brackets come off and go back on.
+                    &|id: &str| {
+                        let bare = id.trim_start_matches('<').trim_end_matches('>');
+                        let head = crate::supersede::resolve_head(store, &config.namespace, bare);
+                        (head != bare).then(|| format!("<{head}>"))
+                    },
                 )
             }),
         _ => None,

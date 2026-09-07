@@ -6,6 +6,7 @@ use oxigraph::sparql::QueryResults;
 use crate::config::NamespaceConfig;
 use crate::crud;
 
+/// Thin delegate to [`log_with`] — see the note on `note::learn`.
 pub fn log(
     cwd: &Path,
     ns: &NamespaceConfig,
@@ -13,6 +14,19 @@ pub fn log(
     decision_text: &str,
     rationale: &str,
     recall: Option<&str>,
+) -> Result<String> {
+    log_with(cwd, ns, domain, decision_text, rationale, recall, None)
+}
+
+/// [`log`], plus the decision this one supersedes — both in one update.
+pub fn log_with(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    domain: &str,
+    decision_text: &str,
+    rationale: &str,
+    recall: Option<&str>,
+    supersedes: Option<&str>,
 ) -> Result<String> {
     let slug = format!("{}.{}", crud::slugify(domain), crud::slugify(decision_text));
     let iri = crud::build_iri(ns, "decision", &slug);
@@ -49,7 +63,13 @@ pub fn log(
          }}"
     );
 
-    crud::load_and_mutate(cwd, ns, &sparql)?;
+    // Named for the refusal: `--supersedes` resolves in the store THIS write
+    // loads and in no other, so the message has to say which one it searched.
+    let tier = crud::tier_label(cwd);
+    crud::load_read_then_mutate(cwd, ns, |store| {
+        let clause = crud::supersedes_clause(store, ns, &graph, &iri, supersedes, &tier)?;
+        Ok(format!("{sparql}{clause}"))
+    })?;
     Ok(slug)
 }
 

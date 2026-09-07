@@ -2,6 +2,7 @@ pub mod ast_map;
 pub mod ast_query;
 pub mod decision;
 pub mod semantic;
+pub mod supersede;
 pub mod entity;
 pub mod goal;
 pub mod handoff;
@@ -182,6 +183,40 @@ pub fn load_workspace_store(cwd: &Path) -> Result<(Store, PathBuf)> {
     Ok((store, trig_path))
 }
 
+/// Load the store once, let the writer READ from it before deciding what to
+/// write, then apply and persist — one parse, one write.
+///
+/// [`load_and_mutate`] takes a finished statement, which is right for a writer
+/// that already knows everything it needs. A writer that must first resolve
+/// something *against* the store — `--supersedes <slug>`, which has to find the
+/// record being corrected and refuse an ambiguous or cyclic one — would otherwise
+/// load to read and load again to write: two parses of a multi-megabyte file for
+/// one command.
+///
+/// The closure may fail, and a failure writes nothing: every `--supersedes`
+/// refusal (no match, two matches, self-reference, cycle) leaves the store exactly
+/// as it was.
+///
+/// kite's parked `fix/f7b-scoped-inherit` carries a helper of this shape under the
+/// name `load_and_mutate_with`. If that branch is ever revived it should reuse this
+/// one rather than land a second — the duplication is noted in the drift fork doc.
+pub fn load_read_then_mutate(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    build: impl FnOnce(&Store) -> Result<String>,
+) -> Result<()> {
+    let (store, trig_path) = load_workspace_store(cwd)?;
+    let sparql = build(&store)?;
+    let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
+    crate::store::update_and_write(
+        &store,
+        &trig_path,
+        &full_sparql,
+        crate::store::Scope::Target,
+        crate::store::Intent::Knowledge,
+    )
+}
+
 /// Load store, execute SPARQL UPDATE, write back atomically.
 pub fn load_and_mutate(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<()> {
     let (store, trig_path) = load_workspace_store(cwd)?;
@@ -206,6 +241,41 @@ pub fn load_and_query(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<
     let store = crate::store::load_graph(&trig_path)?;
     let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
     crate::store::query(&store, &full_sparql)
+}
+
+
+/// Which tier a write is about to touch, in words an operator can act on.
+///
+/// `--supersedes` resolves its slug in the store the WRITE loaded and in no other,
+/// so a refusal that does not say which store it searched reads as "that record does
+/// not exist" when the record exists one tier away. auk hit exactly that on
+/// 2026-09-07: a workspace `--supersedes <global slug>` was refused `no record
+/// matches`, which is #52's false-negative shape.
+pub fn tier_label(cwd: &Path) -> String {
+    match (crate::config::find_workspace_base(cwd), crate::config::global_base_dir()) {
+        (Some(base), Some(gbl)) if base == gbl => "the global tier".to_string(),
+        _ => format!("workspace '{}'", workspace_slug(cwd)),
+    }
+}
+
+/// The supersession statement a `--supersedes <slug>` flag contributes, or an empty
+/// string when the flag is absent.
+///
+/// Resolution and every refusal happen here, against the store the write has already
+/// loaded and BEFORE any statement is applied. Shared by `learn`, `decision log` and
+/// `rule add` so the three flags cannot drift apart.
+pub fn supersedes_clause(
+    store: &oxigraph::store::Store,
+    ns: &NamespaceConfig,
+    graph_iri: &str,
+    new_iri: &str,
+    supersedes: Option<&str>,
+    tier: &str,
+) -> Result<String> {
+    let Some(input) = supersedes else { return Ok(String::new()) };
+    let old_iri = supersede::resolve_slug(store, ns, input, tier)?;
+    let statement = supersede::link_statement(store, ns, graph_iri, &old_iri, new_iri)?;
+    Ok(format!(";\n{statement}"))
 }
 
 // ─── Name resolution ────────────────────────────────────────
