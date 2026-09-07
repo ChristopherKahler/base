@@ -215,6 +215,7 @@ fi
 
 # ── #89 ─────────────────────────────────────────────────────────────────────
 head_ "#89 notices persist through a build nobody watched"
+# Resolved BEFORE the fake HOME below replaces $HOME.
 BIN="${BASE_BIN:-$HOME/.cache/plover-target/release/base}"
 if [ ! -x "$BIN" ]; then
   skip "no branch binary at $BIN -- the end-to-end notice rows were NOT run"
@@ -229,25 +230,83 @@ else
   fi
   ok "the binary carries the branch-only '.last-notices' string ($hits occurrences)"
 
+  # `base sync --ast` resolves its extractor as
+  # ~/.base-gbl/scripts/ast/onto_ast.py -> cwd/scripts/ast/onto_ast.py
+  # (src/cli.rs:2047), and the HOME copy WINS. A harness that runs the branch
+  # binary from the worktree therefore drives whatever python the machine has
+  # installed, silently: the first version of this row did exactly that and read
+  # a missing notice as a defect in the branch. So: a fake HOME carrying the
+  # branch's own scripts, and the md5s printed side by side to prove which
+  # extractor actually ran.
+  # The grammars are a `pip install --user` under the REAL home, so a fake HOME
+  # hides them and the extractor dies on `No module named tree_sitter` -- which
+  # this row first read as "the branch wrote no notices". Resolve them before
+  # HOME moves and hand them to the child explicitly.
+  SITE="$($PY -c 'import tree_sitter, os; print(os.path.dirname(os.path.dirname(tree_sitter.__file__)))' 2>/dev/null)"
+  [ -n "$SITE" ] || die "cannot locate the tree-sitter site-packages to pass through a fake HOME"
+  say "  grammars at $SITE"
+  export PYTHONPATH="${SITE}${PYTHONPATH:+:$PYTHONPATH}"
+
+  FAKE="$WORK/home"; rm -rf "$FAKE"; mkdir -p "$FAKE/.base-gbl/scripts/ast"
+  cp "$WT"/scripts/ast/*.py "$WT"/scripts/ast/requirements.txt "$FAKE/.base-gbl/scripts/ast/"
+  a=$(md5sum "$WT/scripts/ast/onto_ast.py" | cut -d' ' -f1)
+  b=$(md5sum "$FAKE/.base-gbl/scripts/ast/onto_ast.py" | cut -d' ' -f1)
+  say "  extractor the binary will resolve: $b  (branch: $a)"
+  [ "$a" = "$b" ] || die "the fake HOME does not carry the branch's extractor"
+  ok "the binary resolves the BRANCH extractor, not the installed one"
+  export HOME="$FAKE"
+
   T="$WORK/e2e"; mkdir -p "$T"
   git -C "$T" init -q 2>/dev/null
   printf 'def alpha():\n    return 1\n' > "$T/a.py"
-  printf '<script>\nexport let x;\nfunction f() {}\n</script>\n' > "$T/b.svelte"
-  # A file the extractor cannot read at all, so there IS something to report.
-  printf '\x00\x01\x02 not source\n' > "$T/broken.py"
+  # Deeply nested markdown headings. This is the shape measured as the bulk of
+  # the residue on a real markdown-heavy tree (#82, a mid-level heading with
+  # containment in and out), and it is what makes the extractor emit the notice
+  # this row exists to follow. A null-byte file does NOT: tree-sitter reads it
+  # without complaint, so the first version of this fixture scored a SKIP and
+  # proved nothing.
+  printf '# Top\n\n## Second\n\n### Third\n\n#### Fourth\n\n##### Fifth\n\n###### Sixth\n\nProse.\n' > "$T/deep.md"
 
   (cd "$T" && BASE_AST_SKIP_REGISTER=1 "$BIN" sync --ast --yes --target . ) \
     > "$WORK/e2e.log" 2>&1
   rc=$?
   say "  sync exit $rc"
-  if [ -f "$T/.base-ast/.last-notices" ]; then
-    ok "a foreground --yes sync left .last-notices ($(wc -l < "$T/.base-ast/.last-notices") line(s))"
-    sed 's/^/        /' "$T/.base-ast/.last-notices"
-    grep -q "Extracting" "$T/.base-ast/.last-notices" \
-      && bad "the routine per-run line was persisted; it would become a banner" \
-      || ok "the routine 'Extracting N files' line is not persisted"
+  grep -E '^# ' "$WORK/e2e.log" | sed 's/^/        /'
+  N="$T/.base-ast/.last-notices"
+  E="$T/.base-ast/.last-error"
+  # A build that FAILED is a different fact from a build that had nothing to
+  # say, and reporting the second when the first happened is how an instrument
+  # blames the code for its own broken fixture.
+  if [ "$rc" -ne 0 ] || [ -f "$E" ]; then
+    bad "the extraction FAILED (exit $rc) -- this row proves nothing about notices:"
+    [ -f "$E" ] && sed 's/^/        /' "$E" | head -8
+    sed 's/^/        /' "$WORK/e2e.log" | head -6
+  elif [ ! -f "$N" ]; then
+    bad "a --yes sync that printed a notice left no .last-notices"
   else
-    skip "no .last-notices -- this fixture produced nothing worth reporting"
+    ok "the sync left .last-notices ($(wc -l < "$N") line(s))"
+    sed 's/^/        /' "$N"
+    if grep -q "attributed to the app root" "$N"; then
+      ok "the app-root counter survived a build whose output would otherwise be dropped"
+    else
+      bad "the counter is not in the persisted notices"
+    fi
+    if grep -q "Extracting" "$N"; then
+      bad "the routine per-run line was persisted; it would become a banner"
+    else
+      ok "the routine 'Extracting N files' line is not persisted"
+    fi
+
+    # And the silence half: a clean tree must CLEAR the record, not leave the
+    # last complaint standing.
+    C="$WORK/clean"; mkdir -p "$C"; git -C "$C" init -q 2>/dev/null
+    printf 'def beta():\n    return 2\n' > "$C/b.py"
+    (cd "$C" && BASE_AST_SKIP_REGISTER=1 "$BIN" sync --ast --yes --target . ) >/dev/null 2>&1
+    if [ -f "$C/.base-ast/.last-notices" ]; then
+      bad "a clean tree left a notice file:"; sed 's/^/        /' "$C/.base-ast/.last-notices"
+    else
+      ok "a tree with nothing to report leaves no notice file"
+    fi
   fi
 fi
 
