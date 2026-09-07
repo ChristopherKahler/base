@@ -907,10 +907,7 @@ fn migrate_carl(global_dir: &Path, carl_path: &Path) -> Result<()> {
     let config = BaseConfig::load(global_dir);
     match crate::domain::sync::sync_domains_to_graph(&config, global_dir, Some(carl_path)) {
         Ok(stats) => {
-            println!(
-                "✓ ({} domains, {} rules, {} decisions)",
-                stats.domains, stats.rules, stats.decisions
-            );
+            println!("✓ ({})", stats.summary(true));
         }
         Err(e) => {
             println!("⚠ Migration failed: {e}");

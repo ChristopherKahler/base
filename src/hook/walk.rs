@@ -166,7 +166,14 @@ pub fn walk(
 ) -> Vec<(Resolved, Vec<Record>)> {
     let (nodes, adj) = maps;
     let mut out = Vec::new();
+    // Records already in front of the reader this prompt: what the domain blocks
+    // served, then what this walk lists. A record is listed at most once.
     let mut emitted: HashSet<String> = already_served.clone();
+    // Roots this prompt already walked from, kept apart from `emitted` (#65): a
+    // name the domain block listed is still a request to expand it, because the
+    // block served its row and not its attachments. A served root walks; it is
+    // simply never listed as its own record.
+    let mut roots: HashSet<String> = HashSet::new();
 
     // The index the longest-match runs against: every label the graph carries,
     // normalised once. Built from maps the hook already holds, so a candidate
@@ -202,9 +209,10 @@ pub fn walk(
         if is_transient(&id) {
             continue;
         }
-        if !emitted.insert(id.clone()) {
+        if !roots.insert(id.clone()) {
             continue;
         }
+        emitted.insert(id.clone());
         let kind = iri_kind(&id).unwrap_or("record").to_string();
         let hops = hops_for(&kind);
 

@@ -2179,10 +2179,7 @@ pub fn run() {
             DomainAction::Sync { carl } => {
                 let carl_path = carl.as_ref().map(std::path::Path::new);
                 match domain::sync::sync_domains_to_graph(&config, &cwd, carl_path) {
-                    Ok(stats) => println!(
-                        "Domain sync complete: {} domains, {} rules, {} decisions",
-                        stats.domains, stats.rules, stats.decisions
-                    ),
+                    Ok(stats) => println!("Domain sync complete: {}", stats.summary(carl_path.is_some())),
                     Err(e) => die("Domain sync failed", e),
                 }
             }
