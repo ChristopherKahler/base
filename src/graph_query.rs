@@ -101,6 +101,43 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, question: &str, opts: &Options) -> 
         return Ok(());
     }
 
+    // `graph query` SYNTHESISES an answer, so it is a serving surface and must answer
+    // from the live version: a seed that a later record corrected would put the
+    // superseded text into the synthesis, which is the drift this fork exists to end.
+    //
+    // Applied to the SEEDS only, and after the load — never inside `load_graph`. That
+    // same function feeds `analyze`, `neighbors`, `path` and `get-node`, which are
+    // structure surfaces the verdict says must keep superseded records and show the
+    // edge. Filtering there would be the smaller diff and would silently break the
+    // two-class rule.
+    //
+    // The superseded node stays REACHABLE through the walk, so a chain still renders
+    // in the subgraph; it just cannot be the thing the answer is built from.
+    //
+    // One extra store load, on the same terms `get-node` takes it (auk, 2026-09-07):
+    // acceptable in a hand-typed command, never in a hook. `resolve_head` stays the
+    // single walker.
+    let seeds = match crate::config::find_workspace_base(cwd)
+        .and_then(|d| crate::store::load_graph(&d.join("graph.nq")).ok())
+    {
+        Some(store) => {
+            let mut live: Vec<String> = Vec::new();
+            for id in &seeds {
+                let bare = id.trim_start_matches('<').trim_end_matches('>');
+                let head = format!("<{}>", crate::supersede::resolve_head(&store, ns, bare));
+                // Only follow the chain to a node the graph actually holds; a head
+                // that is not in `nodes` would seed a walk from nothing and the query
+                // would answer with silence instead of the older-but-present record.
+                let target = if nodes.contains_key(&head) { head } else { id.clone() };
+                if !live.contains(&target) {
+                    live.push(target);
+                }
+            }
+            live
+        }
+        None => seeds,
+    };
+
     let hub = hub_threshold(&degree);
     let (visited, edges) = bfs(&adj, &seeds, opts.depth, hub, &degree);
     let subgraph = render(&nodes, &visited, &edges, &seeds, opts.token_budget);
