@@ -106,7 +106,10 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
 
     let trigger_ctx = TriggerContext {
         home: crate::home::home_root().map(|h| h.display().to_string()),
-        ..Default::default()
+        registered: graph_store
+            .as_ref()
+            .map(|s| crate::domain::registered_projects(s, &config.namespace, cwd))
+            .unwrap_or_default(),
     };
     let matched = match_domains_auto(&prompt, &domains, &active_paths, &trigger_ctx);
     if matched.is_empty() {
@@ -437,6 +440,14 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             session.prompt_count,
             deduped_count,
         ));
+        // An inert trigger is named on every prompt it would otherwise have judged, so a
+        // domain that stopped loading is never a silent drop (F29 step 6).
+        for (domain, trigger, fault) in crate::domain::matcher::inert_triggers(&domains, &trigger_ctx) {
+            output.push_str(&format!(
+                "  inert: {}\n",
+                crate::domain::matcher::fault_sentence(domain, trigger, &fault)
+            ));
+        }
         if !walk_note.is_empty() {
             output.push_str(&walk_note);
         }

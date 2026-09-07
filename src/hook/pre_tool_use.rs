@@ -118,16 +118,22 @@ pub fn handle(
             .iter()
             .filter_map(|p| p.to_str().map(String::from))
             .collect();
-        let matched = match_by_file(&domains, &file_path_strings);
-
-        // Sync BEFORE the single graph load so the store sees fresh rules.
-        if !matched.is_empty() {
-            crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
-        }
+        // Sync BEFORE the single graph load so the store sees fresh rules. Marker-gated,
+        // a no-op when fresh; it ran only for a matched domain until F29, and the match
+        // now needs the store (the registered projects decide which triggers are live).
+        crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
 
         // Single graph load per invocation — domain injection and PAUL
         // context both read from this store (Q2).
         let graph_store = crate::store::load_merged(cwd);
+        let trigger_ctx = domain::matcher::TriggerContext {
+            home: crate::home::home_root().map(|h| h.display().to_string()),
+            registered: graph_store
+                .as_ref()
+                .map(|s| domain::registered_projects(s, &config.namespace, cwd))
+                .unwrap_or_default(),
+        };
+        let matched = match_by_file(&domains, &file_path_strings, &trigger_ctx);
 
         for domain_def in &matched {
             // Session dedup: skip if this domain's rules were already injected.
@@ -511,6 +517,7 @@ fn context_mode_intercept(event: &serde_json::Value, cwd: &Path) -> Option<Strin
 fn match_by_file<'a>(
     domains: &'a [domain::DomainDef],
     file_paths: &[String],
+    ctx: &domain::matcher::TriggerContext,
 ) -> Vec<&'a domain::DomainDef> {
     domains
         .iter()
@@ -529,9 +536,8 @@ fn match_by_file<'a>(
             // Path match: a touched file lies under a trigger resolved against the tier
             // the domain came from — the one seam the prompt hook uses (F29), never a
             // substring test.
-            let home = crate::home::home_root().map(|h| h.display().to_string());
             let path_hit = d.paths.iter().any(|dp| {
-                domain::matcher::resolve_trigger(dp, d.root.as_deref(), home.as_deref())
+                domain::matcher::live_trigger(dp, d.root.as_deref(), ctx)
                     .is_some_and(|t| file_paths.iter().any(|fp| domain::matcher::path_under(fp, &t)))
             });
 

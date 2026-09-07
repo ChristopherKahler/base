@@ -35,6 +35,44 @@ pub struct DomainMatch<'a> {
 pub struct TriggerContext {
     /// The home directory, for `~`-relative triggers.
     pub home: Option<String>,
+    /// Every registered project, for the broadcast test: a trigger that is a prefix of
+    /// two or more of these is inert.
+    pub registered: Vec<Registered>,
+}
+
+/// A registered project as the trigger rules see it: its name and its path resolved
+/// the way `resolve_trigger` resolves a trigger, so the two compare.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Registered {
+    pub name: String,
+    pub path: String,
+}
+
+/// Why a path trigger is inert (F29, G0 step 6). It cannot fire; doctor names it per
+/// tier and devmode names it per prompt, so the drop is never silent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TriggerFault {
+    /// Not a rooted path: a glob, or a relative trigger with no tier root to resolve against.
+    Unrooted,
+    /// A prefix of the paths of two or more registered projects — a broadcast, not a trigger.
+    Covers(Vec<String>),
+}
+
+impl std::fmt::Display for TriggerFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unrooted => write!(
+                f,
+                "is not a rooted path; write it absolute, ~-relative or relative to the tier root"
+            ),
+            Self::Covers(names) => write!(
+                f,
+                "covers {} registered projects ({}); narrow it or set auto_inject = false",
+                names.len(),
+                names.join(", ")
+            ),
+        }
+    }
 }
 
 /// Match domains against prompt text and active file paths.
@@ -109,7 +147,9 @@ fn is_matched(
     // domain came from. The path that satisfied it rides along so devmode can name
     // the file.
     let path_hit = domain.paths.iter().find_map(|dp| {
-        let trigger = resolve_trigger(dp, domain.root.as_deref(), ctx.home.as_deref())?;
+        // An inert trigger (unrooted, or a broadcast over registered projects) cannot
+        // fire; doctor and devmode name it.
+        let trigger = live_trigger(dp, domain.root.as_deref(), ctx)?;
         active_paths.iter().find(|ap| path_under(ap, &trigger)).cloned()
     });
 
@@ -222,6 +262,52 @@ pub fn path_under(active: &str, trigger: &str) -> bool {
     } else {
         a[..t.len()] == t[..]
     }
+}
+
+/// One trigger, judged: the resolved path it names when it may fire, else its fault.
+/// `root` is the tier the domain came from.
+pub fn trigger_state(trigger: &str, root: Option<&str>, ctx: &TriggerContext) -> Result<String, TriggerFault> {
+    let Some(resolved) = resolve_trigger(trigger, root, ctx.home.as_deref()) else {
+        return Err(TriggerFault::Unrooted);
+    };
+    let covered: Vec<String> = ctx
+        .registered
+        .iter()
+        .filter(|r| path_under(&r.path, &resolved))
+        .map(|r| r.name.clone())
+        .collect();
+    if covered.len() >= 2 {
+        Err(TriggerFault::Covers(covered))
+    } else {
+        Ok(resolved)
+    }
+}
+
+/// The resolved path of a trigger that may fire; `None` for an inert one.
+pub fn live_trigger(trigger: &str, root: Option<&str>, ctx: &TriggerContext) -> Option<String> {
+    trigger_state(trigger, root, ctx).ok()
+}
+
+/// The fault of a trigger, if it has one.
+pub fn trigger_fault(trigger: &str, root: Option<&str>, ctx: &TriggerContext) -> Option<TriggerFault> {
+    trigger_state(trigger, root, ctx).err()
+}
+
+/// Every inert trigger across `domains` as (domain, trigger, fault), for doctor and devmode.
+pub fn inert_triggers<'a>(domains: &'a [DomainDef], ctx: &TriggerContext) -> Vec<(&'a str, &'a str, TriggerFault)> {
+    domains
+        .iter()
+        .flat_map(|d| {
+            d.paths
+                .iter()
+                .filter_map(move |t| trigger_fault(t, d.root.as_deref(), ctx).map(|f| (d.name.as_str(), t.as_str(), f)))
+        })
+        .collect()
+}
+
+/// The one sentence doctor prints and `add-trigger` refuses with.
+pub fn fault_sentence(domain: &str, trigger: &str, fault: &TriggerFault) -> String {
+    format!("path trigger `{trigger}` on `{domain}` {fault}")
 }
 
 #[cfg(test)]
@@ -400,6 +486,47 @@ mod tests {
         let domains = vec![domain];
         assert_eq!(match_domains("what is the weather", &domains, &[], &ctx()).len(), 1);
         assert!(match_domains("write a haiku about tea", &domains, &[], &ctx()).is_empty());
+    }
+
+    /// A trigger over two or more registered projects is a broadcast: inert, named. One
+    /// over a single project, or its own, is live. An unrooted one is inert too.
+    #[test]
+    fn a_broadcast_trigger_is_inert_and_named() {
+        let reg = |n: &str, p: &str| Registered { name: n.into(), path: p.into() };
+        let ctx = TriggerContext {
+            home: Some("/home/u".into()),
+            registered: vec![
+                reg("agentic-os", "c:/Users/x/Documents/agentic-os"),
+                reg("renda-group", "c:/Users/x/Documents/Meet Caddy/renda-group"),
+                reg("meet-caddy", "c:/Users/x/Documents/Meet Caddy"),
+                reg("stt", "c:/Users/x/Tools/stt"),
+                reg("hub", "c:/Users/x/Tools/hub"),
+            ],
+        };
+        let root = Some("C:/Users/x");
+        assert_eq!(
+            trigger_fault("Documents", root, &ctx),
+            Some(TriggerFault::Covers(vec!["agentic-os".into(), "renda-group".into(), "meet-caddy".into()]))
+        );
+        assert_eq!(trigger_fault("tools", root, &ctx), Some(TriggerFault::Covers(vec!["stt".into(), "hub".into()])));
+        assert_eq!(trigger_fault("Documents/Meet Caddy/renda-group", root, &ctx), None);
+        assert_eq!(trigger_fault("*.md", root, &ctx), Some(TriggerFault::Unrooted));
+        assert_eq!(trigger_fault("Documents", None, &ctx), Some(TriggerFault::Unrooted));
+
+        let mut broad = make_domain("vintrix", "triggered", &[], &["Rule"]);
+        broad.paths = vec!["Documents".into()];
+        broad.root = Some("C:/Users/x".into());
+        let touched = vec!["C:/Users/x/Documents/agentic-os/a.md".to_string()];
+        assert!(match_domains("hello", std::slice::from_ref(&broad), &touched, &ctx).is_empty());
+        let inert = inert_triggers(std::slice::from_ref(&broad), &ctx);
+        assert_eq!(inert.len(), 1);
+        assert_eq!(
+            fault_sentence(inert[0].0, inert[0].1, &inert[0].2),
+            "path trigger `Documents` on `vintrix` covers 3 registered projects (agentic-os, renda-group, meet-caddy); narrow it or set auto_inject = false"
+        );
+        // The same trigger with nothing registered under it is live.
+        let alone = TriggerContext { home: Some("/home/u".into()), registered: vec![reg("agentic-os", "c:/Users/x/Documents/agentic-os")] };
+        assert_eq!(match_domains("hello", std::slice::from_ref(&broad), &touched, &alone).len(), 1);
     }
 
     #[test]

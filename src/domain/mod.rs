@@ -219,6 +219,61 @@ fn rooted(mut domains: Vec<DomainDef>, root: Option<&Path>) -> Vec<DomainDef> {
     domains
 }
 
+/// The registered projects as the trigger rules see them: every `ops:Project` with a
+/// path, resolved against the tier its record lives in (the workspace root for the
+/// workspace graph, home for every other graph) in the shape `resolve_trigger`
+/// produces, so a trigger and a project path compare (F29 step 6).
+pub fn registered_projects(
+    store: &oxigraph::store::Store,
+    ns: &crate::config::NamespaceConfig,
+    cwd: &Path,
+) -> Vec<matcher::Registered> {
+    let p = &ns.prefix;
+    let sparql = format!(
+        "{}\nSELECT ?g ?name ?path WHERE {{ GRAPH ?g {{ ?proj a {p}:Project ; {p}:name ?name ; {p}:path ?path }} }}",
+        crate::crud::prefixes(ns)
+    );
+    let ws_graph = crate::crud::workspace_graph_iri(ns, &crate::crud::workspace_slug(cwd));
+    let ws_root = crate::config::find_workspace_base(cwd).and_then(|b| b.parent().map(|r| r.display().to_string()));
+    let home = crate::home::home_root().map(|h| h.display().to_string());
+    let mut out = Vec::new();
+    if let Ok(oxigraph::sparql::QueryResults::Solutions(rows)) = crate::store::query(store, &sparql) {
+        for row in rows.filter_map(|r| r.ok()) {
+            let lit = |k: &str| {
+                row.get(k).and_then(|t| match t.into() {
+                    oxigraph::model::TermRef::Literal(l) => Some(l.value().to_string()),
+                    _ => None,
+                })
+            };
+            let (Some(name), Some(path)) = (lit("name"), lit("path")) else {
+                continue;
+            };
+            let graph = row.get("g").and_then(|t| match t.into() {
+                oxigraph::model::TermRef::NamedNode(n) => Some(n.as_str().to_string()),
+                _ => None,
+            });
+            let root = if graph.as_deref() == Some(ws_graph.as_str()) { ws_root.as_deref() } else { home.as_deref() };
+            if let Some(resolved) = matcher::resolve_trigger(&path, root, home.as_deref()) {
+                out.push(matcher::Registered { name, path: resolved });
+            }
+        }
+    }
+    out
+}
+
+/// The trigger context a CLI reader builds for itself: home plus the registered
+/// projects of the merged store. The hooks build theirs from the store they already hold.
+pub fn trigger_context(cwd: &Path) -> matcher::TriggerContext {
+    let ns = crate::config::BaseConfig::load(cwd).namespace;
+    matcher::TriggerContext {
+        home: crate::home::home_root().map(|h| h.display().to_string()),
+        registered: crate::store::load_merged(cwd)
+            .as_ref()
+            .map(|s| registered_projects(s, &ns, cwd))
+            .unwrap_or_default(),
+    }
+}
+
 fn merge_domains(base: Vec<DomainDef>, overlay: Vec<DomainDef>) -> Vec<DomainDef> {
     let mut merged = base;
     for od in overlay {
