@@ -55,16 +55,24 @@ def _is_ignored(path: Path, root: Path, patterns: list[str]) -> bool:
     except ValueError:
         return False
 
-    rel_str = str(rel)
+    # Patterns are written with forward slashes (.gitignore habit); `rel` is
+    # backslash-separated on Windows, so `archive/` never matched
+    # `archive\\x\\y.ts` and 139 files under an ignored directory were still
+    # collected (#66). The Rust side already normalises the same way —
+    # `crud::normalize_path_sep`, src/crud/mod.rs:71.
+    rel_str = rel.as_posix()
 
     for pattern in patterns:
-        # Direct name match (e.g., "*.log")
+        # Direct name match (e.g., "*.log"). `match` is anchored at the RIGHT,
+        # so this catches globs and whole relative paths, never a directory
+        # prefix — that is what the third branch is for.
         if path.match(pattern):
             return True
-        # Check if any parent directory matches
+        # Check if any parent directory matches. Splits on real path
+        # components, so a bare `archive` already worked on both platforms.
         if "/" not in pattern and any(part == pattern for part in rel.parts):
             return True
-        # Glob-style match against relative path
+        # Directory prefix: `archive/`, `src/vendor/`. Both sides forward-slashed.
         if rel_str == pattern or rel_str.startswith(pattern.rstrip("/") + "/"):
             return True
 

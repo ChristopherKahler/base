@@ -2099,7 +2099,13 @@ pub fn run() {
                         .stdin(std::process::Stdio::null())
                         .stderr(std::process::Stdio::piped());
                     extractor.output().map(|o| {
-                        if !o.status.success() {
+                        if o.status.success() {
+                            // #66: `--yes` pipes stderr, so on success the
+                            // extractor's own notices — the file count, every
+                            // skipped file, the app-root attribution count —
+                            // used to be captured and dropped. Echo them.
+                            base::hook::automap::echo_extractor_notices(&o.stderr);
+                        } else {
                             let _ = std::fs::write(&last_error, base::hook::automap::stderr_tail(&o.stderr));
                         }
                         o.status

@@ -95,7 +95,22 @@ def extract_project(target: Path, project: str, full: bool = False, confirm: boo
             file_map[_make_id(str(f))] = rel
             file_map[_make_id(f"{_file_stem(f)}{f.suffix}")] = rel
             file_map.setdefault(f.name, rel)
-        return serialize(result, project, str(target), "multi", file_map=file_map)
+        stats: dict = {}
+        ttl = serialize(result, project, str(target), "multi", file_map=file_map, stats=stats)
+        # #66: an entity with no file node is attributed to the app root. Say so.
+        # Zero prints nothing. A foreground `base sync --ast --yes` echoes every
+        # `# ` line back on success (src/hook/automap.rs, echo_extractor_notices);
+        # the BACKGROUND refresh cannot show it to anyone, because both the Stop
+        # hook (automap.rs spawn_sync) and the git hook (ast_repo.rs) discard the
+        # child's output by design. See the follow-up issue on persisting notices.
+        orphans = stats.get("app_root_entities", 0)
+        if orphans:
+            noun = "entity" if orphans == 1 else "entities"
+            print(
+                f"# {orphans} {noun} attributed to the app root (no file node)",
+                file=sys.stderr,
+            )
+        return ttl
 
     chunks = []
     for file_path in files:
