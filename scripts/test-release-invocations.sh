@@ -84,6 +84,16 @@ while IFS= read -r line; do
 done < <(grep 'scripts/changelog\.py' .github/workflows/release.yml)
 [ "$found" -gt 0 ] || bad "no changelog.py invocation found in release.yml -- did it move?"
 
+# ── scripts/label-fixed-in.py ───────────────────────────────────────────────
+# The `fixed-in:<version>` window and the labelable filter (#57), proven without
+# the network: the doctests pin the arithmetic release.sh runs after the tag push.
+say "scripts/label-fixed-in.py"
+if python3 -m doctest scripts/label-fixed-in.py >/dev/null 2>"$TMP/err"; then
+  ok "doctest: the fixed-in window and the labelable filter"
+else
+  bad "$(head -3 "$TMP/err")"
+fi
+
 say ""
 if [ "$fail" -eq 0 ]; then
   say "PASS -- every command line the release assembles runs."
