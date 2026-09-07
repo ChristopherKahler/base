@@ -38,3 +38,28 @@ Every change is a branch and a pull request, even a one-line one. The PR title i
 ## Where things are discussed
 
 Questions and how-do-I threads go to the community, not the issue tracker. Design decisions that outlive a PR are logged in the graph with `base decision log`.
+
+## Licensing your contribution
+
+Read this before your first pull request. It is here so that a future licensing
+correction never means chasing down everyone who ever sent a patch.
+
+By opening a pull request against this repository you agree that:
+
+1. You wrote the contribution yourself, or you have the right to submit it, and
+   you are not knowingly submitting anyone else's copyrighted work.
+2. You license your contribution to the project and to everyone who receives
+   the project under the terms in [LICENSE.md](LICENSE.md).
+3. You grant Chris Kahler a perpetual, worldwide, irrevocable, royalty-free
+   right to **relicense** your contribution under any other terms, including
+   more permissive open source terms and including commercial terms. This is
+   what lets the project change its license without a hunt for signatures.
+4. You keep the copyright in your contribution. Nothing here assigns it. You
+   may go on using your own work anywhere, under any terms you like.
+
+Sign off each commit with `git commit -s`, which appends a `Signed-off-by:`
+line. That line is your record of agreeing to the four points above.
+
+If you are contributing on behalf of an employer, make sure you are allowed to.
+That is between you and them, and it is the one thing this project cannot check
+for you.
