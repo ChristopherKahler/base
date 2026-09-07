@@ -2117,11 +2117,14 @@ Options:
 ```text
 List rules for a domain from the graph
 
-Usage: base rule list --domain <DOMAIN>
+Usage: base rule list [OPTIONS] --domain <DOMAIN>
 
 Options:
       --domain <DOMAIN>
           
+
+      --include-superseded
+          Show rules that have been superseded, each marked `[superseded]`. Off by default: this listing is what the agent receives, so it serves the rule that stands. Indices are ids and never renumber
 
   -h, --help
           Print help
