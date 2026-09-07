@@ -349,6 +349,21 @@ pub fn maps_from_store(
             return;
         }
         adj.entry(a.clone()).or_default().push((b.clone(), rel.clone()));
+
+        // The mirror exists so reachability is undirected, and for every predicate
+        // where direction is a display detail that is the right trade. For the two
+        // supersession predicates the direction IS the claim, and the mirror made the
+        // renderers state its opposite: `get-node` listed `--supersedes--> <new>` under
+        // the OLD record, and `graph query` rendered `gamma --supersededBy--> beta`,
+        // whose synthesis then named the OLDEST record as the live one -- on the exact
+        // question this fork exists to settle. auk found it on md5 7bf502c9, 2026-09-07.
+        //
+        // Nothing is lost by dropping it: `link_update` writes BOTH halves as real
+        // quads, so each end already reaches the other from its own subject. Here the
+        // mirror could only ever add a line that is false.
+        if rel == crate::supersede::PRED_SUPERSEDES || rel == crate::supersede::PRED_SUPERSEDED_BY {
+            return;
+        }
         adj.entry(b).or_default().push((a, rel)); // undirected for reachability
     };
 
@@ -673,6 +688,57 @@ mod edge_loading_tests {
             .unwrap_or_default();
         v.sort();
         v
+    }
+
+    /// auk, 2026-09-07, on md5 7bf502c9. `push` mirrors every edge so reachability
+    /// is undirected, which for most predicates is a display quirk. For supersession
+    /// the direction IS the answer: the mirrored copy made `get-node` list
+    /// `--supersedes--> <new>` under the OLD record, and made `graph query` render
+    /// `gamma --supersededBy--> beta`, and the synthesis then named the OLDEST record
+    /// as the live one -- on the exact question this fork exists to settle.
+    ///
+    /// `link_update` writes BOTH halves as real quads, so for these two predicates the
+    /// mirror adds nothing to reachability and only ever adds a line that is false.
+    #[test]
+    fn a_supersession_edge_is_only_ever_listed_from_its_own_subject() {
+        let u = ns().uri;
+        let g = crate::crud::workspace_graph_iri(&ns(), "t");
+        let mut b = String::new();
+        b += &format!("<{u}note/old> <{RDF_TYPE}> <{u}Note> <{g}> .\n");
+        b += &format!("<{u}note/old> <{u}noteText> \"old\" <{g}> .\n");
+        b += &format!("<{u}note/new> <{RDF_TYPE}> <{u}Note> <{g}> .\n");
+        b += &format!("<{u}note/new> <{u}noteText> \"new\" <{g}> .\n");
+        // Exactly what `link_update` writes: both halves, each from its own subject.
+        b += &format!("<{u}note/new> <{u}supersedes> <{u}note/old> <{g}> .\n");
+        b += &format!("<{u}note/old> <{u}supersededBy> <{u}note/new> <{g}> .\n");
+
+        let dir = workspace(&b);
+        let (_nodes, adj) = load(&dir);
+        let (old, new) = (id("note/old"), id("note/new"));
+        let from_old = adj.get(&old).cloned().unwrap_or_default();
+        let from_new = adj.get(&new).cloned().unwrap_or_default();
+
+        assert!(
+            from_old.contains(&(new.clone(), "supersededBy".to_string())),
+            "the old record lost its OWN supersededBy edge: {from_old:?}"
+        );
+        assert!(
+            !from_old.contains(&(new.clone(), "supersedes".to_string())),
+            "the old record listed `supersedes`, of which it is the OBJECT: {from_old:?}"
+        );
+        assert!(
+            from_new.contains(&(old.clone(), "supersedes".to_string())),
+            "the new record lost its OWN supersedes edge: {from_new:?}"
+        );
+        assert!(
+            !from_new.contains(&(old.clone(), "supersededBy".to_string())),
+            "the new record listed `supersededBy`, of which it is the OBJECT: {from_new:?}"
+        );
+
+        // Reachability is unharmed: each end still reaches the other, because the
+        // paired quad supplies the direction the mirror used to fake.
+        assert!(from_old.iter().any(|(nb, _)| *nb == new), "old no longer reaches new");
+        assert!(from_new.iter().any(|(nb, _)| *nb == old), "new no longer reaches old");
     }
 
     /// Two named projects wired by a direct ontology predicate, plus the literal
