@@ -335,7 +335,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         let mut walk_deduped = 0usize;
         for (r, recs) in walked {
             let key = format!("walk:{}", r.id);
-            let h = crate::domain::session::rules_hash(&[r.id.clone()]);
+            let h = crate::domain::session::rules_hash(std::slice::from_ref(&r.id));
             if session.is_injected(&key, h) {
                 walk_deduped += 1;
                 continue;
@@ -362,7 +362,8 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         for (r, _) in walked {
             if block.contains(&format!("name=\"{}\"", r.name)) {
                 let key = format!("walk:{}", r.id);
-                session.mark_injected(&key, crate::domain::session::rules_hash(&[r.id.clone()]));
+                session
+                    .mark_injected(&key, crate::domain::session::rules_hash(std::slice::from_ref(&r.id)));
             }
         }
         if config.devmode.enabled {

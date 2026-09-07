@@ -96,7 +96,7 @@ pub fn candidates(prompt: &str, known: &dyn Fn(&str) -> bool) -> Vec<String> {
         while let Some(a) = rest.find(open) {
             let after = &rest[a + open.len_utf8()..];
             let Some(b) = after.find(close) else { break };
-            push(&after[..b].to_string(), &mut out, &mut seen);
+            push(&after[..b], &mut out, &mut seen);
             rest = &after[b + close.len_utf8()..];
         }
     }
