@@ -2,6 +2,7 @@ pub mod ast_map;
 pub mod ast_query;
 pub mod decision;
 pub mod semantic;
+pub mod supersede;
 pub mod entity;
 pub mod goal;
 pub mod handoff;
