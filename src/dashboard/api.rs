@@ -2297,17 +2297,10 @@ fn build_edges_sparql(ns: &crate::config::NamespaceConfig) -> String {
 
 // ─── Log Rotation ───────────────────────────────────────────
 
-/// Truncate hook-events.jsonl if > 10MB, keeping last 5000 lines.
+/// Truncate hook-events.jsonl if over the cap, keeping the last lines. The writer does the
+/// same on every append (#22); this call covers a log written by an older binary.
 pub fn rotate_hook_log(trig_path: &std::path::Path) {
-    let Some(base_dir) = trig_path.parent() else { return };
-    let log_path = base_dir.join("hook-events.jsonl");
-
-    let Ok(meta) = std::fs::metadata(&log_path) else { return };
-    if meta.len() < 10 * 1024 * 1024 { return; }
-
-    let Ok(content) = std::fs::read_to_string(&log_path) else { return };
-    let lines: Vec<&str> = content.lines().collect();
-    let keep = lines.len().saturating_sub(5000);
-    let tail: String = lines[keep..].join("\n") + "\n";
-    let _ = std::fs::write(&log_path, tail);
+    if let Some(base_dir) = trig_path.parent() {
+        crate::hook::rotate_hook_log(base_dir);
+    }
 }

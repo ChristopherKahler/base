@@ -70,6 +70,10 @@ const NOISE_DIRS: &[&str] = &[
 /// Extensions that make a bare folder a code project worth adopting.
 /// Deliberately narrower than what the extractor parses: a folder whose only
 /// "source" is a config.json is a folder, not an app.
+/// Files the extractor turns into entities that are not code: one `ops:Function` per
+/// markdown heading, so a content workspace counts toward the fuse like a code one (#40).
+const DOC_EXTS: &[&str] = &["md", "mdx", "markdown"];
+
 const CODE_EXTS: &[&str] = &[
     "rs", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "go", "java", "kt", "kts",
     "scala", "groovy", "c", "h", "cpp", "cc", "cxx", "hpp", "cs", "rb", "php",
@@ -192,10 +196,11 @@ pub fn ensure_app_map(root: &Path) -> MapPlan {
     // is a crashed build and no longer counts.
     let building = recently(&base_ast.join(".building"), BUILD_LOCK_SECS);
     let plan = plan_map(root, home.as_deref(), never, mapped, building || recently_synced(&marker));
-    // The fuse, on a FIRST build only. An existing map means the extractor
-    // already got through this tree once; re-measuring up to 50,000 entries on
-    // every Stop-hook refresh would cost more than the bug it guards against.
-    if plan == MapPlan::Build && fuse_blocks(root, &base_ast) {
+    // The fuse, on a first build AND on a refresh (#40): an existing map only proves the
+    // extractor got through once, not that it should run again after every turn. The
+    // refresh decision reads the counts recorded at the last measure, so a Stop hook never
+    // re-walks a large tree.
+    if matches!(plan, MapPlan::Build | MapPlan::Refresh) && fuse_blocks(root, &base_ast) {
         return MapPlan::NeedsConfirm;
     }
     match plan {
@@ -355,7 +360,7 @@ pub fn session_start_notice(cwd: &Path) -> Option<String> {
             root.display(),
             base_ast.display()
         )),
-        (MapPlan::NeedsConfirm, _) => Some(format!(
+        (MapPlan::NeedsConfirm, _) if first_showing(&base_ast) => Some(format!(
             "[AST] no code map for {}: {}",
             root.display(),
             std::fs::read_to_string(base_ast.join(".needs-confirm"))
@@ -997,7 +1002,10 @@ pub fn measure_tree(root: &Path) -> TreeSize {
                 && path
                     .extension()
                     .and_then(|e| e.to_str())
-                    .is_some_and(|e| CODE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+                    .is_some_and(|e| {
+                        let e = e.to_ascii_lowercase();
+                        CODE_EXTS.contains(&e.as_str()) || DOC_EXTS.contains(&e.as_str())
+                    })
             {
                 size.sources += 1;
                 if size.over_fuse() {
@@ -1021,13 +1029,55 @@ fn fuse_blocks(root: &Path, base_ast: &Path) -> bool {
     if recently(&base_ast.join(".needs-confirm"), NEEDS_CONFIRM_SECS) {
         return true;
     }
-    let size = measure_tree(root);
+    // A fresh measurement on record answers without walking (#40); a stale one is redone.
+    let recorded = base_ast.join(".tree-size");
+    let size = match recorded_size(&recorded) {
+        Some(size) => size,
+        None => {
+            let size = measure_tree(root);
+            let _ = std::fs::create_dir_all(base_ast);
+            let _ = std::fs::write(&recorded, format!("{} {}\n", size.sources, size.entries));
+            size
+        }
+    };
     if !size.over_fuse() {
         return false;
     }
     let _ = std::fs::create_dir_all(base_ast);
     let _ = std::fs::write(base_ast.join(".needs-confirm"), needs_confirm_text(root, &size));
     true
+}
+
+/// A refusal is surfaced once per marker (#40): the first session start after
+/// `.needs-confirm` is written says it; later ones stay quiet until the marker is renewed.
+fn first_showing(base_ast: &Path) -> bool {
+    let marker = base_ast.join(".needs-confirm");
+    let shown = base_ast.join(".needs-confirm-shown");
+    let newer = |a: &Path, b: &Path| match (std::fs::metadata(a).and_then(|m| m.modified()), std::fs::metadata(b).and_then(|m| m.modified())) {
+        (Ok(x), Ok(y)) => x >= y,
+        _ => false,
+    };
+    if newer(&shown, &marker) {
+        return false;
+    }
+    let _ = std::fs::write(&shown, b"");
+    true
+}
+
+/// The counts the last measure recorded in `.tree-size`, while they are fresh.
+fn recorded_size(path: &Path) -> Option<TreeSize> {
+    if !recently(path, NEEDS_CONFIRM_SECS) {
+        return None;
+    }
+    let s = std::fs::read_to_string(path).ok()?;
+    let mut it = s.split_whitespace();
+    Some(TreeSize { sources: it.next()?.parse().ok()?, entries: it.next()?.parse().ok()? })
+}
+
+/// #40: a plan and the fuse verdict, as one pure decision. `Build` and `Refresh` are
+/// both refused when the tree is over the fuse; nothing else is touched.
+pub fn gate(plan: MapPlan, over_fuse: bool) -> MapPlan {
+    if over_fuse && matches!(plan, MapPlan::Build | MapPlan::Refresh) { MapPlan::NeedsConfirm } else { plan }
 }
 
 /// The one line `.needs-confirm` holds, and the session-start notice reads back.

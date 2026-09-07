@@ -108,6 +108,17 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
     // go without one"). Detached and debounced; never the home directory, a
     // user folder, or a workspace that only holds other apps. The rules live
     // in `hook::automap`; only a FIRST build, or a failing one, is announced.
+    // #20: one line, only when the trail holds a failure; silent otherwise.
+    for (tier, base_dir) in crate::hook::hook_log_dirs(cwd) {
+        // Only when hooks are failing NOW. A hook that failed once and has
+        // succeeded since is history: `doctor` still reports it, but announcing it
+        // at every session start would be a permanent banner for a transient miss.
+        if let Some(t) = crate::hook::hook_failure_summary(&base_dir)
+            && t.broken_now
+        {
+            println!("[hooks] {tier} tier {} Run `base doctor`.", t.summary);
+        }
+    }
     if let Some(line) = crate::hook::automap::session_start_notice(cwd) {
         println!("{line}");
     }

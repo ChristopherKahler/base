@@ -67,11 +67,11 @@ fn extract_tool_context(event: &serde_json::Value) -> (Option<String>, Option<St
 /// Entry point for all hook events. Fail-open: any error → stderr only, exit 0, empty stdout.
 pub fn dispatch(event: &str) {
     let result = run(event);
-    let (success, data) = match &result {
-        Ok(d) => (true, Some(d)),
-        Err(_) => (false, None),
+    let (success, data, error) = match &result {
+        Ok(d) => (true, Some(d), None),
+        Err(e) => (false, None, Some(format!("{e:#}"))),
     };
-    log_hook_event(event, success, data);
+    log_hook_event(event, success, data, error);
     if let Err(e) = result {
         eprintln!("base hook {event}: {e:#}");
     }
@@ -253,8 +253,113 @@ fn relay_task_tick(
     }
 }
 
+/// The hook log is bounded by its own writer (#22): over this size the last
+/// [`HOOK_LOG_KEEP_LINES`] lines are kept and the rest dropped, whether or not a
+/// dashboard is ever opened. Same numbers the dashboard's rotation always used.
+pub const HOOK_LOG_CAP_BYTES: u64 = 10 * 1024 * 1024;
+pub const HOOK_LOG_KEEP_LINES: usize = 5000;
+
+/// Truncate `hook-events.jsonl` under `base_dir` to its last lines once it is over the cap.
+pub fn rotate_hook_log(base_dir: &std::path::Path) {
+    let log_path = base_dir.join("hook-events.jsonl");
+    let Ok(meta) = std::fs::metadata(&log_path) else { return };
+    if meta.len() < HOOK_LOG_CAP_BYTES {
+        return;
+    }
+    let Ok(content) = std::fs::read_to_string(&log_path) else { return };
+    let lines: Vec<&str> = content.lines().collect();
+    let keep = lines.len().saturating_sub(HOOK_LOG_KEEP_LINES);
+    let tail: String = lines[keep..].join("\n") + "\n";
+    let tmp = base_dir.join("hook-events.jsonl.tmp");
+    if std::fs::write(&tmp, tail).is_ok() {
+        let _ = std::fs::rename(&tmp, &log_path);
+    }
+}
+
+/// How many trailing events a failure summary reads. A trail, not history.
+pub const HOOK_FAILURE_WINDOW: usize = 200;
+
+/// #20: hooks fail open by design, so a broken hook looks like a quiet one. This reads the
+/// last [`HOOK_FAILURE_WINDOW`] events of a tier's log and names the failures, or `None`
+/// when there are none, so `doctor` and session start can say it happened.
+/// What the hook trail says, for `doctor` and for session start.
+///
+/// `broken_now` is the half that counts against health: a hook whose MOST RECENT
+/// event in the window failed is failing today. An older failure followed by
+/// successes is history — it stays in the line so an operator can see it happened,
+/// but treating it as unhealthy would hold `doctor` red for days after one
+/// transient miss (auk's ruling, 2026-09-07).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookTrail {
+    pub summary: String,
+    pub broken_now: bool,
+}
+
+pub fn hook_failure_summary(base_dir: &std::path::Path) -> Option<HookTrail> {
+    let content = std::fs::read_to_string(base_dir.join("hook-events.jsonl")).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let window = &lines[lines.len().saturating_sub(HOOK_FAILURE_WINDOW)..];
+    let mut failed = 0usize;
+    let mut last: Option<(String, String, String)> = None;
+    // The latest outcome per hook NAME, in window order: the last write wins, so
+    // after the loop this holds each hook's most recent result.
+    let mut latest: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for line in window {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let hook = v.get("hook").and_then(|h| h.as_str()).unwrap_or("?").to_string();
+        let ok = v.get("success").and_then(|s| s.as_bool()) != Some(false);
+        latest.insert(hook.clone(), ok);
+        if !ok {
+            failed += 1;
+            last = Some((
+                hook,
+                v.get("ts").and_then(|t| t.as_str()).unwrap_or("?").to_string(),
+                v.get("error").and_then(|e| e.as_str()).unwrap_or("(no error text; older binary)").to_string(),
+            ));
+        }
+    }
+    let (hook, ts, err) = last?;
+    let broken_now = latest.values().any(|ok| !ok);
+    let tail = if broken_now {
+        "That hook has not succeeded since."
+    } else {
+        "It has succeeded since, so this is history rather than a live fault."
+    };
+    Some(HookTrail {
+        summary: format!(
+            "hooks: {failed} failed of the last {} run(s); last: {hook} at {ts}: {err}. Hooks fail open, so the session never saw it. {tail}",
+            window.len()
+        ),
+        broken_now,
+    })
+}
+
+/// The tier log dirs a report can read: the workspace `.base` from `cwd`, then the global one.
+pub fn hook_log_dirs(cwd: &std::path::Path) -> Vec<(&'static str, std::path::PathBuf)> {
+    let mut out = Vec::new();
+    if let Some(ws) = crate::config::find_workspace_base(cwd) {
+        out.push(("workspace", ws));
+    }
+    if let Some(g) = crate::home::home_root().map(|h| h.join(".base-gbl").join(".base")).filter(|p| p.is_dir()) {
+        out.push(("global", g));
+    }
+    out
+}
+
+/// Append one event line, trimming the file first when it is over the cap. The writer
+/// owns its own bound; nothing else has to run for the trail to stay bounded.
+pub fn append_hook_event(base_dir: &std::path::Path, event: &serde_json::Value) {
+    rotate_hook_log(base_dir);
+    use std::io::Write;
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base_dir.join("hook-events.jsonl"))
+        .and_then(|mut f| writeln!(f, "{}", event));
+}
+
 /// Append a hook event to the JSONL log file. Fire-and-forget — never blocks hooks.
-fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>) {
+fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>, error: Option<String>) {
     let cwd = std::env::current_dir().unwrap_or_default();
     let base_dir = match crate::config::find_workspace_base(&cwd)
         .or_else(|| {
@@ -264,7 +369,6 @@ fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>) {
         None => return,
     };
 
-    let log_path = base_dir.join("hook-events.jsonl");
     let ts = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
     let empty = Vec::new();
 
@@ -272,6 +376,7 @@ fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>) {
         "ts": ts,
         "hook": hook,
         "success": success,
+        "error": error,
         "cwd": data.and_then(|d| d.cwd.clone()),
         "domains_matched": data.map(|d| &d.domains_matched).unwrap_or(&empty),
         "rules_injected": data.map(|d| d.rules_injected).unwrap_or(0),
@@ -286,12 +391,7 @@ fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>) {
         "section_context": data.map(|d| d.section_context).unwrap_or(false),
     });
 
-    use std::io::Write;
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .and_then(|mut f| writeln!(f, "{}", event));
+    append_hook_event(&base_dir, &event);
 }
 
 fn read_stdin() -> anyhow::Result<serde_json::Value> {

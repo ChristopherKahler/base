@@ -15,7 +15,6 @@
 //! so a future widening of those queries cannot leak pings without failing here.
 
 use std::path::Path;
-use std::sync::Mutex;
 
 use base::config::{BaseConfig, NamespaceConfig};
 use base::crud;
@@ -279,12 +278,12 @@ fn dashboard_graph_view_drops_ping_nodes_and_edges() {
     crud::note::learn(cwd, &ns(), "a real note in probe", "insight", Some("probe"), None, None).unwrap();
 
     let trig_path = cwd.join(".base").join("graph.nq");
-    let state = std::sync::Arc::new(base::dashboard::server::AppState {
-        store: Mutex::new(base::store::load_graph(&trig_path).unwrap()),
-        config: BaseConfig::load(cwd),
-        cwd: cwd.to_path_buf(),
-        trig_path,
-    });
+    let state = std::sync::Arc::new(base::dashboard::server::AppState::new(
+        BaseConfig::load(cwd),
+        cwd.to_path_buf(),
+        trig_path.clone(),
+        vec![trig_path],
+    ));
 
     let nodes = poll_once(base::dashboard::api::nodes(axum::extract::State(state.clone()))).0;
     assert!(
