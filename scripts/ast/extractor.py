@@ -1312,8 +1312,16 @@ _SWIFT_CONFIG = LanguageConfig(
 
 # ── Generic extractor ─────────────────────────────────────────────────────────
 
-def _extract_generic(path: Path, config: LanguageConfig) -> dict:
-    """Generic AST extractor driven by LanguageConfig."""
+def _extract_generic(
+    path: Path, config: LanguageConfig, source_override: bytes | None = None
+) -> dict:
+    """Generic AST extractor driven by LanguageConfig.
+
+    `source_override` replaces the bytes read from disk. Only single-file
+    components use it (#84), and only to blank the markup around their
+    `<script>` block; it is the same length as the file, so every offset and
+    line number the parser reports still points at the real file.
+    """
     try:
         mod = importlib.import_module(config.ts_module)
         from tree_sitter import Language, Parser
@@ -1340,7 +1348,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
 
     try:
         parser = Parser(language)
-        source = path.read_bytes()
+        source = path.read_bytes() if source_override is None else source_override
         tree = parser.parse(source)
         root = tree.root_node
     except Exception as e:
@@ -2229,6 +2237,49 @@ def extract_python(path: Path) -> dict:
     return result
 
 
+# Single-file components: the JavaScript grammar cannot read `<template>` or
+# `<style>`, so an SFC parses as an ERROR node the parser recovers from --
+# and WHAT it recovers is decided by the markup, not by the code. Measured on
+# de301d5 (#84): two files with identical `<script>` contents, `b_fn.vue` and
+# `d_fn.svelte`, gave a function and nothing; two `.vue` files differing by one
+# `export let` line did the same. The under-report was silent either way.
+_SFC_SUFFIXES = frozenset({".vue", ".svelte"})
+_SCRIPT_BLOCK = re.compile(rb"<script\b[^>]*>(.*?)</script\s*>", re.DOTALL | re.IGNORECASE)
+
+
+def _sfc_script_only(source: bytes) -> bytes | None:
+    """Blank every byte outside a `<script>` block, keeping offsets and lines.
+
+    Markup is replaced with spaces and newlines are preserved, so a byte offset
+    and a line number in the result mean exactly what they mean in the file --
+    `ops:sourceLine` stays right with no bookkeeping. Returns None when the
+    file carries no `<script>` block at all, which is the signal to parse it
+    whole: a `.vue` file that is plain JavaScript (no tags) already worked and
+    must keep working.
+    """
+    blocks = list(_SCRIPT_BLOCK.finditer(source))
+    if not blocks:
+        return None
+    out = bytearray(b" " * len(source))
+    for i, byte in enumerate(source):
+        if byte == 0x0A:
+            out[i] = 0x0A
+    for match in blocks:
+        start, end = match.span(1)
+        out[start:end] = source[start:end]
+    return bytes(out)
+
+
+def _sfc_source(path: Path) -> bytes | None:
+    """The parseable source for an SFC, or None to read the file as it is."""
+    if path.suffix not in _SFC_SUFFIXES:
+        return None
+    try:
+        return _sfc_script_only(path.read_bytes())
+    except OSError:
+        return None
+
+
 def extract_js(path: Path) -> dict:
     """Extract classes, functions, arrow functions, and imports from a .js/.ts/.tsx file."""
     if path.suffix == ".tsx":
@@ -2237,7 +2288,7 @@ def extract_js(path: Path) -> dict:
         config = _TS_CONFIG
     else:
         config = _JS_CONFIG
-    return _extract_generic(path, config)
+    return _extract_generic(path, config, _sfc_source(path))
 
 
 def extract_svelte(path: Path) -> dict:
@@ -2246,8 +2297,12 @@ def extract_svelte(path: Path) -> dict:
     Tree-sitter only sees the <script> block. Svelte template syntax like
     {#await import('./X.svelte')} lives in the markup layer and is invisible
     to the JS parser, so a regex pass covers those dynamic imports.
+
+    #84: the script block is isolated before parsing rather than handed to the
+    JS grammar inside its markup, which is what made extraction here depend on
+    the shape of the surrounding tags.
     """
-    result = _extract_generic(path, _JS_CONFIG)
+    result = _extract_generic(path, _JS_CONFIG, _sfc_source(path))
     try:
         import re as _re
         src = path.read_text(encoding="utf-8", errors="replace")
@@ -7376,6 +7431,9 @@ _DISPATCH: dict[str, Any] = {
     ".toc": extract_lua,
     ".zig": extract_zig,
     ".ps1": extract_powershell,
+    # #83: LANG_MAP claimed powershell for .psm1 and bash for .zsh while
+    # neither was ever parsed. The extractors were already correct for them.
+    ".psm1": extract_powershell,
     ".ex": extract_elixir,
     ".exs": extract_elixir,
     ".m": extract_objc,
@@ -7412,6 +7470,7 @@ _DISPATCH: dict[str, Any] = {
     ".lpk": extract_lazarus_package,
     ".sh": extract_bash,
     ".bash": extract_bash,
+    ".zsh": extract_bash,
     ".json": extract_json,
 }
 
