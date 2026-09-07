@@ -282,28 +282,56 @@ pub const HOOK_FAILURE_WINDOW: usize = 200;
 /// #20: hooks fail open by design, so a broken hook looks like a quiet one. This reads the
 /// last [`HOOK_FAILURE_WINDOW`] events of a tier's log and names the failures, or `None`
 /// when there are none, so `doctor` and session start can say it happened.
-pub fn hook_failure_summary(base_dir: &std::path::Path) -> Option<String> {
+/// What the hook trail says, for `doctor` and for session start.
+///
+/// `broken_now` is the half that counts against health: a hook whose MOST RECENT
+/// event in the window failed is failing today. An older failure followed by
+/// successes is history — it stays in the line so an operator can see it happened,
+/// but treating it as unhealthy would hold `doctor` red for days after one
+/// transient miss (auk's ruling, 2026-09-07).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookTrail {
+    pub summary: String,
+    pub broken_now: bool,
+}
+
+pub fn hook_failure_summary(base_dir: &std::path::Path) -> Option<HookTrail> {
     let content = std::fs::read_to_string(base_dir.join("hook-events.jsonl")).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     let window = &lines[lines.len().saturating_sub(HOOK_FAILURE_WINDOW)..];
     let mut failed = 0usize;
     let mut last: Option<(String, String, String)> = None;
+    // The latest outcome per hook NAME, in window order: the last write wins, so
+    // after the loop this holds each hook's most recent result.
+    let mut latest: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     for line in window {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if v.get("success").and_then(|s| s.as_bool()) == Some(false) {
+        let hook = v.get("hook").and_then(|h| h.as_str()).unwrap_or("?").to_string();
+        let ok = v.get("success").and_then(|s| s.as_bool()) != Some(false);
+        latest.insert(hook.clone(), ok);
+        if !ok {
             failed += 1;
             last = Some((
-                v.get("hook").and_then(|h| h.as_str()).unwrap_or("?").to_string(),
+                hook,
                 v.get("ts").and_then(|t| t.as_str()).unwrap_or("?").to_string(),
                 v.get("error").and_then(|e| e.as_str()).unwrap_or("(no error text; older binary)").to_string(),
             ));
         }
     }
     let (hook, ts, err) = last?;
-    Some(format!(
-        "hooks: {failed} failed of the last {} run(s); last: {hook} at {ts}: {err}. Hooks fail open, so the session never saw it.",
-        window.len()
-    ))
+    let broken_now = latest.values().any(|ok| !ok);
+    let tail = if broken_now {
+        "That hook has not succeeded since."
+    } else {
+        "It has succeeded since, so this is history rather than a live fault."
+    };
+    Some(HookTrail {
+        summary: format!(
+            "hooks: {failed} failed of the last {} run(s); last: {hook} at {ts}: {err}. Hooks fail open, so the session never saw it. {tail}",
+            window.len()
+        ),
+        broken_now,
+    })
 }
 
 /// The tier log dirs a report can read: the workspace `.base` from `cwd`, then the global one.

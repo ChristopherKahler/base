@@ -110,8 +110,8 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
     // in `hook::automap`; only a FIRST build, or a failing one, is announced.
     // #20: one line, only when the trail holds a failure; silent otherwise.
     for (tier, base_dir) in crate::hook::hook_log_dirs(cwd) {
-        if let Some(w) = crate::hook::hook_failure_summary(&base_dir) {
-            println!("[hooks] {tier} tier {w} Run `base doctor`.");
+        if let Some(t) = crate::hook::hook_failure_summary(&base_dir) {
+            println!("[hooks] {tier} tier {} Run `base doctor`.", t.summary);
         }
     }
     if let Some(line) = crate::hook::automap::session_start_notice(cwd) {
