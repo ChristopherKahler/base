@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-PolyForm_Noncommercial-0B63D6?style=flat-square" alt="License: PolyForm Noncommercial 1.0.0"></a>
+  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-0B63D6?style=flat-square" alt="License: Functional Source License 1.1, Apache 2.0 future license"></a>
   <img src="https://img.shields.io/badge/version-0.14.1-12263A?style=flat-square" alt="Version 0.14.1">
   <img src="https://img.shields.io/badge/rust-single_binary-2F4A63?style=flat-square&logo=rust&logoColor=white" alt="Rust, single binary">
   <img src="https://img.shields.io/badge/built_for-Claude_Code-C2551F?style=flat-square" alt="Built for Claude Code">
@@ -233,7 +233,19 @@ Going deeper: [hook configuration](docs/settings-hook-config.md) · [workspace s
 
 ## License
 
-basemode is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You can use it, study it, and modify it for any noncommercial purpose. Commercial use — including reselling, repackaging, or building it into a product — requires a separate commercial license granted individually, with approval and terms. Reach out via [basemode.ai](https://basemode.ai).
+base is source-available under the [Functional Source License 1.1](LICENSE.md)
+with an Apache 2.0 future license. **Commercial use is permitted.** You can run
+it at work, inside a company of any size, modify it, and build and sell products
+that use it. The only thing the license withholds is selling base itself, or a
+service that stands in for base or for basemode.
+
+Every version becomes Apache 2.0 two years after it ships. That grant is
+irrevocable and it lives in the license text.
+
+Extensions and adapters you write against base's documented interfaces are your
+own work under an explicit exception, and you may license them however you like,
+including commercially. Full detail, including what happens to versions released
+before v0.14.1, is in [LICENSING.md](LICENSING.md).
 
 ---
 
