@@ -73,9 +73,16 @@ pub fn sparql_exclude_superseded(ns: &NamespaceConfig, var: &str) -> String {
 /// The live end of `iri`'s supersession chain, or `iri` itself when nothing
 /// supersedes it.
 ///
-/// Walks `supersededBy` forward across ANY graph: a workspace correction to a global
-/// note puts both edges in the workspace graph (the tier of the NEW record, per the
-/// G0 verdict), and a merged read must still find them.
+/// Walks `supersededBy` forward across ANY graph, because a merged read spans both
+/// tiers and every workspace graph, and an edge is followed wherever it was written.
+///
+/// The G0 verdict described a workspace correction to a global note landing both edges
+/// in the workspace graph. The CLI does not write that: `crud::supersede::resolve_slug`
+/// searches only the store the write loaded, so both ends of a `--supersedes` or a
+/// `graph supersede` are in ONE tier and a cross-tier slug is refused by name (auk,
+/// 2026-09-07). The graph-crossing walk is therefore about graphs within a merged
+/// read, not about a cross-tier write the writer cannot make. Cross-tier resolution,
+/// if it is wanted, is its own fork.
 ///
 /// Terminates on a visited set. A cycle cannot be written — [`would_cycle`] refuses
 /// it — but the walk runs inside the prompt-submit hook, and a hook that hangs on
@@ -153,9 +160,10 @@ pub fn would_cycle(store: &Store, ns: &NamespaceConfig, old_iri: &str, new_iri: 
 /// second and the third, leaving a record that reads as superseded to one surface and
 /// live to another — the exact ambiguity this fork exists to remove.
 ///
-/// `graph_iri` is the tier of the NEW record (G0 verdict): a workspace correction to a
-/// global note puts both edges in the workspace graph, where [`resolve_head`] finds
-/// them on a merged read.
+/// `graph_iri` is the graph of the store the caller loaded, which today is also the
+/// tier of BOTH records: the writer resolves each end in one store, so a cross-tier
+/// pair never reaches this function (auk, 2026-09-07). [`resolve_head`] finds the
+/// edges on a merged read wherever they were written.
 pub fn link_update(ns: &NamespaceConfig, graph_iri: &str, old_iri: &str, new_iri: &str) -> String {
     let p = &ns.prefix;
     format!(

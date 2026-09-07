@@ -78,8 +78,11 @@ pub fn add_with(
          }}"
     );
 
+    // Named for the refusal: `--supersedes` resolves in the store THIS write
+    // loads and in no other, so the message has to say which one it searched.
+    let tier = crud::tier_label(cwd);
     crud::load_read_then_mutate(cwd, ns, |store| {
-        let clause = crud::supersedes_clause(store, ns, &graph, &rule_iri, supersedes)?;
+        let clause = crud::supersedes_clause(store, ns, &graph, &rule_iri, supersedes, &tier)?;
         Ok(format!("{sparql}{clause}"))
     })?;
     Ok(next_index)

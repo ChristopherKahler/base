@@ -244,6 +244,20 @@ pub fn load_and_query(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<
 }
 
 
+/// Which tier a write is about to touch, in words an operator can act on.
+///
+/// `--supersedes` resolves its slug in the store the WRITE loaded and in no other,
+/// so a refusal that does not say which store it searched reads as "that record does
+/// not exist" when the record exists one tier away. auk hit exactly that on
+/// 2026-09-07: a workspace `--supersedes <global slug>` was refused `no record
+/// matches`, which is #52's false-negative shape.
+pub fn tier_label(cwd: &Path) -> String {
+    match (crate::config::find_workspace_base(cwd), crate::config::global_base_dir()) {
+        (Some(base), Some(gbl)) if base == gbl => "the global tier".to_string(),
+        _ => format!("workspace '{}'", workspace_slug(cwd)),
+    }
+}
+
 /// The supersession statement a `--supersedes <slug>` flag contributes, or an empty
 /// string when the flag is absent.
 ///
@@ -256,9 +270,10 @@ pub fn supersedes_clause(
     graph_iri: &str,
     new_iri: &str,
     supersedes: Option<&str>,
+    tier: &str,
 ) -> Result<String> {
     let Some(input) = supersedes else { return Ok(String::new()) };
-    let old_iri = supersede::resolve_slug(store, ns, input)?;
+    let old_iri = supersede::resolve_slug(store, ns, input, tier)?;
     let statement = supersede::link_statement(store, ns, graph_iri, &old_iri, new_iri)?;
     Ok(format!(";\n{statement}"))
 }

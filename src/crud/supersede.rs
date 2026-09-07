@@ -31,7 +31,12 @@ use crate::supersede;
 /// matches are both errors, and the two-match error names both candidates so the
 /// operator can retype an unambiguous one; guessing would silently correct the
 /// wrong record.
-pub fn resolve_slug(store: &Store, ns: &NamespaceConfig, input: &str) -> Result<String> {
+pub fn resolve_slug(
+    store: &Store,
+    ns: &NamespaceConfig,
+    input: &str,
+    tier: &str,
+) -> Result<String> {
     // Two candidate tails, not one. `crud::slugify` is for turning free text into a
     // slug; applied to a slug that already exists it can change it -- `decision log`
     // builds `{domain}.{decision}`, and re-slugifying that dotted form matches no
@@ -53,9 +58,18 @@ pub fn resolve_slug(store: &Store, ns: &NamespaceConfig, input: &str) -> Result<
 
     match hits.len() {
         1 => Ok(hits.remove(0)),
-        0 => bail!("no record matches '{input}' (slug '{slug}') — nothing was written"),
+        // The tier is named because this searched ONE store. `--supersedes` resolves
+        // in the tier the write lands in and in no other, so a bare "no record
+        // matches" reads as "that record does not exist" when it exists one tier
+        // away -- #52's false-negative shape, hit by auk on 2026-09-07. Cross-tier
+        // resolution is a separate fork; until it exists the message has to say so.
+        0 => bail!(
+            "no record matches '{input}' (slug '{slug}') in {tier} - nothing was \
+             written. Only that tier was searched: correct a global record from the \
+             global tier with `--global`, and a workspace record from its workspace."
+        ),
         _ => bail!(
-            "'{input}' (slug '{slug}') matches {} records and would be ambiguous — \
+            "'{input}' (slug '{slug}') matches {} records in {tier} and would be \
              name one of them exactly: {}. Nothing was written.",
             hits.len(),
             hits.join(", ")
@@ -90,13 +104,19 @@ pub fn link_statement(
 
 /// `base graph supersede <old> <new>` — the standalone primitive.
 ///
-/// The edge pair lands in the tier of the NEW record (G0 verdict): a workspace
-/// correction to a global note puts both edges in the workspace graph, where
-/// [`supersede::resolve_head`] finds them on a merged read.
+/// SINGLE TIER, both ends. This loads the workspace store for `cwd` and resolves
+/// BOTH slugs in it, so a global record cannot be named from a workspace and a
+/// workspace record cannot be named from the global tier -- the refusal says which
+/// store it searched. The G0 verdict's "a workspace correction to a global note puts
+/// both edges in the workspace graph" describes a write the CLI refuses; cross-tier
+/// resolution is its own fork (auk, 2026-09-07). The edge pair lands in the graph of
+/// the store that was loaded, where [`supersede::resolve_head`] finds it on a merged
+/// read.
 pub fn supersede(cwd: &Path, ns: &NamespaceConfig, old: &str, new: &str) -> Result<(String, String)> {
     let (store, trig_path) = crud::load_workspace_store(cwd)?;
-    let old_iri = resolve_slug(&store, ns, old)?;
-    let new_iri = resolve_slug(&store, ns, new)?;
+    let tier = crud::tier_label(cwd);
+    let old_iri = resolve_slug(&store, ns, old, &tier)?;
+    let new_iri = resolve_slug(&store, ns, new, &tier)?;
     let graph = crud::workspace_graph_iri(ns, &crud::workspace_slug(cwd));
 
     let statement = link_statement(&store, ns, &graph, &old_iri, &new_iri)?;
@@ -138,9 +158,33 @@ mod tests {
         let ns = ns();
         let g = format!("{}graph/ws/t", ns.uri);
         let store = store_with(&one_note(&ns.uri, &g, "alpha"));
-        let err = resolve_slug(&store, &ns, "missing").unwrap_err().to_string();
+        let err = resolve_slug(&store, &ns, "missing", "workspace 't'").unwrap_err().to_string();
         assert!(err.contains("no record matches 'missing'"), "{err}");
         assert!(err.contains("nothing was written"), "{err}");
+        // auk, 2026-09-07: this searched ONE store, so "no record matches" alone is
+        // #52's false-negative shape -- it reads as "that record does not exist" when
+        // the record exists one tier away. The message names the tier it searched and
+        // how to reach the other one.
+        assert!(err.contains("workspace 't'"), "the refusal does not name the tier: {err}");
+        assert!(err.contains("--global"), "the refusal does not say how to reach the other tier: {err}");
+    }
+
+    /// `tier_label` is what the refusal above prints, so it is pinned rather than
+    /// trusted: a workspace cwd names its workspace, and the global tier root names
+    /// itself. The global arm is what tells an operator `--global` is the fix.
+    #[test]
+    fn the_tier_label_separates_a_workspace_from_the_global_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("myproj");
+        std::fs::create_dir_all(ws.join(".base")).unwrap();
+        assert_eq!(crud::tier_label(&ws), "workspace 'myproj'");
+
+        // The global tier is `<home>/.base-gbl`, and `find_workspace_base` returns
+        // its `.base` directly for that exact root -- the same path comparison the
+        // label makes, so the two cannot drift apart.
+        if let Some(home) = crate::home::home_root() {
+            assert_eq!(crud::tier_label(&home.join(".base-gbl")), "the global tier");
+        }
     }
 
     #[test]
@@ -153,7 +197,7 @@ mod tests {
             "{}<{u}decision/alpha> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{u}Decision> <{g}> .\n",
             one_note(u, &g, "alpha")
         );
-        let err = resolve_slug(&store_with(&nq), &ns, "alpha").unwrap_err().to_string();
+        let err = resolve_slug(&store_with(&nq), &ns, "alpha", "workspace 't'").unwrap_err().to_string();
         assert!(err.contains("matches 2 records"), "{err}");
         assert!(err.contains("note/alpha") && err.contains("decision/alpha"), "{err}");
     }
@@ -167,7 +211,7 @@ mod tests {
             "<{u}decision/use-rust> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{u}Decision> <{g}> .\n"
         );
         assert_eq!(
-            resolve_slug(&store_with(&nq), &ns, "Use Rust").unwrap(),
+            resolve_slug(&store_with(&nq), &ns, "Use Rust", "workspace 't'").unwrap(),
             format!("{u}decision/use-rust"),
             "the input is slugified, and no kind list gates the match"
         );
