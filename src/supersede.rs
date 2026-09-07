@@ -213,10 +213,11 @@ pub fn audit(store: &Store, ns: &NamespaceConfig) -> Audit {
     let mk = |local: &str| format!("{}{local}", ns.uri);
     let (sup_by_s, status_s, note_type_s) =
         (mk(PRED_SUPERSEDED_BY), mk("status"), mk("noteType"));
-    let iri = |s: &str| NamedNodeRef::new(s).ok();
-    let (Some(sup_by), Some(status_p), Some(note_type)) =
-        (iri(&sup_by_s), iri(&status_s), iri(&note_type_s))
-    else {
+    let (Ok(sup_by), Ok(status_p), Ok(note_type)) = (
+        NamedNodeRef::new(&sup_by_s),
+        NamedNodeRef::new(&status_s),
+        NamedNodeRef::new(&note_type_s),
+    ) else {
         return out;
     };
 
