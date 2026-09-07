@@ -24,29 +24,28 @@ pub fn add(
     let name = crud::escape_sparql_literal(name);
     let desc = crud::escape_sparql_literal(description.unwrap_or(""));
 
-    let sparql = format!(
-        "INSERT DATA {{\n\
-           GRAPH <{graph}> {{\n\
-             <{ms_iri}> rdf:type {p}:Milestone ;\n\
-               {p}:name \"{name}\" ;\n\
-               {p}:status \"active\" ;\n\
-               {p}:description \"{desc}\" ;\n\
-               {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
-               {p}:lastActive \"{now}\"^^xsd:dateTime ;\n\
-               {p}:belongsTo <{project_iri}> .\n\
-             <{project_iri}> {p}:hasMilestone <{ms_iri}> .\n\
-           }}\n\
-         }}"
-    );
-
     // The milestone takes its project's domain now rather than at the next session
-    // start (kite F7b). A project with no domain links nothing here; the delta pass
-    // files it.
-    let sparql = format!(
-        "{sparql};\n{}",
-        crate::domain::link::inherit_update(ns, &graph, &ms_iri, &project_iri)
-    );
-    crud::load_and_mutate(cwd, ns, &sparql)?;
+    // start (kite F7b): read off the store this write already loads, inserted as a
+    // constant (kite F23 — an INSERT ... WHERE here cost 5 s per write). A project with
+    // no domain links nothing here; the delta pass files it.
+    crud::load_and_mutate_with(cwd, ns, |store| {
+        let domain_link = crate::domain::link::inherited_triple(store, ns, &ms_iri, &project_iri);
+        format!(
+            "INSERT DATA {{\n\
+               GRAPH <{graph}> {{\n\
+                 <{ms_iri}> rdf:type {p}:Milestone ;\n\
+                   {p}:name \"{name}\" ;\n\
+                   {p}:status \"active\" ;\n\
+                   {p}:description \"{desc}\" ;\n\
+                   {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
+                   {p}:lastActive \"{now}\"^^xsd:dateTime ;\n\
+                   {p}:belongsTo <{project_iri}> .\n\
+                 <{project_iri}> {p}:hasMilestone <{ms_iri}> .\n\
+                 {domain_link}\
+               }}\n\
+             }}"
+        )
+    })?;
     Ok(slug)
 }
 

@@ -132,31 +132,58 @@ pub fn domain_index(
     out
 }
 
-/// A SPARQL UPDATE that gives `subject_iri` the domain its `parent_iri` already carries,
-/// in `graph_iri`, at creation time: a Task takes its project's domain, a Handoff the
-/// domain of the project it names (kite F7b, vole's ruling of 2026-09-06 that the claim
-/// "every record carries a domain" must not wait for the next session start when the
-/// parent already knows the answer).
+/// The domain IRI `iri` carries, under either predicate, in any graph of `store` — or
+/// `None`. Two index lookups on a bound subject, no SPARQL.
 ///
-/// Nothing is written when the parent has no domain. Inventing the catchall here would
-/// give two places ownership of `unfiled`; the session-start delta pass (`migrate.rs`)
-/// files such a record exactly as it files everything else that arrived without a link.
-/// The object filter keeps `relatedTo`'s entity and project links out, as everywhere
-/// else in this module.
-pub fn inherit_update(
+/// This is how a record takes its parent's domain at creation: a Task its project's, a
+/// Handoff the project's it names (kite F7b, vole's ruling of 2026-09-06 that "every
+/// record carries a domain" must not wait for the next session start when the parent
+/// already knows). The writer reads this off the store it has already loaded and inserts
+/// the answer as a constant in its own `INSERT DATA`. The first version appended an
+/// `INSERT ... WHERE` with a property path instead, and that cost 5 s per `base task add`
+/// on a 60,000-quad store (kite F23): what was meant as a lookup was planned as a scan.
+///
+/// `None` when the parent has no domain. Inventing the catchall here would give two
+/// places ownership of `unfiled`; the session-start delta pass (`migrate.rs`) files such
+/// a record exactly as it files everything else that arrived without a link. The object
+/// filter keeps `relatedTo`'s entity and project links out, as everywhere in this module.
+/// Ties (a parent carrying two domains) resolve to the lexicographically first IRI, so
+/// two writes of the same record agree.
+pub fn domain_of(store: &oxigraph::store::Store, ns: &NamespaceConfig, iri: &str) -> Option<String> {
+    use oxigraph::model::{NamedNodeRef, Term};
+    let subject = NamedNodeRef::new(iri).ok()?;
+    let dom = domain_iri_prefix(ns);
+    let mut found: Vec<String> = Vec::new();
+    for pred in [CANONICAL, LEGACY] {
+        let pred_iri = format!("{}{pred}", ns.uri);
+        let Ok(pred) = NamedNodeRef::new(&pred_iri) else { continue };
+        for q in store
+            .quads_for_pattern(Some(subject.into()), Some(pred), None, None)
+            .filter_map(Result::ok)
+        {
+            if let Term::NamedNode(d) = q.object
+                && d.as_str().starts_with(dom.as_str())
+            {
+                found.push(d.as_str().to_string());
+            }
+        }
+    }
+    found.sort();
+    found.into_iter().next()
+}
+
+/// The `hasDomain` triple for `subject_iri` if its parent has a domain, as a line ready
+/// for an `INSERT DATA` block, else an empty string. See [`domain_of`].
+pub fn inherited_triple(
+    store: &oxigraph::store::Store,
     ns: &NamespaceConfig,
-    graph_iri: &str,
     subject_iri: &str,
     parent_iri: &str,
 ) -> String {
-    let p = &ns.prefix;
-    let path = path(ns);
-    let dom = domain_iri_prefix(ns);
-    format!(
-        "INSERT {{ GRAPH <{graph_iri}> {{ <{subject_iri}> {p}:{CANONICAL} ?d }} }}\n\
-         WHERE {{ GRAPH <{graph_iri}> {{ <{parent_iri}> {path} ?d .\n\
-           FILTER(isIRI(?d) && STRSTARTS(STR(?d), \"{dom}\")) }} }}"
-    )
+    match domain_of(store, ns, parent_iri) {
+        Some(d) => format!("             <{subject_iri}> {}:{CANONICAL} <{d}> .\n", ns.prefix),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -201,14 +228,33 @@ mod tests {
     }
 
     #[test]
-    fn inherit_update_writes_the_canonical_predicate_from_the_parents_domain() {
-        let u = inherit_update(&ns(), "g", "s", "parent");
-        assert!(u.starts_with("INSERT { GRAPH <g> { <s> ops:hasDomain ?d } }"), "{u}");
-        assert!(u.contains("WHERE { GRAPH <g> { <parent> (ops:hasDomain|ops:relatedTo) ?d ."), "{u}");
-        assert!(
-            u.contains("STRSTARTS(STR(?d), \"http://ops-sys.local/ontology#domain/\")"),
-            "relatedTo also carries entity and project links; the object filter must be there: {u}"
+    fn domain_of_reads_either_predicate_and_only_domain_objects() {
+        use oxigraph::store::Store;
+        let ns = ns();
+        let u = &ns.uri;
+        let g = format!("{u}graph/ws/t");
+        let store = Store::new().unwrap();
+        let nq = format!(
+            "<{u}project/p1> <{u}hasDomain> <{u}domain/base> <{g}> .\n\
+             <{u}note/n1> <{u}relatedTo> <{u}domain/basemode> <{g}> .\n\
+             <{u}note/n2> <{u}relatedTo> <{u}entity/e1> <{g}> .\n\
+             <{u}project/p2> <{u}hasDomain> <{u}domain/zeta> <{g}> .\n\
+             <{u}project/p2> <{u}hasDomain> <{u}domain/alpha> <{g}> .\n"
         );
+        store.load_from_reader(oxigraph::io::RdfFormat::NQuads, nq.as_bytes()).unwrap();
+
+        assert_eq!(domain_of(&store, &ns, &format!("{u}project/p1")).as_deref(), Some(format!("{u}domain/base").as_str()));
+        assert_eq!(domain_of(&store, &ns, &format!("{u}note/n1")).as_deref(), Some(format!("{u}domain/basemode").as_str()));
+        assert_eq!(domain_of(&store, &ns, &format!("{u}note/n2")), None, "an entity link is not a domain");
+        assert_eq!(domain_of(&store, &ns, &format!("{u}project/none")), None);
+        assert_eq!(
+            domain_of(&store, &ns, &format!("{u}project/p2")).as_deref(),
+            Some(format!("{u}domain/alpha").as_str()),
+            "two domains resolve to the lexicographically first, every time"
+        );
+        let line = inherited_triple(&store, &ns, &format!("{u}task/t1"), &format!("{u}project/p1"));
+        assert_eq!(line, format!("             <{u}task/t1> ops:hasDomain <{u}domain/base> .\n"));
+        assert_eq!(inherited_triple(&store, &ns, &format!("{u}task/t2"), &format!("{u}project/none")), "");
     }
 
     #[test]

@@ -34,28 +34,28 @@ pub fn add(
 
     let name = crud::escape_sparql_literal(name);
 
-    let sparql = format!(
-        "INSERT DATA {{\n\
-           GRAPH <{graph}> {{\n\
-             <{task_iri}> rdf:type {p}:Task ;\n\
-               {p}:name \"{name}\" ;\n\
-               {p}:status \"active\" ;\n\
-               {p}:priority \"{pri}\" ;\n\
-               {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
-               {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
-             <{project_iri}> {p}:hasTask <{task_iri}> .\n\
-             {milestone_edge}\
-           }}\n\
-         }}"
-    );
-
     // The task takes its project's domain now rather than at the next session start
-    // (kite F7b). A project with no domain links nothing here; the delta pass files it.
-    let sparql = format!(
-        "{sparql};\n{}",
-        crate::domain::link::inherit_update(ns, &graph, &task_iri, &project_iri)
-    );
-    crud::load_and_mutate(cwd, ns, &sparql)?;
+    // (kite F7b): read off the store this write already loads, inserted as a constant
+    // (kite F23 — an INSERT ... WHERE here cost 5 s per write). A project with no domain
+    // links nothing here; the delta pass files it.
+    crud::load_and_mutate_with(cwd, ns, |store| {
+        let domain_link = crate::domain::link::inherited_triple(store, ns, &task_iri, &project_iri);
+        format!(
+            "INSERT DATA {{\n\
+               GRAPH <{graph}> {{\n\
+                 <{task_iri}> rdf:type {p}:Task ;\n\
+                   {p}:name \"{name}\" ;\n\
+                   {p}:status \"active\" ;\n\
+                   {p}:priority \"{pri}\" ;\n\
+                   {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
+                   {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
+                 <{project_iri}> {p}:hasTask <{task_iri}> .\n\
+                 {milestone_edge}\
+                 {domain_link}\
+               }}\n\
+             }}"
+        )
+    })?;
     Ok(slug)
 }
 

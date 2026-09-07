@@ -51,6 +51,13 @@ fn all_tier_files(gbl_root: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
 
 /// Load one graph file, run a SPARQL UPDATE, write back atomically.
 fn mutate_file(path: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<()> {
+    mutate_file_with(path, ns, |_| sparql.to_string())
+}
+
+/// `mutate_file` for a writer that needs one fact from the store before it can write:
+/// the store is loaded once, `build` reads from it and returns the update, and that
+/// update is applied and persisted (kite F23: never an `INSERT ... WHERE` for a lookup).
+fn mutate_file_with(path: &Path, ns: &NamespaceConfig, build: impl FnOnce(&Store) -> String) -> Result<()> {
     let store = if path.exists() {
         crate::store::load_graph(path)?
     } else {
@@ -59,6 +66,7 @@ fn mutate_file(path: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<()> {
         }
         Store::new().context("creating empty store")?
     };
+    let sparql = build(&store);
     let full = format!("{}\n{}", crud::prefixes(ns), sparql);
     crate::store::update_and_write(
         &store,
@@ -133,24 +141,26 @@ pub fn create(
         "DELETE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }}"
     );
 
-    // 3. Insert the new handoff.
-    let insert = format!(
-        "INSERT DATA {{ GRAPH <{graph}> {{\n\
-           <{iri}> rdf:type {p}:Handoff ;\n\
-             {p}:name \"{project}\" ;\n\
-             {p}:project \"{project}\" ;\n\
-             {p}:handoffDoc \"{doc}\" ;\n\
-             {p}:kind \"handoff\" ;\n\
-             {p}:status \"open\" ;\n\
-             {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
-             {p}:resurfaceAt \"{now}\"^^xsd:dateTime ;\n\
-             {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
-         }} }}"
-    );
-
-    // 4. The handoff takes the domain of the project it names, in the same write.
-    let inherit = crate::domain::link::inherit_update(ns, &graph, &iri, &project_iri);
-    mutate_file(&path, ns, &format!("{archive_prior};\n{clean_target};\n{insert};\n{inherit}"))?;
+    // 3. Insert the new handoff, carrying the domain of the project it names, read off
+    //    the store this write already loads (kite F7b, F23).
+    mutate_file_with(&path, ns, |store| {
+        let domain_link = crate::domain::link::inherited_triple(store, ns, &iri, &project_iri);
+        let insert = format!(
+            "INSERT DATA {{ GRAPH <{graph}> {{\n\
+               <{iri}> rdf:type {p}:Handoff ;\n\
+                 {p}:name \"{project}\" ;\n\
+                 {p}:project \"{project}\" ;\n\
+                 {p}:handoffDoc \"{doc}\" ;\n\
+                 {p}:kind \"handoff\" ;\n\
+                 {p}:status \"open\" ;\n\
+                 {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
+                 {p}:resurfaceAt \"{now}\"^^xsd:dateTime ;\n\
+                 {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
+             {domain_link}\
+             }} }}"
+        );
+        format!("{archive_prior};\n{clean_target};\n{insert}")
+    })?;
     Ok(slug)
 }
 
@@ -178,25 +188,27 @@ pub fn create_fork(
     let doc = crud::escape_sparql_literal(doc_path);
 
     // Additive: no archive-prior. A re-create of the same slug re-points it
-    // (idempotent) by deleting any existing node at this IRI first.
-    let insert = format!(
-        "DELETE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }};\n\
-         INSERT DATA {{ GRAPH <{graph}> {{\n\
-           <{iri}> rdf:type {p}:Handoff ;\n\
-             {p}:name \"{name}\" ;\n\
-             {p}:project \"{project}\" ;\n\
-             {p}:handoffDoc \"{doc}\" ;\n\
-             {p}:kind \"fork\" ;\n\
-             {p}:status \"open\" ;\n\
-             {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
-             {p}:resurfaceAt \"{now}\"^^xsd:dateTime ;\n\
-             {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
-         }} }}"
-    );
-
-    // The fork takes the domain of the project it names, in the same write (kite F7b).
-    let inherit = crate::domain::link::inherit_update(ns, &graph, &iri, &project_iri);
-    mutate_file(&path, ns, &format!("{insert};\n{inherit}"))?;
+    // (idempotent) by deleting any existing node at this IRI first. The fork carries
+    // the domain of the project it names, read off the store this write already loads
+    // (kite F7b, F23).
+    mutate_file_with(&path, ns, |store| {
+        let domain_link = crate::domain::link::inherited_triple(store, ns, &iri, &project_iri);
+        format!(
+            "DELETE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }};\n\
+             INSERT DATA {{ GRAPH <{graph}> {{\n\
+               <{iri}> rdf:type {p}:Handoff ;\n\
+                 {p}:name \"{name}\" ;\n\
+                 {p}:project \"{project}\" ;\n\
+                 {p}:handoffDoc \"{doc}\" ;\n\
+                 {p}:kind \"fork\" ;\n\
+                 {p}:status \"open\" ;\n\
+                 {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
+                 {p}:resurfaceAt \"{now}\"^^xsd:dateTime ;\n\
+                 {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
+             {domain_link}\
+             }} }}"
+        )
+    })?;
     Ok(slug)
 }
 

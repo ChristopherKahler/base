@@ -198,6 +198,32 @@ pub fn load_and_mutate(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result
     )
 }
 
+/// Load the workspace store once, let the caller read one thing from it and build the
+/// update it wants, then apply and persist that update.
+///
+/// For writers that need a fact from the store before they can write it: a new task
+/// takes its project's domain, and the project's domain is in the store. The first cut
+/// asked for it with an `INSERT ... WHERE` appended to the writer's `INSERT DATA`, and
+/// that cost 5 s per `base task add` on a 60,000-quad store (kite F23) — the planner
+/// scanned where a lookup was meant. Reading the fact off the loaded store with an index
+/// lookup and inserting it as a constant is one parse, one write, no WHERE.
+pub fn load_and_mutate_with(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    build: impl FnOnce(&Store) -> String,
+) -> Result<()> {
+    let (store, trig_path) = load_workspace_store(cwd)?;
+    let sparql = build(&store);
+    let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
+    crate::store::update_and_write(
+        &store,
+        &trig_path,
+        &full_sparql,
+        crate::store::Scope::Target,
+        crate::store::Intent::Knowledge,
+    )
+}
+
 /// Load workspace graph and run a SPARQL SELECT query.
 pub fn load_and_query(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<QueryResults> {
     let base_dir = crate::config::find_workspace_base(cwd)
