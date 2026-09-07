@@ -88,6 +88,16 @@ pub fn load_graph(path: &Path) -> Result<Store> {
     migrate_trig_to_nq(path)?;
 
     let store = Store::new().context("Failed to create in-memory store")?;
+
+    // A tier that has never been written has no graph file, and that is an
+    // answer rather than a failure: it holds no records. Before this, `rule
+    // list -g` on a home with no global graph died with "Failed to open …",
+    // and so did `rule add` -- in either tier -- so a fresh tier could not take
+    // its first rule. An empty file already worked; only a missing one did not.
+    if !path.exists() {
+        return Ok(store);
+    }
+
     let file = fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
     store
@@ -109,6 +119,10 @@ pub struct BadLine {
 /// Shared by [`load_graph_lenient`] and the [`load_merged`] read fallback.
 /// Returns Err only for unrecoverable IO (cannot open the file).
 fn load_lenient_into(store: &Store, path: &Path) -> Result<Vec<BadLine>> {
+    // Same rule as `load_graph`: absent is empty, and empty has no bad lines.
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
     let file = fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
 
