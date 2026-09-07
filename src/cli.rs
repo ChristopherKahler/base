@@ -128,6 +128,12 @@ pub enum Commands {
     },
     /// Manage domain matching rules
     Domain {
+        /// Act on the global tier (~/.base-gbl) instead of the workspace you are in.
+        ///
+        /// Without it the write commands resolve the workspace, as `add-trigger`
+        /// alone always did. Before #18 the other three ignored where you stood.
+        #[arg(long, global = true)]
+        global: bool,
         #[command(subcommand)]
         action: DomainAction,
     },
@@ -2136,14 +2142,14 @@ pub fn run() {
         }
 
         // ─── Domain ──────────────────────────────────────
-        Some(Commands::Domain { action }) => match action {
+        Some(Commands::Domain { global, action }) => match action {
             DomainAction::AddTrigger { domain: name, keyword, path } => {
                 if keyword.is_none() && path.is_none() {
                     eprintln!("Provide --keyword and/or --path");
                     return;
                 }
-                match domain::add_trigger(&cwd, &name, keyword.as_deref(), path.as_deref()) {
-                    Ok(()) => println!("Trigger added to domain '{name}'"),
+                match domain::add_trigger(&cwd, global, &name, keyword.as_deref(), path.as_deref()) {
+                    Ok(c) => println!("Trigger added to domain '{name}' ({} tier)", c.tier.label()),
                     Err(e) => die("Failed", e),
                 }
             }
@@ -2160,15 +2166,28 @@ pub fn run() {
                 }
             }
             DomainAction::Create { name, keyword, path } => {
-                match domain::create_domain(&cwd, &name, keyword.as_deref(), path.as_deref()) {
-                    Ok(()) => println!("Domain '{name}' created"),
+                match domain::create_domain(&cwd, global, &name, keyword.as_deref(), path.as_deref()) {
+                    Ok(c) => println!("Domain '{name}' created ({} tier)", c.tier.label()),
                     Err(e) => die("Failed", e),
                 }
             }
             DomainAction::Remove { name } => {
-                match domain::remove_domain(&cwd, &name) {
-                    Ok(true) => println!("Domain '{name}' removed"),
-                    Ok(false) => eprintln!("Domain '{name}' not found"),
+                match domain::remove_domain(&cwd, global, &name) {
+                    Ok(c) if !c.is_noop() => {
+                        println!("Domain '{name}' removed ({} tier)", c.tier.label())
+                    }
+                    // #52. This said "not found" about a domain that exists in
+                    // the other tier, and exited 0. Name the tier searched, name
+                    // the one that was not, and fail.
+                    Ok(c) => {
+                        eprintln!(
+                            "Domain '{name}' not found in the {} tier (not searched: {}). \
+                             Use --global to act on the global tier.",
+                            c.tier.label(),
+                            c.tier.other().label()
+                        );
+                        std::process::exit(1);
+                    }
                     Err(e) => die("Failed", e),
                 }
             }
@@ -2177,8 +2196,22 @@ pub fn run() {
                     eprintln!("Provide --keyword and/or --path to remove");
                     return;
                 }
-                match domain::remove_trigger(&cwd, &name, keyword.as_deref(), path.as_deref()) {
-                    Ok(()) => println!("Trigger removed from domain '{name}'"),
+                match domain::remove_trigger(&cwd, global, &name, keyword.as_deref(), path.as_deref()) {
+                    Ok(c) if !c.is_noop() => {
+                        println!("Trigger removed from domain '{name}' ({} tier)", c.tier.label())
+                    }
+                    // #18. This reported success whether or not anything went,
+                    // and with a same-named domain in the other tier it edited
+                    // THAT one and still said success.
+                    Ok(c) => {
+                        eprintln!(
+                            "No such trigger on domain '{name}' in the {} tier (not searched: {}). \
+                             Use --global to act on the global tier.",
+                            c.tier.label(),
+                            c.tier.other().label()
+                        );
+                        std::process::exit(1);
+                    }
                     Err(e) => die("Failed", e),
                 }
             }

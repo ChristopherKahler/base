@@ -128,7 +128,9 @@ pub fn provision_folder(
 /// Default: path-based matching. No keywords unless user adds them later.
 fn auto_create_domain(cwd: &Path, project_name: &str, project_path: &str) -> Result<()> {
     // Add a path trigger via the existing add_trigger mechanism
-    crate::domain::add_trigger(cwd, project_name, None, Some(project_path))?;
+    // false: a project registered in a workspace files its domain there,
+    // which is what this always did before the tier seam made it explicit.
+    crate::domain::add_trigger(cwd, false, project_name, None, Some(project_path))?;
     Ok(())
 }
 
