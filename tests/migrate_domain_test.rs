@@ -62,6 +62,28 @@ fn migrate_manual(cwd: &Path) -> migrate::Outcome {
         .unwrap()
 }
 
+/// Tell the delta gate "this exact store is the one I already looked at".
+///
+/// The marker holds the store's IDENTITY (`len:mtime_nanos`), not a timestamp, so
+/// a literal string no longer pins it — mtime alone let a `.bak` restore land
+/// inside the filesystem's timestamp granularity and silently skip a store that
+/// was no longer migrated.
+fn pin_delta_marker(cwd: &Path) {
+    let g = graph_path(cwd);
+    let m = std::fs::metadata(&g).unwrap();
+    let nanos = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::fs::write(
+        cwd.join(".base").join(".last-domain-delta"),
+        format!("{}:{}", m.len(), nanos),
+    )
+    .unwrap();
+}
+
 /// The `.bak-migrate-*` snapshots on disk.
 fn snapshots(cwd: &Path) -> Vec<String> {
     let dir = cwd.join(".base");
@@ -271,8 +293,7 @@ fn the_manual_command_re_plans_past_the_stamp() {
     // about: a stamped tier the hook has no reason to re-plan, and drift that only the
     // operator's own command goes looking for. (With the store newer than the marker the
     // hook would file it itself — `a_record_written_after_the_migration_is_linked_at_the_next_session`.)
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    std::fs::write(cwd.join(".base").join(".last-domain-delta"), "pinned by the test").unwrap();
+    pin_delta_marker(cwd);
 
     let hook = migrate(cwd);
     assert!(hook.already_migrated, "the hook still takes the fast path: {hook:?}");

@@ -304,6 +304,17 @@ pub fn migrate_tier(
 ) -> Result<Outcome> {
     let mut out = Outcome { path: path.display().to_string(), ..Default::default() };
 
+    // THE GATE COMES FIRST, before anything reads the file. Measured 2026-09-07 on
+    // the frozen 13.4 MB store: with it below the health check, session start paid
+    // `graph_health` (a full parse) AND `load_graph` (a second full parse) per
+    // tier on every session, including the ones the gate then skipped — +6.8 s
+    // against a control with the migration off, for work thrown away. A gate whose
+    // point is to cost one `stat` has to run before the parses it exists to avoid.
+    if trigger == Trigger::SessionStart && !changed_since_last_delta(path) {
+        out.already_migrated = true;
+        return Ok(out);
+    }
+
     // C1: `compact_tier` refuses an unhealthy graph and a migration that reuses
     // this path inherits that. Defined behaviour, not silence: report it, write
     // nothing, stamp nothing, so the next session tries again once repair has run.
@@ -328,10 +339,8 @@ pub fn migrate_tier(
     // but only when the store has actually changed since the last time this pass
     // looked, which is ONE `stat` against a marker file rather than a 13.4 MB
     // parse. A session that wrote nothing costs nothing.
-    if stamped && trigger == Trigger::SessionStart && !changed_since_last_delta(path) {
-        out.already_migrated = true;
-        return Ok(out);
-    }
+    // Reaching here as SessionStart means the store MOVED since the marker, so the
+    // delta pass below re-plans it. The cheap skip already happened, above.
 
     let root = path.parent().and_then(Path::parent).unwrap_or(path).to_path_buf();
     let facts = Facts::gather(&store, ns, root);
@@ -378,6 +387,14 @@ pub fn migrate_tier(
 
 /// Has anything written this tier since the delta pass last looked?
 ///
+/// The marker records the store's IDENTITY, `len:mtime_nanos`, not the time the
+/// pass ran. mtime alone is not enough: a `.bak` restore can land inside the
+/// filesystem's timestamp granularity, leaving the restored store no NEWER than
+/// the marker, and the gate would then skip a store that is no longer migrated —
+/// `a_restored_pre_migration_backup_re_migrates` fails on exactly that. Comparing
+/// identity means any different content re-opens the gate, forward or backward in
+/// time, and it is still one `stat`.
+///
 /// One `stat` per tier, the `auto_compact_tiers` marker shape, and deliberately
 /// mtime-versus-mtime rather than a time cooldown: a cooldown would make the
 /// promise "records are filed at the next session start" false for however long
@@ -387,21 +404,32 @@ pub fn migrate_tier(
 /// Missing marker means never run, so: yes. Unreadable metadata means yes — the
 /// pass is idempotent, and doing it needlessly is cheaper than not doing it.
 fn changed_since_last_delta(path: &Path) -> bool {
-    let marker = path.with_file_name(".last-domain-delta");
-    let (Ok(g), Ok(m)) = (std::fs::metadata(path), std::fs::metadata(&marker)) else {
-        return true;
-    };
-    match (g.modified(), m.modified()) {
-        (Ok(gt), Ok(mt)) => gt > mt,
-        _ => true,
+    let Ok(current) = store_identity(path) else { return true };
+    match std::fs::read_to_string(path.with_file_name(".last-domain-delta")) {
+        Ok(recorded) => recorded.trim() != current,
+        Err(_) => true,
     }
 }
 
-/// Record that the delta pass has seen the store in its current shape.
-/// Best-effort: a marker that cannot be written costs one needless pass next
-/// session, which is the safe direction to fail.
+/// `<len>:<mtime nanos>` — cheap, and different for any different store.
+fn store_identity(path: &Path) -> std::io::Result<String> {
+    let m = std::fs::metadata(path)?;
+    let nanos = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(format!("{}:{}", m.len(), nanos))
+}
+
+/// Record the store's identity as the delta pass leaves it. Best-effort: a marker
+/// that cannot be written costs one needless pass next session, which is the safe
+/// direction to fail.
 fn stamp_delta_marker(path: &Path) {
-    let _ = std::fs::write(path.with_file_name(".last-domain-delta"), crate::crud::now_iso());
+    if let Ok(id) = store_identity(path) {
+        let _ = std::fs::write(path.with_file_name(".last-domain-delta"), id);
+    }
 }
 
 /// Every tier under `cwd`, workspace then global, the `auto_compact_tiers` shape.
