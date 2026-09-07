@@ -83,8 +83,12 @@ H="$OUT/global"; seed_home "$H"
 # Run from a directory that is NOT a workspace: load_graph would have errored
 # here, which is exactly the divergence maps_from_store was split to avoid.
 cd /tmp || exit 1
+# lean_mode is `bracket == Fresh && prompt_num <= 2`, so prompts 1 AND 2 are
+# lean and the walk does not run in either. Two fires were not "past lean mode",
+# they were lean mode; this row and two below failed for that one reason.
 out=$(fire "$H" 'where are we on `aurora`' s1)
-out=$(fire "$H" 'where are we on `aurora`' s1)  # past lean mode
+out=$(fire "$H" 'where are we on `aurora`' s1)
+out=$(fire "$H" 'where are we on `aurora`' s1)  # prompt 3: the first non-lean one
 grep -q "pick postgres over mysql" <<<"$out" \
   && ok "a decision in the global tier reached the prompt" \
   || { bad "global-tier record never arrived"; sed -n '1,15p' <<<"$out"; }
@@ -102,7 +106,8 @@ echo "── row: the devmode line names what was resolved ──"
 H3="$OUT/dev"; seed_home "$H3"
 printf '[devmode]\nenabled = true\n' > "$H3/.base-gbl/base.toml"
 _=$(fire "$H3" 'where are we on `aurora`' s-dev)
-d=$(fire "$H3" 'where are we on `aurora`' s-dev)
+_=$(fire "$H3" 'where are we on `aurora`' s-dev)
+d=$(fire "$H3" 'where are we on `aurora`' s-dev)  # prompt 3
 grep -q "walk: aurora" <<<"$d" \
   && ok "devmode names the resolved node" \
   || { bad "no devmode walk line"; grep -n "DEVMODE" -A6 <<<"$d" | head -10; }
@@ -120,7 +125,8 @@ H4="$OUT/budget"; seed_home "$H4"
 # A budget of 1 byte cannot fit any record, so the walk renders nothing at all.
 printf '[injection]\nwalk_budget = 1\n' > "$H4/.base-gbl/base.toml"
 _=$(fire "$H4" 'where are we on `aurora`' s-bud)
-squeezed=$(fire "$H4" 'where are we on `aurora`' s-bud)
+_=$(fire "$H4" 'where are we on `aurora`' s-bud)
+squeezed=$(fire "$H4" 'where are we on `aurora`' s-bud)  # prompt 3
 grep -q "<base-context" <<<"$squeezed" \
   && bad "a 1-byte budget still rendered a block" \
   || ok "the budget rendered nothing, as set up"

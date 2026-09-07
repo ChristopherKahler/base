@@ -519,15 +519,24 @@ mod tests {
     /// knows how to read it ever saw it. Two halves that did not meet.
     #[test]
     fn a_node_is_found_by_its_slug_as_well_as_its_label() {
+        // Namespaced, because that is what the slug branch matches on:
+        // `resolve_strict` keeps keys that START with the namespace URI and END
+        // with `/<slug>>`. The old fixture used `<x/project/kit>`, which does
+        // neither -- so the branch this test is named after could not fire, and
+        // the two label-shaped spellings were carrying it on the exact-label
+        // step alone. `first-client-kit` cannot equal the lowercased label
+        // `first client kit`, so that spelling resolving at all is proof the
+        // slug branch ran.
+        let id = format!("<{}project/first-client-kit>", ns().uri);
         let mut nodes: HashMap<String, Node> = HashMap::new();
-        put(&mut nodes, "<x/project/kit>", "First Client Kit");
+        put(&mut nodes, &id, "First Client Kit");
         let adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let maps = (nodes, adj);
 
         for spelling in ["`First Client Kit`", "`first-client-kit`", "First Client Kit"] {
             let out = walk(&maps, &ns(), spelling, &HashSet::new(), &no, &no);
             assert_eq!(out.len(), 1, "{spelling:?} resolved to {} things", out.len());
-            assert_eq!(out[0].0.id, "<x/project/kit>", "{spelling:?}");
+            assert_eq!(out[0].0.id, id, "{spelling:?}");
         }
     }
 
