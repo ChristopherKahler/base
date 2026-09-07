@@ -17,7 +17,7 @@ ident () {
   printf '%s  md5=%s  lockmark=%s  %s\n' \
     "$(basename "$b")" \
     "$(md5sum "$b" | awk '{print $1}')" \
-    "$(strings "$b" 2>/dev/null | grep -c 'waiting for the graph lock')" \
+    "$(grep -ac 'waiting for the graph lock' "$b" 2>/dev/null || echo 0)" \
     "$("$b" --version 2>&1 | head -1)"
 }
 median () { sort -n | awk '{a[NR]=$1} END {printf "%d", (NR%2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2}'; }
@@ -26,8 +26,8 @@ say () { printf '%s\n' "$*"; }
 say "=== binaries under test ==="
 say "control: $(ident "$CTRL")"
 say "branch : $(ident "$BR")"
-[ "$(strings "$CTRL" | grep -c 'waiting for the graph lock')" = "0" ] || { say "ABORT: control carries the lock"; exit 2; }
-[ "$(strings "$BR"   | grep -c 'waiting for the graph lock')" = "1" ] || { say "ABORT: branch lacks the lock"; exit 2; }
+[ "$(grep -ac 'waiting for the graph lock' "$CTRL" || echo 0)" = "0" ] || { say "ABORT: control carries the lock"; exit 2; }
+[ "$(grep -ac 'waiting for the graph lock' "$BR" || echo 0)" -ge 1 ] || { say "ABORT: branch lacks the lock"; exit 2; }
 say ""
 say "source graph: $SRC  ($(wc -c < "$SRC") bytes, copied per run, never written)"
 say ""

@@ -9,7 +9,7 @@ CTRL=/tmp/base-0141
 BR=/tmp/base-branch
 
 median () { sort -n | awk '{a[NR]=$1} END {printf "%d", (NR%2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2}'; }
-mark () { strings "$1" 2>/dev/null | grep -c 'waiting for the graph lock'; }
+mark () { grep -ac 'waiting for the graph lock' "$1" 2>/dev/null || echo 0; }
 
 echo "control md5=$(md5sum "$CTRL" | awk '{print $1}') lockmark=$(mark "$CTRL")"
 echo "branch  md5=$(md5sum "$BR"   | awk '{print $1}') lockmark=$(mark "$BR")"

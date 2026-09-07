@@ -26,7 +26,8 @@ say "=== provenance ==="
 BIN_MD5=$(md5sum "$BIN" | awk '{print $1}')
 BIN_VER=$("$BIN" --version 2>&1 | head -1)
 # The branch-only marker: a user-visible string only this change emits.
-LOCKED=$(strings "$BIN" 2>/dev/null | grep -c 'waiting for the graph lock')
+LOCKED=$(grep -ac 'waiting for the graph lock' "$BIN" 2>/dev/null || true)
+LOCKED=${LOCKED:-0}
 say "binary   : $BIN"
 say "version  : $BIN_VER"
 say "md5      : $BIN_MD5"
