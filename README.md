@@ -11,6 +11,12 @@
 
 <h3 align="center">Works with Claude Code today &nbsp;·&nbsp; Codex and Antigravity — coming soon</h3>
 
+```sh
+curl -fsSL https://raw.githubusercontent.com/ChristopherKahler/base/main/install.sh | sh
+```
+
+<p align="center"><sub>macOS and Linux. Windows one-liner below. No Rust toolchain, no compiler.</sub></p>
+
 Your agent is a genius with amnesia. Every session it meets your codebase for the first time and pretends otherwise. basemode gives it one memory that actually knows what things are — your code structure, your projects, your decisions, your rules, what it all means and how it connects — and puts the right slice of it in front of the model the second it's needed. No prompt to paste. No document to maintain. Same agent, briefed.
 
 This repo is the basemode engine: one Rust binary, `base`, that maps your workspace into a knowledge graph and wires it into Claude Code's hook pipeline.
@@ -40,26 +46,42 @@ Every agent inherits this. Main session, subagents, explore agents — same hook
 
 ## Quick start
 
-```bash
-# build
-cargo build --release
+**macOS and Linux**
 
-# install (copies binary, creates config, wires hooks)
-./target/release/base install
+```sh
+curl -fsSL https://raw.githubusercontent.com/ChristopherKahler/base/main/install.sh | sh
+```
 
-# scaffold your workspace
+**Windows**
+
+```powershell
+irm https://raw.githubusercontent.com/ChristopherKahler/base/main/install.ps1 | iex
+```
+
+Then point it at a workspace:
+
+```sh
 cd ~/my-workspace
 base scaffold
 ```
 
-Three commands. `base install` puts the binary in `~/.local/bin/base`, writes global config to `~/.base-gbl/`, and wires the hooks into `~/.claude/settings.json`. It also offers the starter star commands — `*handoff`, `*fork`, `*base`, `*end` — so a fresh install has something to type on day one (`--starter-commands` / `--no-starter-commands` to answer without the prompt). `base scaffold` creates `.base/` in your workspace.
+The installer downloads the release binary for your platform and hands off to `base install`, which puts the binary in `~/.local/bin/base`, writes global config to `~/.base-gbl/`, installs the AST extraction scripts, and wires the hooks into `~/.claude/settings.json`. It also offers the starter star commands — `*handoff`, `*fork`, `*base`, `*end` — so a fresh install has something to type on day one (`--starter-commands` / `--no-starter-commands` to answer without the prompt). `base scaffold` creates `.base/` in your workspace.
+
+Install Claude Code first. The hooks are what make base do anything, and they are only written into an existing `~/.claude` — install base before it and you get an inert binary, so the installer says so and you rerun `base install` afterwards.
+
+Pin a version with `BASE_VERSION=v0.14.1`, and pass arguments straight through: `... | sh -s -- --no-starter-commands`.
 
 <details>
-<summary><strong>Windows</strong></summary>
+<summary><strong>Build from source</strong></summary>
 
-Grab the prebuilt `base-windows-x86_64.zip` from the [latest release](../../releases) — no toolchain needed.
+Needs a Rust toolchain. The release binaries above need nothing.
 
-To build from source instead, run the helper from a normal PowerShell window:
+```bash
+cargo build --release
+./target/release/base install
+```
+
+On Windows, run the helper from a normal PowerShell window instead:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build-base-windows.ps1
