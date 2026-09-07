@@ -4,6 +4,7 @@ pub mod query;
 pub mod session;
 pub mod sync;
 pub mod transcript;
+pub mod tier;
 
 use std::path::Path;
 
