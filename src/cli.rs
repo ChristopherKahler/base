@@ -1955,7 +1955,7 @@ pub fn run() {
                             match out.archived_prior {
                                 Some(prior) => println!(
                                     "archived prior open handoff: {prior} ({})",
-                                    crud::tier_label(&cwd)
+                                    out.tier
                                 ),
                                 None => println!("no prior open handoff in this tier"),
                             }

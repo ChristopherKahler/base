@@ -170,6 +170,8 @@ fn resolve_doc_slug(slug: Option<&str>, doc_path: &str) -> Result<String> {
 #[derive(Debug)]
 pub struct CreateOutcome {
     pub slug: String,
+    /// The tier this create wrote to: "workspace tier" or "global tier".
+    pub tier: String,
     /// The handoff this create archived in its own tier, if any.
     pub archived_prior: Option<String>,
     /// An open handoff for the same project in the OTHER tier. Never touched —
@@ -279,6 +281,7 @@ pub fn create(
     )?;
     Ok(CreateOutcome {
         slug,
+        tier: tier_label(&path, gbl_root).to_string(),
         archived_prior,
         other_tier_open,
     })

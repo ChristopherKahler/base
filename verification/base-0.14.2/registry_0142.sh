@@ -152,12 +152,92 @@ else
   say "=== R15  skipped: control binary has no lock ==="
 fi
 
+# ── R3: the help string promises the tier-scoped behaviour ───
+say "=== R3  'handoff create --help' names the tier ==="
+"$BIN" handoff create --help > "$OUT/r3.out" 2>&1
+if grep -q "archives any prior open handoff for the project in this tier" "$OUT/r3.out"; then
+  ok "R3 help says 'in this tier'"
+else
+  bad "R3 help still promises a project-wide archive: $(grep -m1 'Register a handoff' "$OUT/r3.out")"
+fi
+
+# ── R1: create must name the handoff it archived ─────────────
+say "=== R1  second create in one tier reports what it closed ==="
+d=$(fresh r1); export BASE_HOME="$d/home"
+printf '#\n' > "$d/docs/HANDOFF-A.md"; printf '#\n' > "$d/docs/HANDOFF-B.md"
+( cd "$d/ws" && "$BIN" handoff create --project pj --doc "$d/docs/HANDOFF-A.md" ) >/dev/null 2>&1
+( cd "$d/ws" && "$BIN" handoff create --project pj --doc "$d/docs/HANDOFF-B.md" ) >"$OUT/r1.out" 2>&1
+say "  output: $(tr '\n' '|' < "$OUT/r1.out")"
+grep -q "handoff/HANDOFF-A> <http://ops-sys.local/ontology#status> \"archived\"" "$d/ws/.base/graph.nq" \
+  && ok "R1 A was archived" || bad "R1 A was not archived"
+if grep -q "archived prior open handoff: HANDOFF-A (workspace tier)" "$OUT/r1.out"; then
+  ok "R1 create names what it archived"
+else
+  bad "R1 create archived HANDOFF-A silently"
+fi
+
+# ── R2: the OTHER tier is named, never touched ───────────────
+say "=== R2  an open handoff in the other tier is named, not archived ==="
+d=$(fresh r2); export BASE_HOME="$d/home"
+printf '#\n' > "$d/docs/HANDOFF-G.md"; printf '#\n' > "$d/docs/HANDOFF-W.md"
+( cd "$d/ws" && "$BIN" handoff -g create --project pj --doc "$d/docs/HANDOFF-G.md" ) >/dev/null 2>&1
+( cd "$d/ws" && "$BIN" handoff create --project pj --doc "$d/docs/HANDOFF-W.md" ) >"$OUT/r2.out" 2>&1
+say "  output: $(tr '\n' '|' < "$OUT/r2.out")"
+G="$d/home/.base-gbl/.base/graph.nq"
+grep -q "handoff/HANDOFF-G> <http://ops-sys.local/ontology#status> \"open\"" "$G" \
+  && ok "R2 the global handoff was left open" || bad "R2 the global handoff was mutated"
+if grep -q "global tier also holds an open handoff for 'pj': HANDOFF-G" "$OUT/r2.out" \
+   && grep -q "base handoff -g archive HANDOFF-G" "$OUT/r2.out"; then
+  ok "R2 output names it and the command that would archive it"
+else
+  bad "R2 the other tier's open handoff went unmentioned"
+fi
+
+# ── R4: cross-tier archive by slug (regression pin, green both sides) ──
+say "=== R4  a global-tier fork archives from a workspace cwd, no -g ==="
+d=$(fresh r4); export BASE_HOME="$d/home"
+printf '#\n' > "$d/docs/XT.md"
+( cd "$d/ws" && "$BIN" fork -g create --project xt --doc "$d/docs/XT.md" ) >/dev/null 2>&1
+( cd "$d/ws" && "$BIN" fork archive XT ) >"$OUT/r4.out" 2>&1
+rc=$?
+G="$d/home/.base-gbl/.base/graph.nq"
+if [ "$rc" = "0" ] && grep -q "handoff/XT> <http://ops-sys.local/ontology#status> \"archived\"" "$G"; then
+  ok "R4 archived across tiers by slug (rc=$rc)"
+else
+  bad "R4 cross-tier archive failed (rc=$rc)"
+fi
+if [ "$LOCKED" -ge 1 ]; then
+  grep -q "archived (global tier)" "$OUT/r4.out" \
+    && ok "R4 names the tier it changed" \
+    || bad "R4 did not name the tier: $(cat "$OUT/r4.out")"
+fi
+
+# ── R5/R6: a no-op must never print success ──────────────────
+say "=== R5/R6  archive and snooze of a slug no tier holds ==="
+d=$(fresh r5); export BASE_HOME="$d/home"
+printf '#\n' > "$d/docs/REAL.md"
+( cd "$d/ws" && "$BIN" fork create --project np --doc "$d/docs/REAL.md" ) >/dev/null 2>&1
+for cmd in "fork archive" "fork snooze" "handoff archive" "handoff snooze"; do
+  tag=$(printf '%s' "$cmd" | tr ' ' '-')
+  case "$cmd" in
+    *snooze) ( cd "$d/ws" && "$BIN" $cmd shrike-no-such-slug-xyz 3 ) >"$OUT/r5-$tag.out" 2>&1 ;;
+    *)       ( cd "$d/ws" && "$BIN" $cmd shrike-no-such-slug-xyz )   >"$OUT/r5-$tag.out" 2>&1 ;;
+  esac
+  rc=$?
+  say "  '$cmd <missing>' rc=$rc  -> $(head -1 "$OUT/r5-$tag.out")"
+  if [ "$rc" != "0" ] && grep -q "in either tier" "$OUT/r5-$tag.out"; then
+    ok "R5/R6 '$cmd' fails loudly on a no-op"
+  else
+    bad "R5/R6 '$cmd' reported success for a slug no tier holds (rc=$rc)"
+  fi
+done
+
 # ── Isolation tripwire: the real graphs must be untouched ────
 say "=== isolation ==="
 leak=0
 for g in /mnt/c/Users/Chris/.base/graph.nq /mnt/c/Users/Chris/.base-gbl/.base/graph.nq; do
   [ -f "$g" ] || continue
-  if grep -q "handoff/s-1>\|handoff/a-1>\|handoff/t1>\|handoff/n-1>" "$g"; then
+  if grep -q "handoff/s-1>\|handoff/a-1>\|handoff/t1>\|handoff/n-1>\|handoff/HANDOFF-A>\|handoff/HANDOFF-G>\|handoff/XT>\|handoff/REAL>" "$g"; then
     leak=1; say "  LEAK into $g"
   fi
 done
