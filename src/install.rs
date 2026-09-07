@@ -36,7 +36,6 @@ pub fn run(
     // Step 1: Copy binary to every name it must answer to in ~/.local/bin
     let local_bin = home.join(".local").join("bin");
     let names = crate::home::base_binary_names();
-    let dest_path = local_bin.join(&names[0]);
     let dests: Vec<_> = names.iter().map(|n| local_bin.join(n)).collect();
     println!(
         "1. Install binary → {} ... ",
@@ -199,7 +198,12 @@ pub fn uninstall(purge: bool) -> Result<()> {
         }
     }
     if !removed_any {
-        println!("3. Binary not found at {} — skipped", binary.display());
+        // Name the directory, not one file: there are now N names to miss.
+        println!(
+            "3. Binary not found in {} (looked for {}) — skipped",
+            bin_dir.display(),
+            crate::home::base_binary_names().join(", ")
+        );
     }
 
     // 4. Remove bundled skills. Backups (<skill>.bak-* under
