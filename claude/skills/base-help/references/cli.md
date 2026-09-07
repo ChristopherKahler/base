@@ -1206,7 +1206,7 @@ Manage session handoffs (resume docs surfaced at session start)
 Usage: base handoff [OPTIONS] <COMMAND>
 
 Commands:
-  create   Register a handoff doc (archives any prior open handoff for the project)
+  create   Register a handoff doc (archives any prior open handoff for the project in this tier)
   list     List handoffs across global + workspace tiers
   snooze   Snooze a handoff for N days (hide until then)
   archive  Archive a handoff (stop resurfacing)
@@ -1223,7 +1223,7 @@ Options:
 ## base handoff create
 
 ```text
-Register a handoff doc (archives any prior open handoff for the project)
+Register a handoff doc (archives any prior open handoff for the project in this tier)
 
 Usage: base handoff create [OPTIONS] --project <PROJECT> --doc <DOC>
 

@@ -1095,7 +1095,7 @@ pub enum ReminderAction {
 
 #[derive(Subcommand)]
 pub enum HandoffAction {
-    /// Register a handoff doc (archives any prior open handoff for the project)
+    /// Register a handoff doc (archives any prior open handoff for the project in this tier)
     Create {
         #[arg(long)]
         project: String,
@@ -1934,8 +1934,42 @@ pub fn run() {
             let cwd = tier_cwd(&cwd, global);
             match action {
                 HandoffAction::Create { project, doc, slug } => {
-                    match crud::handoff::create(&cwd, &config.namespace, &project, &doc, slug.as_deref()) {
-                        Ok(slug) => println!("Handoff for '{project}' registered (slug: {slug})"),
+                    let gbl = base::home::home_root();
+                    match crud::handoff::create(
+                        gbl.as_deref(),
+                        &cwd,
+                        &config.namespace,
+                        &project,
+                        &doc,
+                        slug.as_deref(),
+                    ) {
+                        Ok(out) => {
+                            // First line unchanged: scripts and the *end flow read it.
+                            println!(
+                                "Handoff for '{project}' registered (slug: {})",
+                                out.slug
+                            );
+                            // 0.14.1 archived the prior handoff silently, so four
+                            // builders inside twelve seconds each closed the one
+                            // before it with nothing on screen (#71).
+                            match out.archived_prior {
+                                Some(prior) => println!(
+                                    "archived prior open handoff: {prior} ({})",
+                                    crud::tier_label(&cwd)
+                                ),
+                                None => println!("no prior open handoff in this tier"),
+                            }
+                            // Named, never touched: a write acts on the tier you
+                            // stand in (#61), so the other tier's handoff is the
+                            // operator's call, with the command to make it.
+                            if let Some((other, tier)) = out.other_tier_open {
+                                let flag = if tier == "global tier" { " -g" } else { "" };
+                                println!(
+                                    "{tier} also holds an open handoff for '{project}': {other} \
+                                     — archive it with: base handoff{flag} archive {other}"
+                                );
+                            }
+                        }
                         Err(e) => die("Failed", e),
                     }
                 }
@@ -1948,7 +1982,24 @@ pub fn run() {
                         &slug,
                         days,
                     ) {
-                        Ok(()) => println!("Handoff '{slug}' snoozed {days}d"),
+                        // An empty vec means no tier held the slug. 0.14.1 printed
+                        // success here regardless, which is #72's observable.
+                        Ok(changed) if changed.is_empty() => die(
+                            "Failed",
+                            format!(
+                                "no handoff '{slug}' in either tier — nothing was snoozed. Searched:\n  {}",
+                                crud::handoff::searched_tiers(
+                                    base::home::home_root().as_deref(),
+                                    &cwd
+                                )
+                                .join("\n  ")
+                            ),
+                        ),
+                        Ok(changed) => {
+                            for tier in changed {
+                                println!("Handoff '{slug}' snoozed {days}d ({tier})");
+                            }
+                        }
                         Err(e) => die("Failed", e),
                     }
                 }
@@ -1959,7 +2010,24 @@ pub fn run() {
                         &config.namespace,
                         &slug,
                     ) {
-                        Ok(()) => println!("Handoff '{slug}' archived"),
+                        // An empty vec means no tier held the slug. 0.14.1 printed
+                        // success here regardless, which is #72's observable.
+                        Ok(changed) if changed.is_empty() => die(
+                            "Failed",
+                            format!(
+                                "no handoff '{slug}' in either tier — nothing was archived. Searched:\n  {}",
+                                crud::handoff::searched_tiers(
+                                    base::home::home_root().as_deref(),
+                                    &cwd
+                                )
+                                .join("\n  ")
+                            ),
+                        ),
+                        Ok(changed) => {
+                            for tier in changed {
+                                println!("Handoff '{slug}' archived ({tier})");
+                            }
+                        }
                         Err(e) => die("Failed", e),
                     }
                 }
@@ -1985,7 +2053,24 @@ pub fn run() {
                         &slug,
                         days,
                     ) {
-                        Ok(()) => println!("Fork '{slug}' snoozed {days}d"),
+                        // An empty vec means no tier held the slug. 0.14.1 printed
+                        // success here regardless, which is #72's observable.
+                        Ok(changed) if changed.is_empty() => die(
+                            "Failed",
+                            format!(
+                                "no fork '{slug}' in either tier — nothing was snoozed. Searched:\n  {}",
+                                crud::handoff::searched_tiers(
+                                    base::home::home_root().as_deref(),
+                                    &cwd
+                                )
+                                .join("\n  ")
+                            ),
+                        ),
+                        Ok(changed) => {
+                            for tier in changed {
+                                println!("Fork '{slug}' snoozed {days}d ({tier})");
+                            }
+                        }
                         Err(e) => die("Failed", e),
                     }
                 }
@@ -1996,7 +2081,24 @@ pub fn run() {
                         &config.namespace,
                         &slug,
                     ) {
-                        Ok(()) => println!("Fork '{slug}' archived"),
+                        // An empty vec means no tier held the slug. 0.14.1 printed
+                        // success here regardless, which is #72's observable.
+                        Ok(changed) if changed.is_empty() => die(
+                            "Failed",
+                            format!(
+                                "no fork '{slug}' in either tier — nothing was archived. Searched:\n  {}",
+                                crud::handoff::searched_tiers(
+                                    base::home::home_root().as_deref(),
+                                    &cwd
+                                )
+                                .join("\n  ")
+                            ),
+                        ),
+                        Ok(changed) => {
+                            for tier in changed {
+                                println!("Fork '{slug}' archived ({tier})");
+                            }
+                        }
                         Err(e) => die("Failed", e),
                     }
                 }
