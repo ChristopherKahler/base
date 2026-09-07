@@ -192,6 +192,14 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         .collect();
     warnings.extend(leaked_global_handoffs());
     warnings.extend(coach_drift());
+    // #20: a failed hook is invisible everywhere else (fail-open by design); doctor names it.
+    if let Ok(cwd) = std::env::current_dir() {
+        for (tier, base_dir) in crate::hook::hook_log_dirs(&cwd) {
+            if let Some(w) = crate::hook::hook_failure_summary(&base_dir) {
+                warnings.push(format!("{tier} tier {w}"));
+            }
+        }
+    }
     let config_errors = crate::command::check_command_files(cwd);
     let trigger_faults = trigger_faults(cwd);
     let healthy = tiers.iter().all(|t| t.status != "unhealthy") && config_errors.is_empty() && trigger_faults.is_empty();

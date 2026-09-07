@@ -67,11 +67,11 @@ fn extract_tool_context(event: &serde_json::Value) -> (Option<String>, Option<St
 /// Entry point for all hook events. Fail-open: any error → stderr only, exit 0, empty stdout.
 pub fn dispatch(event: &str) {
     let result = run(event);
-    let (success, data) = match &result {
-        Ok(d) => (true, Some(d)),
-        Err(_) => (false, None),
+    let (success, data, error) = match &result {
+        Ok(d) => (true, Some(d), None),
+        Err(e) => (false, None, Some(format!("{e:#}"))),
     };
-    log_hook_event(event, success, data);
+    log_hook_event(event, success, data, error);
     if let Err(e) = result {
         eprintln!("base hook {event}: {e:#}");
     }
@@ -276,6 +276,48 @@ pub fn rotate_hook_log(base_dir: &std::path::Path) {
     }
 }
 
+/// How many trailing events a failure summary reads. A trail, not history.
+pub const HOOK_FAILURE_WINDOW: usize = 200;
+
+/// #20: hooks fail open by design, so a broken hook looks like a quiet one. This reads the
+/// last [`HOOK_FAILURE_WINDOW`] events of a tier's log and names the failures, or `None`
+/// when there are none, so `doctor` and session start can say it happened.
+pub fn hook_failure_summary(base_dir: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(base_dir.join("hook-events.jsonl")).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let window = &lines[lines.len().saturating_sub(HOOK_FAILURE_WINDOW)..];
+    let mut failed = 0usize;
+    let mut last: Option<(String, String, String)> = None;
+    for line in window {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v.get("success").and_then(|s| s.as_bool()) == Some(false) {
+            failed += 1;
+            last = Some((
+                v.get("hook").and_then(|h| h.as_str()).unwrap_or("?").to_string(),
+                v.get("ts").and_then(|t| t.as_str()).unwrap_or("?").to_string(),
+                v.get("error").and_then(|e| e.as_str()).unwrap_or("(no error text; older binary)").to_string(),
+            ));
+        }
+    }
+    let (hook, ts, err) = last?;
+    Some(format!(
+        "hooks: {failed} failed of the last {} run(s); last: {hook} at {ts}: {err}. Hooks fail open, so the session never saw it.",
+        window.len()
+    ))
+}
+
+/// The tier log dirs a report can read: the workspace `.base` from `cwd`, then the global one.
+pub fn hook_log_dirs(cwd: &std::path::Path) -> Vec<(&'static str, std::path::PathBuf)> {
+    let mut out = Vec::new();
+    if let Some(ws) = crate::config::find_workspace_base(cwd) {
+        out.push(("workspace", ws));
+    }
+    if let Some(g) = crate::home::home_root().map(|h| h.join(".base-gbl").join(".base")).filter(|p| p.is_dir()) {
+        out.push(("global", g));
+    }
+    out
+}
+
 /// Append one event line, trimming the file first when it is over the cap. The writer
 /// owns its own bound; nothing else has to run for the trail to stay bounded.
 pub fn append_hook_event(base_dir: &std::path::Path, event: &serde_json::Value) {
@@ -289,7 +331,7 @@ pub fn append_hook_event(base_dir: &std::path::Path, event: &serde_json::Value) 
 }
 
 /// Append a hook event to the JSONL log file. Fire-and-forget — never blocks hooks.
-fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>) {
+fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>, error: Option<String>) {
     let cwd = std::env::current_dir().unwrap_or_default();
     let base_dir = match crate::config::find_workspace_base(&cwd)
         .or_else(|| {
@@ -306,6 +348,7 @@ fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>) {
         "ts": ts,
         "hook": hook,
         "success": success,
+        "error": error,
         "cwd": data.and_then(|d| d.cwd.clone()),
         "domains_matched": data.map(|d| &d.domains_matched).unwrap_or(&empty),
         "rules_injected": data.map(|d| d.rules_injected).unwrap_or(0),
