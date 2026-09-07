@@ -56,6 +56,10 @@ pub struct TierReport {
     /// after a migration is not a fault: `base sync` writes a Document with no
     /// domain, so the count climbs again until every write path carries the link.
     pub domain_orphans: Vec<(String, usize)>,
+    /// Supersession counts and defects for this tier. Default (all zero, no
+    /// lists) on a tier that has never used the feature, and doctor then prints
+    /// nothing about it — a store from before 0.14.0 reads exactly as it did.
+    pub supersede_audit: crate::supersede::Audit,
     pub latest_backup: Option<BackupCompare>,
 }
 
@@ -120,15 +124,19 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
     // Namespace from THIS tier's own base.toml (`<root>/.base/graph.nq` → `<root>`),
     // so a workspace with a custom prefix is read with its own vocabulary rather
     // than the default. Keeps `diagnose_tier` path-scoped — the test-isolation seam.
-    let (schema_version, domain_orphans) = if status == "healthy" {
+    let (schema_version, domain_orphans, supersede_audit) = if status == "healthy" {
         let root = path.parent().and_then(Path::parent).unwrap_or(path);
         let ns = crate::config::BaseConfig::load(root).namespace;
         match store::load_graph(path) {
-            Ok(s) => (crate::migrate::stamp_of_tier(&s, &ns), crate::migrate::orphan_counts(&s, &ns)),
-            Err(_) => (None, Vec::new()),
+            Ok(s) => (
+                crate::migrate::stamp_of_tier(&s, &ns),
+                crate::migrate::orphan_counts(&s, &ns),
+                crate::supersede::audit(&s, &ns),
+            ),
+            Err(_) => (None, Vec::new(), crate::supersede::Audit::default()),
         }
     } else {
-        (None, Vec::new())
+        (None, Vec::new(), crate::supersede::Audit::default())
     };
 
     let latest_backup = newest_backup(path).map(|bpath| {
@@ -151,6 +159,7 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
         ends_with_newline,
         stale_tmp,
         entity_composition,
+        supersede_audit,
         schema_version,
         domain_orphans,
         latest_backup,
@@ -256,6 +265,49 @@ pub fn format_human(report: &DoctorReport) -> String {
                     "   schema: not migrated — the domain backfill runs at the next session start\n",
                 ),
             }
+            // Supersession, reported ONLY when there is something to report, so a
+            // store that has never used the feature prints exactly what it printed
+            // before. Counts and defects, never a judgement: doctor is where an
+            // operator goes looking for problems.
+            let a = &t.supersede_audit;
+            if !a.is_silent() {
+                out.push_str(&format!("   superseded: {} record(s)\n", a.superseded));
+                if a.corrections_naming_nothing > 0 {
+                    // The answer to G0 Q1: reported here once instead of nagging on
+                    // every `learn --type correction`.
+                    out.push_str(&format!(
+                        "   {} correction(s) name nothing they correct\n",
+                        a.corrections_naming_nothing
+                    ));
+                }
+                if a.status_without_edge > 0 || a.edge_without_status > 0 {
+                    // Two numbers, not one: status-without-edge is a pre-0.14.0
+                    // artefact, edge-without-status is a writer that half-ran.
+                    out.push_str(&format!(
+                        "   supersession disagreement: {} with the status and no edge, \
+                         {} with the edge and no status\n",
+                        a.status_without_edge, a.edge_without_status
+                    ));
+                }
+                if !a.long_chains.is_empty() {
+                    out.push_str(&format!(
+                        "   {} chain(s) longer than 3 links — first: {}\n",
+                        a.long_chains.len(),
+                        a.long_chains.first().map(String::as_str).unwrap_or("")
+                    ));
+                }
+                if !a.cycles.is_empty() {
+                    // A defect, not a warning: the writer refuses to create one, so a
+                    // cycle here arrived by another route and `resolve_head` is
+                    // returning an arbitrary member of it as the live version.
+                    out.push_str(&format!(
+                        "   DEFECT: {} supersession cycle(s) — first: {}\n",
+                        a.cycles.len(),
+                        a.cycles.first().map(String::as_str).unwrap_or("")
+                    ));
+                }
+            }
+
             if orphans > 0 {
                 let top: Vec<String> = t
                     .domain_orphans

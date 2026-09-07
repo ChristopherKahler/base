@@ -165,6 +165,143 @@ pub fn link_update(ns: &NamespaceConfig, graph_iri: &str, old_iri: &str, new_iri
     )
 }
 
+/// What `base doctor` reports about supersession on one tier.
+///
+/// Every field is a COUNT or a list of IRIs, never a judgement: doctor is where an
+/// operator goes looking for problems, so it states what is there and lets them
+/// decide. The two disagreement counts are deliberately separate — a record with the
+/// status and no edge is a pre-0.14.0 artefact (one exists in Chris's store today),
+/// while a record with the edge and no status is a writer that half-ran, and folding
+/// them into one number would hide which of those happened.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Audit {
+    /// Records carrying `supersededBy`.
+    pub superseded: usize,
+    /// Chains longer than three links, by their starting record.
+    pub long_chains: Vec<String>,
+    /// Records whose forward walk revisits a node. The writer refuses these; one here
+    /// arrived by another route and is a defect, not a warning.
+    pub cycles: Vec<String>,
+    /// `status "superseded"` with no `supersededBy` edge.
+    pub status_without_edge: usize,
+    /// `supersededBy` edge with no `status "superseded"`.
+    pub edge_without_status: usize,
+    /// `noteType "correction"` notes that name nothing they correct.
+    ///
+    /// Reported here, once, rather than warned about at write time: Chris writes
+    /// corrections daily, and a per-write nag fires several times a day, is ignored
+    /// within a week, and trains him to ignore the next warning that matters (G0 Q1,
+    /// ruled 2026-09-06).
+    pub corrections_naming_nothing: usize,
+}
+
+impl Audit {
+    /// Nothing to report — doctor prints no supersession line at all in this case,
+    /// so a store that has never used the feature reads exactly as it did before.
+    pub fn is_silent(&self) -> bool {
+        *self == Audit::default()
+    }
+}
+
+/// Audit one loaded store. One pass per predicate, then the walks — this runs inside
+/// `base doctor`, which already loads the store, so it adds no parse.
+pub fn audit(store: &Store, ns: &NamespaceConfig) -> Audit {
+    let mut out = Audit::default();
+    let iri = |local: &str| NamedNodeRef::new(format!("{}{local}", ns.uri)).ok();
+    let (Some(sup_by), Some(status_p), Some(note_type)) =
+        (iri(PRED_SUPERSEDED_BY), iri("status"), iri("noteType"))
+    else {
+        return out;
+    };
+
+    let subjects_of = |pred: NamedNodeRef<'_>| -> BTreeSet<String> {
+        store
+            .quads_for_pattern(None, Some(pred), None, None)
+            .filter_map(|q| q.ok())
+            .filter_map(|q| match q.subject {
+                oxigraph::model::Subject::NamedNode(n) => Some(n.into_string()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let has_edge = subjects_of(sup_by);
+    out.superseded = has_edge.len();
+
+    let marked: BTreeSet<String> = store
+        .quads_for_pattern(None, Some(status_p), None, None)
+        .filter_map(|q| q.ok())
+        .filter(|q| matches!(&q.object, Term::Literal(l) if l.value() == STATUS_SUPERSEDED))
+        .filter_map(|q| match &q.subject {
+            oxigraph::model::Subject::NamedNode(n) => Some(n.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+
+    out.status_without_edge = marked.difference(&has_edge).count();
+    out.edge_without_status = has_edge.difference(&marked).count();
+
+    // Chain length and cycles, walked from every record that has a successor. A
+    // cycle is detected by the walk revisiting, which is the same visited-set rule
+    // `resolve_head` uses, so the two cannot disagree about what a cycle is.
+    for start in &has_edge {
+        let mut seen = BTreeSet::new();
+        seen.insert(start.clone());
+        let mut cur = start.clone();
+        let mut hops = 0usize;
+        loop {
+            let Ok(subject) = NamedNodeRef::new(&cur) else { break };
+            let next = store
+                .quads_for_pattern(Some(subject.into()), Some(sup_by), None, None)
+                .filter_map(|q| q.ok())
+                .filter_map(|q| match q.object {
+                    Term::NamedNode(n) => Some(n.into_string()),
+                    _ => None,
+                })
+                .min();
+            match next {
+                Some(n) if seen.insert(n.clone()) => {
+                    cur = n;
+                    hops += 1;
+                }
+                Some(_) => {
+                    out.cycles.push(start.clone());
+                    break;
+                }
+                None => break,
+            }
+        }
+        if hops > 3 {
+            out.long_chains.push(start.clone());
+        }
+    }
+
+    // A correction that names nothing it corrects.
+    out.corrections_naming_nothing = store
+        .quads_for_pattern(None, Some(note_type), None, None)
+        .filter_map(|q| q.ok())
+        .filter(|q| matches!(&q.object, Term::Literal(l) if l.value() == "correction"))
+        .filter_map(|q| match &q.subject {
+            oxigraph::model::Subject::NamedNode(n) => Some(n.as_str().to_string()),
+            _ => None,
+        })
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .filter(|s| {
+            NamedNodeRef::new(s)
+                .ok()
+                .and_then(|n| {
+                    NamedNodeRef::new(format!("{}{PRED_SUPERSEDES}", ns.uri))
+                        .ok()
+                        .map(|p| store.quads_for_pattern(Some(n.into()), Some(p), None, None).next().is_none())
+                })
+                .unwrap_or(false)
+        })
+        .count();
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
