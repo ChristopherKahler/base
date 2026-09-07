@@ -11,8 +11,24 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use oxigraph::sparql::QueryResults;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::config::NamespaceConfig;
 use crate::crud;
+
+/// How many times this process has federated an app's `.base-ast` sidecar.
+///
+/// The prompt hook passes `include_ast = false` (kite F9): the walk resolves
+/// projects, decisions, people and documents, and parsing a multi-megabyte AST
+/// map on every prompt to serve none of it is a cost nobody sees. `base graph *`
+/// passes `true` because it is expected to walk into call graphs. Asserted at 0
+/// on the hook path by the same harness that asserts `graph=1`.
+pub static AST_LOADS: AtomicUsize = AtomicUsize::new(0);
+
+/// AST sidecar loads so far in this process. See [`AST_LOADS`].
+pub fn ast_loads() -> usize {
+    AST_LOADS.load(Ordering::Relaxed)
+}
 
 pub struct Node {
     pub label: String,
@@ -353,6 +369,7 @@ pub fn maps_from_store(
     // Edges are kept only when both endpoints are real nodes (drops dangling
     // import targets). Code-entity IRIs (code:*) never collide with concept IRIs.
     if include_ast {
+        AST_LOADS.fetch_add(1, Ordering::Relaxed);
         let (code_nodes, code_edges) = crate::crud::ast_query::code_graph(cwd, ns);
         for (id, label, ntype, file) in code_nodes {
             nodes.entry(id).or_insert(Node {

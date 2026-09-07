@@ -383,6 +383,22 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         }
     }
 
+    // Test 5's instrument, and kite F9's. Both claims -- one parse per prompt,
+    // and no AST sidecar on the prompt path -- are invisible in the output: the
+    // injected text is identical whether the graph was parsed once or twice.
+    // So the counts are REPORTED rather than inferred, and the hook harness
+    // asserts on this line instead of on a stopwatch.
+    //
+    // Outside the `if let Some(walked)` above on purpose: a prompt that resolves
+    // no names is exactly where an accidental second parse would hide.
+    if config.devmode.enabled {
+        walk_note.push_str(&format!(
+            "  parses: graph={} ast={}\n",
+            crate::store::graph_loads(),
+            crate::graph_query::ast_loads(),
+        ));
+    }
+
     // Grounding (Phase 30): when enabled, ride a source-verification block on any
     // fresh injection this prompt. Skipped on dedup-only prompts (already grounded).
     if config.grounding.enabled && injected_any {
