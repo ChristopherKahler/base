@@ -186,6 +186,16 @@ pub fn purge_stale(path: &Path, ns: &NamespaceConfig, days: i64, apply: bool) ->
 
     let store = store::load_graph(path)?;
 
+    // Never purge a member of a supersession chain, at EITHER end (hawk C2). The
+    // superseded record is the evidence the drift claim rests on, and deleting it
+    // would leave its successor's `supersedes` edge pointing at nothing. Inside the
+    // GRAPH group with the staleness filter, for the reason F16 exists.
+    let sup = &crate::supersede::PRED_SUPERSEDES;
+    let sup_by = &crate::supersede::PRED_SUPERSEDED_BY;
+    let spare_chains = format!(
+        "FILTER NOT EXISTS {{ {{ ?n {p}:{sup_by} ?_newer }} UNION {{ ?_older {p}:{sup} ?n }} }}"
+    );
+
     let select = format!(
         "{prefixes}\n\
          SELECT ?n ?text WHERE {{\n\
@@ -194,6 +204,7 @@ pub fn purge_stale(path: &Path, ns: &NamespaceConfig, days: i64, apply: bool) ->
              OPTIONAL {{ ?n {p}:lastRead ?lr }}\n\
              OPTIONAL {{ ?n {p}:createdAt ?cr }}\n\
              FILTER( COALESCE(?lr, ?cr, \"1970-01-01T00:00:00Z\"^^xsd:dateTime) < \"{cutoff}\"^^xsd:dateTime )\n\
+             {spare_chains}\
            }}\n\
          }}",
         prefixes = crate::crud::prefixes(ns),
