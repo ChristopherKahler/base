@@ -302,7 +302,7 @@ fn a_context_block_of_only_the_domains_own_project_is_not_emitted() {
         let store = base::store::load_merged(root).expect("the merged store loads");
         // `served` is not asserted here: the neighbourhood SPARQL projects `?name ?type`
         // only, so `row.get("related")` is never bound and this leg has never marked a
-        // record as served, on 0.14.0 as now. Recorded in the fork doc; not this fork's.
+        // record as served, on 0.14.0 as now. Issue #65; its fix asserts two here.
         let (_, neighbourhood, _) = base::domain::query::query_domain_from_graph(&store, &config, &domain);
         assert!(neighbourhood.contains("Decision: Use Seedance for b-roll"), "{neighbourhood}");
         assert!(neighbourhood.contains("Project: vp-operators"), "{neighbourhood}");
