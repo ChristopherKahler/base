@@ -1,9 +1,13 @@
 //! #66 lock 2, the visible half: `base sync --ast --yes` pipes the extractor's
 //! stderr so a FAILED build can explain itself at the next session start
 //! (`.base-ast/.last-error`). Until 0.14.2 a SUCCESSFUL build's stderr was
-//! captured and dropped, so the new app-root attribution counter would have been
-//! invisible on the path that runs it most — the Stop hook, which always passes
-//! `--yes` (src/hook/automap.rs, spawn_sync).
+//! captured and dropped, so the app-root attribution counter never reached the
+//! person who ran the sync.
+//!
+//! Scope, precisely: this fixes the FOREGROUND `--yes` sync only. A background
+//! refresh still shows nobody anything, because `spawn_sync` hands its child
+//! `Stdio::null()` and the git hook redirects to `/dev/null` (both by design).
+//! Persisting notices for session start is a separate change.
 //!
 //! The stub extractor here writes notice lines and exits 0. The real python is
 //! not involved: this pins the plumbing, not the count.
