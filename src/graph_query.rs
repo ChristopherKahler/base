@@ -164,6 +164,9 @@ pub fn load_graph(
     // `conceptType` is written only by `graph extract`; a store that has never run it
     // has none, so fall back to the RDF class every record carries. Without this every
     // node's type is blank and two records sharing a name are indistinguishable.
+    // Session traffic never enters the graph a `base graph` command reasons over.
+    // One list, four readers — see `ontology::transient`.
+    let no_transient = crate::ontology::transient::sparql_exclude(ns, "s");
     let node_q = format!(
         "SELECT ?s ?label ?type ?rdftype ?src ?summary WHERE {{ GRAPH ?g {{\n\
            ?s {p}:name ?label .\n\
@@ -171,6 +174,7 @@ pub fn load_graph(
            OPTIONAL {{ ?s a ?rdftype }}\n\
            OPTIONAL {{ ?s {p}:sourceDoc ?src }}\n\
            OPTIONAL {{ ?s {p}:summary ?summary }}\n\
+         {no_transient}\
          }} }}"
     );
     let mut nodes: HashMap<String, Node> = HashMap::new();
@@ -205,6 +209,7 @@ pub fn load_graph(
            FILTER NOT EXISTS {{ ?s {p}:name ?any }}\n\
            OPTIONAL {{ ?s {p}:sourceDoc ?src }}\n\
          {body_opts}\
+         {no_transient}\
          }} }}"
     );
     if let QueryResults::Solutions(sols) = ask(&typed_q)? {
@@ -243,6 +248,14 @@ pub fn load_graph(
 
     let mut adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let push = |adj: &mut HashMap<String, Vec<(String, String)>>, a: String, b: String, rel: String| {
+        // An edge touching session traffic is not an edge. This is the single
+        // choke point for adjacency, so it also stops the `dangling` pass below
+        // re-introducing a transient endpoint by IRI.
+        if crate::ontology::transient::is_transient_iri(ns, &a)
+            || crate::ontology::transient::is_transient_iri(ns, &b)
+        {
+            return;
+        }
         adj.entry(a.clone()).or_default().push((b.clone(), rel.clone()));
         adj.entry(b).or_default().push((a, rel)); // undirected for reachability
     };

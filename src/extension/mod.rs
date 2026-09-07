@@ -191,6 +191,13 @@ pub struct IngestSource {
     pub entity: String,
     #[serde(default = "default_strategy")]
     pub strategy: String,
+    /// The domain every record from this source is filed under, as a slug, e.g.
+    /// `domain = "skyrim-companion"` for a lore extension (Chris's ruling 3, G0 verdict
+    /// A3: "the extension's write path gains the same link for new records"). Optional:
+    /// a source that declares none is filed by class at the next session start by the
+    /// delta pass in `migrate.rs`.
+    #[serde(default)]
+    pub domain: Option<String>,
 }
 
 fn default_strategy() -> String {

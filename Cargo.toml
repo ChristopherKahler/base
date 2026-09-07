@@ -34,3 +34,7 @@ isolation-guard = []
 [dev-dependencies]
 base = { path = ".", features = ["isolation-guard"] }
 tempfile = "3"
+# The dashboard's node/edge handlers are part of the read surface ruling 4
+# governs, so `tests/transient_kinds_test.rs` drives them directly. Same crate
+# and version the binary already links; nothing new enters the tree.
+axum = { version = "0.8", features = ["ws"] }

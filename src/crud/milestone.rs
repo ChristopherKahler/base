@@ -39,6 +39,13 @@ pub fn add(
          }}"
     );
 
+    // The milestone takes its project's domain now rather than at the next session
+    // start (kite F7b). A project with no domain links nothing here; the delta pass
+    // files it.
+    let sparql = format!(
+        "{sparql};\n{}",
+        crate::domain::link::inherit_update(ns, &graph, &ms_iri, &project_iri)
+    );
     crud::load_and_mutate(cwd, ns, &sparql)?;
     Ok(slug)
 }

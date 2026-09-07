@@ -4,6 +4,8 @@ use oxigraph::store::Store;
 
 use crate::config::NamespaceConfig;
 
+pub mod transient;
+
 /// The ops: vocabulary template, embedded at compile time.
 /// Namespace prefix and URI are replaced at runtime from BaseConfig.
 const OPS_TTL: &str = include_str!("ops.ttl");

@@ -140,6 +140,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base doctor`
 - `base graph`
 - `base graph compact`
+- `base graph migrate`
 - `base graph apply-ops`
 - `base graph purge`
 - `base graph extract`
@@ -2783,6 +2784,7 @@ Usage: base graph <COMMAND>
 
 Commands:
   compact    Dedup + canonicalize the workspace graph (atomic rewrite, snapshots first)
+  migrate    Give every covered record a domain link, once, per tier
   apply-ops  Apply inbound fact ops (JSON on stdin) into the local graph
   purge      Remove notes unread past --days (recency only). PREVIEW unless --apply
   extract    LLM semantic extraction over a doc corpus → concepts + edges in the graph. Markdown-only by default; PDF/image/audio/video need multimodal enabled (`base config set multimodal.enabled true`, or one-shot --multimodal)
@@ -2809,6 +2811,23 @@ Usage: base graph compact
 Options:
   -h, --help
           Print help
+```
+
+## base graph migrate
+
+```text
+Give every covered record a domain link, once, per tier.
+
+Normally runs itself at session start and needs no operator. This exists because `base doctor` reports "not migrated" for a tier whose graph was unhealthy when the hook tried — telling an operator about a problem they cannot then act on is worse than not telling them. Repair, then run this.
+
+Usage: base graph migrate [OPTIONS]
+
+Options:
+      --dry-run
+          Show what would be linked, and by which source, without writing
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## base graph apply-ops

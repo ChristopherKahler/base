@@ -78,6 +78,34 @@ Dedups + canonicalizes the workspace graph via an atomic rewrite (snapshots firs
 Idempotent — running it twice changes nothing. The safe replacement for a manual cleanup.
 Refuses an unhealthy graph (run `base doctor --repair` first).
 
+### Domain migration — `base graph migrate`
+```
+base graph migrate --dry-run          # what would be linked, and by which source
+base graph migrate                    # snapshot, link, stamp, atomic rewrite
+```
+Gives every covered record a domain link, once per tier. **Normally you never run
+this**: it runs itself at session start, and says nothing when there is nothing to
+do. Run it by hand after `base doctor --repair`, because a migration skips an
+unhealthy graph and `base doctor` will keep reporting `schema: not migrated`
+until it succeeds.
+
+Idempotent, and idempotent the hard way: the work is recomputed from the store
+every time, and the schema stamp is written **inside the same atomic rewrite as
+the links**. A stamp in a file beside the store would survive a `.bak` restore and
+claim a migration that is no longer in the data — so restoring a pre-migration
+snapshot correctly re-migrates, and restoring a post-migration one correctly does
+nothing.
+
+Where a record's domain comes from is reported per source, so the catchall
+(`unfiled`) is one line among the others rather than a silent remainder:
+```
+base: domain migration — 2871 record(s) now carry a domain.
+  by source: fixed 1434, parent 1241, path-trigger 510, unfiled 862, ...
+  by kind:   LoreKnowledge 929, AcceptanceCriteria 375, Document 999, ...
+```
+`base doctor` reports each tier's `schema:` line and `without a domain: N` so a
+migration that never ran is never invisible.
+
 ### Purge stale notes — `base graph purge --stale`
 ```
 base graph purge --stale              # PREVIEW: list notes unread > 21 days (writes nothing)
@@ -96,7 +124,10 @@ if they become relevant again.
 
 - **Naming:** `graph.nq.bak-<op>-<date>` (e.g. `graph.nq.bak-pre-repair-2026-06-19-140817`).
 - **Rotation:** the newest 10 snapshots are kept; older ones are rotated out automatically.
-- **Who snapshots:** repair, restore, compact, and purge all snapshot before mutating.
+- **Who snapshots:** repair, restore, compact, purge and migrate all snapshot before
+  mutating. They share one pool of 10, so a migration snapshot evicts the oldest
+  compact snapshot. A migration that finds nothing to do takes no snapshot, for
+  exactly that reason.
 
 ---
 

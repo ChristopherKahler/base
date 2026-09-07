@@ -26,8 +26,7 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, top_n: usize) -> Result<()> {
         .collect();
 
     // ── God nodes: highest degree = core abstractions ──
-    let mut by_deg: Vec<(&String, usize)> = degree.iter().map(|(k, v)| (*k, *v)).collect();
-    by_deg.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| label_of(&nodes, a.0).cmp(&label_of(&nodes, b.0))));
+    let by_deg = rank_god_nodes(ns, &nodes, &degree);
 
     // ── Communities: label propagation ──
     let comm = label_propagation(&nodes, &adj);
@@ -65,9 +64,7 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, top_n: usize) -> Result<()> {
 
     println!("\n## Communities (by size)");
     for (i, (_, members)) in group_vec.iter().enumerate().take(top_n) {
-        let mut sample: Vec<String> = members.iter().map(|m| label_of(&nodes, m)).collect();
-        sample.sort();
-        let sample: Vec<String> = sample.into_iter().take(5).collect();
+        let sample = community_sample(ns, &nodes, members);
         println!("  [{}] {} nodes — {}", i, members.len(), sample.join(", "));
     }
 
@@ -112,6 +109,46 @@ fn bridge_pairs(
     let weight = |p: &(String, String)| degree.get(&p.0).unwrap_or(&0) + degree.get(&p.1).unwrap_or(&0);
     bridges.sort_by(|x, y| weight(y).cmp(&weight(x)).then_with(|| x.cmp(y)));
     bridges
+}
+
+/// Is this node the catchall domain? The catchall is a hub by construction: every record
+/// no source could file points at it (1,511 on the first migrated store, where it ranked
+/// as the #2 god node). It is not a core abstraction and it is not a community's name.
+/// One guard, both places (kite F22, vole 2026-09-06). Real domains still rank until
+/// base-analyze-demo-grade decides what a domain's degree means.
+fn is_catchall(ns: &NamespaceConfig, id: &str) -> bool {
+    id.trim_matches(['<', '>']) == crate::crud::build_iri(ns, "domain", crate::migrate::CATCHALL)
+}
+
+/// Nodes by degree, highest first, ties by label. The catchall never appears.
+pub fn rank_god_nodes(
+    ns: &NamespaceConfig,
+    nodes: &HashMap<String, crate::graph_query::Node>,
+    degree: &HashMap<&String, usize>,
+) -> Vec<(String, usize)> {
+    let mut by_deg: Vec<(String, usize)> = degree
+        .iter()
+        .filter(|(k, _)| !is_catchall(ns, k.as_str()))
+        .map(|(k, v)| ((*k).clone(), *v))
+        .collect();
+    by_deg.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| label_of(nodes, &a.0).cmp(&label_of(nodes, &b.0))));
+    by_deg
+}
+
+/// Up to five member labels, sorted, that stand for a community. The catchall is never
+/// one of them.
+pub fn community_sample(
+    ns: &NamespaceConfig,
+    nodes: &HashMap<String, crate::graph_query::Node>,
+    members: &[&String],
+) -> Vec<String> {
+    let mut sample: Vec<String> = members
+        .iter()
+        .filter(|m| !is_catchall(ns, m.as_str()))
+        .map(|m| label_of(nodes, m))
+        .collect();
+    sample.sort();
+    sample.into_iter().take(5).collect()
 }
 
 fn label_of(nodes: &HashMap<String, crate::graph_query::Node>, id: &str) -> String {

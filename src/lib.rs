@@ -23,6 +23,7 @@ pub mod first_run;
 pub mod hook;
 pub mod install;
 pub mod manifest;
+pub mod migrate;
 pub mod ontology;
 pub mod operator;
 pub mod plugin;

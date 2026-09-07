@@ -351,6 +351,17 @@ pub enum Commands {
 pub enum GraphAction {
     /// Dedup + canonicalize the workspace graph (atomic rewrite, snapshots first)
     Compact,
+    /// Give every covered record a domain link, once, per tier.
+    ///
+    /// Normally runs itself at session start and needs no operator. This exists
+    /// because `base doctor` reports "not migrated" for a tier whose graph was
+    /// unhealthy when the hook tried — telling an operator about a problem they
+    /// cannot then act on is worse than not telling them. Repair, then run this.
+    Migrate {
+        /// Show what would be linked, and by which source, without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Apply inbound fact ops (JSON on stdin) into the local graph.
     ///
     /// The pull half of desktop sync. Reads either a bare array of ops or
@@ -3613,6 +3624,26 @@ pub fn run() {
                     std::process::exit(1);
                 }
             },
+            GraphAction::Migrate { dry_run } => {
+                if dry_run {
+                    print!("{}", base::migrate::format_dry_run(&cwd, &config.namespace));
+                } else {
+                    // Manual: always re-plans past the stamp. `base doctor` reporting
+                    // orphans while this printed "nothing to migrate" was a false
+                    // statement to the operator (kite, PR #50).
+                    let outcomes = base::migrate::migrate_tiers(
+                        &cwd,
+                        &config.namespace,
+                        base::migrate::Trigger::Manual,
+                    );
+                    let notice = base::migrate::format_outcomes(&outcomes);
+                    if notice.is_empty() {
+                        println!("Nothing to migrate — every covered record already carries a domain.");
+                    } else {
+                        print!("{notice}");
+                    }
+                }
+            }
             GraphAction::Purge { stale, apply, days } => {
                 if !stale {
                     eprintln!("Usage: base graph purge --stale [--apply] [--days N]");

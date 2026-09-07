@@ -236,6 +236,15 @@ fn ingest_file(
         triples.push(format!(
             "<{entity_iri}> {p}:source \"ext:{ext_name}\""
         ));
+        // The source's declared domain, written with the record (kite F7b / A3). No
+        // declaration, no link: the delta pass files the record by its class later.
+        if let Some(domain) = source.domain.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+            let domain_iri = crud::build_iri(ctx.ns, "domain", &crud::slugify(domain));
+            triples.push(format!(
+                "<{entity_iri}> {p}:{} <{domain_iri}>",
+                crate::domain::link::CANONICAL
+            ));
+        }
 
         for (key, value) in map {
             if key == "id" {
@@ -452,6 +461,7 @@ mod tests {
                         file: "items.json".into(),
                         entity: "TestItem".into(),
                         strategy: "upsert".into(),
+                        domain: None,
                     }],
                     inject: None,
                 }),
@@ -516,6 +526,7 @@ mod tests {
                         file: "items.json".into(),
                         entity: "ReplItem".into(),
                         strategy: "replace".into(),
+                        domain: None,
                     }],
                     inject: None,
                 }),
@@ -593,6 +604,7 @@ mod tests {
                         file: "data.json".into(),
                         entity: "Thing".into(),
                         strategy: "upsert".into(),
+                        domain: None,
                     }],
                     inject: None,
                 }),
