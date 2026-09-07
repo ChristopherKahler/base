@@ -105,12 +105,17 @@ pub fn add_with(
 /// Indices do not renumber. A rule is addressed by its IRI (`rule/{domain}/cli-N`,
 /// built at the `add` above), so hiding one leaves every other index exactly where it
 /// was and `rule remove --index` keeps working.
+/// One CLI rule as every reader here wants it: its tier-local index, its text,
+/// and whether a later record superseded it (#59). Both tiers number from 0
+/// independently, so the index only means something beside its own tier.
+type CliRule = (u32, String, bool);
+
 pub fn fetch(
     cwd: &Path,
     ns: &NamespaceConfig,
     domain_name: &str,
     include_superseded: bool,
-) -> Result<Vec<(u32, String, bool)>> {
+) -> Result<Vec<CliRule>> {
     let p = &ns.prefix;
     let domain_slug = crud::slugify(domain_name);
     let domain_iri = crud::build_iri(ns, "domain", &domain_slug);
@@ -199,7 +204,7 @@ pub fn list_all_tiers(
         .unwrap_or_else(|| cwd.to_path_buf());
 
     let mut total = 0usize;
-    let mut shown: Vec<(&str, Vec<(u32, String, bool)>)> = Vec::new();
+    let mut shown: Vec<(&str, Vec<CliRule>)> = Vec::new();
     for (label, c) in [("workspace", &ws_cwd), ("global", &gbl_cwd)] {
         let rules = fetch(c, ns, domain_name, include_superseded).unwrap_or_default();
         total += rules.len();
