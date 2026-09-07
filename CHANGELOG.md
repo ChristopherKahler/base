@@ -7,6 +7,32 @@ fails when the version in `Cargo.toml` has no entry here.
 
 Releases before 0.13.3 are tagged in the repository but are not written up.
 
+## 0.14.0 (2026-09-07)
+
+Every record in the graph now carries a domain. The first session start on 0.14.0 backfills a link onto every record that lacks one, per tier, after snapshotting the store; on a 14 MB workspace store (60,000 quads) that pass took 1.1 seconds, once, and later session starts add about half a second only when the store changed since the last one. Later session starts file only what was written since, so records that `base sync` and the PAUL ingest create are filed at the next session start, and tasks, milestones and handoffs are filed the moment they are created. `base doctor` reports each tier's `schema:` line and anything still without a domain; `base graph migrate` runs the backfill by hand. Relay pings no longer appear in `graph analyze`, `recall`, prompt-time injection or the dashboard.
+
+**Every install rewrites the BASE CLI section of `~/.claude/CLAUDE.md` once.** The section's text changed in this release, so the first session start on 0.14.0 refreshes it and prints one `[contract]` line; everything outside the section is left byte for byte as it was.
+
+**`base activate` is retired.** It removed an attribution block that no longer exists. The command still parses and exits 0, so a script that runs it does not break. An install that had activated will see the update-available banner again when a newer release exists; `base update --snooze` quiets it for 24 hours.
+
+Nothing base prints or writes names a company any more: the install and scaffold banners, the update banner, the generated `base.toml`, `domains.toml` and operator files, the CLAUDE.md section, `--help`, the release bodies and the docs site carry only the docs link and the author credit. `base install` and `base scaffold` print one short first-run message, and the first session start after an update prints one line saying what version is now running and where the changelog is.
+
+**Prompt-time injection walks the graph from what you named.** Until now everything served at prompt time hung off a domain that a keyword selected, so naming a project surfaced nothing about its client or its files, and a topic with no configured keyword could never fire at all. Naming a thing now resolves it to a record and serves what hangs off it — decisions, rules, tasks in progress, notes, documents and entities — as one `<base-context>` block per named thing, each line carrying the relation that put it there. A project or a domain gets two hops; a single record gets one. Keyword triggers stay as the domain-level layer and this is the record-level layer beside them, so a domain with no keywords is now reachable through anything filed in it that you name. Quoting, backticking, capitalising, a path shape, or two or more words all read as naming something; a bare lowercase word never resolves on its own, so `base` mid-sentence stays a word. An ambiguous name resolves to the same record every time or is skipped, never guessed. Relay pings never appear. The walk reuses the store the hook has already parsed rather than reading it a second time — one graph load per prompt, and the per-app AST map is not read at all — and `injection.walk_budget` caps the block, counting what it drops rather than dropping it silently.
+
+### Added
+
+- **injection**: prompt-time injection walks the graph from what the prompt names ([#56](https://github.com/ChristopherKahler/base/issues/56))
+- **domain**: every record carries a domain link, migrated in one idempotent pass ([#50](https://github.com/ChristopherKahler/base/issues/50))
+- **install**: brand strip, one first-run message, and a session-start update notice ([#49](https://github.com/ChristopherKahler/base/issues/49))
+
+### Fixed
+
+- **release**: label-fixed-in windows on the previous release and always creates the label ([#58](https://github.com/ChristopherKahler/base/issues/58)) ([#57](https://github.com/ChristopherKahler/base/issues/57))
+
+### Changed
+
+- **release**: the 0.14.0 note and the licence notice without the company ([#51](https://github.com/ChristopherKahler/base/issues/51))
+
 ## 0.13.19 (2026-09-05)
 
 A follow-up to 0.13.18's CLAUDE.md contract refresh. 0.13.18 marked the refresh done even when it had installed nothing (no CLAUDE.md, no `## BASE CLI` section, or two of them), so a user who fixed that later never received the current section. This release looks once more at the next session start: a current section is left alone, a missing or duplicated one is reported every session until it is resolved, and the refresh lands as soon as it can.
