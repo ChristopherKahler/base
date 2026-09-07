@@ -401,7 +401,7 @@ pub fn stamp_last_read(cwd: &Path, ns: &NamespaceConfig, note_iris: &[String]) -
     let graph = crud::workspace_graph_iri(ns, &ws_slug);
     let now = crud::now_iso();
 
-    let (store, trig_path) = crud::load_workspace_store(cwd)?;
+    let (store, trig_path, _lock) = crud::lock_and_load(cwd)?;
 
     let mut stmts: Vec<String> = Vec::new();
     for iri in note_iris {
@@ -533,7 +533,7 @@ pub fn remove(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<bool> {
         "SELECT ?text WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:noteText ?text }} }}"
     );
 
-    let (store, trig_path) = crud::load_workspace_store(cwd)?;
+    let (store, trig_path, _lock) = crud::lock_and_load(cwd)?;
     let full_check = format!("{}\n{}", crud::prefixes(ns), check);
     let results = crate::store::query(&store, &full_check)?;
     let exists = if let QueryResults::Solutions(mut sols) = results {
@@ -569,7 +569,7 @@ pub fn update_text(cwd: &Path, ns: &NamespaceConfig, slug: &str, new_text: &str)
     let graph = crud::workspace_graph_iri(ns, &ws_slug);
     let escaped = crud::escape_sparql_literal(new_text);
 
-    let (store, trig_path) = crud::load_workspace_store(cwd)?;
+    let (store, trig_path, _lock) = crud::lock_and_load(cwd)?;
 
     let check = format!(
         "{}\nSELECT ?text WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:noteText ?text }} }}",

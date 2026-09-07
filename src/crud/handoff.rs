@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use oxigraph::sparql::QueryResults;
-use oxigraph::store::Store;
 
 use crate::config::NamespaceConfig;
 use crate::crud;
@@ -51,17 +50,10 @@ fn all_tier_files(gbl_root: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
 
 /// Load one graph file, run a SPARQL UPDATE, write back atomically.
 fn mutate_file(path: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<()> {
-    let store = if path.exists() {
-        crate::store::load_graph(path)?
-    } else {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).context("creating tier .base/ directory")?;
-        }
-        Store::new().context("creating empty store")?
-    };
     let full = format!("{}\n{}", crud::prefixes(ns), sparql);
-    crate::store::update_and_write(
-        &store,
+    // Locked, load inside: four builders registering inside twelve seconds is
+    // how #71-#74 were filed, and every one of those writes reported success.
+    crate::store::locked_update(
         path,
         &full,
         crate::store::Scope::Target,

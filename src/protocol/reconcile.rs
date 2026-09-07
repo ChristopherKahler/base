@@ -99,6 +99,13 @@ pub fn reconcile(cwd: &Path, config: &BaseConfig) -> Result<ReconcileStats> {
     if !config.protocol.enabled {
         return Ok(ReconcileStats::default());
     }
+    // The writer path locks before open_workspace loads.  itself
+    // stays unlocked: cli.rs uses it for the read-only plan, and readers never
+    // take this lock.
+    let Some(base_dir) = crate::config::find_workspace_base(cwd) else {
+        return Ok(ReconcileStats::default());
+    };
+    let _lock = store::lock_graph(&base_dir.join("graph.nq"))?;
     let Some((store, trig_path, ws_root)) = open_workspace(cwd) else {
         return Ok(ReconcileStats::default());
     };

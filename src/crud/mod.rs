@@ -170,6 +170,29 @@ fn require_base_for_write(cwd: &Path) -> Result<PathBuf> {
 
 /// Load the workspace store. Requires an existing .base/; creates an empty
 /// store only when graph.nq itself doesn't exist yet.
+/// The workspace graph file for `cwd`, resolved WITHOUT loading it.
+///
+/// Split out of [`load_workspace_store`] so a writer can take the graph lock
+/// before it loads: the load must be inside the critical section or the store
+/// it produces is already stale by the time the write lands.
+pub fn workspace_graph_path(cwd: &Path) -> Result<PathBuf> {
+    Ok(require_base_for_write(cwd)?.join("graph.nq"))
+}
+
+/// Take the workspace graph lock, THEN load the store, and hand back both plus
+/// the guard.
+///
+/// The order is the whole point: a store loaded before the lock was taken is the
+/// stale snapshot that silently loses the other writer's change. Bind the guard
+/// to a local (`let (store, path, _lock) = ...`) and the critical section runs
+/// to the end of the function, covering the write.
+pub fn lock_and_load(cwd: &Path) -> Result<(Store, PathBuf, crate::store::GraphLockGuard)> {
+    let trig_path = workspace_graph_path(cwd)?;
+    let guard = crate::store::lock_graph(&trig_path)?;
+    let store = crate::store::load_or_empty(&trig_path)?;
+    Ok((store, trig_path, guard))
+}
+
 pub fn load_workspace_store(cwd: &Path) -> Result<(Store, PathBuf)> {
     let base_dir = require_base_for_write(cwd)?;
     let trig_path = base_dir.join("graph.nq");
@@ -205,32 +228,44 @@ pub fn load_read_then_mutate(
     ns: &NamespaceConfig,
     build: impl FnOnce(&Store) -> Result<String>,
 ) -> Result<()> {
-    let (store, trig_path) = load_workspace_store(cwd)?;
-    let sparql = build(&store)?;
-    let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
-    crate::store::update_and_write(
-        &store,
-        &trig_path,
-        &full_sparql,
-        crate::store::Scope::Target,
-        crate::store::Intent::Knowledge,
-    )
+    let trig_path = workspace_graph_path(cwd)?;
+    // The whole load -> build -> write sequence sits inside the lock: a store
+    // read before the lock was taken is the stale snapshot that loses writes.
+    crate::store::with_graph_lock(&trig_path, || {
+        let store = crate::store::load_or_empty(&trig_path)?;
+        let sparql = build(&store)?;
+        let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
+        crate::store::update_and_write(
+            &store,
+            &trig_path,
+            &full_sparql,
+            crate::store::Scope::Target,
+            crate::store::Intent::Knowledge,
+        )
+    })
 }
 
 /// Load store, execute SPARQL UPDATE, write back atomically.
 pub fn load_and_mutate(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<()> {
-    let (store, trig_path) = load_workspace_store(cwd)?;
+    let trig_path = workspace_graph_path(cwd)?;
     let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
     // Scope::Target, not Wide: this is the hot path — 40 CRUD callers, and the
     // hooks behind them fire on every tool call. Its SPARQL always names its
     // graph, so the target is derivable and a whole-store diff is never needed.
-    crate::store::update_and_write(
-        &store,
-        &trig_path,
-        &full_sparql,
-        crate::store::Scope::Target,
-        crate::store::Intent::Knowledge,
-    )
+    //
+    // Locked, and the load is inside the lock: 37 callers reach here, including
+    // the relay ping writer that interleaved with a registry archive in
+    // production on 2026-09-07 and silently discarded it (#72/#73/#74).
+    crate::store::with_graph_lock(&trig_path, || {
+        let store = crate::store::load_or_empty(&trig_path)?;
+        crate::store::update_and_write(
+            &store,
+            &trig_path,
+            &full_sparql,
+            crate::store::Scope::Target,
+            crate::store::Intent::Knowledge,
+        )
+    })
 }
 
 /// Load workspace graph and run a SPARQL SELECT query.
@@ -402,7 +437,7 @@ pub fn repair_edges(cwd: &Path, ns: &NamespaceConfig) -> Result<Vec<String>> {
             missing.display()
         );
     }
-    let (store, trig_path) = load_workspace_store(cwd)?;
+    let (store, trig_path, _lock) = lock_and_load(cwd)?;
     let ws_slug = workspace_slug(cwd);
     let graph = workspace_graph_iri(ns, &ws_slug);
     let p = &ns.prefix;

@@ -845,6 +845,199 @@ fn rotate_backups(path: &Path, fname: &str, just_written: &Path) {
     }
 }
 
+// ─── Write serialization ─────────────────────────────────────
+
+/// How long a writer waits for the graph lock before giving up.
+///
+/// A write on this machine's graphs takes about a second (shrike, 0.14.2:
+/// 1 540 ms to dump 27 MB), so ten seconds is room for several writers to queue
+/// and still an obvious error rather than a hang.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A lock file older than this is reaped. Same reasoning and same number as the
+/// abandoned-temp sweep in [`write_back_inner`]: a real write finishes in well
+/// under a second, so a minute-old lock is a crashed writer, not a live one.
+const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(60);
+
+thread_local! {
+    /// Lock files this thread currently holds. A set, not a counter, because the
+    /// lock must be RE-ENTRANT PER PATH: an outer writer takes the lock, then
+    /// calls a helper that also locks the same graph. A non-re-entrant lock
+    /// would make that self-deadlock — the outer holder waiting out its own
+    /// timeout on a file it is itself holding — which is a worse failure than
+    /// the lost update it was added to prevent.
+    ///
+    /// Also read by [`holds_graph_lock`], which the tripwire test uses so a
+    /// writer that forgets the lock fails the suite instead of silently racing.
+    static HELD_LOCKS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Held for the duration of a locked write. Removes the lock file on drop, so a
+/// panic inside the critical section cannot wedge the graph for other processes.
+/// A re-entrant (already-held) acquisition drops without releasing anything.
+///
+/// Returned by [`lock_graph`] for writers whose load and write are separated by
+/// a long body: binding it to a local keeps the critical section open until the
+/// function returns, without restructuring that body into a closure.
+pub struct GraphLockGuard {
+    path: PathBuf,
+    reentrant: bool,
+}
+
+impl Drop for GraphLockGuard {
+    fn drop(&mut self) {
+        if self.reentrant {
+            return;
+        }
+        HELD_LOCKS.with(|h| {
+            let mut h = h.borrow_mut();
+            if let Some(i) = h.iter().rposition(|p| p == &self.path) {
+                h.remove(i);
+            }
+        });
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// The lock file guarding `graph`: a sibling of it, so the two tiers lock
+/// independently and a workspace write never queues behind a global one.
+pub fn lock_path(graph: &Path) -> PathBuf {
+    let mut name = graph
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(".lock");
+    graph.with_file_name(name)
+}
+
+/// Run `f` holding an exclusive lock on `graph`.
+///
+/// This exists because `graph.nq` is a whole-file read-modify-write: a writer
+/// loads the entire graph, mutates it in memory, dumps it to a temp file and
+/// renames over the original. Two overlapping writers therefore destroy each
+/// other's changes and BOTH report success. Measured on 0.14.1 (shrike,
+/// 2026-09-07, `verification/base-0.14.2/registry_0142.sh`): eight concurrent
+/// `fork create` left three of eight rows, eight concurrent `fork archive`
+/// archived two of eight, and not one command exited non-zero. That is issues
+/// #72, #73 and #74, which are one defect.
+///
+/// The critical section spans load → update → write_back, never just the write:
+/// a store loaded before the lock was taken is precisely the stale snapshot that
+/// produces the lost update.
+///
+/// READERS DO NOT TAKE THIS LOCK. `fs::rename` is atomic, so a reader sees
+/// either the whole old file or the whole new one; hooks read on every tool call
+/// and must never queue behind a writer.
+pub fn with_graph_lock<T>(graph: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _guard = lock_graph(graph)?;
+    f()
+}
+
+/// Acquire the graph lock and hand back the guard. See [`with_graph_lock`] for
+/// why the lock exists and what it must span; this is the same lock, for callers
+/// whose load and write are too far apart to wrap in a closure.
+pub fn lock_graph(graph: &Path) -> Result<GraphLockGuard> {
+    let lock = lock_path(graph);
+    if let Some(parent) = lock.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating directory for lock {}", lock.display()))?;
+    }
+
+    // Already ours: re-enter without touching the file. See [`HELD_LOCKS`].
+    if HELD_LOCKS.with(|h| h.borrow().iter().any(|p| p == &lock)) {
+        return Ok(GraphLockGuard {
+            path: lock,
+            reentrant: true,
+        });
+    }
+
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    let mut backoff = std::time::Duration::from_millis(5);
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(mut fh) => {
+                let _ = writeln!(fh, "{}", std::process::id());
+                HELD_LOCKS.with(|h| h.borrow_mut().push(lock.clone()));
+                return Ok(GraphLockGuard {
+                    path: lock,
+                    reentrant: false,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if reap_stale_lock(&lock) {
+                    continue;
+                }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out after {}s waiting for the graph lock {} — another base process \
+                         is writing this graph. Nothing was written.",
+                        LOCK_WAIT.as_secs(),
+                        lock.display()
+                    );
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("taking the graph lock {}", lock.display()));
+            }
+        }
+    }
+}
+
+/// Remove a lock file whose mtime is older than [`LOCK_STALE`]. Returns whether
+/// one was reaped, so the caller retries at once instead of sleeping out its
+/// backoff behind a lock nobody holds.
+fn reap_stale_lock(lock: &Path) -> bool {
+    let stale = fs::metadata(lock)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        .map(|age| age > LOCK_STALE)
+        .unwrap_or(false);
+    if !stale {
+        return false;
+    }
+    eprintln!(
+        "base: reaping stale graph lock {} (mtime older than {}s)",
+        lock.display(),
+        LOCK_STALE.as_secs()
+    );
+    fs::remove_file(lock).is_ok()
+}
+
+/// Whether this thread currently holds a graph lock. The tripwire reads it.
+pub fn holds_graph_lock() -> bool {
+    HELD_LOCKS.with(|h| !h.borrow().is_empty())
+}
+
+/// Load `path`, run a SPARQL UPDATE and write it back — all inside the lock.
+///
+/// The load is inside the critical section on purpose; see [`with_graph_lock`].
+pub fn locked_update(path: &Path, sparql: &str, scope: Scope, intent: Intent) -> Result<()> {
+    with_graph_lock(path, || {
+        let store = load_or_empty(path)?;
+        update_and_write(&store, path, sparql, scope, intent)
+    })
+}
+
+/// Load a graph file, or an empty store when it does not exist yet.
+pub fn load_or_empty(path: &Path) -> Result<Store> {
+    if path.exists() {
+        load_graph(path)
+    } else {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).context("creating tier .base/ directory")?;
+        }
+        Store::new().context("creating empty store")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

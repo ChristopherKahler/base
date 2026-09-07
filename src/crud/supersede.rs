@@ -113,7 +113,7 @@ pub fn link_statement(
 /// the store that was loaded, where [`supersede::resolve_head`] finds it on a merged
 /// read.
 pub fn supersede(cwd: &Path, ns: &NamespaceConfig, old: &str, new: &str) -> Result<(String, String)> {
-    let (store, trig_path) = crud::load_workspace_store(cwd)?;
+    let (store, trig_path, _lock) = crud::lock_and_load(cwd)?;
     let tier = crud::tier_label(cwd);
     let old_iri = resolve_slug(&store, ns, old, &tier)?;
     let new_iri = resolve_slug(&store, ns, new, &tier)?;
