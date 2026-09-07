@@ -1111,6 +1111,21 @@ pub fn stderr_tail(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[start..]).into_owned()
 }
 
+/// The extractor's own notices — every `# ...` line it writes to stderr: how
+/// many files it is walking, which ones it skipped, and (#66) how many entities
+/// it could not attribute to a file. `--yes` pipes stderr so a FAILED build can
+/// explain itself at the next session start via `.last-error`; until 0.14.2 a
+/// SUCCESSFUL build's notices were captured and dropped on the floor, which made
+/// the fallback counter invisible on the path that runs it most — the Stop hook.
+/// Echoing them back on success costs nothing and keeps a silent skip visible.
+pub fn echo_extractor_notices(stderr: &[u8]) {
+    for line in String::from_utf8_lossy(stderr).lines() {
+        if line.starts_with("# ") {
+            eprintln!("{line}");
+        }
+    }
+}
+
 /// True if a refresh ran within the debounce window — skip this one.
 fn recently_synced(marker: &Path) -> bool {
     std::fs::metadata(marker)

@@ -2,6 +2,12 @@
 
 from pathlib import Path
 
+# One source of truth for "is a file" (#66). Import direction:
+# onto_ast imports both; extractor imports neither of us, so this closes
+# no cycle. extractor's module-level imports are stdlib only — every
+# tree-sitter grammar loads lazily inside its handler.
+from extractor import _DISPATCH
+
 _CONFIG_PATH = Path.home() / ".open-ontologies" / "config.toml"
 _ns_cache: dict[str, str] | None = None
 
@@ -111,11 +117,45 @@ def _extract_line(node: dict) -> int:
     return 0
 
 
-_FILE_EXTS = frozenset({
-    ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".java", ".rb",
-    ".cpp", ".c", ".h", ".cs", ".php", ".swift", ".kt", ".scala", ".ex",
-    ".exs", ".lua", ".jl", ".zig", ".sh", ".sql", ".dart", ".svelte", ".astro",
-})
+def _parsed_extensions() -> frozenset[str]:
+    """Every extension the extractor actually parses.
+
+    #66: this was a hand-kept list of 27 while `_DISPATCH` grew to 66. The 39
+    extensions in the gap (`.mjs`, `.ps1`, `.vue`, `.md`, `.json`, `.hpp`,
+    `.kts`, every Fortran and Pascal spelling, ...) were parsed, reached the
+    graph, and had every one of their entities attributed to the app root,
+    because no file node was recognised for them and `_resolve_source_file`
+    took its fallback. Deriving the set is the only way the two cannot drift
+    again. No `try/except ImportError` guard: a degraded empty set would
+    attribute EVERY entity to the app root, silently — the very failure this
+    exists to kill, made total. Fail loudly instead.
+    """
+    return frozenset(_DISPATCH)
+
+
+_FILE_EXTS = _parsed_extensions()
+
+
+def _identify_file_nodes(
+    node_labels: dict[str, str],
+    file_map: dict[str, str] | None,
+) -> set[str]:
+    """Which node ids are file-level nodes.
+
+    `file_map` (built in onto_ast.py under every id form a file node can carry)
+    IS the definition of a file node in `--full` mode, so membership in it is
+    exact and needs no extension list at all. The extension test is the
+    fallback for single-file mode, where there is no `file_map`; it is a
+    heuristic over free-text labels (a markdown heading ending in `.md` reads
+    as a file) and is only ever consulted when the exact answer is unavailable.
+    """
+    if file_map:
+        return {nid for nid in node_labels if nid in file_map}
+    return {
+        nid
+        for nid, label in node_labels.items()
+        if any(label.endswith(ext) for ext in _FILE_EXTS)
+    }
 
 # Extensions whose structs/records should be ops:Struct, not ops:Class
 _STRUCT_LANGUAGES = frozenset({".rs", ".go", ".c", ".cpp", ".h", ".hpp", ".zig", ".cs"})
@@ -132,6 +172,7 @@ def _build_role_map(
     nodes: list[dict],
     file_membership: dict[str, str],
     node_labels: dict[str, str],
+    file_nodes_in: set[str],
 ) -> dict[str, str]:
     """Pre-process edges to infer node types from relationships.
 
@@ -147,10 +188,11 @@ def _build_role_map(
     is_rationale: set[str] = set()
     file_nodes: set[str] = set()
 
-    for nid, label in node_labels.items():
-        if any(label.endswith(ext) for ext in _FILE_EXTS):
-            file_nodes.add(nid)
-            roles[nid] = "module"
+    # One identification, made once by the caller: role assignment and file
+    # membership must never disagree about what a file is.
+    for nid in file_nodes_in:
+        file_nodes.add(nid)
+        roles[nid] = "module"
 
     for edge in edges:
         rel = edge.get("relation", "")
@@ -274,6 +316,7 @@ def serialize(
     source_file: str,
     language: str,
     file_map: dict[str, str] | None = None,
+    stats: dict | None = None,
 ) -> str:
     """Serialize extraction to Turtle/TTL.
 
@@ -289,17 +332,26 @@ def serialize(
     # Build node label lookup
     node_labels = {n["id"]: n.get("label", "") for n in nodes}
 
-    # Identify file-level nodes
-    file_node_ids: set[str] = set()
-    for nid, label in node_labels.items():
-        if any(label.endswith(ext) for ext in _FILE_EXTS):
-            file_node_ids.add(nid)
+    # Identify file-level nodes (exact via file_map, else by extension)
+    file_node_ids = _identify_file_nodes(node_labels, file_map)
 
     # Build file membership (must come before role_map for Gap 2)
     file_membership = _build_file_membership(edges, file_node_ids)
 
     # Infer types (uses file_membership for struct vs class distinction)
-    role_map = _build_role_map(edges, nodes, file_membership, node_labels)
+    role_map = _build_role_map(edges, nodes, file_membership, node_labels, file_node_ids)
+
+    # #66: entities with no file node fall back to the app root. Silent until
+    # now, which is why 39 extensions drifted for months. The caller prints it.
+    if stats is not None:
+        orphans = sum(
+            1
+            for n in nodes
+            if n["id"] not in file_node_ids and n["id"] not in file_membership
+        )
+        stats["app_root_entities"] = orphans
+        stats["total_entities"] = len(nodes)
+        stats["file_nodes"] = len(file_node_ids)
 
     # Build import resolver (Gap 1)
     project_clean = sanitize_iri(project)
