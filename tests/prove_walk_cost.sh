@@ -76,6 +76,21 @@ profile_of() {
   return $rc
 }
 
+
+# The baseline must prove WHICH binary it is, and --version cannot do it: a build
+# of the merge base still reports 0.13.19, because the version bump has not
+# happened yet. Symbols can. Two-sided, because both errors are silent:
+#   has is_transient_iri   -> PR #50 is in it, so it is not the 0.13.19 release
+#   lacks maps_from_store  -> this fork is NOT in it, so it is not a build of the
+#                             branch under test being diffed against itself
+baseline_is_merge_base() {
+  local bin="$1" has lacks
+  has=$(nm -C "$bin" 2>/dev/null | grep -c is_transient_iri)
+  lacks=$(nm -C "$bin" 2>/dev/null | grep -c maps_from_store)
+  printf '  baseline identity: is_transient_iri=%s (want >0) maps_from_store=%s (want 0)\n' "$has" "$lacks"
+  [ "$has" -gt 0 ] && [ "$lacks" -eq 0 ]
+}
+
 case "$B" in
   */target/*)
     echo "BASE_BIN=$B is inside a cargo target dir. cargo test rewrites it mid-run; copy it aside." >&2
@@ -203,6 +218,8 @@ if [ -z "$BASELINE" ]; then
   skip "BASELINE unset — set it to a binary built from main dd048888 (NOT 0.13.19: PR #50 changed which nodes load)"
 elif [ ! -x "$BASELINE" ]; then
   skip "BASELINE=$BASELINE is not executable"
+elif ! baseline_is_merge_base "$BASELINE"; then
+  skip "BASELINE is not a merge-base build — see the identity line above"
 else
   # Names taken FROM the store, a few of EACH kind rather than the first N
   # alphabetically: the resolver's total order is kind-first, and a sample that
@@ -251,6 +268,8 @@ echo
 echo "── test 5b: hook wall time vs the merge base ──"
 if [ -z "$BASELINE" ] || [ ! -x "$BASELINE" ]; then
   skip "BASELINE unset — timing needs a before as well as an after"
+elif ! baseline_is_merge_base "$BASELINE" >/dev/null 2>&1; then
+  skip "BASELINE is not a merge-base build — timing it would compare the wrong pair"
 elif ! profile_of "$B" >/dev/null 2>&1 || ! profile_of "$BASELINE" >/dev/null 2>&1; then
   # This is the F23 defect exactly: a debug binary is 5-8x slower on every
   # oxigraph path, so a debug branch against a release baseline reports the
