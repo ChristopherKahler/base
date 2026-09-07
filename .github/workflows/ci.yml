@@ -35,6 +35,11 @@ jobs:
 
   # Every changelog.py command line the release assembles, run with the argv it
   # assembles. 0.13.16 nearly died on one that every other test had missed.
+  # The second script runs the workflow's two packing steps and reads what they
+  # produced: through v0.14.1 every published asset carried the binary and
+  # scripts/ and no license text, and nothing here could have noticed. A step
+  # rather than a job because this runner is already checked out; the image
+  # ships pwsh, which the Windows leg needs.
   release-invocations:
     runs-on: ubuntu-latest
     steps:
@@ -42,6 +47,7 @@ jobs:
         with:
           fetch-depth: 0
       - run: ./scripts/test-release-invocations.sh
+      - run: ./scripts/test-release-packaging.sh
 
   # Advisory until the three pre-existing never_loop denies in src/crud are
   # cleared; then drop continue-on-error and it becomes a required check.
