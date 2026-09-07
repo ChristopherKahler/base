@@ -40,3 +40,20 @@ fn inside_a_workspace_nothing_is_added() {
     let (_, _, err) = run(home.path(), ws.path(), &["recall", "--keyword", "anything"]);
     assert!(!err.contains(SENTENCE), "inside a workspace the sentence must not print: {err}");
 }
+
+#[test]
+fn project_list_outside_a_workspace_answers_from_the_global_tier() {
+    // It exited 1 with "no .base/ directory found" while recall, doctor and
+    // commands list all answered from the global tier. Four behaviours for one
+    // situation was the whole of #19; erroring was the odd one out.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".base-gbl").join(".base")).unwrap();
+    let nowhere = tempfile::tempdir().unwrap();
+    let (code, _out, err) = run(home.path(), nowhere.path(), &["project", "list"]);
+    assert_eq!(code, 0, "project list must answer, not error; stderr was: {err}");
+    assert!(err.contains(SENTENCE), "and it must name the tier: {err}");
+    assert!(
+        !err.contains("no .base/ directory found"),
+        "the bail message must be gone: {err}"
+    );
+}

@@ -205,9 +205,19 @@ pub fn list_data(
     // then resolve the current workspace and filter rows by #path-derived home.
     let registry = canon_registry(&config.workspace);
     let current = scope::current_workspace(&canon_path(cwd), &registry);
-    let peer_map = peer_workspaces(cwd, ns)?;
+    // #19: outside a workspace this bailed with rc 1 while every other reader
+    // quietly answered from the global tier. Read the global tier here too and let
+    // the CLI print the sentence naming it. `scope::in_scope` already returns true
+    // for `Current` when there is no current workspace, so nothing is hidden.
+    let read_cwd = match crate::config::find_workspace_base(cwd) {
+        Some(_) => cwd.to_path_buf(),
+        None => crate::home::home_root()
+            .map(|h| h.join(".base-gbl"))
+            .unwrap_or_else(|| cwd.to_path_buf()),
+    };
+    let peer_map = peer_workspaces(&read_cwd, ns)?;
 
-    let results = crud::load_and_query(cwd, ns, &sparql)?;
+    let results = crud::load_and_query(&read_cwd, ns, &sparql)?;
     let QueryResults::Solutions(solutions) = results else {
         return Ok((Vec::new(), 0));
     };
