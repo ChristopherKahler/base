@@ -21,6 +21,11 @@ EOF
   exit 2
 fi
 [ -x "$B" ] || { echo "BASE_BIN=$B is not executable" >&2; exit 2; }
+case "$B" in
+  */target/*)
+    echo "BASE_BIN=$B is inside a cargo target dir. cargo test rewrites it mid-run; copy it aside." >&2
+    exit 2 ;;
+esac
 OUT=/tmp/walkhook; rm -rf "$OUT"; mkdir -p "$OUT"
 
 fail=0
