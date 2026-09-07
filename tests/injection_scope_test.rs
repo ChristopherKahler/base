@@ -300,11 +300,22 @@ fn a_context_block_of_only_the_domains_own_project_is_not_emitted() {
 
         crud::decision::log(root, &ns(), "vp-operators", "Use Seedance for b-roll", "cheapest per clip", None).unwrap();
         let store = base::store::load_merged(root).expect("the merged store loads");
-        // `served` is not asserted here: the neighbourhood SPARQL projects `?name ?type`
-        // only, so `row.get("related")` is never bound and this leg has never marked a
-        // record as served, on 0.14.0 as now. Issue #65; its fix asserts two here.
-        let (_, neighbourhood, _) = base::domain::query::query_domain_from_graph(&store, &config, &domain);
+        // #65. The neighbourhood SPARQL projected `?name ?type` only, so `row.get("related")`
+        // was never bound and this leg marked nothing as served (0.14.0, 0.14.1). Served now
+        // carries both rows AND the domain itself, each in the walk's own key form
+        // (`<full-iri>`); until 0.14.2 the list held `term_display` suffixes the walk could
+        // never match, so the dedup it fed had never fired.
+        let (_, neighbourhood, served) = base::domain::query::query_domain_from_graph(&store, &config, &domain);
         assert!(neighbourhood.contains("Decision: Use Seedance for b-roll"), "{neighbourhood}");
         assert!(neighbourhood.contains("Project: vp-operators"), "{neighbourhood}");
+        let key = |kind: &str, slug: &str| format!("<{}>", crud::build_iri(&config.namespace, kind, slug));
+        assert_eq!(served.len(), 3, "{served:?}");
+        for k in [
+            key("decision", "vp-operators.use-seedance-for-b-roll"),
+            key("project", "vp-operators"),
+            key("domain", "vp-operators"),
+        ] {
+            assert!(served.contains(&k), "served lacks {k}: {served:?}");
+        }
     });
 }

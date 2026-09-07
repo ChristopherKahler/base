@@ -469,6 +469,14 @@ mod tests {
         let some = walk(&maps, &ns, "`first client kit`", &served, &no, &live);
         assert_eq!(some[0].1.len(), 1, "domain-served record was served twice");
         assert_eq!(some[0].1[0].id, "<x/decision/d2>");
+
+        // #65. A served ROOT still walks: the block listed its row, not its
+        // attachments. It is never its own record.
+        let served_root: HashSet<String> = HashSet::from(["<x/project/kit>".to_string()]);
+        let walked = walk(&maps, &ns, "`first client kit`", &served_root, &no, &live);
+        assert_eq!(walked.len(), 1, "a served root must still walk");
+        assert_eq!(walked[0].1.len(), 2, "its unserved attachments come through: {:?}", walked[0].1);
+        assert!(walked[0].1.iter().all(|r| r.id != "<x/project/kit>"), "a root is never its own record");
     }
 
     /// A transient record never reaches a prompt, whatever it is attached to.
