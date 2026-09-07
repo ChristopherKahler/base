@@ -95,11 +95,13 @@ fn is_matched(
         }
     }
 
-    // Keyword match: any prompt_keyword substring in prompt text
+    // Keyword match: a prompt keyword as whole words in the prompt text. A substring
+    // test stood here until 0.14.0 and fired `base` on `database` (F29). Excludes keep
+    // the substring test on purpose: a veto that fires too often errs toward silence.
     let keyword_hit = domain
         .prompt_keywords
         .iter()
-        .any(|kw| prompt_lower.contains(&kw.to_lowercase()));
+        .any(|kw| contains_word(prompt_lower, &kw.to_lowercase()));
 
     // Path match: an active path lies under a trigger resolved against the tier the
     // domain came from. The path that satisfied it rides along so devmode can name
@@ -116,6 +118,30 @@ fn is_matched(
         (false, false) => return None,
     };
     Some((reason, path_hit))
+}
+
+/// Does `needle` occur in `text` as whole words? The characters on either side of an
+/// occurrence, when there are any, must not be word characters (alphanumeric or `_`).
+/// Case is the caller's business; both sides arrive lowercased from the matcher.
+pub fn contains_word(text: &str, needle: &str) -> bool {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(needle) {
+        let at = from + pos;
+        let end = at + needle.len();
+        let before_ok = text[..at].chars().next_back().is_none_or(|c| !is_word(c));
+        let after_ok = text[end..].chars().next().is_none_or(|c| !is_word(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        // Step one character, not one byte, so a multi-byte prompt never splits.
+        from = at + text[at..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 /// A path as components on `/`, with the shapes this crate meets on one machine folded
@@ -345,6 +371,24 @@ mod tests {
         assert!(!path_under("/home/x/Src/main.rs", "/home/x/src"));
         assert!(!path_under("D:/mirror/C:/Users/x/genai/vp/a.md", "c:/Users/x/genai/vp"));
         assert!(!path_under("anything", ""));
+    }
+
+    /// `base` fired on `database`; whole-word matching stops that and keeps the phrase
+    /// keywords, the punctuated ones and the ones at either end of the prompt.
+    #[test]
+    fn keywords_match_on_word_boundaries() {
+        assert!(!contains_word("show me the database schema", "base"));
+        assert!(!contains_word("rebase onto main", "base"));
+        assert!(contains_word("how is base doing", "base"));
+        assert!(contains_word("base", "base"));
+        assert!(contains_word("ask base.", "base"));
+        assert!(contains_word("please fix bug in auth", "fix bug"));
+        assert!(contains_word("edit .base-gbl/base.toml", ".base-gbl"));
+        assert!(contains_word("über base über", "base"));
+        assert!(!contains_word("anything", ""));
+        let domains = vec![make_domain("cfg", "triggered", &["base"], &["Rule"])];
+        assert!(match_domains("show me the database schema", &domains, &[], &ctx()).is_empty());
+        assert_eq!(match_domains("how is base doing", &domains, &[], &ctx()).len(), 1);
     }
 
     #[test]
