@@ -11,14 +11,35 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use oxigraph::sparql::QueryResults;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::config::NamespaceConfig;
 use crate::crud;
+
+/// How many times this process has federated an app's `.base-ast` sidecar.
+///
+/// The prompt hook passes `include_ast = false` (kite F9): the walk resolves
+/// projects, decisions, people and documents, and parsing a multi-megabyte AST
+/// map on every prompt to serve none of it is a cost nobody sees. `base graph *`
+/// passes `true` because it is expected to walk into call graphs. Asserted at 0
+/// on the hook path by the same harness that asserts `graph=1`.
+pub static AST_LOADS: AtomicUsize = AtomicUsize::new(0);
+
+/// AST sidecar loads so far in this process. See [`AST_LOADS`].
+pub fn ast_loads() -> usize {
+    AST_LOADS.load(Ordering::Relaxed)
+}
 
 pub struct Node {
     pub label: String,
     pub ntype: String,
     pub source: String,
     pub summary: String,
+    /// When this record was last touched: `updatedAt` if the store has one,
+    /// else `createdAt`, else empty. Ranking uses it, so it is a string in ISO
+    /// 8601 and compared as one -- a record with no timestamp sorts last rather
+    /// than sorting as though it were ancient.
+    pub touched: String,
 }
 
 /// The record a bare name denotes when several kinds answer to it, in preference
@@ -150,16 +171,40 @@ pub fn load_graph(
     ns: &NamespaceConfig,
     include_ast: bool,
 ) -> Result<GraphMaps> {
-    let p = &ns.prefix;
-
     // One parse, four queries. `crud::load_and_query` re-reads and re-parses graph.nq
     // on every call, so the old two-query loader paid for the 13 MB store twice and
     // this four-query one would pay four times.
     let base_dir = crate::config::find_workspace_base(cwd)
         .context("no .base/ directory found. Use --global for global rules, or run `base scaffold` to create a workspace.")?;
     let store = crate::store::load_graph(&base_dir.join("graph.nq"))?;
+    maps_from_store(&store, cwd, ns, include_ast)
+}
+
+/// The projection half of [`load_graph`], over a store the caller already has.
+///
+/// `load_graph` finds the workspace and parses `graph.nq` itself. That is right
+/// for `base graph *`, which starts with nothing but a cwd, and wrong for the
+/// prompt hook, which has already parsed a store by the time it wants a walk --
+/// going back through `load_graph` there would parse the whole thing a SECOND
+/// time on every prompt.
+///
+/// It also matters WHICH store. `load_graph` reads the workspace graph only and
+/// errors outside a workspace; the hook's `store::load_merged` reads the global
+/// tier as well. Two retrieval layers in one prompt disagreeing about what the
+/// graph contains is the failure that looks fine in the output, so the hook
+/// passes its own merged store in here and both layers see the same graph.
+///
+/// `cwd` is still taken because the AST sidecar is per-app and lives on disk,
+/// not in the store.
+pub fn maps_from_store(
+    store: &oxigraph::store::Store,
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    include_ast: bool,
+) -> Result<GraphMaps> {
+    let p = &ns.prefix;
     let pfx = crud::prefixes(ns);
-    let ask = |q: &str| crate::store::query(&store, &format!("{pfx}\n{q}"));
+    let ask = |q: &str| crate::store::query(store, &format!("{pfx}\n{q}"));
 
     // `conceptType` is written only by `graph extract`; a store that has never run it
     // has none, so fall back to the RDF class every record carries. Without this every
@@ -168,12 +213,14 @@ pub fn load_graph(
     // One list, four readers — see `ontology::transient`.
     let no_transient = crate::ontology::transient::sparql_exclude(ns, "s");
     let node_q = format!(
-        "SELECT ?s ?label ?type ?rdftype ?src ?summary WHERE {{ GRAPH ?g {{\n\
+        "SELECT ?s ?label ?type ?rdftype ?src ?summary ?created ?updated WHERE {{ GRAPH ?g {{\n\
            ?s {p}:name ?label .\n\
            OPTIONAL {{ ?s {p}:conceptType ?type }}\n\
            OPTIONAL {{ ?s a ?rdftype }}\n\
            OPTIONAL {{ ?s {p}:sourceDoc ?src }}\n\
            OPTIONAL {{ ?s {p}:summary ?summary }}\n\
+           OPTIONAL {{ ?s {p}:createdAt ?created }}\n\
+           OPTIONAL {{ ?s {p}:updatedAt ?updated }}\n\
          {no_transient}\
          }} }}"
     );
@@ -190,6 +237,13 @@ pub fn load_graph(
                     .unwrap_or_default(),
                 source: row.get("src").map(|t| crud::term_display(t.into())).unwrap_or_default(),
                 summary: row.get("summary").map(|t| crud::term_display(t.into())).unwrap_or_default(),
+                // Touched beats created: the question ranking asks is "how
+                // recently did this matter", not "how old is it".
+                touched: row
+                    .get("updated")
+                    .or_else(|| row.get("created"))
+                    .map(|t| crud::term_display(t.into()))
+                    .unwrap_or_default(),
             });
         }
     }
@@ -241,6 +295,7 @@ pub fn load_graph(
                         .unwrap_or_default(),
                     source: row.get("src").map(|t| crud::term_display(t.into())).unwrap_or_default(),
                     summary: String::new(),
+                    touched: String::new(),
                 },
             );
         }
@@ -305,7 +360,7 @@ pub fn load_graph(
         let Some((kind, label)) = kind_and_label_from_iri(&id, ns) else { continue };
         nodes.insert(
             id,
-            Node { label, ntype: kind, source: String::new(), summary: String::new() },
+            Node { label, ntype: kind, source: String::new(), summary: String::new(), touched: String::new() },
         );
     }
 
@@ -314,6 +369,7 @@ pub fn load_graph(
     // Edges are kept only when both endpoints are real nodes (drops dangling
     // import targets). Code-entity IRIs (code:*) never collide with concept IRIs.
     if include_ast {
+        AST_LOADS.fetch_add(1, Ordering::Relaxed);
         let (code_nodes, code_edges) = crate::crud::ast_query::code_graph(cwd, ns);
         for (id, label, ntype, file) in code_nodes {
             nodes.entry(id).or_insert(Node {
@@ -321,6 +377,7 @@ pub fn load_graph(
                 ntype,
                 source: file,
                 summary: String::new(),
+                touched: String::new(),
             });
         }
         for (a, b, rel) in code_edges {
@@ -599,6 +656,47 @@ mod edge_loading_tests {
         b
     }
 
+    /// Test 11's hazard, pinned where it actually lives.
+    ///
+    /// The traversal fork needed a recency field, so the node query gained
+    /// `OPTIONAL { ?s ops:createdAt ?created }` and `OPTIONAL { ?s ops:updatedAt
+    /// ?updated }`. An OPTIONAL is a join: a subject carrying the predicate
+    /// twice yields two rows where it yielded one, and the map keeps whichever
+    /// row came last. Everything else in the split is a pure refactor -- the
+    /// same projection behind the same caller -- so this is the ONE way the
+    /// change could have moved `base graph get-node` output, and a byte diff
+    /// against a baseline binary would only catch it if the store happened to
+    /// contain a duplicate. This does not leave it to chance.
+    #[test]
+    fn a_record_with_two_timestamps_still_loads_as_one_node() {
+        let u = ns().uri;
+        let g = crate::crud::workspace_graph_iri(&ns(), "t");
+        let mut b = String::new();
+        b += &format!("<{u}decision/dup> <{u}name> \"dup\" <{g}> .\n");
+        b += &format!("<{u}decision/dup> <{RDF_TYPE}> <{u}Decision> <{g}> .\n");
+        b += &format!("<{u}decision/dup> <{u}updatedAt> \"2026-01-01T00:00:00Z\" <{g}> .\n");
+        b += &format!("<{u}decision/dup> <{u}updatedAt> \"2026-09-01T00:00:00Z\" <{g}> .\n");
+        b += &format!("<{u}decision/dup> <{u}createdAt> \"2025-01-01T00:00:00Z\" <{g}> .\n");
+
+        let dir = workspace(&b);
+        let (nodes, _) = load(&dir);
+        let hits: Vec<&String> =
+            nodes.keys().filter(|k| k.ends_with("decision/dup>")).collect();
+        assert_eq!(hits.len(), 1, "two updatedAt triples produced {hits:?}");
+
+        // And the same node on every load: a projection that varies run to run
+        // is a `base graph get-node` whose output varies run to run.
+        let n = &nodes[&id("decision/dup")];
+        let (label, ntype, touched) = (n.label.clone(), n.ntype.clone(), n.touched.clone());
+        for i in 0..5 {
+            let (again, _) = load(&dir);
+            let m = &again[&id("decision/dup")];
+            assert_eq!(m.label, label, "label moved on load {i}");
+            assert_eq!(m.ntype, ntype, "type moved on load {i}");
+            assert_eq!(m.touched, touched, "touched moved on load {i}");
+        }
+    }
+
     /// The reified shape `base graph extract` writes.
     fn semantic_body() -> String {
         let u = ns().uri;
@@ -794,7 +892,7 @@ mod seed_tests {
     const U: &str = "http://t.local/o#";
 
     fn node(label: &str, ntype: &str) -> Node {
-        Node { label: label.into(), ntype: ntype.into(), source: String::new(), summary: String::new() }
+        Node { label: label.into(), ntype: ntype.into(), source: String::new(), summary: String::new(), touched: String::new() }
     }
 
     type Maps = (HashMap<String, Node>, HashMap<String, Vec<(String, String)>>);

@@ -222,7 +222,13 @@ mod order_tests {
     const U: &str = "http://t.local/o#";
 
     fn node(label: &str, ntype: &str) -> Node {
-        Node { label: label.into(), ntype: ntype.into(), source: String::new(), summary: String::new() }
+        Node {
+            label: label.into(),
+            ntype: ntype.into(),
+            source: String::new(),
+            summary: String::new(),
+            touched: String::new(),
+        }
     }
 
     /// Two communities joined by one bridge, built in a varying insertion order and

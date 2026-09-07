@@ -190,6 +190,8 @@ pub struct BaseConfig {
     #[serde(default)]
     pub update: UpdateConfig,
     #[serde(default)]
+    pub injection: InjectionConfig,
+    #[serde(default)]
     pub grounding: GroundingConfig,
     #[serde(default)]
     pub graph: GraphConfig,
@@ -416,6 +418,28 @@ impl Default for RelayConfig {
 /// rename, so the running process keeps its inode and the next session is new.
 ///
 /// Pin a machine with `base config set update.auto false`.
+/// What prompt-time traversal is allowed to spend.
+///
+/// The walk runs on every non-lean prompt, so an unbounded one would grow the
+/// prompt without ever saying so. The default is sized to what the neighbourhood
+/// block already spends, so injection volume does not move on average when this
+/// ships -- it moves in WHAT it spends the budget on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InjectionConfig {
+    #[serde(default = "default_walk_budget")]
+    pub walk_budget: usize,
+}
+
+fn default_walk_budget() -> usize {
+    2000
+}
+
+impl Default for InjectionConfig {
+    fn default() -> Self {
+        Self { walk_budget: default_walk_budget() }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateConfig {
     #[serde(default = "default_auto_update")]

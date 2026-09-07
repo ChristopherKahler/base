@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use oxigraph::io::{RdfFormat, RdfSerializer};
@@ -13,6 +14,26 @@ use crate::changelog::{AppliedOp, Change, DeltaGap};
 /// NQuads is immune to the graph-block split corruption bug in oxigraph's
 /// TriG serializer (one quad per line, no stateful graph-block machine).
 const GRAPH_FORMAT: RdfFormat = RdfFormat::NQuads;
+
+/// How many times this process has built a `Store` by parsing graph files.
+///
+/// The prompt hook must parse the graph exactly ONCE. `load_merged` builds one
+/// store and every injection layer -- the domain blocks and the prompt-time
+/// walk -- shares it. Routing the walk through `graph_query::load_graph` instead
+/// would build a SECOND store on every prompt, and that is invisible: the
+/// injected text is identical either way, only the clock moves. A counter is the
+/// only thing that catches it, which is why the traversal fork's test 5 asks for
+/// one.
+///
+/// Counts store BUILDS, not files. `load_merged` parses the global and the
+/// workspace tier into a single store; that is one build, and `graph=1` is what
+/// the hook harness asserts.
+pub static GRAPH_LOADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Store builds so far in this process. See [`GRAPH_LOADS`].
+pub fn graph_loads() -> usize {
+    GRAPH_LOADS.load(Ordering::Relaxed)
+}
 
 /// Auto-migrate a legacy graph.trig to graph.nq if present.
 /// Loads the TriG file, writes it as NQuads, and removes the old file.
@@ -62,6 +83,7 @@ pub fn migrate_trig_to_nq(nq_path: &Path) -> Result<bool> {
 /// Load an NQuads file into a new in-memory store.
 /// Auto-migrates legacy graph.trig if graph.nq doesn't exist yet.
 pub fn load_graph(path: &Path) -> Result<Store> {
+    GRAPH_LOADS.fetch_add(1, Ordering::Relaxed);
     // Auto-migrate legacy TriG if needed
     migrate_trig_to_nq(path)?;
 
@@ -129,6 +151,7 @@ fn load_lenient_into(store: &Store, path: &Path) -> Result<Vec<BadLine>> {
 /// [`load_graph`] / [`load_graphs`] so a corrupt graph is never silently rewritten
 /// with dropped lines — repair is explicit via `base doctor --repair` (§7.3).
 pub fn load_graph_lenient(path: &Path) -> Result<(Store, Vec<BadLine>)> {
+    GRAPH_LOADS.fetch_add(1, Ordering::Relaxed);
     let store = Store::new().context("Failed to create in-memory store")?;
     let bad_lines = load_lenient_into(&store, path)?;
     Ok((store, bad_lines))
@@ -441,6 +464,8 @@ fn strip_ledger(store: &Store) {
 ///
 /// A READ seam: the sync ledger is dropped before the store is returned.
 pub fn load_graphs(paths: &[&Path]) -> Result<Store> {
+    // One build, however many tiers it reads.
+    GRAPH_LOADS.fetch_add(1, Ordering::Relaxed);
     let store = Store::new().context("Failed to create in-memory store")?;
     for path in paths {
         // Auto-migrate legacy TriG if needed
@@ -491,6 +516,9 @@ pub fn load_merged(cwd: &Path) -> Option<Store> {
     // a lenient per-tier load so one corrupt tier costs only its bad lines, not all
     // context. WRITES never reach here (they use strict load_graph + write_back), so
     // a corrupt graph is never silently rewritten with lines dropped (§7.3).
+    // A second, real build: the strict one above failed and its work is thrown
+    // away. Counted, because it happened.
+    GRAPH_LOADS.fetch_add(1, Ordering::Relaxed);
     let store = Store::new().ok()?;
     let mut total_bad = 0usize;
     let mut bad_tiers = 0usize;

@@ -167,7 +167,10 @@ fn domain_injection_drops_a_transient_neighbour() {
     let config = BaseConfig::load(cwd);
     let store = base::store::load_graph(&cwd.join(".base").join("graph.nq")).unwrap();
     let def = base::domain::load_domains(cwd).into_iter().find(|d| d.name == "probe").unwrap();
-    let (_rules, neighbourhood) = base::domain::query::query_domain_from_graph(&store, &config, &def);
+    // Three now: the third is the set of record IRIs this domain block served,
+    // which the prompt-time walk dedups against so one record cannot arrive twice.
+    let (_rules, neighbourhood, _served) =
+        base::domain::query::query_domain_from_graph(&store, &config, &def);
 
     assert!(
         neighbourhood.contains("real probe project"),

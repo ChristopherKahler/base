@@ -71,6 +71,17 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
         );
     }
 
+    // A home that got base without either installer -- an `npx` bootstrap, a
+    // release zip, a binary copied into place -- has never seen the first-run
+    // message. This is the third path, and it prints the SAME text: byte
+    // identity across all three is the whole point of `first_run`.
+    //
+    // It is exclusive with the update notice below by construction: a home with
+    // a swap in update.log is not on its first run, it is on its fourth.
+    if let Some(msg) = crate::first_run::session_start_message() {
+        print!("{msg}");
+    }
+
     // Same cluster, same reason: this is the new binary's first session, and it
     // is the only process that can say what it is now running.
     if let Some(notice) = crate::update::session_start_notice() {

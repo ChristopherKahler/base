@@ -137,6 +137,9 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // and remember whether any fresh content was injected (gates the grounding block).
     let mut injected_commands: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut injected_any = false;
+    // Every record IRI the domain blocks serve this prompt. The walk below dedups
+    // against it, so a record cannot arrive twice under two headings.
+    let mut domain_served: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Format and emit matched rules
     for dm in &matched {
@@ -145,7 +148,8 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         // Try graph-backed injection first, fall back to TOML rules
         let (rules_text, neighborhood_text) = match &graph_store {
             Some(store) => {
-                let (r, n) = query_domain_from_graph(store, config, domain_def);
+                let (r, n, served) = query_domain_from_graph(store, config, domain_def);
+                domain_served.extend(served);
                 if lean_mode {
                     (r, String::new()) // skip neighborhood in lean mode
                 } else {
@@ -285,6 +289,119 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         session.mark_injected(&domain_def.name, combined_hash);
     }
 
+    // ─── Prompt-time traversal ───────────────────────────────────────────
+    // AFTER the domain loop, not before: it dedups against the IRIs those
+    // blocks served, and it cannot do that before they have run. Skipped in
+    // lean mode with the neighbourhood, for the same reason.
+    //
+    // `maps_from_store` and not `graph_query::load_graph`: the store is already
+    // parsed above, and load_graph would parse it a second time AND read the
+    // workspace graph only, so this layer would disagree with the domain layer
+    // beside it about what the graph contains.
+    //
+    // include_ast = false. The CLI passes true because `base graph neighbors`
+    // is expected to walk into call graphs; this walk resolves projects,
+    // decisions, people and documents, and parsing a 23.6 MB AST sidecar on
+    // every prompt to serve none of it is the kind of cost nobody sees.
+    let walked = match (&graph_store, lean_mode) {
+        (Some(store), false) => crate::graph_query::maps_from_store(store, cwd, &config.namespace, false)
+            .ok()
+            .map(|maps| {
+                crate::hook::walk::walk(
+                    &maps,
+                    &config.namespace,
+                    &prompt,
+                    &domain_served,
+                    // One list, every reader (ruling 4): the same seam the graph
+                    // commands, recall, the domain block and the dashboard consult.
+                    // A substring test stood here until PR #50 landed (kite F4).
+                    &|id: &str| crate::ontology::transient::is_transient_iri(&config.namespace, id),
+                    // No drift resolution yet: the drift fork fills this with
+                    // `resolve_head`. `None` means "this record still stands".
+                    &|_id: &str| None,
+                )
+            }),
+        _ => None,
+    };
+
+    // The walk's block rides after the domain blocks, so a reader sees the
+    // configured layer first and the named-thing layer as the specific addition.
+    let mut walk_note = String::new();
+    if let Some(walked) = walked {
+        // Once per session per node, not once per prompt. Naming the same
+        // project in five consecutive prompts is one context, not five: the
+        // domain layer above has always worked this way and the record layer
+        // has no reason to be noisier. Keyed on the resolved IRI rather than the
+        // spelling, so "First Client Kit" and "first-client-kit" are one entry.
+        let mut fresh: Vec<(crate::hook::walk::Resolved, Vec<crate::hook::walk::Record>)> = Vec::new();
+        let mut walk_deduped = 0usize;
+        for (r, recs) in walked {
+            let key = format!("walk:{}", r.id);
+            let h = crate::domain::session::rules_hash(std::slice::from_ref(&r.id));
+            if session.is_injected(&key, h) {
+                walk_deduped += 1;
+                continue;
+            }
+            // NOT marked here. Marking before the render means a name whose
+            // records are all cut by the byte budget is recorded as injected and
+            // never shown again this session -- the budget quietly becoming a
+            // permanent suppression, which looks exactly like dedup working.
+            // Marked below, against what actually rendered.
+            fresh.push((r, recs));
+        }
+        let walked = fresh;
+        if config.devmode.enabled && walk_deduped > 0 {
+            walk_note.push_str(&format!("  walk: {walk_deduped} name(s) already injected this session\n"));
+        }
+        let walked = &walked;
+        let (block, dropped) = crate::hook::walk::render(walked, config.injection.walk_budget);
+        if !block.is_empty() {
+            output.push_str(&block);
+            injected_any = true;
+        }
+        // Mark only what the reader actually got. A name the budget squeezed out
+        // entirely was not served, so it must be free to come back next prompt.
+        for (r, _) in walked {
+            if block.contains(&format!("name=\"{}\"", r.name)) {
+                let key = format!("walk:{}", r.id);
+                session
+                    .mark_injected(&key, crate::domain::session::rules_hash(std::slice::from_ref(&r.id)));
+            }
+        }
+        if config.devmode.enabled {
+            for (r, recs) in walked {
+                walk_note.push_str(&format!(
+                    "  walk: {} → {} ({}) {} hop(s), {} record(s){}\n",
+                    r.name,
+                    r.id.trim_matches(['<', '>']),
+                    r.kind,
+                    r.hops,
+                    recs.len(),
+                    if r.ties > 1 { format!(", {} same-kind ties", r.ties) } else { String::new() },
+                ));
+            }
+            if dropped > 0 {
+                walk_note.push_str(&format!("  walk: {dropped} record(s) dropped by walk_budget\n"));
+            }
+        }
+    }
+
+    // Test 5's instrument, and kite F9's. Both claims -- one parse per prompt,
+    // and no AST sidecar on the prompt path -- are invisible in the output: the
+    // injected text is identical whether the graph was parsed once or twice.
+    // So the counts are REPORTED rather than inferred, and the hook harness
+    // asserts on this line instead of on a stopwatch.
+    //
+    // Outside the `if let Some(walked)` above on purpose: a prompt that resolves
+    // no names is exactly where an accidental second parse would hide.
+    if config.devmode.enabled {
+        walk_note.push_str(&format!(
+            "  parses: graph={} ast={}\n",
+            crate::store::graph_loads(),
+            crate::graph_query::ast_loads(),
+        ));
+    }
+
     // Grounding (Phase 30): when enabled, ride a source-verification block on any
     // fresh injection this prompt. Skipped on dedup-only prompts (already grounded).
     if config.grounding.enabled && injected_any {
@@ -300,6 +417,9 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             session.prompt_count,
             deduped_count,
         ));
+        if !walk_note.is_empty() {
+            output.push_str(&walk_note);
+        }
     }
 
     // Save updated session state
