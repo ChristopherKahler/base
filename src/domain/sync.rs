@@ -16,6 +16,26 @@ pub struct SyncStats {
     pub decisions: usize,
 }
 
+impl SyncStats {
+    /// The line every sync print shows, saying what the numbers COUNT. `rules` is
+    /// what this run imported from `domains.toml` (and from `carl.json` when one
+    /// was named); CLI rules at `rule/<slug>/cli-N` are never touched by sync and
+    /// never counted here, which is why the unlabelled `N rules` read as "your
+    /// `rule add` did not work" (#62, the reading #38 had of `domain get`). A
+    /// source nobody named has no count, so without carl the decisions clause is
+    /// not printed at all rather than printed as zero.
+    pub fn summary(&self, from_carl: bool) -> String {
+        if from_carl {
+            format!(
+                "{} domains, {} rules imported from domains.toml and carl.json, {} decisions imported from carl.json",
+                self.domains, self.rules, self.decisions
+            )
+        } else {
+            format!("{} domains, {} rules imported from domains.toml", self.domains, self.rules)
+        }
+    }
+}
+
 // ─── Domain → graph sync ────────────────────────────────────
 
 /// Sync domains.toml domains/rules into the graph as ops:Domain and ops:Rule entities.
@@ -439,6 +459,19 @@ fn carl_next_rule_index(store: &oxigraph::store::Store, pfx: &str, p: &str, doma
 mod tests {
     use super::*;
     use crate::config::BaseConfig;
+
+    /// #62. The line says what the number counts; without a carl.json nobody named
+    /// there is no decisions clause to print as zero.
+    #[test]
+    fn sync_summary_names_its_sources() {
+        let s = SyncStats { domains: 1, rules: 0, decisions: 0 };
+        assert_eq!(s.summary(false), "1 domains, 0 rules imported from domains.toml");
+        let s = SyncStats { domains: 1, rules: 2, decisions: 1 };
+        assert_eq!(
+            s.summary(true),
+            "1 domains, 2 rules imported from domains.toml and carl.json, 1 decisions imported from carl.json"
+        );
+    }
 
     /// Parse domains directly from a TOML string — bypasses global config for test isolation.
     fn parse_domains(toml_content: &str) -> Vec<domain::DomainDef> {

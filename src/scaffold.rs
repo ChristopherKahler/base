@@ -113,7 +113,7 @@ pub fn run(target: &Path) -> Result<()> {
     print!("5. Sync domains to graph ... ");
     let config = BaseConfig::load(target);
     match crate::domain::sync::sync_domains_to_graph(&config, target, None) {
-        Ok(stats) => println!("✓ ({} domains, {} rules)", stats.domains, stats.rules),
+        Ok(stats) => println!("✓ ({})", stats.summary(false)),
         Err(_) => println!("✓ (empty graph initialized)"),
     }
 

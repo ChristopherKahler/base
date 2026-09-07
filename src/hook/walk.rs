@@ -166,7 +166,14 @@ pub fn walk(
 ) -> Vec<(Resolved, Vec<Record>)> {
     let (nodes, adj) = maps;
     let mut out = Vec::new();
+    // Records already in front of the reader this prompt: what the domain blocks
+    // served, then what this walk lists. A record is listed at most once.
     let mut emitted: HashSet<String> = already_served.clone();
+    // Roots this prompt already walked from, kept apart from `emitted` (#65): a
+    // name the domain block listed is still a request to expand it, because the
+    // block served its row and not its attachments. A served root walks; it is
+    // simply never listed as its own record.
+    let mut roots: HashSet<String> = HashSet::new();
 
     // The index the longest-match runs against: every label the graph carries,
     // normalised once. Built from maps the hook already holds, so a candidate
@@ -202,9 +209,10 @@ pub fn walk(
         if is_transient(&id) {
             continue;
         }
-        if !emitted.insert(id.clone()) {
+        if !roots.insert(id.clone()) {
             continue;
         }
+        emitted.insert(id.clone());
         let kind = iri_kind(&id).unwrap_or("record").to_string();
         let hops = hops_for(&kind);
 
@@ -469,6 +477,14 @@ mod tests {
         let some = walk(&maps, &ns, "`first client kit`", &served, &no, &live);
         assert_eq!(some[0].1.len(), 1, "domain-served record was served twice");
         assert_eq!(some[0].1[0].id, "<x/decision/d2>");
+
+        // #65. A served ROOT still walks: the block listed its row, not its
+        // attachments. It is never its own record.
+        let served_root: HashSet<String> = HashSet::from(["<x/project/kit>".to_string()]);
+        let walked = walk(&maps, &ns, "`first client kit`", &served_root, &no, &live);
+        assert_eq!(walked.len(), 1, "a served root must still walk");
+        assert_eq!(walked[0].1.len(), 2, "its unserved attachments come through: {:?}", walked[0].1);
+        assert!(walked[0].1.iter().all(|r| r.id != "<x/project/kit>"), "a root is never its own record");
     }
 
     /// A transient record never reaches a prompt, whatever it is attached to.

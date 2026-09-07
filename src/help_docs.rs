@@ -722,6 +722,17 @@ mod tests {
         );
     }
 
+    /// #70. The bank lagged shipped behaviour: F29 (0.14.1) added `auto_inject`, the
+    /// broadcast rule and doctor's `path triggers` section, and the coach had no pair
+    /// naming any of them. Red on 0.14.1's file.
+    #[test]
+    fn the_bank_answers_the_f29_questions() {
+        let qa = read(QA_MD);
+        for needle in ["auto_inject = false", "broadcast", "path triggers"] {
+            assert!(qa.contains(needle), "{QA_MD} has no pair naming `{needle}` (#70)");
+        }
+    }
+
     #[test]
     fn changelog_has_a_section_for_this_version() {
         let text = changelog();

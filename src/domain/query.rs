@@ -7,8 +7,20 @@ use crate::crud;
 use crate::domain;
 use crate::domain::session::{rules_hash, SessionState};
 
+/// A served record in the key form the prompt-time walk dedups by: the full IRI in
+/// angle brackets, the id `graph_query` gives every node. `crud::term_display` keeps
+/// only the suffix after `#`, which is what the served list carried until 0.14.2, so
+/// the walk's `already_served` never matched a served record and F3's dedup had never
+/// fired at the seam (#65). Literals and blank nodes are not records: `None`.
+fn walk_key(term: TermRef<'_>) -> Option<String> {
+    match term {
+        TermRef::NamedNode(n) => Some(format!("<{}>", n.as_str())),
+        _ => None,
+    }
+}
+
 /// Query a domain's rules and 1-hop neighborhood from the graph.
-/// Returns (rules_text, neighborhood_text). Falls back to TOML if graph query fails.
+/// Returns (rules_text, neighborhood_text, served). Falls back to TOML if graph query fails.
 pub fn query_domain_from_graph(
     store: &oxigraph::store::Store,
     config: &BaseConfig,
@@ -18,7 +30,8 @@ pub fn query_domain_from_graph(
     // from the things the prompt NAMES and would otherwise re-serve records the
     // domain block just printed; it dedups against this list. Returned rather
     // than re-derived, because re-deriving it means running these queries twice
-    // and getting a second chance to disagree with the first.
+    // and getting a second chance to disagree with the first. Every entry is in
+    // the walk's key form, `<full-iri>` (`walk_key`), or the dedup cannot match.
     let mut served: Vec<String> = Vec::new();
     let ns = &config.namespace;
     let p = &ns.prefix;
@@ -59,8 +72,8 @@ pub fn query_domain_from_graph(
                         }
                         _ => None,
                     });
-                    if let Some(iri) = row.get("rule").map(|t| crud::term_display(t.into())) {
-                        served.push(iri);
+                    if let Some(key) = row.get("rule").and_then(|t| walk_key(t.into())) {
+                        served.push(key);
                     }
                     Some(domain::render_rule(&text, rationale.as_deref()))
                 })
@@ -110,9 +123,12 @@ pub fn query_domain_from_graph(
     // other filter — outside it the pattern matches the default graph, where base keeps
     // nothing, so it excludes nothing while reading as a working filter (F16).
     let no_superseded = crate::supersede::sparql_exclude_superseded(ns, "related");
+    // `?related` is projected as well as bound (#65): the served list below reads it, and
+    // until 0.14.2 the projection was `?name ?type`, so no neighbourhood record was ever
+    // marked served and the walk listed each one a second time under `<base-context>`.
     let neighborhood_sparql = format!(
         "{pfx}\n\
-         SELECT ?name ?type WHERE {{\n\
+         SELECT ?name ?type ?related WHERE {{\n\
            GRAPH ?g {{\n\
              {{\n\
                <{domain_iri}> {p}:hasDecision ?related .\n\
@@ -140,7 +156,7 @@ pub fn query_domain_from_graph(
                         _ => String::new(),
                     })?;
                     let type_label = row.get("type").map(|t| crud::term_display(t.into()))?;
-                    let iri = row.get("related").map(|t| crud::term_display(t.into()));
+                    let iri = row.get("related").and_then(|t| walk_key(t.into()));
                     if name.is_empty() {
                         None
                     } else {
@@ -161,6 +177,10 @@ pub fn query_domain_from_graph(
                 String::new()
             } else {
                 served.extend(neighbors.iter().filter_map(|(_, _, iri)| iri.clone()));
+                // The header IS the domain: a walk that reaches this domain from a named
+                // record has nothing to add by listing it (#65). A served ROOT still
+                // walks, so naming the domain keeps serving what the block did not.
+                served.push(format!("<{domain_iri}>"));
                 let mut out = format!("[{} CONTEXT]\n", domain_def.name);
                 for (type_label, name, _) in &neighbors {
                     out.push_str(&format!("  - {type_label}: {name}\n"));
