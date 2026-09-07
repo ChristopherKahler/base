@@ -413,15 +413,21 @@ mod tests {
         let u = &ns.uri;
         let g = format!("{u}graph/ws/t");
         let a = format!("{u}note/a");
-        let b = format!("{u}note/b");
+        let _b = format!("{u}note/b");
         let c = format!("{u}note/c");
 
         let store = store_with(&format!("{}{}", edge(u, &g, "note/a", "note/b"), edge(u, &g, "note/b", "note/c")));
         assert!(would_cycle(&store, &ns, &a, &a), "a record cannot supersede itself");
+        // a -> b -> c. Superseding C **by A** is the cycle: the new edge is
+        // `c supersededBy a`, and walking forward from A reaches c again.
         assert!(
-            would_cycle(&store, &ns, &a, &c),
-            "c already descends from a, so a superseded BY c closes the loop"
+            would_cycle(&store, &ns, &c, &a),
+            "a is upstream of c, so making a the successor of c closes the loop"
         );
+        // The other direction is a diamond, not a cycle: a would have two
+        // successors, which is a defect the writer resolves deterministically
+        // rather than one it must refuse.
+        assert!(!would_cycle(&store, &ns, &a, &c));
         assert!(
             !would_cycle(&store, &ns, &c, &format!("{u}note/d")),
             "a fresh successor for the head is the normal case"

@@ -186,14 +186,16 @@ mod tests {
         let ns = ns();
         let u = &ns.uri;
         let g = format!("{u}graph/ws/t");
-        // a -> b -> c already exists; making c supersede a would close the loop.
+        // a -> b -> c already exists; making A the successor of C closes the loop.
         let nq = format!(
             "<{u}note/a> <{u}supersededBy> <{u}note/b> <{g}> .\n\
              <{u}note/b> <{u}supersededBy> <{u}note/c> <{g}> .\n"
         );
         let store = store_with(&nq);
         let before = store.len().unwrap();
-        let err = link_statement(&store, &ns, &g, &format!("{u}note/a"), &format!("{u}note/c"))
+        // old = c, new = a: the new edge is `c supersededBy a`, and a already
+        // reaches c through b. Passing these the other way round is a diamond.
+        let err = link_statement(&store, &ns, &g, &format!("{u}note/c"), &format!("{u}note/a"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("would close a"), "{err}");
