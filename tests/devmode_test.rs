@@ -74,6 +74,8 @@ fn devmode_block_format_includes_domains() {
         base::domain::DomainDef {
             name: "GLOBAL".into(),
             mode: "always".into(),
+            auto_inject: true,
+            root: None,
             prompt_keywords: vec![],
             file_keywords: vec![],
             paths: vec![],
@@ -90,6 +92,8 @@ fn devmode_block_format_includes_domains() {
         base::domain::DomainDef {
             name: "DEVELOPMENT".into(),
             mode: "triggered".into(),
+            auto_inject: true,
+            root: None,
             prompt_keywords: vec!["write code".into()],
             file_keywords: vec![],
             paths: vec![],
@@ -106,6 +110,8 @@ fn devmode_block_format_includes_domains() {
         base::domain::DomainDef {
             name: "UNMATCHED".into(),
             mode: "triggered".into(),
+            auto_inject: true,
+            root: None,
             prompt_keywords: vec!["something else".into()],
             file_keywords: vec![],
             paths: vec![],

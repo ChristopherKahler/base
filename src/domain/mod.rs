@@ -79,6 +79,18 @@ pub struct DomainDef {
     pub name: String,
     #[serde(default = "default_mode")]
     pub mode: String, // "always" | "triggered"
+    /// `auto_inject = false` keeps this domain out of every automatic injection — the
+    /// prompt hook, the tool hook and the session-start cheat-sheet — whatever its mode
+    /// or triggers (F29 D3). Explicit
+    /// readers (`base context`, `base recall`, star commands) still see it. Absent means
+    /// true, and true is not written back, so a round-trip leaves the file as it was.
+    #[serde(default = "default_auto_inject", skip_serializing_if = "is_auto_inject")]
+    pub auto_inject: bool,
+    /// The tier root this domain was loaded from (home for the global tier, the
+    /// workspace root for the workspace tier). Relative path triggers resolve against
+    /// it; never read from or written to domains.toml (F29).
+    #[serde(skip)]
+    pub root: Option<String>,
     /// Keywords matched against user prompt text (natural language, user-configured).
     /// Backward-compatible: legacy `keywords` field deserializes here via alias.
     #[serde(default, alias = "keywords")]
@@ -121,6 +133,14 @@ fn default_mode() -> String {
     "triggered".into()
 }
 
+fn default_auto_inject() -> bool {
+    true
+}
+
+fn is_auto_inject(auto_inject: &bool) -> bool {
+    *auto_inject
+}
+
 fn default_command_activation() -> String {
     "both".into()
 }
@@ -156,31 +176,129 @@ struct DomainsFile {
 pub fn load_domains(cwd: &Path) -> Vec<DomainDef> {
     let mut domains = Vec::new();
 
-    // Global
-    if let Some(home) = crate::home::home_root()
+    // Global — relative path triggers resolve against the home directory.
+    let home = crate::home::home_root();
+    if let Some(home) = &home
         && let Ok(content) =
             std::fs::read_to_string(home.join(".base-gbl").join("domains.toml"))
         && let Ok(file) = toml::from_str::<DomainsFile>(&content)
     {
-        domains = file.domain;
+        domains = rooted(file.domain, Some(home));
     }
 
-    // Workspace (overlays global by name)
+    // Workspace (overlays global by name) — triggers resolve against the workspace root.
+    let ws_root = crate::config::find_workspace_base(cwd).and_then(|b| b.parent().map(Path::to_path_buf));
     if let Some(base_dir) = crate::config::find_workspace_base(cwd)
         && let Ok(content) = std::fs::read_to_string(base_dir.join("domains.toml"))
         && let Ok(file) = toml::from_str::<DomainsFile>(&content)
     {
-        domains = merge_domains(domains, file.domain);
+        domains = merge_domains(domains, rooted(file.domain, ws_root.as_deref()));
     }
 
-    // Extension domains (Phase 22 — merged into normal pool, lowest priority)
+    // Extension domains (Phase 22 — merged into normal pool, lowest priority). Their
+    // triggers name workspace state dirs (`.outpost/`), so they root at the workspace
+    // when there is one, else at home.
     let extensions = crate::extension::load_extensions();
     for ext in &extensions {
-        let ext_domains = crate::extension::extension_domains_to_domain_defs(ext);
+        let ext_domains = rooted(
+            crate::extension::extension_domains_to_domain_defs(ext),
+            ws_root.as_deref().or(home.as_deref()),
+        );
         domains = merge_domains(domains, ext_domains);
     }
 
     domains
+}
+
+/// Stamp the tier root every domain in `domains` came from (F29): relative path
+/// triggers resolve against it, and a domain with no root has no rooted relative trigger.
+fn rooted(mut domains: Vec<DomainDef>, root: Option<&Path>) -> Vec<DomainDef> {
+    let root = root.map(|r| r.display().to_string());
+    for d in &mut domains {
+        d.root = root.clone();
+    }
+    domains
+}
+
+/// `add_trigger` refused a path trigger that could never fire (F29 step 6). Typed so
+/// `project add` can tell this apart from an I/O or parse failure and degrade to a warning.
+#[derive(Debug)]
+pub struct TriggerRefused(pub String);
+
+impl std::fmt::Display for TriggerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TriggerRefused {}
+
+/// One tier's domains.toml, rooted at that tier (F29): the reader doctor uses to judge a
+/// tier on its own. Absent or unparsable is empty; the loaders fail open by design and
+/// doctor reports a corrupt file through `config_errors`.
+pub fn load_domains_file(path: &Path, root: Option<&Path>) -> Vec<DomainDef> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    match toml::from_str::<DomainsFile>(&content) {
+        Ok(file) => rooted(file.domain, root),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The registered projects as the trigger rules see them: every `ops:Project` with a
+/// path, resolved against the tier its record lives in (the workspace root for the
+/// workspace graph, home for every other graph) in the shape `resolve_trigger`
+/// produces, so a trigger and a project path compare (F29 step 6).
+pub fn registered_projects(
+    store: &oxigraph::store::Store,
+    ns: &crate::config::NamespaceConfig,
+    cwd: &Path,
+) -> Vec<matcher::Registered> {
+    let p = &ns.prefix;
+    let sparql = format!(
+        "{}\nSELECT ?g ?name ?path WHERE {{ GRAPH ?g {{ ?proj a {p}:Project ; {p}:name ?name ; {p}:path ?path }} }}",
+        crate::crud::prefixes(ns)
+    );
+    let ws_graph = crate::crud::workspace_graph_iri(ns, &crate::crud::workspace_slug(cwd));
+    let ws_root = crate::config::find_workspace_base(cwd).and_then(|b| b.parent().map(|r| r.display().to_string()));
+    let home = crate::home::home_root().map(|h| h.display().to_string());
+    let mut out = Vec::new();
+    if let Ok(oxigraph::sparql::QueryResults::Solutions(rows)) = crate::store::query(store, &sparql) {
+        for row in rows.filter_map(|r| r.ok()) {
+            let lit = |k: &str| {
+                row.get(k).and_then(|t| match t.into() {
+                    oxigraph::model::TermRef::Literal(l) => Some(l.value().to_string()),
+                    _ => None,
+                })
+            };
+            let (Some(name), Some(path)) = (lit("name"), lit("path")) else {
+                continue;
+            };
+            let graph = row.get("g").and_then(|t| match t.into() {
+                oxigraph::model::TermRef::NamedNode(n) => Some(n.as_str().to_string()),
+                _ => None,
+            });
+            let root = if graph.as_deref() == Some(ws_graph.as_str()) { ws_root.as_deref() } else { home.as_deref() };
+            if let Some(resolved) = matcher::resolve_trigger(&path, root, home.as_deref()) {
+                out.push(matcher::Registered { name, path: resolved });
+            }
+        }
+    }
+    out
+}
+
+/// The trigger context a CLI reader builds for itself: home plus the registered
+/// projects of the merged store. The hooks build theirs from the store they already hold.
+pub fn trigger_context(cwd: &Path) -> matcher::TriggerContext {
+    let ns = crate::config::BaseConfig::load(cwd).namespace;
+    matcher::TriggerContext {
+        home: crate::home::home_root().map(|h| h.display().to_string()),
+        registered: crate::store::load_merged(cwd)
+            .as_ref()
+            .map(|s| registered_projects(s, &ns, cwd))
+            .unwrap_or_default(),
+    }
 }
 
 fn merge_domains(base: Vec<DomainDef>, overlay: Vec<DomainDef>) -> Vec<DomainDef> {
@@ -219,6 +337,18 @@ pub fn add_trigger(
         }
     };
 
+    // A trigger that cannot fire is refused before anything is written (F29 step 6): an
+    // unrooted path, or one that covers two or more registered projects.
+    if let Some(p) = path {
+        // The tier root is the parent of the tier dir the file sits in: `~/.base-gbl/
+        // domains.toml` roots at home, `<ws>/.base/domains.toml` at the workspace.
+        let root = toml_path.parent().and_then(Path::parent).map(|r| r.display().to_string());
+        let ctx = trigger_context(cwd);
+        if let Some(fault) = matcher::trigger_fault(p, root.as_deref(), &ctx) {
+            return Err(TriggerRefused(matcher::fault_sentence(domain_name, p, &fault)).into());
+        }
+    }
+
     // Find or create domain
     let domain = if let Some(pos) = file.domain.iter().position(|d| d.name == domain_name) {
         &mut file.domain[pos]
@@ -226,6 +356,8 @@ pub fn add_trigger(
         file.domain.push(DomainDef {
             name: domain_name.to_string(),
             mode: "triggered".to_string(),
+            auto_inject: true,
+            root: None,
             prompt_keywords: Vec::new(),
             file_keywords: Vec::new(),
             paths: Vec::new(),
@@ -332,6 +464,8 @@ pub fn create_domain(
     file.domain.push(DomainDef {
         name: domain_name.to_string(),
         mode: "triggered".to_string(),
+        auto_inject: true,
+        root: None,
         prompt_keywords: kws,
         file_keywords: Vec::new(),
         paths: ps,

@@ -1,11 +1,10 @@
 use std::path::Path;
 
 use anyhow::Result;
-use oxigraph::model::TermRef;
 
 use crate::config::BaseConfig;
 use crate::domain;
-use crate::domain::matcher::match_domains;
+use crate::domain::matcher::{match_domains_auto, TriggerContext};
 use crate::domain::query::{query_domain_from_graph, resolve_and_run_query, format_toml_rules};
 use crate::domain::session::{rules_hash, Bracket, SessionState};
 
@@ -98,14 +97,21 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // load below sees freshly synced rules. Marker-gated — no-op when fresh.
     ensure_domain_sync(config, cwd);
 
-    // Single graph load per invocation (merged: global + workspace).
-    // gather_active_paths and the injection loop all share this store.
+    // Single graph load per invocation (merged: global + workspace); the
+    // injection loop and the walk share this store.
     let graph_store = crate::store::load_merged(cwd);
 
-    // Gather active file paths from graph (if available)
-    let active_paths = gather_active_paths(config, &graph_store);
+    // The paths this session touched (tool-hook log), never the store.
+    let active_paths = gather_active_paths(cwd, base_dir.as_deref(), session_id);
 
-    let matched = match_domains(&prompt, &domains, &active_paths);
+    let trigger_ctx = TriggerContext {
+        home: crate::home::home_root().map(|h| h.display().to_string()),
+        registered: graph_store
+            .as_ref()
+            .map(|s| crate::domain::registered_projects(s, &config.namespace, cwd))
+            .unwrap_or_default(),
+    };
+    let matched = match_domains_auto(&prompt, &domains, &active_paths, &trigger_ctx);
     if matched.is_empty() {
         // Still save session state (prompt_count) even if nothing matched
         if let Some(ref base_dir) = base_dir {
@@ -269,7 +275,10 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
 
         // Use the actual match reason from the matcher (only meaningful in DEVMODE)
         let match_reason = if config.devmode.enabled {
-            format!("{}", dm.reason)
+            match &dm.path {
+                Some(p) => format!("{} ({p})", dm.reason),
+                None => format!("{}", dm.reason),
+            }
         } else if domain_def.is_always() {
             "always_on".to_string()
         } else {
@@ -431,6 +440,14 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             session.prompt_count,
             deduped_count,
         ));
+        // An inert trigger is named on every prompt it would otherwise have judged, so a
+        // domain that stopped loading is never a silent drop (F29 step 6).
+        for (domain, trigger, fault) in crate::domain::matcher::inert_triggers(&domains, &trigger_ctx) {
+            output.push_str(&format!(
+                "  inert: {}\n",
+                crate::domain::matcher::fault_sentence(domain, trigger, &fault)
+            ));
+        }
         if !walk_note.is_empty() {
             output.push_str(&walk_note);
         }
@@ -679,40 +696,43 @@ fn extract_prompt(event: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// Gather recently-active file paths from the merged graph (for path-based domain matching).
-/// Returns empty vec if no graph available — graceful degradation.
-fn gather_active_paths(config: &BaseConfig, graph: &Option<oxigraph::store::Store>) -> Vec<String> {
-    let graph = match graph {
-        Some(g) => g,
-        None => return Vec::new(),
+/// The file paths THIS session has touched, for path-triggered domains: every `file_path`
+/// the tool hooks logged for `session_id` in this tier's `hook-events.jsonl` (the file
+/// `log_hook_event` writes), plus the session's cwd. Nothing from the graph.
+///
+/// Until 0.14.0 this was a SPARQL over `ops:path` / `ops:lastActive`, which is every path
+/// ever active on the store (923 on the operator's, identical on every prompt), so a
+/// `Documents` trigger fired on prompt 3 of every session whatever was typed — F29 D1, and
+/// D3 with it. Empty apart from the cwd when the session is unknown or the log is absent.
+fn gather_active_paths(cwd: &Path, base_dir: Option<&Path>, session_id: Option<&str>) -> Vec<String> {
+    let mut paths = vec![cwd.display().to_string()];
+    let (Some(base_dir), Some(sid)) = (base_dir, session_id) else {
+        return paths;
     };
-
-    let sparql = format!(
-        "PREFIX {p}: <{u}>\n\
-         SELECT ?path WHERE {{\n\
-           GRAPH ?g {{\n\
-             ?entity {p}:path ?path .\n\
-             ?entity {p}:lastActive ?ts .\n\
-           }}\n\
-         }}",
-        p = config.namespace.prefix,
-        u = config.namespace.uri,
-    );
-
-    match crate::store::query(graph, &sparql) {
-        Ok(oxigraph::sparql::QueryResults::Solutions(solutions)) => solutions
-            .filter_map(|r| r.ok())
-            .filter_map(|row| {
-                row.get("path")
-                    .map(|t| match t.into() {
-                        TermRef::Literal(l) => l.value().to_string(),
-                        _ => String::new(),
-                    })
-                    .filter(|s| !s.is_empty())
-            })
-            .collect(),
-        _ => Vec::new(),
+    let Ok(text) = std::fs::read_to_string(base_dir.join("hook-events.jsonl")) else {
+        return paths;
+    };
+    let mut seen: std::collections::HashSet<String> = paths.iter().cloned().collect();
+    for line in text.lines() {
+        // The log holds every session on this tier; a substring gate keeps the JSON
+        // parse to this session's rows.
+        if !line.contains(sid) {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if row.get("session_id").and_then(serde_json::Value::as_str) != Some(sid) {
+            continue;
+        }
+        if let Some(fp) = row.get("file_path").and_then(serde_json::Value::as_str)
+            && !fp.is_empty()
+            && seen.insert(fp.to_string())
+        {
+            paths.push(fp.to_string());
+        }
     }
+    paths
 }
 
 #[cfg(test)]

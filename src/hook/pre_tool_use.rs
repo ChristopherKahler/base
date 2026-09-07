@@ -118,16 +118,22 @@ pub fn handle(
             .iter()
             .filter_map(|p| p.to_str().map(String::from))
             .collect();
-        let matched = match_by_file(&domains, &file_path_strings);
-
-        // Sync BEFORE the single graph load so the store sees fresh rules.
-        if !matched.is_empty() {
-            crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
-        }
+        // Sync BEFORE the single graph load so the store sees fresh rules. Marker-gated,
+        // a no-op when fresh; it ran only for a matched domain until F29, and the match
+        // now needs the store (the registered projects decide which triggers are live).
+        crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
 
         // Single graph load per invocation — domain injection and PAUL
         // context both read from this store (Q2).
         let graph_store = crate::store::load_merged(cwd);
+        let trigger_ctx = domain::matcher::TriggerContext {
+            home: crate::home::home_root().map(|h| h.display().to_string()),
+            registered: graph_store
+                .as_ref()
+                .map(|s| domain::registered_projects(s, &config.namespace, cwd))
+                .unwrap_or_default(),
+        };
+        let matched = match_by_file(&domains, &file_path_strings, &trigger_ctx);
 
         for domain_def in &matched {
             // Session dedup: skip if this domain's rules were already injected.
@@ -511,20 +517,28 @@ fn context_mode_intercept(event: &serde_json::Value, cwd: &Path) -> Option<Strin
 fn match_by_file<'a>(
     domains: &'a [domain::DomainDef],
     file_paths: &[String],
+    ctx: &domain::matcher::TriggerContext,
 ) -> Vec<&'a domain::DomainDef> {
     domains
         .iter()
         .filter(|d| {
+            // `auto_inject = false` is honoured before any other test (F29 D3): this
+            // hook is the other automatic path, and a tool call under `Documents`
+            // used to serve the same block the prompt hook serves.
+            if !d.auto_inject {
+                return false;
+            }
             // Skip always-on (those fire on user-prompt-submit, not here)
             if d.is_always() {
                 return false;
             }
 
-            // Path match: any file path starts with or contains a domain path trigger
+            // Path match: a touched file lies under a trigger resolved against the tier
+            // the domain came from — the one seam the prompt hook uses (F29), never a
+            // substring test.
             let path_hit = d.paths.iter().any(|dp| {
-                file_paths
-                    .iter()
-                    .any(|fp| fp.starts_with(dp) || fp.contains(dp))
+                domain::matcher::live_trigger(dp, d.root.as_deref(), ctx)
+                    .is_some_and(|t| file_paths.iter().any(|fp| domain::matcher::path_under(fp, &t)))
             });
 
             // File keyword match: check if any file_keywords appear in the file paths
