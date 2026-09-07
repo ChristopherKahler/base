@@ -87,6 +87,55 @@ fn a_second_ingest_of_an_unchanged_paul_toml_touches_nothing() {
     assert_eq!(changelog_lines(&ws), log_after_first);
 }
 
+/// F25's actual cause, found 2026-09-07 with the in-process instrument.
+///
+/// Chris's `My Documents` junction sits beside `Documents`, so `scan_all_workspaces`
+/// returned the same `paul.toml` twice under two paths. The ingest loop ran twice for
+/// one IRI and the two passes overwrote each other's `path` quad, so the guard saw a
+/// real difference on BOTH passes, both restamped, and every session start rewrote the
+/// store. The second pass put `path` back where the first found it, which is why every
+/// between-session diff reported "only `updatedAt` moved" and the cause survived three
+/// refuted hypotheses.
+///
+/// unix-only because the reproduction needs a second path to one directory and creating
+/// one on Windows needs a privilege a test cannot assume. The defect is not unix-only.
+#[cfg(unix)]
+#[test]
+fn a_project_reachable_by_two_paths_is_ingested_once() {
+    let root = tempfile::tempdir().unwrap();
+    let config = workspace_with_project(root.path(), None);
+    let ws = root.path().join("ws");
+    // A second directory in the same workspace reaching the same project, exactly what
+    // the junction does on Chris's machine.
+    std::os::unix::fs::symlink(ws.join("demo"), ws.join("demo-link")).unwrap();
+
+    let projects = scan_all_workspaces(&config);
+    assert_eq!(
+        projects.len(),
+        1,
+        "one paul.toml was scanned twice: {:?}",
+        projects.iter().map(|(p, _)| p.display().to_string()).collect::<Vec<_>>()
+    );
+
+    let graph = ws.join(".base").join("graph.nq");
+    assert_eq!(ingest(&config, &ws), 1, "one project is one registration, not two");
+    let after_first = fs::read(&graph).unwrap();
+    let log_after_first = changelog_lines(&ws);
+
+    // The whole point: with the duplicate gone the second ingest is a no-op again.
+    assert_eq!(ingest(&config, &ws), 0, "the second ingest must touch nothing");
+    assert_eq!(
+        fs::read(&graph).unwrap(),
+        after_first,
+        "graph.nq moved on a no-op ingest of a duplicated project"
+    );
+    assert_eq!(
+        changelog_lines(&ws),
+        log_after_first,
+        "a no-op ingest appended a changelog entry"
+    );
+}
+
 #[test]
 fn a_changed_paul_toml_is_still_ingested_and_restamped() {
     let root = tempfile::tempdir().unwrap();
@@ -108,6 +157,14 @@ fn a_changed_paul_toml_is_still_ingested_and_restamped() {
          \n[milestone]\nname = \"Ship\"\nversion = \"v1\"\nstatus = \"active\"\n",
     )
     .unwrap();
+
+    // `updatedAt` is written at second resolution (`crud::now_iso` uses
+    // `SecondsFormat::Secs`) and this test runs in ~10 ms, so both ingests would
+    // otherwise stamp the SAME literal and the restamp assertion below would fail
+    // even though the restamp fired. Cross a real second boundary so the assertion
+    // measures the restamp and not the clock resolution; 1100 ms crosses at least
+    // one tick from any starting offset.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
 
     assert_eq!(ingest(&config, &ws), 1, "a changed project is re-ingested");
     let after = fs::read_to_string(&graph).unwrap();

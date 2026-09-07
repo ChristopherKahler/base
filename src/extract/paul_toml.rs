@@ -103,7 +103,48 @@ pub fn scan_all_workspaces(config: &crate::config::BaseConfig) -> Vec<(PathBuf, 
         }
     }
 
-    results
+    // ONE PROJECT, ONE ENTRY. A `paul.toml` reachable by two paths was returned twice
+    // -- Chris's `My Documents` junction sitting beside `Documents` is the live case --
+    // and the ingest loop then ran twice for one IRI. The two passes overwrote each
+    // other's `path` quad, so `managed_quads` reported a REAL difference on both passes,
+    // both restamped `updatedAt`, `registered` counted two, and every session start
+    // rewrote the whole store to change two timestamps (F25).
+    //
+    // It left no trace in the delta because the second pass put `path` back where the
+    // first found it, so the store ended each session on the value it started with.
+    // That is why three separate whole-quad between-session diffs all reported "only
+    // `updatedAt` moved" and three hypotheses were aimed one level too high; only an
+    // in-process instrument could see the churn.
+    //
+    // Two shapes are dropped, and they are different defects. The same FILE reached by
+    // two paths is caught by `canonicalize`, which resolves the junction or symlink.
+    // Two DIFFERENT directories whose `paul.toml` declare the same name are caught by
+    // the slug, because the IRI is built from the name and one IRI is one project
+    // whatever the disk says. First hit wins; `workspace_roots` is ordered by config
+    // and then cwd, so the survivor is the same on every run of the same machine.
+    let mut seen_file = std::collections::HashSet::new();
+    let mut seen_slug = std::collections::HashSet::new();
+    let mut deduped: Vec<(PathBuf, PaulToml)> = Vec::with_capacity(results.len());
+    for (toml_path, paul) in results {
+        // A path that cannot be canonicalised (a race, a permission) falls back to
+        // itself rather than being dropped: an un-resolvable duplicate is a smaller
+        // problem than a project that silently stops being ingested.
+        let real = std::fs::canonicalize(&toml_path).unwrap_or_else(|_| toml_path.clone());
+        let slug = crud::slugify(&paul.name);
+        if !seen_file.insert(real) || !seen_slug.insert(slug) {
+            if config.devmode.enabled {
+                eprintln!(
+                    "[paul] duplicate of project '{}' ignored: {}",
+                    paul.name,
+                    toml_path.display()
+                );
+            }
+            continue;
+        }
+        deduped.push((toml_path, paul));
+    }
+
+    deduped
 }
 
 fn try_load_paul_toml(project_dir: &Path) -> Option<(PathBuf, PaulToml)> {
@@ -290,7 +331,8 @@ pub fn ingest_paul_projects(
         // store untouched, which is what keeps `migrate_tiers`' delta gate closed: the
         // old unconditional refresh moved the store's identity every session, re-opened
         // that gate, and bought a full re-plan that was then discarded (F25).
-        if managed_quads(&store, ns, &iri, &graph) != managed_before {
+        let managed_after = managed_quads(&store, ns, &iri, &graph);
+        if managed_after != managed_before {
             let touch = format!(
                 "{pfx}\n\
                  DELETE {{ GRAPH <{graph}> {{ <{iri}> {p}:updatedAt ?o }} }}\n\
