@@ -1,0 +1,25 @@
+# Line endings are pinned here so every file has ONE identity on every platform.
+#
+# Git for Windows sets core.autocrlf=true by default. Without this file every .sh in the
+# tree checks out CRLF on a Windows clone INCLUDING the shebang, and running one directly
+# then fails with `/usr/bin/env: 'bash\r': Permission denied` (rc 126) — the shebang names
+# `env`, so `env` is what refuses, not the kernel. It is invisible in CI, which runs on
+# ubuntu where the files stay LF, and invisible to `bash script.sh`, which bypasses the
+# shebang entirely. That is how it survived three separate harnesses. See #95.
+#
+# It also gives one file two identities: scripts/test-release-packaging.sh reads md5
+# 9998764d in a Windows checkout and 6fd8bf6a in a Linux one. Any gate comparing a script
+# hash across the two sides reports a mismatch that is pure line-ending noise.
+#
+# NOTE for an existing Windows clone: `git pull` does not re-materialise files that are
+# already checked out. Run `git add --renormalize .` or take a fresh clone, or your .sh
+# stay CRLF and this file appears to have done nothing.
+
+*.sh    text eol=lf
+*.py    text eol=lf
+
+# PowerShell is a Windows consumer and CRLF is what it expects — but it is pinned rather
+# than left to autocrlf for the same reason as the others: unpinned means the file hashes
+# one way on Windows and another on Linux, which is the trap above. Leaving one script
+# family unpinned in the commit that pins the rest is how the next gap gets created.
+*.ps1   text eol=crlf

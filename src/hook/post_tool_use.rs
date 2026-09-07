@@ -12,7 +12,21 @@ use crate::store;
 /// the pattern it compiles to is a single literal `\`.
 const PATH_SEP_NORM: &str = r#"REPLACE(STR(?path), "\\\\", "/")"#;
 
-pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Result<super::HookEventData> {
+/// PostToolUse: section AST context on a partial read, extension `inject` nudges, and
+/// the directory-move nudges.
+///
+/// Returns the injection text instead of printing it, for the same reason
+/// `pre_tool_use::handle` does: Claude Code only feeds PostToolUse context to the model
+/// through the JSON `hookSpecificOutput.additionalContext` envelope, and plain stdout on
+/// this event is captured into the transcript and never delivered. The dispatcher
+/// assembles all of it into one envelope. Stderr stays stderr — those lines are operator
+/// diagnostics, not model context, and they were never on the broken channel.
+pub fn handle(
+    config: &BaseConfig,
+    cwd: &Path,
+    event: &serde_json::Value,
+) -> Result<(super::HookEventData, String)> {
+    let mut output = String::new();
     let mut data = super::HookEventData::default();
 
     // Folder-move nudge: a Bash `mv` of a registered project's folder must repath
@@ -25,7 +39,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             .and_then(|i| i.get("command"))
             .and_then(|c| c.as_str())
     {
-        emit_move_nudge(config, cwd, cmd);
+        output.push_str(&emit_move_nudge(config, cwd, cmd));
     }
 
     let file_paths = extract_file_paths(event);
@@ -105,7 +119,10 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
                         && let Some(section) =
                             crud::ast_query::section_entities(cwd, &config.namespace, fp_str, offset, limit)
                         {
-                            print!("{}", section.trim_end());
+                            if !output.is_empty() {
+                                output.push('\n');
+                            }
+                            output.push_str(section.trim_end());
                             data.section_context = true;
                         }
             }
@@ -190,7 +207,10 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
                             if once && session.is_injected(&key, msg_hash) {
                                 continue;
                             }
-                            print!("{}", message.trim_end());
+                            if !output.is_empty() {
+                                output.push('\n');
+                            }
+                            output.push_str(message.trim_end());
                             data.nudged = true;
                             if once {
                                 session.mark_injected(&key, msg_hash);
@@ -210,7 +230,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         let _ = session.save(bd);
     }
 
-    Ok(data)
+    Ok((data, output))
 }
 
 /// Design/frontend file heuristic for the "designset" post-tool inject pattern.
@@ -378,10 +398,17 @@ fn extract_file_paths(event: &serde_json::Value) -> Vec<PathBuf> {
 ///     `path` field to the new location (base ingest then self-corrects the graph).
 ///   · non-PAUL registered project (basename match) → emit a `repath` nudge.
 /// Silent on ordinary `mv`s.
-fn emit_move_nudge(config: &BaseConfig, cwd: &Path, command: &str) {
+/// Returns the blocks rather than printing them.
+///
+/// Both are addressed to the model and both carry an instruction — "base re-ingests the
+/// real directory", "base project repath {slug} {dest}" — so both sat on the same dead
+/// PostToolUse stdout channel as the two nudges #75 names, for exactly as long. The issue
+/// counted two print sites; there were four (delta D1).
+fn emit_move_nudge(config: &BaseConfig, cwd: &Path, command: &str) -> String {
+    let mut out = String::new();
     let moves = detect_dir_moves(command);
     if moves.is_empty() {
-        return;
+        return out;
     }
     let mut projects: Option<Vec<(String, String, String)>> = None;
 
@@ -393,14 +420,17 @@ fn emit_move_nudge(config: &BaseConfig, cwd: &Path, command: &str) {
         if paul_toml.is_file() {
             let abs = new_dir.to_string_lossy().to_string();
             if update_paul_path(&paul_toml, &abs).unwrap_or(false) {
-                println!(
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!(
                     "<base:paul-path-synced>\n\
                      Moved PAUL project → {abs}\n\
                      Rewrote {} path field to the new location; base re-ingests the real \
                      directory at next session-start (ops:path self-corrects).\n\
                      </base:paul-path-synced>",
                     paul_toml.display()
-                );
+                ));
             }
             continue;
         }
@@ -412,16 +442,20 @@ fn emit_move_nudge(config: &BaseConfig, cwd: &Path, command: &str) {
         });
         for (slug, name, ppath) in list.iter() {
             if basename(&strip_paul(ppath)).as_deref() == Some(src_base.as_str()) {
-                println!(
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!(
                     "<base:path-drift>\n\
                      Folder moved: {src} → {dest}\n\
                      Registered project '{name}' (slug {slug}) still points at the old path: {ppath}\n\
                      Sync graph + domain trigger:  base project repath {slug} {dest}\n\
                      </base:path-drift>"
-                );
+                ));
             }
         }
     }
+    out
 }
 
 /// Resolve the new on-disk directory of a moved folder. `mv src dest` lands either

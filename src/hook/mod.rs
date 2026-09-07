@@ -9,7 +9,7 @@ pub mod user_prompt_submit;
 pub mod walk;
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::BaseConfig;
 
@@ -66,26 +66,73 @@ fn extract_tool_context(event: &serde_json::Value) -> (Option<String>, Option<St
 
 /// Entry point for all hook events. Fail-open: any error → stderr only, exit 0, empty stdout.
 pub fn dispatch(event: &str) {
-    let result = run(event);
-    let (success, data, error) = match &result {
+    let outcome = run(event);
+    let (success, data, error) = match &outcome.result {
         Ok(d) => (true, Some(d), None),
         Err(e) => (false, None, Some(format!("{e:#}"))),
     };
-    log_hook_event(event, success, data, error);
-    if let Err(e) = result {
+    log_hook_event(
+        event,
+        success,
+        data,
+        error,
+        &outcome.cwd,
+        outcome.cwd_from_payload,
+    );
+    if let Err(e) = outcome.result {
         eprintln!("base hook {event}: {e:#}");
     }
 }
 
-fn run(event: &str) -> anyhow::Result<HookEventData> {
-    let stdin_json = read_stdin()?;
+/// What `run` established before it could fail.
+///
+/// The cwd has to survive the error arm. `log_hook_event` picks the tier from it, and a
+/// hook that FAILED is precisely the event `hook_failure_summary` has to find in the
+/// right workspace — so reading the cwd back out of `HookEventData` cannot work: that is
+/// `None` on exactly the arm the fix exists for (#77).
+struct HookRun {
+    cwd: PathBuf,
+    /// False when the host sent no `cwd` and the process cwd was used instead, so the
+    /// log can say which input chose the tier rather than implying the host named one.
+    cwd_from_payload: bool,
+    result: anyhow::Result<HookEventData>,
+}
 
-    let cwd = stdin_json
+fn run(event: &str) -> HookRun {
+    let stdin_json = match read_stdin() {
+        Ok(v) => v,
+        Err(e) => {
+            // No payload at all, so the process cwd is the only input there is — and the
+            // log will say so rather than implying the host reported it.
+            return HookRun {
+                cwd: std::env::current_dir().unwrap_or_default(),
+                cwd_from_payload: false,
+                result: Err(e),
+            };
+        }
+    };
+
+    let payload_cwd = stdin_json
         .get("cwd")
         .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        .map(PathBuf::from);
+    let cwd_from_payload = payload_cwd.is_some();
+    let cwd = payload_cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
+    let result = run_event(event, &stdin_json, &cwd);
+    HookRun {
+        cwd,
+        cwd_from_payload,
+        result,
+    }
+}
+
+fn run_event(
+    event: &str,
+    stdin_json: &serde_json::Value,
+    cwd: &Path,
+) -> anyhow::Result<HookEventData> {
+    let cwd = cwd.to_path_buf();
     let config = BaseConfig::load(&cwd);
 
     let session_id = stdin_json
@@ -153,10 +200,25 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
             Ok(data)
         }
         "post-tool-use" => {
-            let mut data = post_tool_use::handle(&config, &cwd, &stdin_json)?;
-            let (tool_name, file_path) = extract_tool_context(&stdin_json);
+            let (mut data, context) = post_tool_use::handle(&config, &cwd, stdin_json)?;
+            let (tool_name, file_path) = extract_tool_context(stdin_json);
             data.tool_name = tool_name;
             data.file_path = file_path;
+            // PostToolUse context only reaches the model through the JSON envelope —
+            // plain stdout is transcript-only on this event, exactly as on pre-tool-use.
+            // Every block this handler produces used to go out as plain stdout, so the
+            // section AST context, the extension nudges and both directory-move blocks
+            // were captured by the host and never delivered (#75).
+            let context = context.trim().to_string();
+            if !context.is_empty() {
+                let envelope = serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PostToolUse",
+                        "additionalContext": context,
+                    }
+                });
+                println!("{envelope}");
+            }
             data.session_id = session_id;
             Ok(data)
         }
@@ -180,11 +242,20 @@ fn run(event: &str) -> anyhow::Result<HookEventData> {
         }
         "stop" => {
             stop::handle(&config, &cwd)?;
-            // End-of-turn nudge for any still-open relayed task (terse, throttled).
+            // #76: Stop has no additive model-facing channel. This block used to go out
+            // as plain stdout, which the host captures and drops — and it was redundant
+            // as well as undeliverable, because the same open task is re-announced by the
+            // Phase::Prompt and Phase::Tool ticks the moment the session moves again.
+            //
+            // What a Stop hook CAN do is speak to the operator. `systemMessage` produces
+            // a `hook_system_message` record where plain stdout produces none, measured
+            // on Claude Code 2.1.263 with two Stop hooks on one event — and neither
+            // reached the model, which is the point: this line is for the person.
             if let Some(sid) = session_id.as_deref()
                 && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Stop, false)
             {
-                print!("{block}");
+                let envelope = serde_json::json!({ "systemMessage": block.trim() });
+                println!("{envelope}");
             }
             Ok(HookEventData { session_id, ..Default::default() })
         }
@@ -359,9 +430,20 @@ pub fn append_hook_event(base_dir: &std::path::Path, event: &serde_json::Value) 
 }
 
 /// Append a hook event to the JSONL log file. Fire-and-forget — never blocks hooks.
-fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>, error: Option<String>) {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let base_dir = match crate::config::find_workspace_base(&cwd)
+fn log_hook_event(
+    hook: &str,
+    success: bool,
+    data: Option<&HookEventData>,
+    error: Option<String>,
+    payload_cwd: &std::path::Path,
+    cwd_from_payload: bool,
+) {
+    // #77: the tier comes from the cwd the HOST reported, not from wherever this process
+    // happens to be standing. A host that runs hooks from its own directory (Codex sets
+    // the child's cwd from its own request; Gemini CLI and Cursor do not specify) used to
+    // log workspace A's event into workspace B's tier, so a failing hook in A was
+    // invisible from A — while the line itself named A the whole time.
+    let base_dir = match crate::config::find_workspace_base(payload_cwd)
         .or_else(|| {
             crate::home::home_root().map(|h| h.join(".base-gbl").join(".base")).filter(|p| p.is_dir())
         }) {
@@ -389,6 +471,13 @@ fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>, error
         "ast_injected": data.map(|d| d.ast_injected).unwrap_or(false),
         "grep_intercepted": data.map(|d| d.grep_intercepted).unwrap_or(false),
         "section_context": data.map(|d| d.section_context).unwrap_or(false),
+        // Both of these were set on the struct and never written out, so an extension
+        // nudge was invisible in BOTH directions: the model never received it, and the
+        // log never recorded that it had fired (#75).
+        "nudged": data.map(|d| d.nudged).unwrap_or(false),
+        "standards_injected": data.map(|d| d.standards_injected).unwrap_or(0),
+        // Absent is not the same as empty: name the input that chose the tier.
+        "cwd_source": if cwd_from_payload { "payload" } else { "process" },
     });
 
     append_hook_event(&base_dir, &event);
