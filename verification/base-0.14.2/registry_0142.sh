@@ -160,6 +160,83 @@ else
   say "=== R15  skipped: control binary has no lock ==="
 fi
 
+# ── R16: a LIVE holder past LOCK_STALE must NOT be reaped ────
+# R15 proves a DEAD pid is reaped. This proves the other half, which is the half
+# that loses data if it is wrong: `holder_is_alive` is all that stands between a
+# slow `graph compact` (legitimately holding the lock past LOCK_STALE) and two
+# writers on one graph. Its Windows arm shells out to `tasklist`, its Linux arm
+# stats /proc, and the two have never been compared. Same lock file, same old
+# mtime, reaped only after the holder actually dies.
+if [ "$LOCKED" -ge 1 ]; then
+  say "=== R16  a live holder past LOCK_STALE is not reaped ==="
+  d=$(fresh r16); export BASE_HOME="$d/home"
+  printf '#\n' > "$d/docs/LK2.md"
+  ( cd "$d/ws" && "$BIN" fork create --project lk2 --doc "$d/docs/LK2.md" ) >/dev/null 2>&1
+  G="$d/ws/.base/graph.nq"
+
+  # The helper reports its OWN os-level pid. A shell job's $! is the msys pid
+  # under Git Bash and `tasklist` has never heard of it, so asking the process
+  # is the only portable way to get a pid the binary under test can resolve.
+  rm -f "$OUT/r16.pid"
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      ( powershell -NoProfile -Command '$PID; Start-Sleep -Seconds 120' > "$OUT/r16.pid" 2>/dev/null ) &
+      ;;
+    *)
+      ( sh -c 'echo $$; exec sleep 120' > "$OUT/r16.pid" 2>/dev/null ) &
+      ;;
+  esac
+  helper_job=$!
+  helper_pid=""
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    helper_pid=$(tr -d ' \r\n' < "$OUT/r16.pid" 2>/dev/null || true)
+    case "$helper_pid" in ''|*[!0-9]*) helper_pid="" ;; *) break ;; esac
+    sleep 1
+  done
+
+  if [ -z "$helper_pid" ]; then
+    # Never a silent skip: the row that cannot run says why.
+    bad "R16 could not obtain a live os-level pid on $(uname -s) — leg DID NOT RUN"
+  else
+    say "  live holder pid=$helper_pid"
+    printf '%s\n' "$helper_pid" > "$G.lock"
+    touch -d '2 hours ago' "$G.lock"
+    ( cd "$d/ws" && "$BIN" fork archive LK2 >"$OUT/r16-live.out" 2>&1 )
+    rc=$?
+    say "  live-holder archive rc=$rc"
+    if [ "$rc" != "0" ] && grep -q "graph lock" "$OUT/r16-live.out"; then
+      ok "R16 a live holder past LOCK_STALE is refused, not reaped"
+    else
+      bad "R16 the lock of a LIVE pid $helper_pid was reaped or ignored (rc=$rc)"
+    fi
+    grep -q "reaping stale graph lock" "$OUT/r16-live.out" \
+      && bad "R16 the reap fired on a live holder" \
+      || ok "R16 no reap message while the holder was alive"
+    grep -q "handoff/LK2> <http://ops-sys.local/ontology#status> \"open\"" "$G" \
+      && ok "R16 nothing was written behind the live holder" \
+      || bad "R16 the row changed while a live holder held the lock"
+
+    # Kill the holder and rerun: the SAME lock file, the SAME old mtime, now
+    # reaped. Only holder_is_alive changed its answer, which is the discrimination.
+    case "$(uname -s)" in
+      MINGW*|MSYS*|CYGWIN*) taskkill //PID "$helper_pid" //F >/dev/null 2>&1 ;;
+      *)                    kill -9 "$helper_pid" >/dev/null 2>&1 ;;
+    esac
+    wait "$helper_job" 2>/dev/null || true
+    sleep 2
+    ( cd "$d/ws" && "$BIN" fork archive LK2 >"$OUT/r16-dead.out" 2>&1 )
+    rc=$?
+    say "  dead-holder archive rc=$rc"
+    if [ "$rc" = "0" ] && grep -q "handoff/LK2> <http://ops-sys.local/ontology#status> \"archived\"" "$G"; then
+      ok "R16 the same lock is reaped once the holder dies"
+    else
+      bad "R16 the lock was not reaped after the holder died (rc=$rc)"
+    fi
+  fi
+else
+  say "=== R16  skipped: control binary has no lock ==="
+fi
+
 # ── R3: the help string promises the tier-scoped behaviour ───
 say "=== R3  'handoff create --help' names the tier ==="
 "$BIN" handoff create --help > "$OUT/r3.out" 2>&1
@@ -288,15 +365,31 @@ fi
 unset CLAUDE_CODE_SESSION_ID
 
 # ── Isolation tripwire: the real graphs must be untouched ────
+# The operator's graphs live at a different path depending on which shell is
+# driving: /mnt/c/... under WSL, /c/... under Git Bash on Windows. Listing only
+# the WSL spellings made every Windows run take the `[ -f ] || continue` branch
+# on both entries and print PASS having opened nothing — a silent false green in
+# the one row whose entire job is to prove nothing leaked. Both spellings are
+# listed now, and a run that inspected ZERO graphs is a FAIL, not a pass.
 say "=== isolation ==="
 leak=0
-for g in /mnt/c/Users/Chris/.base/graph.nq /mnt/c/Users/Chris/.base-gbl/.base/graph.nq; do
+checked=0
+for g in /mnt/c/Users/Chris/.base/graph.nq /mnt/c/Users/Chris/.base-gbl/.base/graph.nq \
+         /c/Users/Chris/.base/graph.nq /c/Users/Chris/.base-gbl/.base/graph.nq; do
   [ -f "$g" ] || continue
-  if grep -q "handoff/s-1>\|handoff/a-1>\|handoff/t1>\|handoff/n-1>\|handoff/HANDOFF-A>\|handoff/HANDOFF-G>\|handoff/XT>\|handoff/REAL>\|handoff/g-1>" "$g"; then
+  checked=$((checked+1))
+  if grep -q "handoff/s-1>\|handoff/a-1>\|handoff/t1>\|handoff/n-1>\|handoff/HANDOFF-A>\|handoff/HANDOFF-G>\|handoff/XT>\|handoff/REAL>\|handoff/g-1>\|handoff/LK2>" "$g"; then
     leak=1; say "  LEAK into $g"
   fi
 done
-[ "$leak" = "0" ] && ok "no harness slug reached the operator's graphs" || bad "harness leaked into a real graph"
+say "  operator graphs inspected: $checked"
+if [ "$checked" = "0" ]; then
+  bad "isolation proved NOTHING — no operator graph was found at any known path"
+elif [ "$leak" = "0" ]; then
+  ok "no harness slug reached the operator's graphs ($checked graph(s) inspected)"
+else
+  bad "harness leaked into a real graph"
+fi
 
 say ""
 say "registry_0142: $PASS pass, $FAIL fail  (binary $BIN_VER md5 $BIN_MD5 lockmark $LOCKED)"
