@@ -275,12 +275,14 @@ pub fn trigger_state(trigger: &str, root: Option<&str>, ctx: &TriggerContext) ->
     let Some(resolved) = resolve_trigger(trigger, root, ctx.home.as_deref()) else {
         return Err(TriggerFault::Unrooted);
     };
-    let covered: Vec<String> = ctx
-        .registered
-        .iter()
-        .filter(|r| path_under(&r.path, &resolved))
-        .map(|r| r.name.clone())
-        .collect();
+    // Distinct projects, by name: the operator's `video-gen` is registered in both tiers
+    // (one relative, one absolute path) and is one project, not two.
+    let mut covered: Vec<String> = Vec::new();
+    for r in ctx.registered.iter().filter(|r| path_under(&r.path, &resolved)) {
+        if !covered.iter().any(|n| n.eq_ignore_ascii_case(&r.name)) {
+            covered.push(r.name.clone());
+        }
+    }
     if covered.len() >= 2 {
         Err(TriggerFault::Covers(covered))
     } else {
@@ -529,6 +531,15 @@ mod tests {
             fault_sentence(inert[0].0, inert[0].1, &inert[0].2),
             "path trigger `Documents` on `vintrix` covers 3 registered projects (agentic-os, renda-group, meet-caddy); narrow it or set auto_inject = false"
         );
+        // A project registered twice (both tiers, two spellings) is one project.
+        let twice = TriggerContext {
+            home: Some("/home/u".into()),
+            registered: vec![
+                reg("video-gen", "c:/Users/x/Documents/video-gen"),
+                reg("video-gen", "c:/Users/x/Documents/video-gen"),
+            ],
+        };
+        assert_eq!(trigger_fault("Documents/video-gen", root, &twice), None);
         // The same trigger with nothing registered under it is live.
         let alone = TriggerContext { home: Some("/home/u".into()), registered: vec![reg("agentic-os", "c:/Users/x/Documents/agentic-os")] };
         assert_eq!(match_domains("hello", std::slice::from_ref(&broad), &touched, &alone).len(), 1);
