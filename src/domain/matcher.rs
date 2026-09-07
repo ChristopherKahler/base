@@ -83,16 +83,18 @@ fn is_matched(
     active_paths: &[String],
     ctx: &TriggerContext,
 ) -> Option<(MatchReason, Option<String>)> {
-    // Always-on domains always match
-    if domain.is_always() {
-        return Some((MatchReason::Always, None));
-    }
-
-    // Check exclude patterns first — any match vetoes the domain
+    // Exclude patterns are checked first — any match vetoes the domain, an always-on
+    // one included. Until 0.14.0 `always` returned before this loop, so an exclude on
+    // an always-on domain was dead configuration (F29).
     for pattern in &domain.exclude {
         if prompt_lower.contains(&pattern.to_lowercase()) {
             return None;
         }
+    }
+
+    // Always-on domains match everything else
+    if domain.is_always() {
+        return Some((MatchReason::Always, None));
     }
 
     // Keyword match: a prompt keyword as whole words in the prompt text. A substring
@@ -389,6 +391,15 @@ mod tests {
         let domains = vec![make_domain("cfg", "triggered", &["base"], &["Rule"])];
         assert!(match_domains("show me the database schema", &domains, &[], &ctx()).is_empty());
         assert_eq!(match_domains("how is base doing", &domains, &[], &ctx()).len(), 1);
+    }
+
+    #[test]
+    fn an_exclude_vetoes_an_always_on_domain() {
+        let mut domain = make_domain("quiet", "always", &[], &["Rule"]);
+        domain.exclude = vec!["haiku".into()];
+        let domains = vec![domain];
+        assert_eq!(match_domains("what is the weather", &domains, &[], &ctx()).len(), 1);
+        assert!(match_domains("write a haiku about tea", &domains, &[], &ctx()).is_empty());
     }
 
     #[test]
