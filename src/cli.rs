@@ -162,6 +162,10 @@ pub enum Commands {
         /// Link to an entity (optional additional edge)
         #[arg(long)]
         entity: Option<String>,
+        /// Slug of the record this one replaces: writes the supersession edge
+        /// pair in the same write, so serving surfaces stop returning the old one
+        #[arg(long)]
+        supersedes: Option<String>,
         /// Record a mention of an existing note (pass the slug)
         #[arg(long)]
         mention: Option<String>,
@@ -351,6 +355,22 @@ pub enum Commands {
 pub enum GraphAction {
     /// Dedup + canonicalize the workspace graph (atomic rewrite, snapshots first)
     Compact,
+    /// Record that one record replaces another: `base graph supersede <old> <new>`.
+    ///
+    /// Writes `new supersedes old`, its inverse, and `old status "superseded"` in one
+    /// statement. Serving surfaces (recall, context, the prompt injection) then return
+    /// only the live version; structure surfaces (analyze, neighbors, path, get-node)
+    /// keep both and show the edge, because the superseded record IS the drift evidence.
+    ///
+    /// Refuses a slug that matches nothing, a slug that matches more than one record
+    /// (naming every candidate), a self-reference, and any edge that would close a
+    /// cycle. Every refusal happens before anything is written.
+    Supersede {
+        /// Slug of the record being replaced
+        old: String,
+        /// Slug of the record replacing it
+        new: String,
+    },
     /// Give every covered record a domain link, once, per tier.
     ///
     /// Normally runs itself at session start and needs no operator. This exists
@@ -915,6 +935,10 @@ pub enum DecisionAction {
         rationale: String,
         #[arg(long)]
         recall: Option<String>,
+        /// Slug of the record this one replaces: writes the supersession edge
+        /// pair in the same write, so serving surfaces stop returning the old one
+        #[arg(long)]
+        supersedes: Option<String>,
     },
     /// Search decisions by keyword
     Search {
@@ -1107,6 +1131,10 @@ pub enum RuleAction {
         /// Optional rationale — injected as "rule — because rationale" (Phase 26)
         #[arg(long)]
         rationale: Option<String>,
+        /// Slug of the record this one replaces: writes the supersession edge
+        /// pair in the same write, so serving surfaces stop returning the old one
+        #[arg(long)]
+        supersedes: Option<String>,
     },
     /// List rules for a domain from the graph
     List {
@@ -1790,8 +1818,8 @@ pub fn run() {
         Some(Commands::Decision { global, action }) => {
             let cwd = tier_cwd(&cwd, global);
             match action {
-                DecisionAction::Log { domain, decision, rationale, recall } => {
-                    match crud::decision::log(&cwd, &config.namespace, &domain, &decision, &rationale, recall.as_deref()) {
+                DecisionAction::Log { domain, decision, rationale, recall, supersedes } => {
+                    match crud::decision::log_with(&cwd, &config.namespace, &domain, &decision, &rationale, recall.as_deref(), supersedes.as_deref()) {
                         Ok(slug) => println!("Decision logged (slug: {slug})"),
                         Err(e) => die("Failed", e),
                     }
@@ -2614,8 +2642,8 @@ pub fn run() {
         Some(Commands::Rule { global, action }) => {
             let rule_cwd = tier_cwd(&cwd, global);
             match action {
-                RuleAction::Add { domain: name, text, rationale } => {
-                    match crud::rule::add(&rule_cwd, &config.namespace, &name, &text, rationale.as_deref()) {
+                RuleAction::Add { domain: name, text, rationale, supersedes } => {
+                    match crud::rule::add_with(&rule_cwd, &config.namespace, &name, &text, rationale.as_deref(), supersedes.as_deref()) {
                         Ok(index) => println!("Rule {index} added to domain '{name}'"),
                         Err(e) => die("Failed", e),
                     }
@@ -2635,7 +2663,7 @@ pub fn run() {
         },
 
         // ─── Learn ────────────────────────────────────────
-        Some(Commands::Learn { global, text, r#type, domain, project, entity, mention, context, remove, update, list }) => {
+        Some(Commands::Learn { global, text, r#type, domain, project, entity, supersedes, mention, context, remove, update, list }) => {
             let cwd = tier_cwd(&cwd, global);
             if list {
                 if let Err(e) = crud::note::list_notes(&cwd, &config.namespace, if r#type != "insight" { Some(&r#type) } else { None }, domain.as_deref()) {
@@ -2676,7 +2704,7 @@ pub fn run() {
                     eprintln!("--domain is required (or use --mention, --remove, --update, --list)");
                     std::process::exit(1);
                 };
-                match crud::note::learn(
+                match crud::note::learn_with(
                     &cwd,
                     &config.namespace,
                     &text,
@@ -2684,6 +2712,7 @@ pub fn run() {
                     Some(&domain),
                     project.as_deref(),
                     entity.as_deref(),
+                    supersedes.as_deref(),
                 ) {
                     Ok(slug) => println!("Learned: '{text}' (slug: {slug}, type: {}, domain: {domain})", r#type),
                     Err(e) => die("Failed", e),
@@ -3683,6 +3712,15 @@ pub fn run() {
             GraphAction::Analyze { top_n } => {
                 if let Err(e) = base::graph_analyze::run(&cwd, &config.namespace, top_n) {
                     die("graph analyze failed", e);
+                }
+            }
+            GraphAction::Supersede { old, new } => {
+                match crud::supersede::supersede(&cwd, &config.namespace, &old, &new) {
+                    Ok((old_iri, new_iri)) => {
+                        println!("Superseded: {old_iri}");
+                        println!("        by: {new_iri}");
+                    }
+                    Err(e) => die("graph supersede failed", e),
                 }
             }
             GraphAction::GetNode { node } => {
