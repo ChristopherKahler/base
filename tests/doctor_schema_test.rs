@@ -77,6 +77,7 @@ fn an_unmigrated_tier_says_so_and_counts_its_orphans() {
         healthy: true,
         warnings: vec![],
         config_errors: vec![],
+        trigger_faults: vec![],
     };
     let human = base::doctor::format_human(&report);
     assert!(human.contains("schema: not migrated"), "{human}");
@@ -102,6 +103,7 @@ fn a_migrated_tier_reports_its_schema_version_and_no_orphans() {
         healthy: true,
         warnings: vec![],
         config_errors: vec![],
+        trigger_faults: vec![],
     };
     let human = base::doctor::format_human(&report);
     assert!(human.contains("schema: domain-1"), "{human}");

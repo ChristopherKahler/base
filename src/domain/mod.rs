@@ -219,6 +219,19 @@ fn rooted(mut domains: Vec<DomainDef>, root: Option<&Path>) -> Vec<DomainDef> {
     domains
 }
 
+/// One tier's domains.toml, rooted at that tier (F29): the reader doctor uses to judge a
+/// tier on its own. Absent or unparsable is empty; the loaders fail open by design and
+/// doctor reports a corrupt file through `config_errors`.
+pub fn load_domains_file(path: &Path, root: Option<&Path>) -> Vec<DomainDef> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    match toml::from_str::<DomainsFile>(&content) {
+        Ok(file) => rooted(file.domain, root),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// The registered projects as the trigger rules see them: every `ops:Project` with a
 /// path, resolved against the tier its record lives in (the workspace root for the
 /// workspace graph, home for every other graph) in the shape `resolve_trigger`

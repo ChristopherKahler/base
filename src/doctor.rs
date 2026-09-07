@@ -77,6 +77,11 @@ pub struct DoctorReport {
     /// corrupt file otherwise looks exactly like an absent one. Counts against
     /// `healthy`: silently-dead star commands are a fault, not an advisory.
     pub config_errors: Vec<String>,
+    /// Path triggers that cannot fire (F29 step 6): per tier, a domains.toml trigger that
+    /// is unrooted or covers two or more registered projects, with the projects named.
+    /// Counts against `healthy`: an inert trigger is a domain that silently stopped
+    /// loading, and the fix is one line in domains.toml.
+    pub trigger_faults: Vec<String>,
 }
 
 /// Diagnose a single graph file. PURE: only touches `path` and its siblings
@@ -188,13 +193,38 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
     warnings.extend(leaked_global_handoffs());
     warnings.extend(coach_drift());
     let config_errors = crate::command::check_command_files(cwd);
-    let healthy = tiers.iter().all(|t| t.status != "unhealthy") && config_errors.is_empty();
+    let trigger_faults = trigger_faults(cwd);
+    let healthy = tiers.iter().all(|t| t.status != "unhealthy") && config_errors.is_empty() && trigger_faults.is_empty();
     DoctorReport {
         tiers,
         healthy,
         warnings,
         config_errors,
+        trigger_faults,
     }
+}
+
+/// Every inert path trigger, per tier, as the sentence `add-trigger` refuses with
+/// (F29 step 6). Each tier is read from its own domains.toml and resolved against its
+/// own root, against the registered projects of the merged store.
+fn trigger_faults(cwd: &Path) -> Vec<String> {
+    let ctx = crate::domain::trigger_context(cwd);
+    let mut tiers: Vec<(&str, PathBuf, Option<PathBuf>)> = Vec::new();
+    if let Some(home) = crate::home::home_root() {
+        tiers.push(("global", home.join(".base-gbl").join("domains.toml"), Some(home)));
+    }
+    if let Some(base_dir) = crate::config::find_workspace_base(cwd) {
+        let root = base_dir.parent().map(Path::to_path_buf);
+        tiers.push(("workspace", base_dir.join("domains.toml"), root));
+    }
+    let mut out = Vec::new();
+    for (tier, path, root) in tiers {
+        let domains = crate::domain::load_domains_file(&path, root.as_deref());
+        for (domain, trigger, fault) in crate::domain::matcher::inert_triggers(&domains, &ctx) {
+            out.push(format!("{tier} tier: {}", crate::domain::matcher::fault_sentence(domain, trigger, &fault)));
+        }
+    }
+    out
 }
 
 /// Render a clearly-delimited human report.
@@ -210,6 +240,9 @@ pub fn format_human(report: &DoctorReport) -> String {
         // the reason star commands went quiet, and it has nothing to do with tiers.
         for e in &report.config_errors {
             out.push_str(&format!("   ⚠ {e}\n"));
+        }
+        for t in &report.trigger_faults {
+            out.push_str(&format!("   ⚠ {t}\n"));
         }
         // Same reasoning for advisories: a coach lagging the binary is true
         // whether or not a graph exists here, and this early return used to
@@ -344,6 +377,13 @@ pub fn format_human(report: &DoctorReport) -> String {
         out.push_str("\n─── config faults ────────────────────\n");
         for e in &report.config_errors {
             out.push_str(&format!("   ⚠ {e}\n"));
+        }
+    }
+
+    if !report.trigger_faults.is_empty() {
+        out.push_str("\n─── path triggers ────────────────────\n");
+        for t in &report.trigger_faults {
+            out.push_str(&format!("   ⚠ {t}\n"));
         }
     }
 
@@ -1092,6 +1132,7 @@ mod coach_drift_tests {
             healthy: true,
             warnings: vec![skill_drift_warning(Some("0.12.3"), "0.13.2", true).unwrap()],
             config_errors: vec![],
+            trigger_faults: vec![],
         };
         assert!(report.healthy, "an advisory must not flip the verdict");
         // Reaches the reader even with no graph tiers present — a lagging coach
