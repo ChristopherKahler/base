@@ -153,6 +153,29 @@ pub fn get_node(cwd: &Path, ns: &NamespaceConfig, input: &str) -> Result<()> {
     if !n.ntype.is_empty() { println!("  type: {}", n.ntype); }
     if !n.source.is_empty() { println!("  source: {}", n.source); }
     if !n.summary.is_empty() { println!("  summary: {}", n.summary); }
+    // A structure surface KEEPS a superseded record and says so, rather than hiding
+    // it: the superseded record is the drift evidence the successor's edge points at,
+    // and a view that dropped it would leave that edge dangling. The head is printed
+    // so an operator who landed on a corrected record is told where the live one is
+    // instead of walking the chain by hand.
+    //
+    // This costs one extra store load. Acceptable HERE and nowhere else: `get-node` is
+    // typed by hand and is on no hot path (auk's ruling, 2026-09-07, taken after F25
+    // was filed for an unconditional reload on the session-start path). `resolve_head`
+    // stays the single walker rather than gaining an adjacency-shaped twin (law 8).
+    // Both lines print ONLY when the node is actually superseded, so every other
+    // `get-node` output stays byte-identical.
+    if let Some(base_dir) = crate::config::find_workspace_base(cwd) {
+        let bare = id.trim_start_matches('<').trim_end_matches('>');
+        if let Ok(store) = crate::store::load_graph(&base_dir.join("graph.nq")) {
+            let head = crate::supersede::resolve_head(&store, ns, bare);
+            if head != bare {
+                let head_id = format!("<{head}>");
+                println!("  [superseded]");
+                println!("  head: {}", label(&nodes, &head_id));
+            }
+        }
+    }
     let edges = adj.get(&id).map(|v| v.as_slice()).unwrap_or(&[]);
     println!("  degree: {}", edges.len());
     if !edges.is_empty() {
