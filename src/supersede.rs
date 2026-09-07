@@ -1,0 +1,286 @@
+//! Supersession: the one place that knows what "this record replaced that one" is
+//! spelled as, mirroring [`crate::domain::link`].
+//!
+//! `ops:supersedes` and `ops:supersededBy` have been declared in `ops.ttl` since
+//! before 0.13.19 (`:136` and `:139-140`, inverse of each other) and **nothing has
+//! ever written either one** — measured on Chris's store, 2026-09-07: 0 quads of
+//! each across both tiers. The only supersession base has today is
+//! `supersedes_fact_id`, a JSON field in the basemode sync ledger
+//! (`apply_ops.rs:11,189-192`, `changelog.rs:82-102`), which no graph reader can
+//! see. So a correction is stored beside the thing it corrects, both come back
+//! from `recall` together, and nothing says which one is live. That is the drift
+//! this module exists to end.
+//!
+//! ## The edge is the truth; the status is a label
+//!
+//! Every decision path keys on [`PRED_SUPERSEDED_BY`] and nothing else. The writer
+//! also sets `ops:status "superseded"` on the old record so the dashboard and
+//! `learn --list` do not show it as active, but **no reader may require both**:
+//! `ops:status` is unvalidated free text. Measured on the frozen copy, both tiers:
+//! 44 distinct values against the six `ops.ttl:117` declares, including case
+//! variants used as separate values (`Pass` 242, `PASS` 43, `PASS (no change)` 1)
+//! and whole sentences (`"no silent loss"`, `"CWD outside any ws → global"`, one
+//! truncated markdown paragraph). One record already carries the status with no
+//! edge. `base doctor` reports the disagreement in both directions rather than any
+//! reader trying to reconcile it.
+//!
+//! ## Chains
+//!
+//! A → B → C is three records and two edges; nothing is ever re-pointed.
+//! [`resolve_head`] walks `supersededBy` forward to the live end, so `resolve_head(A)`
+//! is C. A cycle is refused at write time by [`would_cycle`]; if one reaches the
+//! store by another route the walk still terminates on its visited set rather than
+//! hanging a session-start hook.
+
+use std::collections::BTreeSet;
+
+use oxigraph::model::{NamedNodeRef, Term};
+use oxigraph::store::Store;
+
+use crate::config::NamespaceConfig;
+
+/// `new ops:supersedes old` — written on the SUCCESSOR, naming what it replaced.
+pub const PRED_SUPERSEDES: &str = "supersedes";
+
+/// `old ops:supersededBy new` — the inverse, written in the same statement. This is
+/// the predicate every reader keys on.
+pub const PRED_SUPERSEDED_BY: &str = "supersededBy";
+
+/// The `ops:status` value the writer stamps on a superseded record. Written for the
+/// dashboard, never read by a decision path — see the module docs.
+pub const STATUS_SUPERSEDED: &str = "superseded";
+
+/// `FILTER NOT EXISTS {{ ?var ops:supersededBy ?var_supersededBy }}` — "serve only the
+/// live version".
+///
+/// **This must be interpolated INSIDE the `GRAPH ?g {{ … }}` group it filters**, next
+/// to the arm's other filters. A triple pattern outside every GRAPH group is matched
+/// against the default graph, where base keeps nothing, so `NOT EXISTS` is always
+/// true and the filter silently excludes nothing while reading like a working filter.
+/// That is not hypothetical: it shipped once as F16 (`crud/note.rs`, kite, 2026-09-06),
+/// where a transient filter placed after the last UNION arm let `recall --keyword`
+/// keep printing pings.
+///
+/// The bound variable is derived from `var` so interpolating this into an arm that
+/// already binds `?x` cannot capture it.
+pub fn sparql_exclude_superseded(ns: &NamespaceConfig, var: &str) -> String {
+    let p = &ns.prefix;
+    format!("FILTER NOT EXISTS {{ ?{var} {p}:{PRED_SUPERSEDED_BY} ?{var}_supersededBy }}")
+}
+
+/// The live end of `iri`'s supersession chain, or `iri` itself when nothing
+/// supersedes it.
+///
+/// Walks `supersededBy` forward across ANY graph: a workspace correction to a global
+/// note puts both edges in the workspace graph (the tier of the NEW record, per the
+/// G0 verdict), and a merged read must still find them.
+///
+/// Terminates on a visited set. A cycle cannot be written — [`would_cycle`] refuses
+/// it — but the walk runs inside the prompt-submit hook, and a hook that hangs on
+/// malformed data is worse than one that stops early and lets `doctor` report it.
+/// A record with two successors is likewise a defect the writer prevents; if one
+/// exists the lexicographically first is taken so two runs agree.
+pub fn resolve_head(store: &Store, ns: &NamespaceConfig, iri: &str) -> String {
+    let Ok(pred) = NamedNodeRef::new(&format!("{}{PRED_SUPERSEDED_BY}", ns.uri)) else {
+        return iri.to_string();
+    };
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    seen.insert(iri.to_string());
+    let mut cur = iri.to_string();
+
+    loop {
+        let Ok(subject) = NamedNodeRef::new(&cur) else { return cur };
+        // Lexicographically first successor, so a two-successor defect still
+        // resolves the same way on every run.
+        let next = store
+            .quads_for_pattern(Some(subject.into()), Some(pred), None, None)
+            .filter_map(|q| q.ok())
+            .filter_map(|q| match q.object {
+                Term::NamedNode(n) => Some(n.into_string()),
+                _ => None,
+            })
+            .min();
+        match next {
+            Some(n) if seen.insert(n.clone()) => cur = n,
+            // No successor, or one we have already walked through: this is the end
+            // of the chain we can trust.
+            _ => return cur,
+        }
+    }
+}
+
+/// True when making `new_iri` supersede `old_iri` would close a cycle — i.e. `old_iri`
+/// is already reachable by walking forward from `new_iri`.
+///
+/// Checked BEFORE anything is inserted, so a refusal leaves the store untouched.
+pub fn would_cycle(store: &Store, ns: &NamespaceConfig, old_iri: &str, new_iri: &str) -> bool {
+    if old_iri == new_iri {
+        return true;
+    }
+    let Ok(pred) = NamedNodeRef::new(&format!("{}{PRED_SUPERSEDED_BY}", ns.uri)) else {
+        return false;
+    };
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    seen.insert(new_iri.to_string());
+    let mut cur = new_iri.to_string();
+
+    loop {
+        let Ok(subject) = NamedNodeRef::new(&cur) else { return false };
+        let next = store
+            .quads_for_pattern(Some(subject.into()), Some(pred), None, None)
+            .filter_map(|q| q.ok())
+            .filter_map(|q| match q.object {
+                Term::NamedNode(n) => Some(n.into_string()),
+                _ => None,
+            })
+            .min();
+        match next {
+            Some(n) if n == old_iri => return true,
+            Some(n) if seen.insert(n.clone()) => cur = n,
+            _ => return false,
+        }
+    }
+}
+
+/// The whole supersession fact as ONE `INSERT DATA`: the forward edge, its inverse,
+/// and the status label, into `graph_iri`.
+///
+/// One statement on purpose. Three separate updates can be interrupted between the
+/// second and the third, leaving a record that reads as superseded to one surface and
+/// live to another — the exact ambiguity this fork exists to remove.
+///
+/// `graph_iri` is the tier of the NEW record (G0 verdict): a workspace correction to a
+/// global note puts both edges in the workspace graph, where [`resolve_head`] finds
+/// them on a merged read.
+pub fn link_update(ns: &NamespaceConfig, graph_iri: &str, old_iri: &str, new_iri: &str) -> String {
+    let p = &ns.prefix;
+    format!(
+        "INSERT DATA {{ GRAPH <{graph_iri}> {{\n\
+        \x20 <{new_iri}> {p}:{PRED_SUPERSEDES} <{old_iri}> .\n\
+        \x20 <{old_iri}> {p}:{PRED_SUPERSEDED_BY} <{new_iri}> .\n\
+        \x20 <{old_iri}> {p}:status \"{STATUS_SUPERSEDED}\" .\n\
+        }} }}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ns() -> NamespaceConfig {
+        NamespaceConfig::default()
+    }
+
+    fn store_with(nq: &str) -> Store {
+        let store = Store::new().unwrap();
+        store
+            .load_from_reader(oxigraph::io::RdfFormat::NQuads, nq.as_bytes())
+            .unwrap();
+        store
+    }
+
+    /// `a supersededBy b`, in graph `g`, as one N-Quads line.
+    fn edge(u: &str, g: &str, a: &str, b: &str) -> String {
+        format!("<{u}{a}> <{u}{PRED_SUPERSEDED_BY}> <{u}{b}> <{g}> .\n")
+    }
+
+    #[test]
+    fn the_exclusion_filter_binds_a_variable_derived_from_its_subject() {
+        let f = sparql_exclude_superseded(&ns(), "n");
+        assert_eq!(f, "FILTER NOT EXISTS { ?n ops:supersededBy ?n_supersededBy }");
+        assert!(
+            !f.contains("GRAPH"),
+            "the filter carries no GRAPH group of its own — the caller must place it \
+             INSIDE the arm it filters, or it is inert (F16)"
+        );
+    }
+
+    #[test]
+    fn custom_namespace_is_honoured() {
+        let ns = NamespaceConfig { prefix: "mybase".into(), uri: "http://example.com/base#".into() };
+        assert!(sparql_exclude_superseded(&ns, "x").contains("mybase:supersededBy"));
+        assert!(link_update(&ns, "g", "old", "new").contains("mybase:supersedes"));
+    }
+
+    #[test]
+    fn link_update_writes_both_edges_and_the_status_in_one_statement() {
+        let u = link_update(&ns(), "g", "old", "new");
+        assert_eq!(
+            u.matches("INSERT DATA").count(),
+            1,
+            "three statements can be interrupted between the second and the third: {u}"
+        );
+        assert!(u.contains("<new> ops:supersedes <old> ."), "{u}");
+        assert!(u.contains("<old> ops:supersededBy <new> ."), "{u}");
+        assert!(u.contains("<old> ops:status \"superseded\" ."), "{u}");
+    }
+
+    #[test]
+    fn resolve_head_walks_a_chain_to_its_live_end() {
+        let ns = ns();
+        let u = &ns.uri;
+        let g = format!("{u}graph/ws/t");
+        let store = store_with(&format!("{}{}", edge(u, &g, "note/a", "note/b"), edge(u, &g, "note/b", "note/c")));
+
+        assert_eq!(resolve_head(&store, &ns, &format!("{u}note/a")), format!("{u}note/c"));
+        assert_eq!(resolve_head(&store, &ns, &format!("{u}note/b")), format!("{u}note/c"));
+        assert_eq!(
+            resolve_head(&store, &ns, &format!("{u}note/c")),
+            format!("{u}note/c"),
+            "the head resolves to itself"
+        );
+    }
+
+    #[test]
+    fn resolve_head_crosses_graphs() {
+        // The edge pair lives in the NEW record's tier; a global record superseded by
+        // a workspace one is found only if the walk ignores graph names.
+        let ns = ns();
+        let u = &ns.uri;
+        let store = store_with(&edge(u, &format!("{u}graph/ws/chris"), "note/global", "note/local"));
+        assert_eq!(resolve_head(&store, &ns, &format!("{u}note/global")), format!("{u}note/local"));
+    }
+
+    #[test]
+    fn resolve_head_terminates_on_a_cycle_instead_of_hanging() {
+        // `would_cycle` refuses to write this. It runs inside the prompt-submit hook,
+        // so if one ever arrives by another route the walk must still stop.
+        let ns = ns();
+        let u = &ns.uri;
+        let g = format!("{u}graph/ws/t");
+        let store = store_with(&format!("{}{}", edge(u, &g, "note/a", "note/b"), edge(u, &g, "note/b", "note/a")));
+        let head = resolve_head(&store, &ns, &format!("{u}note/a"));
+        assert!(head == format!("{u}note/a") || head == format!("{u}note/b"), "{head}");
+    }
+
+    #[test]
+    fn resolve_head_is_deterministic_when_a_record_has_two_successors() {
+        let ns = ns();
+        let u = &ns.uri;
+        let g = format!("{u}graph/ws/t");
+        let store = store_with(&format!("{}{}", edge(u, &g, "note/a", "note/z"), edge(u, &g, "note/a", "note/b")));
+        // Lexicographically first, so two runs of the same store agree.
+        assert_eq!(resolve_head(&store, &ns, &format!("{u}note/a")), format!("{u}note/b"));
+    }
+
+    #[test]
+    fn would_cycle_catches_a_self_reference_and_a_closed_loop() {
+        let ns = ns();
+        let u = &ns.uri;
+        let g = format!("{u}graph/ws/t");
+        let a = format!("{u}note/a");
+        let b = format!("{u}note/b");
+        let c = format!("{u}note/c");
+
+        let store = store_with(&format!("{}{}", edge(u, &g, "note/a", "note/b"), edge(u, &g, "note/b", "note/c")));
+        assert!(would_cycle(&store, &ns, &a, &a), "a record cannot supersede itself");
+        assert!(
+            would_cycle(&store, &ns, &a, &c),
+            "c already descends from a, so a superseded BY c closes the loop"
+        );
+        assert!(
+            !would_cycle(&store, &ns, &c, &format!("{u}note/d")),
+            "a fresh successor for the head is the normal case"
+        );
+    }
+}
