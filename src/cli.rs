@@ -1411,6 +1411,14 @@ fn resolve(cwd: &std::path::Path, ns: &base::config::NamespaceConfig, entity_typ
 /// fail-open (exit 0) and surface corruption via the session-start warning
 /// block instead (see hook::session_start). `{e:#}` prints the full anyhow
 /// context chain so the underlying parse error is visible.
+/// #19: outside a workspace every tier-bound reader says so, in one sentence, before it
+/// answers, so an empty answer from the wrong directory never looks like an empty graph.
+fn outside_workspace_note(cwd: &std::path::Path) {
+    if base::config::find_workspace_base(cwd).is_none() {
+        eprintln!("(no workspace here: searched the global tier only; run `base scaffold` in a project folder to create one)");
+    }
+}
+
 fn die(prefix: &str, e: impl std::fmt::Display) -> ! {
     eprintln!("{prefix}: {e:#}");
     std::process::exit(1);
@@ -1548,6 +1556,9 @@ pub fn run() {
                 }
             }
             ProjectAction::List { all, workspace, unscoped, json } => {
+                if !json {
+                    outside_workspace_note(&cwd);
+                }
                 // Precedence: --all > --workspace > --unscoped > default (current workspace).
                 let project_scope = if all {
                     scope::ProjectScope::All
@@ -2788,6 +2799,7 @@ pub fn run() {
 
         // ─── Recall ─────────────────────────────────────────
         Some(Commands::Recall { keyword, domain, include_superseded, slug }) => {
+            outside_workspace_note(&cwd);
             // Note IRIs to stamp lastRead on (usage signal for `base graph purge --stale`).
             // Resolved BEFORE printing so an explicit recall marks what it surfaced.
             let mut surfaced: Vec<String> = Vec::new();
@@ -3148,6 +3160,7 @@ pub fn run() {
         // ─── Commands (star commands) ─────────────────────────
         Some(Commands::Command { action }) => match action {
             CommandAction::List => {
+                outside_workspace_note(&cwd);
                 let commands = command::load_commands(&cwd);
                 if commands.is_empty() {
                     println!("No commands configured.");
@@ -3580,6 +3593,9 @@ pub fn run() {
 
         // ─── Doctor ───────────────────────────────────────────
         Some(Commands::Doctor { json, repair, restore }) => {
+            if !json {
+                outside_workspace_note(&cwd);
+            }
             // Parser-independent: every branch must run BECAUSE the graph is broken.
             if let Some(which) = restore {
                 // --restore: workspace tier only (operator's corruptible graph).
