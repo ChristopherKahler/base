@@ -15,7 +15,6 @@
 //! so a future widening of those queries cannot leak pings without failing here.
 
 use std::path::Path;
-use std::sync::Mutex;
 
 use base::config::{BaseConfig, NamespaceConfig};
 use base::crud;
