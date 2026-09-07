@@ -253,6 +253,41 @@ fn relay_task_tick(
     }
 }
 
+/// The hook log is bounded by its own writer (#22): over this size the last
+/// [`HOOK_LOG_KEEP_LINES`] lines are kept and the rest dropped, whether or not a
+/// dashboard is ever opened. Same numbers the dashboard's rotation always used.
+pub const HOOK_LOG_CAP_BYTES: u64 = 10 * 1024 * 1024;
+pub const HOOK_LOG_KEEP_LINES: usize = 5000;
+
+/// Truncate `hook-events.jsonl` under `base_dir` to its last lines once it is over the cap.
+pub fn rotate_hook_log(base_dir: &std::path::Path) {
+    let log_path = base_dir.join("hook-events.jsonl");
+    let Ok(meta) = std::fs::metadata(&log_path) else { return };
+    if meta.len() < HOOK_LOG_CAP_BYTES {
+        return;
+    }
+    let Ok(content) = std::fs::read_to_string(&log_path) else { return };
+    let lines: Vec<&str> = content.lines().collect();
+    let keep = lines.len().saturating_sub(HOOK_LOG_KEEP_LINES);
+    let tail: String = lines[keep..].join("\n") + "\n";
+    let tmp = base_dir.join("hook-events.jsonl.tmp");
+    if std::fs::write(&tmp, tail).is_ok() {
+        let _ = std::fs::rename(&tmp, &log_path);
+    }
+}
+
+/// Append one event line, trimming the file first when it is over the cap. The writer
+/// owns its own bound; nothing else has to run for the trail to stay bounded.
+pub fn append_hook_event(base_dir: &std::path::Path, event: &serde_json::Value) {
+    rotate_hook_log(base_dir);
+    use std::io::Write;
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base_dir.join("hook-events.jsonl"))
+        .and_then(|mut f| writeln!(f, "{}", event));
+}
+
 /// Append a hook event to the JSONL log file. Fire-and-forget — never blocks hooks.
 fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>) {
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -264,7 +299,6 @@ fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>) {
         None => return,
     };
 
-    let log_path = base_dir.join("hook-events.jsonl");
     let ts = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
     let empty = Vec::new();
 
@@ -286,12 +320,7 @@ fn log_hook_event(hook: &str, success: bool, data: Option<&HookEventData>) {
         "section_context": data.map(|d| d.section_context).unwrap_or(false),
     });
 
-    use std::io::Write;
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .and_then(|mut f| writeln!(f, "{}", event));
+    append_hook_event(&base_dir, &event);
 }
 
 fn read_stdin() -> anyhow::Result<serde_json::Value> {
