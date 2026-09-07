@@ -239,6 +239,19 @@ fn auto_inject_false_keeps_a_domain_out_of_every_automatic_path() {
     });
 }
 
+/// D3, the third automatic surface (plover's review): the session-start cheat-sheet lists
+/// every keyword domain by name with its first four keywords, every session. A flagged
+/// domain is not listed; an unflagged one still is.
+#[test]
+fn auto_inject_false_keeps_a_domain_out_of_the_session_start_cheat_sheet() {
+    let tmp = home(&format!("{GLOBAL_DOMAINS}{CONFIDENTIAL_DOMAINS}"));
+    base::home::with_thread_home(tmp.path(), || {
+        let sheet = base::domain::query::context_triggers_block(tmp.path());
+        assert!(sheet.contains("meet-caddy: caddy"), "an unflagged keyword domain is listed:\n{sheet}");
+        assert!(!sheet.contains("terms"), "a flagged domain is not named, nor its keywords:\n{sheet}");
+    });
+}
+
 /// An exclude vetoes an always-on domain; on 0.14.0 `always` returned before the check.
 #[test]
 fn an_always_on_domain_with_an_exclude_is_vetoed() {

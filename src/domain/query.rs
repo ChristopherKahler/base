@@ -414,9 +414,12 @@ pub fn context_list(cwd: &Path) {
 /// and keyword-triggered domains so Claude knows what's pullable.
 pub fn context_triggers_block(cwd: &Path) -> String {
     let domains = domain::load_domains(cwd);
+    // A domain marked `auto_inject = false` is not listed either: the sheet is printed
+    // automatically at every session start, and a name with four keywords is the
+    // identifying vocabulary of exactly the domains the flag exists to keep quiet (F29).
     let triggerable: Vec<_> = domains
         .iter()
-        .filter(|d| !d.prompt_keywords.is_empty() || d.query.is_some())
+        .filter(|d| d.auto_inject && (!d.prompt_keywords.is_empty() || d.query.is_some()))
         .collect();
 
     if triggerable.is_empty() {

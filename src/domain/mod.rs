@@ -80,7 +80,8 @@ pub struct DomainDef {
     #[serde(default = "default_mode")]
     pub mode: String, // "always" | "triggered"
     /// `auto_inject = false` keeps this domain out of every automatic injection — the
-    /// prompt hook and the tool hooks — whatever its mode or triggers (F29 D3). Explicit
+    /// prompt hook, the tool hook and the session-start cheat-sheet — whatever its mode
+    /// or triggers (F29 D3). Explicit
     /// readers (`base context`, `base recall`, star commands) still see it. Absent means
     /// true, and true is not written back, so a round-trip leaves the file as it was.
     #[serde(default = "default_auto_inject", skip_serializing_if = "is_auto_inject")]
