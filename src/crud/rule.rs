@@ -178,7 +178,19 @@ pub fn list(
 }
 
 /// Remove a rule by index from a domain.
-pub fn remove(cwd: &Path, ns: &NamespaceConfig, domain_name: &str, index: u32) -> Result<()> {
+/// Remove one CLI rule from THIS tier. Returns how many went: 0 means the index
+/// is not in this tier, which is not the same as success.
+///
+/// #55. This ran the DELETE and returned `Ok(())` whatever matched, so
+/// `rule remove --domain X --index 10` against a tier with no rules at all
+/// printed "Rule 10 removed from domain 'X'" and exited 0. The index is
+/// tier-local and both tiers start at 0, so the number a user reads in their
+/// injected context routinely names a different rule here.
+pub fn remove(cwd: &Path, ns: &NamespaceConfig, domain_name: &str, index: u32) -> Result<usize> {
+    // Check before deleting, against the same view `list` prints.
+    if !fetch(cwd, ns, domain_name)?.iter().any(|(pri, _)| *pri == index) {
+        return Ok(0);
+    }
     let p = &ns.prefix;
     let domain_slug = crud::slugify(domain_name);
     let domain_iri = crud::build_iri(ns, "domain", &domain_slug);
@@ -205,7 +217,7 @@ pub fn remove(cwd: &Path, ns: &NamespaceConfig, domain_name: &str, index: u32) -
     );
 
     crud::load_and_mutate(cwd, ns, &sparql)?;
-    Ok(())
+    Ok(1)
 }
 
 /// Find the next available rule index for a domain.

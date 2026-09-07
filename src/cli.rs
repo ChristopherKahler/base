@@ -221,8 +221,12 @@ pub enum Commands {
     },
     /// Manage rules in the graph (add, list, remove)
     Rule {
-        /// Target the global tier (~/.base-gbl/) instead of workspace
-        #[arg(long, short)]
+        /// Target the global tier (~/.base-gbl/) instead of workspace.
+        ///
+        /// `global = true` so it works before OR after the subcommand. Without
+        /// it the flag sat on the group alone, which is the workaround #55 had
+        /// to document: `base rule --global remove ...`.
+        #[arg(long, short, global = true)]
         global: bool,
         #[command(subcommand)]
         action: RuleAction,
@@ -2697,8 +2701,18 @@ pub fn run() {
                     }
                 }
                 RuleAction::Remove { domain: name, index } => {
+                    let tier = if global { "global" } else { "workspace" };
+                    let other = if global { "workspace" } else { "global" };
                     match crud::rule::remove(&rule_cwd, &config.namespace, &name, index) {
-                        Ok(()) => println!("Rule {index} removed from domain '{name}'"),
+                        Ok(0) => {
+                            eprintln!(
+                                "No rule {index} on domain '{name}' in the {tier} tier \
+                                 (not searched: {other}). Rule numbers are per tier: \
+                                 `base rule list --domain {name}` shows this tier's."
+                            );
+                            std::process::exit(1);
+                        }
+                        Ok(_) => println!("Rule {index} removed from domain '{name}' ({tier} tier)"),
                         Err(e) => die("Failed", e),
                     }
                 }
