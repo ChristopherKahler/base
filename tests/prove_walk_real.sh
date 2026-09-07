@@ -73,7 +73,7 @@ echo "  binary     $("$B" --version | awk '{print $NF}')  md5 $(md5sum "$B" | cu
 echo "  run root   $R   (BASE_HOME=$R/home, cwd=$WS)"
 echo "  ws slug    $WS_SLUG"
 echo "  workspace  $(md5sum "$WS/.base/graph.nq" | cut -c1-12)  $(stat -c %s "$WS/.base/graph.nq") bytes"
-echo "  baseline   ${BASELINE:-<unset — line 1's negative half will SKIP>}"
+echo "  baseline   ${BASELINE:-<unset, so the negative half of line 1 will SKIP>}"
 echo
 
 # A fresh session id per call, so nothing is suppressed by the once-per-session
@@ -113,8 +113,11 @@ else
   if [ -s "$OLD1" ]; then
     bad "the merge base ALSO served a walk block — this fork is not what put it there"
     sed -n '1,6p' "$OLD1" | sed 's/^/        /'
-  else
+  elif [ -s "$NEW1" ]; then
     ok "merge base served nothing: the block above is this fork's doing"
+  else
+    # Both served nothing. The premise is true and the conclusion is not.
+    ok "merge base served nothing, but neither did the branch — see the FAIL above"
   fi
 fi
 echo
@@ -159,13 +162,20 @@ echo
 echo "── line 3: the ambiguous name resolves identically across $RUNS runs ──"
 : > "$R/hashes"
 for i in $(seq 1 "$RUNS"); do
-  walk_block "$B" 'where are we on `basemode`' "L3-$i" | sha256sum | cut -d' ' -f1 >> "$R/hashes"
+  walk_block "$B" 'where are we on `basemode`' "L3-$i" > "$R/blk-$i"
+  sha256sum < "$R/blk-$i" | cut -d' ' -f1 >> "$R/hashes"
 done
 distinct=$(sort -u "$R/hashes" | wc -l)
 h=$(head -1 "$R/hashes")
-if [ "$distinct" -eq 1 ]; then
-  ok "$RUNS runs, one sha256: $h"
-  head -1 "$R/line1.new" | sed 's/^/        chose: /'
+# An empty block hashes just as consistently as a real one:
+# e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 is sha256 of
+# nothing, and this leg greened on it once. Determinism over nothing is not
+# determinism. Prove there IS a block before proving the block is stable.
+if [ ! -s "$R/blk-1" ]; then
+  bad "every run rendered an EMPTY block — a stable hash of nothing proves nothing"
+elif [ "$distinct" -eq 1 ]; then
+  ok "$RUNS runs, one sha256 over a $(wc -c < "$R/blk-1")-byte block: $h"
+  head -1 "$R/blk-1" | sed 's/^/        chose: /'
 else
   bad "$RUNS runs produced $distinct distinct hashes — the walk is not deterministic"
   sort "$R/hashes" | uniq -c | sed 's/^/        /'

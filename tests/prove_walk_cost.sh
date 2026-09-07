@@ -188,7 +188,10 @@ if [ ! -f "$WS/.base-ast/ast.ttl" ]; then
   skip "no AST sidecar at $ASTSRC — ast=0 proves nothing without one to skip"
 else
   sz=$(stat -c%s "$WS/.base-ast/ast.ttl")
+  # "absent" and "parsed" are different facts. Reporting a missing line as a
+  # parse is the harness telling a lie about the binary it was handed.
   case "$p" in
+    "")       bad "no parses line at all, so ast= was never reported (see test 5 above)" ;;
     *"ast=0") ok "a ${sz}-byte sidecar sat at cwd and was never parsed" ;;
     *)        bad "sidecar at cwd was parsed on the prompt path: $p" ;;
   esac
