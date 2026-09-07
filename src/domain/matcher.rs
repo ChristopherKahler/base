@@ -205,6 +205,11 @@ fn components(p: &str) -> Vec<String> {
         // keep it simple: `/mnt/c/x` -> ["c:", "x"]
         out.insert(0, format!("{}:", p[5..6].to_ascii_lowercase()));
     }
+    // One spelling for a volume: `C:` and `c:` are the same drive, and a resolved
+    // trigger is compared and printed as a string (doctor, add-trigger, devmode).
+    if windows_shaped(&out) {
+        out[0] = out[0].to_ascii_lowercase();
+    }
     out
 }
 
