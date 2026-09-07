@@ -108,6 +108,7 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
             schema_version: None,
             domain_orphans: Vec::new(),
             latest_backup: None,
+            supersede_audit: crate::supersede::Audit::default(),
         };
     }
 

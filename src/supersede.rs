@@ -83,7 +83,8 @@ pub fn sparql_exclude_superseded(ns: &NamespaceConfig, var: &str) -> String {
 /// A record with two successors is likewise a defect the writer prevents; if one
 /// exists the lexicographically first is taken so two runs agree.
 pub fn resolve_head(store: &Store, ns: &NamespaceConfig, iri: &str) -> String {
-    let Ok(pred) = NamedNodeRef::new(&format!("{}{PRED_SUPERSEDED_BY}", ns.uri)) else {
+    let pred_iri = format!("{}{PRED_SUPERSEDED_BY}", ns.uri);
+    let Ok(pred) = NamedNodeRef::new(&pred_iri) else {
         return iri.to_string();
     };
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -119,7 +120,8 @@ pub fn would_cycle(store: &Store, ns: &NamespaceConfig, old_iri: &str, new_iri: 
     if old_iri == new_iri {
         return true;
     }
-    let Ok(pred) = NamedNodeRef::new(&format!("{}{PRED_SUPERSEDED_BY}", ns.uri)) else {
+    let pred_iri = format!("{}{PRED_SUPERSEDED_BY}", ns.uri);
+    let Ok(pred) = NamedNodeRef::new(&pred_iri) else {
         return false;
     };
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -173,7 +175,7 @@ pub fn link_update(ns: &NamespaceConfig, graph_iri: &str, old_iri: &str, new_iri
 /// status and no edge is a pre-0.14.0 artefact (one exists in Chris's store today),
 /// while a record with the edge and no status is a writer that half-ran, and folding
 /// them into one number would hide which of those happened.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Audit {
     /// Records carrying `supersededBy`.
     pub superseded: usize,
@@ -207,9 +209,13 @@ impl Audit {
 /// `base doctor`, which already loads the store, so it adds no parse.
 pub fn audit(store: &Store, ns: &NamespaceConfig) -> Audit {
     let mut out = Audit::default();
-    let iri = |local: &str| NamedNodeRef::new(format!("{}{local}", ns.uri)).ok();
+    // Owned first: `NamedNodeRef` borrows, so the String has to outlive the ref.
+    let mk = |local: &str| format!("{}{local}", ns.uri);
+    let (sup_by_s, status_s, note_type_s) =
+        (mk(PRED_SUPERSEDED_BY), mk("status"), mk("noteType"));
+    let iri = |s: &str| NamedNodeRef::new(s).ok();
     let (Some(sup_by), Some(status_p), Some(note_type)) =
-        (iri(PRED_SUPERSEDED_BY), iri("status"), iri("noteType"))
+        (iri(&sup_by_s), iri(&status_s), iri(&note_type_s))
     else {
         return out;
     };
@@ -288,14 +294,13 @@ pub fn audit(store: &Store, ns: &NamespaceConfig) -> Audit {
         .collect::<BTreeSet<String>>()
         .into_iter()
         .filter(|s| {
-            NamedNodeRef::new(s)
-                .ok()
-                .and_then(|n| {
-                    NamedNodeRef::new(format!("{}{PRED_SUPERSEDES}", ns.uri))
-                        .ok()
-                        .map(|p| store.quads_for_pattern(Some(n.into()), Some(p), None, None).next().is_none())
-                })
-                .unwrap_or(false)
+            let sup_s = mk(PRED_SUPERSEDES);
+            match (NamedNodeRef::new(s), NamedNodeRef::new(&sup_s)) {
+                (Ok(n), Ok(p)) => {
+                    store.quads_for_pattern(Some(n.into()), Some(p), None, None).next().is_none()
+                }
+                _ => false,
+            }
         })
         .count();
 
