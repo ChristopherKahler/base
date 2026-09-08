@@ -64,7 +64,7 @@ jobs:
       # whose test IS called and fails -- so its 0 means "nothing to fail", not
       # "cannot fail".
       #
-      # --selftest runs FIRST and is the control: sixteen arms, each of which must
+      # --selftest runs FIRST and is the control: seventeen arms, each of which must
       # land on its own exit code, and the ones that could pass for the wrong reason
       # also assert the exact test NAMES reported. A checker whose failing and
       # non-running states share an exit code is not a gate; neither is one that

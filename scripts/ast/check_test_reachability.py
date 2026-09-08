@@ -38,6 +38,9 @@ appears nowhere below -- because the next file will call it something else.
   D  no `def test_*` and no `__main__` at all                        -> FAIL
      (running the file asserts nothing)
   I  tests defined, none unreachable, at least one INDETERMINATE     -> OK
+  U  the file could not be PARSED at all                            -> FAIL
+     (its own bucket: never counted as unreachable, and the walk
+      continues so the rest of the directory is still reported)
 
 A `__main__` block that sweeps `globals()`/`vars()` for test names, or delegates
 to `pytest.main()`/`unittest.main()`, reaches every module-level test without
@@ -85,7 +88,8 @@ usage:  check_test_reachability.py [dir ...]     (default: this file's directory
         check_test_reachability.py --selftest    (control arms; run this first)
 
 exit:   0  every test file asserts something when run as `python <file>`
-        1  at least one file cannot assert anything, or has unreachable tests
+        1  at least one file cannot assert anything, has unreachable tests,
+           or could not be parsed at all
         2  VOID -- visited zero files, so this run proved NOTHING
 
 Law 23: prints the size of every set it visits; a zero visit is rc 2, never a pass.
@@ -97,7 +101,9 @@ Law 27: rc is ASSIGNED into a variable before any reporting and the process ends
         on an explicit sys.exit(rc). The last statement is never a grep or a print.
 """
 import ast
+import contextlib
 import hashlib
+import io
 import os
 import sys
 import tempfile
@@ -331,6 +337,7 @@ _SHAPE_NOTE = {
     "C": "no def test_*, __main__ drives (main()/sweeper/delegate)",
     "D": "no def test_* and no __main__ - running this file asserts NOTHING",
     "I": "def test_* all reachable or INDETERMINATE, none proven unreachable",
+    "U": "UNPARSEABLE - could not be read at all, so nothing about it is known",
 }
 
 
@@ -350,9 +357,22 @@ def audit_dirs(dirs):
         return 2
 
     bad = 0
-    total_defined = total_unreach = total_indet = 0
+    total_defined = total_unreach = total_indet = total_unparse = 0
     for p in files:
-        defined, unreachable, indeterminate, shape, has_main, generic = audit_file(p)
+        # A file that could not be READ and a file whose tests are DEAD are the
+        # two states law 24 exists to separate, so an unparseable file gets its
+        # own bucket and is never counted as unreachable. It also must not stop
+        # the walk: aborting here would print no totals at all and say nothing
+        # about the files after it, which would make this module's own law-23
+        # claim false and quietly degrade the gate to a syntax check.
+        try:
+            defined, unreachable, indeterminate, shape, has_main, generic = audit_file(p)
+        except (SyntaxError, UnicodeDecodeError) as exc:
+            total_unparse += 1
+            bad += 1
+            print("%s %-32s shape=U %s" % ("!!", os.path.basename(p), _SHAPE_NOTE["U"]))
+            print("     UNPARSEABLE, not unreachable: %s: %s" % (type(exc).__name__, exc))
+            continue
         total_defined += len(defined)
         total_unreach += len(unreachable)
         total_indet += len(indeterminate)
@@ -373,10 +393,10 @@ def audit_dirs(dirs):
             print("     add a `if __name__ == \"__main__\":` block that calls its assertions")
 
     print("totals: files=%d defined_tests=%d reachable=%d unreachable=%d "
-          "indeterminate=%d failing_files=%d  (VOID is a whole-run state: rc 2 "
-          "when zero files are visited)"
+          "indeterminate=%d unparseable_files=%d failing_files=%d  (VOID is a "
+          "whole-run state: rc 2 when zero files are visited)"
           % (len(files), total_defined, total_defined - total_unreach - total_indet,
-             total_unreach, total_indet, bad))
+             total_unreach, total_indet, total_unparse, bad))
     return 1 if bad else 0
 
 
@@ -474,6 +494,60 @@ def _arm(label, body, want_rc, want_unreachable=None, want_indeterminate=None):
         return fails
 
 
+def _arm_unparseable():
+    """Law 23 arm: ONE unparseable file must not stop the walk.
+
+    Three clauses, and the third is the one that gets dropped:
+      1. rc is 1 -- the run happened, the gate cannot certify the tree
+      2. the broken file is NAMED, and named as UNPARSEABLE rather than as
+         unreachable: a file that could not be read and a file whose tests are
+         dead are the two states law 24 exists to separate
+      3. BOTH good files are audited and counted
+
+    The second good file sorts AFTER the broken one on purpose. Without that,
+    an arm passes while proving only that the crash moved.
+    """
+    files = {
+        "test_aaa_good.py": 'def test_a():\n    assert True\n\n\nif __name__ == "__main__":\n    test_a()\n',
+        "test_bbb_broken.py": "def test_broken(:\n    this is not python\n",
+        "test_zzz_good.py": 'def test_z():\n    assert True\n\n\nif __name__ == "__main__":\n    test_z()\n',
+    }
+    print("--- control arm U  one unparseable file among two good ones (expect rc 1)")
+    with tempfile.TemporaryDirectory(prefix="reach-arm-unparse-") as d:
+        for name, body in files.items():
+            with open(os.path.join(d, name), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(body)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = audit_dirs([d])
+        out = buf.getvalue()
+    print(out, end="")
+
+    fails = 0
+    if rc != 1:
+        print("    ARM FAIL: rc=%d, expected 1" % rc)
+        fails += 1
+    if "test_bbb_broken.py" not in out or "UNPARSEABLE" not in out:
+        print("    ARM FAIL: the unparseable file was not named as UNPARSEABLE")
+        fails += 1
+    if "unreachable: test_broken" in out:
+        print("    ARM FAIL: an unparseable file was reported as UNREACHABLE")
+        fails += 1
+    # clause 3: the walk CONTINUED past the break
+    for good in ("test_aaa_good.py", "test_zzz_good.py"):
+        if good not in out:
+            print("    ARM FAIL: %s was never audited - the walk stopped" % good)
+            fails += 1
+    if "files=3 defined_tests=2" not in out:
+        print("    ARM FAIL: totals did not count 3 files and 2 defined tests")
+        fails += 1
+    if "unparseable_files=1" not in out:
+        print("    ARM FAIL: totals did not report unparseable_files=1")
+        fails += 1
+    print("arm U  one unparseable among two good rc=%d" % rc)
+    return fails
+
+
 def selftest():
     fails = 0
     fails += _arm("A  driver calls its test", _ARM_A, 0, [], [])
@@ -491,6 +565,8 @@ def selftest():
     fails += _arm("P  PRE-REGISTERED false pass: named, never called", _ARM_P, 0, [], [])
     fails += _arm("W  INDETERMINATE must not mask a FAIL", _ARM_W, 1,
                   ["test_orphan"], ["test_returned"])
+
+    fails += _arm_unparseable()
 
     # condor's armH, pinned. If the embedded bytes ever stop hashing to the
     # recorded md5 the arm fails rather than silently grading a different
