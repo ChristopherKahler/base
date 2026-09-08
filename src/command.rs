@@ -242,4 +242,82 @@ mod tests {
             "doctor must report the file the loader could not parse"
         );
     }
+
+    // ─── match_commands (#101) ──────────────────────────────────
+    //
+    // The first tests this function has ever had. They land BEFORE the
+    // positional rule so the record shows which behaviours were already true;
+    // a preservation claim made only after the change is not checkable.
+
+    /// A fixed corpus. These tests never read the operator's live
+    /// `commands.toml` — it changes underneath and would make the same table
+    /// mean something different on every machine.
+    fn corpus() -> Vec<CommandDef> {
+        ["END", "FORK", "BASE", "HANDOFF", "AUDIT", "STEELMAN", "BLUNT"]
+            .iter()
+            .map(|n| CommandDef {
+                name: (*n).into(),
+                description: String::new(),
+                rules: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn fired(prompt: &str) -> Vec<String> {
+        let c = corpus();
+        match_commands(prompt, &c).iter().map(|d| d.name.clone()).collect()
+    }
+
+    /// Every row is `(label, prompt, expected)`. The label is what a failure
+    /// prints, so a red row names itself instead of a line number.
+    ///
+    /// Law 23: the table asserts how many rows it VISITED, and a visited count
+    /// of zero fails — a loop that opened nothing is never a pass.
+    fn check(rows: &[(&str, &str, &[&str])]) {
+        let mut visited = 0usize;
+        for (label, prompt, expected) in rows {
+            let got = fired(prompt);
+            let want: Vec<String> = expected.iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(got, want, "row [{label}] on prompt {prompt:?}");
+            visited += 1;
+        }
+        assert!(visited > 0, "the table visited ZERO rows — it proves nothing");
+        assert_eq!(visited, rows.len(), "visited {visited} of {} rows", rows.len());
+    }
+
+    /// The documented forms. Each of these passes before the positional rule
+    /// and must still pass after it — that is the whole reason they are here
+    /// first.
+    #[test]
+    fn documented_forms_activate() {
+        check(&[
+            ("bare token alone — the real invocation", "*end", &["END"]),
+            ("`*name arg arg`", "*end wrap up the session", &["END"]),
+            (
+                "stacking, which the doc comment calls the point",
+                "*audit *steelman review this",
+                &["AUDIT", "STEELMAN"],
+            ),
+            ("trailing punctuation, tolerated at :123", "*blunt, and be quick", &["BLUNT"]),
+            ("case-insensitive", "*EnD", &["END"]),
+            ("deduped, first-seen order", "*end *end *audit", &["END", "AUDIT"]),
+        ]);
+    }
+
+    /// Immunity that already exists today: `strip_prefix('*')` needs the
+    /// token's FIRST byte to be `*`, so a leading delimiter makes it fail.
+    /// Pinned so a fix that narrows position cannot accidentally WIDEN the
+    /// surface at the same time.
+    #[test]
+    fn leading_delimiters_are_already_inert() {
+        check(&[
+            ("markdown code span", "`*end`", &[]),
+            ("parenthesised", "(*end)", &[]),
+            ("double-quoted", "\"*end\"", &[]),
+            ("single-quoted", "'*end'", &[]),
+            ("star mid-word", "foo*end", &[]),
+            ("bare stars, no name", "* * *", &[]),
+            ("a name that is not a command", "*notacommand", &[]),
+        ]);
+    }
 }
