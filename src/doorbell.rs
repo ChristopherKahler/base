@@ -22,10 +22,18 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+// Unix only, like the constant it types: the Windows `poke` has no write
+// timeout to spend, so importing this there is dead too.
+#[cfg(unix)]
 use std::time::Duration;
 
 /// The longest base will spend telling the app. A write must never wait on a
 /// listener that has stopped reading.
+///
+/// Unix only. `set_write_timeout` is what enforces it, and the Windows `poke`
+/// below has no equivalent for a `File` — so on Windows there is no budget to
+/// declare rather than a budget that is declared and ignored.
+#[cfg(unix)]
 const BUDGET: Duration = Duration::from_millis(50);
 
 /// Where the app publishes the socket/pipe it is listening on — one line.
@@ -88,9 +96,9 @@ fn poke(addr: &str, payload: &str) -> std::io::Result<()> {
     // away rather than blocking, because blocking would require an explicit
     // WaitNamedPipe this deliberately does not call.
     //
-    // std exposes no write timeout for a File, so the BUDGET is not enforced on
-    // this side: the app's pipe server must read promptly. Documented rather
-    // than papered over with a thread that could outlive the process.
+    // std exposes no write timeout for a File, so the unix side's write budget has
+    // no equivalent here: the app's pipe server must read promptly. Documented
+    // rather than papered over with a thread that could outlive the process.
     let mut pipe = std::fs::OpenOptions::new().write(true).open(addr)?;
     pipe.write_all(payload.as_bytes())?;
     pipe.write_all(b"\n")
