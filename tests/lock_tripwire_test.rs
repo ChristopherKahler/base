@@ -364,16 +364,16 @@ fn scan_file(
         let site = format!("{rel}::{}", f.name);
 
         // Rule 1 — the seam's write calls, exempted by FILE.
-        if let Some(tok) = first_match(&code, &WRITE_CALLS) {
-            if !allow_files.contains(rel) {
-                counts.write_call_functions_checked += 1;
-                if !locked {
-                    found.push(Finding {
-                        site: site.clone(),
-                        rule: Rule::WriteCall,
-                        token: tok.to_string(),
-                    });
-                }
+        if let Some(tok) = first_match(&code, &WRITE_CALLS)
+            && !allow_files.contains(rel)
+        {
+            counts.write_call_functions_checked += 1;
+            if !locked {
+                found.push(Finding {
+                    site: site.clone(),
+                    rule: Rule::WriteCall,
+                    token: tok.to_string(),
+                });
             }
         }
 
@@ -384,17 +384,18 @@ fn scan_file(
             .filter(|l| first_match(l, &FS_PRIMITIVES).is_some())
             .count();
         counts.fs_primitive_sites_seen += sites;
-        if sites > 0 && !locked {
-            if let Some(sig) = first_match(&code, &GRAPH_SIGNALS) {
-                counts.fs_primitive_graph_functions += 1;
-                if !allow_fns.contains(&(rel, f.name.as_str())) {
-                    counts.fs_primitive_functions_flagged += 1;
-                    found.push(Finding {
-                        site,
-                        rule: Rule::FsPrimitive,
-                        token: sig.to_string(),
-                    });
-                }
+        if sites > 0
+            && !locked
+            && let Some(sig) = first_match(&code, &GRAPH_SIGNALS)
+        {
+            counts.fs_primitive_graph_functions += 1;
+            if !allow_fns.contains(&(rel, f.name.as_str())) {
+                counts.fs_primitive_functions_flagged += 1;
+                found.push(Finding {
+                    site,
+                    rule: Rule::FsPrimitive,
+                    token: sig.to_string(),
+                });
             }
         }
     }
