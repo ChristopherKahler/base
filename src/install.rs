@@ -74,7 +74,7 @@ pub fn run(
     // Step 6: Seed system rules
     seed_system_rules(&global_dir)?;
 
-    // Step 6: Install bundled Claude skills (local checkout, else fetch)
+    // Step 7: Install bundled Claude skills (local checkout, else fetch)
     install_skills(
         &binary_path,
         &home,
@@ -83,14 +83,14 @@ pub fn run(
         SkillReport::InstallStep,
     )?;
 
-    // Step 6b: Offer the starter star commands
+    // Step 7b: Offer the starter star commands (unnumbered in the output: it prints its own ✓/⊘ line)
     install_starter_commands(&global_dir, starter)?;
 
-    // Step 7: Append BASE CLI section to ~/.claude/CLAUDE.md
+    // Step 8: Append BASE CLI section to ~/.claude/CLAUDE.md
     let claude_md = home.join(".claude").join("CLAUDE.md");
     append_claude_md(&claude_md)?;
 
-    // Step 8: Write manifest.toml
+    // Step 9: Write manifest.toml
     write_manifest(&global_dir, full)?;
 
     println!("═══════════════════════════════════════");
@@ -1068,7 +1068,7 @@ pub(crate) fn install_skills(
     report: SkillReport,
 ) -> Result<()> {
     if report == SkillReport::InstallStep {
-        print!("6. Install Claude skills ... ");
+        print!("7. Install Claude skills ... ");
     }
 
     let dest_root = installed_skills_dir(home);
@@ -1445,7 +1445,7 @@ fn install_python_deps(scripts_dest: &Path) {
 // ─── Step 6: Seed system rules ──────────────────────────────
 
 fn seed_system_rules(global_dir: &Path) -> Result<()> {
-    print!("5. Seed system rules ... ");
+    print!("6. Seed system rules ... ");
 
     let config = BaseConfig::load(global_dir);
 
@@ -1487,7 +1487,7 @@ fn seed_system_rules(global_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-// ─── Step 7: CLAUDE.md integration ──────────────────────────
+// ─── Step 8: CLAUDE.md integration ──────────────────────────
 
 /// The contract `base install` writes into `~/.claude/CLAUDE.md` and
 /// `refresh_claude_md_section` keeps current. Public so a test can hold the
@@ -1605,10 +1605,10 @@ pub(crate) fn record_base_help_after_update() {
     let _ = manifest.save();
 }
 
-// ─── Step 8: Write manifest ─────────────────────────────────
+// ─── Step 9: Write manifest ─────────────────────────────────
 
 fn write_manifest(global_dir: &Path, full: bool) -> Result<()> {
-    print!("7. Write manifest.toml ... ");
+    print!("9. Write manifest.toml ... ");
 
     let now = chrono::Local::now().to_rfc3339();
     let mut manifest = Manifest::load().unwrap_or_default();
@@ -1680,7 +1680,7 @@ fn write_manifest(global_dir: &Path, full: bool) -> Result<()> {
 }
 
 fn append_claude_md(claude_md_path: &Path) -> Result<()> {
-    print!("5. CLAUDE.md integration ... ");
+    print!("8. CLAUDE.md integration ... ");
 
     if !claude_md_path.exists() {
         std::fs::write(claude_md_path, BASE_CLI_SECTION.trim_start())?;
