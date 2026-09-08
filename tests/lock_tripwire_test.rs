@@ -35,7 +35,8 @@
 //!   here: `src/dashboard/api.rs` is one deliberate entry covering 17 sites.
 //! * **Rule 2 — filesystem primitives.** A function that puts bytes over a path
 //!   it names as a graph must hold the lock, unless the (FILE, FUNCTION) pair is
-//!   on [`ALLOW_FNS`].
+//!   on [`ALLOW_FNS`]. Measured on `610636e`: 157 primitive sites in non-test
+//!   functions, 9 of them in a function that names a graph and takes no lock.
 //!
 //! **Rule 2's exemptions are function-scoped and that is load-bearing.** A
 //! file-scoped exemption is precisely what would have let `restore_tier` ship
@@ -377,10 +378,6 @@ fn scan_file(
 
         // Rule 2 — filesystem primitives over a path the function names as a
         // graph, exempted by (FILE, FUNCTION).
-        //
-        // NOT YET ENFORCED in this commit. The candidates are measured and
-        // PRINTED so the red-first run shows the detector naming the very sites
-        // it then fails to report as findings — the widening lands next.
         let sites = code
             .lines()
             .filter(|l| first_match(l, &FS_PRIMITIVES).is_some())
@@ -391,7 +388,11 @@ fn scan_file(
                 counts.fs_primitive_graph_functions += 1;
                 if !allow_fns.contains(&(rel, f.name.as_str())) {
                     counts.fs_primitive_functions_flagged += 1;
-                    println!("  rule 2 candidate (not yet enforced): {site}  [{sig}]");
+                    found.push(Finding {
+                        site,
+                        rule: Rule::FsPrimitive,
+                        token: sig.to_string(),
+                    });
                 }
             }
         }
