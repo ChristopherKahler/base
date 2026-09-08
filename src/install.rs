@@ -942,33 +942,48 @@ fn migrate_carl(global_dir: &Path, carl_path: &Path) -> Result<()> {
 
 // ─── Step 5: Install scripts ────────────────────────────────
 
+/// The file that marks a real `scripts/ast` directory. Probed rather than the
+/// directory itself, so a half-finished copy cannot answer as a source.
+const AST_SCRIPTS_MARKER: &str = "onto_ast.py";
+
+/// Where `scripts/ast/` lives relative to a `base` binary, most specific first.
+///
+/// `cwd` is a parameter rather than read from the process because
+/// `std::env::current_dir` is process-global: a test that set it would race
+/// every other test in the same binary.
+pub fn ast_scripts_source(binary_path: &Path, cwd: &Path) -> Option<std::path::PathBuf> {
+    // `n` levels above the binary's own directory, then `scripts/ast`.
+    let up = |n: usize| -> Option<std::path::PathBuf> {
+        let mut p = binary_path.parent()?;
+        for _ in 0..n {
+            p = p.parent()?;
+        }
+        Some(p.join("scripts").join("ast"))
+    };
+
+    [
+        // Source repo, binary one level in.
+        up(1),
+        // Cargo target dir: target/<profile>/base → ../../scripts/ast.
+        up(2),
+        // Whatever directory the shell happened to be in.
+        Some(cwd.join("scripts").join("ast")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| p.join(AST_SCRIPTS_MARKER).exists())
+}
+
 fn install_scripts(binary_path: &Path, global_dir: &Path) -> Result<()> {
     print!("5. Install AST scripts ... ");
 
     let scripts_dest = global_dir.join("scripts").join("ast");
     std::fs::create_dir_all(&scripts_dest)?;
 
-    // Find scripts relative to the binary source (dev builds) or cwd
-    let source_candidates = [
-        // Same directory as source repo
-        binary_path
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("scripts").join("ast")),
-        // Cargo target dir (target/release/../scripts/ast → ../../scripts/ast)
-        binary_path
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .map(|p| p.join("scripts").join("ast")),
-        // Current working directory
-        Some(std::env::current_dir().unwrap_or_default().join("scripts").join("ast")),
-    ];
-
-    let source_dir = source_candidates
-        .iter()
-        .filter_map(|p| p.as_ref())
-        .find(|p| p.join("onto_ast.py").exists());
+    let source_dir = ast_scripts_source(
+        binary_path,
+        &std::env::current_dir().unwrap_or_default(),
+    );
 
     let Some(source_dir) = source_dir else {
         // No source near the binary (e.g. `cargo install` drops only the binary,
@@ -986,7 +1001,7 @@ fn install_scripts(binary_path: &Path, global_dir: &Path) -> Result<()> {
 
     // Copy all .py files
     let mut count = 0;
-    for entry in std::fs::read_dir(source_dir)? {
+    for entry in std::fs::read_dir(&source_dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "py") {
