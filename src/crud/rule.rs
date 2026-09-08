@@ -1,7 +1,8 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use oxigraph::sparql::QueryResults;
+use oxigraph::store::Store;
 
 use crate::config::NamespaceConfig;
 use crate::crud;
@@ -232,52 +233,124 @@ pub fn list_all_tiers(
 }
 
 /// Remove a rule by index from a domain.
-/// Remove one CLI rule from THIS tier. Returns how many went: 0 means the index
-/// is not in this tier, which is not the same as success.
+/// Remove one CLI rule from THIS tier. Returns how many went — READ BACK from the
+/// store after the write, not assumed: 0 means the index is not in this tier,
+/// which is not the same as success.
 ///
 /// #55. This ran the DELETE and returned `Ok(())` whatever matched, so
 /// `rule remove --domain X --index 10` against a tier with no rules at all
 /// printed "Rule 10 removed from domain 'X'" and exited 0. The index is
 /// tier-local and both tiers start at 0, so the number a user reads in their
 /// injected context routinely names a different rule here.
+///
+/// #112. #55 gave `cli.rs:2851-2858` an `Ok(0)` branch that exits non-zero, and
+/// this function could never reach it. The guard read `GRAPH ?g` — a wildcard over
+/// every named graph in this tier's FILE — while the DELETE was scoped to
+/// `GRAPH <graph/ws/{slug}>`, the tier's own graph. A rule sitting in a foreign
+/// named graph (460 quads of them on the reporting install) passed the guard,
+/// matched nothing in the DELETE, and the hardcoded `Ok(1)` reported success. Both
+/// sides now ask the wildcard's question, which is what six of the seven other
+/// removers in `crud` already ask, and the return value asks the store.
+///
+/// A wildcard cannot cross a tier: `lock_and_load` resolves ONE path through
+/// `find_workspace_base(cwd)`, so `GRAPH ?g` ranges over the named graphs inside
+/// one tier's own `graph.nq` and reaches nothing else.
 pub fn remove(cwd: &Path, ns: &NamespaceConfig, domain_name: &str, index: u32) -> Result<usize> {
-    // Check before deleting. `true` deliberately: a superseded rule still
-    // occupies its index in this tier, and refusing to remove one because the
-    // default view hides it would be a fresh false "no rule N" of exactly the
-    // kind #55 is about.
-    if !fetch(cwd, ns, domain_name, true)?
-        .iter()
-        .any(|(pri, _, _)| *pri == index)
-    {
-        return Ok(0);
-    }
     let p = &ns.prefix;
     let domain_slug = crud::slugify(domain_name);
     let domain_iri = crud::build_iri(ns, "domain", &domain_slug);
-    let ws_slug = crud::workspace_slug(cwd);
-    let graph = crud::workspace_graph_iri(ns, &ws_slug);
+
+    // One lock, one load, and the load is INSIDE the lock. The old guard was a
+    // second `fetch`, which parsed the whole graph through `load_and_query` before
+    // `load_and_mutate` parsed it again.
+    let (store, trig_path, _lock) = crud::lock_and_load(cwd)?;
+
+    // Counted as DISTINCT rules, which is the unit every other remover here
+    // reports (`decision::delete` returns decisions, `milestone::delete` returns
+    // cascade-deleted tasks). Superseded rules are counted deliberately: one still
+    // occupies its index, and refusing to remove it because the default view hides
+    // it would be a fresh false "no rule N" of exactly the kind #55 is about.
+    let count = format!(
+        "SELECT (COUNT(DISTINCT ?rule) AS ?n) WHERE {{\n\
+           GRAPH ?g {{\n\
+             <{domain_iri}> {p}:hasRule ?rule .\n\
+             ?rule {p}:index \"{index}\" .\n\
+           }}\n\
+         }}"
+    );
+    let before = count_rules(&store, ns, &count)?;
+    if before == 0 {
+        return Ok(0);
+    }
 
     // Match by {p}:index predicate, not constructed IRI — CLI rules live at
     // rule/{slug}/cli-N and are the only rules carrying {p}:index. Synced
     // rules are managed by editing domains.toml (sync GC handles them).
     let sparql = format!(
-        "DELETE {{\n\
-           GRAPH <{graph}> {{\n\
+        "{}\n\
+         DELETE {{\n\
+           GRAPH ?g {{\n\
              ?rule ?rp ?ro .\n\
              <{domain_iri}> {p}:hasRule ?rule .\n\
            }}\n\
          }}\n\
          WHERE {{\n\
-           GRAPH <{graph}> {{\n\
+           GRAPH ?g {{\n\
              <{domain_iri}> {p}:hasRule ?rule .\n\
              ?rule {p}:index \"{index}\" ;\n\
                ?rp ?ro .\n\
            }}\n\
-         }}"
+         }}",
+        crud::prefixes(ns)
     );
 
-    crud::load_and_mutate(cwd, ns, &sparql)?;
-    Ok(1)
+    // Wide, not Target: `changelog::derive_graph_iri` cannot name a target for a
+    // `GRAPH ?g` update, so Target would record a MultiGraph delta GAP where a
+    // retraction owes a delta. `note::remove` takes Wide for the same statement
+    // shape, and `store.rs` documents the scope for exactly this case.
+    crate::store::update_and_write(
+        &store,
+        &trig_path,
+        &sparql,
+        crate::store::Scope::Wide,
+        crate::store::Intent::Knowledge,
+    )?;
+
+    // READ BACK, which is the only thing that separates a repaired write from a
+    // silenced one. `update_and_write` applies the update to THIS store and only
+    // then serialises it to `trig_path`, propagating any failure — so on `Ok` the
+    // file on disk was written FROM the store being re-queried here, and the two
+    // cannot disagree. A count taken before the write, or assumed from the guard,
+    // would report exactly what #112 reported.
+    let after = count_rules(&store, ns, &count)?;
+    if after > before {
+        anyhow::bail!(
+            "removing rule {index} from domain '{domain_name}' left MORE rules at that \
+             index than it started with ({before} before, {after} after)"
+        );
+    }
+    Ok(before - after)
+}
+
+/// How many distinct rules a counting query binds, asked of a store already loaded.
+///
+/// Split out because `remove` asks it twice with the same text — once before the
+/// write and once after — and the two readings are only comparable if they are the
+/// same question put to the same store.
+fn count_rules(store: &Store, ns: &NamespaceConfig, sparql: &str) -> Result<usize> {
+    let full = format!("{}\n{}", crud::prefixes(ns), sparql);
+    let QueryResults::Solutions(mut solutions) = crate::store::query(store, &full)? else {
+        anyhow::bail!("rule count query did not return solutions: {sparql}");
+    };
+    let Some(row) = solutions.next().transpose()? else {
+        return Ok(0);
+    };
+    let Some(term) = row.get("n") else { return Ok(0) };
+    let text = crud::term_display(term.into());
+    // Parsed, never defaulted: a count that failed to parse is not a count of zero,
+    // and zero is the value the caller treats as "no such rule".
+    text.parse()
+        .with_context(|| format!("rule count returned an unreadable value: {text:?}"))
 }
 
 /// Find the next available rule index for a domain.
