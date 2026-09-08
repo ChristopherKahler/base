@@ -294,3 +294,101 @@ jobs:
           # status silently, which is the worse of the two polarities. The
           # arms' rcs are the evidence and they live in arm_*.rc.
           exit 0
+
+  # ==========================================================================
+  # TEMPORARY. REMOVED BEFORE G2. Do not merge with it.
+  #
+  # R1 EXTENSION. The first experiment measured the release profile against ONE
+  # of the four targets #129 covers (hook_log_tier_test). R1's action gates only
+  # the 2 ast_automap tests and moves the Windows job to --release, which leaves
+  # 14 tests ungated on one target's evidence. If the other three still overflow
+  # in release, that job's first full run turns main RED for every later PR.
+  #
+  # Deferring a measurement onto the trunk is not measuring. So each of the four
+  # targets is measured here, and each gets its OWN debug control -- "debug
+  # overflows" is established only for hook_log_tier_test, and assuming it for
+  # the rest would be the same unmeasured leap in the opposite direction.
+  #
+  # The job-level verdict is the STRICTEST of the four, never a majority.
+  # ==========================================================================
+  windows-release-all-targets-EXPERIMENT:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build both profiles once, so the arms differ only in profile
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cargo build --bin base > build_debug.log 2>&1;    echo "$?" > build_debug.rc
+          cargo build --release --bin base > build_rel.log 2>&1; echo "$?" > build_rel.rc
+          set -e
+          echo "BUILD_DEBUG_RC=$(cat build_debug.rc)  BUILD_RELEASE_RC=$(cat build_rel.rc)"
+          ls -l target/debug/base.exe   2>&1 || echo "NO DEBUG BINARY"
+          ls -l target/release/base.exe 2>&1 || echo "NO RELEASE BINARY"
+
+      - name: Four targets x two profiles, rc captured to files before any reporting
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          for t in hook_log_tier_test hook_output_channel_test outside_workspace_test served_count_coach_test; do
+            cargo test --test "$t" -- --nocapture > "dbg_$t.log" 2>&1
+            echo "$?" > "dbg_$t.rc"
+            cargo test --release --test "$t" -- --nocapture > "rel_$t.log" 2>&1
+            echo "$?" > "rel_$t.rc"
+            echo "TARGET=$t DEBUG_RC=$(cat dbg_$t.rc) RELEASE_RC=$(cat rel_$t.rc)"
+          done
+          set -e
+
+      - name: PER-TARGET VERDICT (same pre-registered ladder, applied four times)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          ovf_of () { grep -c -e "has overflowed its stack" -e "1073741571" "$1" 2>/dev/null || true; }
+          ran_of () { awk '/^test result:/ { for (i=1;i<=NF;i++) { if ($i=="passed;") p+=$(i-1); if ($i=="failed;") f+=$(i-1) } } END { print (p+0)+(f+0) }' "$1"; }
+
+          worst=R1
+          rank () { case "$1" in V1) echo 5;; V2) echo 4;; R2) echo 3;; R3) echo 2;; R1) echo 1;; esac; }
+
+          echo "=================== PER-TARGET FACTS ==================="
+          for t in hook_log_tier_test hook_output_channel_test outside_workspace_test served_count_coach_test; do
+            tr -d '\r' < "dbg_$t.log" > "dbg_$t.clean" 2>/dev/null || : > "dbg_$t.clean"
+            tr -d '\r' < "rel_$t.log" > "rel_$t.clean" 2>/dev/null || : > "rel_$t.clean"
+            d_rc=$(cat "dbg_$t.rc" 2>/dev/null || echo NO_RC)
+            r_rc=$(cat "rel_$t.rc" 2>/dev/null || echo NO_RC)
+            d_ovf=$(ovf_of "dbg_$t.clean"); r_ovf=$(ovf_of "rel_$t.clean")
+            d_ran=$(ran_of "dbg_$t.clean"); r_ran=$(ran_of "rel_$t.clean")
+
+            if [ "$d_ran" = "0" ] || [ "$r_ran" = "0" ]; then b=V1
+            elif [ "$d_ovf" = "0" ];                        then b=V2
+            elif [ "$r_ovf" != "0" ];                        then b=R2
+            elif [ "$r_rc" = "0" ];                          then b=R1
+            else                                                  b=R3
+            fi
+            echo "TARGET_VERDICT $t = $b"
+            echo "   debug   rc=$d_rc ran=$d_ran ovf=$d_ovf"
+            echo "   release rc=$r_rc ran=$r_ran ovf=$r_ovf"
+            grep "^test result:" "rel_$t.clean" | sed 's/^/   release result: /' || echo "   release result: (none)"
+            grep -e "panicked" -e "left:" -e "right:" "rel_$t.clean" | head -6 | sed 's/^/   release fail: /' || true
+            if [ "$(rank $b)" -gt "$(rank $worst)" ]; then worst=$b; fi
+          done
+
+          echo "=================== JOB VERDICT ==================="
+          echo "STRICTEST_ACROSS_FOUR_TARGETS=$worst"
+          if [ "$worst" = "R1" ]; then
+            echo "All four targets read R1. The release profile is clean on every target"
+            echo "the R1 action decides the fate of. Merging on it is now a measurement."
+          else
+            echo "NOT R1 across the set. One or more targets denies it, so the R1 action"
+            echo "(gate only 2, move the job to --release) MUST NOT be taken."
+          fi
+          echo "This job is TEMPORARY and is removed before G2."
+          exit 0
