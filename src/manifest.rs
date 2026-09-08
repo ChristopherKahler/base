@@ -134,11 +134,14 @@ pub fn detect_component(name: &str) -> Option<ComponentEntry> {
 
     match name {
         "base" => {
-            let bin = home.join(".local").join("bin").join("base");
-            if bin.exists() {
+            let bin_dir = home.join(".local").join("bin");
+            let found = crate::home::base_binary_names()
+                .iter()
+                .any(|n| bin_dir.join(n).exists());
+            if found {
                 Some(ComponentEntry {
                     version: env!("CARGO_PKG_VERSION").to_string(),
-                    path: "~/.local/bin/base".to_string(),
+                    path: crate::home::base_binary_display(),
                     installed_at: now,
                     content_hash: String::new(),
                 })
@@ -474,7 +477,7 @@ mod tests {
             "base".to_string(),
             ComponentEntry {
                 version: "0.1.0".to_string(),
-                path: "~/.local/bin/base".to_string(),
+                path: crate::home::base_binary_display(),
                 installed_at: "2026-06-03T15:00:00-05:00".to_string(),
                 content_hash: String::new(),
             },
@@ -600,7 +603,7 @@ token = "some-activation-key"
             "base".to_string(),
             ComponentEntry {
                 version: version.to_string(),
-                path: "~/.local/bin/base".to_string(),
+                path: crate::home::base_binary_display(),
                 installed_at: "2026-06-03T15:00:00-05:00".to_string(),
                 content_hash: String::new(),
             },
@@ -748,7 +751,7 @@ dismissed_until = ""
     fn empty_content_hash_is_not_serialized() {
         let e = ComponentEntry {
             version: "0.13.2".to_string(),
-            path: "~/.local/bin/base".to_string(),
+            path: crate::home::base_binary_display(),
             installed_at: "now".to_string(),
             content_hash: String::new(),
         };

@@ -130,3 +130,111 @@ fn no_hand_built_sparql_change_outside_the_seam() {
         offenders.join("\n  ")
     );
 }
+
+/// #91: the installed binary's name must come from one seam, never a literal.
+///
+/// Red on every platform, not only Windows: it greps the source rather than
+/// asking what this build resolves to, so Linux CI catches a drifting site the
+/// same way a Windows run would. That is the whole reason it is a grep and not
+/// a behavioural test - `EXE_SUFFIX` is `""` on Linux, so a behavioural test
+/// passes on CI while the Windows install stays broken.
+#[test]
+fn no_literal_base_binary_path_outside_the_seam() {
+    const SANCTIONED: &str = "home.rs";
+    let mut files = Vec::new();
+    rust_files(Path::new("src"), &mut files);
+
+    let mut offenders = Vec::new();
+    let mut visited = 0usize;
+    for f in &files {
+        if f.file_name().is_some_and(|n| n == SANCTIONED) {
+            continue;
+        }
+        // Scoped exemptions: only where the literal IS the thing under test.
+        // Named line by line, never a file-level or cfg(test)-level allow, so
+        // any other fixture spelling the name by hand still fails — a fixture
+        // carrying the old spelling is where the next drift starts.
+        const EXEMPT: &[(&str, &str, &str)] = &[
+            (
+                "update/mod.rs",
+                "let plain = tmp.path().join(\"base\");",
+                "refresh_sibling's test seeds the extensionless sibling on purpose; \
+                 the literal is the case being asserted",
+            ),
+            (
+                "manifest.rs",
+                "path = \"~/.local/bin/base\"",
+                "a TOML fixture parsed as input - it must keep the spelling real \
+                 manifests on disk already carry",
+            ),
+        ];
+
+        let f_name = f.to_string_lossy().replace('\\', "/");
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        // Counted AFTER the read succeeds, so it is files actually opened rather
+        // than files merely listed. A path that failed to read proved nothing.
+        visited += 1;
+        for (i, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            if EXEMPT
+                .iter()
+                .any(|(file, text, _why)| f_name.ends_with(file) && line.trim() == *text)
+            {
+                continue;
+            }
+            let literal_string = line.contains("\"~/.local/bin/base\"");
+            let literal_join = line.contains(".join(\"base\")");
+            // The name's OTHER spelling. A `cfg!(windows)` arm choosing between
+            // the two literals is `base_binary_name()` rewritten by hand, and
+            // the two checks above cannot see it: neither literal appears in the
+            // form they look for. That blind spot is where the drift restarted
+            // after this guard's first pass - five live sites in update/mod.rs,
+            // found by reading, not by the guard.
+            //
+            // Matched on ONE line, which is the ternary form. A multi-line
+            // `if cfg!(windows) {` block is left alone on purpose: those guard
+            // genuine platform behaviour rather than construct a name, and
+            // `install_dest_is_platform_correct` asserts the seam's output
+            // against the literal, which is the case under test.
+            let cfg_name_arm = line.contains("cfg!(windows)")
+                && line.contains("\"base.exe\"")
+                && line.contains("\"base\"");
+            if literal_string || literal_join || cfg_name_arm {
+                offenders.push(format!("{}:{}", f.display(), i + 1));
+            }
+        }
+    }
+
+    // A loop that asserts over a set prints the size of the set it actually
+    // visited, and a visited count of ZERO is a failure meaning "this proved
+    // nothing" - never a pass. Without this the guard goes green having opened no
+    // files at all: `rust_files` returns an empty vec if `src` is not where the
+    // test is standing, every `continue` is taken, `offenders` stays empty, and
+    // `is_empty()` is true. That is a pass built on zero evidence, and it is the
+    // shape that produced a false PASS on an isolation tripwire earlier in this
+    // release. The count goes to stdout so `cargo test -- --nocapture` shows the
+    // number rather than leaving it to a side measurement.
+    println!("guard: scanned {visited} rust file(s) under src/, excluding {SANCTIONED}");
+    assert!(
+        visited > 0,
+        "the guard opened ZERO files under src/ and therefore proved NOTHING. \
+         Either `rust_files` stopped walking or the test is not standing where \
+         `src/` is. A pass here would be a pass over an empty set."
+    );
+
+    assert!(
+        offenders.is_empty(),
+        "the installed binary must be named through crate::home::base_binary_name() \
+         (or base_binary_path()/base_binary_display()), never a literal and never a \
+         hand-written `if cfg!(windows) {{ \"base.exe\" }} else {{ \"base\" }}` arm - the \
+         literal drops the Windows .exe suffix and produces a file Windows cannot run \
+         by name, and the cfg arm is the same seam rewritten where this guard used to \
+         be unable to see it (#91). Offending sites:\n  {}",
+        offenders.join("\n  ")
+    );
+}

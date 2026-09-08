@@ -153,8 +153,8 @@ fn extract_and_locate(archive: &Path, dest_dir: &Path) -> Result<PathBuf> {
 
 /// Bounded recursive search for a file named `base` (or `base.exe`).
 fn find_base_binary(dir: &Path, depth: u32) -> Option<PathBuf> {
-    let target = if cfg!(windows) { "base.exe" } else { "base" };
-    let direct = dir.join(target);
+    let target = crate::home::base_binary_name();
+    let direct = dir.join(&target);
     if direct.is_file() {
         return Some(direct);
     }
@@ -297,10 +297,7 @@ fn binary_version(bin: &Path) -> Option<String> {
 
 /// Canonical install location: `~/.local/bin/base` (`base.exe` on Windows).
 fn install_dest() -> Result<PathBuf> {
-    let name = if cfg!(windows) { "base.exe" } else { "base" };
-    crate::home::home_root()
-        .map(|h| h.join(".local").join("bin").join(name))
-        .context("cannot resolve home directory")
+    crate::home::base_binary_path().context("cannot resolve home directory")
 }
 
 /// Atomic swap: stage beside the target, set the exec bit, rename over it.
@@ -604,7 +601,7 @@ mod tests {
     fn atomic_swap_replaces_an_existing_dest_and_leaves_no_staging_file() {
         let tmp = tempfile::tempdir().unwrap();
         let new_bin = tmp.path().join("fresh");
-        let dest = tmp.path().join("bin").join(if cfg!(windows) { "base.exe" } else { "base" });
+        let dest = tmp.path().join("bin").join(crate::home::base_binary_name());
         std::fs::write(&new_bin, b"new").unwrap();
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         std::fs::write(&dest, b"old").unwrap();
@@ -691,7 +688,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("base-0.1.0").join("bin");
         std::fs::create_dir_all(&nested).unwrap();
-        let name = if cfg!(windows) { "base.exe" } else { "base" };
+        let name = crate::home::base_binary_name();
         std::fs::write(nested.join(name), b"stub").unwrap();
         assert!(find_base_binary(tmp.path(), 3).is_some());
     }
@@ -701,7 +698,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let deep = tmp.path().join("a").join("b").join("c").join("d");
         std::fs::create_dir_all(&deep).unwrap();
-        let name = if cfg!(windows) { "base.exe" } else { "base" };
+        let name = crate::home::base_binary_name();
         std::fs::write(deep.join(name), b"stub").unwrap();
         assert!(find_base_binary(tmp.path(), 2).is_none());
     }

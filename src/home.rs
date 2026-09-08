@@ -185,6 +185,51 @@ fn test_root() -> PathBuf {
     .clone()
 }
 
+/// The installed binary's file name, carrying the platform executable suffix.
+///
+/// `base` on Unix, `base.exe` on Windows. Every site that names the installed
+/// binary resolves through here. A `cfg(windows)` arm at each call site is what
+/// produced #91: `uninstall` and `update` grew one, `install` and `manifest`
+/// did not, and the two halves drifted for five releases. One expression cannot
+/// drift, and `tests/guard_test.rs` keeps a sixth site from appearing.
+pub fn base_binary_name() -> String {
+    format!("base{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Every name the installed binary is expected to carry, primary first.
+///
+/// Windows keeps **two**: `base.exe`, which PATHEXT lets cmd, PowerShell and the
+/// hooks resolve, and an extensionless `base` that Git Bash resolves. That pair
+/// is deliberate — `update::refresh_sibling` exists to keep the second in step
+/// with the first — but `refresh_sibling` only refreshes a sibling that already
+/// exists and never creates one, so a clean install that writes a single name
+/// leaves the other permanently missing. That was #91. Install writes all of
+/// these; uninstall removes all of them.
+pub fn base_binary_names() -> Vec<String> {
+    let primary = base_binary_name();
+    if std::env::consts::EXE_SUFFIX.is_empty() {
+        vec![primary]
+    } else {
+        vec![primary, "base".to_string()]
+    }
+}
+
+/// The canonical installed path: `~/.local/bin/base`, `base.exe` on Windows.
+pub fn base_binary_path() -> Option<PathBuf> {
+    Some(home_root()?.join(".local").join("bin").join(base_binary_name()))
+}
+
+/// The same path as the `~`-rooted string the manifest records.
+///
+/// The manifest stores a display path rather than an absolute one, and it must
+/// name the file that actually exists: `manifest.rs` documents that a stale
+/// `[components.base] path` leaves the install pinned at the old version
+/// indefinitely, so a Windows manifest pointing at an extensionless `base` is
+/// the silent half of #91.
+pub fn base_binary_display() -> String {
+    format!("~/.local/bin/{}", base_binary_name())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
