@@ -250,10 +250,22 @@ fn the_rule_in_this_tiers_own_graph_still_goes_and_nothing_else_does() {
     assert_eq!(other.len(), 1, "another domain's rules were collateral: {other:?}");
 }
 
-/// CONTROL, passes before the fix. #55's zero path must still be REACHED after the
-/// change — it is the branch `cli.rs:2851-2858` prints the tier-scoped error and
-/// calls `std::process::exit(1)` on. A fix that returned a non-zero count
+/// CONTROL. #55's zero path must still be REACHED — it is the branch
+/// `cli.rs:2851-2858` prints the tier-scoped error and calls
+/// `std::process::exit(1)` on. A `remove` that returned a non-zero count
 /// unconditionally passes every leg above and fails this one.
+///
+/// It is a PAIR, and the second half is the point. On its own, "asking for index
+/// 99 returns 0" is satisfied just as well by a counting query that finds nothing
+/// for ANY index — a domain IRI built from a broken slug path resolves to no
+/// rules at all, `remove` returns 0 every time, and this leg passes having proven
+/// nothing about index 99. So the same fixture, through the same code path, is
+/// then asked for an index that IS present and must answer non-zero.
+///
+/// tern found this against its own leg while #140 was frozen for review, one law
+/// after raven found the same shape in osprey's `--skip-hooks` control, where a
+/// fake home missing `~/.claude` short-circuited the seam and the control passed
+/// without ever testing the flag. A leg that cannot fail is not a control.
 #[test]
 fn an_index_in_no_graph_at_all_reports_zero_and_writes_nothing() {
     let tmp = workspace();
@@ -275,5 +287,16 @@ fn an_index_in_no_graph_at_all_reports_zero_and_writes_nothing() {
         "a refused removal wrote to the graph: {} lines before, {} after",
         before.len(),
         after.len()
+    );
+
+    // The positive half. Same tier, same fixture, same function — an index that
+    // IS there must come back non-zero, or the 0 above was a blind query rather
+    // than an answer about index 99.
+    let present = crud::rule::remove(tmp.path(), &ns(), "demoapp", 0).unwrap();
+    assert_eq!(
+        present, 1,
+        "the same code path found nothing at index 0 either, so the 0 reported for \
+         index 99 proved nothing: this leg cannot tell an absent index from a \
+         counting query that never sees anything"
     );
 }
