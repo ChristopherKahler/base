@@ -44,7 +44,10 @@ pub fn handle(
 
     let file_paths = extract_file_paths(event);
     if file_paths.is_empty() {
-        return Ok(data);
+        // `output` may already hold a move nudge from the Bash arm above — a `mv` carries
+        // no file_path, so this is the ONLY return that case ever reaches. Returning an
+        // empty string here would compile and silently drop it.
+        return Ok((data, output));
     }
 
     // ─── lastActive timestamp update (existing behavior) ─────
