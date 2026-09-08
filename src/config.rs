@@ -134,17 +134,70 @@ pub fn resolve_ast_ttl(target: &Path) -> PathBuf {
     }
 }
 
+/// Pure: may a read that started at `start` take the map sitting at `dir`?
+///
+/// Home is both a map holder and the usual workspace, so from anywhere beneath
+/// it an unbounded walk lands there and answers with the operator's whole
+/// profile. [`resolve_ast_ttl`] refuses exactly this on the WRITE side; the read
+/// side had no equivalent, which is what let `base ast query` answer a question
+/// about the code in front of you with a different project's code — silently,
+/// at exit 0. Measured 2026-09-08 from a clone with no map of its own: 13 rows
+/// of an unrelated tool, and `--contains` on a symbol defined in that very tree
+/// reported no match.
+///
+/// Home stays valid when it IS the start directory, so an intentional
+/// workspace-wide map still answers for someone standing in it.
+///
+/// Deliberately takes `home` as a parameter rather than calling
+/// [`crate::home::home_root`]: that function resolves differently in a test
+/// binary than in the shipped one (`home.rs:41-44` is `cfg`-gated), so a rule
+/// that consulted it could not be tested for what it actually does in
+/// production. A pure function has no feature-gated input.
+pub fn ast_map_admissible(start: &Path, dir: &Path, home: Option<&Path>) -> bool {
+    home != Some(dir) || dir == start
+}
+
 /// Find the AST map to READ from `cwd`, walking up: prefers `<root>/.base-ast/ast.ttl`,
 /// falling back to a legacy `<root>/.base/ast.ttl` (the pre-sidecar workspace map).
+///
+/// The walk is BOUNDED, by the same two rules the write path already applies:
+/// it climbs no further than the app root ([`ast_app_root`]), and it never
+/// adopts home's map from below ([`ast_map_admissible`]). Walking up *within* an
+/// app is kept — a query from `src/crud/` must still answer from the repo's map.
+///
+/// The app-root stop is evaluated OUTSIDE the `isolation-guard` block on
+/// purpose. That guard exists only in test builds, so a boundary that depended
+/// on it would be a boundary the shipped binary does not have, and a green test
+/// would say nothing about production.
 pub fn find_ast_ttl(cwd: &Path) -> Option<PathBuf> {
-    walk_up(cwd, |dir| {
-        let sidecar = dir.join(".base-ast").join("ast.ttl");
-        if sidecar.is_file() {
-            return Some(sidecar);
+    let app_root = ast_app_root(cwd);
+    let home = crate::home::home_root();
+    let mut dir = cwd.to_path_buf();
+    loop {
+        #[cfg(feature = "isolation-guard")]
+        if !crate::home::within_sandbox(&dir) {
+            return None;
         }
-        let legacy = dir.join(".base").join("ast.ttl");
-        legacy.is_file().then_some(legacy)
-    })
+        if ast_map_admissible(cwd, &dir, home.as_deref()) {
+            let sidecar = dir.join(".base-ast").join("ast.ttl");
+            if sidecar.is_file() {
+                return Some(sidecar);
+            }
+            let legacy = dir.join(".base").join("ast.ttl");
+            if legacy.is_file() {
+                return Some(legacy);
+            }
+        }
+        // Stop AT the app root. A read never crosses into another app's map:
+        // that is the difference between this and #37, which is about letting a
+        // read span several maps DELIBERATELY.
+        if app_root.as_deref() == Some(dir.as_path()) {
+            return None;
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
 }
 
 // ─── Namespace Config ────────────────────────────────────────

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use oxigraph::sparql::QueryResults;
@@ -9,7 +9,7 @@ use crate::crud;
 /// Query AST entities by label (case-insensitive substring match).
 /// Returns: file, line, type, calls, called-by for each match.
 pub fn contains(cwd: &Path, ns: &NamespaceConfig, name: &str) -> Result<()> {
-    let store = load_ast_store(cwd)?;
+    let store = load_ast_store_reporting(cwd)?;
     let pfx = ast_prefixes(ns);
     let name_lower = crud::escape_sparql_literal(&name.to_lowercase());
 
@@ -76,7 +76,7 @@ pub fn contains(cwd: &Path, ns: &NamespaceConfig, name: &str) -> Result<()> {
 
 /// List all entities in a source file with their relationships.
 pub fn file(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Result<()> {
-    let store = load_ast_store(cwd)?;
+    let store = load_ast_store_reporting(cwd)?;
     let pfx = ast_prefixes(ns);
 
     // Normalize: accept "src/cli.rs" or "cli.rs" — match by CONTAINS on sourceFile.
@@ -156,7 +156,7 @@ pub fn file(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Result<()> {
 
 /// Find all callers of a named entity.
 pub fn calls(cwd: &Path, ns: &NamespaceConfig, name: &str) -> Result<()> {
-    let store = load_ast_store(cwd)?;
+    let store = load_ast_store_reporting(cwd)?;
     let pfx = ast_prefixes(ns);
     let name_lower = crud::escape_sparql_literal(&name.to_lowercase());
 
@@ -217,7 +217,7 @@ pub fn calls(cwd: &Path, ns: &NamespaceConfig, name: &str) -> Result<()> {
 
 /// Find all files that import from a given file/module.
 pub fn imports(cwd: &Path, ns: &NamespaceConfig, file_path: &str) -> Result<()> {
-    let store = load_ast_store(cwd)?;
+    let store = load_ast_store_reporting(cwd)?;
     let pfx = ast_prefixes(ns);
     let file_lower = crud::normalize_path_sep(file_path)
         .trim_start_matches("src/")
@@ -601,11 +601,42 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
     Ok(())
 }
 
-fn load_ast_store(cwd: &Path) -> Result<oxigraph::store::Store> {
-    let ast_path = crate::config::find_ast_ttl(cwd)
-        .ok_or_else(|| anyhow::anyhow!("No ast.ttl found. Run `base sync --ast` first."))?;
+/// The map that answers for `cwd`, and where it came from.
+///
+/// The error names the directory. "No ast.ttl found" described the tool's own
+/// bookkeeping; the reader needs to know WHICH directory has no map, because
+/// the answer to that is what tells them whether to map it or to stand
+/// somewhere else.
+fn resolve_ast_store(cwd: &Path) -> Result<(oxigraph::store::Store, PathBuf)> {
+    let ast_path = crate::config::find_ast_ttl(cwd).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No code map covers {}. Run `base sync --ast --target {}` to map it.",
+            cwd.display(),
+            cwd.display()
+        )
+    })?;
     let store = oxigraph::store::Store::new()?;
     crate::store::load_turtle_into(&store, &ast_path)?;
+    Ok((store, ast_path))
+}
+
+fn load_ast_store(cwd: &Path) -> Result<oxigraph::store::Store> {
+    Ok(resolve_ast_store(cwd)?.0)
+}
+
+/// As [`load_ast_store`], and says which map answered when it is not `cwd`'s own.
+///
+/// Climbing to the app root is intended — a query from `src/crud/` answers from
+/// the repo's map — but it must not be SILENT, or a reader cannot tell whose
+/// code they are being shown. On stderr, so a caller parsing rows from stdout is
+/// unaffected. The banner is provenance for the legitimate case; it is not what
+/// makes the resolution correct, which is [`crate::config::find_ast_ttl`]'s
+/// boundary.
+fn load_ast_store_reporting(cwd: &Path) -> Result<oxigraph::store::Store> {
+    let (store, ast_path) = resolve_ast_store(cwd)?;
+    if ast_path.parent().and_then(Path::parent) != Some(cwd) {
+        eprintln!("map: {}", ast_path.display());
+    }
     Ok(store)
 }
 
@@ -776,7 +807,7 @@ fn relation_key(name: &str) -> String {
 
 /// Query one relation in both directions for a named entity.
 pub fn relation(cwd: &Path, ns: &NamespaceConfig, rel: &str, name: &str) -> Result<()> {
-    let store = load_ast_store(cwd)?;
+    let store = load_ast_store_reporting(cwd)?;
     let pfx = ast_prefixes(ns);
 
     let present = map_relations(&store, ns);
