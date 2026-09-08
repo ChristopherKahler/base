@@ -238,11 +238,15 @@ def _build_role_map(
 
 
 #: Relations where the TARGET physically lives inside the SOURCE's file.
-#: `defines` is here on the evidence of its eight `add_edge` sites in
-#: `extractor.py` — four file→symbol (`:2798`, `:2812`, `:2881`, `:3310`) and
-#: four scope→symbol (`:1699`, `:3329`, `:3341`, `:3355`) — every one of them
-#: containment. It was absent before #82 and cost the map every C++ struct
-#: field: one hop from a resolved parent, dropped on the relation's NAME.
+#: `defines` is here on the evidence of ALL SIXTEEN of its emission sites in
+#: `extractor.py` — every one file→symbol or scope→symbol, so every one
+#: containment. No line numbers: an earlier draft of this comment listed eight
+#: of them and the list was both wrong and the reason it stayed wrong, because a
+#: grep truncated at eight looks exactly like an answer. Count them from a parse
+#: of `extractor.py`, not from a literal search — three `add_edge` calls and six
+#: dict-appends pass a relation that is not a literal at all.
+#: `defines` was absent before #82 and cost the map every C++ struct field: one
+#: hop from a resolved parent, dropped on the relation's NAME.
 _CONTAINS_DOWNWARD: frozenset[str] = frozenset({"contains", "method", "defines"})
 
 #: The one relation that runs the other way: a rationale node takes the file of
@@ -287,7 +291,14 @@ def _build_file_membership(edges: list[dict], file_nodes: set[str]) -> dict[str,
             up.setdefault(edge["target"], []).append(edge["source"])
 
     membership: dict[str, str] = {}
-    queue: deque[str] = deque(file_nodes)
+    # SORTED, and that is load-bearing. `file_nodes` is a set, and iteration
+    # order over a set of strings is a function of PYTHONHASHSEED, which CPython
+    # randomises per process. A node reachable from two file nodes is claimed by
+    # whichever seed the walk reaches first, so an unsorted seed makes the map
+    # differ between runs of identical input. The three passes this replaced
+    # iterated `edges` — a list — and were deterministic; sorting is what keeps
+    # that property while fixing the edge-order dependence.
+    queue: deque[str] = deque(sorted(file_nodes))
     while queue:
         nid = queue.popleft()
         owner = nid if nid in file_nodes else membership[nid]

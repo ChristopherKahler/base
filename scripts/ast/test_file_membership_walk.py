@@ -251,6 +251,56 @@ def test_membership_is_independent_of_edge_order():
     )
 
 
+CONTENDED = """
+import sys, json
+sys.path.insert(0, %r)
+from ttl_serializer import _build_file_membership
+edges = [
+    {"source": "alpha.md", "target": "shared", "relation": "contains"},
+    {"source": "beta.md",  "target": "shared", "relation": "contains"},
+]
+print(json.dumps(_build_file_membership(edges, {"alpha.md", "beta.md"})))
+"""
+
+
+def test_membership_is_independent_of_the_interpreters_hash_seed():
+    """Two file nodes contain the same node. Which one owns it must not depend
+    on the process.
+
+    The walk is seeded from `file_nodes`, which `_identify_file_nodes` returns as
+    a `set[str]`. Iteration order over a set of strings is a function of
+    PYTHONHASHSEED, which CPython randomises per process — so first-writer-wins
+    over that seed order picks a different owner on different runs of the SAME
+    input. The three-pass implementation this replaced iterated `edges`, a LIST,
+    and was deterministic; the rewrite fixed edge-order dependence and
+    introduced seed-order dependence in the same motion.
+
+    `test_membership_is_independent_of_edge_order` cannot see this: its file set
+    is `{f.md, other.md}` and `other.md` carries only a `calls` edge, so the two
+    seeds never contend for the same node.
+
+    Run in SUBPROCESSES because PYTHONHASHSEED is read once at interpreter
+    start-up: setting it in this process would change nothing.
+    """
+    seeds, results = ("0", "1", "42", "12345"), {}
+    for seed in seeds:
+        env = os.environ.copy()
+        env["PYTHONHASHSEED"] = seed
+        proc = subprocess.run(
+            [sys.executable, "-c", CONTENDED % str(HERE)],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+        assert proc.returncode == 0, f"seed {seed} failed:\n{proc.stderr}"
+        results[seed] = proc.stdout.strip()
+
+    distinct = set(results.values())
+    assert len(distinct) == 1, (
+        "membership depends on the interpreter's hash seed — a node reachable "
+        "from two file nodes changes owner between runs of identical input:\n  "
+        + "\n  ".join(f"PYTHONHASHSEED={s}: {r}" for s, r in results.items())
+    )
+
+
 def test_rationale_inherits_from_its_target_not_the_other_way():
     """`rationale_for` runs the OPPOSITE way to the other three, in both arms.
 
