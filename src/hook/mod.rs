@@ -164,8 +164,8 @@ fn run_event(
             Ok(HookEventData { session_id, ..Default::default() })
         }
         "pre-tool-use" => {
-            let (mut data, mut context) = pre_tool_use::handle(&config, &cwd, &stdin_json)?;
-            let (tool_name, file_path) = extract_tool_context(&stdin_json);
+            let (mut data, mut context) = pre_tool_use::handle(&config, &cwd, stdin_json)?;
+            let (tool_name, file_path) = extract_tool_context(stdin_json);
             data.tool_name = tool_name;
             data.file_path = file_path;
             // Mid-turn task-relay scan: a pending task or ping fires loud
@@ -223,7 +223,7 @@ fn run_event(
             Ok(data)
         }
         "user-prompt-submit" => {
-            let mut data = user_prompt_submit::handle(&config, &cwd, &stdin_json)?;
+            let mut data = user_prompt_submit::handle(&config, &cwd, stdin_json)?;
             // Relay inbox push for messages that arrived mid-session. Runs in
             // the dispatcher (not the handler) so star-command and empty-prompt
             // early returns can't swallow a pending delivery. Silent when
