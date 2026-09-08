@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""File membership is transitive over containment, and ONLY over containment (#82).
+
+`_build_file_membership` used to run three single passes: `contains` one hop from
+a file node, `method` from an already-resolved class, `rationale_for`. Two things
+were wrong with that shape and only the first is named in #82:
+
+  DEPTH        a `contains` chain deeper than one hop was dropped, so every
+               markdown heading below the first fell to the app root.
+  RELATION     `defines` is emitted file->symbol and class->field at eight sites
+               in `extractor.py`, and pass 1 matched on the literal string
+               "contains". A C++ struct field is ONE HOP from a resolved struct
+               and was lost anyway, purely because of the relation's name.
+
+The fix walks to a fixed point over an explicit containment allowlist. The
+allowlist is the load-bearing half: #82's text asks for a walk "rather than a
+fixed set of relations", and an unbounded walk is a WORSE bug than the one being
+fixed -- it would propagate membership along `calls` and `inherits` and attribute
+a stdlib base class to whichever file happens to subclass it. `test_external_
+symbol_stays_on_app_root` and `test_callee_keeps_its_own_file` are the guards
+against exactly that, and they are green before the fix and must stay green
+after it.
+
+Not everything reaching the app root is a defect. A synthesised stand-in for a
+class that lives OUTSIDE the tree (`RuntimeError`) has no file because there is
+no file. It is expected to stay on the app root, and a run that drives the
+count to zero has propagated membership to nodes with no legitimate file (#98).
+
+Run: python3 scripts/ast/test_file_membership_walk.py   (or: pytest scripts/ast/)
+"""
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from collections import namedtuple
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+COUNTER = re.compile(r"^# (\d+) entit(?:y|ies) attributed to the app root", re.M)
+
+#: The map goes to stdout; the `# N entities attributed to the app root` notice
+#: goes to STDERR (`onto_ast.py`, `file=sys.stderr`). Reading the counter off
+#: stdout returns 0 for every tree ever measured -- an instrument that cannot
+#: fail. Both streams are carried, separately and deliberately.
+Run = namedtuple("Run", "ttl notices")
+
+
+def _extract(tree: dict[str, str]) -> Run:
+    """Write `tree` to a fixture repo, extract it, return the raw output.
+
+    NOT under /tmp: file discovery drops any path with a `tmp` component, so a
+    fixture there extracts to nothing and every assertion below would pass
+    against an empty map.
+    """
+    with tempfile.TemporaryDirectory(prefix="base-ast-m82-", dir=Path.home()) as td:
+        root = Path(td)
+        for rel, body in tree.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body, encoding="utf-8")
+        # File discovery walks a repo, so the fixture has to look like one.
+        subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
+        # Explicit env and a bounded wait: a child spawned by a differently
+        # launched parent must not inherit a surprise, and a hung grammar must
+        # fail the leg rather than the job's whole timeout.
+        proc = subprocess.run(
+            [sys.executable, str(HERE / "onto_ast.py"), str(root),
+             "--project", "t", "--full"],
+            capture_output=True, text=True, cwd=str(HERE),
+            env=os.environ.copy(), timeout=300,
+        )
+        assert proc.returncode == 0, f"extraction failed:\n{proc.stderr}"
+        run = Run(proc.stdout, proc.stderr)
+    # An empty map cannot be allowed to read as a pass -- the shape that let a
+    # tripwire report PASS having opened no files at all.
+    assert "a ops:" in run.ttl, "extraction produced no entities; the fixture never parsed"
+    # Nor can a silent stream. If the extractor said nothing on stderr the notice
+    # channel is gone and every orphan assertion below would read a false zero.
+    assert "# Extracting" in run.notices, (
+        f"the extractor's notice stream is empty; `_orphans` cannot tell 0 from "
+        f"missing. stderr was:\n{run.notices!r}"
+    )
+    return run
+
+
+def _orphans(run: Run) -> int:
+    """How many entities the extractor itself said fell to the app root.
+
+    Read from the NOTICE stream, whose presence `_extract` has already proved.
+    The line is only printed when the number is non-zero, so its absence here is
+    a real zero rather than an unread stream.
+    """
+    m = COUNTER.search(run.notices)
+    return int(m.group(1)) if m else 0
+
+
+def _source_file(run: Run, label: str) -> str:
+    """The sourceFile recorded for the entity carrying `label`."""
+    lines = run.ttl.splitlines()
+    idx = [i for i, ln in enumerate(lines) if f'rdfs:label "{label}"' in ln]
+    assert idx, f"entity {label!r} is missing from the map entirely"
+    window = "\n".join(lines[idx[0]: idx[0] + 5])
+    m = re.search(r'ops:sourceFile "(.*?)" ;', window)
+    assert m, f"entity {label!r} has no sourceFile:\n{window}"
+    return m.group(1)
+
+
+# --------------------------------------------------------------------------
+# Depth: the live reproduction. #82's own `x.cpp` repro no longer reproduces.
+# --------------------------------------------------------------------------
+
+NESTED_HEADINGS = {
+    "doc.md": "# Top Heading\n\nbody\n\n## Middle Heading\n\nbody\n\n### Deep Heading\n\nbody\n",
+}
+
+
+def test_nested_headings_belong_to_their_file():
+    """h2 and h3 are two and three `contains` hops from the file node.
+
+    Before the fix this failed by exactly 2: `Top Heading` resolved (one hop)
+    and everything under it fell to the app root.
+    """
+    run = _extract(NESTED_HEADINGS)
+    for label in ("Top Heading", "Middle Heading", "Deep Heading"):
+        assert _source_file(run, label) == "doc.md", (
+            f"{label!r} is attributed to {_source_file(run, label)!r}, not doc.md "
+            f"-- the containment walk is not reaching a fixed point"
+        )
+    assert _orphans(run) == 0, (
+        f"{_orphans(run)} entities on the app root; a tree of one markdown file "
+        f"has no entity that legitimately belongs there"
+    )
+
+
+# --------------------------------------------------------------------------
+# Relation: one hop from a resolved parent, lost on the relation's name.
+# --------------------------------------------------------------------------
+
+STRUCT_WITH_FIELD = {
+    "f.cpp": "struct WithField {\n    int counter;\n    int f() { return counter; }\n};\n",
+}
+
+
+def test_class_field_belongs_to_its_file():
+    """`counter` and `f` are siblings in one struct, reached by different relations.
+
+    `f` arrives on `hasMethod` and always resolved. `counter` arrives on
+    `defines` and fell to the app root -- same file, same parent, same depth.
+    That is the relation half of #82, and it is not in the issue.
+    """
+    run = _extract(STRUCT_WITH_FIELD)
+    assert _source_file(run, ".f()") == "f.cpp", "the method regressed"
+    assert _source_file(run, "counter") == "f.cpp", (
+        f"the struct field is attributed to {_source_file(run, 'counter')!r}; "
+        f"`defines` is missing from the containment allowlist"
+    )
+    assert _orphans(run) == 0
+
+
+# --------------------------------------------------------------------------
+# The guards. Both are GREEN before the fix and must stay green after it.
+# --------------------------------------------------------------------------
+
+CROSS_FILE = {
+    "callee.py": "def callee_fn():\n    return 1\n",
+    "caller.py": (
+        "from callee import callee_fn\n\n"
+        "class MyErr(RuntimeError):\n    pass\n\n"
+        "def caller_fn():\n    return callee_fn()\n"
+    ),
+}
+
+
+def test_callee_keeps_its_own_file():
+    """`calls` and `imports` are not containment.
+
+    `caller.py` both imports and calls `callee_fn`. A walk that followed either
+    would move `callee_fn` into the file that calls it.
+    """
+    run = _extract(CROSS_FILE)
+    assert _source_file(run, "callee_fn()") == "callee.py", (
+        f"callee_fn moved to {_source_file(run, 'callee_fn()')!r} -- membership "
+        f"is propagating along `calls` or `imports`, which are cross-file"
+    )
+
+
+def test_external_symbol_stays_on_app_root():
+    """A stand-in for a class outside the tree has no file, and must keep none.
+
+    `RuntimeError` is synthesised because `MyErr` subclasses it; it exists in the
+    map only as the target of an `inherits` edge. Attributing it to `caller.py`
+    would be a false attribution that DROPS the app-root counter -- a regression
+    wearing a green number. This is the #98 population, and #82 is not allowed
+    to clear it.
+    """
+    run = _extract(CROSS_FILE)
+    assert _source_file(run, "MyErr") == "caller.py"
+    external = _source_file(run, "RuntimeError")
+    assert external != "caller.py", (
+        "RuntimeError was attributed to the file that subclasses it -- membership "
+        "is propagating along `inherits`, which is not containment"
+    )
+    assert _orphans(run) == 1, (
+        f"expected exactly 1 app-root entity (RuntimeError, no file in this tree), "
+        f"got {_orphans(run)}. Zero here is a FAILURE signal, not a win."
+    )
+
+
+# --------------------------------------------------------------------------
+# Unit legs on the seam itself. No grammar, no subprocess, no vacuous pass.
+# --------------------------------------------------------------------------
+
+def test_membership_is_independent_of_edge_order():
+    """Three single passes made the result depend on the order `edges` arrived in.
+
+    A class resolved later in the list than its own methods never propagated on
+    that run. A fixed point does not care about order, and this asserts it
+    rather than trusting it.
+    """
+    import random
+    from ttl_serializer import _build_file_membership
+
+    edges = [
+        {"source": "f.md", "target": "h1", "relation": "contains"},
+        {"source": "h1", "target": "h2", "relation": "contains"},
+        {"source": "h2", "target": "h3", "relation": "contains"},
+        {"source": "h3", "target": "cls", "relation": "contains"},
+        {"source": "cls", "target": "m", "relation": "method"},
+        {"source": "cls", "target": "fld", "relation": "defines"},
+        {"source": "r", "target": "m", "relation": "rationale_for"},
+        {"source": "other.md", "target": "x", "relation": "calls"},
+    ]
+    files = {"f.md", "other.md"}
+
+    expected = {k: "f.md" for k in ("h1", "h2", "h3", "cls", "m", "fld", "r")}
+    rng = random.Random(82)
+    for _ in range(25):
+        shuffled = edges[:]
+        rng.shuffle(shuffled)
+        got = _build_file_membership(shuffled, files)
+        assert got == expected, (
+            f"membership depends on edge order.\n  expected {expected}\n  got      {got}"
+        )
+    assert "x" not in _build_file_membership(edges, files), (
+        "a `calls` target was given a file; the allowlist is not being enforced"
+    )
+
+
+CONTENDED = """
+import sys, json
+sys.path.insert(0, %r)
+from ttl_serializer import _build_file_membership
+edges = [
+    {"source": "alpha.md", "target": "shared", "relation": "contains"},
+    {"source": "beta.md",  "target": "shared", "relation": "contains"},
+]
+print(json.dumps(_build_file_membership(edges, {"alpha.md", "beta.md"})))
+"""
+
+
+def test_membership_is_independent_of_the_interpreters_hash_seed():
+    """Two file nodes contain the same node. Which one owns it must not depend
+    on the process.
+
+    The walk is seeded from `file_nodes`, which `_identify_file_nodes` returns as
+    a `set[str]`. Iteration order over a set of strings is a function of
+    PYTHONHASHSEED, which CPython randomises per process — so first-writer-wins
+    over that seed order picks a different owner on different runs of the SAME
+    input. The three-pass implementation this replaced iterated `edges`, a LIST,
+    and was deterministic; the rewrite fixed edge-order dependence and
+    introduced seed-order dependence in the same motion.
+
+    `test_membership_is_independent_of_edge_order` cannot see this: its file set
+    is `{f.md, other.md}` and `other.md` carries only a `calls` edge, so the two
+    seeds never contend for the same node.
+
+    Run in SUBPROCESSES because PYTHONHASHSEED is read once at interpreter
+    start-up: setting it in this process would change nothing.
+    """
+    seeds, results = ("0", "1", "42", "12345"), {}
+    for seed in seeds:
+        env = os.environ.copy()
+        env["PYTHONHASHSEED"] = seed
+        proc = subprocess.run(
+            [sys.executable, "-c", CONTENDED % str(HERE)],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+        assert proc.returncode == 0, f"seed {seed} failed:\n{proc.stderr}"
+        results[seed] = proc.stdout.strip()
+
+    distinct = set(results.values())
+    assert len(distinct) == 1, (
+        "membership depends on the interpreter's hash seed — a node reachable "
+        "from two file nodes changes owner between runs of identical input:\n  "
+        + "\n  ".join(f"PYTHONHASHSEED={s}: {r}" for s, r in results.items())
+    )
+
+
+def test_rationale_inherits_from_its_target_not_the_other_way():
+    """`rationale_for` runs the OPPOSITE way to the other three, in both arms.
+
+    `contains`, `method` and `defines` put the TARGET in the SOURCE's file. A
+    rationale node is the source of its own `rationale_for` edge and takes the
+    file of the thing it is a rationale FOR -- target to source. Folding all four
+    into one uniform parent-to-child rule inverts this one and the rationale
+    stops inheriting, which no test on main would have caught: main's
+    `test_file_attribution.py` is 76 lines, one test, and the string "rationale"
+    appears in it zero times.
+
+    This leg cannot be red-first: main handles both arms correctly, so there is
+    no failure to reproduce. Its teeth were shown instead by inverting
+    `_CONTAINS_UPWARD` to `_CONTAINS_DOWNWARD` in the walk and confirming both
+    arms below fail -- mutation-testing the test, recorded in the fork doc.
+    """
+    from ttl_serializer import _build_file_membership
+
+    # Arm 1: the target is an ordinary entity that itself resolves through the
+    # walk. The rationale must end up in the same file, one step behind it.
+    got = _build_file_membership(
+        [
+            {"source": "a.py", "target": "fn", "relation": "contains"},
+            {"source": "why", "target": "fn", "relation": "rationale_for"},
+        ],
+        {"a.py"},
+    )
+    assert got.get("why") == "a.py", (
+        f"rationale 'why' resolved to {got.get('why')!r}; it must inherit the file "
+        f"of the entity it explains. Membership is flowing parent->child for "
+        f"`rationale_for`, which inverts it."
+    )
+    assert "a.py" not in {k for k in got if k == "fn"} or got["fn"] == "a.py"
+
+    # Arm 2: the target IS a file node -- the `elif target_id in file_nodes`
+    # branch of the original three-pass implementation. A whole-file rationale
+    # belongs to that file directly.
+    got = _build_file_membership(
+        [{"source": "why", "target": "a.py", "relation": "rationale_for"}],
+        {"a.py"},
+    )
+    assert got.get("why") == "a.py", (
+        f"a rationale pointing straight at a file node resolved to "
+        f"{got.get('why')!r}; the file-node arm of the rationale pass is gone."
+    )
+
+
+def test_deep_class_is_typed_by_its_own_files_language():
+    """Membership has a SECOND consumer, and the fix moves `rdf:type` too.
+
+    `_build_role_map` takes `file_membership` and uses the containing file's
+    EXTENSION to decide struct vs class (`_STRUCT_LANGUAGES`). A method-bearing
+    node with no membership got an empty label, an empty extension, and fell to
+    `class` unconditionally -- whatever language it was written in. Once the walk
+    gives it a file, the same node is typed by that file for the first time.
+
+    Measured population on the three trees in the round doc: ZERO. No orphan
+    subject sources a method edge on any of them, so this coupling is inert in
+    practice and no `rdf:type` moved. It is pinned here because it is live in
+    the code and the next tree may not be so tidy.
+    """
+    from ttl_serializer import _build_file_membership, _build_role_map
+
+    def role_of(filename: str) -> str:
+        edges = [
+            {"relation": "contains", "source": filename, "target": "outer"},
+            {"relation": "contains", "source": "outer", "target": "deep"},
+            {"relation": "method", "source": "deep", "target": "m"},
+        ]
+        labels = {filename: filename, "outer": "Outer", "deep": "Deep", "m": "m"}
+        nodes = [{"id": n} for n in labels]
+        files = {filename}
+        membership = _build_file_membership(edges, files)
+        return _build_role_map(edges, nodes, membership, labels, files)["deep"]
+
+    assert role_of("a.rs") == "struct", (
+        "a method-bearing node two `contains` hops inside a .rs file is still "
+        "typed `class`; it never acquired membership, so `_build_role_map` read "
+        "an empty extension"
+    )
+    assert role_of("a.py") == "class", (
+        "the same node inside a .py file must stay `class` -- the type follows "
+        "the file's language, and .py is not a struct language"
+    )
+
+
+def test_containment_allowlist_is_pinned_to_the_vocabulary():
+    """Every name in the allowlist must be a real relation, and the complement
+    is enumerated here on purpose.
+
+    A 29th relation added to `relations._RELATION_NAMES` is silently excluded
+    from membership. Silent is the right DEFAULT and the wrong DECISION, so this
+    fails until someone states which side the new name belongs on -- the same
+    shape as the three-list drift that #83 fixed.
+    """
+    import relations
+    from ttl_serializer import CONTAINMENT_RELATIONS
+
+    known = set(relations.RELATIONS)
+    unknown = CONTAINMENT_RELATIONS - known
+    assert not unknown, (
+        f"allowlist names no relation the extractor can emit: {sorted(unknown)}. "
+        f"Add them to _RELATION_NAMES in scripts/ast/relations.py or drop them."
+    )
+
+    # The complement, stated. Each of these is cross-file by construction: the
+    # target lives somewhere the source merely refers to.
+    NOT_CONTAINMENT = {
+        "binds_method", "bound_to", "calls", "dynamic_import", "extends",
+        "implements", "imports", "imports_from", "includes", "inherits",
+        "instantiates", "listened_by", "re_exports", "reads_from", "references",
+        "references_constant", "relatedTo", "supersedes", "triggers", "uses",
+        "uses_component", "uses_config", "uses_static_prop",
+    }
+    unclassified = known - CONTAINMENT_RELATIONS - NOT_CONTAINMENT
+    assert not unclassified, (
+        f"relation(s) {sorted(unclassified)} are in the vocabulary but on neither "
+        f"side of the containment split. Decide: does a {sorted(unclassified)[0]!r} "
+        f"edge mean the target lives in the source's file? Then add it to "
+        f"CONTAINMENT_RELATIONS in ttl_serializer.py, or to NOT_CONTAINMENT here."
+    )
+    overlap = CONTAINMENT_RELATIONS & NOT_CONTAINMENT
+    assert not overlap, f"{sorted(overlap)} is on both sides of the split"
+
+
+if __name__ == "__main__":
+    # Every leg runs even after one fails, and the exit code is the run's --
+    # a red table of all of them is worth more than the first traceback.
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    rc = 0
+    for t in tests:
+        try:
+            t()
+            print(f"ok   {t.__name__}")
+        except Exception as exc:
+            rc = 1
+            first = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            print(f"FAIL {t.__name__}: {first}")
+    print(f"ran {len(tests)} legs; rc={rc}")
+    sys.exit(rc)
