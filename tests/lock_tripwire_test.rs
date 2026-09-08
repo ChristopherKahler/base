@@ -274,9 +274,10 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// filesystem primitives in scope, because **626 of the 1,903 functions in
 /// `src/` are test code** and fixtures legitimately write graph files directly.
 /// `src/graph_move.rs` alone carries 8 `fs::write` calls past its
-/// `#[cfg(test)]`, and `src/hook/session_start.rs` — the sentinel — writes a
-/// `graph.nq` fixture. The cheap way to green that would be to re-add files to
-/// an allow-list, which re-blinds the exact files under repair.
+/// `#[cfg(test)]`, and `src/hook/session_start.rs` writes a `graph.nq` fixture
+/// which is that file's only filesystem primitive. The cheap way to green that
+/// would be to re-add files to an allow-list, which re-blinds the exact files
+/// under repair.
 fn functions(src: &str) -> Vec<Func> {
     let lines: Vec<&str> = src.lines().collect();
     let cfg_test_at = lines
