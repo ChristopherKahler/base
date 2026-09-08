@@ -66,9 +66,8 @@ becomes ours, and nothing you write against them is encumbered by our license.
 
 ## Versions published before this change
 
-Every release up to and including **v0.14.1** was published under the PolyForm
-Noncommercial License 1.0.0, retained verbatim at
-[LICENSE-PolyForm-Noncommercial-1.0.0.md](LICENSE-PolyForm-Noncommercial-1.0.0.md).
+Every release up to and including **v0.14.1** was published under the
+[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0).
 That grant is not withdrawn and cannot be. If you received one of those
 versions, you keep the rights you were given for that version, permanently.
 
