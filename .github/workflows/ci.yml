@@ -299,7 +299,7 @@ jobs:
   # TEMPORARY. REMOVED BEFORE G2. Do not merge with it.
   #
   # R1 EXTENSION. The first experiment measured the release profile against ONE
-  # of the four targets #129 covers (hook_log_tier_test). R1's action gates only
+  # of the spawning targets #129 covers (hook_log_tier_test). R1's action gates only
   # the 2 ast_automap tests and moves the Windows job to --release, which leaves
   # 14 tests ungated on one target's evidence. If the other three still overflow
   # in release, that job's first full run turns main RED for every later PR.
@@ -309,7 +309,7 @@ jobs:
   # overflows" is established only for hook_log_tier_test, and assuming it for
   # the rest would be the same unmeasured leap in the opposite direction.
   #
-  # The job-level verdict is the STRICTEST of the four, never a majority.
+  # The job-level verdict is the STRICTEST of the set, never a majority.
   # ==========================================================================
   windows-release-all-targets-EXPERIMENT:
     runs-on: windows-latest
@@ -333,12 +333,12 @@ jobs:
           ls -l target/debug/base.exe   2>&1 || echo "NO DEBUG BINARY"
           ls -l target/release/base.exe 2>&1 || echo "NO RELEASE BINARY"
 
-      - name: Four targets x two profiles, rc captured to files before any reporting
+      - name: Five targets x two profiles, rc captured to files before any reporting
         if: always()
         shell: bash
         run: |
           set +e
-          for t in hook_log_tier_test hook_output_channel_test outside_workspace_test served_count_coach_test; do
+          for t in hook_log_tier_test hook_output_channel_test outside_workspace_test served_count_coach_test ast_relation_query_test; do
             cargo test --test "$t" -- --nocapture > "dbg_$t.log" 2>&1
             echo "$?" > "dbg_$t.rc"
             cargo test --release --test "$t" -- --nocapture > "rel_$t.log" 2>&1
@@ -347,7 +347,7 @@ jobs:
           done
           set -e
 
-      - name: PER-TARGET VERDICT (same pre-registered ladder, applied four times)
+      - name: PER-TARGET VERDICT (same pre-registered ladder, applied per target)
         if: always()
         shell: bash
         run: |
@@ -359,7 +359,7 @@ jobs:
           rank () { case "$1" in V1) echo 5;; V2) echo 4;; R2) echo 3;; R3) echo 2;; R1) echo 1;; esac; }
 
           echo "=================== PER-TARGET FACTS ==================="
-          for t in hook_log_tier_test hook_output_channel_test outside_workspace_test served_count_coach_test; do
+          for t in hook_log_tier_test hook_output_channel_test outside_workspace_test served_count_coach_test ast_relation_query_test; do
             tr -d '\r' < "dbg_$t.log" > "dbg_$t.clean" 2>/dev/null || : > "dbg_$t.clean"
             tr -d '\r' < "rel_$t.log" > "rel_$t.clean" 2>/dev/null || : > "rel_$t.clean"
             d_rc=$(cat "dbg_$t.rc" 2>/dev/null || echo NO_RC)
@@ -382,9 +382,9 @@ jobs:
           done
 
           echo "=================== JOB VERDICT ==================="
-          echo "STRICTEST_ACROSS_FOUR_TARGETS=$worst"
+          echo "STRICTEST_ACROSS_TARGETS=$worst"
           if [ "$worst" = "R1" ]; then
-            echo "All four targets read R1. The release profile is clean on every target"
+            echo "All targets read R1. The release profile is clean on every target"
             echo "the R1 action decides the fate of. Merging on it is now a measurement."
           else
             echo "NOT R1 across the set. One or more targets denies it, so the R1 action"
