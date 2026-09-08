@@ -1445,6 +1445,22 @@ fn tier_cwd(cwd: &std::path::Path, global: bool) -> std::path::PathBuf {
 
 pub fn run() {
     let cli = Cli::parse();
+
+    // #93: `ensure_hooks_wired` had exactly one caller — the session-start hook
+    // — so a home whose hooks were never wired had no path back: no hook fires,
+    // therefore nothing re-checks, and `base update` re-wires nothing either.
+    // Any ordinary command repairs it now. The gate is one stat on a per-version
+    // stamp, which that function checks before anything else.
+    //
+    // The hook arm is excluded on purpose. `hook::dispatch` reaches
+    // `session_start`, which calls the same function and uses its RETURN VALUE
+    // to print the `[hooks]` notice; calling it here first would consume the
+    // wiring and hand that notice an empty vec — a silent regression with
+    // nothing to fail.
+    if !matches!(&cli.command, Some(Commands::Hook { .. })) {
+        let _ = base::install::ensure_hooks_wired();
+    }
+
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {

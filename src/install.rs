@@ -56,12 +56,13 @@ pub fn run(
     create_global_tier(&global_dir)?;
 
     // Step 3: Wire hooks in ~/.claude/settings.json
-    if !skip_hooks {
-        let settings_path = home.join(".claude").join("settings.json");
-        wire_hooks(&settings_path)?;
+    let settings_path = home.join(".claude").join("settings.json");
+    let hooks_deferred = if !skip_hooks {
+        wire_hooks(&settings_path)?
     } else {
         println!("⊘ Hook wiring skipped (--skip-hooks)\n");
-    }
+        false
+    };
 
     // Step 4: Migrate carl.json decisions if provided
     if let Some(carl_path) = carl_json_path {
@@ -89,6 +90,23 @@ pub fn run(
     // Step 8: Append BASE CLI section to ~/.claude/CLAUDE.md
     let claude_md = home.join(".claude").join("CLAUDE.md");
     append_claude_md(&claude_md)?;
+
+    // #93: step 3 could not wire because ~/.claude did not exist yet. Steps 7
+    // and 8 have since created it — for base's own bundled skill, then for
+    // CLAUDE.md — so the wiring lands now rather than never. Without this, a
+    // home that got base before Claude Code stays inert through the install
+    // AND through the first session, because the session has no base hook to
+    // run. `--skip-hooks` never reaches here: it sets `hooks_deferred` false.
+    if hooks_deferred {
+        let added = wire_hooks_quiet(&settings_path).unwrap_or_default();
+        if !added.is_empty() {
+            println!(
+                "   ↳ hooks wired into {} after all — base created that directory for its \
+                 own skill, so Claude Code will find them when it is installed.",
+                settings_path.display()
+            );
+        }
+    }
 
     // Step 9: Write manifest.toml
     write_manifest(&global_dir, full)?;
@@ -807,12 +825,33 @@ pub fn hooks_manifest() -> serde_json::Value {
     })
 }
 
-fn wire_hooks(settings_path: &Path) -> Result<()> {
+/// True when there is somewhere for the hook wiring to land: the settings file,
+/// or the directory that would hold it.
+///
+/// Deliberately NOT a test for "is Claude Code installed" — `base install`
+/// creates `~/.claude` itself for the bundled skill, so the directory proves
+/// nothing about that. It answers the only question the wiring needs: can this
+/// write reach a file Claude Code will read.
+fn claude_config_tier(settings_path: &Path) -> bool {
+    settings_path.exists() || settings_path.parent().is_some_and(|d| d.is_dir())
+}
+
+/// Wire the hooks, returning whether the wiring was DEFERRED for want of a
+/// `~/.claude` to write into.
+///
+/// Deferred, not abandoned: steps 7 and 8 of this same install create that
+/// directory themselves — the bundled skill, then CLAUDE.md — so a wiring that
+/// cannot land at step 3 can land after them, in the same run. Before #93 it
+/// was simply dropped, and a home that got base before Claude Code had no path
+/// back at all: Claude Code learns about base's hooks from settings.json, so
+/// without one base never runs inside a session, and the repair that would fix
+/// it ran from a hook.
+fn wire_hooks(settings_path: &Path) -> Result<bool> {
     print!("3. Wire hooks → {} ... ", settings_path.display());
 
-    if !settings_path.exists() && !settings_path.parent().is_some_and(|d| d.is_dir()) {
-        println!("⊘ no ~/.claude directory (is Claude Code installed?), skipped");
-        return Ok(());
+    if !claude_config_tier(settings_path) {
+        println!("⊘ no ~/.claude directory (is Claude Code installed?), deferred to step 8");
+        return Ok(true);
     }
 
     let added = wire_hooks_quiet(settings_path)?;
@@ -821,7 +860,7 @@ fn wire_hooks(settings_path: &Path) -> Result<()> {
     } else {
         println!("✓ (added base hook {})", added.join(", "));
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Session start: wire any hook this release added that the host's
@@ -841,6 +880,15 @@ pub fn ensure_hooks_wired() -> Vec<&'static str> {
         return Vec::new();
     }
     let settings = home.join(".claude").join("settings.json");
+    // An empty result has two causes — already wired, and nothing to write into
+    // — and stamping the second is what made #93 PERMANENT rather than merely
+    // delayed: one call on a home with no Claude Code disarmed the repair for
+    // the rest of this version's life. Stamp only when there was a config tier
+    // to reconcile against; otherwise leave it absent and retry next time, at a
+    // cost of two stats.
+    if !claude_config_tier(&settings) {
+        return Vec::new();
+    }
     let added = wire_hooks_quiet(&settings).unwrap_or_default();
     let _ = std::fs::write(&stamp, b"");
     added
@@ -962,6 +1010,13 @@ pub fn ast_scripts_source(binary_path: &Path, cwd: &Path) -> Option<std::path::P
     };
 
     [
+        // An unpacked release archive: `base` and `scripts/ast/` are siblings.
+        // `.github/workflows/release.yml` stages exactly that and tars from
+        // inside `staging/`, so this is the only candidate here derived from a
+        // layout base itself ships. It is first because it is the most
+        // specific, and it shadows no dev layout: for `target/<profile>/base`
+        // it names `target/<profile>/scripts/ast`, which nothing produces.
+        up(0),
         // Source repo, binary one level in.
         up(1),
         // Cargo target dir: target/<profile>/base → ../../scripts/ast.

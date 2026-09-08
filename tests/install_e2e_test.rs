@@ -43,7 +43,7 @@ fn unpack_fake_archive(into: &Path) -> PathBuf {
         std::fs::copy(BASE, &binary).unwrap();
     }
 
-    let dest = mkdir(&into.join("scripts").join("ast"));
+    let dest = mkdir(into.join("scripts").join("ast"));
     let mut staged = 0;
     for entry in std::fs::read_dir(repo_scripts_ast()).unwrap() {
         let path = entry.unwrap().path();
@@ -64,7 +64,7 @@ fn unpack_fake_archive(into: &Path) -> PathBuf {
 /// this test never reaches the network. `find_local_skills_dir` probes
 /// `<binary>/../../claude/skills` first, which is `<parent of archive>`.
 fn seed_local_skill(archive_parent: &Path) {
-    let dir = mkdir(&archive_parent.join("claude").join("skills").join("base-help"));
+    let dir = mkdir(archive_parent.join("claude").join("skills").join("base-help"));
     std::fs::write(dir.join("SKILL.md"), "---\nname: base-help\n---\n").unwrap();
 }
 
@@ -114,10 +114,10 @@ fn an_unpacked_archive_installs_the_ast_scripts_from_an_unrelated_directory() {
     let binary = unpack_fake_archive(&archive);
     seed_local_skill(tmp.path());
 
-    let home = mkdir(&tmp.path().join("home"));
+    let home = mkdir(tmp.path().join("home"));
     // The reproduction from the issue: run the unpacked binary from anywhere
     // that is not the unpack directory.
-    let elsewhere = mkdir(&tmp.path().join("elsewhere"));
+    let elsewhere = mkdir(tmp.path().join("elsewhere"));
 
     let out = run_base(&binary, &elsewhere, &home, &["install", "--no-starter-commands"]);
     let installed = home.join(".base-gbl").join("scripts").join("ast");
@@ -141,7 +141,7 @@ fn the_same_archive_run_from_its_own_directory_also_installs_them() {
     let binary = unpack_fake_archive(&archive);
     seed_local_skill(tmp.path());
 
-    let home = mkdir(&tmp.path().join("home"));
+    let home = mkdir(tmp.path().join("home"));
 
     let out = run_base(&binary, &archive, &home, &["install", "--no-starter-commands"]);
     assert!(
@@ -160,12 +160,12 @@ fn an_ordinary_command_wires_the_hooks_when_claude_code_arrived_later() {
     // The state #93 describes, after Claude Code has been installed: base's
     // global tier exists, `~/.claude` exists, and settings.json does not,
     // because hook wiring was skipped at install time.
-    mkdir(&home.join(".base-gbl"));
-    mkdir(&home.join(".claude"));
+    mkdir(home.join(".base-gbl"));
+    mkdir(home.join(".claude"));
     let settings = home.join(".claude").join("settings.json");
     assert!(!settings.exists(), "the precondition, stated rather than assumed");
 
-    let cwd = mkdir(&tmp.path().join("cwd"));
+    let cwd = mkdir(tmp.path().join("cwd"));
     let out = run_base(Path::new(BASE), &cwd, &home, &["recall", "--keyword", "anything"]);
 
     assert!(
@@ -198,8 +198,8 @@ fn the_session_start_hook_still_announces_what_it_wired() {
     // first, this notice would silently disappear and nothing else would fail.
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    mkdir(&home.join(".base-gbl"));
-    mkdir(&home.join(".claude"));
+    mkdir(home.join(".base-gbl"));
+    mkdir(home.join(".claude"));
 
     // An install from before the Stop hook existed: four of the five.
     let four: Vec<String> = base::install::HOOK_TABLE
@@ -214,7 +214,7 @@ fn the_session_start_hook_still_announces_what_it_wired() {
     )
     .unwrap();
 
-    let cwd = mkdir(&tmp.path().join("cwd"));
+    let cwd = mkdir(tmp.path().join("cwd"));
     let out = run_base(Path::new(BASE), &cwd, &home, &["hook", "session-start"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
 
@@ -242,7 +242,7 @@ fn one_install_into_a_home_with_no_claude_code_still_leaves_the_hooks_wired() {
     let binary = unpack_fake_archive(&archive);
     seed_local_skill(tmp.path());
 
-    let home = mkdir(&tmp.path().join("home"));
+    let home = mkdir(tmp.path().join("home"));
     assert!(!home.join(".claude").exists(), "no Claude Code, stated not assumed");
 
     let out = run_base(&binary, &archive, &home, &["install", "--no-starter-commands"]);
@@ -277,7 +277,7 @@ fn skip_hooks_still_means_skip_hooks_even_after_base_creates_the_directory() {
     let binary = unpack_fake_archive(&archive);
     seed_local_skill(tmp.path());
 
-    let home = mkdir(&tmp.path().join("home"));
+    let home = mkdir(tmp.path().join("home"));
     let out = run_base(
         &binary,
         &archive,

@@ -143,15 +143,18 @@
             Say '  then reopen your terminal.'
         }
 
-        # Hooks are only written into an existing ~\.claude. Installing base
-        # before Claude Code leaves it inert with no way to self-heal, because the
-        # repair runs from the session-start hook that was never wired. Test
-        # settings.json, not the directory: `base install` creates ~\.claude
-        # itself for the bundled skill, so the directory always exists afterwards.
+        # Since #93 `base install` wires the hooks even when Claude Code is not
+        # installed yet: it creates ~\.claude itself for the bundled skill, and
+        # the wiring is deferred to after that rather than dropped, so a later
+        # Claude Code finds them. This file therefore exists after every install
+        # that did not pass --skip-hooks; if it does not, the wiring FAILED
+        # rather than being deferred. Test settings.json, not the directory,
+        # which `base install` creates either way.
         if (-not (Test-Path (Join-Path $binHome '.claude\settings.json'))) {
             Say ''
-            Say 'base: no ~\.claude directory, so the hooks were not wired and base will'
-            Say '  not do anything yet. Install Claude Code, then run:'
+            Say 'base: the hooks were not wired, so base will not do anything yet.'
+            Say '  Re-run the line below; if it happens twice, please report it at'
+            Say '  https://github.com/ChristopherKahler/base/issues'
             Say ''
             Say '    base install'
             Say ''
