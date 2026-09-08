@@ -145,6 +145,7 @@ fn no_literal_base_binary_path_outside_the_seam() {
     rust_files(Path::new("src"), &mut files);
 
     let mut offenders = Vec::new();
+    let mut visited = 0usize;
     for f in &files {
         if f.file_name().is_some_and(|n| n == SANCTIONED) {
             continue;
@@ -172,6 +173,9 @@ fn no_literal_base_binary_path_outside_the_seam() {
         let Ok(text) = std::fs::read_to_string(f) else {
             continue;
         };
+        // Counted AFTER the read succeeds, so it is files actually opened rather
+        // than files merely listed. A path that failed to read proved nothing.
+        visited += 1;
         for (i, line) in text.lines().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") || trimmed.starts_with("///") {
@@ -205,6 +209,23 @@ fn no_literal_base_binary_path_outside_the_seam() {
             }
         }
     }
+
+    // A loop that asserts over a set prints the size of the set it actually
+    // visited, and a visited count of ZERO is a failure meaning "this proved
+    // nothing" - never a pass. Without this the guard goes green having opened no
+    // files at all: `rust_files` returns an empty vec if `src` is not where the
+    // test is standing, every `continue` is taken, `offenders` stays empty, and
+    // `is_empty()` is true. That is a pass built on zero evidence, and it is the
+    // shape that produced a false PASS on an isolation tripwire earlier in this
+    // release. The count goes to stdout so `cargo test -- --nocapture` shows the
+    // number rather than leaving it to a side measurement.
+    println!("guard: scanned {visited} rust file(s) under src/, excluding {SANCTIONED}");
+    assert!(
+        visited > 0,
+        "the guard opened ZERO files under src/ and therefore proved NOTHING. \
+         Either `rust_files` stopped walking or the test is not standing where \
+         `src/` is. A pass here would be a pass over an empty set."
+    );
 
     assert!(
         offenders.is_empty(),
