@@ -1,5 +1,6 @@
-//! #66 rows A1 and B1: the two gates that need no tree-sitter grammar, so they
-//! ride `cargo test` rather than waiting for a CI job that installs 28 wheels.
+//! #66 rows A1 and B1, and #83/#84's own grammar-free rows: the gates that need
+//! no tree-sitter grammar, so they ride `cargo test` rather than waiting for a
+//! CI job that installs 28 wheels (#85, deferred).
 //!
 //! A1 is the drift assertion that would have caught this months ago: `_FILE_EXTS`
 //! (which node labels are file nodes) had drifted 39 extensions behind `_DISPATCH`
@@ -147,3 +148,99 @@ print("unrelated", detect._is_ignored(ts, root, ["build/"]))
     assert!(out.contains("bare_dir True"), "{out}");
     assert!(out.contains("unrelated False"), "{out}");
 }
+
+/// #83: every extension the extractor parses is an extension the map can name a
+/// language for. `LANG_MAP` was a third hand-kept list beside `_DISPATCH` and
+/// `_FILE_EXTS`; #66 derived the second and left this one, then widened its gap
+/// by adding `.cjs` to the parser table alone. Derived now, so it cannot drift.
+#[test]
+fn every_parsed_extension_has_a_language() {
+    let out = py(r#"
+import sys; sys.path.insert(0, ".")
+import extractor, onto_ast as o
+gap = set(extractor._DISPATCH) - set(o.LANG_MAP)
+extra = set(o.LANG_MAP) - set(extractor._DISPATCH) - set(o._EXT_LANG)
+print("gap", len(gap), sorted(gap))
+print("extra", len(extra), sorted(extra))
+print("unknown", sorted(e for e, l in o.LANG_MAP.items() if l == "unknown"))
+print("count", len(o.LANG_MAP))
+"#);
+    assert!(
+        out.contains("gap 0 []"),
+        "extensions are parsed but have no language — they reach the graph as \
+         \"unknown\" (#83):\n{out}"
+    );
+    assert!(
+        out.contains("extra 0 []"),
+        "the language map claims a language for something nothing parses, and \
+         nothing declares it an exception (#83):\n{out}"
+    );
+    assert!(out.contains("unknown []"), "an extension is mapped to the literal \"unknown\":\n{out}");
+    let n: usize = out
+        .lines()
+        .find_map(|l| l.strip_prefix("count ")?.trim().parse().ok())
+        .expect("no count line");
+    assert!(n >= 60, "the language map collapsed to {n} entries:\n{out}");
+}
+
+/// #83: a new extractor with no language is a loud failure at import, not a
+/// silent "unknown" in every map built afterwards — the same choice
+/// `_parsed_extensions` makes, and the reason this class of drift ends here.
+#[test]
+fn an_extractor_with_no_language_fails_loudly() {
+    let out = py(r#"
+import sys; sys.path.insert(0, ".")
+import extractor, onto_ast as o
+def extract_nothing(path): return {}
+extractor._DISPATCH[".plover"] = extract_nothing
+try:
+    o._build_lang_map()
+    print("RESULT no-error")
+except RuntimeError as e:
+    print("RESULT raised", ".plover" in str(e) and "extract_nothing" in str(e))
+"#);
+    assert!(
+        out.contains("RESULT raised True"),
+        "an unmapped extractor must raise, and the message must name the \
+         extension and the function (#83):\n{out}"
+    );
+}
+
+/// #84: the markup around a single-file component's `<script>` block is blanked
+/// before parsing, and the blanking preserves every byte offset and line break.
+///
+/// This is the deterministic core of the fix and it needs no grammar. What the
+/// JS parser then MAKES of those bytes is measured in
+/// `verification/base-0.14.2/ast_followups_0142.sh`, which has the 28 wheels.
+#[test]
+fn sfc_script_isolation_preserves_offsets() {
+    let out = py(r#"
+import sys; sys.path.insert(0, ".")
+from extractor import _sfc_script_only
+src = b"<template>\n  <div>{{ x }}</div>\n</template>\n<script>\nfunction f() {}\n</script>\n<style>a{}</style>\n"
+got = _sfc_script_only(src)
+print("same_len", len(got) == len(src))
+print("same_lines", got.count(b"\n") == src.count(b"\n"))
+print("newlines_aligned", [i for i,b in enumerate(src) if b == 10] == [i for i,b in enumerate(got) if b == 10])
+print("kept_script", b"function f() {}" in got)
+print("dropped_template", b"<div>" not in got and b"<style>" not in got)
+print("offset_kept", got.index(b"function f() {}") == src.index(b"function f() {}"))
+print("no_block", _sfc_script_only(b"export function plain() {}\n") is None)
+"#);
+    for row in [
+        "same_len True",
+        "same_lines True",
+        "newlines_aligned True",
+        "kept_script True",
+        "dropped_template True",
+        "offset_kept True",
+        "no_block True",
+    ] {
+        assert!(
+            out.contains(row),
+            "#84: `{row}` did not hold — an SFC's line numbers or script body \
+             would be wrong:\n{out}"
+        );
+    }
+}
+

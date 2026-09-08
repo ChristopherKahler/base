@@ -9,26 +9,99 @@ import argparse
 import sys
 from pathlib import Path
 
-from extractor import extract, _get_extractor, _safe_extract, collect_files, _make_id, _file_stem
+from extractor import (
+    extract, _get_extractor, _safe_extract, collect_files, _make_id, _file_stem,
+    _DISPATCH,
+)
 from ttl_serializer import serialize
 
-LANG_MAP = {
-    ".py": "python", ".js": "javascript", ".ts": "typescript", ".tsx": "typescript",
-    ".jsx": "javascript", ".svelte": "svelte", ".astro": "astro",
-    ".java": "java", ".groovy": "groovy", ".kt": "kotlin", ".scala": "scala",
-    ".c": "c", ".h": "c", ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp",
-    ".rb": "ruby", ".cs": "csharp", ".php": "php", ".blade.php": "php",
-    ".dart": "dart", ".v": "verilog", ".sv": "verilog",
-    ".sql": "sql", ".lua": "lua", ".swift": "swift", ".jl": "julia",
-    ".f90": "fortran", ".f95": "fortran", ".f03": "fortran", ".f08": "fortran",
-    ".go": "go", ".rs": "rust", ".zig": "zig",
-    ".ps1": "powershell", ".psm1": "powershell",
-    ".m": "objective-c", ".mm": "objective-c",
-    ".ex": "elixir", ".exs": "elixir",
-    ".md": "markdown", ".pas": "pascal", ".pp": "pascal",
-    ".sh": "bash", ".bash": "bash", ".zsh": "bash",
-    ".json": "json",
+# The language an extension is reported as, derived from the extractor it
+# dispatches to.
+#
+# #83: this was a third hand-kept list beside `_DISPATCH` (what is parsed) and
+# `_FILE_EXTS` (what counts as a file), and it had drifted from both -- 22
+# parsed extensions with no entry here, falling back to "unknown", and two
+# entries (`.psm1`, `.zsh`) claiming a language for files nothing ever parsed.
+# #66 derived `_FILE_EXTS` from `_DISPATCH` for exactly this reason and left
+# this list alone; it then widened the gap by one, adding `.cjs` to the parser
+# table and not to this map.
+#
+# 32 of the 33 extractors serve exactly one language, so the language is a
+# property of the extractor rather than of the extension. Only `extract_js`
+# serves several, and those extensions are named in `_EXT_LANG` below. A new
+# entry in `_DISPATCH` therefore gets a language for free, and one whose
+# extractor is not named here fails loudly at import rather than reaching the
+# graph as "unknown" -- the same choice `_parsed_extensions` makes, and for the
+# same reason: a silent degraded default is the failure this exists to kill.
+_EXTRACTOR_LANG = {
+    "extract_astro": "astro",
+    "extract_bash": "bash",
+    "extract_c": "c",
+    "extract_cpp": "cpp",
+    "extract_csharp": "csharp",
+    "extract_dart": "dart",
+    "extract_delphi_form": "pascal",
+    "extract_elixir": "elixir",
+    "extract_fortran": "fortran",
+    "extract_go": "go",
+    "extract_groovy": "groovy",
+    "extract_java": "java",
+    "extract_js": "javascript",
+    "extract_json": "json",
+    "extract_julia": "julia",
+    "extract_kotlin": "kotlin",
+    "extract_lazarus_form": "pascal",
+    "extract_lazarus_package": "pascal",
+    "extract_lua": "lua",
+    "extract_markdown": "markdown",
+    "extract_objc": "objective-c",
+    "extract_pascal": "pascal",
+    "extract_php": "php",
+    "extract_powershell": "powershell",
+    "extract_python": "python",
+    "extract_ruby": "ruby",
+    "extract_rust": "rust",
+    "extract_scala": "scala",
+    "extract_sql": "sql",
+    "extract_svelte": "svelte",
+    "extract_swift": "swift",
+    "extract_verilog": "verilog",
+    "extract_zig": "zig",
 }
+
+# Extensions whose language is not the one their extractor implies.
+# `.blade.php` is not a `_DISPATCH` key at all -- `_get_extractor` matches it on
+# the full filename -- so it is carried here or it is carried nowhere.
+_EXT_LANG = {
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".vue": "vue",
+    ".blade.php": "php",
+}
+
+
+def _build_lang_map() -> dict[str, str]:
+    """Every parsed extension, with the language it is reported as."""
+    mapping = dict(_EXT_LANG)
+    unknown = []
+    for ext, extractor_fn in _DISPATCH.items():
+        if ext in mapping:
+            continue
+        name = getattr(extractor_fn, "__name__", "")
+        language = _EXTRACTOR_LANG.get(name)
+        if language is None:
+            unknown.append(f"{ext} -> {name or extractor_fn!r}")
+        else:
+            mapping[ext] = language
+    if unknown:
+        raise RuntimeError(
+            "extension(s) in _DISPATCH whose extractor has no language in "
+            "_EXTRACTOR_LANG: " + ", ".join(sorted(unknown))
+        )
+    return mapping
+
+
+LANG_MAP = _build_lang_map()
 
 
 def extract_single(path: Path) -> dict:
