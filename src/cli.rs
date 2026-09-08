@@ -2737,13 +2737,7 @@ pub fn run() {
                     let answered =
                         base::relay::task_inbox::clear_pings_from(&config.namespace, &to, &my_titles);
                     let kind = if answered > 0 { "reply" } else { "ping" };
-                    let id = format!(
-                        "ping-{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis())
-                            .unwrap_or(0)
-                    );
+                    let id = base::relay::ping_slug();
                     let ping = base::relay::task_inbox::InboxTask {
                         slug: id.clone(),
                         summary: msg.clone(),
