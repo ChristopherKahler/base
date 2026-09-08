@@ -37,7 +37,7 @@ pub fn run(
     let local_bin = home.join(".local").join("bin");
     let names = crate::home::base_binary_names();
     let dests: Vec<_> = names.iter().map(|n| local_bin.join(n)).collect();
-    println!(
+    print!(
         "1. Install binary → {} ... ",
         dests
             .iter()
