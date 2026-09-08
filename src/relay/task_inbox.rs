@@ -326,10 +326,20 @@ fn render_loud_ping(task: &InboxTask) -> String {
     )
 }
 
+/// The message starts its own line, like every other renderer here, and that
+/// is load-bearing rather than cosmetic (#101): `hook/mod.rs` matches star
+/// commands against this rendered block, and a command only activates in the
+/// leading star-run of a line. `cli.rs` marks a send `kind = "reply"` whenever
+/// the target has an unanswered ping from the sender, so the operator
+/// ANSWERING a session's question arrives here — interpolating the message
+/// after a prefix would make a command in it unreachable. Same for
+/// [`render_notify`]. Pinned by
+/// `every_renderer_puts_the_operator_message_on_its_own_line`.
 fn render_reply(task: &InboxTask) -> String {
     format!(
         "<relay-ping-reply from=\"{from}\" to=\"{title}\">\n\
-         🔔 PING REPLY from {from}: {msg}\n\
+         🔔 PING REPLY from {from}:\n\
+         {msg}\n\
          {refs}\
          Consumed — no acknowledgment needed. Fold it into your work, continue, and mention it in one line of your response.\n\
          </relay-ping-reply>\n",
@@ -343,7 +353,8 @@ fn render_reply(task: &InboxTask) -> String {
 fn render_notify(task: &InboxTask) -> String {
     format!(
         "<relay-message-inbound from=\"{from}\" to=\"{title}\">\n\
-         📨 RELAY MESSAGE from {from}: {msg}\n\
+         📨 RELAY MESSAGE from {from}:\n\
+         {msg}\n\
          {refs}\
          The full message queue is in the workspace relay spool — consume it now (marks it seen): base relay poll\n\
          </relay-message-inbound>\n",

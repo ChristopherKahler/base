@@ -110,24 +110,52 @@ fn merge_commands(base: Vec<CommandDef>, overlay: Vec<CommandDef>) -> Vec<Comman
 
 // ─── Matching ───────────────────────────────────────────────
 
-/// Find every *COMMAND token anywhere in the prompt and return the matching
-/// commands, in first-seen order, deduped. Composition is the point: stacking
-/// two modes in one prompt activates both — "*audit *steelman review this" →
-/// [AUDIT, STEELMAN]. Matching is case-insensitive and tolerant of trailing
-/// punctuation (*blunt, → BLUNT).
+/// Find the *COMMAND tokens ADDRESSED in a prompt and return the matching
+/// commands, in first-seen order, deduped.
+///
+/// A token activates only inside the **leading run of star-prefixed tokens on
+/// its line**: walk each line from the first token while every token begins
+/// with `*`; the first token that does not ends the run, and everything after
+/// it on that line is prose. Composition is the point and survives — stacking
+/// two modes activates both, "*audit *steelman review this" → [AUDIT,
+/// STEELMAN] — because both tokens are inside the run, and `*name arg arg`
+/// works because the first argument is what ends it. Matching inside the run
+/// is unchanged: case-insensitive, and tolerant of trailing punctuation
+/// (*blunt, → BLUNT).
+///
+/// The position rule is #101: an instruction must be ADDRESSED, not merely
+/// PRESENT. Scanning every token meant a peer quoting another peer, a bug
+/// report about a command, or a boot brief telling a session *not* to run one
+/// all activated it — five measured times, in every role in a build round, and
+/// `*end` chains `fork create` / `sync` / `handoff create` with no
+/// confirmation. It also silently cost the receiving session its domain-rules
+/// injection, because `user_prompt_submit` returns early on a match.
+///
+/// Two shapes remain, deliberately: a quoted block whose *line* begins with a
+/// bare token, and line-start italic. Both are byte-identical to a real
+/// invocation, so no positional rule can separate them — only a sender-origin
+/// gate can, which is the operator's call and not this function's.
 pub fn match_commands<'a>(prompt: &str, commands: &'a [CommandDef]) -> Vec<&'a CommandDef> {
     let mut matched: Vec<&CommandDef> = Vec::new();
-    for token in prompt.split_whitespace() {
-        let Some(rest) = token.strip_prefix('*') else { continue };
-        // Tolerate trailing punctuation: "*blunt," / "*audit." still match.
-        let name = rest.trim_end_matches(|c: char| !c.is_alphanumeric());
-        if name.is_empty() {
-            continue;
-        }
-        if let Some(cmd) = commands.iter().find(|c| c.name.eq_ignore_ascii_case(name))
-            && !matched.iter().any(|m| m.name.eq_ignore_ascii_case(&cmd.name))
-        {
-            matched.push(cmd);
+    for line in prompt.lines() {
+        for token in line.split_whitespace() {
+            // The run ends at the first token that is not star-prefixed.
+            let Some(rest) = token.strip_prefix('*') else { break };
+            // Tolerate trailing punctuation: "*blunt," / "*audit." still match.
+            let name = rest.trim_end_matches(|c: char| !c.is_alphanumeric());
+            // A lone `*` is a bullet or an emphasis marker, never an
+            // invocation, so it ends the run rather than being skipped over.
+            if name.is_empty() {
+                break;
+            }
+            // An unknown name does NOT end the run: a typo or a command this
+            // tier has not loaded must not silently disarm the rest of a
+            // deliberate stack.
+            if let Some(cmd) = commands.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+                && !matched.iter().any(|m| m.name.eq_ignore_ascii_case(&cmd.name))
+            {
+                matched.push(cmd);
+            }
         }
     }
     matched
