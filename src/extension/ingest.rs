@@ -62,20 +62,23 @@ pub fn ingest_extension(
         return Ok(IngestStats::default());
     }
 
-    // Load workspace graph
-    let (graph_store, trig_path) = crud::load_workspace_store(cwd)
-        .context("Failed to load workspace store for ingest")?;
+    // #87: lock the workspace graph, THEN load it; the guard on `locked` holds to
+    // the end of the function so the load and the conditional write are one
+    // critical section.
+    let locked = crud::lock_and_load_workspace(cwd)
+        .context("Failed to lock and load workspace store for ingest")?;
+    let graph_store = locked.store();
     let ns = &config.namespace;
     let ws_slug = crud::workspace_slug(cwd);
     let graph_iri = crud::workspace_graph_iri(ns, &ws_slug);
 
     // Snapshot the target graph so the record carries the delta, not just a label.
-    let before = store::snapshot_graphs(&graph_store, std::slice::from_ref(&graph_iri));
+    let before = store::snapshot_graphs(graph_store, std::slice::from_ref(&graph_iri));
     let pfx = crud::prefixes(ns);
     let p = &ns.prefix;
 
     let ctx = IngestCtx {
-        store: &graph_store,
+        store: graph_store,
         ns,
         graph_iri: &graph_iri,
         pfx: &pfx,
@@ -125,9 +128,10 @@ pub fn ingest_extension(
     // Write back if we changed anything
     if graph_dirty {
         let op = format!("extension.ingest:{}", ext.name);
-        let delta = store::delta_since(&graph_store, std::slice::from_ref(&graph_iri), before);
+        let delta = store::delta_since(graph_store, std::slice::from_ref(&graph_iri), before);
         let ops = delta.to_ops();
-        store::write_back(&graph_store, &trig_path, Change::OpWithDelta(&op, &ops))
+        locked
+            .write(Change::OpWithDelta(&op, &ops))
             .with_context(|| format!("Failed to write back graph after ext:{} ingest", ext.name))?;
     }
 

@@ -445,27 +445,21 @@ pub fn run(graph_path: &Path, input: &str) -> (Value, i32) {
         return (Outcome::default().to_json(), 0);
     }
 
-    // A machine that has never written anything has no graph.nq yet, and a first
-    // pull is exactly that case — so start from an empty store rather than
-    // refusing, matching `crud::load_workspace_store`, the write path `base learn`
-    // already takes on a fresh home.
-    let store = if graph_path.exists() {
-        match crate::store::load_graph(graph_path) {
-            Ok(s) => s,
-            Err(e) => {
-                return (OpError::whole("graph_load_failed", e.to_string()).to_json(), 1);
-            }
-        }
-    } else {
-        match Store::new() {
-            Ok(s) => s,
-            Err(e) => {
-                return (OpError::whole("store_init_failed", e.to_string()).to_json(), 1);
-            }
+    // #87: lock, THEN load, and the conditional is gone rather than moved.
+    // `lock_and_load_graph` loads through `load_or_empty`, which already answers
+    // the case this branch existed for: a machine that has never written anything
+    // has no graph.nq yet, and a first pull is exactly that — an empty store, not
+    // a refusal. One route now covers both, so there is no second path to keep in
+    // step. The guard holds to the end of the function, covering the write below.
+    let locked = match crate::store::lock_and_load_graph(graph_path) {
+        Ok(g) => g,
+        Err(e) => {
+            return (OpError::whole("graph_load_failed", e.to_string()).to_json(), 1);
         }
     };
+    let store = locked.store();
 
-    let outcome = match apply(&store, &prepared) {
+    let outcome = match apply(store, &prepared) {
         Ok(o) => o,
         Err(e) => return (e.to_json(), 1),
     };
@@ -476,8 +470,7 @@ pub fn run(graph_path: &Path, input: &str) -> (Value, i32) {
         return (outcome.to_json(), 0);
     }
 
-    if let Err(e) = crate::store::write_back(&store, graph_path, Change::RemoteOps(&outcome.records))
-    {
+    if let Err(e) = locked.write(Change::RemoteOps(&outcome.records)) {
         return (OpError::whole("write_failed", e.to_string()).to_json(), 1);
     }
     (outcome.to_json(), 0)

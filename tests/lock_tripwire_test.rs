@@ -81,12 +81,14 @@ const FS_PRIMITIVES: [&str; 7] = [
 /// its own guard cannot read is the false-RED twin of the false-PASS this file
 /// exists to prevent, so [`every_lock_token_actually_clears_the_flag`] now fails
 /// the suite for any entry here that has no effect.
-const LOCK_TOKENS: [&str; 6] = [
+const LOCK_TOKENS: [&str; 8] = [
     "with_graph_lock(",
     "lock_graph(",
     "lock_graph_bulk(",
+    "lock_for_rebuild(",
     "locked_update(",
     "lock_and_load(",
+    "lock_and_load_workspace(",
     "mutate_file_if_holds(",
 ];
 
@@ -143,22 +145,18 @@ const GRAPH_SIGNALS: [&str; 12] = [
 /// exempted `migrate_trig_to_nq`, whose unlocked `write_back` at `store.rs:74`
 /// is site TEN of #87's own table, and would have exempted the next one added
 /// beside it. The three real seam writers are named in [`ALLOW_WRITE_FNS`].
-const ALLOW_FILES: [(&str, &str); 11] = [
+/// The nine `(#87)` entries that used to sit here are GONE, and their absence is
+/// the acceptance leg for the migration. Each named a Tier C writer that reached
+/// the seam's whole-file write from a pre-lock snapshot; all nine now go through
+/// `LockedGraph`, and `write_back` is private, so no caller outside `store.rs`
+/// can reach it whatever this list says.
+const ALLOW_FILES: [(&str, &str); 2] = [
     (
         "src/dashboard/api.rs",
         "the dashboard holds a long-lived in-memory Store (server.rs:62,68) that these mutate \
          and write back, so reload-under-lock would diverge that cache from the file. It is \
          being deprecated and is not getting the lock (Chris, 2026-09-07)",
     ),
-    ("src/extract/mod.rs", "one-shot bulk rebuild (#87)"),
-    ("src/extract/paul_toml.rs", "one-shot bulk rebuild (#87)"),
-    ("src/extension/ingest.rs", "one-shot bulk ingest (#87)"),
-    ("src/standards/sync.rs", "one-shot bulk sync (#87)"),
-    ("src/domain/sync.rs", "one-shot bulk sync (#87)"),
-    ("src/apply_ops.rs", "remote op application, bulk (#87)"),
-    ("src/doctor.rs", "doctor.repair, whole-file rebuild (#87)"),
-    ("src/graph.rs", "graph.compact, whole-file rebuild (#87)"),
-    ("src/migrate.rs", "migration, one-shot (#87)"),
     ("src/hook/session_start.rs", "no graph write; listed if a call appears"),
 ];
 
@@ -202,7 +200,7 @@ const ALLOW_WRITE_FNS: [(&str, &str, &str); 3] = [
 /// naming a graph path. **Every reason names the file the function actually
 /// writes** — an exemption that cannot say what it writes is not an exemption,
 /// it is a hole.
-const ALLOW_FNS: [(&str, &str, &str); 9] = [
+const ALLOW_FNS: [(&str, &str, &str); 8] = [
     (
         "src/store.rs",
         "write_back_inner",
@@ -225,12 +223,6 @@ const ALLOW_FNS: [(&str, &str, &str); 9] = [
         "restore_tier",
         "#87: fs::copy + fs::rename straight over the graph. Takes the lock with the migration; \
          this entry is removed then",
-    ),
-    (
-        "src/doctor.rs",
-        "repair_tier",
-        "writes the .quarantine-<stamp> sidecar, NOT the graph. Its graph write is write_back \
-         at :793 and is Rule 1's (#87)",
     ),
     (
         "src/graph.rs",

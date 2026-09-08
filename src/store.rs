@@ -725,13 +725,32 @@ impl FileIdentity {
 pub struct LockedGraph {
     path: PathBuf,
     store: Store,
+    /// False only for a value from [`lock_for_rebuild`], whose file could not be
+    /// parsed. Read by [`LockedGraph::store`], which refuses to hand back a
+    /// store that is not the file.
+    store_is_the_file: bool,
     identity: std::cell::Cell<FileIdentity>,
     _guard: GraphLockGuard,
 }
 
 impl LockedGraph {
     /// The store, loaded inside the lock.
+    ///
+    /// # Panics
+    ///
+    /// If this value came from [`lock_for_rebuild`], where the file could not be
+    /// parsed and there is therefore no loaded store to hand back. A silently
+    /// EMPTY store returned to a caller that expected the file's contents is a
+    /// worse failure than a loud one: it would serialize as a valid, empty graph
+    /// and erase everything. That is a programming error, not a runtime
+    /// condition, so it is an assert rather than a `Result`.
     pub fn store(&self) -> &Store {
+        assert!(
+            self.store_is_the_file,
+            "store() on a LockedGraph from lock_for_rebuild: the file could not be \
+             parsed, so there is no loaded store. That caller brings its own store \
+             and writes it through write_store."
+        );
         &self.store
     }
 
@@ -747,7 +766,9 @@ impl LockedGraph {
 
     /// Write the store this value loaded.
     pub fn write(&self, change: Change<'_>) -> Result<()> {
-        self.write_store(&self.store, change)
+        // Through `store()`, not the field, so a `lock_for_rebuild` value cannot
+        // reach the write path with an empty store by this route either.
+        self.write_store(self.store(), change)
     }
 
     /// Write a store this value did NOT load.
@@ -808,6 +829,27 @@ pub fn lock_and_load_graph(path: &Path) -> Result<LockedGraph> {
     Ok(LockedGraph {
         path: path.to_path_buf(),
         store,
+        store_is_the_file: true,
+        identity: std::cell::Cell::new(identity),
+        _guard: guard,
+    })
+}
+
+/// Take the graph lock on the bulk bound and record the identity WITHOUT loading.
+///
+/// For the one writer whose file cannot be parsed. `doctor --repair` runs on an
+/// UNHEALTHY graph by definition, so [`lock_and_load_graph`] is unusable there:
+/// its load would fail on exactly the file the repair exists to fix. The
+/// returned value's [`LockedGraph::store`] is NOT the file's contents and
+/// panics if called; that caller brings its own store, built from a lenient
+/// re-parse, and writes it through [`LockedGraph::write_store`].
+pub fn lock_for_rebuild(path: &Path) -> Result<LockedGraph> {
+    let guard = lock_graph_bulk(path)?;
+    let identity = FileIdentity::of(path)?;
+    Ok(LockedGraph {
+        path: path.to_path_buf(),
+        store: Store::new().context("creating the placeholder store for a rebuild lock")?,
+        store_is_the_file: false,
         identity: std::cell::Cell::new(identity),
         _guard: guard,
     })
@@ -816,12 +858,20 @@ pub fn lock_and_load_graph(path: &Path) -> Result<LockedGraph> {
 /// Serialize the store to NQuads and write atomically (temp + rename).
 /// Validates the output by re-parsing before committing the rename.
 ///
+/// **PRIVATE since #87, and the privacy is the fix.** This is a whole-file
+/// overwrite that takes NO lock, so any caller holding a pre-lock snapshot
+/// erases whatever landed in between and reports success. Nine callers outside
+/// this module did exactly that. They now go through [`LockedGraph::write`],
+/// which cannot be constructed without the lock, so the compile error IS the
+/// acceptance leg: a tenth caller cannot be added from outside this file.
+/// [`write_back_seamed`] is the test-only entry and is feature-gated.
+///
 /// `change` describes what produced this write and is appended to the sibling
 /// `changes.jsonl` **after** the rename commits -- see [`crate::changelog`]. It is a
 /// required parameter rather than an optional call at each writer because a writer
 /// that forgets to log is indistinguishable, to the reader, from no write at all;
 /// requiring it makes that a compile error instead of a silent gap.
-pub fn write_back(store: &Store, path: &Path, change: Change<'_>) -> Result<()> {
+fn write_back(store: &Store, path: &Path, change: Change<'_>) -> Result<()> {
     // No identity expectation: this entry point is the unlocked whole-file route
     // the deprecated dashboard uses, and it has no load to compare against.
     // Writers that hold a [`LockedGraph`] go through its `write`, which does.
@@ -1397,6 +1447,40 @@ pub fn load_or_empty(path: &Path) -> Result<Store> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The claim `tests/write_back_test.rs` can no longer make: the two entry
+    /// points into the seam produce identical bytes.
+    ///
+    /// It lives here because `write_back` is private since #87, so only a test
+    /// inside this module can call both sides. Without it, "write_back_seamed
+    /// with no injection behaves exactly like write_back" is an assertion about
+    /// two functions that nothing compares.
+    #[test]
+    fn the_two_entry_points_write_identical_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let via_private = dir.path().join("private.nq");
+        let via_seam = dir.path().join("seam.nq");
+
+        let store = Store::new().unwrap();
+        store
+            .insert(&oxigraph::model::Quad::new(
+                oxigraph::model::NamedNode::new("http://test.local/s").unwrap(),
+                oxigraph::model::NamedNode::new("http://test.local/p").unwrap(),
+                oxigraph::model::Literal::new_simple_literal("v"),
+                oxigraph::model::GraphName::NamedNode(
+                    oxigraph::model::NamedNode::new("http://test.local/g").unwrap(),
+                ),
+            ))
+            .unwrap();
+
+        write_back(&store, &via_private, Change::Op("test.private")).unwrap();
+        write_back_seamed(&store, &via_seam, Change::Op("test.seam"), |f| f, None, None).unwrap();
+
+        let a = fs::read(&via_private).unwrap();
+        let b = fs::read(&via_seam).unwrap();
+        assert!(!a.is_empty(), "precondition: the private entry wrote something");
+        assert_eq!(a, b, "the two entry points must write identical bytes");
+    }
     use std::io::Write;
 
     fn write_file(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {

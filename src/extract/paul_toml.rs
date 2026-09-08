@@ -194,13 +194,15 @@ pub fn ingest_paul_projects(
     projects: &[(PathBuf, PaulToml)],
 ) -> Result<IngestStats> {
     let ns = &config.namespace;
-    let (store, trig_path) = crud::load_workspace_store(cwd)?;
+    // #87: lock, THEN load; the guard on `locked` holds to the end of the function.
+    let locked = crud::lock_and_load_workspace(cwd)?;
+    let store = locked.store();
 
     // Whole-store snapshot, not a per-graph one: this writer picks a target graph
     // per project as it goes (a project can be scoped to another workspace), so
     // the set is not known until the loop has run. It is affordable here because
     // this runs when a paul.toml changes, not on every tool call.
-    let before = crate::store::snapshot_graphs(&store, &[]);
+    let before = crate::store::snapshot_graphs(store, &[]);
     // Per-project home routing: a project's named graph comes from where it physically
     // lives (scope::home of its discovered dir), NOT the CWD slug — so the tag is correct
     // and CWD-independent (re-running session-start never re-pollutes). Unscoped → CWD slug.
@@ -256,7 +258,7 @@ pub fn ingest_paul_projects(
         // F25: what the store already holds for this project, `updatedAt` excluded.
         // Compared against the same set after the re-ingest, it decides whether this
         // project really changed — and so whether the store is touched at all.
-        let managed_before = managed_quads(&store, ns, &iri, &graph);
+        let managed_before = managed_quads(store, ns, &iri, &graph);
 
         let _ = store.update(&delete);
 
@@ -331,7 +333,7 @@ pub fn ingest_paul_projects(
         // store untouched, which is what keeps `migrate_tiers`' delta gate closed: the
         // old unconditional refresh moved the store's identity every session, re-opened
         // that gate, and bought a full re-plan that was then discarded (F25).
-        let managed_after = managed_quads(&store, ns, &iri, &graph);
+        let managed_after = managed_quads(store, ns, &iri, &graph);
         if managed_after != managed_before {
             let touch = format!(
                 "{pfx}\n\
@@ -346,7 +348,7 @@ pub fn ingest_paul_projects(
         }
     }
 
-    let delta = crate::store::delta_since(&store, &[], before);
+    let delta = crate::store::delta_since(store, &[], before);
 
     // F25: nothing moved, so do not rewrite the whole store to change nothing. The
     // rewrite was unconditional, it moved the store's identity, and
@@ -360,7 +362,7 @@ pub fn ingest_paul_projects(
     }
 
     let ops = delta.to_ops();
-    crate::store::write_back(&store, &trig_path, Change::OpWithDelta("extract.paul_toml", &ops))?;
+    locked.write(Change::OpWithDelta("extract.paul_toml", &ops))?;
 
     Ok(IngestStats {
         scanned: projects.len(),

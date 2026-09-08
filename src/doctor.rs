@@ -776,6 +776,16 @@ pub fn repair_tier(tier: &str, path: &Path) -> Result<RepairOutcome> {
         GraphHealth::Missing => Ok(base(None, None, 0, 0, true)),
         GraphHealth::Healthy => Ok(base(None, None, count_lines(path), 0, true)),
         GraphHealth::Unhealthy { .. } => {
+            // #87: the lock is taken before the snapshot, so the backup, the
+            // lenient re-parse and the rewrite all describe one file.
+            //
+            // NOT `lock_and_load_graph`: this arm runs on a graph that does not
+            // parse, so a load here would fail on exactly the file the repair
+            // exists to fix. `lock_for_rebuild` takes the lock and records the
+            // identity without loading, and the rebuilt store goes through
+            // `write_store`.
+            let locked = store::lock_for_rebuild(path)?;
+
             // 1. Snapshot first (rotating, in-binary backup — Phase 36 store::snapshot).
             let backup_path = store::snapshot(path, "pre-repair")
                 .context("failed to back up before repair")?;
@@ -800,7 +810,7 @@ pub fn repair_tier(tier: &str, path: &Path) -> Result<RepairOutcome> {
             };
 
             // 4. Atomic rewrite of the good set (temp → validate → rename).
-            store::write_back(&good, path, Change::Op("doctor.repair"))?;
+            locked.write_store(&good, Change::Op("doctor.repair"))?;
 
             // 5. Re-verify.
             let healthy_after = matches!(store::graph_health(path), GraphHealth::Healthy);

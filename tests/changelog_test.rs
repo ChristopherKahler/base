@@ -193,7 +193,15 @@ fn deltaless_writes_are_logged_with_a_kind_not_dropped() {
     let graph_path = ws.join(".base").join("graph.nq");
 
     let store = oxigraph::store::Store::new().unwrap();
-    base::store::write_back(&store, &graph_path, Change::Op("graph.compact")).unwrap();
+    base::store::write_back_seamed(
+        &store,
+        &graph_path,
+        Change::Op("graph.compact"),
+        |f| f,
+        None,
+        None,
+    )
+    .unwrap();
 
     let recs = lines(&ws);
     assert_eq!(recs.len(), 1, "a silent write would be worse than an unlabelled one");

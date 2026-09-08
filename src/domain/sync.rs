@@ -58,13 +58,15 @@ fn sync_domain_list(
     domains: &[domain::DomainDef],
     carl_json_path: Option<&Path>,
 ) -> Result<SyncStats> {
-    let (store, trig_path) = crud::load_workspace_store(cwd)?;
+    // #87: lock, THEN load; the guard on `locked` holds to the end of the function.
+    let locked = crud::lock_and_load_workspace(cwd)?;
+    let store = locked.store();
     let ws_slug = crud::workspace_slug(cwd);
     let graph = crud::workspace_graph_iri(ns, &ws_slug);
     // Snapshot the one graph this writer targets, so the record can carry what
     // actually changed instead of only a label. Scoped to the target graph
     // because this runs often and diffing the whole store would not be free.
-    let before = crate::store::snapshot_graphs(&store, std::slice::from_ref(&graph));
+    let before = crate::store::snapshot_graphs(store, std::slice::from_ref(&graph));
 
     let pfx = crud::prefixes(ns);
     let p = &ns.prefix;
@@ -209,15 +211,15 @@ fn sync_domain_list(
 
     // Migrate rules + decisions from carl.json if provided
     let (carl_rules, total_decisions) = if let Some(carl_path) = carl_json_path {
-        sync_carl_decisions(&store, ns, &graph, &pfx, carl_path)?
+        sync_carl_decisions(store, ns, &graph, &pfx, carl_path)?
     } else {
         (0, 0)
     };
     total_rules += carl_rules;
 
-    let delta = crate::store::delta_since(&store, std::slice::from_ref(&graph), before);
+    let delta = crate::store::delta_since(store, std::slice::from_ref(&graph), before);
     let ops = delta.to_ops();
-    crate::store::write_back(&store, &trig_path, Change::OpWithDelta("domain.sync", &ops))?;
+    locked.write(Change::OpWithDelta("domain.sync", &ops))?;
 
     Ok(SyncStats {
         domains: domains.len(),

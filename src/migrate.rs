@@ -323,9 +323,13 @@ pub fn migrate_tier(
         return Ok(out);
     }
 
-    let store = store::load_graph(path)?;
+    // #87: lock, THEN load. The snapshot at the write branch below is already
+    // inside this critical section, and the `graph_health` probe above is a READ,
+    // which deliberately never takes this lock.
+    let locked = store::lock_and_load_graph(path)?;
+    let store = locked.store();
 
-    let stamped = stamp_of(&store, ns, graph_iri).as_deref() == Some(SCHEMA_VERSION);
+    let stamped = stamp_of(store, ns, graph_iri).as_deref() == Some(SCHEMA_VERSION);
 
     // The fast path, and ONLY for the hook. Not a truth source — the work below is
     // recomputed from the store whenever it is not taken, so a restored
@@ -343,7 +347,7 @@ pub fn migrate_tier(
     // delta pass below re-plans it. The cheap skip already happened, above.
 
     let root = path.parent().and_then(Path::parent).unwrap_or(path).to_path_buf();
-    let facts = Facts::gather(&store, ns, root);
+    let facts = Facts::gather(store, ns, root);
     let plan = plan_backfill(&facts, ns);
 
     // Re-planned and there is genuinely nothing to do. Return without touching the
@@ -370,15 +374,16 @@ pub fn migrate_tier(
         if !is_delta {
             out.backup = Some(store::snapshot(path, "migrate")?.display().to_string());
         }
-        apply(&store, ns, graph_iri, &plan, &mut out)?;
+        apply(store, ns, graph_iri, &plan, &mut out)?;
     }
 
-    write_stamp(&store, ns, graph_iri)?;
+    write_stamp(store, ns, graph_iri)?;
     out.stamped = true;
     out.delta = is_delta;
 
     let label = if is_delta { "migrate.domain-1.delta" } else { "migrate.domain-1" };
-    store::write_back(&store, path, Change::Op(label))
+    locked
+        .write(Change::Op(label))
         .context("migration write-back failed — the store is unchanged")?;
     stamp_delta_marker(path);
 

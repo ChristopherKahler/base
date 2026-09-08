@@ -23,13 +23,19 @@ pub struct SyncReport {
 /// Run sync: scan workspace files, extract metadata to graph.
 pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncReport> {
     let ns = &config.namespace;
-    let (store, trig_path) = crud::load_workspace_store(cwd)?;
+    // #87: lock, THEN load. The guard lives on `locked`, so the critical section
+    // runs to the end of this function — and this is the WIDEST load-to-write
+    // window in the tree, which is why both forks lost on 2026-09-07 went through
+    // it: `fork create` succeeded, then `base sync` overwrote the file from a
+    // snapshot taken before it.
+    let locked = crud::lock_and_load_workspace(cwd)?;
+    let store = locked.store();
     let ws_slug = crud::workspace_slug(cwd);
     let graph_iri = crud::workspace_graph_iri(ns, &ws_slug);
     // Snapshot the one graph this writer targets, so the record can carry what
     // actually changed instead of only a label. Scoped to the target graph
     // because this runs often and diffing the whole store would not be free.
-    let before = crate::store::snapshot_graphs(&store, std::slice::from_ref(&graph_iri));
+    let before = crate::store::snapshot_graphs(store, std::slice::from_ref(&graph_iri));
 
     let prefixes = crud::prefixes(ns);
 
@@ -60,7 +66,7 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
 
         // Incremental: check mtime vs lastExtracted
         if incremental
-            && let Some(true) = is_up_to_date(&store, &file_iri, file_path, ns)
+            && let Some(true) = is_up_to_date(store, &file_iri, file_path, ns)
         {
             report.skipped += 1;
             continue;
@@ -178,14 +184,14 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
     }
 
     // Extract ledger.toml (append-only session ledger for cost attribution)
-    let ledger_count = ledger::extract_ledger(cwd, &store, ns, &graph_iri);
+    let ledger_count = ledger::extract_ledger(cwd, store, ns, &graph_iri);
     if ledger_count > 0 {
         report.extracted += ledger_count;
     }
 
-    let delta = crate::store::delta_since(&store, std::slice::from_ref(&graph_iri), before);
+    let delta = crate::store::delta_since(store, std::slice::from_ref(&graph_iri), before);
     let ops = delta.to_ops();
-    crate::store::write_back(&store, &trig_path, Change::OpWithDelta("extract.markdown", &ops))?;
+    locked.write(Change::OpWithDelta("extract.markdown", &ops))?;
     Ok(report)
 }
 

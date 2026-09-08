@@ -137,7 +137,15 @@ fn test_round_trip() {
     // Write to temp file
     let tmp_dir = tempfile::tempdir().unwrap();
     let tmp_path = tmp_dir.path().join("roundtrip.nq");
-    base::store::write_back(&store, &tmp_path, base::changelog::Change::Op("test")).unwrap();
+    base::store::write_back_seamed(
+        &store,
+        &tmp_path,
+        base::changelog::Change::Op("test"),
+        |f| f,
+        None,
+        None,
+    )
+    .unwrap();
 
     // Reload from written file
     let store2 = base::store::load_graph(&tmp_path).unwrap();
@@ -223,7 +231,15 @@ fn test_atomic_write_no_corrupt() {
     let out_path = tmp_dir.path().join("atomic.nq");
 
     // Write
-    base::store::write_back(&store, &out_path, base::changelog::Change::Op("test")).unwrap();
+    base::store::write_back_seamed(
+        &store,
+        &out_path,
+        base::changelog::Change::Op("test"),
+        |f| f,
+        None,
+        None,
+    )
+    .unwrap();
 
     // Verify file exists
     assert!(
