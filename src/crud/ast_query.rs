@@ -651,16 +651,42 @@ fn get_type_str(row: &oxigraph::sparql::QuerySolution, var: &str) -> String {
         .get(var)
         .map(|t| crud::term_display(t.into()))
         .unwrap_or_default();
-    // Strip namespace prefix: "Function" from "ops:Function" or full IRI
-    raw.strip_prefix("Function")
-        .map(|_| "fn")
-        .or_else(|| raw.strip_prefix("Struct").map(|_| "struct"))
-        .or_else(|| raw.strip_prefix("Class").map(|_| "class"))
-        .or_else(|| raw.strip_prefix("Method").map(|_| "method"))
-        .or_else(|| raw.strip_prefix("Module").map(|_| "mod"))
-        .or_else(|| raw.strip_prefix("Rationale").map(|_| "const"))
-        .unwrap_or("entity")
-        .to_string()
+    kind_label(&raw).to_string()
+}
+
+/// The short kind a row prints, from the class the map declares.
+///
+/// #105: this was a chain of `strip_prefix` calls, which is a PREFIX test
+/// doing an EQUALITY job — `Struct` also matches a `Structure`, and on an
+/// exact hit it returns `Some("")` and works by accident. Exact match, so a
+/// class added later cannot be silently absorbed by a shorter name.
+///
+/// `Rationale` used to render as `const`. A docstring is not a constant: it is
+/// prose, and #563 had already established in-tree that rationale labels are
+/// not identifiers. It renders as `note`.
+///
+/// The import kinds are deliberately three different words. A reader has to be
+/// able to tell "this import resolved", "this import is BROKEN" and "this is a
+/// third-party package" apart at a glance, because a map that cannot say which
+/// one it means is the defect this function is part of.
+fn kind_label(raw: &str) -> &'static str {
+    match raw {
+        "Function" => "fn",
+        "Struct" => "struct",
+        "Class" => "class",
+        "Method" => "method",
+        "Module" => "mod",
+        "Rationale" => "note",
+        "Heading" => "heading",
+        "CodeBlock" => "code",
+        "Property" => "prop",
+        "ExternalModule" => "ext",
+        "UnresolvedImport" => "unresolved",
+        "UnparsedFile" => "file",
+        "Import" => "import",
+        "Entity" => "entity",
+        _ => "entity",
+    }
 }
 
 fn query_calls(store: &oxigraph::store::Store, ns: &NamespaceConfig, entity_iri: &str) -> Vec<String> {

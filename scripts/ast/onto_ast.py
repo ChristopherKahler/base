@@ -176,6 +176,44 @@ def extract_project(target: Path, project: str, full: bool = False, confirm: boo
         # the BACKGROUND refresh cannot show it to anyone, because both the Stop
         # hook (automap.rs spawn_sync) and the git hook (ast_repo.rs) discard the
         # child's output by design. See the follow-up issue on persisting notices.
+        # #105: the three import states, printed BY THE RUN. A single dangling
+        # total cannot tell a fix from a suppression — an extractor that
+        # stopped emitting scores the same zero as one that resolved
+        # everything — so each state is reported on its own, and a failure is
+        # reported AS a failure rather than filed under "external".
+        states = result.get("import_states") or {}
+        if states:
+            print(
+                "# imports: {resolved} resolved, {failed} failed to resolve, "
+                "{external} third-party".format(
+                    resolved=states.get("resolved", 0),
+                    failed=states.get("failed", 0),
+                    external=states.get("external", 0),
+                ),
+                file=sys.stderr,
+            )
+            if states.get("failed"):
+                print(
+                    f"# {states['failed']} import(s) name a path inside this tree "
+                    f"that does not resolve — these are broken imports, not "
+                    f"third-party packages",
+                    file=sys.stderr,
+                )
+            for key, note in (
+                ("resolved_unparsed", "resolved to a file this extractor does not parse"),
+                ("ambiguous_multi", "bare name matched more than one file; carried as third-party"),
+                ("unclassified", "no import_kind recorded by the extractor that emitted it"),
+            ):
+                if states.get(key):
+                    print(f"#   {states[key]} {note}", file=sys.stderr)
+        untyped = stats.get("untyped_non_code_entities", 0)
+        if untyped:
+            print(
+                f"# {untyped} non-code entit{'y' if untyped == 1 else 'ies'} had no "
+                f"kind and are typed ops:Entity (never ops:Function)",
+                file=sys.stderr,
+            )
+
         orphans = stats.get("app_root_entities", 0)
         if orphans:
             noun = "entity" if orphans == 1 else "entities"

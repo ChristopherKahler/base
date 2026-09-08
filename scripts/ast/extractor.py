@@ -405,6 +405,199 @@ def _find_body(node, config: LanguageConfig):
 
 # ── Import handlers ───────────────────────────────────────────────────────────
 
+# ── import states (#105) ──────────────────────────────────────────────────────
+#
+# An import is not one thing. It either resolved to a file in this tree, or it
+# was SUPPOSED to and did not, or it names something outside the tree
+# altogether. Collapsing the middle state into the third files a resolution
+# FAILURE as a deliberate taxonomy, and `'../lib/api.js'` is the proof: a
+# relative path is required to resolve inside the tree, so when it does not,
+# the honest report is "this import is broken", never "this is third-party".
+#
+# The split is deliberately across two places, because the two halves are known
+# in two different places:
+#
+#   * WHAT THE SPECIFIER DEMANDS is syntax, and only the parser sees it. Each
+#     `_import_*` handler records it on the edge as `import_kind`.
+#   * WHETHER THE TARGET EXISTS is cross-file, and no single-file extractor can
+#     answer it. `_classify_import_targets` answers it once the tree is whole.
+#
+# Deciding either one in the other place is how this defect happened.
+
+#: `import_kind` — what the specifier's syntax demands of its target.
+IMPORT_KIND_INTERNAL = "internal"    # must resolve inside this tree
+IMPORT_KIND_EXTERNAL = "external"    # unambiguously outside it (`std::`, `<stdio.h>`)
+#: A bare name that the syntax CANNOT place. `import json` and
+#: `from extractor import extract` are spelled identically whether the module
+#: is stdlib or the file next door, so the parser must not pretend to know:
+#: the tree decides, and only a name matching no file in it is third-party.
+#: Calling these external on syntax alone would commit the same error as
+#: filing a broken relative path under "external" — asserting a taxonomy where
+#: there is only a missing lookup.
+IMPORT_KIND_AMBIGUOUS = "ambiguous"
+
+#: The node types the classifier emits. `import_external` is a real thing that
+#: lives elsewhere; `import_unresolved` is a FAILURE, and is typed as one so no
+#: reader can mistake it for a deliberate category.
+IMPORT_TYPE_EXTERNAL = "import_external"
+IMPORT_TYPE_UNRESOLVED = "import_unresolved"
+#: Resolved to a real file this extractor does not parse (`./app.css`). The
+#: import works, so it is NOT a failure; the target is just not a mapped
+#: language, and saying so is the difference between a diagnosis and a smear.
+IMPORT_TYPE_UNPARSED = "import_unparsed"
+
+
+def _import_kind_from_specifier(specifier: str) -> str:
+    """`internal` when the specifier is required to resolve inside this tree.
+
+    A leading `.` is a relative path in python, javascript and typescript
+    alike, and a relative path that does not resolve is a broken import. Every
+    other spelling is a bare name, external until a file node proves otherwise
+    — which `_classify_import_targets` checks rather than assumes.
+    """
+    return IMPORT_KIND_INTERNAL if specifier.startswith(".") else IMPORT_KIND_AMBIGUOUS
+
+
+#: `use` roots that are internal by construction: the crate itself, the current
+#: module, its parent.
+_RUST_INTERNAL_ROOTS = frozenset({"crate", "self", "super"})
+#: Files whose module IS their directory, so their submodules are siblings
+#: rather than children.
+_RUST_DIR_MODULES = frozenset({"mod", "lib", "main"})
+
+
+def _rust_module_dir(path: Path) -> Path:
+    """The directory a rust file's own submodules live in."""
+    return path.parent if path.stem in _RUST_DIR_MODULES else path.parent / path.stem
+
+
+def _rust_crate_root(path: Path) -> Path:
+    """The nearest enclosing `src`, which is where `crate::` starts."""
+    for parent in path.parents:
+        if parent.name == "src":
+            return parent
+    return path.parent
+
+
+def _rust_inside_inline_mod(node) -> bool:
+    """True when this `use` sits inside an inline `mod { ... }` in the file.
+
+    It decides what `super` MEANS, so it is read from the tree rather than
+    assumed: inside `#[cfg(test)] mod tests`, `super` is the file's own module
+    and `use super::*` resolves to THIS file. At the top level of the file,
+    `super` is the parent module and resolves to another file. Guessing one of
+    those reports 72 working imports as broken, which is how this function came
+    to exist.
+    """
+    parent = node.parent
+    while parent is not None:
+        if parent.type == "mod_item":
+            return True
+        parent = parent.parent
+    return False
+
+
+def _rust_module_file(path: Path) -> Path | None:
+    """The file holding the module a rust file's `super` refers to."""
+    module_dir = _rust_module_dir(path)
+    stem = module_dir.name
+    for candidate in (module_dir.with_suffix(".rs"), module_dir / "mod.rs"):
+        try:
+            if candidate.is_file() and candidate != path:
+                return candidate
+        except OSError:
+            continue
+    for candidate in (path.parent / "lib.rs", path.parent / "main.rs",
+                      path.parent / "mod.rs"):
+        try:
+            if candidate.is_file() and candidate != path:
+                return candidate
+        except OSError:
+            continue
+    _ = stem
+    return None
+
+
+def _rust_use_target(raw: str, path: Path, in_inline_mod: bool = False) -> "tuple[str | None, str, str]":
+    """`(target_nid, import_kind, label)` for one rust `use` declaration.
+
+    The old behaviour took the LAST segment, so `use oxigraph::model::NamedNode`
+    recorded an edge to a node called `model` — a path SEGMENT nobody wrote,
+    which was emitted as no node and therefore dangled. **718 of base's own 894
+    dangling edges were this one line.**
+
+    A `use` path has two shapes and they need opposite treatment:
+
+      * `crate::` / `self::` / `super::` are INTERNAL by construction. The
+        module is resolved against a real file under the crate root, and a miss
+        is a BROKEN import — never a third party. This is the case most likely
+        to be quietly lumped in with externals, so it is the one spelled out.
+      * anything else names ANOTHER CRATE, and the crate is the FIRST segment:
+        `oxigraph`, `serde`, `std`. That is the identity the author typed and
+        the one a dependency list can confirm — not the last segment, which is
+        usually a type.
+
+    Item names are not modules, so resolution walks the path from the longest
+    prefix down: `crate::store::write_back` tries `store/write_back.rs`, then
+    `store/write_back/mod.rs`, then `store.rs`, and stops at the first that
+    exists on disk.
+    """
+    clean = raw.split("{")[0].strip()
+    clean = clean.rstrip(":").rstrip("*").rstrip(":").strip()
+    if not clean:
+        return None, IMPORT_KIND_EXTERNAL, raw
+    segments = [s.strip() for s in clean.split("::") if s.strip()]
+    if not segments:
+        return None, IMPORT_KIND_EXTERNAL, raw
+
+    root = segments[0]
+    if root not in _RUST_INTERNAL_ROOTS:
+        # Another crate. Named by the crate, with the full path kept as the
+        # label so nothing the author wrote is lost.
+        return _make_id(root), IMPORT_KIND_EXTERNAL, root
+
+    if root == "crate":
+        base = _rust_crate_root(path)
+    elif root == "self":
+        base = _rust_module_dir(path)
+    else:  # super
+        base = _rust_module_dir(path).parent
+    rest = segments[1:]
+
+    for i in range(len(rest), 0, -1):
+        prefix = rest[:i]
+        for candidate in (base.joinpath(*prefix).with_suffix(".rs"),
+                          base.joinpath(*prefix) / "mod.rs"):
+            try:
+                if candidate.is_file():
+                    return _make_id(str(candidate)), IMPORT_KIND_INTERNAL, clean
+            except OSError:
+                continue
+
+    # Nothing under the path is a file, so the import names ITEMS in a module
+    # rather than a module — `use super::*` (the glob an inline `mod tests`
+    # uses), or `use super::notice_from_log`. Resolve to the module's own file.
+    # Measured: 72 of 73 first-pass "failures" on base's own tree were
+    # `use super::*`, every one of them a working import.
+    if root == "self" or (root == "super" and in_inline_mod):
+        return _make_id(str(path)), IMPORT_KIND_INTERNAL, clean
+    if root == "super":
+        module_file = _rust_module_file(path)
+        if module_file is not None:
+            return _make_id(str(module_file)), IMPORT_KIND_INTERNAL, clean
+    if root == "crate":
+        for candidate in (base / "lib.rs", base / "main.rs"):
+            try:
+                if candidate.is_file():
+                    return _make_id(str(candidate)), IMPORT_KIND_INTERNAL, clean
+            except OSError:
+                continue
+
+    # Required to resolve inside the tree and did not: a broken import, and it
+    # is reported as one rather than filed under "external".
+    return _make_id(clean), IMPORT_KIND_INTERNAL, clean
+
+
 def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str) -> None:
     t = node.type
     if t == "import_statement":
@@ -422,6 +615,12 @@ def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, s
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
                     "weight": 1.0,
+                    # A dotted or bare module name. Never relative, but not
+                    # proof of a third party either: it is spelled the same
+                    # for a stdlib module and for the file next door, so the
+                    # tree places it (`_classify_import_targets`), not this.
+                    "specifier": module_name,
+                    "import_kind": IMPORT_KIND_AMBIGUOUS,
                 })
     elif t == "import_from_statement":
         module_node = node.child_by_field_name("module_name")
@@ -447,6 +646,11 @@ def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, s
                 "source_file": str_path,
                 "source_location": f"L{node.start_point[0] + 1}",
                 "weight": 1.0,
+                # `from . import x` is required to resolve inside the tree, so
+                # a miss is a BROKEN import. `from json import x` is a bare
+                # name the tree has to place.
+                "specifier": raw,
+                "import_kind": _import_kind_from_specifier(raw),
             })
 
 
@@ -497,6 +701,14 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                 "source_file": str_path,
                 "source_location": f"L{node.start_point[0] + 1}",
                 "weight": 1.0,
+                # `_resolve_js_import_target` ALREADY decided this and the
+                # answer was being discarded at this line: a `resolved_path` of
+                # None is its "I could not place this, here is a bare-name
+                # fallback". Carrying both is what separates a broken relative
+                # path from a package — #105's second shape.
+                "specifier": raw,
+                "import_kind": _import_kind_from_specifier(raw),
+                "resolved_path": str(resolved_path) if resolved_path else None,
             })
             break
 
@@ -652,6 +864,12 @@ def _import_java(node, source: bytes, file_nid: str, stem: str, edges: list, str
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
                     "weight": 1.0,
+                    # A dotted or bare module name. Never relative, but not
+                    # proof of a third party either: it is spelled the same
+                    # for a stdlib module and for the file next door, so the
+                    # tree places it (`_classify_import_targets`), not this.
+                    "specifier": module_name,
+                    "import_kind": IMPORT_KIND_AMBIGUOUS,
                 })
             break
 
@@ -703,6 +921,12 @@ def _import_c(node, source: bytes, file_nid: str, stem: str, edges: list, str_pa
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
                     "weight": 1.0,
+                    # A dotted or bare module name. Never relative, but not
+                    # proof of a third party either: it is spelled the same
+                    # for a stdlib module and for the file next door, so the
+                    # tree places it (`_classify_import_targets`), not this.
+                    "specifier": module_name,
+                    "import_kind": IMPORT_KIND_AMBIGUOUS,
                 })
             break
 
@@ -723,6 +947,12 @@ def _import_csharp(node, source: bytes, file_nid: str, stem: str, edges: list, s
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
                     "weight": 1.0,
+                    # A dotted or bare module name. Never relative, but not
+                    # proof of a third party either: it is spelled the same
+                    # for a stdlib module and for the file next door, so the
+                    # tree places it (`_classify_import_targets`), not this.
+                    "specifier": module_name,
+                    "import_kind": IMPORT_KIND_AMBIGUOUS,
                 })
             break
 
@@ -779,6 +1009,12 @@ def _import_scala(node, source: bytes, file_nid: str, stem: str, edges: list, st
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
                     "weight": 1.0,
+                    # A dotted or bare module name. Never relative, but not
+                    # proof of a third party either: it is spelled the same
+                    # for a stdlib module and for the file next door, so the
+                    # tree places it (`_classify_import_targets`), not this.
+                    "specifier": module_name,
+                    "import_kind": IMPORT_KIND_AMBIGUOUS,
                 })
             break
 
@@ -799,6 +1035,12 @@ def _import_php(node, source: bytes, file_nid: str, stem: str, edges: list, str_
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
                     "weight": 1.0,
+                    # A dotted or bare module name. Never relative, but not
+                    # proof of a third party either: it is spelled the same
+                    # for a stdlib module and for the file next door, so the
+                    # tree places it (`_classify_import_targets`), not this.
+                    "specifier": module_name,
+                    "import_kind": IMPORT_KIND_AMBIGUOUS,
                 })
             break
 
@@ -1387,7 +1629,7 @@ def _extract_generic(
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0,
-                 context: str | None = None) -> None:
+                 context: str | None = None, **extra) -> None:
         edge = {
             "source": src,
             "target": tgt,
@@ -1399,6 +1641,10 @@ def _extract_generic(
         }
         if context:
             edge["context"] = context
+        # `specifier` / `import_kind` travel on an import edge so
+        # `_classify_import_targets` can separate the three states without
+        # re-parsing anything.
+        edge.update(extra)
         edges.append(edge)
 
     def ensure_named_node(name: str, line: int) -> str:
@@ -2364,6 +2610,14 @@ def extract_svelte(path: Path) -> dict:
                 continue
             result.setdefault("nodes", []).append({
                 "id": node_id, "label": raw,
+                # A stub is only reached when the target is NOT an existing
+                # node, so a RELATIVE specifier that got here failed to
+                # resolve: `'../lib/api.js'` resolved to a `.ts` path that is
+                # not on disk, and the stub then reached the map as
+                # `ops:Function` at the app root, line 0. It is a broken
+                # import and is typed as one.
+                "type": (IMPORT_TYPE_UNRESOLVED if raw.startswith(".")
+                         else IMPORT_TYPE_EXTERNAL),
                 "file_type": "code", "source_file": stub_source_file,
                 "confidence": "EXTRACTED",
             })
@@ -2423,6 +2677,10 @@ def extract_svelte(path: Path) -> dict:
                     continue
                 result.setdefault("nodes", []).append({
                     "id": node_id, "label": raw,
+                    # See the sibling site: a stub for a relative specifier is
+                    # a failed resolution, never a third party.
+                    "type": (IMPORT_TYPE_UNRESOLVED if raw.startswith(".")
+                             else IMPORT_TYPE_EXTERNAL),
                     "file_type": "code", "source_file": stub_source_file,
                     "confidence": "EXTRACTED",
                 })
@@ -2494,6 +2752,14 @@ def extract_astro(path: Path) -> dict:
                 continue
             result.setdefault("nodes", []).append({
                 "id": node_id, "label": raw,
+                # A stub is only reached when the target is NOT an existing
+                # node, so a RELATIVE specifier that got here failed to
+                # resolve: `'../lib/api.js'` resolved to a `.ts` path that is
+                # not on disk, and the stub then reached the map as
+                # `ops:Function` at the app root, line 0. It is a broken
+                # import and is typed as one.
+                "type": (IMPORT_TYPE_UNRESOLVED if raw.startswith(".")
+                         else IMPORT_TYPE_EXTERNAL),
                 "file_type": "code", "source_file": stub_source_file,
                 "confidence": "EXTRACTED",
             })
@@ -2559,6 +2825,10 @@ def extract_astro(path: Path) -> dict:
                     continue
                 result.setdefault("nodes", []).append({
                     "id": node_id, "label": raw,
+                    # See the sibling site: a stub for a relative specifier is
+                    # a failed resolution, never a third party.
+                    "type": (IMPORT_TYPE_UNRESOLVED if raw.startswith(".")
+                             else IMPORT_TYPE_EXTERNAL),
                     "file_type": "code", "source_file": stub_source_file,
                     "confidence": "EXTRACTED",
                 })
@@ -2819,12 +3089,21 @@ def extract_dart(path: Path) -> dict:
         pkg = m.group(1)
         tgt_nid = _make_id(pkg)
         if tgt_nid not in defined:
-            nodes.append({"id": tgt_nid, "label": pkg, "file_type": "code",
+            # This site already emitted its import target as a node — the one
+            # extractor that did — but untyped, so the serializer declared a
+            # dart package a callable. It is typed for what it is.
+            nodes.append({"id": tgt_nid, "label": pkg,
+                          "type": (IMPORT_TYPE_UNRESOLVED
+                                   if pkg.startswith(".")
+                                   else IMPORT_TYPE_EXTERNAL),
+                          "file_type": "code",
                           "source_file": str(path), "source_location": None})
             defined.add(tgt_nid)
         edges.append({"source": file_nid, "target": tgt_nid, "relation": "imports",
                       "confidence": "EXTRACTED", "confidence_score": 1.0,
-                      "source_file": str(path), "source_location": None, "weight": 1.0})
+                      "source_file": str(path), "source_location": None, "weight": 1.0,
+                      "specifier": pkg,
+                      "import_kind": _import_kind_from_specifier(pkg)})
 
     return {"nodes": nodes, "edges": edges}
 
@@ -3246,7 +3525,7 @@ def extract_julia(path: Path) -> dict:
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0,
-                 context: str | None = None) -> None:
+                 context: str | None = None, **extra) -> None:
         edge = {
             "source": src,
             "target": tgt,
@@ -3258,6 +3537,10 @@ def extract_julia(path: Path) -> dict:
         }
         if context:
             edge["context"] = context
+        # `specifier` / `import_kind` travel on an import edge so
+        # `_classify_import_targets` can separate the three states without
+        # re-parsing anything.
+        edge.update(extra)
         edges.append(edge)
 
     file_nid = _make_id(str(path))
@@ -3498,7 +3781,7 @@ def extract_fortran(path: Path) -> dict:
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0,
-                 context: str | None = None) -> None:
+                 context: str | None = None, **extra) -> None:
         edge = {
             "source": src,
             "target": tgt,
@@ -3510,6 +3793,10 @@ def extract_fortran(path: Path) -> dict:
         }
         if context:
             edge["context"] = context
+        # `specifier` / `import_kind` travel on an import edge so
+        # `_classify_import_targets` can separate the three states without
+        # re-parsing anything.
+        edge.update(extra)
         edges.append(edge)
 
     file_nid = _make_id(str(path))
@@ -3670,7 +3957,7 @@ def extract_go(path: Path) -> dict:
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0,
-                 context: str | None = None) -> None:
+                 context: str | None = None, **extra) -> None:
         edge = {
             "source": src,
             "target": tgt,
@@ -3682,6 +3969,10 @@ def extract_go(path: Path) -> dict:
         }
         if context:
             edge["context"] = context
+        # `specifier` / `import_kind` travel on an import edge so
+        # `_classify_import_targets` can separate the three states without
+        # re-parsing anything.
+        edge.update(extra)
         edges.append(edge)
 
     file_nid = _make_id(str(path))
@@ -3898,7 +4189,7 @@ def extract_rust(path: Path) -> dict:
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0,
-                 context: str | None = None) -> None:
+                 context: str | None = None, **extra) -> None:
         edge = {
             "source": src,
             "target": tgt,
@@ -3910,6 +4201,10 @@ def extract_rust(path: Path) -> dict:
         }
         if context:
             edge["context"] = context
+        # `specifier` / `import_kind` travel on an import edge so
+        # `_classify_import_targets` can separate the three states without
+        # re-parsing anything.
+        edge.update(extra)
         edges.append(edge)
 
     file_nid = _make_id(str(path))
@@ -3963,11 +4258,19 @@ def extract_rust(path: Path) -> dict:
             arg = node.child_by_field_name("argument")
             if arg:
                 raw = _read_text(arg, source)
-                clean = raw.split("{")[0].rstrip(":").rstrip("*").rstrip(":")
-                module_name = clean.split("::")[-1].strip()
-                if module_name:
-                    tgt_nid = _make_id(module_name)
-                    add_edge(file_nid, tgt_nid, "imports_from", node.start_point[0] + 1, context="import")
+                tgt_nid, kind, label = _rust_use_target(
+                    raw, path, _rust_inside_inline_mod(node))
+                # A `use super::*` inside an inline `mod tests` resolves to
+                # this very file. That is not an inter-file dependency, so no
+                # self-loop is written. It costs base's own tree 67
+                # `imports_from` edges, which is why it is pinned by
+                # `test_import_states.py::test_a_super_glob_inside_an_inline_
+                # mod_writes_no_self_loop` rather than left to this comment --
+                # an earlier draft named a test that did not exist yet.
+                if tgt_nid and tgt_nid != file_nid:
+                    add_edge(file_nid, tgt_nid, "imports_from",
+                             node.start_point[0] + 1, context="import",
+                             specifier=label, import_kind=kind)
             return
 
         for child in node.children:
@@ -4111,8 +4414,12 @@ def extract_zig(path: Path) -> dict:
                             module_name = raw.split("/")[-1].split(".")[0]
                             if module_name:
                                 tgt_nid = _make_id(module_name)
+                                # `@import("std")` is a third party;
+                                # `@import("./foo.zig")` must resolve here.
                                 add_edge(file_nid, tgt_nid, "imports_from",
-                                         node.start_point[0] + 1)
+                                         node.start_point[0] + 1,
+                                         specifier=raw,
+                                         import_kind=_import_kind_from_specifier(raw))
                             return
             elif child.type == "field_expression":
                 _extract_import(child)
@@ -4520,6 +4827,146 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
             edge["target"] = remap[str(edge["target"])]
 
     nodes[:] = [node for node in nodes if node.get("id") not in drop_ids]
+
+
+#: The relations whose target names a module. Not derived from
+#: `relations.RELATIONS`: that vocabulary is every relation the extractor can
+#: emit, and only these five name an import target. Counted from the tree, not
+#: assumed — `test_import_states.py` pins this set against the vocabulary so a
+#: sixth import relation cannot join it without someone saying which side it
+#: belongs on.
+_IMPORT_RELATIONS = frozenset({
+    "imports", "imports_from", "dynamic_import", "re_exports", "includes",
+})
+
+
+def _classify_import_targets(
+    nodes: list[dict], edges: list[dict]
+) -> dict[str, int]:
+    """Separate the three import states, and emit the target each edge names.
+
+    Every `_import_*` handler is handed `edges` but NOT `nodes`, so it cannot
+    emit the target it names: the edge gets written, the node never does, and
+    the map is left with an edge pointing at nothing. All 894 dangling edges on
+    base's own tree at `0acd6e85` were that one shape, and zero nodes carried
+    an external type because there was nowhere for one to come from.
+
+    This runs where the whole tree is known, which is the only place the
+    question can be answered honestly:
+
+      * target is already a node   -> RESOLVED, emit nothing.
+      * absent, specifier internal -> FAILED TO RESOLVE. A node typed
+                                      `import_unresolved`, counted, and
+                                      reported — a failure reported AS a
+                                      failure, not filed as third-party.
+      * absent, specifier external -> genuinely THIRD PARTY, typed
+                                      `import_external`.
+      * absent, no kind recorded   -> UNCLASSIFIED: counted and reported, never
+                                      guessed into one of the three.
+
+    Returns the per-state counts. They are reported by `base sync --ast`,
+    because a single dangling total cannot tell a fix from a suppression: an
+    extractor that stopped emitting scores the same zero as one that resolved
+    everything.
+    """
+    existing = {n["id"] for n in nodes}
+
+    # A bare specifier is placed by the TREE, not by the parser — and only when
+    # the name matches EXACTLY ONE file. Binding a bare name that several files
+    # share is the #66 collapse (`mod.rs`, `index.ts`, `__init__.py` all
+    # colliding onto whichever was extracted last), so a name with two
+    # candidates is never silently bound to one of them.
+    stems: dict[str, list[str]] = {}
+    for n in nodes:
+        label = str(n.get("label") or "")
+        suffix = Path(label).suffix.lower()
+        if suffix and suffix in _DISPATCH:
+            stems.setdefault(Path(label).stem.lower(), []).append(n["id"])
+
+    counts = {"resolved": 0, "failed": 0, "external": 0, "resolved_unparsed": 0,
+              "ambiguous_multi": 0, "unclassified": 0}
+    emit: dict[str, dict] = {}
+
+    for edge in edges:
+        if edge.get("relation") not in _IMPORT_RELATIONS:
+            continue
+        target = edge.get("target")
+        if not target:
+            continue
+        if target in existing:
+            counts["resolved"] += 1
+            continue
+
+        kind = edge.get("import_kind")
+        specifier = edge.get("specifier") or ""
+
+        if kind == IMPORT_KIND_AMBIGUOUS:
+            # The module is the LAST segment of a dotted or slashed specifier:
+            # `os.path` -> `path`, `@scope/pkg` -> `pkg`.
+            leaf = specifier.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+            if "." in leaf:
+                leaf = leaf.rsplit(".", 1)[-1]
+            candidates = stems.get(leaf.lower(), [])
+            if len(candidates) == 1:
+                # The tree placed it: this is a first-party import that the
+                # syntax could not distinguish from a third-party one.
+                edge["target"] = candidates[0]
+                counts["resolved"] += 1
+                continue
+            if len(candidates) > 1:
+                # Two files could be meant and nothing here can choose. Counted
+                # in its own bucket and reported, then carried as third-party so
+                # the edge still names something that exists.
+                counts["ambiguous_multi"] += 1
+            kind = IMPORT_KIND_EXTERNAL
+
+        if kind == IMPORT_KIND_INTERNAL:
+            # An import can resolve to a real file that this extractor does not
+            # parse — `import './app.css'`. The import WORKS; the target is
+            # simply not a mapped language. Reporting that as a broken import
+            # would be a fresh false claim of exactly the kind this change
+            # exists to remove, so it is counted as resolved and the target is
+            # emitted for what it is.
+            on_disk = edge.get("resolved_path") or ""
+            if on_disk and Path(on_disk).suffix.lower() not in _DISPATCH:
+                counts["resolved"] += 1
+                counts["resolved_unparsed"] = counts.get("resolved_unparsed", 0) + 1
+                node_type = IMPORT_TYPE_UNPARSED
+            else:
+                counts["failed"] += 1
+                node_type = IMPORT_TYPE_UNRESOLVED
+        elif kind == IMPORT_KIND_EXTERNAL:
+            counts["external"] += 1
+            node_type = IMPORT_TYPE_EXTERNAL
+        else:
+            counts["unclassified"] += 1
+            continue
+
+        prev = emit.get(target)
+        if prev is None:
+            emit[target] = {
+                "id": target,
+                "label": specifier or target,
+                "type": node_type,
+                "file_type": "import",
+                # The IMPORTING file, never the app root. `'../lib/api.js'`
+                # was filed against the app root at line 0 precisely because
+                # nothing carried the importer's own provenance this far.
+                "source_file": edge.get("source_file") or "",
+                "source_location": edge.get("source_location"),
+                "confidence": "EXTRACTED",
+            }
+        elif (prev["type"] == IMPORT_TYPE_EXTERNAL
+                and node_type == IMPORT_TYPE_UNRESOLVED):
+            # A broken import must never be hidden by another file importing
+            # the same name successfully as a third party.
+            prev["type"] = IMPORT_TYPE_UNRESOLVED
+            if specifier:
+                prev["label"] = specifier
+
+    nodes.extend(emit.values())
+    counts["nodes_emitted"] = len(emit)
+    return counts
 
 
 def _js_source_path(source_file: str, root: Path) -> Path | None:
@@ -5895,7 +6342,10 @@ def extract_elixir(path: Path) -> dict:
             module_name = _get_alias_text(arguments_node)
             if module_name:
                 tgt_nid = _make_id(module_name)
-                add_edge(file_nid, tgt_nid, "imports", line, context="import")
+                # An elixir alias is a bare module name; the tree places it.
+                add_edge(file_nid, tgt_nid, "imports", line, context="import",
+                         specifier=module_name,
+                         import_kind=IMPORT_KIND_AMBIGUOUS)
             return
 
         for child in node.children:
@@ -6142,7 +6592,10 @@ def extract_markdown(path: Path) -> dict:
                     if first_line:
                         label = f"{label} ({first_line})"
                 cb_nid = _make_id(stem, f"codeblock_{code_block_count}")
-                add_node(cb_nid, label, code_block_start)
+                # A fenced block is a code SAMPLE, not a definition. Untyped it
+                # reached the map as `ops:Function`, so `ast query --contains`
+                # answered with 214 of them on base's own docs.
+                add_node(cb_nid, label, code_block_start, type="code_block")
                 # Attach to nearest heading or file
                 parent = heading_stack[-1][1] if heading_stack else file_nid
                 add_edge(parent, cb_nid, "contains", code_block_start)
@@ -6161,7 +6614,11 @@ def extract_markdown(path: Path) -> dict:
             # Avoid duplicate heading IDs by appending line number
             if h_nid in seen_ids:
                 h_nid = _make_id(stem, title, str(line_num))
-            add_node(h_nid, title, line_num)
+            # #105's first shape: a heading is a section of prose, and it was
+            # reaching the map untyped, so the serializer declared it callable
+            # — `fn Need an official Svelte framework?`. 591 of them on base's
+            # own tree.
+            add_node(h_nid, title, line_num, type="heading")
 
             # Pop headings at same or deeper level
             while heading_stack and heading_stack[-1][0] >= level:
@@ -7344,14 +7801,21 @@ def extract_json(path: Path) -> dict:
         "optionalDependencies", "bundleDependencies", "bundledDependencies",
     })
 
-    def add_node(nid: str, label: str, line: int) -> None:
+    def add_node(nid: str, label: str, line: int,
+                 node_type: str = "property") -> None:
         if nid and nid not in seen_ids:
             seen_ids.add(nid)
-            nodes.append({"id": nid, "label": label, "file_type": "code",
+            # A JSON key is a PROPERTY of an object. It was reaching the map
+            # with no type at all, so the serializer's default declared it a
+            # callable: `fn node_modules/@esbuild/aix-ppc64` from a
+            # `package-lock.json` key, one of #105's four shapes. Whatever a
+            # key is, it is never a function.
+            nodes.append({"id": nid, "label": label, "type": node_type,
+                          "file_type": "code",
                           "source_file": str_path, "source_location": f"L{line}"})
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
-                 context: str | None = None) -> None:
+                 context: str | None = None, **extra) -> None:
         if not src or not tgt or src == tgt:
             return
         edge = {"source": src, "target": tgt, "relation": relation,
@@ -7359,10 +7823,11 @@ def extract_json(path: Path) -> dict:
                 "source_location": f"L{line}", "weight": 1.0}
         if context:
             edge["context"] = context
+        edge.update(extra)
         edges.append(edge)
 
     file_nid = _make_id(str(path))
-    add_node(file_nid, path.name, 1)
+    add_node(file_nid, path.name, 1, node_type="module")
 
     def _key_text(pair_node) -> str | None:
         """Extract the string content of a pair's key."""
@@ -7440,7 +7905,13 @@ def extract_json(path: Path) -> dict:
                 elif parent_key in _DEP_KEYS and val_text:
                     dep_nid = _make_id(key)
                     if dep_nid:
-                        add_edge(key_nid, dep_nid, "imports", line, context="import")
+                        # A dependency block entry IS a third party by
+                        # definition — that is what the block declares — so it
+                        # is the one import site that can say `external`
+                        # outright rather than letting the tree decide.
+                        add_edge(key_nid, dep_nid, "imports", line,
+                                 context="import", specifier=key,
+                                 import_kind=IMPORT_KIND_EXTERNAL)
 
     # Entry: find root document → object
     doc = root
@@ -7942,9 +8413,16 @@ def extract(
         where=f"{len(all_edges)} edges from {len(paths)} files under {root}",
     )
 
+    # #105: LAST, after every pass that can add an import edge — the cross-file
+    # resolvers above among them. Running it earlier would classify a tree that
+    # is still growing and leave the late arrivals dangling, which is the
+    # failure it exists to remove.
+    import_states = _classify_import_targets(all_nodes, all_edges)
+
     return {
         "nodes": all_nodes,
         "edges": all_edges,
+        "import_states": import_states,
         "input_tokens": 0,
         "output_tokens": 0,
     }

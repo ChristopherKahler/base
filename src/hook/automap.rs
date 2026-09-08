@@ -70,8 +70,10 @@ const NOISE_DIRS: &[&str] = &[
 /// Extensions that make a bare folder a code project worth adopting.
 /// Deliberately narrower than what the extractor parses: a folder whose only
 /// "source" is a config.json is a folder, not an app.
-/// Files the extractor turns into entities that are not code: one `ops:Function` per
+/// Files the extractor turns into entities that are not code: one `ops:Heading` per
 /// markdown heading, so a content workspace counts toward the fuse like a code one (#40).
+/// (#105 retyped these from `ops:Function` — a heading is not a callable. The COUNT
+/// is unchanged, so the fuse behaves exactly as before; only the class is now true.)
 const DOC_EXTS: &[&str] = &["md", "mdx", "markdown"];
 
 const CODE_EXTS: &[&str] = &[
