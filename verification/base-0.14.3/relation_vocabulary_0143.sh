@@ -20,6 +20,15 @@
 # law 24's void FAIL. Pairing the old subject with the new instrument is the
 # only construction in which a red means what it says.
 #
+# THE CORPUS IS PINNED, AND THIS IS BINDING — do not point the `base` row at
+# the live worktree to "keep it simple". `base` is both the tool under test and
+# one of the mapped trees. The branch adds four files to it, so the live tree
+# drops 348 relations where 610636e's tree drops 243, and the row would compare a
+# live measurement against an expectation derived from a smaller tree. Both arms
+# already map the SAME directory — the asymmetry was never between the arms, it
+# was between the mapped tree and the number. `git archive BASE_SHA` is what
+# makes the two describe the same thing.
+#
 # Exit codes are ASSIGNED, never inherited (law 27):
 #   0  every row passed
 #   1  one or more rows failed
@@ -81,6 +90,17 @@ for f in relations.py relation_vocabulary.py test_relation_corpus.py; do
   cp "scripts/ast/$f" "$WORK/base/$f"
 done
 cp scripts/ast/*.py "$WORK/branch/"
+
+# The `base` row maps THIS, never "$REPO". See the header. `git archive` writes a
+# tree with no .git and no working-tree cruft, so the corpus is exactly what
+# BASE_SHA tracked — which is the tree the 243 expectation was measured on.
+CORPUS_BASE="$WORK/corpus-base"
+mkdir -p "$CORPUS_BASE" || die 2 "cannot create $CORPUS_BASE"
+git archive "$BASE_SHA" | tar -x -C "$CORPUS_BASE" \
+  || die 2 "cannot materialise $BASE_SHA into $CORPUS_BASE"
+CORPUS_FILES=$(find "$CORPUS_BASE" -type f | wc -l)
+[ "$CORPUS_FILES" -gt 0 ] || die 3 "the pinned corpus is empty — every B row on it would score an empty map"
+echo "pinned corpus      $BASE_SHA -> $CORPUS_BASE ($CORPUS_FILES files)"
 
 BASE_SER_MD5=$(md5sum "$WORK/base/ttl_serializer.py" | cut -d' ' -f1)
 BRANCH_SER_MD5=$(md5sum "$WORK/branch/ttl_serializer.py" | cut -d' ' -f1)
@@ -227,7 +247,7 @@ PY
 declare -A TREES=(
   [ping-chat-hub]="/mnt/c/Users/Chris/tools/ping-chat-hub:31"
   [claude-coop]="/mnt/c/Users/Chris/tools/claude-coop:109"
-  [base]="$REPO:243"
+  [base]="$CORPUS_BASE:243"
 )
 echo "== B must-not-move / must-move, per tree =="
 for name in ping-chat-hub claude-coop base; do
@@ -249,6 +269,35 @@ PY
   base_edges=$(grep -cE '^code:\S+ ops:\S+ code:\S+ \.$' "$WORK/$name.base.ttl")
   delta=$((added_edges - base_edges))
   row "B2 $name must-move (+$want edges)" "$([ "$delta" -eq "$want" ] && echo 0 || echo 1)" "edges $base_edges -> $added_edges (delta $delta, expected $want)"
+
+  # B3: every edge the branch GAINED must be an edge the base arm DROPPED, and
+  # nothing else. B2 alone cannot tell "recovered 348 drops" from "recovered 243
+  # and invented 105" — both satisfy a delta check against a single number.
+  #
+  # This derives the expected delta from the branch map's PREDICATE DISTRIBUTION,
+  # a different quantity read off a different file than the edge-count delta it
+  # predicts, so it is a real assertion and not a restatement. The base
+  # serializer maps exactly eight predicates; every branch triple carrying any
+  # other predicate is an edge the base arm built and discarded. It fails if the
+  # branch changed how a base-8 edge is emitted, or gained an edge from anywhere
+  # other than un-dropping.
+  recovered=$(python3 - "$WORK/$name.branch.ttl" <<'PY'
+import re, sys
+BASE8 = {"calls", "imports", "importsFrom", "contains",
+         "hasMethod", "rationaleFor", "relatedTo", "supersedes"}
+pat = re.compile(r"^code:\S+ ops:(\S+) code:\S+ \.$")
+n = 0
+for line in open(sys.argv[1], encoding="utf-8"):
+    m = pat.match(line.rstrip("\n"))
+    if m and m.group(1) not in BASE8:
+        n += 1
+print(n)
+PY
+)
+  [ "${recovered:-0}" -gt 0 ] || die 3 "B3 $name counted zero recovered edges — the predicate scan matched nothing"
+  row "B3 $name delta is exactly the recovered drops" \
+      "$([ "$delta" -eq "${recovered:-(-1)}" ] && echo 0 || echo 1)" \
+      "delta=$delta recovered(non-base-8 predicates)=$recovered"
 done
 echo
 
