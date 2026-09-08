@@ -5991,7 +5991,7 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _parse_frontmatter(source: str) -> tuple[dict | None, int]:
+def _parse_frontmatter(source: str, path: Path | None = None) -> tuple[dict | None, int]:
     """Extract YAML frontmatter from markdown source. Returns (parsed_dict, end_line) or (None, 0)."""
     lines = source.splitlines()
     if not lines or lines[0].strip() != "---":
@@ -6003,17 +6003,51 @@ def _parse_frontmatter(source: str) -> tuple[dict | None, int]:
             break
     if end < 0:
         return None, 0
-    # The import sits OUTSIDE the swallow on purpose (#131). A bare
-    # `except Exception` wrapped around it made an absent PyYAML
-    # indistinguishable from "this file has no frontmatter", so on any box
-    # without the wheel every frontmatter-derived relation vanished silently --
-    # and `scripts/ast/requirements.txt` never asked for PyYAML at all. An
-    # absent parser is an absent TOOL and has to be loud: `_safe_extract`
-    # catches it per file, warns to stderr, and populates the `error` key that
-    # `test_relation_corpus.py`'s precondition already reads. A malformed
-    # document is DATA, stays non-fatal, and is the only thing the swallow
-    # should ever have covered.
-    import yaml
+    # An absent parser is an absent TOOL and it has to SAY SO -- but it must not
+    # cost the file (#131).
+    #
+    # Until now `import yaml` sat inside a `try` whose handler was a bare
+    # `except Exception: return None, 0`, which is also the return for "this
+    # file has no frontmatter". An ImportError was therefore indistinguishable
+    # from a document with no frontmatter block, and `requirements.txt` never
+    # asked for PyYAML, so on any box without the wheel every
+    # frontmatter-derived relation vanished with no warning and no counter.
+    #
+    # Letting the ImportError escape instead is loud but DESTRUCTIVE:
+    # `_safe_extract` catches it and returns `{"nodes": [], "edges": []}`, so
+    # the whole file is discarded. That is the wrong trade for the population
+    # this actually reaches. `install_python_deps` (src/install.rs:1424) is
+    # never fatal by design -- no pip, an externally-managed env (PEP 668 is the
+    # default on current Debian/Ubuntu), or being offline all print a hint and
+    # let `base install` succeed -- and that same failure takes the whole
+    # requirements file, so such a box has none of the 27 tree-sitter grammars
+    # either. Every code extractor there is already failing and saying so.
+    # `extract_markdown` needs no grammar at all, which makes markdown the ONE
+    # extractor still working on that box. Discarding the file would delete the
+    # last thing that works. So: return `(None, 0)`, keep the headings and
+    # fenced blocks, and lose only the frontmatter-derived relations.
+    #
+    # The notice spelling is load-bearing, not cosmetic. `notable_notices`
+    # (src/hook/automap.rs:1155) gates `.last-notices` on a `"# "` prefix AND
+    # `startswith("# Skipped ")`, and all four background refresh paths --
+    # `spawn_sync`, `first_contact_wait`, `delegate_wsl_contact` and the git
+    # hook -- give the child `Stdio::null()` deliberately, so stderr reaches
+    # nobody there. `# Skipped ` is the one spelling that survives: echoed in
+    # the foreground by `echo_extractor_notices`, written beside the map by
+    # `record_notices`, and surfaced at the next session start by
+    # `pending_notices` with its dedupe -- and none of automap.rs changes.
+    # It names the FRONTMATTER rather than the file, because the file was not
+    # skipped and a notice that overstates the loss is its own defect.
+    try:
+        import yaml
+    except ImportError as exc:
+        where = path if path is not None else "<unknown markdown file>"
+        print(
+            f"# Skipped frontmatter of {where} (ImportError: {exc})",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None, 0
 
     try:
         fm = yaml.safe_load("\n".join(lines[1:end]))
@@ -6064,7 +6098,7 @@ def extract_markdown(path: Path) -> dict:
 
     file_nid = _make_id(str(path))
 
-    frontmatter, fm_end_line = _parse_frontmatter(source)
+    frontmatter, fm_end_line = _parse_frontmatter(source, path)
     is_ontology_doc = frontmatter and frontmatter.get("ontology") is True
 
     if is_ontology_doc:
