@@ -125,6 +125,28 @@ cargo not found. Install the Rust toolchain (MSVC ABI) and re-run:
 }
 Write-Ok ((cargo --version) -join '')
 
+# ── 3b. clippy ─ the lint gate this build cannot otherwise run ─────────────
+# clippy is NOT installed by default with the msvc toolchain, so a from-source
+# Windows build had no way to run base's own lint gate (#97). Reported, never
+# installed: this script's job is to produce a binary, and a missing lint
+# component is not a reason to refuse one.
+#
+# Asked of cargo rather than looked for on PATH. The component is per-toolchain,
+# and a cargo-clippy.exe belonging to a DIFFERENT toolchain on PATH is exactly
+# the state that made `clippy -D warnings` and `clippy` both exit non-zero and
+# read as a confirmed lint failure when the tool was simply absent.
+Write-Step "Checking clippy (lint gate)"
+$clippyVersion = $null
+try { $clippyVersion = (cargo clippy --version 2>$null) -join '' } catch { }
+if ($clippyVersion) {
+    Write-Ok $clippyVersion
+} else {
+    Write-Warn2 "clippy is not installed for this toolchain. The build below will still"
+    Write-Warn2 "work, but you cannot run base's lint gate. To install it:"
+    Write-Warn2 "  rustup component add clippy"
+    Write-Warn2 "Then: cargo clippy --all-targets -- -D warnings"
+}
+
 # ── 4. Build / install ─────────────────────────────────────────────────────
 if ($SkipInstall) {
     Write-Step "Building base (cargo build --release)"

@@ -12,7 +12,13 @@
 //! The stub extractor here writes notice lines and exits 0. The real python is
 //! not involved: this pins the plumbing, not the count.
 
+// Both consumers are `#[cfg(unix)]` — `stub_python` below and the one test that
+// spawns the binary — so on Windows these imports are dead and
+// `clippy --all-targets -- -D warnings` fails on them (#97). Gated with what
+// uses them rather than allowed, so the cfg story reads the same in both places.
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
 
 /// A fake `python3`/`python` earlier on PATH than the real one. It ignores its

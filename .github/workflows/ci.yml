@@ -52,11 +52,14 @@ jobs:
       # this runner is ubuntu — so the check reads `git check-attr`, not the checkout.
       - run: ./scripts/test-crlf-attributes.sh
 
-  # Advisory until the three pre-existing never_loop denies in src/crud are
-  # cleared; then drop continue-on-error and it becomes a required check.
+  # Required, not advisory. It was `continue-on-error: true` "until the three
+  # pre-existing never_loop denies in src/crud are cleared" -- they are: a
+  # repo-wide grep for never_loop matches zero lines, and the step itself has been
+  # `success` on main (run 34200195605, job clippy, step 5). An advisory lint job
+  # reports the RUN green whether the step passed or failed, which is how a real
+  # Windows failure sat on main unnoticed (#97, #108).
   clippy:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
