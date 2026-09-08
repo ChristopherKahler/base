@@ -1445,6 +1445,54 @@ fn tier_cwd(cwd: &std::path::Path, global: bool) -> std::path::PathBuf {
 
 pub fn run() {
     let cli = Cli::parse();
+
+    // #93: `ensure_hooks_wired` had exactly one caller — the session-start hook
+    // — so a home whose hooks were never wired had no path back: no hook fires,
+    // therefore nothing re-checks, and `base update` re-wires nothing either.
+    // Any ordinary command repairs it now. The gate is one stat on a per-version
+    // stamp, which that function checks before anything else.
+    //
+    // Three arms are excluded, all for one reason: they OWN the hook state, so
+    // reaching it from here takes the decision away from them — and this call
+    // runs BEFORE the dispatch, so it always wins.
+    //
+    // These three are not a guess. `wire_hooks_quiet` and `remove_hooks` are the
+    // only writers of `~/.claude/settings.json` in the tree; of the 39 `Commands`
+    // variants, exactly these three reach one. (`Hooks` only prints the manifest.)
+    //
+    // `Hook` — `hook::dispatch` reaches `session_start`, which calls this same
+    // function and uses its RETURN VALUE to print the `[hooks]` notice. Calling
+    // it here first would consume the wiring and hand that notice an empty vec:
+    // a silent regression with nothing to fail.
+    //
+    // `Install` — step 3 wires, and #93's deferred block wires after step 8.
+    // Without this arm, `base install --skip-hooks` on a home that already has
+    // `~/.claude` wired all five hooks and stamped the version, and step 3's
+    // `⊘ Hook wiring skipped (--skip-hooks)` then printed over work already done.
+    // The flag is documented as "skip hook wiring in settings.json" and it held
+    // before #93 only because this function had exactly one caller.
+    //
+    // `Uninstall` — `remove_hooks` is reached from nowhere else. Without this
+    // arm, `base uninstall` on a home with `~/.claude/` and no `settings.json`
+    // took `wire_hooks_quiet`'s "the parent is a directory" branch, CREATED that
+    // file, wired five hooks and stamped the version — and `remove_hooks` then
+    // stripped them and reported removing hooks from settings.json. A command
+    // asked to remove base left behind a config file that was never there.
+    //
+    // Both non-hook arms were found in review — the first by raven reading the
+    // tree, the second by sweeping every variant against the mutators' callers.
+    // The controls beside them could not reach either: their fake homes have no
+    // `~/.claude` at entry, so this seam returns empty for an unrelated reason
+    // and the legs passed while the product was broken.
+    if !matches!(
+        &cli.command,
+        Some(Commands::Hook { .. })
+            | Some(Commands::Install { .. })
+            | Some(Commands::Uninstall { .. })
+    ) {
+        let _ = base::install::ensure_hooks_wired();
+    }
+
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {

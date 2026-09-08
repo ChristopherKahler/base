@@ -56,3 +56,72 @@ fn no_claude_directory_means_nothing_to_wire() {
     assert!(wire_hooks_quiet(&settings).unwrap().is_empty());
     assert!(!settings.exists(), "base never invents a Claude Code install");
 }
+
+// ─── Issue #93 ──────────────────────────────────────────────
+//
+// `ensure_hooks_wired` returns an empty vec for TWO different states: "already
+// fully wired" and "there is no ~/.claude directory to write into". It stamped
+// the version for both. So on a machine where base was installed before Claude
+// Code, the first call disarmed the repair for the rest of that version's life
+// — which is what turns a delay into the permanent inertness #93 reports.
+//
+// The stamp means "reconciled against a real Claude Code config", not "tried".
+
+/// The stamp file `ensure_hooks_wired` gates itself on.
+fn stamp_of(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".base-gbl")
+        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")))
+}
+
+#[test]
+fn no_claude_code_yet_leaves_the_stamp_absent_so_the_next_run_retries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_path_buf();
+    // `.base-gbl` exists on every real install (step 2 runs before step 3), and
+    // it has to exist here too: without it the stamp write fails for an
+    // unrelated reason and this test would pass without proving anything.
+    std::fs::create_dir_all(home.join(".base-gbl")).unwrap();
+    assert!(home.join(".base-gbl").is_dir(), "the stamp has somewhere to land");
+    // No ~/.claude at all: base installed before Claude Code.
+    assert!(!home.join(".claude").exists());
+
+    base::home::with_thread_home(&home, || {
+        assert!(ensure_hooks_wired().is_empty(), "nothing to wire yet");
+        assert!(
+            !stamp_of(&home).exists(),
+            "no Claude Code config was reconciled, so nothing is stamped"
+        );
+
+        // Claude Code arrives. The very next call repairs, with no re-install.
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let added = ensure_hooks_wired();
+        assert_eq!(added.len(), HOOK_TABLE.len(), "every hook, on the next run");
+
+        let text = std::fs::read_to_string(home.join(".claude").join("settings.json")).unwrap();
+        for (_, cmd) in HOOK_TABLE {
+            assert_eq!(text.matches(cmd).count(), 1, "{cmd}: present exactly once");
+        }
+        assert!(stamp_of(&home).exists(), "now there was something to stamp");
+        assert!(ensure_hooks_wired().is_empty(), "and once per version after that");
+    });
+}
+
+#[test]
+fn an_already_wired_home_is_stamped_and_left_byte_identical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_path_buf();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(home.join(".base-gbl")).unwrap();
+
+    let settings = home.join(".claude").join("settings.json");
+    base::home::with_thread_home(&home, || {
+        // Wire it once, then assert the second pass changes nothing at all.
+        assert_eq!(ensure_hooks_wired().len(), HOOK_TABLE.len());
+        std::fs::remove_file(stamp_of(&home)).unwrap();
+        let before = std::fs::read(&settings).unwrap();
+
+        assert!(ensure_hooks_wired().is_empty(), "nothing left to add");
+        assert_eq!(std::fs::read(&settings).unwrap(), before, "not one byte rewritten");
+        assert!(stamp_of(&home).exists(), "a real config WAS reconciled");
+    });
+}

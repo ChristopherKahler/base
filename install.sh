@@ -105,16 +105,19 @@ case ":${PATH}:" in
     ;;
 esac
 
-# Hooks are what make base do anything, and they are only written into an
-# existing ~/.claude. Installing base before Claude Code leaves it inert with no
-# way to self-heal, because the repair runs from the session-start hook that was
-# never wired. Test settings.json rather than the directory: `base install`
-# creates ~/.claude itself to hold the bundled skill, so the directory always
-# exists afterwards and cannot tell us anything.
+# Hooks are what make base do anything. Since #93 `base install` wires them even
+# when Claude Code is not installed yet: it creates ~/.claude itself for the
+# bundled skill, and the wiring is deferred to after that rather than dropped, so
+# a later Claude Code finds them. This file therefore exists after every install
+# that did not pass --skip-hooks; if it does not, the wiring FAILED rather than
+# being deferred, and that is worth saying. Test settings.json rather than the
+# directory, which `base install` creates either way and which cannot tell us
+# anything.
 if [ ! -f "$root/.claude/settings.json" ]; then
   say ""
-  say "base: no ~/.claude directory, so the hooks were not wired and base will"
-  say "  not do anything yet. Install Claude Code, then run:"
+  say "base: the hooks were not wired, so base will not do anything yet."
+  say "  Re-run the line below; if it happens twice, please report it at"
+  say "  https://github.com/ChristopherKahler/base/issues"
   say ""
   say "    base install"
   say ""
