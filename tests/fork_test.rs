@@ -91,7 +91,9 @@ fn fork_slug_equals_doc_basename() {
 fn handoff_slug_defaults_to_doc_basename() {
     let tmp = workspace();
     let doc = "/abs/path/2026-06-25-2230-base-v2.md";
-    let slug = crud::handoff::create(tmp.path(), &ns(), "base-v2", doc, None).unwrap();
+    let slug = crud::handoff::create(None, tmp.path(), &ns(), "base-v2", doc, None)
+        .unwrap()
+        .slug;
     assert_eq!(slug, "2026-06-25-2230-base-v2");
 
     let store = store_of(tmp.path());
@@ -118,8 +120,11 @@ fn explicit_slug_override_wins_for_both() {
     let p = ns().prefix;
 
     let hslug = crud::handoff::create(
+        None,
         tmp.path(), &ns(), "base-v2", "/d/whatever-timestamped.md", Some("resume-base-v2"),
-    ).unwrap();
+    )
+    .unwrap()
+    .slug;
     assert_eq!(hslug, "resume-base-v2");
 
     let fslug = crud::handoff::create_fork(
@@ -174,8 +179,8 @@ fn recreate_same_slug_is_idempotent() {
 
     crud::handoff::create_fork(tmp.path(), &ns(), "p", "/d/FEATURE-A.md", None).unwrap();
     crud::handoff::create_fork(tmp.path(), &ns(), "p", "/d/FEATURE-A.md", None).unwrap();
-    crud::handoff::create(tmp.path(), &ns(), "p", "/d/RESUME.md", None).unwrap();
-    crud::handoff::create(tmp.path(), &ns(), "p", "/d/RESUME.md", None).unwrap();
+    crud::handoff::create(None, tmp.path(), &ns(), "p", "/d/RESUME.md", None).unwrap();
+    crud::handoff::create(None, tmp.path(), &ns(), "p", "/d/RESUME.md", None).unwrap();
 
     let store = store_of(tmp.path());
     let forks = count(&store, &format!("?h a {p}:Handoff ; {p}:kind \"fork\" ; {p}:status \"open\""));
@@ -196,7 +201,7 @@ fn fork_and_handoff_are_independent() {
     let tmp = workspace();
     let p = ns().prefix;
 
-    crud::handoff::create(tmp.path(), &ns(), "base-v2", "/d/HANDOFF-1.md", None).unwrap();
+    crud::handoff::create(None, tmp.path(), &ns(), "base-v2", "/d/HANDOFF-1.md", None).unwrap();
     crud::handoff::create_fork(tmp.path(), &ns(), "base-v2", "/d/FEATURE-A.md", None).unwrap();
 
     // Both open: the fork did not archive the handoff, the handoff did not archive the fork.
@@ -216,7 +221,7 @@ fn fork_and_handoff_are_independent() {
     assert_eq!(open_forks, 1, "the fork is open alongside the handoff");
 
     // *handoff unchanged: a SECOND handoff archives the first, fork untouched.
-    crud::handoff::create(tmp.path(), &ns(), "base-v2", "/d/HANDOFF-2.md", None).unwrap();
+    crud::handoff::create(None, tmp.path(), &ns(), "base-v2", "/d/HANDOFF-2.md", None).unwrap();
     let store = store_of(tmp.path());
     let open_handoffs = count(
         &store,
@@ -255,7 +260,7 @@ fn fork_archive_by_title() {
 fn list_surfaces_run() {
     let tmp = workspace();
     crud::handoff::create_fork(tmp.path(), &ns(), "p", "/d/FEATURE-A.md", None).unwrap();
-    crud::handoff::create(tmp.path(), &ns(), "p", "/d/HANDOFF-1.md", None).unwrap();
+    crud::handoff::create(None, tmp.path(), &ns(), "p", "/d/HANDOFF-1.md", None).unwrap();
     assert!(crud::handoff::list_forks(tmp.path(), &ns()).is_ok());
     assert!(crud::handoff::list(tmp.path(), &ns()).is_ok());
 }

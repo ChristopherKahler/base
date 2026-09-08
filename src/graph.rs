@@ -184,6 +184,9 @@ pub fn purge_stale(path: &Path, ns: &NamespaceConfig, days: i64, apply: bool) ->
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
         .unwrap_or_default();
 
+    // Lock before load: purge reads candidates, then deletes them. Anything
+    // written between the read and the write would be dropped by the dump.
+    let _lock = store::lock_graph(path)?;
     let store = store::load_graph(path)?;
 
     // Never purge a member of a supersession chain, at EITHER end (hawk C2). The

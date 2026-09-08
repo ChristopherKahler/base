@@ -36,6 +36,9 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // ─── lastActive timestamp update (existing behavior) ─────
     let trig_path = find_workspace_trig(cwd);
     if let Some(ref tp) = trig_path {
+        // This fires on EVERY tool call, so it is the writer most likely to be
+        // mid-dump when another base process renames over the same graph.
+        let _lock = store::lock_graph(tp)?;
         let graph = store::load_graph(tp)?;
         let now = Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
         // Collect the deltas that actually applied so the change log carries them.
