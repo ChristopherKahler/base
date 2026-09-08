@@ -155,3 +155,142 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+
+  # ==========================================================================
+  # TEMPORARY. REMOVED BEFORE THIS PR IS PUT UP FOR G2. Do not merge with it.
+  #
+  # Pre-registered experiment for #129, settling whether base.exe's Windows
+  # stack overflow is a debug-profile artefact or reaches the shipped binary.
+  # Every observation behind #129 so far is from a DEBUG build; the artifact
+  # base actually publishes is `cargo build --release`, which has different
+  # stack usage and different inlining. #124's design depends on the answer:
+  # release clean means the Windows job can run --release and cover 14 of the
+  # 16 failures for real; release broken means the job ignores all 16 and the
+  # finding leaves #124 entirely.
+  #
+  # The decision rule was written, hashed and handed to the orchestrator
+  # BEFORE this job existed on the branch:
+  #   scratchpad/EXPERIMENT-RULE.md
+  #   sha256 A41245A64992CD0A732F01347349F5F4FAB9FA421E8E35A4385B4BAB9740A553
+  #   6730 bytes, 2026-09-08T13:30:08Z
+  #
+  # TWO ARMS, ONE RUNNER, ONE COMMIT, DIFFERING IN EXACTLY ONE VARIABLE: the
+  # cargo profile. Arm A (debug) is the CONTROL and is REQUIRED TO FAIL -- if
+  # it passes, the experiment is VOID and arm B proves nothing, because the
+  # profile is then no longer the only thing that changed. Yesterday's red run
+  # on 703dca6 is deliberately NOT used as the control: different commit,
+  # different day, different runner. A control has to be the change, not the
+  # calendar.
+  #
+  # `cargo test --release --test <name>` builds the `base` bin target in
+  # release and hands the test `CARGO_BIN_EXE_base` pointing at it, so the
+  # spawned process IS the release binary. The artifact-probe step below reads
+  # that file's size off disk rather than assuming the build produced it.
+  #
+  # Neither arm's STEP CONCLUSION is evidence for anything. `continue-on-error`
+  # makes a failing step report `conclusion: success` -- law 28's trap in the
+  # mirror -- so each arm captures its own rc into a file BEFORE printing
+  # anything, and the verdict is computed from those files and the log text.
+  # ==========================================================================
+  windows-release-vs-debug-EXPERIMENT:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: ARM A -- DEBUG (control; this arm is REQUIRED to fail)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cargo test --test hook_log_tier_test -- --nocapture > arm_debug.log 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > arm_debug.rc
+          echo "ARM_A_DEBUG_RC=$rc"
+          echo "----- arm A (debug) log -----"
+          cat arm_debug.log
+
+      - name: Artifact probe -- prove a RELEASE base.exe exists before believing arm B
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cargo build --release --bin base > relbuild.log 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > relbuild.rc
+          echo "RELEASE_BUILD_RC=$rc"
+          tail -20 relbuild.log
+          echo "----- target/release listing -----"
+          ls -l target/release/base.exe 2>&1 || echo "NO RELEASE BINARY ON DISK"
+
+      - name: ARM B -- RELEASE (subject)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cargo test --release --test hook_log_tier_test -- --nocapture > arm_release.log 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > arm_release.rc
+          echo "ARM_B_RELEASE_RC=$rc"
+          echo "----- arm B (release) log -----"
+          cat arm_release.log
+
+      - name: VERDICT (branch letters are pre-registered; see hash above)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          for f in arm_debug arm_release; do
+            tr -d '\r' < "$f.log" > "$f.clean" 2>/dev/null || : > "$f.clean"
+          done
+
+          rc_of () { cat "$1.rc" 2>/dev/null || echo "NO_RC"; }
+          # grep -c exits 1 on ABSENCE (law 27), so the count is captured and the
+          # status is deliberately discarded -- an honest zero must not read as a
+          # tool failure.
+          ovf_of () { grep -c -e "has overflowed its stack" -e "1073741571" "$1.clean" 2>/dev/null || true; }
+          # law 23: print what was COUNTED. passed+failed==0 is a failure, never a pass.
+          ran_of () { awk '/^test result:/ { for (i=1;i<=NF;i++) { if ($i=="passed;") p+=$(i-1); if ($i=="failed;") f+=$(i-1) } } END { print (p+0)+(f+0) }' "$1.clean"; }
+
+          A_RC=$(rc_of arm_debug);   B_RC=$(rc_of arm_release)
+          A_OVF=$(ovf_of arm_debug); B_OVF=$(ovf_of arm_release)
+          A_RAN=$(ran_of arm_debug); B_RAN=$(ran_of arm_release)
+
+          echo "=================== RAW FACTS ==================="
+          echo "arm A debug   rc=$A_RC  tests_run=$A_RAN  overflow_lines=$A_OVF"
+          echo "arm B release rc=$B_RC  tests_run=$B_RAN  overflow_lines=$B_OVF"
+          echo "release build rc=$(rc_of relbuild)"
+          echo "--- test result lines, arm A ---"; grep "^test result:" arm_debug.clean   || echo "(none)"
+          echo "--- test result lines, arm B ---"; grep "^test result:" arm_release.clean || echo "(none)"
+          echo "--- assertion text, arm A ---"; grep -e "left" -e "right" -e "panicked" arm_debug.clean   | head -20 || echo "(none)"
+          echo "--- assertion text, arm B ---"; grep -e "left" -e "right" -e "panicked" arm_release.clean | head -20 || echo "(none)"
+
+          echo "=================== VERDICT ==================="
+          if [ "$A_RAN" = "0" ] || [ "$B_RAN" = "0" ]; then
+            echo "BRANCH=V1  VOID -- an arm executed ZERO tests. This experiment proved NOTHING."
+          elif [ "$A_OVF" = "0" ]; then
+            echo "BRANCH=V2  VOID -- the DEBUG CONTROL did not reproduce the overflow."
+            echo "           A green subject beside a green control is not a result."
+          elif [ "$B_OVF" != "0" ]; then
+            echo "BRANCH=R2  RELEASE ALSO OVERFLOWS -- #129 reaches the shipped binary."
+          elif [ "$B_RC" = "0" ]; then
+            echo "BRANCH=R1  RELEASE IS CLEAN -- overflow is debug-only on this evidence."
+          else
+            echo "BRANCH=R3  AMBIGUOUS -- release does NOT overflow but still fails."
+            echo "           This is NOT R1. Read the arm B assertion text above."
+          fi
+          echo "==============================================="
+          echo "This job is TEMPORARY and is removed before G2."
+          # law 27: this step is a REPORTER, not a gate. Its exit code is
+          # ASSIGNED here deliberately rather than inherited from whatever it
+          # happened to run last -- an unmarked trailing `echo` swallows every
+          # status silently, which is the worse of the two polarities. The
+          # arms' rcs are the evidence and they live in arm_*.rc.
+          exit 0
