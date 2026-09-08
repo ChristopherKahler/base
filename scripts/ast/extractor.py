@@ -16,6 +16,13 @@ except ImportError:
     def load_cached(*a, **kw): return None
     def save_cached(*a, **kw): pass
 
+# #107: the vocabulary every edge this module builds must draw from. `relations`
+# is a leaf module — it imports nothing — so this closes no cycle with
+# `ttl_serializer`, which imports both of us. Unguarded on purpose, like
+# `ttl_serializer`'s import of `_DISPATCH`: a degraded fallback here would
+# disarm the check that exists because a degraded fallback lost 19 relations.
+from relations import assert_known as _assert_known_relations
+
 _RECURSION_LIMIT = 10_000
 
 
@@ -7877,6 +7884,18 @@ def extract(
             item["source_file"] = str(sf_path.relative_to(root))
         except ValueError:
             pass
+
+    # #107: the one seam every edge in a --full extraction passes through,
+    # including the ones synthesised after the per-file phase
+    # (`_augment_symbol_resolution_edges`, `_resolve_cross_file_imports`, the
+    # raw-call promotion above). `ttl_serializer` raises on an unmapped relation
+    # too, and covers single-file mode, which has no merge seam; this one fires
+    # earlier and can name the file the edge came from, which the serializer
+    # cannot — by then the per-file context is gone.
+    _assert_known_relations(
+        (e.get("relation", "calls") for e in all_edges),
+        where=f"{len(all_edges)} edges from {len(paths)} files under {root}",
+    )
 
     return {
         "nodes": all_nodes,

@@ -719,3 +719,179 @@ fn extract_labels(store: &oxigraph::store::Store, sparql: &str, var: &str) -> Ve
         _ => vec![],
     }
 }
+
+// ── #107: query an arbitrary relation ────────────────────────────────────────
+//
+// Before this, `--calls` and `--imports` were the only two relations the CLI
+// could reach, and `RELATION_MAP` only mapped 8 of the 27 the extractor emits,
+// so class hierarchy was unanswerable twice over: the triples were dropped, and
+// there was no way to ask for them if they had not been.
+//
+// The valid names are read FROM THE MAP, never from a Rust-side list. A second
+// hand-kept vocabulary, in a second language, with no contract between them, is
+// #107 one layer up — and it would drift the moment `scripts/ast/relations.py`
+// gained an entry. The map is the only copy that is always current, and it also
+// lets an unknown name answer with the names that ARE present instead of an
+// empty result that cannot distinguish "no such relation" from "no such entity".
+
+/// Relation-shaped predicates present in a map: `ops:` predicates whose object
+/// is an IRI. Node attributes (`sourceFile`, `sourceLine`, `language`,
+/// `signature`) all carry literals, so they fall out without being named.
+fn map_relations(store: &oxigraph::store::Store, ns: &NamespaceConfig) -> Vec<String> {
+    let pfx = ast_prefixes(ns);
+    let ops_ns = &ns.uri;
+    let sparql = format!(
+        "{pfx}\n\
+         SELECT DISTINCT ?p WHERE {{\n\
+           ?s ?p ?o .\n\
+           FILTER(isIRI(?o))\n\
+           FILTER(STRSTARTS(STR(?p), \"{ops_ns}\"))\n\
+         }}"
+    );
+    let mut names: Vec<String> = match crate::store::query(store, &sparql) {
+        Ok(QueryResults::Solutions(solutions)) => solutions
+            .filter_map(|r| r.ok())
+            .filter_map(|row| {
+                row.get("p")
+                    .map(|t| t.to_string().trim_matches(['<', '>']).to_string())
+            })
+            .filter_map(|iri| iri.rsplit('#').next().map(str::to_string))
+            .collect(),
+        _ => vec![],
+    };
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// `imports_from`, `importsFrom` and `importsfrom` all name the same predicate.
+/// The map stores the camelCase spelling; the extractor and the issues use the
+/// snake_case one, and a user reading either should not have to know which.
+fn relation_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Query one relation in both directions for a named entity.
+pub fn relation(cwd: &Path, ns: &NamespaceConfig, rel: &str, name: &str) -> Result<()> {
+    let store = load_ast_store(cwd)?;
+    let pfx = ast_prefixes(ns);
+
+    let present = map_relations(&store, ns);
+    let wanted = relation_key(rel);
+    let Some(pred) = present.iter().find(|p| relation_key(p) == wanted) else {
+        // Honest about which half is missing. An empty result set here would
+        // read identically to "the entity has no such edges", which is a
+        // different fact and would send the reader looking in the wrong place.
+        if present.is_empty() {
+            println!("This map carries no relations at all — it may predate the map format.");
+        } else {
+            println!("No 'ops:{rel}' in this map. Present: {}", present.join(", "));
+        }
+        return Ok(());
+    };
+
+    let name_lower = crud::escape_sparql_literal(&name.to_lowercase());
+    let find = format!(
+        "{pfx}\n\
+         SELECT ?entity ?label ?file ?line WHERE {{\n\
+           ?entity rdfs:label ?label .\n\
+           OPTIONAL {{ ?entity ops:sourceFile ?file }}\n\
+           OPTIONAL {{ ?entity ops:sourceLine ?line }}\n\
+           FILTER(CONTAINS(LCASE(STR(?label)), \"{name_lower}\"))\n\
+         }}\n\
+         ORDER BY ?file ?line"
+    );
+
+    let QueryResults::Solutions(solutions) = crate::store::query(&store, &find)? else {
+        return Ok(());
+    };
+    let entities: Vec<(String, String, String, String)> = solutions
+        .filter_map(|r| r.ok())
+        .map(|row| {
+            (
+                row.get("entity").map(|t| t.to_string()).unwrap_or_default(),
+                get_str(&row, "label"),
+                get_str(&row, "file"),
+                get_str(&row, "line"),
+            )
+        })
+        .collect();
+
+    if entities.is_empty() {
+        println!("No entity named '{name}' found. ops:{pred} IS present in this map.");
+        return Ok(());
+    }
+
+    for (iri, label, file, line) in &entities {
+        let loc = if line.is_empty() {
+            file.clone()
+        } else {
+            format!("{file}:{line}")
+        };
+        println!("{loc}  {label}");
+        let out = query_related(&store, ns, pred, iri, true);
+        let inn = query_related(&store, ns, pred, iri, false);
+        if out.is_empty() && inn.is_empty() {
+            println!("  No ops:{pred} edges.");
+        }
+        if !out.is_empty() {
+            println!("  {pred}:");
+            for row in &out {
+                println!("    {row}");
+            }
+        }
+        if !inn.is_empty() {
+            println!("  {pred}_by:");
+            for row in &inn {
+                println!("    {row}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One direction of one relation. `outgoing` selects `entity -> ?other` versus
+/// `?other -> entity`; both are printed because "what does X inherit" and "what
+/// inherits X" are the same question asked from two ends, and `--calls` already
+/// answers both.
+fn query_related(
+    store: &oxigraph::store::Store,
+    ns: &NamespaceConfig,
+    pred: &str,
+    entity_iri: &str,
+    outgoing: bool,
+) -> Vec<String> {
+    let pfx = ast_prefixes(ns);
+    let pattern = if outgoing {
+        format!("{entity_iri} ops:{pred} ?other .")
+    } else {
+        format!("?other ops:{pred} {entity_iri} .")
+    };
+    let sparql = format!(
+        "{pfx}\n\
+         SELECT ?other_label ?other_file WHERE {{\n\
+           {pattern}\n\
+           ?other rdfs:label ?other_label .\n\
+           OPTIONAL {{ ?other ops:sourceFile ?other_file }}\n\
+         }}\n\
+         ORDER BY ?other_file ?other_label"
+    );
+    match crate::store::query(store, &sparql) {
+        Ok(QueryResults::Solutions(solutions)) => solutions
+            .filter_map(|r| r.ok())
+            .map(|row| {
+                let label = get_str(&row, "other_label");
+                let file = get_str(&row, "other_file");
+                if file.is_empty() {
+                    label
+                } else {
+                    format!("{file} → {label}")
+                }
+            })
+            .collect(),
+        _ => vec![],
+    }
+}

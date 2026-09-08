@@ -8,6 +8,10 @@ from pathlib import Path
 # tree-sitter grammar loads lazily inside its handler.
 from extractor import _DISPATCH
 
+# One source of truth for "is a relation" (#107). `relations` is a leaf: it
+# imports nothing from this package, so both we and `extractor` can depend on it.
+from relations import RELATIONS, predicate as _relation_predicate
+
 _CONFIG_PATH = Path.home() / ".open-ontologies" / "config.toml"
 _ns_cache: dict[str, str] | None = None
 
@@ -71,16 +75,22 @@ TYPE_MAP = {
     "rationale": "Rationale",
 }
 
-RELATION_MAP = {
-    "calls": "calls",
-    "imports": "imports",
-    "imports_from": "importsFrom",
-    "contains": "contains",
-    "method": "hasMethod",
-    "rationale_for": "rationaleFor",
-    "relatedTo": "relatedTo",
-    "supersedes": "supersedes",
-}
+# #107: this was a hand-kept table of 8, written 2026-06-01, while `extractor.py`
+# grew to 34 language extractors emitting 27 relations. The 19 in the gap were
+# discarded below by `RELATION_MAP.get` followed by a bare `continue` — no
+# warning, no counter — so `ops:inherits` and `ops:extends` occur in no map on
+# any tree, and class hierarchy is unanswerable in every language.
+#
+# The table now lives in `relations.py`, imported by the extractor as well, for
+# the same reason `_FILE_EXTS` derives from `_DISPATCH` rather than agreeing with
+# it: two lists that must match are two lists that will drift. `RELATION_MAP` is
+# kept as a name because it is what every reader of this module already looks
+# for; it IS `relations.RELATIONS`, not a copy of it.
+#
+# No `try/except ImportError` guard, matching `_parsed_extensions`: a degraded
+# empty map would drop EVERY edge in every map, silently — the failure this
+# exists to kill, made total. Fail loudly instead.
+RELATION_MAP = RELATIONS
 
 ONTOLOGY_SKIP_KEYS = frozenset({"ontology", "type", "tags", "related", "supersedes"})
 
@@ -438,9 +448,13 @@ def serialize(
 
     for edge in edges:
         relation = edge.get("relation", "calls")
-        ops_rel = RELATION_MAP.get(relation)
-        if not ops_rel:
-            continue
+        # #107: this was `RELATION_MAP.get(relation)` then `if not ops_rel:
+        # continue` — the silent drop that lost 19 of the 27 relations the
+        # extractor emits. An edge the extractor spent a parse building is
+        # either worth a triple or worth a decision; it is never worth a
+        # `continue`. `predicate` raises `UnknownRelation` naming the relation
+        # and the file to add it to.
+        ops_rel = _relation_predicate(relation)
         src_iri = f"code:{project_clean}_{sanitize_iri(edge['source'])}"
         tgt_iri = f"code:{project_clean}_{sanitize_iri(edge['target'])}"
         confidence = edge.get("confidence", "extracted").lower()
