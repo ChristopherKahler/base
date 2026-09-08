@@ -278,9 +278,17 @@ print("emittable", len(v.relations))
 print("mapped", len(t.RELATION_MAP))
 print("missing", len(missing), missing)
 print("dead", len(dead), dead)
-print("unresolved", len(v.unresolved), v.unresolved)
-print("shapes", sorted(v.shape_counts.items()))
+print(v.report())
 "#);
+    // A8: the census publishes its own enumeration rule, and the FLOOR line is
+    // asserted so a later edit cannot quietly drop it and leave a bare `27`
+    // reading as a closed set. A2's standing ruling is that the set is OPEN.
+    assert!(
+        out.contains("FLOOR not CLOSURE"),
+        "the relation census printed a completeness figure without the FLOOR \
+         line naming the enumeration it counted over (amendment A8):\n{out}"
+    );
+
     // Law 23: a resolver that silently skipped sites proves less than it claims,
     // so an unresolved site is a failure of THIS test, not a smaller vocabulary.
     assert!(

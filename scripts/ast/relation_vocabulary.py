@@ -69,6 +69,43 @@ class Vocabulary:
     #: matching shows up as a zero instead of as a smaller vocabulary.
     shape_counts: dict[str, int] = field(default_factory=dict)
 
+    def report(self) -> str:
+        """The census block, in the shape amendment A8 makes binding.
+
+        A8 was written by raven against raven's own resolver, which reported
+        ``UNRESOLVED = 0`` over an enumeration that could not reach
+        ``uses_config`` at all -- the site was never a candidate, so the zero was
+        arithmetically incapable of counting it. The lesson is that a bare count
+        invites the reader to attack the number when the thing to attack is the
+        enumeration, so the enumeration ships beside the figure:
+
+        * one line per enumeration path, with its size -- a path that silently
+          stops matching reads as a zero here rather than as a smaller
+          vocabulary (law 23, one layer up);
+        * the total slots visited, printed rather than left to be summed, so the
+          denominator never has to be reconstructed by the reader;
+        * every unresolved site, ``file:line`` then the ``ast.dump`` of the slot,
+          whose leading token is the node type;
+        * a closing FLOOR line.
+
+        The FLOOR line is not a disclaimer. Three independent passes over this
+        same extractor produced 25, then 26, then 27 relations, each finding a
+        construction the previous method could not see, which is why A2's
+        standing ruling treats the set as OPEN. This is the one place that count
+        is asserted mechanically, so it is the place the caveat has to live.
+        """
+        shapes = sorted(self.shape_counts.items())
+        lines = ["path %s %d" % (name, count) for name, count in shapes]
+        lines.append("slots visited %d" % sum(self.shape_counts.values()))
+        lines.append("unresolved %d %r" % (len(self.unresolved), self.unresolved))
+        lines.append(
+            "FLOOR not CLOSURE: %d relations is a floor over the %d enumerated "
+            "shapes (%s). A construction none of them match is invisible to this "
+            "census and would read as a smaller vocabulary, never as a miss."
+            % (len(self.relations), len(shapes), ", ".join(n for n, _ in shapes))
+        )
+        return chr(10).join(lines)
+
 
 def _const_str(node: ast.AST) -> str | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
