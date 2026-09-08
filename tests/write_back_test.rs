@@ -227,6 +227,7 @@ fn a_sink_that_fails_mid_dump_is_an_error_and_the_original_survives() {
             Change::Op("test.fail"),
             |file| FailAfter { inner: file, left: limit },
             None,
+            None,
         );
 
         let err = result.expect_err("a failed write must surface as an error");
@@ -250,6 +251,7 @@ fn a_flush_failure_after_a_clean_dump_is_an_error_and_the_original_survives() {
         Change::Op("test.flush"),
         |file| FailAfter { inner: file, left: 0 },
         None,
+        None,
     );
 
     let msg = format!("{:#}", result.expect_err("the flush error must propagate"));
@@ -262,7 +264,7 @@ fn a_quad_count_mismatch_is_an_error_naming_both_counts_and_the_original_survive
     let root = tempfile::tempdir().unwrap();
     let (path, bytes, mtime, log) = seeded(root.path());
 
-    let result = store::write_back_seamed(&store_with(1_000), &path, Change::Op("test.count"), |file| file, Some(999));
+    let result = store::write_back_seamed(&store_with(1_000), &path, Change::Op("test.count"), |file| file, Some(999), None);
 
     let msg = format!("{:#}", result.expect_err("a short file must not be renamed into place"));
     assert!(msg.contains("999") && msg.contains("1000"), "both counts are named, got: {msg}");
@@ -273,7 +275,7 @@ fn a_quad_count_mismatch_is_an_error_naming_both_counts_and_the_original_survive
 fn the_seam_with_no_injection_behaves_exactly_like_write_back() {
     let root = tempfile::tempdir().unwrap();
     let path = graph_path(root.path());
-    store::write_back_seamed(&store_with(1_000), &path, Change::Op("test.identity"), |file| file, None).unwrap();
+    store::write_back_seamed(&store_with(1_000), &path, Change::Op("test.identity"), |file| file, None, None).unwrap();
     assert_eq!(fs::read(&path).unwrap(), raw_dump(&store_with(1_000)));
     assert_eq!(log_lines(&path), 1);
 }

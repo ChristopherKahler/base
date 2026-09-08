@@ -639,6 +639,180 @@ pub fn query_union(store: &Store, sparql: &str) -> Result<QueryResults> {
         .with_context(|| format!("SPARQL query failed: {sparql}"))
 }
 
+/// The provenance marker for #87's write seam.
+///
+/// A deliberate named constant, referenced from a live path -- `base doctor
+/// --json` carries it as `seam` -- so a harness can prove which binary it is
+/// driving without trusting a filename or an mtime. Probe it in a binary by
+/// SUBSTRING, never with an anchored `^...$`: rustc glues string literals into
+/// `.rodata`, and an anchored match reads zero on a binary that carries it.
+pub const LOCK_SEAM_MARKER: &str = "base:lock-seam:0.14.3:write_back-private+identity-check";
+
+/// What a graph file looked like at a moment in time.
+///
+/// `Absent` is a real answer, not a failure: a tier that has never been written
+/// has no graph file. It is also load-bearing -- absent at load and present at
+/// write means another writer CREATED the graph, which is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileIdentity {
+    Absent,
+    Present {
+        len: u64,
+        mtime: std::time::SystemTime,
+    },
+}
+
+impl FileIdentity {
+    /// Stat `path` now.
+    ///
+    /// Fails closed. A missing file is `Absent`, but an unreadable mtime on a
+    /// file that DOES exist is an error rather than a variant: an unknown
+    /// identity must never be able to compare equal to a recorded one, and a
+    /// third "unknown" variant would do exactly that under a derived `PartialEq`.
+    pub fn of(path: &Path) -> Result<Self> {
+        match fs::metadata(path) {
+            Ok(m) => {
+                let mtime = m.modified().with_context(|| {
+                    format!(
+                        "reading the modified time of {} — the identity backstop cannot be \
+                         armed without it, and proceeding would let an unknown identity \
+                         compare as unchanged",
+                        path.display()
+                    )
+                })?;
+                Ok(FileIdentity::Present {
+                    len: m.len(),
+                    mtime,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileIdentity::Absent),
+            Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
+        }
+    }
+
+    /// For the refusal message. Both identities are named there, because a
+    /// refusal that does not say what changed cannot be triaged.
+    pub fn describe(&self) -> String {
+        match self {
+            FileIdentity::Absent => "absent".to_string(),
+            FileIdentity::Present { len, mtime } => {
+                let stamp = mtime
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+                    .unwrap_or_else(|_| "pre-epoch".to_string());
+                format!("{len} bytes, mtime {stamp}")
+            }
+        }
+    }
+}
+
+/// A graph loaded INSIDE its lock, carrying the guard and the file identity
+/// observed at load. The intended single route to a graph write.
+///
+/// The guard field keeps the critical section open until this value drops, so
+/// the load and the write are inside one lock without restructuring a long
+/// function body into a closure. `load inside the lock` is the whole point --
+/// see [`with_graph_lock`]: a store loaded BEFORE the lock is precisely the
+/// stale snapshot that produces the lost update #87 is about.
+///
+/// `write` takes `&self` rather than `&mut self` on purpose. A caller does
+/// `let store = g.store();` near the top of a long function and writes at the
+/// bottom; with `&mut self` that outstanding immutable borrow makes the write a
+/// compile error, and the migration would have to restructure nine function
+/// bodies to satisfy the borrow checker rather than to fix a bug. The identity
+/// therefore lives in a `Cell`, which is also what oxigraph's own `Store` does
+/// with its interior mutability.
+pub struct LockedGraph {
+    path: PathBuf,
+    store: Store,
+    identity: std::cell::Cell<FileIdentity>,
+    _guard: GraphLockGuard,
+}
+
+impl LockedGraph {
+    /// The store, loaded inside the lock.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// The graph file this lock and store belong to.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The identity observed at load, or refreshed by the last successful write.
+    pub fn identity(&self) -> FileIdentity {
+        self.identity.get()
+    }
+
+    /// Write the store this value loaded.
+    pub fn write(&self, change: Change<'_>) -> Result<()> {
+        self.write_store(&self.store, change)
+    }
+
+    /// Write a store this value did NOT load.
+    ///
+    /// Exactly one caller needs this: `doctor::repair_tier` writes a `good`
+    /// store built from a lenient re-parse inside the function. Forcing that
+    /// through a closure over `self.store` would be a lie about what it does.
+    /// What must hold is the lock and the identity check, not the provenance of
+    /// the bytes.
+    ///
+    /// It is deliberately ONE caller with a name rather than a pattern: "two
+    /// callers write a store they did not load" is an escape hatch, "one caller
+    /// does, and it is the lenient repair path" is a special case that can be
+    /// defended now and removed later.
+    pub fn write_store(&self, store: &Store, change: Change<'_>) -> Result<()> {
+        write_back_inner(
+            store,
+            &self.path,
+            change,
+            |file| file,
+            None,
+            Some(self.identity.get()),
+        )?;
+        // Refresh from the file we just renamed into place, so a second write
+        // from the same LockedGraph is legal.
+        //
+        // This is a FORWARD guarantee, not a description of any current caller:
+        // measured on this tree, 0 of the 9 Tier C sites write twice within one
+        // LockedGraph. The three functions invoked once per tier by their caller
+        // (`migrate_tier`, `repair_tier`, `compact_tier`) each do their own load,
+        // so each gets its own LockedGraph and writes it once. The refresh is
+        // here so the first writer that DOES write twice is correct, and it is
+        // written down as forward-looking rather than presented as observed.
+        self.identity.set(FileIdentity::of(&self.path)?);
+        Ok(())
+    }
+}
+
+/// Take the graph lock on the bulk bound, THEN load, and hand back both plus the
+/// guard and the file identity.
+///
+/// The order is the whole point and it is why this exists as a primitive rather
+/// than as a convention. `crud::lock_and_load` already had this shape for the
+/// five CRUD callers; this is the same seam at the store level, where the nine
+/// Tier C writers can reach it.
+pub fn lock_and_load_graph(path: &Path) -> Result<LockedGraph> {
+    let guard = lock_graph_bulk(path)?;
+    let store = load_or_empty(path)?;
+    // Stat AFTER the load, per the approved design. Note the residual honestly:
+    // this records the identity of the file as it is NOW, not of the inode the
+    // load actually read, so an unlocked writer landing between the open and
+    // this stat would be recorded as our baseline and then overwritten. Holding
+    // the lock excludes every locked writer from that window; the ones left are
+    // the deprecated dashboard route and anything outside `src/`, which is
+    // exactly the population this backstop is aimed at. Statting the fd the load
+    // opened would close it and is a 0.14.4 refinement, not a change of shape.
+    let identity = FileIdentity::of(path)?;
+    Ok(LockedGraph {
+        path: path.to_path_buf(),
+        store,
+        identity: std::cell::Cell::new(identity),
+        _guard: guard,
+    })
+}
+
 /// Serialize the store to NQuads and write atomically (temp + rename).
 /// Validates the output by re-parsing before committing the rename.
 ///
@@ -648,7 +822,10 @@ pub fn query_union(store: &Store, sparql: &str) -> Result<QueryResults> {
 /// that forgets to log is indistinguishable, to the reader, from no write at all;
 /// requiring it makes that a compile error instead of a silent gap.
 pub fn write_back(store: &Store, path: &Path, change: Change<'_>) -> Result<()> {
-    write_back_inner(store, path, change, |file| file, None)
+    // No identity expectation: this entry point is the unlocked whole-file route
+    // the deprecated dashboard uses, and it has no load to compare against.
+    // Writers that hold a [`LockedGraph`] go through its `write`, which does.
+    write_back_inner(store, path, change, |file| file, None, None)
 }
 
 /// `write_back` with its two failure paths exposed for tests: `wrap` sees the
@@ -665,8 +842,9 @@ pub fn write_back_seamed<W: Write>(
     change: Change<'_>,
     wrap: impl FnOnce(fs::File) -> W,
     validation_len: Option<usize>,
+    expect: Option<FileIdentity>,
 ) -> Result<()> {
-    write_back_inner(store, path, change, wrap, validation_len)
+    write_back_inner(store, path, change, wrap, validation_len, expect)
 }
 
 /// Bytes the dump is buffered in before each write syscall. oxrdfio's serializer
@@ -681,6 +859,7 @@ fn write_back_inner<W: Write>(
     change: Change<'_>,
     wrap: impl FnOnce(fs::File) -> W,
     validation_len: Option<usize>,
+    expect: Option<FileIdentity>,
 ) -> Result<()> {
     crate::home::assert_isolated_write(path);
     let parent = path
@@ -731,6 +910,44 @@ fn write_back_inner<W: Write>(
     if let Err(e) = dump_and_validate(store, &tmp_path, wrap(tmp_file), validation_len) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
+    }
+
+    // Runtime identity backstop (#87 step 3), checked immediately before the
+    // rename so the window it cannot cover is one syscall pair wide.
+    //
+    // A lock only serialises writers that TAKE it. This catches the ones that do
+    // not: the deprecated dashboard route, a shell-out, a dependency, and the
+    // routes outside `src/` that the tripwire test cannot see at all. It is a
+    // complement to the lock, never a substitute -- it fires from inside this
+    // writer, before its own rename, and cannot see a clobber that lands after
+    // it. That one is read-back-after-write, filed to 0.14.4.
+    //
+    // Stat, not hash. Every legitimate write lands via temp+rename, which always
+    // produces a fresh len/mtime pair, and hashing costs seconds on a real graph
+    // (1 540 ms to dump 27 MB, shrike, 0.14.2). The stated limit -- a same-length
+    // rewrite inside one mtime tick -- was MEASURED with the real write shape:
+    // 2000 back-to-back temp+rename writes of an identical 4 096-byte payload
+    // with no sleep, giving 0 collisions in 1 999 consecutive pairs on both ext4
+    // (tightest gap 46 182 ns) and NTFS (tightest gap 975 400 ns, four orders of
+    // magnitude above its own 100 ns granularity). Two sequential base writes
+    // cannot land in one tick. If that ever changes the fix is the unix inode or
+    // the Windows file index, not a hash.
+    if let Some(expected) = expect {
+        let now = FileIdentity::of(path)?;
+        if now != expected {
+            let _ = fs::remove_file(&tmp_path);
+            anyhow::bail!(
+                "refusing to write {}: it changed while this writer held the lock. \
+                 At load it was {}; it is now {}. NOTHING was written — the file on \
+                 disk is the other writer's and this command's changes are lost, \
+                 which is the honest outcome, because overwriting would have \
+                 destroyed theirs with no error on either side. Re-run the command. \
+                 ({LOCK_SEAM_MARKER})",
+                path.display(),
+                expected.describe(),
+                now.describe(),
+            );
+        }
     }
 
     // Atomic rename
