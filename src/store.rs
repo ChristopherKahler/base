@@ -38,6 +38,11 @@ pub fn graph_loads() -> usize {
 /// Auto-migrate a legacy graph.trig to graph.nq if present.
 /// Loads the TriG file, writes it as NQuads, and removes the old file.
 /// Returns Ok(true) if migration happened, Ok(false) if no legacy file found.
+///
+/// Takes the graph lock on the bulk bound, but only in the branch that writes:
+/// this is row TEN of #87 and its `write_back` at the end used to run unlocked.
+/// The `nq_path.exists()` test is repeated inside the lock, because a check made
+/// outside it and a whole-file write made inside it are still a lost update.
 pub fn migrate_trig_to_nq(nq_path: &Path) -> Result<bool> {
     let trig_path = nq_path.with_extension("trig");
     // If the caller passed a .trig path directly, trig_path == nq_path and the
@@ -50,6 +55,37 @@ pub fn migrate_trig_to_nq(nq_path: &Path) -> Result<bool> {
     }
 
     // If graph.nq already exists alongside graph.trig, just remove the old one
+    if nq_path.exists() {
+        let _ = fs::remove_file(&trig_path);
+        return Ok(false);
+    }
+
+    // Row TEN of #87's table. Everything from here on WRITES nq_path, so the lock
+    // is taken here and held to the end of the function by the guard binding.
+    //
+    // It is NOT taken above the three early returns: none of them writes a graph.
+    // The middle one removes the dead legacy .trig once graph.nq exists, which is
+    // not a graph write at all.
+    //
+    // It is deliberately NOT taken in `load_graph`, which calls this function.
+    // `load_graph` has 27 call sites and most are pure readers -- `graph_analyze`,
+    // `graph_query`, `graph_tools`, `protocol::reconcile`, and `graph_health`,
+    // which is `base doctor`. `with_graph_lock`'s own doc comment forbids exactly
+    // that: readers never take this lock, because hooks read on every tool call
+    // and must not queue behind a writer.
+    //
+    // Re-entrant per path via `HELD_LOCKS`, so a caller that already holds this
+    // graph's lock -- every migrated Tier C writer, and `crud::lock_and_load` --
+    // re-enters here instead of waiting out its own timeout on a file it holds.
+    let _guard = lock_graph_bulk(nq_path)?;
+
+    // The `!nq_path.exists()` test above ran OUTSIDE the lock. Between it and this
+    // line another process can have created and written the graph, and the write
+    // below is a whole-file overwrite built from the legacy .trig, so it would
+    // erase that graph and report success -- #87's own failure, one level down
+    // from the write it is fixing. A lock that only serialises the write still
+    // loses the update; the re-check inside it is what makes the test and the
+    // write one decision. Same branch as above: the .trig is dead weight now.
     if nq_path.exists() {
         let _ = fs::remove_file(&trig_path);
         return Ok(false);
@@ -854,6 +890,27 @@ fn rotate_backups(path: &Path, fname: &str, just_written: &Path) {
 /// and still an obvious error rather than a hang.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a BULK writer waits for the graph lock before giving up.
+///
+/// The hot path keeps [`LOCK_WAIT`]: a timeout there is loud, immediate and
+/// loses nothing, and lengthening it would make the per-tool-call hooks queue
+/// behind a bulk writer -- the failure the "readers never lock" rule exists to
+/// prevent. Bulk and maintenance acquirers are none of them on a per-tool-call
+/// path, and the two forks lost to #87 were lost at session close, when
+/// `base sync` runs. A `base sync` that FAILS because a compact held the lock
+/// for twelve seconds is a worse outcome than one that waits.
+///
+/// The number is measurement, not taste: `ceil(4 x p100 hold time of
+/// compact_tier and repair_tier)`, floor 30 s, cap 120 s. Measured on a copy of
+/// the 37.1 MB workspace graph, N=10 per arm, every iteration from pristine,
+/// the repair arm made unhealthy so it takes the write branch: `compact_tier`
+/// p100 6 626 ms, `repair_tier` p100 2 336 ms, so `4 x p100 = 27 s` and the
+/// **floor governs**. Insensitive to the single outlier -- discard compact run 7
+/// and it is 13 s, still 30 s. Biased upward, because the harness sets
+/// `BASE_HOME`, which arms `assert_isolated_write`; production does not carry
+/// that cost. The 120 s cap is not reached.
+const LOCK_WAIT_BULK: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A lock file older than this is reaped. Same reasoning and same number as the
 /// abandoned-temp sweep in [`write_back_inner`]: a real write finishes in well
 /// under a second, so a minute-old lock is a crashed writer, not a live one.
@@ -991,6 +1048,25 @@ pub fn with_graph_lock<T>(graph: &Path, f: impl FnOnce() -> Result<T>) -> Result
 /// why the lock exists and what it must span; this is the same lock, for callers
 /// whose load and write are too far apart to wrap in a closure.
 pub fn lock_graph(graph: &Path) -> Result<GraphLockGuard> {
+    lock_graph_waiting(graph, LOCK_WAIT)
+}
+
+/// [`lock_graph`] on the bulk wait bound, [`LOCK_WAIT_BULK`].
+///
+/// For the bulk and maintenance writers only -- the Tier C whole-graph writers,
+/// `graph compact`, `doctor --repair`, `graph move` and the legacy TriG
+/// migration. Never for a per-tool-call path: a hook that waits thirty seconds
+/// behind a compact is a hang from the user's side, and readers do not take this
+/// lock at all.
+pub fn lock_graph_bulk(graph: &Path) -> Result<GraphLockGuard> {
+    lock_graph_waiting(graph, LOCK_WAIT_BULK)
+}
+
+/// The one acquisition path. `wait` is how long to keep trying before the bail,
+/// and it is NAMED in the timeout message: a reader of that error has to be able
+/// to tell which bound produced it, or the two bounds are indistinguishable in
+/// the field.
+fn lock_graph_waiting(graph: &Path, wait: std::time::Duration) -> Result<GraphLockGuard> {
     let lock = lock_path(graph);
     if let Some(parent) = lock.parent() {
         fs::create_dir_all(parent)
@@ -1005,7 +1081,7 @@ pub fn lock_graph(graph: &Path) -> Result<GraphLockGuard> {
         });
     }
 
-    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    let deadline = std::time::Instant::now() + wait;
     let mut backoff = std::time::Duration::from_millis(5);
     loop {
         match fs::OpenOptions::new()
@@ -1027,9 +1103,10 @@ pub fn lock_graph(graph: &Path) -> Result<GraphLockGuard> {
                 }
                 if std::time::Instant::now() >= deadline {
                     anyhow::bail!(
-                        "timed out after {}s waiting for the graph lock {} — another base process \
-                         is writing this graph. Nothing was written.",
-                        LOCK_WAIT.as_secs(),
+                        "timed out after {}s ({} bound) waiting for the graph lock {} — another \
+                         base process is writing this graph. Nothing was written.",
+                        wait.as_secs(),
+                        if wait == LOCK_WAIT_BULK { "bulk" } else { "hot-path" },
                         lock.display()
                     );
                 }
