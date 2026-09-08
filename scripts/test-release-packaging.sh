@@ -31,10 +31,9 @@ cd "$ROOT"
 
 WORKFLOW=".github/workflows/release.yml"
 
-# The four files the archives must carry. LICENSE-PolyForm-Noncommercial-1.0.0.md
-# is the grant every release up to and including v0.14.1 shipped under, retained
-# so a downloader comparing versions finds both in the same place.
-LICENSES="LICENSE.md LICENSING.md LICENSE-APACHE-2.0 LICENSE-PolyForm-Noncommercial-1.0.0.md"
+# The three files the archives must carry: the engine terms, the plain-English
+# guide, and the Apache 2.0 text that every version becomes two years on.
+LICENSES="LICENSE.md LICENSING.md LICENSE-APACHE-2.0"
 
 # Matrix values for one representative target. The packing steps are written once
 # and expanded per target, so proving one expansion proves the member list for

@@ -68,15 +68,13 @@ jobs:
           cp scripts/ast/*.py staging/scripts/ast/
           cp scripts/ast/requirements.txt staging/scripts/ast/
           # FSL-1.1-ALv2 asks that copies carry the terms, and this asset is
-          # the first copy anyone receives. The PolyForm file is the grant
-          # every release up to 0.14.1 shipped under, kept so a downloader
-          # comparing versions finds both in the same place.
-          cp LICENSE.md LICENSING.md LICENSE-APACHE-2.0 LICENSE-PolyForm-Noncommercial-1.0.0.md staging/
+          # the first copy anyone receives.
+          cp LICENSE.md LICENSING.md LICENSE-APACHE-2.0 staging/
           cd staging
           # `tar` packs the members it is named, so the licenses belong on
           # this line as well as in the `cp` above. Adding a file to staging/
           # alone leaves it out of the archive.
-          tar -czf ../${{ matrix.asset }} ${{ matrix.binary }} scripts/ LICENSE.md LICENSING.md LICENSE-APACHE-2.0 LICENSE-PolyForm-Noncommercial-1.0.0.md
+          tar -czf ../${{ matrix.asset }} ${{ matrix.binary }} scripts/ LICENSE.md LICENSING.md LICENSE-APACHE-2.0
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -86,9 +84,9 @@ jobs:
           Copy-Item target/${{ matrix.target }}/release/${{ matrix.binary }} staging/
           Copy-Item scripts/ast/*.py staging/scripts/ast/
           Copy-Item scripts/ast/requirements.txt staging/scripts/ast/
-          # Same four files as the Unix leg. `Compress-Archive -Path staging/*`
+          # Same three files as the Unix leg. `Compress-Archive -Path staging/*`
           # globs, so unlike `tar` it needs no member list of its own.
-          Copy-Item LICENSE.md,LICENSING.md,LICENSE-APACHE-2.0,LICENSE-PolyForm-Noncommercial-1.0.0.md staging/
+          Copy-Item LICENSE.md,LICENSING.md,LICENSE-APACHE-2.0 staging/
           Compress-Archive -Path staging/* -DestinationPath ${{ matrix.asset }}
 
       - name: Upload artifact
