@@ -7,7 +7,7 @@ A self-contained Claude Code skill that turns `/base-help [question]` into a coa
 | File | Role |
 | --- | --- |
 | `SKILL.md` | The skill logic: local-profile audit, bank-first answer flow, coaching format, beginner orientation |
-| `references/qa.md` | 186 question/answer pairs covering orientation, star commands, handoffs/forks, graph and memory, rules and domains, project scoping, ingestion, GraphRAG, AST navigation, hooks, relay, admin surfaces, known bugs, and destructive operations. Every pair carries a provenance tag |
+| `references/qa.md` | 187 question/answer pairs covering orientation, star commands, handoffs/forks, graph and memory, rules and domains, project scoping, ingestion, GraphRAG, AST navigation, hooks, relay, admin surfaces, known bugs, and destructive operations. Every pair carries a provenance tag |
 | `references/commands.md` | The command surface grouped by what is safe to run: read-only, mutating, and destructive, plus alias and flag gotchas |
 | `references/cli.md` | The verbatim `--help` of every subcommand, generated from the binary's own command tree at each release |
 
