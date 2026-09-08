@@ -501,24 +501,32 @@ def serialize(
         #      anything else is an `Entity` and is COUNTED, because "I do not
         #      know what this is" and "this is a function" are different
         #      claims and only one of them was being made.
-        node_type = node.get("type")
+        explicit = node.get("type")
         if node["id"] in file_node_ids:
             node_type = "module"
-        elif not node_type or node_type not in TYPE_MAP:
+        elif explicit:
+            # An explicit type the map has no class for is a programming error
+            # in this seam, and it STOPS the run naming the file to edit. The
+            # first draft of this block let it fall through to the code
+            # default instead — which is the same silent reclassification the
+            # whole change exists to remove, reintroduced inside the fix.
+            # `test_node_kinds.py` caught it.
+            if explicit not in TYPE_MAP:
+                raise KeyError(
+                    f"node type {explicit!r} has no ops: class (node "
+                    f"{node['id']!r} from {node.get('source_file')!r}). Add it "
+                    f"to TYPE_MAP in ttl_serializer.py — a silent default here "
+                    f"is the defect #105 was filed for."
+                )
+            node_type = explicit
+        else:
             node_type = role_map.get(node["id"])
-        if not node_type:
-            if node.get("file_type") == "code":
-                node_type = "function"
-            else:
-                node_type = "entity"
-                untyped_non_code += 1
-        if node_type not in TYPE_MAP:
-            raise KeyError(
-                f"node type {node_type!r} has no ops: class (node {node['id']!r} "
-                f"from {node.get('source_file')!r}). Add it to TYPE_MAP in "
-                f"ttl_serializer.py — a silent default here is the defect #105 "
-                f"was filed for."
-            )
+            if not node_type:
+                if node.get("file_type") == "code":
+                    node_type = "function"
+                else:
+                    node_type = "entity"
+                    untyped_non_code += 1
         ops_type = TYPE_MAP[node_type]
         iri = f"code:{project_clean}_{sanitize_iri(node['id'])}"
         label = _escape_literal(node.get("label", node["id"]))

@@ -2610,6 +2610,14 @@ def extract_svelte(path: Path) -> dict:
                 continue
             result.setdefault("nodes", []).append({
                 "id": node_id, "label": raw,
+                # A stub is only reached when the target is NOT an existing
+                # node, so a RELATIVE specifier that got here failed to
+                # resolve: `'../lib/api.js'` resolved to a `.ts` path that is
+                # not on disk, and the stub then reached the map as
+                # `ops:Function` at the app root, line 0. It is a broken
+                # import and is typed as one.
+                "type": (IMPORT_TYPE_UNRESOLVED if raw.startswith(".")
+                         else IMPORT_TYPE_EXTERNAL),
                 "file_type": "code", "source_file": stub_source_file,
                 "confidence": "EXTRACTED",
             })
@@ -2669,6 +2677,10 @@ def extract_svelte(path: Path) -> dict:
                     continue
                 result.setdefault("nodes", []).append({
                     "id": node_id, "label": raw,
+                    # See the sibling site: a stub for a relative specifier is
+                    # a failed resolution, never a third party.
+                    "type": (IMPORT_TYPE_UNRESOLVED if raw.startswith(".")
+                             else IMPORT_TYPE_EXTERNAL),
                     "file_type": "code", "source_file": stub_source_file,
                     "confidence": "EXTRACTED",
                 })
@@ -2740,6 +2752,14 @@ def extract_astro(path: Path) -> dict:
                 continue
             result.setdefault("nodes", []).append({
                 "id": node_id, "label": raw,
+                # A stub is only reached when the target is NOT an existing
+                # node, so a RELATIVE specifier that got here failed to
+                # resolve: `'../lib/api.js'` resolved to a `.ts` path that is
+                # not on disk, and the stub then reached the map as
+                # `ops:Function` at the app root, line 0. It is a broken
+                # import and is typed as one.
+                "type": (IMPORT_TYPE_UNRESOLVED if raw.startswith(".")
+                         else IMPORT_TYPE_EXTERNAL),
                 "file_type": "code", "source_file": stub_source_file,
                 "confidence": "EXTRACTED",
             })
@@ -2805,6 +2825,10 @@ def extract_astro(path: Path) -> dict:
                     continue
                 result.setdefault("nodes", []).append({
                     "id": node_id, "label": raw,
+                    # See the sibling site: a stub for a relative specifier is
+                    # a failed resolution, never a third party.
+                    "type": (IMPORT_TYPE_UNRESOLVED if raw.startswith(".")
+                             else IMPORT_TYPE_EXTERNAL),
                     "file_type": "code", "source_file": stub_source_file,
                     "confidence": "EXTRACTED",
                 })
