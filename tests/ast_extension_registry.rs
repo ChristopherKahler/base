@@ -308,13 +308,25 @@ print(v.report())
     );
     // A shape that stops matching would quietly shrink the vocabulary and pass
     // every assertion above. Pin the ones with exactly one instance in the tree.
+    // These two pin a shape with exactly one instance, and they are matched
+    // LINE-EXACT rather than by `contains` for two separate reasons.
+    //
+    // Format: `relation_vocabulary.report()` emits `"path %s %d"` lines. The
+    // previous spelling here asserted a Python tuple repr, `('forwarders', 1)`,
+    // which was written against the pre-A8 report and became unmatchable the
+    // moment that report was rewritten — so it asserted nothing that could ever
+    // hold, while the counters it was guarding were all green.
+    //
+    // Exactness: `out.contains("path forwarders 1")` is also satisfied by
+    // `path forwarders 10`, so a substring guard would keep passing while the
+    // count it exists to pin drifted upward.
     assert!(
-        out.contains("('forwarders', 1)"),
+        out.lines().any(|l| l.trim() == "path forwarders 1"),
         "the forwarder shape found nothing — `implements` is spelled at no other \
          site and would vanish from the vocabulary:\n{out}"
     );
     assert!(
-        out.contains("('via_closed_set', 1)"),
+        out.lines().any(|l| l.trim() == "path via_closed_set 1"),
         "the f-string-over-a-closed-set shape found nothing — `uses_config` is \
          spelled at no other site and would vanish from the vocabulary:\n{out}"
     );
