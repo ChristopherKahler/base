@@ -251,6 +251,92 @@ def test_membership_is_independent_of_edge_order():
     )
 
 
+def test_rationale_inherits_from_its_target_not_the_other_way():
+    """`rationale_for` runs the OPPOSITE way to the other three, in both arms.
+
+    `contains`, `method` and `defines` put the TARGET in the SOURCE's file. A
+    rationale node is the source of its own `rationale_for` edge and takes the
+    file of the thing it is a rationale FOR -- target to source. Folding all four
+    into one uniform parent-to-child rule inverts this one and the rationale
+    stops inheriting, which no test on main would have caught: main's
+    `test_file_attribution.py` is 76 lines, one test, and the string "rationale"
+    appears in it zero times.
+
+    This leg cannot be red-first: main handles both arms correctly, so there is
+    no failure to reproduce. Its teeth were shown instead by inverting
+    `_CONTAINS_UPWARD` to `_CONTAINS_DOWNWARD` in the walk and confirming both
+    arms below fail -- mutation-testing the test, recorded in the fork doc.
+    """
+    from ttl_serializer import _build_file_membership
+
+    # Arm 1: the target is an ordinary entity that itself resolves through the
+    # walk. The rationale must end up in the same file, one step behind it.
+    got = _build_file_membership(
+        [
+            {"source": "a.py", "target": "fn", "relation": "contains"},
+            {"source": "why", "target": "fn", "relation": "rationale_for"},
+        ],
+        {"a.py"},
+    )
+    assert got.get("why") == "a.py", (
+        f"rationale 'why' resolved to {got.get('why')!r}; it must inherit the file "
+        f"of the entity it explains. Membership is flowing parent->child for "
+        f"`rationale_for`, which inverts it."
+    )
+    assert "a.py" not in {k for k in got if k == "fn"} or got["fn"] == "a.py"
+
+    # Arm 2: the target IS a file node -- the `elif target_id in file_nodes`
+    # branch of the original three-pass implementation. A whole-file rationale
+    # belongs to that file directly.
+    got = _build_file_membership(
+        [{"source": "why", "target": "a.py", "relation": "rationale_for"}],
+        {"a.py"},
+    )
+    assert got.get("why") == "a.py", (
+        f"a rationale pointing straight at a file node resolved to "
+        f"{got.get('why')!r}; the file-node arm of the rationale pass is gone."
+    )
+
+
+def test_deep_class_is_typed_by_its_own_files_language():
+    """Membership has a SECOND consumer, and the fix moves `rdf:type` too.
+
+    `_build_role_map` takes `file_membership` and uses the containing file's
+    EXTENSION to decide struct vs class (`_STRUCT_LANGUAGES`). A method-bearing
+    node with no membership got an empty label, an empty extension, and fell to
+    `class` unconditionally -- whatever language it was written in. Once the walk
+    gives it a file, the same node is typed by that file for the first time.
+
+    Measured population on the three trees in the round doc: ZERO. No orphan
+    subject sources a method edge on any of them, so this coupling is inert in
+    practice and no `rdf:type` moved. It is pinned here because it is live in
+    the code and the next tree may not be so tidy.
+    """
+    from ttl_serializer import _build_file_membership, _build_role_map
+
+    def role_of(filename: str) -> str:
+        edges = [
+            {"relation": "contains", "source": filename, "target": "outer"},
+            {"relation": "contains", "source": "outer", "target": "deep"},
+            {"relation": "method", "source": "deep", "target": "m"},
+        ]
+        labels = {filename: filename, "outer": "Outer", "deep": "Deep", "m": "m"}
+        nodes = [{"id": n} for n in labels]
+        files = {filename}
+        membership = _build_file_membership(edges, files)
+        return _build_role_map(edges, nodes, membership, labels, files)["deep"]
+
+    assert role_of("a.rs") == "struct", (
+        "a method-bearing node two `contains` hops inside a .rs file is still "
+        "typed `class`; it never acquired membership, so `_build_role_map` read "
+        "an empty extension"
+    )
+    assert role_of("a.py") == "class", (
+        "the same node inside a .py file must stay `class` -- the type follows "
+        "the file's language, and .py is not a struct language"
+    )
+
+
 def test_containment_allowlist_is_pinned_to_the_vocabulary():
     """Every name in the allowlist must be a real relation, and the complement
     is enumerated here on purpose.

@@ -1,5 +1,6 @@
 """Convert extraction dicts ({nodes, edges}) to Turtle strings for ops:code graph."""
 
+from collections import deque
 from pathlib import Path
 
 # One source of truth for "is a file" (#66). Import direction:
@@ -236,36 +237,66 @@ def _build_role_map(
     return roles
 
 
+#: Relations where the TARGET physically lives inside the SOURCE's file.
+#: `defines` is here on the evidence of its eight `add_edge` sites in
+#: `extractor.py` — four file→symbol (`:2798`, `:2812`, `:2881`, `:3310`) and
+#: four scope→symbol (`:1699`, `:3329`, `:3341`, `:3355`) — every one of them
+#: containment. It was absent before #82 and cost the map every C++ struct
+#: field: one hop from a resolved parent, dropped on the relation's NAME.
+_CONTAINS_DOWNWARD: frozenset[str] = frozenset({"contains", "method", "defines"})
+
+#: The one relation that runs the other way: a rationale node takes the file of
+#: the thing it is a rationale FOR, so membership flows target → source.
+_CONTAINS_UPWARD: frozenset[str] = frozenset({"rationale_for"})
+
+#: Membership propagates along these and NOTHING else. #82 asks for "a
+#: transitive walk to a fixed point rather than a fixed set of relations", and
+#: the second half of that sentence is a worse bug than the one it fixes: an
+#: unbounded walk follows `calls` and `inherits` and puts a symbol in whatever
+#: file happens to refer to it. `RuntimeError` would land inside the user's
+#: file that subclasses it, and the app-root counter would FALL — a false
+#: attribution wearing a green number (#98). Transitive in depth, bounded in
+#: relation. `scripts/ast/test_file_membership_walk.py` pins this set against
+#: `relations._RELATION_NAMES` so a 29th relation cannot join the vocabulary
+#: without someone stating which side of the split it belongs on.
+CONTAINMENT_RELATIONS: frozenset[str] = _CONTAINS_DOWNWARD | _CONTAINS_UPWARD
+
+
 def _build_file_membership(edges: list[dict], file_nodes: set[str]) -> dict[str, str]:
-    """Map each node to its containing file by walking edges from file-level nodes.
+    """Map each node to its containing file, transitively, from the file nodes out.
+
+    Breadth-first from every file node along `CONTAINMENT_RELATIONS`, so a node
+    nested any number of hops deep resolves — a markdown `### heading` three
+    `contains` edges below its file used to fall to the app root, and on a
+    docs-heavy tree that was the majority of the map.
+
+    The previous shape was three single passes, which made the answer depend on
+    the order `edges` happened to arrive in: a class resolved later in the list
+    than its own methods never propagated on that run. A fixed point does not
+    care about order.
 
     Returns dict mapping node_id → file node_id.
     """
+    down: dict[str, list[str]] = {}
+    up: dict[str, list[str]] = {}
+    for edge in edges:
+        rel = edge.get("relation")
+        if rel in _CONTAINS_DOWNWARD:
+            down.setdefault(edge["source"], []).append(edge["target"])
+        elif rel in _CONTAINS_UPWARD:
+            up.setdefault(edge["target"], []).append(edge["source"])
+
     membership: dict[str, str] = {}
-
-    # Direct containment: file → entity
-    for edge in edges:
-        if edge.get("relation") == "contains" and edge["source"] in file_nodes:
-            membership[edge["target"]] = edge["source"]
-
-    # Method containment: class → method (walk up to file via class)
-    for edge in edges:
-        if edge.get("relation") == "method":
-            cls_id = edge["source"]
-            method_id = edge["target"]
-            if cls_id in membership and method_id not in membership:
-                membership[method_id] = membership[cls_id]
-
-    # Rationale containment: rationale → target (inherit file from rationaleFor target)
-    for edge in edges:
-        if edge.get("relation") == "rationale_for":
-            rationale_id = edge["source"]
-            target_id = edge["target"]
-            if rationale_id not in membership:
-                if target_id in membership:
-                    membership[rationale_id] = membership[target_id]
-                elif target_id in file_nodes:
-                    membership[rationale_id] = target_id
+    queue: deque[str] = deque(file_nodes)
+    while queue:
+        nid = queue.popleft()
+        owner = nid if nid in file_nodes else membership[nid]
+        for neighbour in (*down.get(nid, ()), *up.get(nid, ())):
+            # A node already placed is never rewritten, which is what makes a
+            # containment cycle terminate rather than spin.
+            if neighbour not in membership and neighbour not in file_nodes:
+                membership[neighbour] = owner
+                queue.append(neighbour)
 
     return membership
 
