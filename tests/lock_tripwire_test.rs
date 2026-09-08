@@ -31,14 +31,20 @@
 //! So:
 //!
 //! * **Rule 1 — write calls.** A function reaching the store seam's write must
-//!   hold the lock, unless its FILE is on [`ALLOW_FILES`]. File scope is right
-//!   here: `src/dashboard/api.rs` is one deliberate entry covering 17 sites.
+//!   hold the lock, unless its FILE is on [`ALLOW_FILES`] or, for the seam
+//!   file itself, the (FILE, FUNCTION) pair is on [`ALLOW_WRITE_FNS`]. File
+//!   scope is right for `src/dashboard/api.rs`, one deliberate entry covering
+//!   17 sites. It was WRONG for `src/store.rs`, whose reason -- "the seam
+//!   itself: it defines the lock and the write" -- is true of `write_back` and
+//!   false of `migrate_trig_to_nq` sitting beside it. That entry silently
+//!   absorbed site TEN of #87 and would have absorbed the next one too.
 //! * **Rule 2 — filesystem primitives.** A function that puts bytes over a path
 //!   it names as a graph must hold the lock, unless the (FILE, FUNCTION) pair is
 //!   on [`ALLOW_FNS`]. Measured on `610636e`: 157 primitive sites in non-test
 //!   functions, 9 of them in a function that names a graph and takes no lock.
 //!
-//! **Rule 2's exemptions are function-scoped and that is load-bearing.** A
+//! **Exemptions are function-scoped wherever the file is not homogeneous, and
+//! that is load-bearing.** A
 //! file-scoped exemption is precisely what would have let `restore_tier` ship
 //! unlocked inside `doctor.rs` while the tripwire certified that same file green.
 //! Repeating file scope in the wider rule would rebuild the hole one level up.
@@ -100,8 +106,14 @@ const GRAPH_SIGNALS: [&str; 10] = [
 
 /// Rule 1: files allowed to reach the seam's write without holding the lock.
 /// Every entry is a deliberate exemption, not an oversight.
-const ALLOW_FILES: [(&str, &str); 12] = [
-    ("src/store.rs", "the seam itself: it defines the lock and the write"),
+///
+/// `src/store.rs` is NOT here any more. It sat at index 0 with the reason "the
+/// seam itself: it defines the lock and the write", which is true of
+/// `write_back` and false of every other function in that file -- so the entry
+/// exempted `migrate_trig_to_nq`, whose unlocked `write_back` at `store.rs:74`
+/// is site TEN of #87's own table, and would have exempted the next one added
+/// beside it. The three real seam writers are named in [`ALLOW_WRITE_FNS`].
+const ALLOW_FILES: [(&str, &str); 11] = [
     (
         "src/dashboard/api.rs",
         "the dashboard holds a long-lived in-memory Store (server.rs:62,68) that these mutate \
@@ -118,6 +130,42 @@ const ALLOW_FILES: [(&str, &str); 12] = [
     ("src/graph.rs", "graph.compact, whole-file rebuild (#87)"),
     ("src/migrate.rs", "migration, one-shot (#87)"),
     ("src/hook/session_start.rs", "no graph write; listed if a call appears"),
+];
+
+/// Rule 1: (file, function) pairs allowed to reach the seam's write without
+/// holding the lock, for files where a whole-FILE exemption would be a lie.
+///
+/// These three are flagged by their own SIGNATURE lines, not by their bodies:
+/// `functions()` appends the `fn` line to the body it opens, so `fn write_back(`
+/// is a `WRITE_CALLS` hit on `write_back(` from the definition alone. That is a
+/// property of the parser, deliberately preserved, and it is why the seam's own
+/// definitions need naming here at all.
+///
+/// `write_back_inner` is absent on purpose and its absence is MEASURED, not
+/// assumed: `write_back_inner(` does not contain the substring `write_back(`
+/// (the `_inner` sits before the paren), so Rule 1 never sees it. It is on
+/// [`ALLOW_FNS`] for Rule 2 instead, where its temp+rename does get seen.
+const ALLOW_WRITE_FNS: [(&str, &str, &str); 3] = [
+    (
+        "src/store.rs",
+        "write_back",
+        "the seam's write itself: flagged by its own signature line. Every locked \
+         write in the tree ends here",
+    ),
+    (
+        "src/store.rs",
+        "update_and_write",
+        "the dashboard's unlocked whole-file route, flagged by its own signature. \
+         The dashboard holds a long-lived in-memory Store it mutates and writes \
+         back, so reload-under-lock would diverge that cache from the file; it is \
+         being deprecated and is not getting the lock (Chris, 2026-09-07)",
+    ),
+    (
+        "src/store.rs",
+        "mutate_and_write",
+        "same dashboard route as `update_and_write`, and it calls `write_back` in \
+         its body as well as matching its own signature",
+    ),
 ];
 
 /// Rule 2: (file, function) pairs allowed to call a filesystem primitive while
@@ -349,6 +397,7 @@ fn scan_file(
     rel: &str,
     src: &str,
     allow_files: &BTreeSet<&str>,
+    allow_write_fns: &BTreeSet<(&str, &str)>,
     allow_fns: &BTreeSet<(&str, &str)>,
     counts: &mut Counts,
 ) -> Vec<Finding> {
@@ -363,12 +412,13 @@ fn scan_file(
         let locked = first_match(&code, &LOCK_TOKENS).is_some();
         let site = format!("{rel}::{}", f.name);
 
-        // Rule 1 — the seam's write calls, exempted by FILE.
+        // Rule 1 — the seam's write calls, exempted by FILE, or by
+        // (FILE, FUNCTION) where a whole-file exemption would be a lie.
         if let Some(tok) = first_match(&code, &WRITE_CALLS)
             && !allow_files.contains(rel)
         {
             counts.write_call_functions_checked += 1;
-            if !locked {
+            if !locked && !allow_write_fns.contains(&(rel, f.name.as_str())) {
                 found.push(Finding {
                     site: site.clone(),
                     rule: Rule::WriteCall,
@@ -404,6 +454,7 @@ fn scan_file(
 
 fn scan_tree(
     allow_files: &BTreeSet<&str>,
+    allow_write_fns: &BTreeSet<(&str, &str)>,
     allow_fns: &BTreeSet<(&str, &str)>,
 ) -> (Vec<Finding>, Counts) {
     let root = repo_root();
@@ -421,7 +472,14 @@ fn scan_tree(
             .replace('\\', "/");
         let src = std::fs::read_to_string(path).unwrap_or_default();
         counts.files_scanned += 1;
-        found.extend(scan_file(&rel, &src, allow_files, allow_fns, &mut counts));
+        found.extend(scan_file(
+            &rel,
+            &src,
+            allow_files,
+            allow_write_fns,
+            allow_fns,
+            &mut counts,
+        ));
     }
     (found, counts)
 }
@@ -432,6 +490,10 @@ fn allow_file_set() -> BTreeSet<&'static str> {
 
 fn allow_fn_set() -> BTreeSet<(&'static str, &'static str)> {
     ALLOW_FNS.iter().map(|(f, n, _)| (*f, *n)).collect()
+}
+
+fn allow_write_fn_set() -> BTreeSet<(&'static str, &'static str)> {
+    ALLOW_WRITE_FNS.iter().map(|(f, n, _)| (*f, *n)).collect()
 }
 
 fn report(found: &[Finding]) -> String {
@@ -447,11 +509,19 @@ fn report(found: &[Finding]) -> String {
 #[test]
 fn every_graph_writer_outside_the_allow_list_takes_the_lock() {
     let allow_files = allow_file_set();
+    let allow_write_fns = allow_write_fn_set();
     let allow_fns = allow_fn_set();
 
     println!("rule 1 allow-list — {} FILES, each an explicit exemption:", ALLOW_FILES.len());
     for (f, why) in ALLOW_FILES {
         println!("  {f}\n      {why}");
+    }
+    println!(
+        "rule 1 allow-list — {} (FILE, FUNCTION) pairs, for files a whole-file exemption would lie about:",
+        ALLOW_WRITE_FNS.len()
+    );
+    for (f, n, why) in ALLOW_WRITE_FNS {
+        println!("  {f}::{n}\n      {why}");
     }
     println!(
         "rule 2 allow-list — {} (FILE, FUNCTION) pairs, each naming what it actually writes:",
@@ -461,7 +531,7 @@ fn every_graph_writer_outside_the_allow_list_takes_the_lock() {
         println!("  {f}::{n}\n      {why}");
     }
 
-    let (found, counts) = scan_tree(&allow_files, &allow_fns);
+    let (found, counts) = scan_tree(&allow_files, &allow_write_fns, &allow_fns);
 
     println!("tripwire: {} files scanned under src/", counts.files_scanned);
     println!("tripwire: {} non-test functions visited", counts.functions_visited);
@@ -503,8 +573,8 @@ fn every_graph_writer_outside_the_allow_list_takes_the_lock() {
         found.is_empty(),
         "these write a graph without taking the lock, and are not on an allow-list:\n  {}\n\
          Either take the lock (store::with_graph_lock / lock_graph / crud::lock_and_load) or add \
-         the entry to ALLOW_FILES (rule 1) or ALLOW_FNS (rule 2) in this test, with a reason that \
-         names what it writes.",
+         the entry to ALLOW_FILES or ALLOW_WRITE_FNS (rule 1) or ALLOW_FNS (rule 2) in this test, \
+         with a reason that names what it writes.",
         report(&found)
     );
 }
@@ -520,7 +590,7 @@ fn every_graph_writer_outside_the_allow_list_takes_the_lock() {
 fn the_widened_rule_sees_the_unlocked_fs_writers() {
     let no_files: BTreeSet<&str> = BTreeSet::new();
     let no_fns: BTreeSet<(&str, &str)> = BTreeSet::new();
-    let (found, counts) = scan_tree(&no_files, &no_fns);
+    let (found, counts) = scan_tree(&no_files, &no_fns, &no_fns);
 
     assert!(
         counts.functions_visited > 0,
@@ -572,7 +642,7 @@ fn every_fs_primitive_shape_reaches_the_rule() {
 
     let scan = |src: &str| -> Vec<Finding> {
         let mut c = Counts::default();
-        scan_file("src/probe.rs", src, &no_files, &no_fns, &mut c)
+        scan_file("src/probe.rs", src, &no_files, &no_fns, &no_fns, &mut c)
     };
 
     // Positive: every primitive, in a function that names a graph path.
