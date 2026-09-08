@@ -465,6 +465,10 @@ Forks are additive, registering a new one never archives existing forks or the p
 **A:** `base ast query -i "config.rs"` (or `--imports`) lists every file that imports from the target file. Useful before renaming or refactoring a shared module.
 <!-- v0.12.3 | verified: cli-help -->
 
+### Q: How do I ask what a class inherits from, or find any relation other than calls and imports?
+**A:** `base ast query --relation inherits MyClass` answers both directions at once: what `MyClass` inherits, and what inherits `MyClass`. It works for any relation the map carries, not a fixed list — `implements`, `extends`, `contains`, `hasMethod`, `rationaleFor` and the rest. The valid names are read from the map itself rather than a list in base, so a relation added to the extractor is queryable without a change here. An unknown name answers with the relations that ARE present, so an empty result never has to be guessed at: `No 'ops:inherts' in this map. Present: calls, contains, extends, ...`. Underscores, hyphens and case are all ignored, so `imports_from`, `importsFrom` and `importsfrom` are the same query. Before v0.14.3 only `--calls` and `--imports` were reachable, and `inherits` was absent from every map besides.
+<!-- v0.14.3 | verified: source -->
+
 ### Q: Can I query another app's code map without cd-ing into it?
 **A:** Yes, add `-t/--target <path>` to any `base ast query`, e.g. `base ast query -t apps/web -c "auth"`. It queries that app's own `.base-ast/ast.ttl` map directly from wherever you currently are, so you never have to `cd`.
 <!-- v0.12.3 | verified: cli-help -->

@@ -60,6 +60,7 @@ base ast query -c "<name>"               # find entities by name
 base ast query -f "<file>"               # entities in a file
 base ast query --calls "<fn>"            # callers of a function
 base ast query -i "<file>"               # importers of a file
+base ast query --relation <rel> <name>   # any relation, both directions
 base ast query -t apps/X -c "<name>"     # query another app's map
 base ast ensure <path> [--wait]          # build the app's code map if it has none (what the hooks do on first contact)
 ```
