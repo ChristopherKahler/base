@@ -247,6 +247,27 @@ def test_a_crate_relative_rust_import_resolves_to_the_file():
     )
 
 
+def test_a_super_glob_inside_an_inline_mod_writes_no_self_loop():
+    """`use super::*` there resolves to THIS file, so no edge is written.
+
+    That is a deliberate non-emission and it costs base's own tree 67
+    `imports_from` edges, so it is pinned rather than left to a comment: an
+    inline `mod tests` importing its parent module is not a dependency between
+    two files, and a file that imports itself is not a fact about the tree.
+    `extractor.py` claimed this leg existed before the leg did, which is a
+    false capability claim about a guard and the reason this one is here.
+    """
+    run = _extract(RUST_TREE)
+    loops = [(s, r, t) for s, r, t in _import_edges(run) if s == t]
+    assert not loops, f"a file imports itself: {loops[:3]}"
+    # And the other imports on the same file are still there, so the rule
+    # removed a self-loop rather than the file's import edges.
+    assert len(_import_edges(run)) >= 3, (
+        f"the fixture imports three crates and a module; only "
+        f"{len(_import_edges(run))} import edge(s) survived"
+    )
+
+
 def test_a_super_glob_inside_an_inline_mod_is_not_a_failure():
     """`use super::*` in a `#[cfg(test)] mod tests` is a working import.
 

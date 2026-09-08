@@ -4262,8 +4262,11 @@ def extract_rust(path: Path) -> dict:
                     raw, path, _rust_inside_inline_mod(node))
                 # A `use super::*` inside an inline `mod tests` resolves to
                 # this very file. That is not an inter-file dependency, so no
-                # self-loop is written; `test_import_states.py` pins the
-                # absence so it stays a decision rather than an accident.
+                # self-loop is written. It costs base's own tree 67
+                # `imports_from` edges, which is why it is pinned by
+                # `test_import_states.py::test_a_super_glob_inside_an_inline_
+                # mod_writes_no_self_loop` rather than left to this comment --
+                # an earlier draft named a test that did not exist yet.
                 if tgt_nid and tgt_nid != file_nid:
                     add_edge(file_nid, tgt_nid, "imports_from",
                              node.start_point[0] + 1, context="import",
