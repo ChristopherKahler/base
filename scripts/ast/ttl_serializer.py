@@ -74,6 +74,22 @@ TYPE_MAP = {
     "method": "Method",
     "import": "Import",
     "rationale": "Rationale",
+    # #105: the things `ast query` was answering with as if they were symbols.
+    # Each one is emitted with an explicit `type` by the extractor that knows
+    # what it parsed, because nothing downstream can recover the distinction:
+    # a markdown heading, a fenced sample and a JSON key all arrived here
+    # carrying nothing at all, and the fallback declared every one a callable.
+    "heading": "Heading",
+    "code_block": "CodeBlock",
+    "property": "Property",
+    # The three import states, kept apart in the vocabulary itself so no
+    # reader has to infer which one a node stands for.
+    "import_external": "ExternalModule",
+    "import_unresolved": "UnresolvedImport",
+    "import_unparsed": "UnparsedFile",
+    # "I do not know what this is" — a claim the map could not previously
+    # make, which is why it made the stronger and wrong one instead.
+    "entity": "Entity",
 }
 
 # #107: this was a hand-kept table of 8, written 2026-06-01, while `extractor.py`
@@ -403,6 +419,12 @@ def serialize(
             1
             for n in nodes
             if n["id"] not in file_node_ids and n["id"] not in file_membership
+            # An import target has no membership by design and is NOT
+            # app-root attributed: it carries the importing file's path. If it
+            # were counted here the number would report 40 attributions that
+            # do not happen, which is the kind of counter that survives
+            # because nobody re-derives it.
+            and not (n.get("file_type") == "import" and n.get("source_file"))
         )
         stats["app_root_entities"] = orphans
         stats["total_entities"] = len(nodes)
@@ -418,6 +440,12 @@ def serialize(
         known_iris.add(f"code:{project_clean}_{sanitize_iri(node['id'])}")
 
     lines = [_build_prefixes()]
+
+    # Nodes that reached here with no type, no explicit kind and no role, and
+    # whose file_type is not code. They are declared `ops:Entity` rather than
+    # `ops:Function`, and the count is reported: a fallback nobody counts is
+    # how 860 non-symbols came to be declared callable without anyone noticing.
+    untyped_non_code = 0
 
     module_iri = f"code:{project_clean}_{sanitize_iri(source_file)}"
     lines.append(f"{module_iri} a ops:Module ;")
@@ -454,19 +482,66 @@ def serialize(
             lines.append("")
             continue
 
-        # Infer type: explicit node type > role map > fallback to function
+        # Type precedence. Every step is load-bearing:
+        #
+        #   1. A FILE node is a module whatever anyone else says. Its identity
+        #      comes from `file_map` via `_identify_file_nodes`, which is
+        #      stronger evidence than any per-node hint.
+        #   2. Then the extractor's own explicit `type`, for what only the
+        #      emitter can know: a heading, a fenced sample, a JSON key, an
+        #      import target's resolution state.
+        #   3. Then a role inferred from edges (a class that has methods, a
+        #      rationale).
+        #   4. And then NOT "function". This line used to read
+        #      `role_map.get(node["id"], "function")`, and that literal was the
+        #      whole of #105's shapes 1, 1b and 4: 591 markdown headings, 214
+        #      fenced code blocks and 55 lockfile keys declared callable
+        #      because nothing had classified them. An untyped node is called a
+        #      callable only when the extractor says its file_type is code;
+        #      anything else is an `Entity` and is COUNTED, because "I do not
+        #      know what this is" and "this is a function" are different
+        #      claims and only one of them was being made.
         node_type = node.get("type")
-        if not node_type or node_type not in TYPE_MAP:
-            node_type = role_map.get(node["id"], "function")
-        ops_type = TYPE_MAP.get(node_type, "Function")
+        if node["id"] in file_node_ids:
+            node_type = "module"
+        elif not node_type or node_type not in TYPE_MAP:
+            node_type = role_map.get(node["id"])
+        if not node_type:
+            if node.get("file_type") == "code":
+                node_type = "function"
+            else:
+                node_type = "entity"
+                untyped_non_code += 1
+        if node_type not in TYPE_MAP:
+            raise KeyError(
+                f"node type {node_type!r} has no ops: class (node {node['id']!r} "
+                f"from {node.get('source_file')!r}). Add it to TYPE_MAP in "
+                f"ttl_serializer.py — a silent default here is the defect #105 "
+                f"was filed for."
+            )
+        ops_type = TYPE_MAP[node_type]
         iri = f"code:{project_clean}_{sanitize_iri(node['id'])}"
         label = _escape_literal(node.get("label", node["id"]))
         line_num = _extract_line(node)
         signature = node.get("signature", "")
 
-        # Gap 3: resolve per-node sourceFile with relative paths
+        # Gap 3: resolve per-node sourceFile with relative paths.
+        #
+        # #105: an import target has no file MEMBERSHIP by design — an
+        # `imports_from` edge is not containment, and #82 ruled that widening
+        # the membership walk to follow reference relations attributes a symbol
+        # to whatever happens to mention it. So the app-root fallback claimed
+        # them, and `'../lib/api.js'` was filed against the app root at line 0.
+        # It has provenance all the same: the file that imports it, recorded on
+        # the node by `_classify_import_targets`. Where several files import
+        # the same package the first one seen wins, which is an arbitrary
+        # choice between real import sites rather than a directory that
+        # imports nothing.
+        node_fallback = source_file
+        if node.get("file_type") == "import" and node.get("source_file"):
+            node_fallback = node["source_file"]
         node_source = _resolve_source_file(
-            node["id"], file_membership, node_labels, file_map, source_file
+            node["id"], file_membership, node_labels, file_map, node_fallback
         )
         # For file-level Module nodes, also use relative path as label. A module
         # node's own id IS its file-node id, so it resolves uniquely — the bare
@@ -490,6 +565,9 @@ def serialize(
             lines.append(f"    ops:definedIn {parent_iri} ;")
         lines[-1] = lines[-1].rstrip(" ;") + " ."
         lines.append("")
+
+    if stats is not None:
+        stats["untyped_non_code_entities"] = untyped_non_code
 
     for edge in edges:
         relation = edge.get("relation", "calls")
