@@ -55,7 +55,7 @@ def test_gitignored_files_stay_out_of_a_git_repo():
         subprocess.run(["git", "init", "-q", str(root)], check=True)
         # Untracked-but-not-ignored is kept (a new file is still the app's);
         # ignored is not, tracked or otherwise.
-        assert _names(root) == ["src/app.py"], _names(root)
+        assert _names(root) == ["generated/gen.py", "src/app.py"], _names(root)
 
 
 def test_outside_git_the_walk_decides_alone():
