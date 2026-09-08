@@ -677,6 +677,11 @@ pub enum AstAction {
         /// Find all files that import from a given file
         #[arg(short, long)]
         imports: Option<String>,
+        /// Query any relation in both directions: --relation inherits Foo
+        /// answers what Foo inherits and what inherits Foo. Valid names are
+        /// read from the map itself; an unknown one lists what is present.
+        #[arg(long, num_args = 2, value_names = ["RELATION", "ENTITY"])]
+        relation: Option<Vec<String>>,
         /// Query a specific app's map by path (e.g. apps/foo) instead of the cwd's map
         #[arg(short, long)]
         target: Option<String>,
@@ -1467,7 +1472,7 @@ pub fn run() {
 
         // ─── AST Query ──────────────────────────────────
         Some(Commands::Ast { action }) => match action {
-            AstAction::Query { contains, file, calls, imports, target } => {
+            AstAction::Query { contains, file, calls, imports, relation, target } => {
                 // --target lets the parent query a specific app's map: resolve to
                 // that dir so find_ast_ttl walks up to its .base-ast/ast.ttl.
                 let qcwd = match &target {
@@ -1485,8 +1490,15 @@ pub fn run() {
                     if let Err(e) = crud::ast_query::calls(&qcwd, &config.namespace, &name) { die("Error", e); }
                 } else if let Some(path) = imports {
                     if let Err(e) = crud::ast_query::imports(&qcwd, &config.namespace, &path) { die("Error", e); }
+                } else if let Some(pair) = relation {
+                    // clap's num_args = 2 guarantees the length; index rather than
+                    // unwrap so a future arity change is a compile error, not a panic.
+                    let [rel, entity] = &pair[..] else {
+                        die("Error", anyhow::anyhow!("--relation takes exactly two values: <RELATION> <ENTITY>"));
+                    };
+                    if let Err(e) = crud::ast_query::relation(&qcwd, &config.namespace, rel, entity) { die("Error", e); }
                 } else {
-                    eprintln!("Provide one of: --contains, --file, --calls, --imports");
+                    eprintln!("Provide one of: --contains, --file, --calls, --imports, --relation");
                 }
             }
             AstAction::List => {

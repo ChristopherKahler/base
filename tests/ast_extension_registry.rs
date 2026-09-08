@@ -244,3 +244,176 @@ print("no_block", _sfc_script_only(b"export function plain() {}\n") is None)
     }
 }
 
+
+// ── #107: the relation vocabulary ────────────────────────────────────────────
+//
+// Same class as A1 one layer down. `_FILE_EXTS` drifted 39 extensions behind
+// `_DISPATCH` and every entity in the gap landed on the app root; `RELATION_MAP`
+// drifted 19 relations behind what `extractor.py` emits and every edge in THAT
+// gap was discarded at `ttl_serializer.py`'s last step, silently. `ops:inherits`
+// occurs in no map on any tree.
+//
+// These rows are grammar-free on purpose, so they ride `cargo test` today rather
+// than waiting for the Python CI job (#85). The corpus row that needs real
+// parses lives in `scripts/ast/test_relation_corpus.py`.
+
+/// C1: every relation the extractor can emit has an `ops:` predicate.
+///
+/// The emittable set is read from `extractor.py`'s own AST, not grepped. Four of
+/// the names reach an edge without ever appearing as a string literal at an
+/// `add_edge` call site — `implements` arrives through a forwarder, `uses_config`
+/// is built by f-string interpolation over a closed frozenset, and two more are
+/// conditional expressions — so a literal scan reports 24, 25 or 26 depending on
+/// which shapes it happens to know. It is 27.
+#[test]
+fn every_emittable_relation_has_a_predicate() {
+    let out = py(r#"
+import sys; sys.path.insert(0, ".")
+import ttl_serializer as t
+from relation_vocabulary import extractor_relations
+v = extractor_relations("extractor.py")
+missing = sorted(v.relations - set(t.RELATION_MAP))
+dead    = sorted(set(t.RELATION_MAP) - v.relations)
+print("emittable", len(v.relations))
+print("mapped", len(t.RELATION_MAP))
+print("missing", len(missing), missing)
+print("dead", len(dead), dead)
+print(v.report())
+"#);
+    // A8: the census publishes its own enumeration rule, and the FLOOR line is
+    // asserted so a later edit cannot quietly drop it and leave a bare `27`
+    // reading as a closed set. A2's standing ruling is that the set is OPEN.
+    assert!(
+        out.contains("FLOOR not CLOSURE"),
+        "the relation census printed a completeness figure without the FLOOR \
+         line naming the enumeration it counted over (amendment A8):\n{out}"
+    );
+
+    // Law 23: a resolver that silently skipped sites proves less than it claims,
+    // so an unresolved site is a failure of THIS test, not a smaller vocabulary.
+    assert!(
+        out.contains("unresolved 0 []"),
+        "the relation census could not reduce every relation slot to constants. \
+         Teach `relation_vocabulary.py` the new shape — do not narrow the claim:\n{out}"
+    );
+    assert!(
+        out.contains("missing 0 []"),
+        "the extractor emits relations the serializer has no predicate for; every \
+         edge carrying one is discarded silently (#107):\n{out}"
+    );
+    assert!(
+        out.contains("dead 0 []"),
+        "the serializer maps a relation nothing emits — a dead key invites the \
+         next reader to delete a live one by symmetry:\n{out}"
+    );
+    // A shape that stops matching would quietly shrink the vocabulary and pass
+    // every assertion above. Pin the ones with exactly one instance in the tree.
+    // These two pin a shape with exactly one instance, and they are matched
+    // LINE-EXACT rather than by `contains` for two separate reasons.
+    //
+    // Format: `relation_vocabulary.report()` emits `"path %s %d"` lines. The
+    // previous spelling here asserted a Python tuple repr, `('forwarders', 1)`,
+    // which was written against the pre-A8 report and became unmatchable the
+    // moment that report was rewritten — so it asserted nothing that could ever
+    // hold, while the counters it was guarding were all green.
+    //
+    // Exactness: `out.contains("path forwarders 1")` is also satisfied by
+    // `path forwarders 10`, so a substring guard would keep passing while the
+    // count it exists to pin drifted upward.
+    assert!(
+        out.lines().any(|l| l.trim() == "path forwarders 1"),
+        "the forwarder shape found nothing — `implements` is spelled at no other \
+         site and would vanish from the vocabulary:\n{out}"
+    );
+    assert!(
+        out.lines().any(|l| l.trim() == "path via_closed_set 1"),
+        "the f-string-over-a-closed-set shape found nothing — `uses_config` is \
+         spelled at no other site and would vanish from the vocabulary:\n{out}"
+    );
+    let emittable: usize = out
+        .lines()
+        .find_map(|l| l.strip_prefix("emittable "))
+        .and_then(|v| v.parse().ok())
+        .expect("emittable line");
+    assert!(
+        emittable >= 27,
+        "the census found {emittable} relations where 27 were measured on 610636e; \
+         a shrinking vocabulary means the resolver stopped seeing a shape:\n{out}"
+    );
+}
+
+/// C2: every relation in the vocabulary actually reaches the TTL as a triple.
+///
+/// C1 proves the table is complete; this proves the table is USED. A predicate
+/// present in the map and never emitted would satisfy C1 and still lose edges.
+#[test]
+fn every_mapped_relation_reaches_the_ttl() {
+    let out = py(r#"
+import re, sys; sys.path.insert(0, ".")
+import ttl_serializer as t
+missing = []
+for rel, pred in sorted(t.RELATION_MAP.items()):
+    extraction = {
+        "nodes": [
+            {"id": "src_n", "label": "src", "source_file": "a.py", "source_location": "L1"},
+            {"id": "tgt_n", "label": "tgt", "source_file": "a.py", "source_location": "L2"},
+        ],
+        "edges": [{"source": "src_n", "target": "tgt_n", "relation": rel}],
+    }
+    ttl = t.serialize(extraction, "proj", "a.py", "python")
+    if not re.search(rf"^code:\S+ ops:{pred} code:\S+ \.$", ttl, re.M):
+        missing.append(rel)
+print("checked", len(t.RELATION_MAP))
+print("missing", len(missing), missing)
+"#);
+    let checked: usize = out
+        .lines()
+        .find_map(|l| l.strip_prefix("checked "))
+        .and_then(|v| v.parse().ok())
+        .expect("checked line");
+    // Law 23: a loop that visited nothing must never read as a pass.
+    assert!(checked >= 27, "the coverage loop visited only {checked} relations:\n{out}");
+    assert!(
+        out.contains("missing 0 []"),
+        "relations are in the map but emit no triple:\n{out}"
+    );
+}
+
+/// C3: an unknown relation fails loudly instead of vanishing.
+///
+/// Law 25 — this is the leg that separates "repaired" from "silenced". C1 and C2
+/// would both pass if the fix were "add 19 keys" and the `continue` stayed; the
+/// next relation anyone adds would then be dropped exactly as `inherits` was.
+#[test]
+fn an_unknown_relation_fails_loudly() {
+    let out = py(r#"
+import sys; sys.path.insert(0, ".")
+import ttl_serializer as t
+extraction = {
+    "nodes": [
+        {"id": "src_n", "label": "src", "source_file": "a.py", "source_location": "L1"},
+        {"id": "tgt_n", "label": "tgt", "source_file": "a.py", "source_location": "L2"},
+    ],
+    "edges": [{"source": "src_n", "target": "tgt_n", "relation": "wibble_wobble"}],
+}
+try:
+    t.serialize(extraction, "proj", "a.py", "python")
+    print("raised False")
+    print("message -")
+except Exception as e:
+    print("raised True")
+    print("message", type(e).__name__, str(e)[:200])
+"#);
+    assert!(
+        out.contains("raised True"),
+        "an unmapped relation was dropped silently — the #107 defect itself:\n{out}"
+    );
+    assert!(
+        out.contains("wibble_wobble"),
+        "the error must name the offending relation, or the author cannot act on it:\n{out}"
+    );
+    assert!(
+        out.contains("relations.py"),
+        "the error must name the file to edit — `_build_lang_map`'s message does:\n{out}"
+    );
+}

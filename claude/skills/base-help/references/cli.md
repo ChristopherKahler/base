@@ -299,6 +299,9 @@ Options:
   -i, --imports <IMPORTS>
           Find all files that import from a given file
 
+      --relation <RELATION> <ENTITY>
+          Query any relation in both directions: --relation inherits Foo answers what Foo inherits and what inherits Foo. Valid names are read from the map itself; an unknown one lists what is present
+
   -t, --target <TARGET>
           Query a specific app's map by path (e.g. apps/foo) instead of the cwd's map
 
