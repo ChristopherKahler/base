@@ -38,11 +38,22 @@ pub fn compact_tier(path: &Path) -> Result<CompactOutcome> {
         );
     }
 
+    // #87. This site has a ONE LINE load-to-write window and it fires UNATTENDED
+    // on a timer through `auto_compact_tiers`, which makes it the most dangerous
+    // entry on the issue's list and the one a window-width reading triages last.
+    //
+    // The outer guard takes the lock BEFORE the snapshot, so the backup and the
+    // store that gets written describe the same file, and the original ordering
+    // (count, snapshot, load) is preserved rather than rearranged.
+    // `lock_and_load_graph` below RE-ENTERS this same lock through `HELD_LOCKS`,
+    // so there is one critical section and exactly one load.
+    let _outer = store::lock_graph_bulk(path)?;
+
     let lines_before = count_lines(path);
     let backup = store::snapshot(path, "compact").context("failed to snapshot before compact")?;
 
-    let graph = store::load_graph(path)?;
-    store::write_back(&graph, path, Change::Op("graph.compact"))?;
+    let locked = store::lock_and_load_graph(path)?;
+    locked.write(Change::Op("graph.compact"))?;
 
     let lines_after = count_lines(path);
     Ok(CompactOutcome {

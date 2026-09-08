@@ -82,6 +82,15 @@ pub struct DoctorReport {
     /// Counts against `healthy`: an inert trigger is a domain that silently stopped
     /// loading, and the fix is one line in domains.toml.
     pub trigger_faults: Vec<String>,
+    /// The write seam this binary was built with, [`store::LOCK_SEAM_MARKER`].
+    ///
+    /// Not diagnostic information for an operator — it is here so a verification
+    /// harness can prove WHICH binary it is driving from the binary's own output,
+    /// rather than from a filename, an mtime or a directory it was copied to.
+    /// Referencing it from a live path is also what keeps the constant reachable
+    /// in the linked binary, so a substring probe of the executable means
+    /// something.
+    pub seam: &'static str,
 }
 
 /// Diagnose a single graph file. PURE: only touches `path` and its siblings
@@ -219,6 +228,7 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         warnings,
         config_errors,
         trigger_faults,
+        seam: store::LOCK_SEAM_MARKER,
     }
 }
 
@@ -766,6 +776,16 @@ pub fn repair_tier(tier: &str, path: &Path) -> Result<RepairOutcome> {
         GraphHealth::Missing => Ok(base(None, None, 0, 0, true)),
         GraphHealth::Healthy => Ok(base(None, None, count_lines(path), 0, true)),
         GraphHealth::Unhealthy { .. } => {
+            // #87: the lock is taken before the snapshot, so the backup, the
+            // lenient re-parse and the rewrite all describe one file.
+            //
+            // NOT `lock_and_load_graph`: this arm runs on a graph that does not
+            // parse, so a load here would fail on exactly the file the repair
+            // exists to fix. `lock_for_rebuild` takes the lock and records the
+            // identity without loading, and the rebuilt store goes through
+            // `write_store`.
+            let locked = store::lock_for_rebuild(path)?;
+
             // 1. Snapshot first (rotating, in-binary backup — Phase 36 store::snapshot).
             let backup_path = store::snapshot(path, "pre-repair")
                 .context("failed to back up before repair")?;
@@ -790,7 +810,7 @@ pub fn repair_tier(tier: &str, path: &Path) -> Result<RepairOutcome> {
             };
 
             // 4. Atomic rewrite of the good set (temp → validate → rename).
-            store::write_back(&good, path, Change::Op("doctor.repair"))?;
+            locked.write_store(&good, Change::Op("doctor.repair"))?;
 
             // 5. Re-verify.
             let healthy_after = matches!(store::graph_health(path), GraphHealth::Healthy);
@@ -1151,6 +1171,7 @@ mod coach_drift_tests {
             warnings: vec![skill_drift_warning(Some("0.12.3"), "0.13.2", true).unwrap()],
             config_errors: vec![],
             trigger_faults: vec![],
+            seam: store::LOCK_SEAM_MARKER,
         };
         assert!(report.healthy, "an advisory must not flip the verdict");
         // Reaches the reader even with no graph tiers present — a lagging coach

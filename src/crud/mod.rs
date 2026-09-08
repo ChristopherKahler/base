@@ -193,6 +193,25 @@ pub fn lock_and_load(cwd: &Path) -> Result<(Store, PathBuf, crate::store::GraphL
     Ok((store, trig_path, guard))
 }
 
+/// Take the workspace graph lock, THEN load, and hand back a [`LockedGraph`].
+///
+/// The bulk twin of [`lock_and_load`], for the writers that rewrite the WHOLE
+/// file rather than applying a SPARQL update to it. Two differences, both
+/// deliberate: it waits on the bulk bound rather than the hot-path one, because
+/// none of these is on a per-tool-call path; and the value it returns carries
+/// the file identity, so the write refuses a file that changed under the
+/// snapshot instead of overwriting it.
+///
+/// `lock_and_load`'s five CRUD callers stay on the tuple form: they write
+/// through `update_and_write`, which applies a SPARQL update and takes no
+/// identity, so there is nothing for the backstop to compare. That coverage gap
+/// is filed to 0.14.4 — it is a gap in the guard, not in the lock, and those
+/// five do take the lock.
+pub fn lock_and_load_workspace(cwd: &Path) -> Result<crate::store::LockedGraph> {
+    let path = workspace_graph_path(cwd)?;
+    crate::store::lock_and_load_graph(&path)
+}
+
 pub fn load_workspace_store(cwd: &Path) -> Result<(Store, PathBuf)> {
     let base_dir = require_base_for_write(cwd)?;
     let trig_path = base_dir.join("graph.nq");

@@ -72,7 +72,8 @@ fn round_trips(n: usize) {
     let path = graph_path(root.path());
     let store = store_with(n);
 
-    store::write_back(&store, &path, Change::Op("test.round-trip")).unwrap();
+    store::write_back_seamed(&store, &path, Change::Op("test.round-trip"), |f| f, None, None)
+        .unwrap();
 
     let reloaded = store::load_graph(&path).unwrap();
     assert_eq!(reloaded.len().unwrap(), n, "{n} quads written must parse back as {n} quads");
@@ -109,7 +110,7 @@ fn the_written_file_is_byte_identical_to_the_raw_serializer_output() {
     let path = graph_path(root.path());
     let store = store_with(60_000);
 
-    store::write_back(&store, &path, Change::Op("test.bytes")).unwrap();
+    store::write_back_seamed(&store, &path, Change::Op("test.bytes"), |f| f, None, None).unwrap();
 
     let on_disk = fs::read(&path).unwrap();
     let reference = raw_dump(&store);
@@ -137,7 +138,8 @@ fn a_stale_temp_file_is_reaped_and_a_fresh_one_is_left_alone() {
     let fresh = dir.join("graph.nq.tmp.998");
     fs::write(&fresh, "fresh").unwrap();
 
-    store::write_back(&store_with(3), &path, Change::Op("test.sweep")).unwrap();
+    store::write_back_seamed(&store_with(3), &path, Change::Op("test.sweep"), |f| f, None, None)
+        .unwrap();
 
     assert_eq!(
         tmp_files(dir),
@@ -151,8 +153,10 @@ fn a_rewrite_replaces_the_previous_file_completely() {
     let root = tempfile::tempdir().unwrap();
     let path = graph_path(root.path());
 
-    store::write_back(&store_with(1_000), &path, Change::Op("test.first")).unwrap();
-    store::write_back(&store_with(5), &path, Change::Op("test.second")).unwrap();
+    store::write_back_seamed(&store_with(1_000), &path, Change::Op("test.first"), |f| f, None, None)
+        .unwrap();
+    store::write_back_seamed(&store_with(5), &path, Change::Op("test.second"), |f| f, None, None)
+        .unwrap();
 
     assert_eq!(store::load_graph(&path).unwrap().len().unwrap(), 5, "the second write wins in full");
     assert_eq!(fs::read(&path).unwrap(), raw_dump(&store_with(5)));
@@ -166,9 +170,11 @@ fn every_write_appends_exactly_one_changelog_record() {
     let path = graph_path(root.path());
 
     assert_eq!(log_lines(&path), 0);
-    store::write_back(&store_with(2), &path, Change::Op("test.log-1")).unwrap();
+    store::write_back_seamed(&store_with(2), &path, Change::Op("test.log-1"), |f| f, None, None)
+        .unwrap();
     assert_eq!(log_lines(&path), 1);
-    store::write_back(&store_with(2), &path, Change::Op("test.log-2")).unwrap();
+    store::write_back_seamed(&store_with(2), &path, Change::Op("test.log-2"), |f| f, None, None)
+        .unwrap();
     assert_eq!(log_lines(&path), 2);
 }
 
@@ -199,7 +205,8 @@ impl<W: std::io::Write> std::io::Write for FailAfter<W> {
 /// A seeded graph on disk: (path, its bytes, its mtime, its changelog length).
 fn seeded(root: &Path) -> (PathBuf, Vec<u8>, SystemTime, usize) {
     let path = graph_path(root);
-    store::write_back(&store_with(200), &path, Change::Op("test.seed")).unwrap();
+    store::write_back_seamed(&store_with(200), &path, Change::Op("test.seed"), |f| f, None, None)
+        .unwrap();
     let bytes = fs::read(&path).unwrap();
     let mtime = fs::metadata(&path).unwrap().modified().unwrap();
     (path.clone(), bytes, mtime, log_lines(&path))
@@ -227,6 +234,7 @@ fn a_sink_that_fails_mid_dump_is_an_error_and_the_original_survives() {
             Change::Op("test.fail"),
             |file| FailAfter { inner: file, left: limit },
             None,
+            None,
         );
 
         let err = result.expect_err("a failed write must surface as an error");
@@ -250,6 +258,7 @@ fn a_flush_failure_after_a_clean_dump_is_an_error_and_the_original_survives() {
         Change::Op("test.flush"),
         |file| FailAfter { inner: file, left: 0 },
         None,
+        None,
     );
 
     let msg = format!("{:#}", result.expect_err("the flush error must propagate"));
@@ -262,18 +271,23 @@ fn a_quad_count_mismatch_is_an_error_naming_both_counts_and_the_original_survive
     let root = tempfile::tempdir().unwrap();
     let (path, bytes, mtime, log) = seeded(root.path());
 
-    let result = store::write_back_seamed(&store_with(1_000), &path, Change::Op("test.count"), |file| file, Some(999));
+    let result = store::write_back_seamed(&store_with(1_000), &path, Change::Op("test.count"), |file| file, Some(999), None);
 
     let msg = format!("{:#}", result.expect_err("a short file must not be renamed into place"));
     assert!(msg.contains("999") && msg.contains("1000"), "both counts are named, got: {msg}");
     assert_original_survived(&path, &bytes, mtime, log, "count");
 }
 
+/// The name used to say "behaves exactly like `write_back`" while the body
+/// compared against `raw_dump` and never called `write_back` at all. Since #87
+/// made `write_back` private, an integration test cannot reach it, so the
+/// entry-point equivalence is pinned by `the_two_entry_points_write_identical_bytes`
+/// inside `store.rs`, which can. This one asserts what it actually asserts.
 #[test]
-fn the_seam_with_no_injection_behaves_exactly_like_write_back() {
+fn the_seam_with_no_injection_writes_the_raw_serializer_bytes() {
     let root = tempfile::tempdir().unwrap();
     let path = graph_path(root.path());
-    store::write_back_seamed(&store_with(1_000), &path, Change::Op("test.identity"), |file| file, None).unwrap();
+    store::write_back_seamed(&store_with(1_000), &path, Change::Op("test.identity"), |file| file, None, None).unwrap();
     assert_eq!(fs::read(&path).unwrap(), raw_dump(&store_with(1_000)));
     assert_eq!(log_lines(&path), 1);
 }

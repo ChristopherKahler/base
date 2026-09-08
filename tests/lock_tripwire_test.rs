@@ -31,14 +31,20 @@
 //! So:
 //!
 //! * **Rule 1 — write calls.** A function reaching the store seam's write must
-//!   hold the lock, unless its FILE is on [`ALLOW_FILES`]. File scope is right
-//!   here: `src/dashboard/api.rs` is one deliberate entry covering 17 sites.
+//!   hold the lock, unless its FILE is on [`ALLOW_FILES`] or, for the seam
+//!   file itself, the (FILE, FUNCTION) pair is on [`ALLOW_WRITE_FNS`]. File
+//!   scope is right for `src/dashboard/api.rs`, one deliberate entry covering
+//!   17 sites. It was WRONG for `src/store.rs`, whose reason -- "the seam
+//!   itself: it defines the lock and the write" -- is true of `write_back` and
+//!   false of `migrate_trig_to_nq` sitting beside it. That entry silently
+//!   absorbed site TEN of #87 and would have absorbed the next one too.
 //! * **Rule 2 — filesystem primitives.** A function that puts bytes over a path
 //!   it names as a graph must hold the lock, unless the (FILE, FUNCTION) pair is
 //!   on [`ALLOW_FNS`]. Measured on `610636e`: 157 primitive sites in non-test
 //!   functions, 9 of them in a function that names a graph and takes no lock.
 //!
-//! **Rule 2's exemptions are function-scoped and that is load-bearing.** A
+//! **Exemptions are function-scoped wherever the file is not homogeneous, and
+//! that is load-bearing.** A
 //! file-scoped exemption is precisely what would have let `restore_tier` ship
 //! unlocked inside `doctor.rs` while the tripwire certified that same file green.
 //! Repeating file scope in the wider rule would rebuild the hole one level up.
@@ -65,11 +71,24 @@ const FS_PRIMITIVES: [&str; 7] = [
 ];
 
 /// Anything that puts the graph lock in scope for the enclosing function.
-const LOCK_TOKENS: [&str; 5] = [
+///
+/// `"lock_graph_bulk("` is a SEPARATE entry and it has to be. These are
+/// substring tests, and `"lock_graph_bulk("` does not contain `"lock_graph("` --
+/// the `_bulk` sits before the paren, exactly as `_inner` does in
+/// `write_back_inner`. #87 introduced `lock_graph_bulk` and the guard could not
+/// see it: the tree was correctly locked and the tripwire still reported
+/// `migrate_trig_to_nq` as an unlocked writer. A fix that introduces a spelling
+/// its own guard cannot read is the false-RED twin of the false-PASS this file
+/// exists to prevent, so [`every_lock_token_actually_clears_the_flag`] now fails
+/// the suite for any entry here that has no effect.
+const LOCK_TOKENS: [&str; 8] = [
     "with_graph_lock(",
     "lock_graph(",
+    "lock_graph_bulk(",
+    "lock_for_rebuild(",
     "locked_update(",
     "lock_and_load(",
+    "lock_and_load_workspace(",
     "mutate_file_if_holds(",
 ];
 
@@ -85,9 +104,28 @@ const LOCK_TOKENS: [&str; 5] = [
 /// The rest are the resolvers a graph path arrives through. `lock_path(`
 /// deliberately is NOT here: the relay has a `lock_path` of its own over its
 /// spool, and including it flagged `relay::with_lock`, which touches no graph.
-const GRAPH_SIGNALS: [&str; 10] = [
+///
+/// `"nq_path"` and `"trig_path"` were added by #87, and the reason is a
+/// MEASUREMENT rather than a tidy-up. Rule 2 could not see site ten at all.
+/// `migrate_trig_to_nq` calls `fs::remove_file` twice over graph files and names
+/// its paths `nq_path` and `trig_path`; its only `.nq` spellings live in comment
+/// lines, which `code_only` strips before any signal is tested. So the function
+/// was invisible to Rule 2 and only Rule 1's `write_back(` ever saw it -- two
+/// rules meant as defence in depth, one of them blind to the highest-ranked site
+/// in the issue. Measured on this tree with the site unlocked and these two
+/// entries present: graph-signalled fs-primitive functions 9 to 10, flagged 1,
+/// and site ten is caught by BOTH rules. With the site locked they flag nothing
+/// new, so the cost at this head is zero and the gain is a second independent
+/// detector.
+///
+/// `"trig_path"` is not a legacy curiosity: it is the dominant spelling for a
+/// graph path in this tree -- 97 occurrences across 14 files, including
+/// `crud::lock_and_load`, where the variable named `trig_path` holds `graph.nq`.
+const GRAPH_SIGNALS: [&str; 12] = [
     ".nq",
     "\"nq.",
+    "nq_path",
+    "trig_path",
     "graph_path",
     "dest_path",
     "source_path",
@@ -100,31 +138,69 @@ const GRAPH_SIGNALS: [&str; 10] = [
 
 /// Rule 1: files allowed to reach the seam's write without holding the lock.
 /// Every entry is a deliberate exemption, not an oversight.
-const ALLOW_FILES: [(&str, &str); 12] = [
-    ("src/store.rs", "the seam itself: it defines the lock and the write"),
+///
+/// `src/store.rs` is NOT here any more. It sat at index 0 with the reason "the
+/// seam itself: it defines the lock and the write", which is true of
+/// `write_back` and false of every other function in that file -- so the entry
+/// exempted `migrate_trig_to_nq`, whose unlocked `write_back` at `store.rs:74`
+/// is site TEN of #87's own table, and would have exempted the next one added
+/// beside it. The three real seam writers are named in [`ALLOW_WRITE_FNS`].
+/// The nine `(#87)` entries that used to sit here are GONE, and their absence is
+/// the acceptance leg for the migration. Each named a Tier C writer that reached
+/// the seam's whole-file write from a pre-lock snapshot; all nine now go through
+/// `LockedGraph`, and `write_back` is private, so no caller outside `store.rs`
+/// can reach it whatever this list says.
+const ALLOW_FILES: [(&str, &str); 2] = [
     (
         "src/dashboard/api.rs",
         "the dashboard holds a long-lived in-memory Store (server.rs:62,68) that these mutate \
          and write back, so reload-under-lock would diverge that cache from the file. It is \
          being deprecated and is not getting the lock (Chris, 2026-09-07)",
     ),
-    ("src/extract/mod.rs", "one-shot bulk rebuild (#87)"),
-    ("src/extract/paul_toml.rs", "one-shot bulk rebuild (#87)"),
-    ("src/extension/ingest.rs", "one-shot bulk ingest (#87)"),
-    ("src/standards/sync.rs", "one-shot bulk sync (#87)"),
-    ("src/domain/sync.rs", "one-shot bulk sync (#87)"),
-    ("src/apply_ops.rs", "remote op application, bulk (#87)"),
-    ("src/doctor.rs", "doctor.repair, whole-file rebuild (#87)"),
-    ("src/graph.rs", "graph.compact, whole-file rebuild (#87)"),
-    ("src/migrate.rs", "migration, one-shot (#87)"),
     ("src/hook/session_start.rs", "no graph write; listed if a call appears"),
+];
+
+/// Rule 1: (file, function) pairs allowed to reach the seam's write without
+/// holding the lock, for files where a whole-FILE exemption would be a lie.
+///
+/// These three are flagged by their own SIGNATURE lines, not by their bodies:
+/// `functions()` appends the `fn` line to the body it opens, so `fn write_back(`
+/// is a `WRITE_CALLS` hit on `write_back(` from the definition alone. That is a
+/// property of the parser, deliberately preserved, and it is why the seam's own
+/// definitions need naming here at all.
+///
+/// `write_back_inner` is absent on purpose and its absence is MEASURED, not
+/// assumed: `write_back_inner(` does not contain the substring `write_back(`
+/// (the `_inner` sits before the paren), so Rule 1 never sees it. It is on
+/// [`ALLOW_FNS`] for Rule 2 instead, where its temp+rename does get seen.
+const ALLOW_WRITE_FNS: [(&str, &str, &str); 3] = [
+    (
+        "src/store.rs",
+        "write_back",
+        "the seam's write itself: flagged by its own signature line. Every locked \
+         write in the tree ends here",
+    ),
+    (
+        "src/store.rs",
+        "update_and_write",
+        "the dashboard's unlocked whole-file route, flagged by its own signature. \
+         The dashboard holds a long-lived in-memory Store it mutates and writes \
+         back, so reload-under-lock would diverge that cache from the file; it is \
+         being deprecated and is not getting the lock (Chris, 2026-09-07)",
+    ),
+    (
+        "src/store.rs",
+        "mutate_and_write",
+        "same dashboard route as `update_and_write`, and it calls `write_back` in \
+         its body as well as matching its own signature",
+    ),
 ];
 
 /// Rule 2: (file, function) pairs allowed to call a filesystem primitive while
 /// naming a graph path. **Every reason names the file the function actually
 /// writes** — an exemption that cannot say what it writes is not an exemption,
 /// it is a hole.
-const ALLOW_FNS: [(&str, &str, &str); 9] = [
+const ALLOW_FNS: [(&str, &str, &str); 8] = [
     (
         "src/store.rs",
         "write_back_inner",
@@ -147,12 +223,6 @@ const ALLOW_FNS: [(&str, &str, &str); 9] = [
         "restore_tier",
         "#87: fs::copy + fs::rename straight over the graph. Takes the lock with the migration; \
          this entry is removed then",
-    ),
-    (
-        "src/doctor.rs",
-        "repair_tier",
-        "writes the .quarantine-<stamp> sidecar, NOT the graph. Its graph write is write_back \
-         at :793 and is Rule 1's (#87)",
     ),
     (
         "src/graph.rs",
@@ -349,6 +419,7 @@ fn scan_file(
     rel: &str,
     src: &str,
     allow_files: &BTreeSet<&str>,
+    allow_write_fns: &BTreeSet<(&str, &str)>,
     allow_fns: &BTreeSet<(&str, &str)>,
     counts: &mut Counts,
 ) -> Vec<Finding> {
@@ -363,12 +434,13 @@ fn scan_file(
         let locked = first_match(&code, &LOCK_TOKENS).is_some();
         let site = format!("{rel}::{}", f.name);
 
-        // Rule 1 — the seam's write calls, exempted by FILE.
+        // Rule 1 — the seam's write calls, exempted by FILE, or by
+        // (FILE, FUNCTION) where a whole-file exemption would be a lie.
         if let Some(tok) = first_match(&code, &WRITE_CALLS)
             && !allow_files.contains(rel)
         {
             counts.write_call_functions_checked += 1;
-            if !locked {
+            if !locked && !allow_write_fns.contains(&(rel, f.name.as_str())) {
                 found.push(Finding {
                     site: site.clone(),
                     rule: Rule::WriteCall,
@@ -404,6 +476,7 @@ fn scan_file(
 
 fn scan_tree(
     allow_files: &BTreeSet<&str>,
+    allow_write_fns: &BTreeSet<(&str, &str)>,
     allow_fns: &BTreeSet<(&str, &str)>,
 ) -> (Vec<Finding>, Counts) {
     let root = repo_root();
@@ -421,7 +494,14 @@ fn scan_tree(
             .replace('\\', "/");
         let src = std::fs::read_to_string(path).unwrap_or_default();
         counts.files_scanned += 1;
-        found.extend(scan_file(&rel, &src, allow_files, allow_fns, &mut counts));
+        found.extend(scan_file(
+            &rel,
+            &src,
+            allow_files,
+            allow_write_fns,
+            allow_fns,
+            &mut counts,
+        ));
     }
     (found, counts)
 }
@@ -432,6 +512,10 @@ fn allow_file_set() -> BTreeSet<&'static str> {
 
 fn allow_fn_set() -> BTreeSet<(&'static str, &'static str)> {
     ALLOW_FNS.iter().map(|(f, n, _)| (*f, *n)).collect()
+}
+
+fn allow_write_fn_set() -> BTreeSet<(&'static str, &'static str)> {
+    ALLOW_WRITE_FNS.iter().map(|(f, n, _)| (*f, *n)).collect()
 }
 
 fn report(found: &[Finding]) -> String {
@@ -447,11 +531,19 @@ fn report(found: &[Finding]) -> String {
 #[test]
 fn every_graph_writer_outside_the_allow_list_takes_the_lock() {
     let allow_files = allow_file_set();
+    let allow_write_fns = allow_write_fn_set();
     let allow_fns = allow_fn_set();
 
     println!("rule 1 allow-list — {} FILES, each an explicit exemption:", ALLOW_FILES.len());
     for (f, why) in ALLOW_FILES {
         println!("  {f}\n      {why}");
+    }
+    println!(
+        "rule 1 allow-list — {} (FILE, FUNCTION) pairs, for files a whole-file exemption would lie about:",
+        ALLOW_WRITE_FNS.len()
+    );
+    for (f, n, why) in ALLOW_WRITE_FNS {
+        println!("  {f}::{n}\n      {why}");
     }
     println!(
         "rule 2 allow-list — {} (FILE, FUNCTION) pairs, each naming what it actually writes:",
@@ -461,7 +553,7 @@ fn every_graph_writer_outside_the_allow_list_takes_the_lock() {
         println!("  {f}::{n}\n      {why}");
     }
 
-    let (found, counts) = scan_tree(&allow_files, &allow_fns);
+    let (found, counts) = scan_tree(&allow_files, &allow_write_fns, &allow_fns);
 
     println!("tripwire: {} files scanned under src/", counts.files_scanned);
     println!("tripwire: {} non-test functions visited", counts.functions_visited);
@@ -503,8 +595,8 @@ fn every_graph_writer_outside_the_allow_list_takes_the_lock() {
         found.is_empty(),
         "these write a graph without taking the lock, and are not on an allow-list:\n  {}\n\
          Either take the lock (store::with_graph_lock / lock_graph / crud::lock_and_load) or add \
-         the entry to ALLOW_FILES (rule 1) or ALLOW_FNS (rule 2) in this test, with a reason that \
-         names what it writes.",
+         the entry to ALLOW_FILES or ALLOW_WRITE_FNS (rule 1) or ALLOW_FNS (rule 2) in this test, \
+         with a reason that names what it writes.",
         report(&found)
     );
 }
@@ -520,7 +612,7 @@ fn every_graph_writer_outside_the_allow_list_takes_the_lock() {
 fn the_widened_rule_sees_the_unlocked_fs_writers() {
     let no_files: BTreeSet<&str> = BTreeSet::new();
     let no_fns: BTreeSet<(&str, &str)> = BTreeSet::new();
-    let (found, counts) = scan_tree(&no_files, &no_fns);
+    let (found, counts) = scan_tree(&no_files, &no_fns, &no_fns);
 
     assert!(
         counts.functions_visited > 0,
@@ -551,6 +643,109 @@ fn the_widened_rule_sees_the_unlocked_fs_writers() {
     );
 }
 
+/// Law 31, turned on [`LOCK_TOKENS`]: every entry must actually clear the flag.
+///
+/// This leg exists because #87 added `lock_graph_bulk` and the guard kept
+/// reporting a correctly-locked function as an offender: `"lock_graph_bulk("`
+/// does not contain `"lock_graph("`, so the new spelling read as no lock at all.
+/// A token that has no effect is indistinguishable from a token that is absent,
+/// and the failure direction is a false RED -- loud, but it also trains a reader
+/// to add files back to an allow-list, which re-blinds the files under repair.
+///
+/// The list comes from the constant, so a spelling added without effect fails
+/// here rather than being discovered by the next builder.
+#[test]
+fn every_lock_token_actually_clears_the_flag() {
+    let no_files: BTreeSet<&str> = BTreeSet::new();
+    let no_fns: BTreeSet<(&str, &str)> = BTreeSet::new();
+
+    let scan = |src: &str| -> Vec<Finding> {
+        let mut c = Counts::default();
+        scan_file("src/probe.rs", src, &no_files, &no_fns, &no_fns, &mut c)
+    };
+
+    // Control first: with NO lock token, this exact body must be flagged by both
+    // rules. Without this arm a rule that flagged nothing would pass every
+    // assertion below.
+    let unlocked = "fn writes_a_graph(nq_path: &Path) -> Result<()> {\n    \
+                    let tmp = nq_path.with_extension(\"nq.tmp\");\n    \
+                    std::fs::rename(&tmp, nq_path)?;\n    \
+                    write_back(&store, nq_path, change)?;\n    Ok(())\n}\n";
+    let control = scan(unlocked);
+    assert!(
+        control.iter().any(|f| f.rule == Rule::FsPrimitive),
+        "the control body is not flagged by rule 2, so this leg proves NOTHING \
+         about any token:\n{unlocked}"
+    );
+    assert!(
+        control.iter().any(|f| f.rule == Rule::WriteCall),
+        "the control body is not flagged by rule 1, so this leg proves NOTHING \
+         about any token:\n{unlocked}"
+    );
+
+    for tok in LOCK_TOKENS {
+        // Every token is a call spelling ending in '(' except none today; build a
+        // realistic use either way.
+        let call = format!("let _g = store::{tok}nq_path)?;");
+        let src = format!(
+            "fn writes_a_graph(nq_path: &Path) -> Result<()> {{\n    {call}\n    \
+             let tmp = nq_path.with_extension(\"nq.tmp\");\n    \
+             std::fs::rename(&tmp, nq_path)?;\n    \
+             write_back(&store, nq_path, change)?;\n    Ok(())\n}}\n"
+        );
+        let found = scan(&src);
+        assert!(
+            found.is_empty(),
+            "LOCK_TOKENS entry {tok:?} does not clear the flag — it is in the list \
+             and has no effect, which is the shape that made #87's own fix read as \
+             unlocked. Findings:\n  {}\nBody:\n{src}",
+            report(&found)
+        );
+    }
+}
+
+/// Law 31, turned on [`GRAPH_SIGNALS`]: every entry must actually reach rule 2.
+///
+/// The mirror of the token leg. A signal in the list that matches nothing is a
+/// silent hole, and site ten was exactly that: two `fs::remove_file` calls over
+/// graph files in a function whose only `.nq` spellings were in comments.
+#[test]
+fn every_graph_signal_reaches_rule_two() {
+    let no_files: BTreeSet<&str> = BTreeSet::new();
+    let no_fns: BTreeSet<(&str, &str)> = BTreeSet::new();
+
+    let scan = |src: &str| -> Vec<Finding> {
+        let mut c = Counts::default();
+        scan_file("src/probe.rs", src, &no_files, &no_fns, &no_fns, &mut c)
+    };
+
+    // Control: the same primitive with NO signal must NOT be flagged, or the
+    // positive arms below are satisfied by a rule that flags everything.
+    let no_signal = "fn writes_a_log(p: &Path) -> Result<()> {\n    \
+                     std::fs::rename(&tmp, p)?;\n    Ok(())\n}\n";
+    assert!(
+        scan(no_signal).is_empty(),
+        "a primitive with no graph signal is flagged — rule 2 is flagging \
+         everything, which is indistinguishable from working"
+    );
+
+    for sig in GRAPH_SIGNALS {
+        // Put the signal in a position that is code, not a comment: code_only
+        // strips comment lines, which is how site ten stayed invisible.
+        let src = format!(
+            "fn writes_a_graph(p: &Path) -> Result<()> {{\n    \
+             let target = resolve(\"{sig}\", p);\n    \
+             std::fs::rename(&tmp, &target)?;\n    Ok(())\n}}\n"
+        );
+        let found = scan(&src);
+        assert!(
+            found.iter().any(|f| f.rule == Rule::FsPrimitive),
+            "GRAPH_SIGNALS entry {sig:?} does not reach rule 2 — it is in the list \
+             and matches nothing. Body:\n{src}"
+        );
+    }
+}
+
 /// Law 31: prove the rule REACHES every shape of the thing it claims to guard,
 /// with the shapes enumerated from the codebase rather than from this test.
 ///
@@ -572,7 +767,7 @@ fn every_fs_primitive_shape_reaches_the_rule() {
 
     let scan = |src: &str| -> Vec<Finding> {
         let mut c = Counts::default();
-        scan_file("src/probe.rs", src, &no_files, &no_fns, &mut c)
+        scan_file("src/probe.rs", src, &no_files, &no_fns, &no_fns, &mut c)
     };
 
     // Positive: every primitive, in a function that names a graph path.
