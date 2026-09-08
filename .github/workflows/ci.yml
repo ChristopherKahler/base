@@ -123,7 +123,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: cargo test
+      # --no-fail-fast because cargo test ABORTS at the first failing target and
+      # runs the rest of them never. This job's first run proved the cost: it
+      # stopped at ast_automap_test (4th of the suite, alphabetically) and so
+      # tests/hook_log_tier_test.rs -- the failure #108 was FILED for -- did not
+      # execute at all, and #108's own claim went unmeasured by the job built to
+      # measure it. A first-ever Windows job that reveals one failure per 8-minute
+      # round trip is worth little; this one reports every Windows failure at once.
+      - run: cargo test --no-fail-fast
 
   # Required, not advisory. It was `continue-on-error: true` "until the three
   # pre-existing never_loop denies in src/crud are cleared" -- they are: a
