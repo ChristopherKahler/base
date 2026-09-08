@@ -71,9 +71,20 @@ const FS_PRIMITIVES: [&str; 7] = [
 ];
 
 /// Anything that puts the graph lock in scope for the enclosing function.
-const LOCK_TOKENS: [&str; 5] = [
+///
+/// `"lock_graph_bulk("` is a SEPARATE entry and it has to be. These are
+/// substring tests, and `"lock_graph_bulk("` does not contain `"lock_graph("` --
+/// the `_bulk` sits before the paren, exactly as `_inner` does in
+/// `write_back_inner`. #87 introduced `lock_graph_bulk` and the guard could not
+/// see it: the tree was correctly locked and the tripwire still reported
+/// `migrate_trig_to_nq` as an unlocked writer. A fix that introduces a spelling
+/// its own guard cannot read is the false-RED twin of the false-PASS this file
+/// exists to prevent, so [`every_lock_token_actually_clears_the_flag`] now fails
+/// the suite for any entry here that has no effect.
+const LOCK_TOKENS: [&str; 6] = [
     "with_graph_lock(",
     "lock_graph(",
+    "lock_graph_bulk(",
     "locked_update(",
     "lock_and_load(",
     "mutate_file_if_holds(",
@@ -91,9 +102,28 @@ const LOCK_TOKENS: [&str; 5] = [
 /// The rest are the resolvers a graph path arrives through. `lock_path(`
 /// deliberately is NOT here: the relay has a `lock_path` of its own over its
 /// spool, and including it flagged `relay::with_lock`, which touches no graph.
-const GRAPH_SIGNALS: [&str; 10] = [
+///
+/// `"nq_path"` and `"trig_path"` were added by #87, and the reason is a
+/// MEASUREMENT rather than a tidy-up. Rule 2 could not see site ten at all.
+/// `migrate_trig_to_nq` calls `fs::remove_file` twice over graph files and names
+/// its paths `nq_path` and `trig_path`; its only `.nq` spellings live in comment
+/// lines, which `code_only` strips before any signal is tested. So the function
+/// was invisible to Rule 2 and only Rule 1's `write_back(` ever saw it -- two
+/// rules meant as defence in depth, one of them blind to the highest-ranked site
+/// in the issue. Measured on this tree with the site unlocked and these two
+/// entries present: graph-signalled fs-primitive functions 9 to 10, flagged 1,
+/// and site ten is caught by BOTH rules. With the site locked they flag nothing
+/// new, so the cost at this head is zero and the gain is a second independent
+/// detector.
+///
+/// `"trig_path"` is not a legacy curiosity: it is the dominant spelling for a
+/// graph path in this tree -- 97 occurrences across 14 files, including
+/// `crud::lock_and_load`, where the variable named `trig_path` holds `graph.nq`.
+const GRAPH_SIGNALS: [&str; 12] = [
     ".nq",
     "\"nq.",
+    "nq_path",
+    "trig_path",
     "graph_path",
     "dest_path",
     "source_path",
@@ -619,6 +649,109 @@ fn the_widened_rule_sees_the_unlocked_fs_writers() {
         missed.join("\n  "),
         seen.len()
     );
+}
+
+/// Law 31, turned on [`LOCK_TOKENS`]: every entry must actually clear the flag.
+///
+/// This leg exists because #87 added `lock_graph_bulk` and the guard kept
+/// reporting a correctly-locked function as an offender: `"lock_graph_bulk("`
+/// does not contain `"lock_graph("`, so the new spelling read as no lock at all.
+/// A token that has no effect is indistinguishable from a token that is absent,
+/// and the failure direction is a false RED -- loud, but it also trains a reader
+/// to add files back to an allow-list, which re-blinds the files under repair.
+///
+/// The list comes from the constant, so a spelling added without effect fails
+/// here rather than being discovered by the next builder.
+#[test]
+fn every_lock_token_actually_clears_the_flag() {
+    let no_files: BTreeSet<&str> = BTreeSet::new();
+    let no_fns: BTreeSet<(&str, &str)> = BTreeSet::new();
+
+    let scan = |src: &str| -> Vec<Finding> {
+        let mut c = Counts::default();
+        scan_file("src/probe.rs", src, &no_files, &no_fns, &no_fns, &mut c)
+    };
+
+    // Control first: with NO lock token, this exact body must be flagged by both
+    // rules. Without this arm a rule that flagged nothing would pass every
+    // assertion below.
+    let unlocked = "fn writes_a_graph(nq_path: &Path) -> Result<()> {\n    \
+                    let tmp = nq_path.with_extension(\"nq.tmp\");\n    \
+                    std::fs::rename(&tmp, nq_path)?;\n    \
+                    write_back(&store, nq_path, change)?;\n    Ok(())\n}\n";
+    let control = scan(unlocked);
+    assert!(
+        control.iter().any(|f| f.rule == Rule::FsPrimitive),
+        "the control body is not flagged by rule 2, so this leg proves NOTHING \
+         about any token:\n{unlocked}"
+    );
+    assert!(
+        control.iter().any(|f| f.rule == Rule::WriteCall),
+        "the control body is not flagged by rule 1, so this leg proves NOTHING \
+         about any token:\n{unlocked}"
+    );
+
+    for tok in LOCK_TOKENS {
+        // Every token is a call spelling ending in '(' except none today; build a
+        // realistic use either way.
+        let call = format!("let _g = store::{tok}nq_path)?;");
+        let src = format!(
+            "fn writes_a_graph(nq_path: &Path) -> Result<()> {{\n    {call}\n    \
+             let tmp = nq_path.with_extension(\"nq.tmp\");\n    \
+             std::fs::rename(&tmp, nq_path)?;\n    \
+             write_back(&store, nq_path, change)?;\n    Ok(())\n}}\n"
+        );
+        let found = scan(&src);
+        assert!(
+            found.is_empty(),
+            "LOCK_TOKENS entry {tok:?} does not clear the flag — it is in the list \
+             and has no effect, which is the shape that made #87's own fix read as \
+             unlocked. Findings:\n  {}\nBody:\n{src}",
+            report(&found)
+        );
+    }
+}
+
+/// Law 31, turned on [`GRAPH_SIGNALS`]: every entry must actually reach rule 2.
+///
+/// The mirror of the token leg. A signal in the list that matches nothing is a
+/// silent hole, and site ten was exactly that: two `fs::remove_file` calls over
+/// graph files in a function whose only `.nq` spellings were in comments.
+#[test]
+fn every_graph_signal_reaches_rule_two() {
+    let no_files: BTreeSet<&str> = BTreeSet::new();
+    let no_fns: BTreeSet<(&str, &str)> = BTreeSet::new();
+
+    let scan = |src: &str| -> Vec<Finding> {
+        let mut c = Counts::default();
+        scan_file("src/probe.rs", src, &no_files, &no_fns, &no_fns, &mut c)
+    };
+
+    // Control: the same primitive with NO signal must NOT be flagged, or the
+    // positive arms below are satisfied by a rule that flags everything.
+    let no_signal = "fn writes_a_log(p: &Path) -> Result<()> {\n    \
+                     std::fs::rename(&tmp, p)?;\n    Ok(())\n}\n";
+    assert!(
+        scan(no_signal).is_empty(),
+        "a primitive with no graph signal is flagged — rule 2 is flagging \
+         everything, which is indistinguishable from working"
+    );
+
+    for sig in GRAPH_SIGNALS {
+        // Put the signal in a position that is code, not a comment: code_only
+        // strips comment lines, which is how site ten stayed invisible.
+        let src = format!(
+            "fn writes_a_graph(p: &Path) -> Result<()> {{\n    \
+             let target = resolve(\"{sig}\", p);\n    \
+             std::fs::rename(&tmp, &target)?;\n    Ok(())\n}}\n"
+        );
+        let found = scan(&src);
+        assert!(
+            found.iter().any(|f| f.rule == Rule::FsPrimitive),
+            "GRAPH_SIGNALS entry {sig:?} does not reach rule 2 — it is in the list \
+             and matches nothing. Body:\n{src}"
+        );
+    }
 }
 
 /// Law 31: prove the rule REACHES every shape of the thing it claims to guard,
