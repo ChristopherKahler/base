@@ -242,9 +242,12 @@ def _build_role_map(
 #: `extractor.py` — every one file→symbol or scope→symbol, so every one
 #: containment. No line numbers: an earlier draft of this comment listed eight
 #: of them and the list was both wrong and the reason it stayed wrong, because a
-#: grep truncated at eight looks exactly like an answer. Count them from a parse
-#: of `extractor.py`, not from a literal search — three `add_edge` calls and six
-#: dict-appends pass a relation that is not a literal at all.
+#: grep truncated at eight looks exactly like an answer. If you need the sites,
+#: COUNT THEM FROM A PARSE of `extractor.py` — a literal search misses the calls
+#: that pass a relation which is not a literal, and a naive parse miscounts the
+#: helper bodies every call flows through as emissions in their own right.
+#: No enumeration is kept here on purpose: three successive hand-counts in this
+#: comment were each wrong, and a fresher hand-count only resets the clock.
 #: `defines` was absent before #82 and cost the map every C++ struct field: one
 #: hop from a resolved parent, dropped on the relation's NAME.
 _CONTAINS_DOWNWARD: frozenset[str] = frozenset({"contains", "method", "defines"})
