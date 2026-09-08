@@ -21,6 +21,8 @@ ok()      { pass=$((pass+1)); printf '  PASS  %s\n' "$1"; }
 bad()     { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 skipped() { skip=$((skip+1)); printf '  SKIP  %s\n' "$1"; }
 
+WORK_SYMS_NEW=$(mktemp); WORK_SYMS_OLD=$(mktemp)
+trap 'rm -f "$WORK_SYMS_NEW" "$WORK_SYMS_OLD"' EXIT
 echo "═══ provenance ═══"
 for b in "$BASE_BIN" "$OLD_BIN"; do
     [ -x "$b" ] || { echo "ABORT: not executable: $b"; exit 2; }
@@ -32,10 +34,16 @@ printf '  control  %s  md5 %s  %s\n' "$OLD_BIN"  "$MD5_OLD" "$("$OLD_BIN"  --ver
 if [ "$MD5_NEW" = "$MD5_OLD" ]; then
     echo "ABORT: the two binaries are the same file — every row below would be void."; exit 2
 fi
-if ! strings "$BASE_BIN" 2>/dev/null | grep -q "$SYMBOL"; then
+# NO PIPE. `strings BIN | grep -q SYM` under `set -o pipefail` reports the pipeline as
+# FAILED when it MATCHES: grep -q exits at the first hit, strings takes SIGPIPE, and
+# pipefail publishes that. This check therefore inverted and refused a correct binary
+# whose symbol the build had just counted twice. Dump once, grep the file.
+strings "$BASE_BIN" > "$WORK_SYMS_NEW" 2>/dev/null || true
+strings "$OLD_BIN"  > "$WORK_SYMS_OLD" 2>/dev/null || true
+if ! grep -q "$SYMBOL" "$WORK_SYMS_NEW"; then
     echo "ABORT: branch binary has no '$SYMBOL' — it is not this branch's build."; exit 2
 fi
-if strings "$OLD_BIN" 2>/dev/null | grep -q "$SYMBOL"; then
+if grep -q "$SYMBOL" "$WORK_SYMS_OLD"; then
     echo "ABORT: the CONTROL carries '$SYMBOL' — it is not 0.14.1."; exit 2
 fi
 echo "  symbol '$SYMBOL': present in branch, absent in control — both binaries are what they claim"

@@ -61,16 +61,29 @@ fn slugs_sharing_a_millisecond_still_differ() {
     if ms(&a) == ms(&b) {
         assert_ne!(a, b, "same millisecond and same slug — this is #86 exactly");
     }
-    // And whatever the timing, the shape is right: three dash-separated parts, the middle
-    // one all digits so name order stays time order, the last one four hex digits.
+    // Shape: ping-<millis>-<pid>-<seq>. Four fields, not three, and deliberately so — the
+    // first attempt packed pid and counter into one four-hex-digit value, which meant
+    // masking the counter to 8 bits, which wrapped every 256 calls and cost the in-process
+    // uniqueness the counter was added to provide. The counter therefore has no width cap.
     for s in [&a, &b] {
         let parts: Vec<&str> = s.split('-').collect();
-        assert_eq!(parts.len(), 3, "expected ping-<millis>-<disc>, got {s}");
+        assert_eq!(parts.len(), 4, "expected ping-<millis>-<pid>-<seq>, got {s}");
         assert_eq!(parts[0], "ping", "{s}");
         assert!(parts[1].chars().all(|c| c.is_ascii_digit()), "millis must stay numeric: {s}");
-        assert_eq!(parts[2].len(), 4, "discriminator is four hex digits: {s}");
+        assert_eq!(parts[2].len(), 4, "pid field is four hex digits: {s}");
         assert!(parts[2].chars().all(|c| c.is_ascii_hexdigit()), "{s}");
+        assert!(!parts[3].is_empty(), "the counter field must be present: {s}");
+        assert!(parts[3].chars().all(|c| c.is_ascii_hexdigit()), "{s}");
     }
+
+    // The counter must NOT be width-capped: that cap is the defect this design replaced.
+    let many: Vec<String> = (0..300).map(|_| base::relay::ping_slug()).collect();
+    let widest = many.iter().filter_map(|s| s.split('-').nth(3)).map(str::len).max().unwrap();
+    assert!(
+        widest > 2,
+        "300 calls should push the counter past two hex digits; a cap here is the 8-bit \
+         wraparound coming back. widest counter field = {widest}"
+    );
 }
 
 /// Sorting by slug still sorts by time. `read_tasks_in` orders by `created`, but the

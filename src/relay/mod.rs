@@ -597,14 +597,17 @@ pub fn env_session_id() -> Option<String> {
 /// fixed width, so ordering by name is still ordering by time. Nothing parses the tail —
 /// `relay done` and both graph mirrors take the slug whole.
 pub fn ping_slug() -> String {
-    static PING_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static PING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = PING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let disc = ((std::process::id() & 0xff) << 8) | (seq & 0xff);
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    format!("ping-{millis}-{disc:04x}")
+    // The two discriminators are separate fields on purpose. Packing them into one
+    // four-hex-digit value meant masking the counter to 8 bits, which wrapped every 256
+    // calls: 10,000 pings from one process produced 1,280 distinct slugs, and the counter
+    // stopped doing the one job it was added for. Tidiness is not worth the property.
+    format!("ping-{millis}-{:04x}-{seq:x}", std::process::id() & 0xffff)
 }
 
 pub fn now_iso() -> String {
