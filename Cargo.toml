@@ -6,7 +6,7 @@ license = "FSL-1.1-ALv2"
 description = "Proactive context-injection engine for Claude Code"
 
 [dependencies]
-oxigraph = "0.4"
+oxigraph = { version = "0.4", default-features = false }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
