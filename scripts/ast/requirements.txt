@@ -9,6 +9,13 @@
 
 tree-sitter>=0.23.0
 
+# Markdown frontmatter. NOT optional and NOT one of the lazily-degradable
+# grammars below: `extractor._parse_frontmatter` imports this, and without it
+# every frontmatter-derived relation -- `relatedTo`, `supersedes`, the
+# `ontology: true` document type, and every frontmatter key that becomes a
+# graph property -- is dropped for every markdown file in the tree (#131).
+PyYAML>=6.0
+
 # Language grammars (one PyPI package per language the extractor supports).
 tree-sitter-bash
 tree-sitter-c

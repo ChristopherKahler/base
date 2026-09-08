@@ -6003,14 +6003,25 @@ def _parse_frontmatter(source: str) -> tuple[dict | None, int]:
             break
     if end < 0:
         return None, 0
+    # The import sits OUTSIDE the swallow on purpose (#131). A bare
+    # `except Exception` wrapped around it made an absent PyYAML
+    # indistinguishable from "this file has no frontmatter", so on any box
+    # without the wheel every frontmatter-derived relation vanished silently --
+    # and `scripts/ast/requirements.txt` never asked for PyYAML at all. An
+    # absent parser is an absent TOOL and has to be loud: `_safe_extract`
+    # catches it per file, warns to stderr, and populates the `error` key that
+    # `test_relation_corpus.py`'s precondition already reads. A malformed
+    # document is DATA, stays non-fatal, and is the only thing the swallow
+    # should ever have covered.
+    import yaml
+
     try:
-        import yaml
         fm = yaml.safe_load("\n".join(lines[1:end]))
-        if not isinstance(fm, dict):
-            return None, 0
-        return _json_safe(fm), end + 1
     except Exception:
         return None, 0
+    if not isinstance(fm, dict):
+        return None, 0
+    return _json_safe(fm), end + 1
 
 
 def _kebab_to_pascal(s: str) -> str:
