@@ -48,6 +48,8 @@ pub fn run(
     for dest in &dests {
         install_binary(&binary_path, dest, &local_bin)?;
     }
+    // One tick for step 1, not one per name: the loop runs twice on Windows.
+    println!("✓");
 
     // Step 2: Create ~/.base-gbl/ with defaults
     let global_dir = home.join(".base-gbl");
@@ -335,8 +337,9 @@ fn remove_claude_md_section(claude_md_path: &Path) -> Result<()> {
 // ─── Step 1: Install binary ─────────────────────────────────
 
 fn install_binary(binary: &Path, dest: &Path, bin_dir: &Path) -> Result<()> {
-    // The caller announces the step and every destination; this runs once per
-    // name, so printing here would repeat the heading on Windows.
+    // The caller announces the step, every destination, and the closing tick;
+    // this runs once per name, so printing either here would repeat it on
+    // Windows.
 
     std::fs::create_dir_all(bin_dir)
         .with_context(|| format!("Creating {}", bin_dir.display()))?;
@@ -370,7 +373,6 @@ fn install_binary(binary: &Path, dest: &Path, bin_dir: &Path) -> Result<()> {
         std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))?;
     }
 
-    println!("✓");
     Ok(())
 }
 

@@ -185,7 +185,22 @@ fn no_literal_base_binary_path_outside_the_seam() {
             }
             let literal_string = line.contains("\"~/.local/bin/base\"");
             let literal_join = line.contains(".join(\"base\")");
-            if literal_string || literal_join {
+            // The name's OTHER spelling. A `cfg!(windows)` arm choosing between
+            // the two literals is `base_binary_name()` rewritten by hand, and
+            // the two checks above cannot see it: neither literal appears in the
+            // form they look for. That blind spot is where the drift restarted
+            // after this guard's first pass - five live sites in update/mod.rs,
+            // found by reading, not by the guard.
+            //
+            // Matched on ONE line, which is the ternary form. A multi-line
+            // `if cfg!(windows) {` block is left alone on purpose: those guard
+            // genuine platform behaviour rather than construct a name, and
+            // `install_dest_is_platform_correct` asserts the seam's output
+            // against the literal, which is the case under test.
+            let cfg_name_arm = line.contains("cfg!(windows)")
+                && line.contains("\"base.exe\"")
+                && line.contains("\"base\"");
+            if literal_string || literal_join || cfg_name_arm {
                 offenders.push(format!("{}:{}", f.display(), i + 1));
             }
         }
@@ -194,9 +209,11 @@ fn no_literal_base_binary_path_outside_the_seam() {
     assert!(
         offenders.is_empty(),
         "the installed binary must be named through crate::home::base_binary_name() \
-         (or base_binary_path()/base_binary_display()), never a literal - a literal \
-         drops the Windows .exe suffix and produces a file Windows cannot run by \
-         name (#91). Offending sites:\n  {}",
+         (or base_binary_path()/base_binary_display()), never a literal and never a \
+         hand-written `if cfg!(windows) {{ \"base.exe\" }} else {{ \"base\" }}` arm - the \
+         literal drops the Windows .exe suffix and produces a file Windows cannot run \
+         by name, and the cfg arm is the same seam rewritten where this guard used to \
+         be unable to see it (#91). Offending sites:\n  {}",
         offenders.join("\n  ")
     );
 }
