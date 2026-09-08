@@ -298,3 +298,99 @@ fn skip_hooks_still_means_skip_hooks_even_after_base_creates_the_directory() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+#[test]
+fn skip_hooks_holds_when_claude_code_is_already_installed() {
+    // The shape the leg above CANNOT reach, and the only one an ordinary user is
+    // ever in: Claude Code got here first, so `~/.claude` exists BEFORE base runs.
+    //
+    // `cli::run` calls `ensure_hooks_wired` once, before it dispatches to any
+    // subcommand. A seam that excludes only `Commands::Hook` therefore reaches
+    // `install` too: with a config tier already present it wires all five hooks
+    // and stamps the version, and step 3's `⊘ Hook wiring skipped (--skip-hooks)`
+    // then prints over work that has already happened. The leg above passes
+    // against that bug, because its home has no `~/.claude` at entry and the seam
+    // returns empty for a reason that has nothing to do with the flag.
+    //
+    // Found by raven reading the tree, not by any test here. Law 31: a guard is
+    // only proven against the shapes the CODEBASE has, never against its own.
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("unpacked");
+    let binary = unpack_fake_archive(&archive);
+    seed_local_skill(tmp.path());
+
+    let home = mkdir(tmp.path().join("home"));
+    mkdir(home.join(".claude"));
+    // The stamp needs somewhere to land, or a write that "did not happen" may
+    // only have failed, and this leg would pass without proving anything.
+    mkdir(home.join(".base-gbl"));
+
+    let settings = home.join(".claude").join("settings.json");
+    let stamp = home
+        .join(".base-gbl")
+        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")));
+    assert!(!settings.exists(), "the precondition, stated rather than assumed");
+    assert!(!stamp.exists(), "and this version is unstamped, which is what arms the seam");
+
+    let out = run_base(
+        &binary,
+        &archive,
+        &home,
+        &["install", "--no-starter-commands", "--skip-hooks"],
+    );
+
+    assert!(
+        !settings.exists(),
+        "--skip-hooks wrote hooks anyway, into a home that already had ~/.claude.\nstdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !stamp.exists(),
+        "--skip-hooks stamped the version, which disarms the repair for the rest of it.\nstdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn uninstall_does_not_create_a_settings_file_on_its_way_to_emptying_one() {
+    // The same shape as the leg above, one command over, and found by sweeping
+    // all 39 `Commands` variants against every caller of the two settings.json
+    // mutators rather than by trusting a list. Exactly three commands own hook
+    // state: `Hook` (session_start), `Install` (step 3 and the deferred block)
+    // and `Uninstall` (`remove_hooks`, whose only caller is `install::uninstall`).
+    //
+    // `~/.claude/` exists and `settings.json` does not — a Claude Code install
+    // that has never been configured. The CLI seam runs before the dispatch, so
+    // an exclusion list missing `Uninstall` lets `wire_hooks_quiet` take the
+    // "parent is a dir" branch, CREATE the file, wire five hooks and stamp the
+    // version — and `remove_hooks` then strips them and reports that it removed
+    // hooks from settings.json. The user asked base to leave, and it left a
+    // config file behind that was never there.
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("unpacked");
+    let binary = unpack_fake_archive(&archive);
+
+    let home = mkdir(tmp.path().join("home"));
+    mkdir(home.join(".claude"));
+    mkdir(home.join(".base-gbl"));
+
+    let settings = home.join(".claude").join("settings.json");
+    let stamp = home
+        .join(".base-gbl")
+        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")));
+    assert!(!settings.exists(), "the precondition, stated rather than assumed");
+    assert!(!stamp.exists(), "and this version is unstamped, which is what arms the seam");
+
+    let out = run_base(&binary, &archive, &home, &["uninstall"]);
+
+    assert!(
+        !settings.exists(),
+        "uninstall created a settings.json that was never there.\nstdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !stamp.exists(),
+        "uninstall stamped the hooks version on its way out.\nstdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
