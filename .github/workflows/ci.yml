@@ -99,14 +99,48 @@ jobs:
       # this runner is ubuntu — so the check reads `git check-attr`, not the checkout.
       - run: ./scripts/test-crlf-attributes.sh
 
+  # base publishes base-windows-x86_64.zip on every release and, until 0.14.3, no
+  # test and no lint had ever run on Windows (#108). release.yml's Windows leg is a
+  # plain `cargo build --release`: compiled once, zipped, shipped, and nothing else
+  # on that platform ever checked.
+  #
+  # Its own job rather than a matrix leg on `test`. That job's second step is
+  # ./scripts/test-release-rehearsal.sh, a bash release rehearsal that is
+  # Linux-shaped, so a Windows leg would need an `if:` skipping it -- and a leg
+  # called `test` that quietly runs half of what the name says is worse than no
+  # leg at all, because it reports a name it did not earn.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # ast_extension_registry.rs, ast_automap_test.rs and
+      # ast_extractor_notices_test.rs shell `python` on Windows and FAIL rather
+      # than skip when it is absent (ast_extension_registry.rs:14-15, :33 -- "a
+      # skip here is indistinguishable from a pass"). Pinned rather than trusted
+      # to whatever the image happens to ship.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: cargo test
+
   # Required, not advisory. It was `continue-on-error: true` "until the three
   # pre-existing never_loop denies in src/crud are cleared" -- they are: a
   # repo-wide grep for never_loop matches zero lines, and the step itself has been
   # `success` on main (run 34200195605, job clippy, step 5). An advisory lint job
   # reports the RUN green whether the step passed or failed, which is how a real
   # Windows failure sat on main unnoticed (#97, #108).
+  # …and since 0.14.3 it runs on both platforms. A Linux-only lint is how
+  # doorbell.rs's BUDGET -- dead on Windows and only on Windows -- passed every
+  # check base had, for months (#97). fail-fast is off so a failure on one
+  # platform never hides the other's result: telling the two apart is the point.
   clippy:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
