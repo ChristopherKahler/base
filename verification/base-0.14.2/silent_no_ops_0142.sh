@@ -84,13 +84,38 @@ done
 echo
 echo "═══ #76  Stop writes JSON or nothing, never a bare block ═══"
 WS="$WORK/ws76"; mkdir -p "$WS/.base"
-out=$(hook "$BASE_BIN" stop "$WS" "{\"session_id\":\"a76\",\"cwd\":\"$WS\",\"hook_event_name\":\"Stop\"}")
+SID76=00000000-0000-0000-0000-0000000000a7
+
+# Row 1: the empty path. Silence is correct here and proves the dead print is gone.
+out=$(hook "$BASE_BIN" stop "$WS" "{\"session_id\":\"$SID76\",\"cwd\":\"$WS\",\"hook_event_name\":\"Stop\"}")
 t=$(printf '%s' "$out" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-if [ -z "$t" ]; then ok "new: silent with no open task"
-elif printf '%s' "$t" | head -c1 | grep -q '<'; then bad "new: bare relay block on stdout — this is #76"
-elif printf '%s' "$t" | python3 -c 'import json,sys; sys.exit(0 if "systemMessage" in json.load(sys.stdin) else 1)' 2>/dev/null; then
-    ok "new: systemMessage envelope"
-else bad "new: stdout is neither empty nor a systemMessage envelope: $(printf '%s' "$t" | head -c 200)"; fi
+[ -z "$t" ] && ok "new: silent with no open task" \
+            || bad "new: expected silence with no open task, got: $(printf '%s' "$t" | head -c 200)"
+
+# Row 2: the path that matters. Build a REAL open task with the product itself, then run
+# stop again. Without this the section only ever exercises the branch that does nothing —
+# a leg that cannot fail is vacuous, and this one gates the whole (D)+(C) claim.
+( cd "$WS" && BASE_HOME="$HOME_DIR" CLAUDE_CODE_SESSION_ID="$SID76" BASE_NO_AUTO_UPDATE=1 \
+    "$BASE_BIN" relay register --as t76 >/dev/null 2>&1 )
+( cd "$WS" && BASE_HOME="$HOME_DIR" CLAUDE_CODE_SESSION_ID="$SID76" BASE_NO_AUTO_UPDATE=1 \
+    "$BASE_BIN" relay ping --to t76 --from probe --msg "open task for the stop row" >/dev/null 2>&1 )
+pending=$(ls -1 "$HOME_DIR/.base-gbl/.base/relay-inbox/t76"/*.json 2>/dev/null | wc -l)
+
+if [ "$pending" -eq 0 ]; then
+    bad "new: could not create an open task, so the systemMessage row measured NOTHING"
+else
+    out=$(hook "$BASE_BIN" stop "$WS" "{\"session_id\":\"$SID76\",\"cwd\":\"$WS\",\"hook_event_name\":\"Stop\"}")
+    t=$(printf '%s' "$out" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -z "$t" ]; then
+        bad "new: $pending open task(s) and Stop said NOTHING — the nudge is lost, not delivered"
+    elif printf '%s' "$t" | cut -c1 | grep -q '<'; then
+        bad "new: bare relay block on stdout with an open task — this is #76 exactly: $(printf '%s' "$t" | head -c 120)"
+    elif printf '%s' "$t" > "$WORK/stop.json" && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(d.get("systemMessage"),str) and d["systemMessage"] else 1)' "$WORK/stop.json" 2>/dev/null; then
+        ok "new: $pending open task(s) -> systemMessage envelope, no bare block"
+    else
+        bad "new: stdout with an open task is not a systemMessage envelope: $(printf '%s' "$t" | head -c 200)"
+    fi
+fi
 
 # ── #77: the log lands in the payload's tier, on both arms ──────────────
 echo
