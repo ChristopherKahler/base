@@ -214,6 +214,49 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="relation-corpus-") as tmp:
         root = Path(tmp)
         build_corpus(root)
+
+        # Law 24: an absent grammar is an ABSENT TOOL, not a failing assertion.
+        # `_extract_generic` RETURNS {"error": "tree_sitter_php not installed"}
+        # with zero edges rather than raising, so without this the PHP fixture
+        # contributes nothing, `uses_config` reports as "not emitted by the
+        # corpus", and the blocking job added by #122 prints a VOCABULARY defect
+        # for an ENVIRONMENT fault. That is the void FAIL, inside the instrument
+        # whose entire subject is relations that disappear without saying so.
+        #
+        # The languages are DERIVED: every distinct suffix among FIXTURES is
+        # dispatched through the extractor's own `_DISPATCH` and asked for its
+        # own error string. A second hand-written list of grammar names would
+        # drift from the fixtures exactly the way RELATION_MAP drifted from the
+        # extractor.
+        from extractor import _DISPATCH
+
+        unusable: dict[str, str] = {}
+        seen: set[str] = set()
+        for rel in sorted(FIXTURES):
+            suffix = Path(rel).suffix.lower()
+            if suffix in seen:
+                continue
+            seen.add(suffix)
+            handler = _DISPATCH.get(suffix)
+            if handler is None:
+                continue
+            try:
+                probe = handler(root / rel)
+            except Exception as exc:
+                unusable[suffix] = repr(exc)
+                continue
+            if isinstance(probe, dict) and probe.get("error"):
+                unusable[suffix] = str(probe["error"])
+        if unusable:
+            print("ABORT[4]: the corpus cannot parse every language it fixtures.")
+            for suffix, why in sorted(unusable.items()):
+                print(f"  {suffix}  {why}")
+            print("  This is an ABSENT GRAMMAR, not a missing relation. No row")
+            print("  below would mean what it says. Install the grammars first:")
+            print("  python -m pip install -r scripts/ast/requirements.txt")
+            return 4
+        print(f"grammars ok for {len(seen)} fixture suffixes")
+
         try:
             files = collect_files(root)
             result = extract(files, cache_root=root)
