@@ -21,8 +21,26 @@ ok()      { pass=$((pass+1)); printf '  PASS  %s\n' "$1"; }
 bad()     { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 skipped() { skip=$((skip+1)); printf '  SKIP  %s\n' "$1"; }
 
+# A tool that is ABSENT produces the same empty output as a binary that genuinely lacks the
+# symbol. Assert the tool first, or the diagnosis below blames the binary for the toolchain.
+need_tool() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "ABORT: '$1' is not on PATH. Its empty output is indistinguishable from a binary"
+        echo "       that lacks the symbol, so every provenance check below would be void."
+        exit 3
+    }
+}
+# python3 too (shrike, #109 review): the #75 and #76 rows pipe into `python3 -c … 2>/dev/null` inside an
+# elif, so a MISSING python3 makes the condition silently false, the control falls through, and the row
+# reports FAIL against the PRODUCT — the same tool-absence misdiagnosis as strings, two rows further down.
+need_tool strings; need_tool md5sum; need_tool python3
+
+# ONE trap, set ONCE, covering everything it must clean. `trap ... EXIT` does not accumulate:
+# a second one REPLACES the first. This script had two — the tempfile trap here and a WORK trap
+# further down — so the two symbol dumps leaked on every single run.
+WORK=$(mktemp -d)
 WORK_SYMS_NEW=$(mktemp); WORK_SYMS_OLD=$(mktemp)
-trap 'rm -f "$WORK_SYMS_NEW" "$WORK_SYMS_OLD"' EXIT
+trap 'rm -rf "$WORK"; rm -f "$WORK_SYMS_NEW" "$WORK_SYMS_OLD"' EXIT
 echo "═══ provenance ═══"
 for b in "$BASE_BIN" "$OLD_BIN"; do
     [ -x "$b" ] || { echo "ABORT: not executable: $b"; exit 2; }
@@ -38,8 +56,26 @@ fi
 # FAILED when it MATCHES: grep -q exits at the first hit, strings takes SIGPIPE, and
 # pipefail publishes that. This check therefore inverted and refused a correct binary
 # whose symbol the build had just counted twice. Dump once, grep the file.
-strings "$BASE_BIN" > "$WORK_SYMS_NEW" 2>/dev/null || true
-strings "$OLD_BIN"  > "$WORK_SYMS_OLD" 2>/dev/null || true
+# The `|| true` that used to sit on both of these lines swallowed the failure, and the swallow
+# was ONE-SIDED in effect. On the BRANCH an empty dump makes the check below find no symbol and
+# ABORT — closed. On the CONTROL an empty dump makes its check find no symbol and PASS, and the
+# script then prints "both binaries are what they claim". A CONTROL THAT WAS NEVER READ PASSED
+# THE CONTROL CHECK. Same shape as a missing baseline reading as zero differing files.
+dump_syms() { # dump_syms <binary> <outfile> <which>
+    if ! strings "$1" > "$2" 2>/dev/null; then
+        echo "ABORT: strings failed on the $3 binary ($1); its symbol dump is not evidence."; exit 3
+    fi
+    # An empty dump is not a result. Asserted on BOTH arms, because the control is the arm
+    # where emptiness reads as success.
+    [ -s "$2" ] || {
+        echo "ABORT: strings produced an EMPTY dump for the $3 binary ($1)."
+        echo "       Every symbol check below would be meaningless, and the CONTROL check"
+        echo "       would PASS on it — emptiness is indistinguishable from absence there."
+        exit 3
+    }
+}
+dump_syms "$BASE_BIN" "$WORK_SYMS_NEW" branch
+dump_syms "$OLD_BIN"  "$WORK_SYMS_OLD" control
 if ! grep -q "$SYMBOL" "$WORK_SYMS_NEW"; then
     echo "ABORT: branch binary has no '$SYMBOL' — it is not this branch's build."; exit 2
 fi
@@ -48,7 +84,7 @@ if grep -q "$SYMBOL" "$WORK_SYMS_OLD"; then
 fi
 echo "  symbol '$SYMBOL': present in branch, absent in control — both binaries are what they claim"
 
-WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+# WORK and its cleanup are established with the single trap at the top of this script.
 HOME_DIR="$WORK/home"; mkdir -p "$HOME_DIR/.base-gbl/.base"
 
 hook() { # hook <bin> <event> <cwd> <payload>
@@ -179,4 +215,15 @@ echo
 echo "═══════════════════════════════════════════"
 echo "  $pass PASS / $fail FAIL / $skip SKIP"
 echo "  branch $MD5_NEW   control $MD5_OLD"
-[ "$fail" -eq 0 ] || exit 1
+# The verdict used to read the FAIL counter alone, so a run in which every control arm SKIPPED
+# — the move nudge not firing, the #86 race not firing, #95 with REPO_DIR unset — exited 0 and
+# read as acceptance. A row that never ran is neither a pass nor a failure, and collapsing it
+# into either is how an instrument reports coverage it does not have. Three exits, three states.
+if [ "$fail" -ne 0 ]; then echo "  ACCEPTANCE FAIL — $fail failing row(s)"; exit 1; fi
+if [ "$skip" -ne 0 ]; then
+    echo "  ACCEPTANCE INCOMPLETE — $skip skipped row(s); a SKIP is not a PASS."
+    echo "  (set REPO_DIR to the branch worktree to run the #95 row here)"
+    exit 5
+fi
+echo "  ACCEPTANCE PASS"
+exit 0   # explicit: the last statement of this script is never a bare test again
