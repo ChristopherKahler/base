@@ -30,7 +30,10 @@ need_tool() {
         exit 3
     }
 }
-need_tool strings; need_tool md5sum
+# python3 too (shrike, #109 review): the #75 and #76 rows pipe into `python3 -c … 2>/dev/null` inside an
+# elif, so a MISSING python3 makes the condition silently false, the control falls through, and the row
+# reports FAIL against the PRODUCT — the same tool-absence misdiagnosis as strings, two rows further down.
+need_tool strings; need_tool md5sum; need_tool python3
 
 # ONE trap, set ONCE, covering everything it must clean. `trap ... EXIT` does not accumulate:
 # a second one REPLACES the first. This script had two — the tempfile trap here and a WORK trap
