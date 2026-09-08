@@ -47,6 +47,23 @@ to `pytest.main()`/`unittest.main()`, reaches every module-level test without
 naming any; that is detected anywhere in the closure and treated as a driver
 rather than reported as false unreachables. It does NOT excuse a nested test:
 a `globals()` sweep cannot see a function defined inside another function.
+For the identical reason it does NOT excuse a `Test*` class METHOD -- a sweep
+binds the CLASS object, never the bound method, and never constructs an
+instance to call it on. Only `kind == "module"` tests are excused.
+
+KNOWN AND REGISTERED MISSES -- shapes this walk does not see at all
+-------------------------------------------------------------------
+Both are silent misses: the test is never collected, `defined` omits it, and
+the file reads OK. Neither asserts that an unreachable test is reachable.
+
+  * a `def test_*` nested inside a module-level `if` block: not in
+    `tree.body`, so `_collect_tests` never reaches it
+  * a `test_*` method of a class NOT named `Test*`: `Test*` is the only class
+    naming convention treated as a test class
+
+Widening the walk to catch either one means guessing which conditionally
+defined function or non-conventional class was meant to be a test, so they are
+registered rather than chased.
 
 NESTED `def test_*`
 -------------------
@@ -194,7 +211,23 @@ def _module_functions(tree):
 
 
 def _collect_tests(tree):
-    """Every `test*` function, with how it is scoped.
+    """The `test*` functions this walk can SEE, with how each is scoped.
+
+    Deliberately NOT "every test* function" -- that sentence was here and it
+    was false at three measured shapes. Two of them remain true misses and are
+    registered rather than fixed, because widening the walk to catch them means
+    guessing at intent:
+
+      * a `def test_*` nested inside a module-level `if` block is not in
+        `tree.body`, so it is never collected -- `defined` omits it entirely
+      * a `test_*` method of a class NOT named `Test*` is not collected, since
+        `Test*` is the only naming convention this walk treats as a test class
+
+    Both are silent MISSES: the file reads `defined=1` and OK. Neither reports
+    a test as reachable that is not, which is the line between a registrable
+    limitation and a defect -- the third shape, a `globals()` sweep excusing a
+    `Test*` class method, DID assert reachability falsely and was fixed at the
+    dispatch in `audit_file` rather than registered here.
 
     Returns a list of dicts: {name, qual, kind, enclosing}
       kind "module"  -- top-level def
@@ -313,7 +346,14 @@ def audit_file(path):
             else:
                 indeterminate.append(t["qual"])
         else:
-            if generic:
+            # A globals()/vars() sweep reaches MODULE-level tests and nothing
+            # else. It cannot call a `Test*` class METHOD, for the very reason
+            # given above for the nested case: the sweep sees the CLASS object,
+            # never the bound method, and never constructs an instance to call
+            # it on. Excusing a class method here does not merely omit it -- it
+            # COUNTS the test and positively asserts it reachable, which is a
+            # false pass rather than a boundary. Arm Y pins it.
+            if generic and t["kind"] == "module":
                 continue
             if t["name"] not in reached and t["qual"] not in reached:
                 unreachable.append(t["qual"])
@@ -360,14 +400,23 @@ def audit_dirs(dirs):
     total_defined = total_unreach = total_indet = total_unparse = 0
     for p in files:
         # A file that could not be READ and a file whose tests are DEAD are the
-        # two states law 24 exists to separate, so an unparseable file gets its
+        # two states law 24 exists to separate, so an unreadable file gets its
         # own bucket and is never counted as unreachable. It also must not stop
         # the walk: aborting here would print no totals at all and say nothing
         # about the files after it, which would make this module's own law-23
         # claim false and quietly degrade the gate to a syntax check.
+        #
+        # The tuple covers being UNABLE TO READ as well as unable to parse.
+        # `audit_file` opens the file before it parses it, and `audit_dirs`
+        # selects on NAME alone, so a directory or an unreadable file carrying a
+        # `test_*.py` name reaches `open()` and raised OSError straight through
+        # this handler -- killing the walk exactly as a SyntaxError did before
+        # this commit, with totals printed zero times. Arm V pins it, and note
+        # that rc is 1 either way: only "totals printed at all" separates the
+        # two, so rc alone cannot grade that arm.
         try:
             defined, unreachable, indeterminate, shape, has_main, generic = audit_file(p)
-        except (SyntaxError, UnicodeDecodeError) as exc:
+        except (SyntaxError, UnicodeDecodeError, OSError, ValueError) as exc:
             total_unparse += 1
             bad += 1
             print("%s %-32s shape=U %s" % ("!!", os.path.basename(p), _SHAPE_NOTE["U"]))
@@ -463,6 +512,29 @@ _ARM_H = ('def build():\n    def test_inner():\n        assert True\n'
           'if __name__ == "__main__":\n    build()()\n')
 _ARM_H_MD5 = "d7b0e2825c61705aca0d3f59a6017b86"
 
+# Y: a globals() sweep must NOT excuse a `Test*` class METHOD. The sweep matches
+# names starting with lowercase "test", so it finds and calls test_alpha; the
+# class is named TestThing with a capital T and is never matched, so
+# test_method never runs. GROUND TRUTH, executed rather than argued: running
+# this file writes only test_alpha to a marker file.
+#
+# rc ALONE CANNOT GRADE THIS ARM, which is the whole point of its shape: the
+# fixture also holds a genuinely reachable module-level test, so a checker that
+# stopped excusing generic sweeps altogether would also land on rc 1 while
+# naming the WRONG test. Only the NAME set separates the fix from a
+# coincidence, so this arm asserts test_method and ONLY test_method.
+_ARM_Y = ('def test_alpha():\n    assert True\n\n\n'
+          'class TestThing:\n    def test_method(self):\n        assert True\n\n\n'
+          'if __name__ == "__main__":\n'
+          '    for _n, _o in list(globals().items()):\n'
+          '        if _n.startswith("test") and callable(_o):\n'
+          '            _o()\n')
+
+_ARM_V_GOOD_A = ('def test_a():\n    assert True\n\n\n'
+                 'if __name__ == "__main__":\n    test_a()\n')
+_ARM_V_GOOD_Z = ('def test_z():\n    assert True\n\n\n'
+                 'if __name__ == "__main__":\n    test_z()\n')
+
 
 def _arm(label, body, want_rc, want_unreachable=None, want_indeterminate=None):
     """Run one control arm. Asserts rc, and where given the exact NAME sets --
@@ -530,8 +602,28 @@ def _arm_unparseable():
     if "test_bbb_broken.py" not in out or "UNPARSEABLE" not in out:
         print("    ARM FAIL: the unparseable file was not named as UNPARSEABLE")
         fails += 1
-    if "unreachable: test_broken" in out:
+    # PAIRED, and every spelling below is COPIED out of the real print site
+    # rather than typed from this file's prose -- the clause this replaces was
+    # typed, tested for `unreachable: test_broken`, and could not match any
+    # output this program is able to produce. It sat green over a mutation that
+    # reported an unparseable file as unreachable by name.
+    #
+    # Detector A is the per-test report line; detector B is the totals counter.
+    # Two channels that CAN disagree: a regression that prints the line without
+    # moving the counter fires only A, and one that moves the counter without
+    # printing fires only B. A pair where one mutation fires both is one
+    # assertion written twice.
+    #
+    # The bare substring "unreachable: " is NOT usable here: a CORRECT run of
+    # this arm prints "UNPARSEABLE, not unreachable: SyntaxError: ..." and would
+    # match it, turning a clean tree red. Uppercase "UNREACHABLE under" is
+    # emitted at exactly one site and cannot occur in this arm at all.
+    if "UNREACHABLE under" in out:
         print("    ARM FAIL: an unparseable file was reported as UNREACHABLE")
+        fails += 1
+    if "reachable=2 unreachable=0" not in out:
+        print("    ARM FAIL: totals counted an unreachable test; "
+              "expected reachable=2 unreachable=0")
         fails += 1
     # clause 3: the walk CONTINUED past the break
     for good in ("test_aaa_good.py", "test_zzz_good.py"):
@@ -545,6 +637,148 @@ def _arm_unparseable():
         print("    ARM FAIL: totals did not report unparseable_files=1")
         fails += 1
     print("arm U  one unparseable among two good rc=%d" % rc)
+    return fails
+
+
+def _arm_class_method():
+    """Arm Y: a `globals()` sweep must NOT excuse a `Test*` class METHOD.
+
+    TWO CHANNELS, IN THE SAME PROCESS, AND THEY MUST AGREE.
+
+    `_arm()` grades names off a second, independent `audit_file()` call while
+    grading rc off `audit_dirs()`. Both reads are in the right process, but the
+    name read watches a PRIVATE call while the only channel CI ever sees is
+    what `audit_dirs` PRINTS. Two detectors that agree about the wrong channel
+    read as corroboration. So this arm asserts the PRINTED line first -- that
+    is the shipping channel -- and cross-checks the structured return, and a
+    DISAGREEMENT between the two is its own failure rather than a tie broken in
+    favour of whichever is convenient.
+
+    RC CANNOT GRADE THIS ARM. The fixture holds a genuinely reachable
+    module-level test beside the unreachable class method, so a checker that
+    stopped excusing generic sweeps ALTOGETHER would also land on rc 1 while
+    naming the wrong test. Only the NAME separates a fix from a coincidence.
+
+    Ground truth, executed rather than argued: running this fixture under
+    `python <file>` runs test_alpha and never runs test_method, because the
+    sweep matches lowercase `test` and the class is `TestThing`.
+    """
+    print("--- control arm Y  globals sweep must NOT excuse a class method (expect rc 1)")
+    fails = 0
+    with tempfile.TemporaryDirectory(prefix="reach-arm-classmethod-") as d:
+        path = os.path.join(d, "test_arm.py")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_ARM_Y)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = audit_dirs([d])
+        out = buf.getvalue()
+        # channel 2: the structured return, read from the same file
+        _defined, unreach, indet, _shape, _hm, _g = audit_file(path)
+    print(out, end="")
+
+    printed_named = "UNREACHABLE under `python <file>`: TestThing.test_method" in out
+    returned_named = set(unreach) == {"TestThing.test_method"}
+
+    if rc != 1:
+        print("    ARM FAIL: rc=%d, expected 1" % rc)
+        fails += 1
+    # The shipping channel, asserted on the exact printed spelling.
+    if not printed_named:
+        print("    ARM FAIL: the PRINTED output did not name "
+              "TestThing.test_method as unreachable")
+        fails += 1
+    # Over-correction guard: the module-level test IS reached by the sweep and
+    # must still be excused. Without this the arm passes on a checker that
+    # simply stopped excusing sweeps at all.
+    if "UNREACHABLE under `python <file>`: test_alpha" in out:
+        print("    ARM FAIL: test_alpha was named unreachable - the sweep must "
+              "still excuse module-level tests")
+        fails += 1
+    if "defined_tests=2 reachable=1 unreachable=1" not in out:
+        print("    ARM FAIL: totals did not read defined_tests=2 reachable=1 "
+              "unreachable=1")
+        fails += 1
+    if indet:
+        print("    ARM FAIL: indeterminate=%s, expected none" % sorted(indet))
+        fails += 1
+    # Channel disagreement is a finding in its own right: it means one of the
+    # two paths regressed while the other did not, and picking a winner would
+    # hide exactly that.
+    if printed_named != returned_named:
+        print("    ARM FAIL: printed channel and structured channel DISAGREE - "
+              "printed=%s returned=%s" % (printed_named, sorted(unreach)))
+        fails += 1
+    print("arm Y  globals sweep vs class method rc=%d" % rc)
+    return fails
+
+
+def _arm_unopenable():
+    """Law 23 arm, one exception class over: a file that cannot be OPENED must
+    not stop the walk either.
+
+    `audit_dirs` selects on NAME alone, so a DIRECTORY carrying a `test_*.py`
+    name is selected and reaches `open()`. That raises PermissionError on
+    Windows and IsADirectoryError on POSIX -- both OSError, both the same shape
+    as the SyntaxError this commit already handles. A directory needs no chmod
+    and no ACL work, so this arm behaves identically on a developer box and in
+    CI.
+
+    RC CANNOT GRADE THIS ARM. Measured: rc is 1 before the fix and 1 after,
+    because the uncaught OSError propagated and the interpreter exited 1, which
+    is indistinguishable from an honest FAIL. What separates them is that the
+    broken walk printed totals ZERO times and never mentioned the file after
+    the break. So this arm asserts the totals line exists and the later file
+    was audited, and it catches the raise itself rather than letting an
+    unhandled exception take the whole selftest down.
+    """
+    print("--- control arm V  one UNOPENABLE file among two good ones (expect rc 1)")
+    fails = 0
+    with tempfile.TemporaryDirectory(prefix="reach-arm-unopenable-") as d:
+        for name, body in (("test_aaa_good.py", _ARM_V_GOOD_A),
+                           ("test_zzz_good.py", _ARM_V_GOOD_Z)):
+            with open(os.path.join(d, name), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(body)
+        # sorted() puts this between the two good files on purpose: without
+        # that, the arm could pass while proving only that the crash moved.
+        os.mkdir(os.path.join(d, "test_bbb_dir.py"))
+        buf = io.StringIO()
+        rc = None
+        raised = None
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = audit_dirs([d])
+        except OSError as exc:
+            raised = exc
+        out = buf.getvalue()
+    print(out, end="")
+
+    if raised is not None:
+        print("    ARM FAIL: the walk RAISED %s instead of bucketing the file"
+              % type(raised).__name__)
+        print("arm V  one unopenable among two good rc=raised")
+        return fails + 1
+    if rc != 1:
+        print("    ARM FAIL: rc=%d, expected 1" % rc)
+        fails += 1
+    if "test_bbb_dir.py" not in out or "UNPARSEABLE" not in out:
+        print("    ARM FAIL: the unopenable entry was not named as UNPARSEABLE")
+        fails += 1
+    # The two clauses rc cannot supply. A walk killed by the raise printed no
+    # totals at all and never reached the file sorting after the break.
+    if "totals:" not in out:
+        print("    ARM FAIL: totals printed ZERO times - the walk did not finish")
+        fails += 1
+    if "test_zzz_good.py" not in out:
+        print("    ARM FAIL: test_zzz_good.py was never audited - the walk stopped")
+        fails += 1
+    if "files=3 defined_tests=2" not in out:
+        print("    ARM FAIL: totals did not count 3 files and 2 defined tests")
+        fails += 1
+    if "unparseable_files=1" not in out:
+        print("    ARM FAIL: totals did not report unparseable_files=1")
+        fails += 1
+    print("arm V  one unopenable among two good rc=%d" % rc)
     return fails
 
 
@@ -566,7 +800,9 @@ def selftest():
     fails += _arm("W  INDETERMINATE must not mask a FAIL", _ARM_W, 1,
                   ["test_orphan"], ["test_returned"])
 
+    fails += _arm_class_method()
     fails += _arm_unparseable()
+    fails += _arm_unopenable()
 
     # condor's armH, pinned. If the embedded bytes ever stop hashing to the
     # recorded md5 the arm fails rather than silently grading a different
