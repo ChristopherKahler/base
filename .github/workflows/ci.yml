@@ -33,6 +33,53 @@ jobs:
       - name: release rehearsal
         run: ./scripts/test-release-rehearsal.sh
 
+  # scripts/ast/test_*.py existed and passed and NOTHING RAN THEM (#85). A
+  # full-tree grep for their names, for `pytest` and for `scripts/ast/test`
+  # matched their own docstrings and nothing else, which is how #66's extension
+  # drift survived: the regression guards for that exact area were hand-run only.
+  #
+  # The grammar-free rows already ride `cargo test` through
+  # tests/ast_extension_registry.rs. These are the rows that need the extractor's
+  # wheels, so they get a job of their own -- and a required one. An advisory job
+  # here would reproduce the defect it was filed to fix.
+  python-ast-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scripts/ast/requirements.txt
+      - name: Install extractor dependencies
+        run: python -m pip install -r scripts/ast/requirements.txt
+      # Discovered, not listed: a test added to scripts/ast/ runs from the day it
+      # lands rather than the day someone remembers this file. The count is
+      # printed and ZERO IS A FAILURE -- a glob that matches nothing must never
+      # read as a pass, which is the shape that let a tripwire report PASS having
+      # opened no files at all.
+      #
+      # `rc` is accumulated and the last statement is `exit "$rc"`: every test
+      # runs even after one fails, and the job's status is the job's rather than
+      # whatever the final command happened to think.
+      - name: scripts/ast/test_*.py
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(scripts/ast/test_*.py)
+          echo "found ${#tests[@]} test file(s): ${tests[*]:-<none>}"
+          if [ "${#tests[@]}" -eq 0 ]; then
+            echo "FAIL: no scripts/ast/test_*.py were found - this job proved nothing."
+            exit 1
+          fi
+          rc=0
+          for t in "${tests[@]}"; do
+            echo "== $t"
+            python "$t" || rc=1
+          done
+          echo "ran ${#tests[@]} test file(s); rc=$rc"
+          exit "$rc"
+
   # Every changelog.py command line the release assembles, run with the argv it
   # assembles. 0.13.16 nearly died on one that every other test had missed.
   # The second script runs the workflow's two packing steps and reads what they
