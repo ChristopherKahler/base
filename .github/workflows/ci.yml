@@ -25,7 +25,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test
+        run: cargo test --no-fail-fast
       # Cut a whole release in a throwaway clone. It runs here rather than in a
       # job of its own because it reuses this one's target directory and cargo
       # registry; on its own it would pay for both again. 0.13.16's first
