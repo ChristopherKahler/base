@@ -1000,8 +1000,19 @@ fn write_back_inner<W: Write>(
         }
     }
 
-    // Atomic rename
-    fs::rename(&tmp_path, path).with_context(|| {
+    // Atomic rename, retried across the transient lock family (#127).
+    //
+    // MEASURED on Windows: `fs::rename` over an existing destination returns
+    // `PermissionDenied` / os error 5 for as long as ANY other process holds
+    // that destination open without `FILE_SHARE_DELETE`, and succeeds the moment
+    // the same handle allows DELETE -- so the cause is the share mode, not the
+    // handle. An antivirus or the search indexer holding one for a few
+    // milliseconds is routine, which made an un-retried rename turn an ordinary,
+    // self-clearing conflict into a failed write.
+    //
+    // Same predicate and same shape as the change-log append below: retrying
+    // anything OUTSIDE the lock family turns a clear error into a slow one.
+    rename_with_retry(&tmp_path, path).with_context(|| {
         format!(
             "Failed to rename {} → {}",
             tmp_path.display(),
@@ -1018,6 +1029,41 @@ fn write_back_inner<W: Write>(
     crate::doorbell::ring(path);
 
     Ok(())
+}
+
+/// Attempts for the rename retry, and the first backoff step. Matches the
+/// change-log append (`changelog.rs`), which faces the same lock family on the
+/// same directory: sleeps of 15+30+60+120 ms, so a conflict has ~225 ms to
+/// clear.
+///
+/// BOUNDED on purpose. Every caller of this sits on a path a hook can reach on
+/// every tool call, so an unbounded spin would turn a stuck handle into a hang.
+/// A conflict that outlives the budget is a real failure and must still surface
+/// -- retrying forever would replace a lost write with a wedged command.
+const RENAME_ATTEMPTS: usize = 5;
+const RENAME_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(15);
+
+/// `fs::rename`, retried only while the error is the transient lock family.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut delay = RENAME_BASE_DELAY;
+    let mut last: Option<std::io::Error> = None;
+
+    for attempt in 0..RENAME_ATTEMPTS {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            // Anything outside the lock family is a real failure. Retrying
+            // ENOSPC or a missing temp turns a clear error into a slow one.
+            Err(e) if !crate::changelog::is_transient_lock(&e) => return Err(e),
+            Err(e) => last = Some(e),
+        }
+
+        if attempt + 1 < RENAME_ATTEMPTS {
+            std::thread::sleep(delay);
+            delay *= 2;
+        }
+    }
+
+    Err(last.unwrap_or_else(|| std::io::Error::other("rename failed")))
 }
 
 /// Dump the store into `sink` through a buffer, close it, and prove the file
@@ -1723,5 +1769,59 @@ mod tests {
     fn union_query_surfaces_parse_errors() {
         let store = named_graph_store();
         assert!(query_union(&store, "SELECT ?x WHERE { this is not sparql").is_err());
+    }
+
+    // ─── #127 rename retry ───────────────────────────────────────
+
+    #[test]
+    fn rename_with_retry_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("a");
+        let to = dir.path().join("b");
+        std::fs::write(&from, b"payload").unwrap();
+        rename_with_retry(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+        assert!(!from.exists(), "source should be gone after a rename");
+    }
+
+    #[test]
+    fn rename_with_retry_replaces_an_existing_destination() {
+        // The case #127 is actually about: the destination already exists, which
+        // on Windows is what makes the rename need DELETE access to it.
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("a");
+        let to = dir.path().join("b");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        rename_with_retry(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+    }
+
+    /// A non-transient error must come back IMMEDIATELY, not after the budget.
+    ///
+    /// This is the clause that keeps the retry honest: `is_transient_lock` is
+    /// what separates "wait, this clears itself" from "this is a real failure",
+    /// and without the early return a missing temp file would cost every caller
+    /// the full backoff before saying so. Delete the `if !is_transient_lock`
+    /// guard and this test fails on the elapsed bound, so it discriminates the
+    /// clause rather than merely reaching it.
+    #[test]
+    fn rename_with_retry_does_not_retry_a_non_transient_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let to = dir.path().join("b");
+
+        let started = std::time::Instant::now();
+        let err = rename_with_retry(&missing, &to).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "got {err:?}");
+        // The full budget is 15+30+60+120 = 225 ms. Anything under half of that
+        // can only mean the loop returned without sleeping.
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "a NotFound burned the retry budget ({elapsed:?}) — the \
+             is_transient_lock early return is not being taken"
+        );
     }
 }
