@@ -51,6 +51,32 @@ jobs:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: scripts/ast/requirements.txt
+      # The step below runs each discovered file as `python <file>` -- not pytest,
+      # which is not installed in this job. So a `def test_*` executes only if
+      # something reachable from that file's `__main__` block calls it. That step's
+      # guard counts FILES; this one counts TESTS. Without it, a new file with three
+      # tests and no driver is discovered, executed, prints nothing, exits 0, and this
+      # job goes GREEN having asserted nothing -- the same false-PASS shape as a
+      # tripwire that reports PASS having opened no files.
+      #
+      # Measured at 29319c8c: the step below returns 0 on exactly such a file while
+      # this one returns 1 naming both tests, and the step below returns 1 on a file
+      # whose test IS called and fails -- so its 0 means "nothing to fail", not
+      # "cannot fail".
+      #
+      # --selftest runs FIRST and is the control: nineteen arms, each of which must
+      # land on its own exit code, and the ones that could pass for the wrong reason
+      # also assert the exact test NAMES reported. A checker whose failing and
+      # non-running states share an exit code is not a gate; neither is one that
+      # lands on the right code while naming the wrong test.
+      #
+      # Ahead of the dependency install on purpose: it imports only stdlib `ast`, so
+      # an inert test file fails in seconds rather than after a pip install.
+      - name: scripts/ast tests must actually run
+        run: |
+          set -euo pipefail
+          python scripts/ast/check_test_reachability.py --selftest
+          python scripts/ast/check_test_reachability.py scripts/ast
       - name: Install extractor dependencies
         run: python -m pip install -r scripts/ast/requirements.txt
       # Discovered, not listed: a test added to scripts/ast/ runs from the day it
