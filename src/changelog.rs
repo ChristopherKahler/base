@@ -448,7 +448,12 @@ fn append_line(log_path: &Path, line: &str) -> io::Result<()> {
 /// The transient lock family a scanner or backup agent produces:
 /// `EPERM`, `EBUSY`, `EACCES`, `EMFILE`, `ENFILE` — plus their Windows
 /// equivalents. Everything else is fatal.
-fn is_transient_lock(e: &io::Error) -> bool {
+///
+/// `pub(crate)` for `store::rename_with_retry` (#127), which faces the same
+/// family on the same files: an antivirus or the search indexer holding a handle
+/// makes the log append fail here and the graph rename fail there. One list, two
+/// callers — a second copy is a second thing to drift.
+pub(crate) fn is_transient_lock(e: &io::Error) -> bool {
     use io::ErrorKind::*;
     if matches!(e.kind(), PermissionDenied | Interrupted | WouldBlock) {
         return true;

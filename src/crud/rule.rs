@@ -55,7 +55,16 @@ pub fn add_with(
            FILTER NOT EXISTS {{ GRAPH <{graph}> {{ <{domain_iri}> a {p}:Domain }} }}\n\
          }}"
     );
-    let _ = crud::load_and_mutate(cwd, ns, &ensure_domain);
+    // #127. This was `let _ =`. MEASURED by inducing a real rename failure on
+    // this exact write and releasing the conflict before the rule write below:
+    // `base rule add` exits 0 and prints "Rule 0 added to domain '…'", the rule
+    // quads are in the graph, and the domain's `rdf:type Domain` quad is not --
+    // a rule hanging off a domain record that was never written, reported as
+    // success. Failing here instead means the rule is not written either, which
+    // is the honest outcome: the alternative is a rule filed under a domain that
+    // does not exist.
+    crud::load_and_mutate(cwd, ns, &ensure_domain)
+        .with_context(|| format!("ensuring domain '{domain_name}' exists"))?;
 
     // Optional rationale triple (Phase 26) — "Do X — because Y" on injection.
     let rationale_triple = match rationale.filter(|r| !r.is_empty()) {

@@ -69,7 +69,22 @@ pub fn add_with_stage(
     let link_sparql = format!(
         "INSERT DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:hasDomain <{domain_iri}> }} }}"
     );
-    let _ = crud::load_and_mutate(cwd, ns, &link_sparql);
+    // #127. This was `let _ =`, so a failed write here was discarded and `add`
+    // returned `Ok(slug)` regardless -- `base project add` printed success over
+    // a link that is not in the graph. MEASURED by inducing a real rename
+    // failure on this exact write: exit 0, "Project '…' created", and zero
+    // `hasDomain` quads in the store. The same injection one write earlier, at
+    // `:61`, exits non-zero and says why, so the silence was this line's alone.
+    //
+    // The project record at `:61` has already landed by the time we get here, so
+    // the message says what IS in the graph as well as what is not: a bare
+    // failure would read as "nothing happened", which is the opposite of true.
+    crud::load_and_mutate(cwd, ns, &link_sparql).with_context(|| {
+        format!(
+            "project '{slug}' IS registered, but linking it to domain \
+             '{domain_slug}' failed and that link is NOT in the graph"
+        )
+    })?;
 
     Ok(slug)
 }
