@@ -6632,10 +6632,25 @@ def extract_markdown(path: Path) -> dict:
             continue
 
     if is_ontology_doc:
-        for rel in frontmatter.get("related", []) or []:
-            if rel:
-                rel_nid = _make_id(str(rel))
-                add_edge(file_nid, rel_nid, "relatedTo", 1, confidence="FRONTMATTER")
+        # #115: one relatedTo concept, both documented spellings. The Rust
+        # default path (src/extract/frontmatter.rs) reads `relatedto`; the
+        # shipped manual documents `related`. Reading only one of them here
+        # meant a user who followed the manual and ran the OTHER path got zero
+        # edges and no warning. Both are accepted and unioned, order-preserved
+        # and de-duplicated, so a document carrying both does not double-emit.
+        _seen_rel: set[str] = set()
+        _rels: list = []
+        for _key in ("related", "relatedTo"):
+            _val = frontmatter.get(_key)
+            if _val is None:
+                continue
+            for rel in _val if isinstance(_val, (list, tuple)) else [_val]:
+                if rel and str(rel) not in _seen_rel:
+                    _seen_rel.add(str(rel))
+                    _rels.append(rel)
+        for rel in _rels:
+            rel_nid = _make_id(str(rel))
+            add_edge(file_nid, rel_nid, "relatedTo", 1, confidence="FRONTMATTER")
         supersedes = frontmatter.get("supersedes")
         if supersedes:
             sup_nid = _make_id(str(supersedes))

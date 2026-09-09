@@ -46,7 +46,12 @@ pub fn extract_with_project(content: &str, file_path: &str, ns: &NamespaceConfig
                     triples.push((format!("{p}:hasTag"), format!("\"{}\"", escape(&tag))));
                 }
             }
-            "relatedto" => {
+            // #115: the shipped manual documents `related:` (docs/markdown-ontology-protocol.md:88,
+            // :102, :120). This arm only ever read `relatedto`, so the documented
+            // spelling fell through to `_` and was manufactured into an
+            // ops:description triple carrying its own raw text -- a wrong triple
+            // inside the boundary, which is worse than dropping it.
+            "relatedto" | "related" => {
                 for entity in parse_list(value) {
                     let entity_slug = entity
                         .replace(['/', '\\', '.', ' '], "-")
@@ -58,6 +63,17 @@ pub fn extract_with_project(content: &str, file_path: &str, ns: &NamespaceConfig
                 }
             }
             _ => {
+                // #115: reported, NOT dropped. The description triple is still
+                // written -- discarding the value would lose data that a
+                // genuinely unknown key legitimately carries -- but a key that
+                // is one separator or one capital away from a key we DO read
+                // now says so on stderr instead of vanishing into prose.
+                if let Some(known) = plausible_key_alias(key) {
+                    eprintln!(
+                        "[frontmatter] {file_path}: key `{key}` is not read as a field; \
+                         did you mean `{known}`? Recorded as a description only."
+                    );
+                }
                 triples.push((
                     format!("{p}:description"),
                     format!("\"{}: {}\"", escape(key), escape(value)),
@@ -148,17 +164,49 @@ pub fn parse_frontmatter(content: &str) -> Option<Vec<(String, String)>> {
     let fm_text = &after_first[..end_pos];
 
     let mut pairs = Vec::new();
-    for line in fm_text.lines() {
-        let line = line.trim();
+    // #115: a YAML block sequence vanished twice over. Every `- item` line was
+    // skipped outright, and the key line above it carries an EMPTY value, so the
+    // `!value.is_empty()` guard discarded the key too. The pair never reached the
+    // match at all -- which is why block-form `relatedTo:` emitted nothing rather
+    // than falling through to the unknown-key path like its inline form did.
+    let lines: Vec<&str> = fm_text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+        i += 1;
         if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
             continue;
         }
         if let Some((key, value)) = line.split_once(':') {
             let key = key.trim().to_string();
-            let value = value.trim().trim_matches('"').trim_matches('\'').to_string();
-            if !key.is_empty() && !value.is_empty() {
-                pairs.push((key, value));
+            let mut value = trim_scalar(value);
+            if key.is_empty() {
+                continue;
             }
+            if value.is_empty() {
+                // Gather any block sequence beneath the key into the same comma
+                // form `parse_list` already accepts, so list handling stays in
+                // exactly one place rather than being reimplemented here.
+                let mut items = Vec::new();
+                while i < lines.len() {
+                    let item = lines[i].trim();
+                    if item == "-" {
+                        i += 1;
+                    } else if let Some(rest) = item.strip_prefix("- ") {
+                        items.push(trim_scalar(rest));
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if items.is_empty() {
+                    // A valueless key with no sequence under it stays dropped,
+                    // exactly as before this change.
+                    continue;
+                }
+                value = items.join(", ");
+            }
+            pairs.push((key, value));
         }
     }
 
@@ -172,6 +220,40 @@ pub fn parse_frontmatter(content: &str) -> Option<Vec<(String, String)>> {
 /// Parse a comma-separated list value, handling optional bracket syntax.
 /// "rust, sparql, hooks" → ["rust", "sparql", "hooks"]
 /// "[rust, sparql, hooks]" → ["rust", "sparql", "hooks"]
+/// #115: keys this extractor actually reads. Kept beside the match it mirrors so
+/// the two cannot drift without the drift being visible on one screen.
+const KNOWN_KEYS: &[&str] = &[
+    "name", "title", "description", "about", "summary", "status", "priority",
+    "type", "tags", "relatedto", "related",
+];
+
+/// #115 acceptance: an unrecognised-but-PLAUSIBLE key must be REPORTED rather
+/// than silently absorbed. "Plausible" is mechanical rather than a guess: drop
+/// every non-alphanumeric character and the case, and if the result lands
+/// exactly on a key this extractor reads, the author meant that key.
+///
+/// Deliberately an EXACT match after normalising, not a fuzzy distance. A
+/// near-miss matcher that accepted anything close would invent relationships
+/// out of unrelated keys -- the failure the `unrelated_key_creates_no_related_edges`
+/// canary exists to catch.
+fn plausible_key_alias(key: &str) -> Option<&'static str> {
+    let norm: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+    if norm.is_empty() {
+        return None;
+    }
+    KNOWN_KEYS.iter().copied().find(|k| *k == norm)
+}
+
+/// Strip surrounding quotes from a YAML scalar. Shared by the key line and the
+/// block-sequence items so the two cannot drift apart.
+fn trim_scalar(s: &str) -> String {
+    s.trim().trim_matches('"').trim_matches('\'').to_string()
+}
+
 fn parse_list(value: &str) -> Vec<String> {
     let trimmed = value.trim().trim_start_matches('[').trim_end_matches(']');
     trimmed
@@ -642,5 +724,171 @@ Run tests with `cargo test`.
         // References (wikilink + markdown link + @-mention)
         let refs: Vec<_> = triples.iter().filter(|(p, _)| p.contains("references")).collect();
         assert!(refs.len() >= 3);
+    }
+
+    // --- #115: ONE key for relatedTo, both paths, inline AND block ---
+    //
+    // The manual (docs/markdown-ontology-protocol.md:88,102,120) documents
+    // `related:`, inline and as a YAML block sequence. This path reads
+    // `relatedto` (line 49, matched under `key.to_lowercase()`), so the
+    // DOCUMENTED spelling emits zero relatedTo triples -- and the `_` arm turns
+    // it into an ops:description triple carrying the raw text, which is worse
+    // than dropping it. Block form fails earlier still: parse_frontmatter skips
+    // every line starting with '-' and discards a pair whose value is empty, so
+    // the key never reaches the match at all.
+    //
+    // EVERY CELL ASSERTS A CONTROL FIRST. The failure mode is zero triples with
+    // no error, so a leg that only counts relatedTo cannot separate "the key is
+    // not read" from "the fixture never parsed". `tags:` is the control here --
+    // it is handled by this path (unlike the Python path, where `tags` exists
+    // only in a docstring) and it goes red on unparseable frontmatter, proven in
+    // control_tags_has_a_red_state.
+
+    /// Control: frontmatter parsed and the match loop ran over its keys.
+    fn tags_control(triples: &[(String, String)]) -> usize {
+        triples.iter().filter(|(p, _)| p.contains("hasTag")).count()
+    }
+
+    fn related_edges(triples: &[(String, String)]) -> Vec<&(String, String)> {
+        triples.iter().filter(|(p, _)| p.contains("relatedTo")).collect()
+    }
+
+    #[test]
+    fn relatedto_inline_is_not_regressed() {
+        // NON-REGRESSION. This spelling works TODAY because line 49 is matched
+        // under to_lowercase(). A fix that merely renames the arm breaks it.
+        let content = "---\ntags: [alpha, beta]\nrelatedTo: [signal-mod, hook-engine]\n---\n";
+        let triples = extract_with_project(content, "test.md", &ns(), None).unwrap();
+        assert_eq!(tags_control(&triples), 2, "CONTROL FAILED: frontmatter did not parse");
+        assert_eq!(related_edges(&triples).len(), 2);
+    }
+
+    #[test]
+    fn relatedto_block_form_creates_edges() {
+        // RED at 9f8c9b52: parse_frontmatter:153 skips '-' lines and :159 drops
+        // the key line because its value is empty. Nothing reaches the match.
+        let content = "---\ntags: [alpha, beta]\nrelatedTo:\n  - signal-mod\n  - hook-engine\n---\n";
+        let triples = extract_with_project(content, "test.md", &ns(), None).unwrap();
+        assert_eq!(tags_control(&triples), 2, "CONTROL FAILED: frontmatter did not parse");
+        assert_eq!(
+            related_edges(&triples).len(),
+            2,
+            "block-sequence relatedTo emitted no edges (tags control GREEN, so the \
+             frontmatter parsed -- this zero is the parser dropping the pair)"
+        );
+    }
+
+    #[test]
+    fn documented_related_key_creates_edges() {
+        // RED at 9f8c9b52: `related` is the key the shipped manual documents.
+        let content = "---\ntags: [alpha, beta]\nrelated: [signal-mod, hook-engine]\n---\n";
+        let triples = extract_with_project(content, "test.md", &ns(), None).unwrap();
+        assert_eq!(tags_control(&triples), 2, "CONTROL FAILED: frontmatter did not parse");
+        assert_eq!(
+            related_edges(&triples).len(),
+            2,
+            "the DOCUMENTED key emitted no edges (tags control GREEN)"
+        );
+    }
+
+    #[test]
+    fn documented_related_block_form_creates_edges() {
+        // RED at 9f8c9b52. This is the manual's :102 and :120 examples verbatim.
+        let content = "---\ntags: [alpha, beta]\nrelated:\n  - signal-mod\n  - hook-engine\n---\n";
+        let triples = extract_with_project(content, "test.md", &ns(), None).unwrap();
+        assert_eq!(tags_control(&triples), 2, "CONTROL FAILED: frontmatter did not parse");
+        assert_eq!(related_edges(&triples).len(), 2);
+    }
+
+    #[test]
+    fn related_key_emits_no_junk_description_triple() {
+        // RED at 9f8c9b52. The `_` arm does not merely drop an unrecognised key,
+        // it MANUFACTURES ops:description "related: [signal-mod, hook-engine]".
+        // A wrong triple inside the boundary is worse than silence, so proving
+        // the right triple appeared is not enough -- the junk must be GONE.
+        let content = "---\ntags: [alpha, beta]\nrelated: [signal-mod, hook-engine]\n---\n";
+        let triples = extract_with_project(content, "test.md", &ns(), None).unwrap();
+        assert_eq!(tags_control(&triples), 2, "CONTROL FAILED: frontmatter did not parse");
+        let junk: Vec<_> = triples
+            .iter()
+            .filter(|(p, v)| p.contains("description") && v.contains("related:"))
+            .collect();
+        assert!(
+            junk.is_empty(),
+            "the `_` arm manufactured a description triple from a known key: {junk:?}"
+        );
+    }
+
+    #[test]
+    fn unrelated_key_creates_no_related_edges() {
+        // MUST-FAIL CANARY. A fix that sweeps in every key containing "relat"
+        // would pass every cell above while inventing edges out of this one.
+        let content = "---\ntags: [alpha, beta]\nunrelatedthings: [signal-mod]\n---\n";
+        let triples = extract_with_project(content, "test.md", &ns(), None).unwrap();
+        assert_eq!(tags_control(&triples), 2, "CONTROL FAILED: frontmatter did not parse");
+        assert!(
+            related_edges(&triples).is_empty(),
+            "canary matched: the key matcher is too loose, so every cell above is worthless"
+        );
+    }
+
+    #[test]
+    fn control_tags_has_a_red_state() {
+        // A control never seen red is decoration that happens to print PASS.
+        // With no frontmatter at all, extraction returns None and the control
+        // cannot report 2 -- so a GREEN control above is evidence, not an
+        // assumption.
+        assert!(
+            extract_with_project("# no frontmatter\n", "test.md", &ns(), None).is_none(),
+            "the tags control did not go red on a document with no frontmatter"
+        );
+        let no_tags = "---\ntitle: Untagged\n---\n";
+        let triples = extract_with_project(no_tags, "test.md", &ns(), None).unwrap();
+        assert_eq!(
+            tags_control(&triples),
+            0,
+            "the tags control reported tags on a document that has none"
+        );
+    }
+
+    #[test]
+    fn plausible_alias_reports_near_miss_spellings() {
+        // Separator and case variants of a key we DO read.
+        assert_eq!(plausible_key_alias("related_to"), Some("relatedto"));
+        assert_eq!(plausible_key_alias("related-to"), Some("relatedto"));
+        assert_eq!(plausible_key_alias("Related To"), Some("relatedto"));
+        assert_eq!(plausible_key_alias("TAGS"), Some("tags"));
+    }
+
+    #[test]
+    fn plausible_alias_is_exact_after_normalising_not_fuzzy() {
+        // MUST-FAIL CANARY for the reporter itself. A fuzzy matcher would claim
+        // these, and a reporter that cries wolf on every key is noise that gets
+        // switched off -- which is the same silence it was added to remove.
+        assert_eq!(plausible_key_alias("unrelatedthings"), None);
+        assert_eq!(plausible_key_alias("workspace"), None);
+        assert_eq!(plausible_key_alias("severity"), None);
+        assert_eq!(plausible_key_alias("tag"), None);
+        assert_eq!(plausible_key_alias(""), None);
+        assert_eq!(plausible_key_alias("---"), None);
+    }
+
+    #[test]
+    fn near_miss_key_is_reported_but_not_dropped() {
+        // "REPORTED, not dropped": the value must still reach the graph.
+        let content = "---\ntags: [alpha, beta]\nrelated_to: [signal-mod]\n---\n";
+        let triples = extract_with_project(content, "test.md", &ns(), None).unwrap();
+        assert_eq!(tags_control(&triples), 2, "CONTROL FAILED: frontmatter did not parse");
+        assert!(
+            triples
+                .iter()
+                .any(|(p, v)| p.contains("description") && v.contains("related_to")),
+            "a near-miss key was DROPPED; the acceptance says reported, not dropped"
+        );
+        // ...and it must not be silently promoted into a real relationship.
+        assert!(
+            related_edges(&triples).is_empty(),
+            "a near-miss key was silently ACCEPTED as relatedTo; report it, do not guess"
+        );
     }
 }
