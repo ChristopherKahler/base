@@ -214,6 +214,38 @@ def test_collision_reports():
             % (len(hits), err[:400]))
 
 
+def test_ordinary_collision_stays_silent():
+    """The scope of the collision report, asserted rather than assumed.
+
+    An ordinary cross-file call to a name that resolves to several nodes is the case the
+    uniqueness gate exists for -- the comment there names `log`, `execute` and `find` --
+    and its silence is documented behaviour, not a defect. Widening the report to every
+    entry would print a line per such call on any large repo. This leg is what stops the
+    report from being scoped by accident: without it, dropping the `relation != "calls"`
+    condition changes real behaviour and no leg notices.
+    """
+    with _box("ordcollide") as root:
+        paths = _write(root, {
+            "caller.php": "<?php\nfunction caller() {\n    log_it();\n}\n",
+            "one.php": "<?php\nfunction log_it() { return 1; }\n",
+            "two.php": "<?php\nclass log_it { public function m() { return 2; } }\n",
+        })
+        result, err = _run(root, paths)
+        labels = _labels(result)
+        cands = [nid for nid, lab in labels.items()
+                 if str(lab).strip("()").lower() == "log_it"]
+        assert len(cands) > 1, (
+            "FIXTURE CONTROL FAILED: log_it resolves to %d nodes, so this leg is not "
+            "testing a collision at all" % len(cands))
+        calls = [e for e in result.get("edges", [])
+                 if e.get("relation") == "calls"
+                 and str(labels.get(e.get("target"), "")).strip("()").lower() == "log_it"]
+        assert len(calls) == 0, "an ambiguous ordinary call was promoted: %d" % len(calls)
+        assert "ambiguous" not in err, (
+            "the collision report widened to ordinary calls, which would print a line "
+            "per colliding common name on any large repo: %r" % err[:300])
+
+
 def test_stale_cache_defaults():
     """A cache written BEFORE the `relation` field existed must still read.
 
