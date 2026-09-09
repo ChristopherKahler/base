@@ -214,6 +214,29 @@ def extract_project(target: Path, project: str, full: bool = False, confirm: boo
                 file=sys.stderr,
             )
 
+        # #98: the extractor still hands the serializer one dict per REFERENCE
+        # (`all_nodes.extend` per file, `seen_ids` is per-file), and option C
+        # deliberately did not change that -- it declares each IRI once. Say so
+        # rather than collapsing silently: the count is the tripwire that tells
+        # an operator the upstream duplication is still there, and a dedupe
+        # nobody counts is how the same defect walks back in unnoticed.
+        collapsed = stats.get("duplicate_declarations_dropped", 0)
+        if collapsed:
+            iris = stats.get("duplicate_declaration_iris", 0)
+            rescues = stats.get("duplicate_declaration_line_rescues", 0)
+            print(
+                f"# {collapsed} repeat declaration(s) across {iris} IRI"
+                f"{'' if iris == 1 else 's'} collapsed to one declaration each "
+                f"(the extractor emits one node per reference; #98)",
+                file=sys.stderr,
+            )
+            if rescues:
+                print(
+                    f"#   {rescues} kept a later dict carrying a real source "
+                    f"line over an earlier one with none",
+                    file=sys.stderr,
+                )
+
         orphans = stats.get("app_root_entities", 0)
         if orphans:
             noun = "entity" if orphans == 1 else "entities"
