@@ -331,6 +331,84 @@ def _build_file_membership(edges: list[dict], file_nodes: set[str]) -> dict[str,
     return membership
 
 
+def _plan_declarations(
+    nodes: list[dict],
+    project_clean: str,
+    module_iri: str,
+) -> tuple[dict[str, int], int, int, int]:
+    """#98 option C: decide which node dict OWNS each IRI's one declaration.
+
+    `extract()` accumulates `all_nodes` with `all_nodes.extend(...)` per file and
+    dedupes ids only WITHIN a file (`seen_ids` is per-file, extractor.py:1610),
+    so a symbol referenced from six files arrives as six dicts carrying one id.
+    Every one of them was emitted as its own `code:<id> a ops:<T>` block, so the
+    map held one node per IRI while the TTL declared it many times: measured at
+    `cbb375b2`, 9 IRIs over 17 excess declarations, occurrences
+    [6, 6, 2, 2, 2, 2, 2, 2, 2].
+
+    Returns `(owner, duplicate_iris, dropped, line_rescues)` where `owner` maps
+    each IRI to the INDEX of the dict that may declare it. An IRI absent from
+    `owner`, or mapped to -1, is declared by nobody in the node loop.
+
+    WHY THIS RUNS HERE AND NOT EARLIER. Deduping the `nodes` list itself would
+    change more than the declaration count, which is the whole scope of #98:
+    `_build_import_resolver` keys on the cleaned node LABEL with first-match-wins,
+    and the colliding dicts carry DIFFERENT labels ('./panels/X.svelte' from the
+    import site, 'X.svelte' from the file node). Dropping either one moves import
+    edge resolution. The `stats` counters would move too, and #98 rules that
+    counting attributions is still the right tripwire. So every map is built from
+    the full list and only the EMISSION of a repeat declaration is suppressed.
+
+    WHICH DICT WINS, AND WHY IT IS NOT "THE FIRST ONE". Keep-first is arbitrary on
+    the one field that actually differs in the emitted block. Measured at
+    `cbb375b2`: 6 of the 9 collisions are a file node meeting an import-target
+    stub for the same file, identical but for the source line -- and node order
+    does not agree on which arrives first (`GraphExplorer.svelte` had line 0 then
+    1; `CostAttribution.svelte` had 1 then 0). Keep-first would therefore have
+    published `ops:sourceLine 0` for five panels and `1` for the sixth, a coin
+    flip per id. A real line beats the 0 placeholder, then first-in-order breaks
+    the remaining tie. `line_rescues` counts the groups where that first clause
+    changed the outcome, so the rule cannot rot into decoration unnoticed
+    (PROCESS law 38: a clause never seen firing is not a clause).
+    """
+    groups: dict[str, list[int]] = {}
+    for idx, node in enumerate(nodes):
+        iri = f"code:{project_clean}_{sanitize_iri(node['id'])}"
+        groups.setdefault(iri, []).append(idx)
+
+    owner: dict[str, int] = {}
+    duplicate_iris = 0
+    dropped = 0
+    line_rescues = 0
+
+    for iri, idxs in groups.items():
+        # The file/app-root module block is written before the loop, so it has
+        # already spent this IRI's one declaration. No node may declare it again.
+        # Zero nodes hit this at `cbb375b2`; it is here so the invariant is
+        # "every IRI in the map is declared exactly once" with no exception
+        # carved out for the one declaration that is emitted somewhere else.
+        if iri == module_iri:
+            owner[iri] = -1
+            duplicate_iris += 1
+            dropped += len(idxs)
+            continue
+        if len(idxs) == 1:
+            owner[iri] = idxs[0]
+            continue
+        duplicate_iris += 1
+        dropped += len(idxs) - 1
+        win = idxs[0]
+        if _extract_line(nodes[win]) == 0:
+            for i in idxs[1:]:
+                if _extract_line(nodes[i]) > 0:
+                    win = i
+                    line_rescues += 1
+                    break
+        owner[iri] = win
+
+    return owner, duplicate_iris, dropped, line_rescues
+
+
 def _build_import_resolver(
     nodes: list[dict],
     project_clean: str,
@@ -454,10 +532,52 @@ def serialize(
     lines.append(f'    ops:language "{language}" .')
     lines.append("")
 
-    for node in nodes:
+    # #98 option C: one IRI, one declaration. Planned before the loop so the
+    # decision is made over the WHOLE node list rather than by whichever dict
+    # happens to arrive first. Both declaration sites in the loop below (the
+    # ontology-document branch and the code branch) are gated on it -- a guard
+    # covering one branch would have a blind axis, which is how an instrument
+    # comes to report clean over a case it never visits (PROCESS law 41).
+    decl_owner, dup_iris, dup_dropped, dup_line_rescues = _plan_declarations(
+        nodes, project_clean, module_iri
+    )
+    if stats is not None:
+        stats["duplicate_declaration_iris"] = dup_iris
+        stats["duplicate_declarations_dropped"] = dup_dropped
+        stats["duplicate_declaration_line_rescues"] = dup_line_rescues
+
+    # #98's REQUIRED ARM, enforced in the product code rather than only in a
+    # test: this change owns the declaration COUNT and must never change a
+    # node's `rdf:type`. Retyping was #105, which is merged and closed. Every
+    # dict that collapses onto one IRI has its ops class computed as before,
+    # and a disagreement STOPS the run naming both classes -- it cannot reach a
+    # map as a silently-picked winner.
+    declared_ops_type: dict[str, str] = {}
+
+    for idx, node in enumerate(nodes):
+        node_iri = f"code:{project_clean}_{sanitize_iri(node['id'])}"
+        owns_declaration = decl_owner.get(node_iri) == idx
         meta = node.get("ontology_meta")
         if meta and node.get("file_type") == "ontology_document":
-            iri = f"code:{project_clean}_{sanitize_iri(node['id'])}"
+            # Bare class name, the same shape the code branch records, so an
+            # id that arrives as both an ontology document and a code node is
+            # compared like with like rather than "ops:Document" against
+            # "Module" -- which would fire this arm on a formatting difference.
+            onto_declared = node.get("ontology_type", "Document")
+            previous = declared_ops_type.setdefault(node_iri, onto_declared)
+            if previous != onto_declared:
+                raise ValueError(
+                    f"#98 dedupe: {node_iri} is declared ops:{previous} by one "
+                    f"node dict and ops:{onto_declared} by another. "
+                    f"Deduplicating at "
+                    f"emission must not change any node's rdf:type -- that is "
+                    f"#105's territory and it is closed. Fix the disagreement "
+                    f"upstream in the extractor rather than letting emission "
+                    f"pick a winner."
+                )
+            if not owns_declaration:
+                continue
+            iri = node_iri
             label = _escape_literal(node.get("label", node["id"]))
             onto_type = node.get("ontology_type", "Document")
             lines.append(f"{iri} a ops:{onto_type} ;")
@@ -528,7 +648,25 @@ def serialize(
                     node_type = "entity"
                     untyped_non_code += 1
         ops_type = TYPE_MAP[node_type]
-        iri = f"code:{project_clean}_{sanitize_iri(node['id'])}"
+
+        # #98's required arm. The type is computed for EVERY dict, including the
+        # ones whose declaration is about to be suppressed, for two reasons: the
+        # `untyped_non_code` counter keeps counting attributions exactly as it
+        # did before this change, and a collapsed group that disagrees on its
+        # ops class stops the run instead of publishing an arbitrary winner.
+        previous = declared_ops_type.setdefault(node_iri, ops_type)
+        if previous != ops_type:
+            raise ValueError(
+                f"#98 dedupe: {node_iri} is declared ops:{previous} by one node "
+                f"dict and ops:{ops_type} by another. Deduplicating at emission "
+                f"must not change any node's rdf:type -- that is #105's "
+                f"territory and it is closed. Fix the disagreement upstream in "
+                f"the extractor rather than letting emission pick a winner."
+            )
+        if not owns_declaration:
+            continue
+
+        iri = node_iri
         label = _escape_literal(node.get("label", node["id"]))
         line_num = _extract_line(node)
         signature = node.get("signature", "")
