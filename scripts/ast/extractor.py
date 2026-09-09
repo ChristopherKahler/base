@@ -1518,6 +1518,38 @@ def _report_no_literal_key(helper: str, reason: str, path_str: str, line: int) -
     )
 
 
+def _report_ambiguous_cross_file_target(
+    relation: str, callee: str, candidates: list[str], path_str: str, location: str
+) -> None:
+    """One stderr line when a helper reference names a target that is not unique.
+
+    Scoped to raw_calls entries carrying their own `relation` -- the helper-reference
+    lane -- for the same reason _report_no_literal_key is not widened. An ordinary
+    cross-file call to a common short name (log, execute, find) collides by design and
+    its silence is the DOCUMENTED behaviour of the uniqueness gate, not a defect; a
+    helper reference whose key read perfectly and named exactly one file that happens
+    to share a basename is a silent loss, which is the shape #118 shipped a fix for.
+
+    Measured on a real Laravel tree before scoping this: 897 raw_calls entries, and
+    entries hitting len(candidates) > 1 in the ordinary-call lane numbered ZERO -- so
+    the narrow scope is not about volume today, it is about the collision case the
+    comment on the uniqueness gate itself names for repos larger than that one.
+
+    REPORTS rather than preferring a candidate. A directory-based tie-break (prefer a
+    `config/` match) would put framework-specific logic inside a pass built for every
+    language, which is a defect waiting for its second framework.
+    """
+    # raw_calls stores source_location as "L<n>"; the report says ":<n>" so it reads the
+    # same as _report_no_literal_key above. One report convention, not two.
+    line = location[1:] if location[:1] == "L" else location
+    print(
+        f"base-ast: {relation} target {callee!r} at {path_str}:{line} matches "
+        f"{len(candidates)} nodes ({', '.join(sorted(candidates))}) "
+        f"- ambiguous, no {relation} edge emitted",
+        file=sys.stderr,
+    )
+
+
 _PHP_CONFIG = LanguageConfig(
     ts_module="tree_sitter_php",
     ts_language_fn="language_php",
@@ -2303,6 +2335,28 @@ def _extract_generic(
                                 "source_location": f"L{line}",
                                 "weight": 1.0,
                             })
+                    elif not tgt_nid:
+                        # The key read fine but names no node in THIS file. Hand it to
+                        # the cross-file pass in extract() the way an unresolved call is
+                        # handed over -- but carrying its OWN relation, because the
+                        # promotion hard-codes "calls" and a config key is a reference,
+                        # not a call. Routing this in without the relation would assert
+                        # that a controller CALLS config/app.php: fabricated
+                        # relationship data, and worse than the silence it replaces
+                        # because a wrong edge is believed.
+                        #
+                        # The target is the ".php" form. Measured on a real Laravel
+                        # tree: the bare segment is not a key in the global label index
+                        # at all (0 hits) and only "<segment>.php" resolves -- and it is
+                        # the form this branch already computes on the line above.
+                        raw_calls.append({
+                            "caller_nid": caller_nid,
+                            "callee": f"{segment}.php",
+                            "relation": f"uses_{callee_name}",
+                            "is_member_call": is_member_call,
+                            "source_file": str_path,
+                            "source_location": f"L{node.start_point[0] + 1}",
+                        })
 
             # Service container bindings: $this->app->bind(Foo::class, Bar::class)
             if (node.type == "member_call_expression"
@@ -8447,10 +8501,26 @@ def extract(
         if rc.get("is_member_call"):
             continue
         candidates = global_label_to_nids.get(callee.lower(), [])
+        # An entry may carry its own relation (a helper reference such as
+        # config('app.name') is a REFERENCE to a file, not a call to it). The key is
+        # OPTIONAL and read with a default: raw_calls is persisted to the per-file
+        # cache, so a cache written before this field existed is read back after it
+        # and must default rather than raise.
+        relation = rc.get("relation", "calls")
         # Skip ambiguous names that resolve to multiple nodes — these are
         # common short names (log, execute, find) with no import evidence
         # to pick the right target; emitting all edges inflates god_nodes.
         if len(candidates) != 1:
+            # A helper reference that collides is a SILENT LOSS: its key read
+            # perfectly and named one file, which happens to share a basename with
+            # another. Report it rather than preferring a candidate. Ordinary calls
+            # keep the documented silence — colliding on a common short name is the
+            # behaviour this gate exists for, not a defect.
+            if relation != "calls" and len(candidates) > 1:
+                _report_ambiguous_cross_file_target(
+                    relation, callee, candidates,
+                    rc.get("source_file", ""), rc.get("source_location", ""),
+                )
             continue
         tgt = candidates[0]
         caller = rc["caller_nid"]
@@ -8473,17 +8543,22 @@ def extract(
             else:
                 confidence = "INFERRED"
                 confidence_score = 0.8
-            all_edges.append({
+            edge = {
                 "source": caller,
                 "target": tgt,
-                "relation": "calls",
-                "context": "call",
+                "relation": relation,
                 "confidence": confidence,
                 "confidence_score": confidence_score,
                 "source_file": rc.get("source_file", ""),
                 "source_location": rc.get("source_location"),
                 "weight": 1.0,
-            })
+            }
+            # "context": "call" describes a call site. A helper reference is not one,
+            # and the in-file uses_* emission at the config branch does not set it
+            # either — so the two lanes agree on the shape they produce.
+            if relation == "calls":
+                edge["context"] = "call"
+            all_edges.append(edge)
 
     # Relativize source_file fields so paths are portable across machines (#555)
     for item in all_nodes + all_edges:
