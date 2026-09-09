@@ -7,6 +7,34 @@ fails when the version in `Cargo.toml` has no entry here.
 
 Releases before 0.13.3 are tagged in the repository but are not written up.
 
+## 0.15.0 (2026-09-09)
+
+### Fixed
+
+- **store**: retry the atomic rename, and stop discarding its error ([#127](https://github.com/ChristopherKahler/base/issues/127)) ([#155](https://github.com/ChristopherKahler/base/issues/155))
+- **ast**: read a PHP helper key in every plain quote style ([#118](https://github.com/ChristopherKahler/base/issues/118)) ([#154](https://github.com/ChristopherKahler/base/issues/154))
+- **doctor**: report quads belonging to another workspace instead of passing the tier HEALTHY ([#142](https://github.com/ChristopherKahler/base/issues/142)) ([#153](https://github.com/ChristopherKahler/base/issues/153))
+- **ast**: declare each IRI exactly once in the map ([#98](https://github.com/ChristopherKahler/base/issues/98)) ([#152](https://github.com/ChristopherKahler/base/issues/152))
+- **windows**: run the CLI on an 8 MB stack so a debug base.exe reaches product code ([#151](https://github.com/ChristopherKahler/base/issues/151))
+- **frontmatter**: the documented `related` key produces edges, on both paths ([#150](https://github.com/ChristopherKahler/base/issues/150))
+- **ast**: ast query returns non-symbols as symbols ([#148](https://github.com/ChristopherKahler/base/issues/148))
+- **ast**: a read never crosses out of the app it started in ([#147](https://github.com/ChristopherKahler/base/issues/147))
+- **commands**: star commands activate only at an invocation position, and replies render the token on its own line ([#145](https://github.com/ChristopherKahler/base/issues/145)) ([#101](https://github.com/ChristopherKahler/base/issues/101))
+- **ast**: file membership is transitive over containment, and the walk is seed-order deterministic ([#144](https://github.com/ChristopherKahler/base/issues/144)) ([#82](https://github.com/ChristopherKahler/base/issues/82))
+- **[#87](https://github.com/ChristopherKahler/base/issues/87)**: route nine graph writers plus a tenth site through the lock seam ([#139](https://github.com/ChristopherKahler/base/issues/139))
+- **install**: [#93](https://github.com/ChristopherKahler/base/issues/93) permanently-inert install, [#92](https://github.com/ChristopherKahler/base/issues/92) scripts/ast beside the binary ([#136](https://github.com/ChristopherKahler/base/issues/136))
+- **rule**: `rule remove` removes what `rule list` showed, and reports the count it read back ([#112](https://github.com/ChristopherKahler/base/issues/112)) ([#140](https://github.com/ChristopherKahler/base/issues/140))
+- **ast**: one relation vocabulary shared by the extractor and the serializer ([#107](https://github.com/ChristopherKahler/base/issues/107)) ([#130](https://github.com/ChristopherKahler/base/issues/130)) ([#98](https://github.com/ChristopherKahler/base/issues/98), [#105](https://github.com/ChristopherKahler/base/issues/105), [#82](https://github.com/ChristopherKahler/base/issues/82))
+
+### Changed
+
+- **python-ast-tests**: count TESTS, not files ([#149](https://github.com/ChristopherKahler/base/issues/149))
+- drop the rocksdb default feature from oxigraph ([#117](https://github.com/ChristopherKahler/base/issues/117)) ([#137](https://github.com/ChristopherKahler/base/issues/137))
+- --no-fail-fast on the trunk suite ([#135](https://github.com/ChristopherKahler/base/issues/135))
+- Run the Python AST tests in CI, blocking ([#122](https://github.com/ChristopherKahler/base/issues/122))
+- Remove the PolyForm license file from the repo and the release archives ([#123](https://github.com/ChristopherKahler/base/issues/123))
+- The Windows lint gate: three cfg-dead items, and clippy becomes a required check ([#119](https://github.com/ChristopherKahler/base/issues/119))
+
 ## 0.14.2 (2026-09-08)
 
 **base can be used at work.** Every release up to and including 0.14.1 shipped under the PolyForm Noncommercial License 1.0.0, which permitted noncommercial use only, so a company running base internally, the audience it is built for, sat outside the grant. From this release the engine is licensed under the Functional Source License 1.1 with an Apache 2.0 future license (FSL-1.1-ALv2). You may run base inside a company of any size, modify it, and build and sell products that use it. The one thing withheld is selling base itself, or a service that stands in for base or for basemode. Each version becomes Apache 2.0 two years after it ships; that grant is irrevocable and written into the license text. Extensions and adapters written against base's documented interfaces (the extension manifest and API, command plugins, the hook protocol, the CLI surface, the on-disk graph format) are their author's own work under an explicit exception and may be licensed any way the author likes, including commercially. Versions already released keep the terms they shipped with; nothing is withdrawn. `LICENSING.md` carries the plain-English guide and the surface-by-surface table, and `Cargo.toml` now declares the SPDX identifier.
