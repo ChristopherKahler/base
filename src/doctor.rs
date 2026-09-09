@@ -18,8 +18,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use anyhow::{Context, Result};
-use oxigraph::model::Term;
+use oxigraph::model::{GraphName, Term};
 use oxigraph::sparql::QueryResults;
+use oxigraph::store::Store;
 
 use crate::changelog::Change;
 use crate::store::{self, GraphHealth};
@@ -60,6 +61,32 @@ pub struct TierReport {
     /// lists) on a tier that has never used the feature, and doctor then prints
     /// nothing about it — a store from before 0.14.0 reads exactly as it did.
     pub supersede_audit: crate::supersede::Audit,
+    /// Named graphs in this tier that belong to ANOTHER workspace, quad count,
+    /// highest first (#142). Empty on a clean tier, so a store with nothing
+    /// foreign in it serialises and prints exactly as it did before.
+    ///
+    /// **Counts against `healthy`.** This is the whole point of #142: the only
+    /// signal an operator got was `rule list` showing them, while doctor — the
+    /// one surface whose job is to say what is wrong — said nothing at all.
+    pub foreign_graphs: Vec<(String, usize)>,
+    /// Named graphs `base` writes ON PURPOSE that belong to no workspace, so
+    /// they are not-own without being a fault. Today exactly one member:
+    /// [`crate::apply_ops::LEDGER_GRAPH`], which `apply_ops` documents as living
+    /// inside the same `graph.nq` as everything else.
+    ///
+    /// Reported so nothing is silently dropped, and reported SEPARATELY from
+    /// [`Self::unrecognised_graphs`] because an operator who sees
+    /// `urn:base:sync:facts` named as a fault goes looking for a corruption that
+    /// does not exist. **Advisory: never counted against `healthy`.**
+    pub unscoped_graphs: Vec<(String, usize)>,
+    /// Every other named graph — not this tier's, not another workspace's, and
+    /// not one of the crate's own workspace-independent graphs.
+    ///
+    /// An ops-sync pull writes portal-supplied partitions here (the `named_graph`
+    /// of an incoming op is an arbitrary IRI), which is why this cannot count
+    /// against `healthy`: doing so would report every synced machine as unhealthy
+    /// over data it fetched correctly. **Advisory.**
+    pub unrecognised_graphs: Vec<(String, usize)>,
     pub latest_backup: Option<BackupCompare>,
 }
 
@@ -67,8 +94,20 @@ pub struct TierReport {
 #[derive(Debug, Serialize)]
 pub struct DoctorReport {
     pub tiers: Vec<TierReport>,
-    /// True when no tier is "unhealthy" AND no config file is corrupt
-    /// (missing/empty tiers and files do not count against health).
+    /// True when ALL FIVE of these hold. Missing/empty tiers and files do not
+    /// count against health.
+    ///
+    /// 1. no tier is `"unhealthy"` (i.e. no tier failed to parse),
+    /// 2. [`Self::config_errors`] is empty,
+    /// 3. [`Self::trigger_faults`] is empty,
+    /// 4. no hook is failing **now**, and
+    /// 5. no tier carries [`TierReport::foreign_graphs`] (#142).
+    ///
+    /// This comment enumerates every conjunct on purpose. It previously listed
+    /// **two** while the computation had **four**, and anyone rewriting `healthy`
+    /// reads the comment rather than counting the `&&`s — see the ruling in the
+    /// #142 lane doc. Keep it in step with the expression below or delete it;
+    /// a comment that undercounts is worse than none.
     pub healthy: bool,
     /// Advisory operational warnings (bloat, write-probe failures). Do not affect `healthy`.
     pub warnings: Vec<String>,
@@ -91,6 +130,147 @@ pub struct DoctorReport {
     /// in the linked binary, so a substring probe of the executable means
     /// something.
     pub seam: &'static str,
+}
+
+// ─── Provenance: which workspace does a named graph belong to? (#142) ────────
+
+/// Where a named graph found inside a tier came from.
+///
+/// The shapes below are enumerated **from the codebase**, not from what a graph
+/// name looks like it ought to be. A detector whose rule is *anything that is not
+/// my own workspace graph is foreign* reports the crate's OWN
+/// workspace-independent graphs as corruption — which is #142's defect with the
+/// sign flipped, and it would fire on every machine that has run an ops pull.
+///
+/// Every writer that can put a named graph inside a tier's `graph.nq`:
+///
+/// | shape | built at | verdict |
+/// |---|---|---|
+/// | `{ns}graph/ws/{slug}` | [`crate::crud::workspace_graph_iri`] | [`Own`](GraphOrigin::Own) or [`Foreign`](GraphOrigin::Foreign), by the slug |
+/// | `{ns}graph/semantic/{ws}/{doc}` | `crud::semantic::doc_graph_iri` | `Own` or `Foreign`, by the `{ws}` segment |
+/// | `urn:base:sync:facts` | [`crate::apply_ops::LEDGER_GRAPH`], which `apply_ops` states lives inside the same `graph.nq` | [`Unscoped`](GraphOrigin::Unscoped) |
+/// | an arbitrary IRI supplied by the portal | an incoming op's `named_graph`, applied by `apply_ops` | [`Unrecognised`](GraphOrigin::Unrecognised) |
+///
+/// `{ns_base}/relay/{project}` (`crate::relay::Relay::export_nq`) is deliberately
+/// absent rather than forgotten: it writes `inbox.nq` in the relay root and is
+/// documented there as an ephemeral snapshot, "never the live medium", so it can
+/// never reach a tier graph and therefore never reaches this function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphOrigin {
+    /// This tier's own workspace.
+    Own,
+    /// Another workspace's. The only variant that counts against `healthy`.
+    Foreign,
+    /// A graph `base` writes on purpose that belongs to no workspace.
+    Unscoped,
+    /// Not attributable to any shape this build knows.
+    Unrecognised,
+}
+
+/// The workspace slug a tier's own quads are stamped with, derived from the tier
+/// FILE rather than from the process's cwd.
+///
+/// Must stay equal to [`crate::crud::workspace_slug`] for both tier shapes —
+/// `<root>/.base/graph.nq` and `<home>/.base-gbl/.base/graph.nq`, the latter
+/// yielding `base-gbl`. It deliberately does NOT call it: `workspace_slug`
+/// resolves through [`crate::config::find_workspace_base`] (`config.rs:49`), which
+/// walks up from **cwd** and returns the first `.base` it meets. Calling it here
+/// would make this answer about where the process happens to be standing instead
+/// of about the file it was handed, and would destroy the purity of the
+/// [`diagnose_tier`] seam.
+///
+/// If the two ever drift, doctor reports 100% of every tier as foreign — the worst
+/// failure this feature can have — which is why
+/// `tier_own_slug_agrees_with_crud_workspace_slug` pins them together rather than
+/// leaving the equivalence as an assumption inside a larger test.
+fn tier_own_slug(path: &Path) -> String {
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        .map(crate::crud::slugify)
+        .unwrap_or_else(|| "default".into())
+}
+
+/// Classify one named graph against the tier holding it.
+fn classify_graph(graph: &str, ns_uri: &str, own_slug: &str) -> GraphOrigin {
+    if graph == crate::apply_ops::LEDGER_GRAPH {
+        return GraphOrigin::Unscoped;
+    }
+    let Some(rest) = graph.strip_prefix(ns_uri).and_then(|r| r.strip_prefix("graph/")) else {
+        return GraphOrigin::Unrecognised;
+    };
+    // `ws/{slug}` and `semantic/{ws}/{doc}` both carry the owning workspace, in
+    // different positions. Any other shape under `graph/` is one this build does
+    // not know: say so rather than inventing an owner for it.
+    let owner = if let Some(slug) = rest.strip_prefix("ws/") {
+        slug
+    } else if let Some(tail) = rest.strip_prefix("semantic/") {
+        tail.split('/').next().unwrap_or("")
+    } else {
+        return GraphOrigin::Unrecognised;
+    };
+    if owner == own_slug { GraphOrigin::Own } else { GraphOrigin::Foreign }
+}
+
+/// Every quad in `store` bucketed by the origin of its graph, each bucket
+/// **enumerated**.
+///
+/// Nothing here is derived by subtracting one total from another. Two quantities
+/// that count different things, subtracted, print a clean number over a
+/// contradiction, and a clamp hides it outright — so every bucket is counted by
+/// visiting its members and `own + foreign + unscoped + unrecognised +
+/// default_graph` equals the store's quad count exactly. That identity is what
+/// `every_quad_lands_in_exactly_one_bucket` asserts.
+#[derive(Debug, Default)]
+struct GraphProvenance {
+    own: usize,
+    /// Quads in a graph belonging to another workspace, IRI → count.
+    foreign: Vec<(String, usize)>,
+    /// Quads in one of the crate's own workspace-independent graphs.
+    unscoped: Vec<(String, usize)>,
+    /// Quads in a graph no known shape attributes.
+    unrecognised: Vec<(String, usize)>,
+    /// Quads carrying no graph term at all. `base` writes none; a hand-edited
+    /// file can. Counted so the identity above closes, reported nowhere.
+    default_graph: usize,
+}
+
+/// One pass over the loaded store, grouping by graph name.
+///
+/// The store is already in memory by the time this runs (`diagnose_tier` loads it
+/// for the schema stamp and the supersession audit), so this adds no I/O.
+fn graph_provenance(store: &Store, ns_uri: &str, own_slug: &str) -> GraphProvenance {
+    use std::collections::BTreeMap;
+
+    let mut out = GraphProvenance::default();
+    let mut named: BTreeMap<String, usize> = BTreeMap::new();
+    for quad in store.iter().filter_map(Result::ok) {
+        match quad.graph_name {
+            GraphName::DefaultGraph => out.default_graph += 1,
+            GraphName::NamedNode(n) => *named.entry(n.into_string()).or_default() += 1,
+            GraphName::BlankNode(b) => *named.entry(format!("_:{}", b.as_str())).or_default() += 1,
+        }
+    }
+
+    for (graph, count) in named {
+        match classify_graph(&graph, ns_uri, own_slug) {
+            GraphOrigin::Own => out.own += count,
+            GraphOrigin::Foreign => out.foreign.push((graph, count)),
+            GraphOrigin::Unscoped => out.unscoped.push((graph, count)),
+            GraphOrigin::Unrecognised => out.unrecognised.push((graph, count)),
+        }
+    }
+
+    // Highest count first, then IRI, so the report is deterministic and the
+    // biggest offender is the line an operator reads first.
+    let by_size = |v: &mut Vec<(String, usize)>| {
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    };
+    by_size(&mut out.foreign);
+    by_size(&mut out.unscoped);
+    by_size(&mut out.unrecognised);
+    out
 }
 
 /// Diagnose a single graph file. PURE: only touches `path` and its siblings
@@ -121,6 +301,11 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
             entity_composition: Vec::new(),
             schema_version: None,
             domain_orphans: Vec::new(),
+            // A tier with no file holds no quads, so it holds no foreign ones.
+            // Empty here is a measurement, not a default standing in for one.
+            foreign_graphs: Vec::new(),
+            unscoped_graphs: Vec::new(),
+            unrecognised_graphs: Vec::new(),
             latest_backup: None,
             supersede_audit: crate::supersede::Audit::default(),
         };
@@ -139,7 +324,7 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
     // Namespace from THIS tier's own base.toml (`<root>/.base/graph.nq` → `<root>`),
     // so a workspace with a custom prefix is read with its own vocabulary rather
     // than the default. Keeps `diagnose_tier` path-scoped — the test-isolation seam.
-    let (schema_version, domain_orphans, supersede_audit) = if status == "healthy" {
+    let (schema_version, domain_orphans, supersede_audit, provenance) = if status == "healthy" {
         let root = path.parent().and_then(Path::parent).unwrap_or(path);
         let ns = crate::config::BaseConfig::load(root).namespace;
         match store::load_graph(path) {
@@ -147,11 +332,18 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
                 crate::migrate::stamp_of_tier(&s, &ns),
                 crate::migrate::orphan_counts(&s, &ns),
                 crate::supersede::audit(&s, &ns),
+                // #142. Same already-loaded store, so this costs one more pass
+                // over memory and no I/O at all.
+                graph_provenance(&s, &ns.uri, &tier_own_slug(path)),
             ),
-            Err(_) => (None, Vec::new(), crate::supersede::Audit::default()),
+            Err(_) => (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default()),
         }
     } else {
-        (None, Vec::new(), crate::supersede::Audit::default())
+        // An unparseable tier is already `unhealthy` for a stated reason with a
+        // bad line number. Claiming a provenance verdict from a store that never
+        // loaded would put a confident zero where the honest answer is "could not
+        // look" — the failure this whole lane exists to remove.
+        (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default())
     };
 
     let latest_backup = newest_backup(path).map(|bpath| {
@@ -177,6 +369,9 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
         supersede_audit,
         schema_version,
         domain_orphans,
+        foreign_graphs: provenance.foreign,
+        unscoped_graphs: provenance.unscoped,
+        unrecognised_graphs: provenance.unrecognised,
         latest_backup,
     }
 }
@@ -218,10 +413,16 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
     }
     let config_errors = crate::command::check_command_files(cwd);
     let trigger_faults = trigger_faults(cwd);
+    // FIVE conjuncts. Keep the doc comment on `DoctorReport::healthy` in step
+    // with this expression — it undercounted for four releases (#142).
     let healthy = tiers.iter().all(|t| t.status != "unhealthy")
         && config_errors.is_empty()
         && trigger_faults.is_empty()
-        && !hooks_broken;
+        && !hooks_broken
+        // #142: a tier full of quads belonging to another workspace parses
+        // perfectly, so nothing above can see it. Only `unscoped` and
+        // `unrecognised` stay advisory — those are graphs base writes on purpose.
+        && tiers.iter().all(|t| t.foreign_graphs.is_empty());
     DoctorReport {
         tiers,
         healthy,
@@ -315,6 +516,54 @@ pub fn format_human(report: &DoctorReport) -> String {
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect();
             out.push_str(&format!("   composition: {}\n", comp.join(", ")));
+        }
+
+        // #142. Quads belonging to another workspace, named with their counts.
+        // A message saying "foreign quads present" without the graph and the
+        // number is not a diagnosis, it is a rumour.
+        if !t.foreign_graphs.is_empty() {
+            let total: usize = t.foreign_graphs.iter().map(|(_, n)| n).sum();
+            out.push_str(&format!(
+                "   ⚠ {total} quad(s) in {} graph(s) belonging to ANOTHER workspace:\n",
+                t.foreign_graphs.len()
+            ));
+            for (g, n) in &t.foreign_graphs {
+                out.push_str(&format!("       {n} · {g}\n"));
+            }
+            // The one bounded extra line auk ruled in scope. Fires ONLY for the
+            // shape where every quad in the tier sits in a single non-own graph,
+            // because reporting "N foreign quads" when the cause is a renamed
+            // folder sends the operator hunting corruption that is not there.
+            // Diagnosis only: it names the likely cause and stops.
+            if t.foreign_graphs.len() == 1 && total == t.line_count && total > 0 {
+                out.push_str(
+                    "       every quad in this tier is in that one graph — \
+                     this workspace directory was most likely renamed\n",
+                );
+            }
+        }
+
+        // Advisory, and deliberately worded so neither reads as corruption.
+        // `urn:base:sync:facts` is base's own ledger; an ops pull writes
+        // portal-supplied partitions. Naming either as a fault would send an
+        // operator looking for damage that does not exist.
+        if !t.unscoped_graphs.is_empty() {
+            let total: usize = t.unscoped_graphs.iter().map(|(_, n)| n).sum();
+            out.push_str(&format!(
+                "   {total} quad(s) in {} of base's own workspace-independent graph(s) — normal\n",
+                t.unscoped_graphs.len()
+            ));
+        }
+        if !t.unrecognised_graphs.is_empty() {
+            let total: usize = t.unrecognised_graphs.iter().map(|(_, n)| n).sum();
+            out.push_str(&format!(
+                "   {total} quad(s) in {} graph(s) this build does not attribute \
+                 (an ops-sync pull writes portal-supplied graphs here) — advisory, not a fault\n",
+                t.unrecognised_graphs.len()
+            ));
+            for (g, n) in &t.unrecognised_graphs {
+                out.push_str(&format!("       {n} · {g}\n"));
+            }
         }
 
         // The domain schema, always stated when the tier parses. A migration that
@@ -974,6 +1223,272 @@ mod tests {
         let mut f = fs::File::create(&p).unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         p
+    }
+
+    // ─── #142 provenance fixtures ────────────────────────────────────────────
+
+    /// The default namespace URI, read from the config rather than typed here so
+    /// this cannot drift from what the product builds IRIs with.
+    fn nsuri() -> String {
+        crate::config::NamespaceConfig::default().uri
+    }
+
+    /// A realistic tier layout, `<root>/.base/graph.nq`, returned with the slug
+    /// that layout gives the tier.
+    ///
+    /// The existing fixtures above write `graph.nq` loose in a tempdir, which is
+    /// fine for parse-shaped assertions and wrong for provenance ones:
+    /// `tier_own_slug` reads the file's GRANDPARENT, so a loose file is attributed
+    /// to the system temp folder and every quad in it would read foreign.
+    fn tier_at(name: &str) -> (tempfile::TempDir, PathBuf, String) {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().join(name).join(".base");
+        fs::create_dir_all(&base).unwrap();
+        (td, base.join("graph.nq"), crate::crud::slugify(name))
+    }
+
+    /// One well-formed quad in graph `g`.
+    fn quad_in(subject: &str, g: &str) -> String {
+        format!(
+            "<http://example.org/{subject}> \
+             <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://example.org/Thing> <{g}> .\n"
+        )
+    }
+
+    fn ws_graph(slug: &str) -> String {
+        format!("{}graph/ws/{slug}", nsuri())
+    }
+
+    /// A1 — POSITIVE CONTROL. The detector can fire, and it names both the graph
+    /// and the count. A message without the number is a rumour, not a diagnosis.
+    #[test]
+    fn foreign_quads_are_named_with_their_count() {
+        let (_td, p, own) = tier_at("mine");
+        let other = ws_graph("theirs");
+        let mut body = quad_in("a", &ws_graph(&own));
+        body.push_str(&quad_in("b", &other));
+        body.push_str(&quad_in("c", &other));
+        write_file(p.parent().unwrap(), "graph.nq", &body);
+
+        let r = diagnose_tier("workspace", &p);
+        assert_eq!(r.foreign_graphs, vec![(other, 2)]);
+        assert!(r.unscoped_graphs.is_empty());
+        assert!(r.unrecognised_graphs.is_empty());
+        // The tier still PARSES, which is exactly why nothing before #142 saw it.
+        // Overloading `status` would switch off composition, schema and the
+        // supersession audit on the one tier an operator is trying to diagnose.
+        assert_eq!(r.status, "healthy", "provenance is not a parse fault");
+    }
+
+    /// A2 — NEGATIVE CONTROL, and the one most likely to be skipped. Without it a
+    /// detector that reports foreign quads unconditionally passes A1 identically.
+    #[test]
+    fn a_clean_tier_reports_no_foreign_graphs() {
+        let (_td, p, own) = tier_at("mine");
+        let body = quad_in("a", &ws_graph(&own)) + &quad_in("b", &ws_graph(&own));
+        write_file(p.parent().unwrap(), "graph.nq", &body);
+
+        let r = diagnose_tier("workspace", &p);
+        assert!(r.foreign_graphs.is_empty(), "a clean tier must stay silent");
+        assert!(r.unscoped_graphs.is_empty());
+        assert!(r.unrecognised_graphs.is_empty());
+    }
+
+    /// A3 — base's own ledger is NOT foreign. `apply_ops` documents it as living
+    /// inside the same `graph.nq`; naming it a fault sends an operator hunting a
+    /// corruption that does not exist.
+    #[test]
+    fn the_sync_ledger_graph_is_not_foreign() {
+        let (_td, p, own) = tier_at("mine");
+        let body = quad_in("a", &ws_graph(&own)) + &quad_in("f", crate::apply_ops::LEDGER_GRAPH);
+        write_file(p.parent().unwrap(), "graph.nq", &body);
+
+        let r = diagnose_tier("workspace", &p);
+        assert!(r.foreign_graphs.is_empty(), "the ledger is base's own");
+        assert_eq!(r.unscoped_graphs, vec![(crate::apply_ops::LEDGER_GRAPH.to_string(), 1)]);
+        assert!(r.unrecognised_graphs.is_empty());
+    }
+
+    /// A4 — a portal-supplied partition is UNRECOGNISED, never foreign. An
+    /// incoming op's `named_graph` is an arbitrary IRI, so counting these against
+    /// health would report every ops-synced machine as unhealthy over data it
+    /// fetched correctly.
+    #[test]
+    fn a_portal_partition_is_unrecognised_not_foreign() {
+        let (_td, p, own) = tier_at("mine");
+        let portal = "https://basemode.ai/g/6f1c";
+        let body = quad_in("a", &ws_graph(&own)) + &quad_in("p", portal);
+        write_file(p.parent().unwrap(), "graph.nq", &body);
+
+        let r = diagnose_tier("workspace", &p);
+        assert!(r.foreign_graphs.is_empty());
+        assert!(r.unscoped_graphs.is_empty());
+        assert_eq!(r.unrecognised_graphs, vec![(portal.to_string(), 1)]);
+    }
+
+    /// A5 — the second shape that carries a workspace. A detector that knows only
+    /// `graph/ws/` is blind to a whole family it claims to cover.
+    #[test]
+    fn a_foreign_semantic_graph_is_detected() {
+        let (_td, p, own) = tier_at("mine");
+        let g = format!("{}graph/semantic/theirs/some-doc", nsuri());
+        let body = quad_in("a", &ws_graph(&own)) + &quad_in("s", &g);
+        write_file(p.parent().unwrap(), "graph.nq", &body);
+
+        let r = diagnose_tier("workspace", &p);
+        assert_eq!(r.foreign_graphs, vec![(g, 1)]);
+    }
+
+    /// A6 — the same shape with THIS tier's slug is own, not foreign. Pairs with
+    /// A5: one mutation, opposite outcome.
+    #[test]
+    fn the_tiers_own_semantic_graph_is_not_foreign() {
+        let (_td, p, own) = tier_at("mine");
+        let g = format!("{}graph/semantic/{own}/some-doc", nsuri());
+        let body = quad_in("a", &ws_graph(&own)) + &quad_in("s", &g);
+        write_file(p.parent().unwrap(), "graph.nq", &body);
+
+        let r = diagnose_tier("workspace", &p);
+        assert!(r.foreign_graphs.is_empty(), "our own semantic graph is ours");
+        assert!(r.unrecognised_graphs.is_empty());
+    }
+
+    /// A7 — every quad lands in exactly one bucket, and the buckets are counted by
+    /// visiting their members. No bucket is derived by subtracting one total from
+    /// another: a subtraction between quantities that count different things
+    /// prints a clean number over a contradiction.
+    #[test]
+    fn every_quad_lands_in_exactly_one_bucket() {
+        let own_slug = "mine";
+        let mut body = String::new();
+        body.push_str(&quad_in("a", &ws_graph(own_slug)));
+        body.push_str(&quad_in("b", &ws_graph(own_slug)));
+        body.push_str(&quad_in("c", &ws_graph("theirs")));
+        body.push_str(&quad_in("d", &format!("{}graph/semantic/theirs/doc", nsuri())));
+        body.push_str(&quad_in("e", crate::apply_ops::LEDGER_GRAPH));
+        body.push_str(&quad_in("f", "https://basemode.ai/g/6f1c"));
+        body.push_str(&quad_in("g", &format!("{}graph/somethingnew/x", nsuri())));
+        // A bare triple: base writes none, a hand-edited file can.
+        body.push_str(TYPED);
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_file(dir.path(), "graph.nq", &body);
+        let store = store::load_graph(&p).unwrap();
+        let total = store.len().unwrap();
+        let prov = graph_provenance(&store, &nsuri(), own_slug);
+
+        let foreign: usize = prov.foreign.iter().map(|(_, n)| n).sum();
+        let unscoped: usize = prov.unscoped.iter().map(|(_, n)| n).sum();
+        let unrecognised: usize = prov.unrecognised.iter().map(|(_, n)| n).sum();
+
+        assert_eq!(prov.own, 2, "own");
+        assert_eq!(foreign, 2, "foreign: ws/theirs + semantic/theirs");
+        assert_eq!(unscoped, 1, "unscoped: the ledger");
+        assert_eq!(unrecognised, 2, "unrecognised: the portal graph + an unknown shape");
+        assert_eq!(prov.default_graph, 1, "the bare triple");
+        assert_eq!(
+            prov.own + foreign + unscoped + unrecognised + prov.default_graph,
+            total,
+            "every quad in the store must land in exactly one bucket"
+        );
+        assert_eq!(total, 8, "and the store holds what the fixture wrote");
+    }
+
+    /// A8 — the global tier's own slug. Measured against the operator's real
+    /// global graph on 2026-09-09: all 104,962 of its quads are stamped
+    /// `…#graph/ws/base-gbl`, which is this derivation's output.
+    #[test]
+    fn the_global_tier_owns_the_base_gbl_slug() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join(".base-gbl").join(".base").join("graph.nq");
+        assert_eq!(tier_own_slug(&p), "base-gbl");
+    }
+
+    /// A9 — the drift that would report 100% of every tier as foreign.
+    ///
+    /// `tier_own_slug` and [`crate::crud::workspace_slug`] derive the same value by
+    /// two different routes — the tier file's grandparent, and a walk up from cwd.
+    /// They agree today; nothing but this arm keeps them agreeing.
+    #[test]
+    fn tier_own_slug_agrees_with_crud_workspace_slug() {
+        for name in ["mine", "Chris", "some project", "UPPER-Case_1"] {
+            let (_td, p, _) = tier_at(name);
+            fs::write(&p, "").unwrap();
+            let root = p.parent().and_then(Path::parent).unwrap();
+            assert_eq!(
+                tier_own_slug(&p),
+                crate::crud::workspace_slug(root),
+                "the two slug derivations must not drift for {name:?}"
+            );
+        }
+    }
+
+    /// A12 — a workspace with a custom namespace is read with its own vocabulary.
+    /// `diagnose_tier` loads THIS tier's `base.toml`; a detector hard-coded to the
+    /// default URI would call every quad in such a store unrecognised.
+    #[test]
+    fn a_custom_namespace_uri_is_respected() {
+        let (_td, p, own) = tier_at("mine");
+        let base_dir = p.parent().unwrap();
+        write_file(
+            base_dir,
+            "base.toml",
+            "[namespace]\nprefix = \"acme\"\nuri = \"https://acme.example/onto#\"\n",
+        );
+        let mine = format!("https://acme.example/onto#graph/ws/{own}");
+        let theirs = "https://acme.example/onto#graph/ws/theirs";
+        let body = quad_in("a", &mine) + &quad_in("b", theirs);
+        write_file(base_dir, "graph.nq", &body);
+
+        let r = diagnose_tier("workspace", &p);
+        assert_eq!(r.foreign_graphs, vec![(theirs.to_string(), 1)]);
+        assert!(
+            r.unrecognised_graphs.is_empty(),
+            "our own custom-namespace graph must not read as unattributable"
+        );
+    }
+
+    /// A13 — the one bounded extra line. A report saying "3 foreign quads" when
+    /// the cause is a renamed folder routes the operator to the wrong fix, and
+    /// sending someone to the wrong remedy is a diagnostic defect of its own.
+    #[test]
+    fn a_wholly_foreign_tier_names_a_possible_rename() {
+        let (_td, p, _) = tier_at("renamed-after-the-fact");
+        let old = ws_graph("what-it-used-to-be-called");
+        let body = quad_in("a", &old) + &quad_in("b", &old) + &quad_in("c", &old);
+        write_file(p.parent().unwrap(), "graph.nq", &body);
+
+        let r = diagnose_tier("workspace", &p);
+        assert_eq!(r.foreign_graphs, vec![(old, 3)]);
+        let report = DoctorReport {
+            tiers: vec![r],
+            healthy: false,
+            warnings: Vec::new(),
+            config_errors: Vec::new(),
+            trigger_faults: Vec::new(),
+            seam: store::LOCK_SEAM_MARKER,
+        };
+        let human = format_human(&report);
+        assert!(human.contains("most likely renamed"), "got:\n{human}");
+
+        // And it must NOT fire on a tier that merely has some foreign quads —
+        // otherwise it is noise on the common case rather than a diagnosis of
+        // the specific one. Same fixture, one own quad added.
+        let (_td2, p2, own2) = tier_at("mine");
+        let body2 = quad_in("a", &ws_graph(&own2)) + &quad_in("b", &ws_graph("theirs"));
+        write_file(p2.parent().unwrap(), "graph.nq", &body2);
+        let report2 = DoctorReport {
+            tiers: vec![diagnose_tier("workspace", &p2)],
+            healthy: false,
+            warnings: Vec::new(),
+            config_errors: Vec::new(),
+            trigger_faults: Vec::new(),
+            seam: store::LOCK_SEAM_MARKER,
+        };
+        let human2 = format_human(&report2);
+        assert!(human2.contains("ANOTHER workspace"), "got:\n{human2}");
+        assert!(!human2.contains("most likely renamed"), "got:\n{human2}");
     }
 
     #[test]
