@@ -1446,6 +1446,78 @@ _SCALA_CONFIG = LanguageConfig(
     import_handler=_import_scala,
 )
 
+# PHP produces FOUR node types for a plain string literal, and the content is not always
+# at the same depth. Measured against the installed grammar (tree-sitter-php 0.24.1)
+# rather than taken from the grammar's documentation:
+#
+#   'a.b'       -> string             string_content
+#   "a.b"       -> encapsed_string    string_content
+#   <<<EOT      -> heredoc            value: heredoc_body -> string_content
+#   <<<'EOT'    -> nowdoc             value: nowdoc_body  -> nowdoc_string
+#
+# `nowdoc_string` is why the body types have to be walked rather than assumed: a fix that
+# collects only `string_content` reads NOTHING for a nowdoc and emits no edge at exit 0.
+#
+# Backticks stay OUT. `` `a.b` `` is a `shell_command_expression` -- shell execution, not
+# a string literal -- and it carries a `string_content` child with no interpolation
+# children, so a children-only test would admit it as a config key. The type set is a
+# WHITELIST and the no-compile-time-value test is applied INSIDE it.
+_PHP_STRING_TYPES = frozenset({"string", "encapsed_string", "heredoc", "nowdoc"})
+_PHP_STRING_BODY_TYPES = frozenset({"heredoc_body", "nowdoc_body"})
+_PHP_STRING_CONTENT_TYPES = frozenset({"string_content", "nowdoc_string"})
+
+
+def _php_literal_key(node, source: bytes) -> "tuple[str | None, str | None]":
+    r"""The compile-time value of a PHP string literal, or the reason it has none.
+
+    Returns ``(key, None)`` for a plain literal; ``(None, reason)`` when the node IS a
+    string literal but has no single compile-time value; and ``(None, None)`` when the
+    node is not a string literal at all, so the caller keeps looking at later arguments.
+
+    The branch is on the node's CHILDREN, never on the quote character and never on the
+    node type alone: a double-quoted string with no interpolation is a plain literal that
+    tree-sitter still types ``encapsed_string``, which is the whole of #118.
+
+    ``escape_sequence`` counts as no-compile-time-value deliberately. The value does
+    exist, but decoding it needs a PHP escape decoder whose rules DIFFER between single
+    and double quotes, and both cheap readings invent data: joining the siblings yields
+    ``ab`` for ``"a\tb"``, and taking only the first sibling -- what this function
+    replaces -- yielded ``a`` for ``'a\'b.c'``, an edge to a target the source never
+    named.
+    """
+    if node.type not in _PHP_STRING_TYPES:
+        return None, None
+    body = node.child_by_field_name("value")
+    if body is None or body.type not in _PHP_STRING_BODY_TYPES:
+        body = node
+    parts: list[str] = []
+    for child in body.children:
+        if not child.is_named:
+            continue
+        if child.type in _PHP_STRING_CONTENT_TYPES:
+            parts.append(_read_text(child, source))
+        elif child.type == "escape_sequence":
+            return None, "escape sequence"
+        else:
+            return None, "interpolates"
+    return ("".join(parts) if parts else None), None
+
+
+def _report_no_literal_key(helper: str, reason: str, path_str: str, line: int) -> None:
+    """One stderr line per rejected helper argument, naming the file and the line.
+
+    Deliberately NOT widened to "report anything unresolvable". It fires only for an
+    argument to a recognised helper that IS a string literal without a compile-time
+    value. A key that resolves to no node in the file stays silent, because the key
+    itself was read correctly -- that is a missing target, not an unknown value.
+    """
+    print(
+        f"base-ast: {helper}() argument at {path_str}:{line} {reason} "
+        f"- no uses_{helper} edge emitted",
+        file=sys.stderr,
+    )
+
+
 _PHP_CONFIG = LanguageConfig(
     ts_module="tree_sitter_php",
     ts_language_fn="language_php",
@@ -2188,20 +2260,30 @@ def _extract_generic(
             if (callee_name and callee_name in config.helper_fn_names):
                 args_node = node.child_by_field_name("arguments")
                 first_key: str | None = None
+                # A literal that was recognised but has no compile-time value ENDS the
+                # search: it must not fall through to a later argument and emit an edge
+                # built from a default value.
+                no_literal_value = False
                 if args_node:
                     for arg in args_node.children:
                         if arg.type != "argument":
                             continue
                         for inner in arg.children:
-                            if inner.type == "string":
-                                for sc in inner.children:
-                                    if sc.type == "string_content":
-                                        first_key = _read_text(sc, source)
-                                        break
+                            if not inner.is_named:
+                                continue
+                            key, reason = _php_literal_key(inner, source)
+                            if reason is not None:
+                                _report_no_literal_key(
+                                    callee_name, reason, str_path,
+                                    node.start_point[0] + 1)
+                                no_literal_value = True
                                 break
-                        if first_key:
+                            if key is not None:
+                                first_key = key
+                                break
+                        if first_key or no_literal_value:
                             break
-                if first_key:
+                if first_key and not no_literal_value:
                     segment = first_key.split(".")[0]
                     tgt_nid = (label_to_nid.get(segment.lower())
                                or label_to_nid.get(f"{segment}.php".lower()))
