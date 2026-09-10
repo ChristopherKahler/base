@@ -61,6 +61,29 @@ fn hops_for(kind: &str) -> usize {
     if matches!(kind, "project" | "domain") { 2 } else { 1 }
 }
 
+/// Does this token look like a slug rather than an ordinary word?
+///
+/// A slug carries a separator: `-` or `_`, which is what `crud::slugify` emits, or a `.`
+/// sitting BETWEEN two alphanumerics, which is how a filename reads.
+///
+/// The dot has to be fenced that way. The word split in `candidates` keeps `.` inside a
+/// token, so a sentence-final `base.` arrives with its full stop attached; an unfenced
+/// test would call that slug-shaped and re-open the exact case the single-word rule
+/// exists to close.
+fn is_slug_shaped(s: &str) -> bool {
+    if s.contains('-') || s.contains('_') {
+        return true;
+    }
+    let c: Vec<char> = s.chars().collect();
+    c.iter().enumerate().any(|(i, ch)| {
+        *ch == '.'
+            && i > 0
+            && i + 1 < c.len()
+            && c[i - 1].is_alphanumeric()
+            && c[i + 1].is_alphanumeric()
+    })
+}
+
 /// Candidate spans from a prompt: longest match wins, per start position.
 ///
 /// `known` answers "is this a name the graph has?". Without it there is nothing
@@ -127,7 +150,23 @@ pub fn candidates(prompt: &str, known: &dyn Fn(&str) -> bool) -> Vec<String> {
             let span = words[i..i + n].join(" ");
             // The single-word rule. Quoted / backticked / path-shaped words were
             // already taken above and do not come through here.
-            if n == 1 && span.chars().next().is_some_and(char::is_lowercase) {
+            //
+            // A SLUG-SHAPED token is exempt from it. `renda-group` is not a word: it is
+            // what `base domain list` and `base project list` print, and it is what a
+            // user types back at us. The rule was written for `base` mid-sentence and
+            // caught the slug as collateral, so at 0.15.0 `Renda-Group` resolved and
+            // `renda-group` did not -- the only difference being the case of the first
+            // letter, which nothing documents and no user would guess.
+            //
+            // The exemption is still gated by `known()` immediately below, so a
+            // hyphenated English word the graph has never heard of stays a word. That
+            // gate is not decoration: without it every `well-known` and `state-of-the-art`
+            // in every prompt would buy a `resolve_strict` scan over the whole node map,
+            // on a path that runs on every prompt.
+            if n == 1
+                && span.chars().next().is_some_and(char::is_lowercase)
+                && !is_slug_shaped(&span)
+            {
                 continue;
             }
             if known(&span) {
@@ -673,5 +712,79 @@ mod tests {
     #[test]
     fn an_empty_walk_renders_nothing() {
         assert_eq!(render(&[], 1000).0, "");
+    }
+
+    // ─── Gap A: a slug is not a bare lowercase word ──────────────────────
+
+    /// The four acceptance rows, at the level the cut happens.
+    #[test]
+    fn a_lowercase_slug_survives_the_candidate_cut_when_the_graph_has_it() {
+        for spelling in ["renda-group", "renda_group"] {
+            let n = names(&format!("status of {spelling} today"), &[spelling]);
+            assert!(
+                n.contains(&spelling.to_string()),
+                "{spelling:?} was dropped by the single-word rule: {n:?}"
+            );
+        }
+    }
+
+    /// The gate that keeps the exemption honest. A hyphenated English word the graph
+    /// does not have must not become a candidate.
+    #[test]
+    fn a_slug_shaped_word_the_graph_lacks_is_not_a_name() {
+        assert!(names("a well-known issue arrived", &["renda-group"]).is_empty());
+    }
+
+    /// The rule the exemption must NOT weaken.
+    #[test]
+    fn a_bare_lowercase_word_is_still_not_a_name() {
+        assert!(!names("what did we decide about base", &["base"]).contains(&"base".to_string()));
+    }
+
+    /// `Renda-Group` already resolved at 0.15.0 and must keep resolving. This is the
+    /// blindness control: it passes before and after, so it discriminates nothing about
+    /// the fix and everything about a regression.
+    #[test]
+    fn an_uppercase_slug_still_resolves() {
+        assert!(names("Renda-Group today", &["Renda-Group"]).contains(&"Renda-Group".to_string()));
+    }
+
+    #[test]
+    fn is_slug_shaped_fences_the_dot_between_alphanumerics() {
+        assert!(is_slug_shaped("renda-group"));
+        assert!(is_slug_shaped("renda_group"));
+        assert!(is_slug_shaped("walk.rs"), "a filename is an explicit reference");
+        assert!(!is_slug_shaped("base"));
+        assert!(!is_slug_shaped("base."), "a sentence-final stop is not a separator");
+        assert!(!is_slug_shaped(".base"), "a leading dot is not a separator");
+        assert!(!is_slug_shaped(""));
+    }
+
+    /// End to end through `walk`, because the sentence-final case depends on the REAL
+    /// `known` closure: `index.contains(&slugify(span))` absorbs the trailing stop, and
+    /// `push` then trims it. The unit-test `idx` helper does not slugify, so this case
+    /// cannot be proved at `candidates` level without testing a different function.
+    #[test]
+    fn a_slug_at_the_end_of_a_sentence_resolves_through_the_real_index() {
+        let id = format!("<{}project/renda-group>", ns().uri);
+        let mut nodes: HashMap<String, Node> = HashMap::new();
+        put(&mut nodes, &id, "Renda Group");
+        put(&mut nodes, "<x/decision/d1>", "pick postgres");
+        let mut adj: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        adj.insert(id.clone(), vec![("<x/decision/d1>".into(), "belongsTo".into())]);
+        let maps = (nodes, adj);
+
+        for spelling in ["renda-group", "we shipped renda-group.", "status of renda-group today"] {
+            let out = walk(&maps, &ns(), spelling, &HashSet::new(), &no, &live);
+            assert_eq!(out.len(), 1, "{spelling:?} resolved to {} things", out.len());
+            assert_eq!(out[0].0.id, id, "{spelling:?}");
+        }
+
+        // And the control: a slug-shaped word with no record behind it resolves to
+        // nothing, so the exemption cannot fabricate a block.
+        assert!(
+            walk(&maps, &ns(), "a well-known issue", &HashSet::new(), &no, &live).is_empty(),
+            "a slug-shaped English word fabricated a resolution"
+        );
     }
 }
