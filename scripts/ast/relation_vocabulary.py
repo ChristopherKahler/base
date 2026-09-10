@@ -31,6 +31,23 @@ assumptions (law 31 — a guard is only proven against the codebase):
      this single site. Resolving it means reading the guard, so that widening
      `helper_fn_names` widens the vocabulary and fails this test until the
      table is updated, rather than silently dropping a new relation.
+  7. the SAME f-string, written INLINE in the slot rather than bound to a name
+     first. Shape 6 only ever looked for an `ast.Assign`, so an author who put
+     `"relation": f"uses_{callee_name}"` straight into a `raw_calls` dict — the
+     obvious spelling, and identical in meaning — landed in `unresolved`. The
+     reduction is the same closed-set walk; only where the JoinedStr sits
+     differs, so shapes 6 and 7 share one resolver.
+  8. a RELAY: a name bound to `<mapping>.get("relation", <const>)`, which hands
+     on a relation some OTHER site in this file already wrote. It resolves to
+     the default, and its non-default range needs no separate resolution
+     because shape 2 already visits every site in this file that writes a
+     `"relation"` key — a relay cannot introduce a relation no writer spelled,
+     and if a writer's own slot is unresolvable then THAT site fails the census.
+     The closure is only valid while every write goes through a dict literal, so
+     the resolver first proves there is no `<expr>["relation"] = ...` subscript
+     write anywhere in the file; one such write and the relay goes back to
+     `unresolved` rather than being trusted. That is what keeps this from being
+     a narrowing: the shape is falsifiable by a single line of new code.
 
 Anything the resolver cannot reduce to constants is returned in `unresolved`, and
 the caller is expected to FAIL on a non-empty list rather than report a smaller
@@ -357,6 +374,10 @@ def extractor_relations(source_path: Path | str) -> Vocabulary:
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in EDGE_FNS
     )
     counts["forwarders"] = len(forwarders)
+    # Shape 8's precondition, computed ONCE and reported so a reader can see it was
+    # checked rather than assumed. A non-empty list revokes every relay.
+    subscript_writes = _subscript_writes_key(tree, "relation")
+    counts["subscript_writes_relation_key"] = len(subscript_writes)
 
     def record(shape: str, node: ast.AST, slot: ast.AST | None) -> None:
         if inside_helper(getattr(node, "lineno", 0)):
@@ -378,6 +399,22 @@ def extractor_relations(source_path: Path | str) -> Vocabulary:
             if expanded:
                 vocab.relations.update(expanded)
                 counts["via_closed_set"] = counts.get("via_closed_set", 0) + 1
+                return
+        # shape 7: the same f-string written INLINE in the slot
+        if isinstance(slot, ast.JoinedStr) and scope is not None:
+            inline = _expand_joinedstr(slot, node, scope, closed_sets)
+            if inline:
+                vocab.relations.update(inline)
+                counts["via_inline_fstring"] = counts.get("via_inline_fstring", 0) + 1
+                return
+        # shape 8: a relay of a relation another site in this file wrote. Valid only
+        # while no subscript write can smuggle in a value no dict literal spells.
+        if (isinstance(slot, ast.Name) and scope is not None
+                and not subscript_writes):
+            relayed = _relay_bindings(scope, slot.id, "relation")
+            if relayed:
+                vocab.relations.update(relayed)
+                counts["via_relay"] = counts.get("via_relay", 0) + 1
                 return
         if isinstance(slot, ast.Attribute):
             per_class = _dataclass_field_constants(tree, slot.attr)
@@ -406,17 +443,56 @@ def extractor_relations(source_path: Path | str) -> Vocabulary:
     return vocab
 
 
+def _expand_joinedstr(
+    joined: ast.JoinedStr,
+    at: ast.AST,
+    scope: "_Scope",
+    closed_sets: dict[str, set[str]],
+) -> set[str]:
+    """The shared half of shapes 6 and 7: reduce ONE f-string to constants using the
+    guards that dominate the position `at`.
+
+    Split out of `_expand_fstring_binding` when shape 7 arrived. The reduction never
+    depended on the JoinedStr being the right-hand side of an assignment — only on
+    which guards enclose it — so a bound f-string and an inline one are the same
+    problem read at two different nodes.
+
+    Returns the full cross-product, or an EMPTY SET when any part of the chain is
+    open. An empty return means "unresolved", never "no relations".
+    """
+    pieces: list[set[str]] = []
+    for part in joined.values:
+        literal = _const_str(part)
+        if literal is not None:
+            pieces.append({literal})
+            continue
+        if not (isinstance(part, ast.FormattedValue)
+                and isinstance(part.value, ast.Name)):
+            return set()
+        guards = _dominating_guards(scope.node, at)
+        fields = guards.get(part.value.id) or set()
+        if len(fields) != 1:
+            # No dominating guard, or more than one — the name is not provably
+            # closed at this site, so the whole slot is unresolved rather than
+            # partially guessed.
+            return set()
+        members = closed_sets.get(next(iter(fields)))
+        if not members:
+            return set()
+        pieces.append(set(members))
+    combos = {""}
+    for piece in pieces:
+        combos = {prefix + suffix for prefix in combos for suffix in piece}
+    return combos
+
+
 def _expand_fstring_binding(
     name: str,
     scope: "_Scope",
     closed_sets: dict[str, set[str]],
 ) -> set[str]:
     """Shape 6: a name bound to an f-string over other names the same scope has
-    constrained to a closed frozenset.
-
-    Returns the full cross-product, or an empty set when any part of the chain
-    is open — an empty return means "unresolved", never "no relations".
-    """
+    constrained to a closed frozenset."""
     out: set[str] = set()
     for node in ast.walk(scope.node):
         if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
@@ -426,28 +502,60 @@ def _expand_fstring_binding(
             continue
         if not isinstance(node.value, ast.JoinedStr):
             continue
-        pieces: list[set[str]] = []
-        for part in node.value.values:
-            literal = _const_str(part)
-            if literal is not None:
-                pieces.append({literal})
-                continue
-            if not (isinstance(part, ast.FormattedValue)
-                    and isinstance(part.value, ast.Name)):
-                return set()
-            guards = _dominating_guards(scope.node, node)
-            fields = guards.get(part.value.id) or set()
-            if len(fields) != 1:
-                # No dominating guard, or more than one — the name is not
-                # provably closed at this site, so the whole binding is
-                # unresolved rather than partially guessed.
-                return set()
-            members = closed_sets.get(next(iter(fields)))
-            if not members:
-                return set()
-            pieces.append(set(members))
-        combos = {""}
-        for piece in pieces:
-            combos = {prefix + suffix for prefix in combos for suffix in piece}
+        combos = _expand_joinedstr(node.value, node, scope, closed_sets)
+        if not combos:
+            return set()
         out.update(combos)
+    return out
+
+
+def _subscript_writes_key(tree: ast.AST, key: str) -> list[int]:
+    """Every `<expr>["<key>"] = ...` assignment line in the file.
+
+    Shape 8's closure holds only while every write of a relation key goes through a
+    dict LITERAL, which shape 2 already visits. A subscript write is the one shape
+    that could smuggle in a relation no literal spells, so its presence must revoke
+    the relay rather than be assumed absent (law 48: absence needs a reader that can
+    see, and this one is the reader).
+    """
+    hits: list[int] = []
+    for node in ast.walk(tree):
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        for t in targets:
+            if isinstance(t, ast.Subscript) and _const_str(t.slice) == key:
+                hits.append(getattr(node, "lineno", 0))
+    return hits
+
+
+def _relay_default(node: ast.AST, key: str) -> str | None:
+    """Shape 8: `<mapping>.get("<key>", "<const>")` -> the constant default."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get" and len(node.args) == 2):
+        return None
+    if _const_str(node.args[0]) != key:
+        return None
+    return _const_str(node.args[1])
+
+
+def _relay_bindings(scope: "_Scope", name: str, key: str) -> set[str]:
+    """Every constant default a `.get("<key>", ...)` binding of `name` can yield.
+
+    An empty return means unresolved: either the name is not a relay here, or one of
+    its bindings is a relay whose default this reader cannot see.
+    """
+    out: set[str] = set()
+    for node in ast.walk(scope.node):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+            continue
+        target = node.targets[0]
+        if not (isinstance(target, ast.Name) and target.id == name):
+            continue
+        default = _relay_default(node.value, key)
+        if default is None:
+            return set()
+        out.add(default)
     return out
