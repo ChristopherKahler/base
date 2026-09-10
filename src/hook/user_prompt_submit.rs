@@ -303,47 +303,17 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // blocks served, and it cannot do that before they have run. Skipped in
     // lean mode with the neighbourhood, for the same reason.
     //
-    // `maps_from_store` and not `graph_query::load_graph`: the store is already
-    // parsed above, and load_graph would parse it a second time AND read the
-    // workspace graph only, so this layer would disagree with the domain layer
-    // beside it about what the graph contains.
-    //
-    // include_ast = false. The CLI passes true because `base graph neighbors`
-    // is expected to walk into call graphs; this walk resolves projects,
-    // decisions, people and documents, and parsing a 23.6 MB AST sidecar on
-    // every prompt to serve none of it is the kind of cost nobody sees.
+    // The maps, the closures and the reasons for both now live in
+    // `walk::walk_from_text`, which `base context` calls as well. One seam, so the
+    // command and the prompt path cannot answer differently about the same graph.
     let walked = match (&graph_store, lean_mode) {
-        (Some(store), false) => crate::graph_query::maps_from_store(store, cwd, &config.namespace, false)
-            .ok()
-            .map(|maps| {
-                crate::hook::walk::walk(
-                    &maps,
-                    &config.namespace,
-                    &prompt,
-                    &domain_served,
-                    // One list, every reader (ruling 4): the same seam the graph
-                    // commands, recall, the domain block and the dashboard consult.
-                    // A substring test stood here until PR #50 landed (kite F4).
-                    &|id: &str| crate::ontology::transient::is_transient_iri(&config.namespace, id),
-                    // The drift fork's fill. `None` means the record still stands;
-                    // `Some(head)` is the record that replaced it, so the walk
-                    // re-anchors rather than dropping the edge that reached it.
-                    //
-                    // `store` is the one `load_merged` already parsed above — the
-                    // whole reason this closure takes it rather than calling
-                    // `load_graph`. A load here would be a second full parse on
-                    // every prompt, and `store::GRAPH_LOADS` would catch it as a
-                    // red test rather than as a session that got quietly slower.
-                    //
-                    // `graph_query` ids carry angle brackets and `resolve_head`
-                    // walks bare IRIs, so the brackets come off and go back on.
-                    &|id: &str| {
-                        let bare = id.trim_start_matches('<').trim_end_matches('>');
-                        let head = crate::supersede::resolve_head(store, &config.namespace, bare);
-                        (head != bare).then(|| format!("<{head}>"))
-                    },
-                )
-            }),
+        (Some(store), false) => Some(crate::hook::walk::walk_from_text(
+            store,
+            cwd,
+            config,
+            &prompt,
+            &domain_served,
+        )),
         _ => None,
     };
 

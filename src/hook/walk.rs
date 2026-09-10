@@ -15,8 +15,9 @@
 //! prompt, so it is hash lookups over maps the hook already built.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
-use crate::config::NamespaceConfig;
+use crate::config::{BaseConfig, NamespaceConfig};
 use crate::graph_query::{iri_kind, GraphMaps, Node};
 
 /// A name the prompt used, and what it resolved to.
@@ -313,6 +314,52 @@ pub fn walk(
         ));
     }
     out
+}
+
+/// Build the maps and the two seam closures, then walk. The one place either caller
+/// does this, so the prompt hook and `base context` cannot drift apart -- and drift in
+/// exactly this seam is what produced `N-WALK-DEAD-WITHOUT-A-MATCHED-DOMAIN`.
+///
+/// `maps_from_store` and not `graph_query::load_graph`: the caller has already parsed a
+/// store, and `load_graph` would parse it a SECOND time AND read the workspace graph
+/// only, so this layer would disagree with the domain layer beside it about what the
+/// graph contains.
+///
+/// `include_ast = false`. The CLI passes true because `base graph neighbors` is expected
+/// to walk into call graphs; this walk resolves projects, decisions, people and
+/// documents, and parsing a 23.6 MB AST sidecar to serve none of it is the kind of cost
+/// nobody sees.
+///
+/// A store that will not project returns NO names rather than an error: this is an
+/// injection layer, and a prompt that fails to gain context must still be a prompt.
+pub fn walk_from_text(
+    store: &oxigraph::store::Store,
+    cwd: &Path,
+    config: &BaseConfig,
+    text: &str,
+    already_served: &HashSet<String>,
+) -> Vec<(Resolved, Vec<Record>)> {
+    let Ok(maps) = crate::graph_query::maps_from_store(store, cwd, &config.namespace, false) else {
+        return Vec::new();
+    };
+    walk(
+        &maps,
+        &config.namespace,
+        text,
+        already_served,
+        // One list, every reader (ruling 4): the same seam the graph commands, recall,
+        // the domain block and the dashboard consult.
+        &|id: &str| crate::ontology::transient::is_transient_iri(&config.namespace, id),
+        // `None` means the record still stands; `Some(head)` is what replaced it, so the
+        // walk re-anchors rather than dropping the edge that reached it. `graph_query`
+        // ids carry angle brackets and `resolve_head` walks bare IRIs, so the brackets
+        // come off and go back on.
+        &|id: &str| {
+            let bare = id.trim_start_matches('<').trim_end_matches('>');
+            let head = crate::supersede::resolve_head(store, &config.namespace, bare);
+            (head != bare).then(|| format!("<{head}>"))
+        },
+    )
 }
 
 fn label_of(nodes: &HashMap<String, Node>, id: &str) -> String {
