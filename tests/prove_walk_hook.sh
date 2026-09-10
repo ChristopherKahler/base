@@ -67,6 +67,12 @@ seed_home() {
 <http://ops-sys.local/ontology#decision/pick-postgres> <http://ops-sys.local/ontology#name> "pick postgres over mysql" <http://ops-sys.local/ontology#graph/global> .
 <http://ops-sys.local/ontology#decision/pick-postgres> <http://ops-sys.local/ontology#belongsTo> <http://ops-sys.local/ontology#project/aurora> <http://ops-sys.local/ontology#graph/global> .
 <http://ops-sys.local/ontology#decision/pick-postgres> <http://ops-sys.local/ontology#updatedAt> "2026-09-01T00:00:00Z" <http://ops-sys.local/ontology#graph/global> .
+<http://ops-sys.local/ontology#project/aurora-borealis> <http://ops-sys.local/ontology#name> "Aurora Borealis" <http://ops-sys.local/ontology#graph/global> .
+<http://ops-sys.local/ontology#decision/ship-friday> <http://ops-sys.local/ontology#name> "ship on friday" <http://ops-sys.local/ontology#graph/global> .
+<http://ops-sys.local/ontology#decision/ship-friday> <http://ops-sys.local/ontology#belongsTo> <http://ops-sys.local/ontology#project/aurora-borealis> <http://ops-sys.local/ontology#graph/global> .
+<http://ops-sys.local/ontology#project/base> <http://ops-sys.local/ontology#name> "base" <http://ops-sys.local/ontology#graph/global> .
+<http://ops-sys.local/ontology#decision/keep-it-small> <http://ops-sys.local/ontology#name> "keep it small" <http://ops-sys.local/ontology#graph/global> .
+<http://ops-sys.local/ontology#decision/keep-it-small> <http://ops-sys.local/ontology#belongsTo> <http://ops-sys.local/ontology#project/base> <http://ops-sys.local/ontology#graph/global> .
 NQ
   printf '[[domain]]\nname = "GLOBAL"\nmode = "always"\nprompt_keywords = []\n' > "$h/.base-gbl/domains.toml"
 }
@@ -140,5 +146,37 @@ grep -q "pick postgres over mysql" <<<"$roomy" \
   || bad "the budget permanently suppressed a name that was never served"
 echo
 
-[ "$fail" -eq 0 ] && { echo "PASS — the three hook rows plus the budget-suppression leg."; exit 0; }
+echo "── a bare lowercase SLUG resolves; a bare lowercase WORD still does not ──"
+# `aurora-borealis` is what `base domain list` and `base project list` print and what a
+# user types back. Before this row existed the single-word rule dropped it before known()
+# was consulted, so it never resolved -- while `Aurora-Borealis` did, on nothing but the
+# case of the first letter.
+H5="$OUT/slug"; seed_home "$H5"
+_=$(fire "$H5" 'aurora-borealis' s-slug)
+_=$(fire "$H5" 'aurora-borealis' s-slug)
+slug=$(fire "$H5" 'aurora-borealis' s-slug)   # prompt 3: the first non-lean one
+grep -q "ship on friday" <<<"$slug" \
+  && ok "a bare lowercase slug resolved" \
+  || { bad "a bare lowercase slug did not resolve"; sed -n '1,12p' <<<"$slug"; }
+
+# The control that keeps the exemption honest, and it needs a node named `base` in the
+# graph or it reads 0 for the WRONG REASON: known() would miss, the single-word rule would
+# never be the thing under test, and no regression of that rule could redden this row.
+_=$(fire "$H5" 'base mid-sentence here' s-word)
+_=$(fire "$H5" 'base mid-sentence here' s-word)
+word=$(fire "$H5" 'base mid-sentence here' s-word)
+grep -q "keep it small" <<<"$word" \
+  && bad "a bare lowercase WORD resolved; the single-word rule is gone" \
+  || ok "a bare lowercase word is still a word"
+
+# And no fabrication: a slug-shaped English word the graph does not have stays a word.
+_=$(fire "$H5" 'a well-known thing entirely' s-fab)
+_=$(fire "$H5" 'a well-known thing entirely' s-fab)
+fab=$(fire "$H5" 'a well-known thing entirely' s-fab)
+grep -q "<base-context" <<<"$fab" \
+  && bad "a slug-shaped word with no record behind it fabricated a block" \
+  || ok "no fabrication from a slug-shaped English word"
+echo
+
+[ "$fail" -eq 0 ] && { echo "PASS — the hook rows, the budget-suppression leg and the slug rows."; exit 0; }
 echo "FAIL — $fail problem(s)."; exit 1
