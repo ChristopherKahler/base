@@ -7,6 +7,12 @@ fails when the version in `Cargo.toml` has no entry here.
 
 Releases before 0.13.3 are tagged in the repository but are not written up.
 
+## 0.15.1 (2026-09-10)
+
+### Fixed
+
+- **ast**: a PHP config key resolves to its config file in another file
+
 ## 0.15.0 (2026-09-09)
 
 ### Fixed

@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-0B63D6?style=flat-square" alt="License: Functional Source License 1.1, Apache 2.0 future license"></a>
-  <img src="https://img.shields.io/badge/version-0.15.0-12263A?style=flat-square" alt="Version 0.15.0">
+  <img src="https://img.shields.io/badge/version-0.15.1-12263A?style=flat-square" alt="Version 0.15.1">
   <img src="https://img.shields.io/badge/rust-single_binary-2F4A63?style=flat-square&logo=rust&logoColor=white" alt="Rust, single binary">
   <img src="https://img.shields.io/badge/built_for-Claude_Code-C2551F?style=flat-square" alt="Built for Claude Code">
 </p>
