@@ -340,9 +340,12 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
     let graph_store = crate::store::load_merged(cwd);
 
     let matched = domain::matcher::match_domains(text, &domains, &[], &domain::matcher::TriggerContext::default());
-    if matched.is_empty() {
-        return;
-    }
+    // NO EARLY RETURN on an empty match. The walk below resolves what the TEXT names,
+    // which has nothing to do with whether a domain trigger fired, and returning here
+    // made `base context` dead on any machine without an always-on domain -- the same
+    // shape as `N-WALK-DEAD-WITHOUT-A-MATCHED-DOMAIN` in the prompt hook. The loop over
+    // `matched` below is simply a no-op when it is empty, and the store was already
+    // parsed above, so nothing extra is paid to reach here.
 
     let base_dir = crate::config::find_workspace_base(cwd);
     let mut session = base_dir
@@ -350,13 +353,22 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
         .map(SessionState::load)
         .unwrap_or_default();
     let mut session_dirty = false;
+    // Every record IRI the domain blocks serve on this call. The walk dedups against it.
+    let mut domain_served: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for dm in &matched {
         let domain_def = dm.domain;
 
         let (rules_text, neighborhood_text) = match &graph_store {
             Some(store) => {
-                let (r, n, _served) = query_domain_from_graph(store, config, domain_def);
+                // The served list is COLLECTED, not discarded. Without it the walk below
+                // reprints, four lines later and under a `<base-context>` heading, a
+                // record the domain block just printed -- which the prompt hook
+                // deliberately does not do, and this command claims to be the same
+                // engine. Records dedup; a served ROOT still walks and is never listed as
+                // its own record (the binding 0.14.2 ruling).
+                let (r, n, served) = query_domain_from_graph(store, config, domain_def);
+                domain_served.extend(served);
                 (r, n)
             }
             None => (format_toml_rules(domain_def), String::new()),
@@ -398,6 +410,22 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
             };
             session.mark_injected(&domain_def.name, combined_hash);
             session_dirty = true;
+        }
+    }
+
+    // ─── The walk, after the domain blocks, exactly as the hook orders them ───
+    //
+    // NO session dedup, in either direction. This is a preview, not a session: a
+    // `walk:<id>` key marked here would silently suppress the hook's block on the
+    // operator's NEXT REAL PROMPT, which is the failure the hook's own comment about the
+    // byte budget was written to avoid. Repeated calls therefore give the same answer.
+    //
+    // Lean mode does not apply -- there is no prompt count on this path.
+    if let Some(store) = &graph_store {
+        let walked = crate::hook::walk::walk_from_text(store, cwd, config, text, &domain_served);
+        let (block, _dropped) = crate::hook::walk::render(&walked, config.injection.walk_budget);
+        if !block.is_empty() {
+            print!("{block}");
         }
     }
 
