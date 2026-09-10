@@ -2512,12 +2512,16 @@ pub fn run() {
                                 .unwrap_or_else(|| " (no session binding — hook delivery needs CLAUDE_CODE_SESSION_ID)".into())
                         ),
                     }
+                    // #132: identity siblings from sessions that are long
+                    // gone. Human-invoked here and never on a timer; the
+                    // four required conditions are on the function.
+                    let _ = base::relay::wake::prune_watch_siblings(&title);
                     // Wake contract, in-band: registration is often a boot
                     // sequence's last tool call, so the arming block must ride
                     // the register output itself — a hook nudge on the NEXT
                     // tool call never fires if the session goes idle here.
                     if !base::relay::wake::is_watching(&title)
-                        && let Some(block) = base::relay::wake::arm_block(&title)
+                        && let Some(block) = base::relay::wake::arm_block(&title, sid.as_deref())
                     {
                         println!("\n{block}");
                     }

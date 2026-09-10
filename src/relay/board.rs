@@ -68,6 +68,28 @@ fn print_store_board(store: &RelayStore) {
                 store.pending_for(&entry.title).len(),
             );
         }
+
+        // Who is touching each sentinel (#132). The Watching cell says WHICH
+        // STATE a title is in; this says WHICH SESSION, with the id in full —
+        // a partial id would invite completing it into the wrong one, and a
+        // full id in every table row wrecks a board the operator scans
+        // constantly. Bounded by the number of loops actually running: a title
+        // that nothing is touching has no line here, because its cell already
+        // says everything there is to say.
+        let watchers: Vec<(String, String)> = reg
+            .sessions
+            .values()
+            .filter_map(|e| super::wake::watch_detail(&e.title).map(|d| (e.title.clone(), d)))
+            .collect();
+        if !watchers.is_empty() {
+            println!(
+                "\nWATCHERS ({} — who last touched each title's sentinel):",
+                watchers.len()
+            );
+            for (title, detail) in &watchers {
+                println!("  {title} {detail}");
+            }
+        }
     }
 
     if !claims.claims.is_empty() {
