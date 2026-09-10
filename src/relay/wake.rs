@@ -116,6 +116,15 @@ pub enum WatchState {
     /// Deliberately not called "retired" — three different situations produce
     /// it and the id is reported rather than the cause guessed.
     Foreign { session: String, age: u64 },
+    /// A named session is touching, but no session is registered as holding
+    /// this title, so there is nothing to compare it against.
+    ///
+    /// This exists because there are TWO registries. The board iterates the
+    /// per-project store; [`watch_state`] resolves the global one. Measured
+    /// 2026-09-10: 27 global titles against 118 rows in one project store, with
+    /// only 9 present in both. Falling through to `Foreign` would accuse 109
+    /// sessions of being foreign to a title that has no holder to be foreign to.
+    UnknownHolder { session: String, age: u64 },
     /// The sentinel is fresh but nothing claims it: a monitor armed before
     /// identity existed, or a toucher that is not a relay session at all.
     Unidentified { age: u64 },
@@ -125,12 +134,29 @@ pub enum WatchState {
     Never,
 }
 
-/// Read the sentinel and its identity siblings, and say who is watching.
+/// Read the sentinel and its identity siblings, resolving the holder from the
+/// GLOBAL session registry.
+///
+/// Correct for the re-arm nudge and the ping warning, which both mean the global
+/// binding. The board must NOT use this: it iterates a per-project store whose
+/// titles largely do not appear in the global registry, and it knows its own
+/// binding — so it calls [`watch_state_for`] with it.
 pub fn watch_state(title: &str) -> WatchState {
+    let holder = super::session_registry::resolve(title).map(|e| e.session_id);
+    watch_state_for(title, holder.as_deref())
+}
+
+/// [`watch_state`] with the holder supplied by the caller.
+///
+/// The caller says who holds the title, because the caller is the one iterating
+/// a registry and this crate has two of them. `None` means "no holder is
+/// registered" and produces [`WatchState::UnknownHolder`] rather than an
+/// accusation of foreignness.
+pub fn watch_state_for(title: &str, holder: Option<&str>) -> WatchState {
     let Some(dir) = title_dir(title) else {
         return WatchState::Never;
     };
-    let holder = super::session_registry::resolve(title).map(|e| sanitize_id(&e.session_id));
+    let holder = holder.map(sanitize_id);
 
     let mut siblings: Vec<(String, u64)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -163,7 +189,12 @@ pub fn watch_state(title: &str) -> WatchState {
         siblings.iter().filter(|(_, a)| fresh_age(*a)).collect();
     fresh_ids.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
     if let Some((id, age)) = fresh_ids.first() {
-        return WatchState::Foreign { session: id.clone(), age: *age };
+        // With no registered holder there is nothing to be foreign TO, so the
+        // toucher is named and the absence of a holder is stated (#132 C9).
+        return match holder {
+            Some(_) => WatchState::Foreign { session: id.clone(), age: *age },
+            None => WatchState::UnknownHolder { session: id.clone(), age: *age },
+        };
     }
 
     // No fresh identity anywhere. The bare sentinel still separates "a loop is
@@ -178,11 +209,39 @@ pub fn watch_state(title: &str) -> WatchState {
     }
 }
 
-/// Is a wake monitor for this title provably alive right now?
+/// Is SOME loop touching this title's sentinel right now?
 ///
-/// True only for [`WatchState::Watching`] — a fresh sentinel touched by a loop
-/// belonging to some OTHER session proves nothing about this titleholder.
+/// **This keeps the meaning it had in 0.15.0 and must not be narrowed.** Its
+/// caller that matters is `session_registry::pick_name`, which asks a different
+/// question from the board: not "can this titleholder be woken" but "is it safe
+/// to hand this codename to somebody else". A live session whose heartbeat only
+/// refreshes at boundary hooks looks dead for minutes at a time while its
+/// monitor loops, and this is the signal that stops its name being taken — a
+/// spawned tab stole "heron" from a mid-build session exactly that way on
+/// 2026-08-17.
+///
+/// Narrowing this to holder identity re-opened that hole. Measured on this
+/// machine 2026-09-10, before the split: 7 registered titles had a dead-looking
+/// heartbeat, a sentinel touched within 5 seconds by a loop still running, and
+/// no identity file — with 8 more one idle interval away, the orchestrator, the
+/// reviewer and the author of this change among them. Use
+/// [`watching_by_holder`] for the narrow question.
 pub fn is_watching(title: &str) -> bool {
+    matches!(
+        watch_state(title),
+        WatchState::Watching { .. }
+            | WatchState::Foreign { .. }
+            | WatchState::UnknownHolder { .. }
+            | WatchState::Unidentified { .. }
+    )
+}
+
+/// Is the title's OWN registered holder touching its sentinel right now?
+///
+/// The narrow question: only this answers "a ping will wake this session while
+/// it sits idle". A loop belonging to some other session proves nothing about
+/// the titleholder. Used by the board, the ping warning and the re-arm nudge.
+pub fn watching_by_holder(title: &str) -> bool {
     matches!(watch_state(title), WatchState::Watching { .. })
 }
 
@@ -192,9 +251,20 @@ pub fn is_watching(title: &str) -> bool {
 /// and a 36-character id in every row wrecks a board the operator scans
 /// constantly — so the id goes in [`watch_detail`]'s footer line, in full.
 pub fn watch_cell(title: &str) -> String {
-    match watch_state(title) {
+    cell_of(watch_state(title))
+}
+
+/// [`watch_cell`] with the holder supplied by the caller — the board's entry
+/// point, since the board knows its own store's binding (#132 C9).
+pub fn watch_cell_for(title: &str, holder: Option<&str>) -> String {
+    cell_of(watch_state_for(title, holder))
+}
+
+fn cell_of(state: WatchState) -> String {
+    match state {
         WatchState::Watching { .. } => "✓".into(),
         WatchState::Foreign { .. } => "✗ foreign".into(),
+        WatchState::UnknownHolder { .. } => "✗ unverified".into(),
         WatchState::Unidentified { .. } => "✗ unidentified".into(),
         WatchState::Stale { age } => format!("✗ stale {}", human(age)),
         WatchState::Never => "✗ never".into(),
@@ -208,12 +278,24 @@ pub fn watch_cell(title: &str) -> String {
 /// footer bounded by the number of loops actually running rather than by the
 /// size of the registry — two lines under a 118-row board, measured.
 pub fn watch_detail(title: &str) -> Option<String> {
-    match watch_state(title) {
+    detail_of(watch_state(title))
+}
+
+/// [`watch_detail`] with the holder supplied by the caller (#132 C9).
+pub fn watch_detail_for(title: &str, holder: Option<&str>) -> Option<String> {
+    detail_of(watch_state_for(title, holder))
+}
+
+fn detail_of(state: WatchState) -> Option<String> {
+    match state {
         WatchState::Watching { session, .. } => {
             Some(format!("✓ session {session} — the registered holder"))
         }
         WatchState::Foreign { session, .. } => Some(format!(
             "✗ foreign — session {session} is touching this sentinel and does not hold the title"
+        )),
+        WatchState::UnknownHolder { session, .. } => Some(format!(
+            "✗ unverified — session {session} is touching, but no session is registered as holding this title"
         )),
         WatchState::Unidentified { .. } => {
             Some("✗ unidentified — a loop is touching, no session id on disk".into())
@@ -354,6 +436,15 @@ fn arm_block_for(title: &str, operator: &str, session_id: Option<&str>) -> Optio
     let inbox_disp = title_dir(title)?.to_string_lossy().replace('\\', "/");
     let script = watch_script(title, session_id)?;
     let indented: String = script.lines().map(|l| format!("    {l}\n")).collect();
+    // #132 C7: the skip condition must be an IDENTITY, not a behaviour. Keying it
+    // on "your loop touches .watching" told every monitor armed before this
+    // change to skip — they all touch it — so they never re-armed, never wrote an
+    // identity, and drew the stale-sentinel nudge every 3 minutes forever. Naming
+    // the exact file a session can look for makes the check decidable.
+    let skip_marker = match session_id {
+        Some(s) if !s.trim().is_empty() => sibling_name(s),
+        _ => ".watching".to_string(),
+    };
     Some(format!(
         "=== RELAY WAKE CONTRACT ({title}) ===\n\
          This session holds the relay title \"{title}\" and has no live wake monitor (sentinel \
@@ -366,9 +457,10 @@ fn arm_block_for(title: &str, operator: &str, session_id: Option<&str>) -> Optio
          If Monitor is a deferred tool in your harness, load it first (ToolSearch \
          \"select:Monitor\") — a direct call fails with InputValidationError until the schema \
          is loaded. No test ping is needed. If THIS session already runs a monitor for \
-         \"{title}\" armed with THIS script (its loop touches .watching), skip — never arm a \
-         duplicate. If your running monitor is an older script that does not touch the \
-         sentinel, TaskStop it first, then arm this one.\n\n\
+         \"{title}\" that writes {skip_marker}, skip — never arm a duplicate. \
+         Otherwise TaskStop whatever monitor you are running and arm this one, INCLUDING a \
+         monitor that touches .watching but writes no such file: that is the older script, and \
+         until it is replaced the board cannot tell your loop from a retired session's.\n\n\
          \x20 description: relay wake: {title}\n\
          \x20 persistent: true\n\
          \x20 command:\n{indented}\n\
@@ -426,9 +518,10 @@ pub fn arm_blocks_for(session_id: &str, force: bool) -> Option<String> {
     }
     let mut out = String::new();
     for title in super::session_registry::titles_for(session_id) {
-        // `is_watching` is now holder-aware, so a retired predecessor still
-        // touching this path no longer silences the successor's nudge (#132).
-        if is_watching(&title) {
+        // The NARROW predicate: a retired predecessor still touching this path
+        // must not silence the successor's nudge (#132). Using the wide
+        // `is_watching` here is the bug this lane exists to fix.
+        if watching_by_holder(&title) {
             continue;
         }
         let due = force

@@ -64,7 +64,11 @@ fn print_store_board(store: &RelayStore) {
                 entry.worktree,
                 if entry.session_id.is_some() { "✓" } else { "-" },
                 liveness,
-                super::wake::watch_cell(&entry.title),
+                // The holder comes from THIS store's own binding, not the global
+                // registry (#132 C9): measured 2026-09-10, 118 rows here against
+                // 27 global titles with only 9 in both, so resolving globally
+                // would leave 109 rows unable to name a holder at all.
+                super::wake::watch_cell_for(&entry.title, entry.session_id.as_deref()),
                 store.pending_for(&entry.title).len(),
             );
         }
@@ -79,7 +83,10 @@ fn print_store_board(store: &RelayStore) {
         let watchers: Vec<(String, String)> = reg
             .sessions
             .values()
-            .filter_map(|e| super::wake::watch_detail(&e.title).map(|d| (e.title.clone(), d)))
+            .filter_map(|e| {
+                super::wake::watch_detail_for(&e.title, e.session_id.as_deref())
+                    .map(|d| (e.title.clone(), d))
+            })
             .collect();
         if !watchers.is_empty() {
             println!(

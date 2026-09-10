@@ -2520,7 +2520,7 @@ pub fn run() {
                     // sequence's last tool call, so the arming block must ride
                     // the register output itself — a hook nudge on the NEXT
                     // tool call never fires if the session goes idle here.
-                    if !base::relay::wake::is_watching(&title)
+                    if !base::relay::wake::watching_by_holder(&title)
                         && let Some(block) = base::relay::wake::arm_block(&title, sid.as_deref())
                     {
                         println!("\n{block}");
@@ -2731,7 +2731,7 @@ pub fn run() {
                             "Warning: session '{to}' last seen {} ago — it may be dead. Pinging anyway.",
                             base::relay::age_str(&entry.last_heartbeat)
                         );
-                    } else if !base::relay::wake::is_watching(&to) {
+                    } else if !base::relay::wake::watching_by_holder(&to) {
                         eprintln!(
                             "Note: '{to}' has no live wake monitor ({}) — if idle it will NOT wake; \
                              the ping lands on its next tool call or prompt.",

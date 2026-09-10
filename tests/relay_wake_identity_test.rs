@@ -83,14 +83,27 @@ fn a_bare_sentinel_naming_nobody_does_not_read_as_watching() {
         bare_touch(&inbox(root, "t132bare").join(".watching"));
 
         let cell = wake::watch_cell("t132bare");
+        // NARROW: this is the assertion this test was written for. It originally
+        // named `is_watching`; that predicate had to keep its wide 0.15.0 meaning
+        // (see the C8 assertion below), so the narrow question moved to its own
+        // function. The claim is unchanged and still fails on the pre-fix tree.
         assert!(
-            !wake::is_watching("t132bare"),
+            !wake::watching_by_holder("t132bare"),
             "a bare touch identifies no session, so it must not read as the \
              titleholder's own monitor; cell was {cell:?}"
         );
         assert!(
             cell.contains("unidentified"),
             "the state must be named rather than silently downgraded; cell was {cell:?}"
+        );
+        // WIDE, and this half is #132's C8: `is_watching` is what
+        // `session_registry::pick_name` consults before handing a codename to
+        // someone else. A loop IS running here, so it must stay true — narrowing
+        // it frees the titles of live sessions whose heartbeat merely looks
+        // stale. Measured on this machine 2026-09-10: 7 such titles at once.
+        assert!(
+            wake::is_watching("t132bare"),
+            "a loop is touching this sentinel, so the title must NOT be reusable"
         );
     });
 }
@@ -134,9 +147,16 @@ fn control_an_untouched_sentinel_reads_never_and_nudges() {
         session_registry::register("t132never", holder, root, Some("base")).unwrap();
         std::fs::create_dir_all(inbox(root, "t132never")).unwrap();
 
-        assert!(!wake::is_watching("t132never"));
+        assert!(!wake::watching_by_holder("t132never"));
         assert_eq!(wake::watch_cell("t132never"), "✗ never");
         assert!(wake::arm_blocks_for(holder, true).is_some());
+        // The WIDE predicate must be false too when nothing is touching at all.
+        // Without this the C8 assertions elsewhere would pass on a predicate that
+        // simply always returned true, which protects titles by being useless.
+        assert!(
+            !wake::is_watching("t132never"),
+            "no loop is running, so this title IS free for reuse"
+        );
     });
 }
 
@@ -158,8 +178,12 @@ fn only_a_foreign_loop_touching_reads_as_a_named_foreign_watcher() {
         bare_touch(&dir.join(format!(".watching-by-{retired}")));
 
         assert!(
-            !wake::is_watching("t132foreign"),
+            !wake::watching_by_holder("t132foreign"),
             "a loop belonging to another session proves nothing about this holder"
+        );
+        assert!(
+            wake::is_watching("t132foreign"),
+            "but a loop IS running, so the title must not become reusable (C8)"
         );
         assert_eq!(wake::watch_cell("t132foreign"), "✗ foreign");
         let detail = wake::watch_detail("t132foreign").expect("a foreign watcher gets a footer line");
@@ -211,6 +235,94 @@ fn the_holders_own_loop_wins_while_a_predecessor_is_also_touching() {
             wake::arm_blocks_for(holder, true).is_none(),
             "a session whose own monitor is live must not be told to arm again"
         );
+    });
+}
+
+/// C7 — the emitted skip condition must be an IDENTITY, not a behaviour.
+///
+/// Keying it on "your loop touches .watching" told every monitor armed before
+/// this change to skip, because they all touch it. They would then never
+/// re-arm, never write an identity, and draw the nudge every three minutes for
+/// as long as they ran. The block must name the exact file instead.
+#[test]
+fn c7_the_skip_condition_names_the_identity_file_not_the_touch() {
+    let sid = "77777777-c7c7-4bbb-8ccc-777777777777";
+    let Some(block) = wake::arm_block("t132c7", Some(sid)) else {
+        return;
+    };
+    assert!(
+        block.contains(&format!("that writes .watching-by-{sid}, skip")),
+        "the skip condition must name the identity file this session writes"
+    );
+    assert!(
+        !block.contains("(its loop touches .watching), skip"),
+        "the behaviour-keyed skip is what trapped every already-armed monitor"
+    );
+    assert!(
+        block.contains("touches .watching but writes no such file"),
+        "and it must tell an old-shape monitor, in those terms, to replace itself"
+    );
+}
+
+/// C9 — with no registered holder there is nothing to be foreign TO.
+///
+/// The board iterates a per-project store; `watch_state` resolves the global
+/// registry. Measured 2026-09-10: 118 rows in one store against 27 global
+/// titles, only 9 in both. Calling the other 109 "foreign" would be an
+/// accusation the data cannot support.
+#[test]
+fn c9_no_registered_holder_is_unverified_never_foreign() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    with_thread_home(root, || {
+        let toucher = "99999999-c9c9-4bbb-8ccc-999999999999";
+        // Deliberately NOT registered: this is the 109-row case.
+        let dir = inbox(root, "t132c9");
+        bare_touch(&dir.join(".watching"));
+        bare_touch(&dir.join(format!(".watching-by-{toucher}")));
+
+        let st = wake::watch_state_for("t132c9", None);
+        assert!(
+            matches!(st, wake::WatchState::UnknownHolder { .. }),
+            "with no holder the state is unverified, not foreign; got {st:?}"
+        );
+        assert_eq!(wake::watch_cell_for("t132c9", None), "✗ unverified");
+        let d = wake::watch_detail_for("t132c9", None).expect("it still gets a footer line");
+        assert!(d.contains(toucher), "and it still names the toucher in full: {d:?}");
+
+        // CONTROL: hand the SAME directory a holder that is not the toucher and
+        // it must read foreign. Without this, "unverified" could be what this
+        // code says about everything, and the test would prove nothing.
+        let other = "aaaaaaaa-c9c9-4bbb-8ccc-aaaaaaaaaaaa";
+        assert_eq!(wake::watch_cell_for("t132c9", Some(other)), "✗ foreign");
+        // And with the toucher AS the holder it must read watching.
+        assert_eq!(wake::watch_cell_for("t132c9", Some(toucher)), "✓");
+    });
+}
+
+/// C8's population, as a test rather than a paragraph: a live session whose
+/// heartbeat looks dead and whose monitor is old-shape must keep its title.
+#[test]
+fn c8_a_live_old_shape_session_does_not_lose_its_title() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    with_thread_home(root, || {
+        let holder = "bbbbbbbb-c8c8-4bbb-8ccc-bbbbbbbbbbbb";
+        session_registry::register("t132c8", holder, root, Some("base")).unwrap();
+        // Its monitor is looping. It writes no sibling, because on 2026-09-10
+        // there were 151 bare sentinels on this machine and zero siblings.
+        bare_touch(&inbox(root, "t132c8").join(".watching"));
+
+        assert!(
+            wake::is_watching("t132c8"),
+            "pick_name consults this before reusing a codename; a running loop \
+             must keep the title held even when the heartbeat looks stale"
+        );
+        assert!(
+            !wake::watching_by_holder("t132c8"),
+            "and the board must still report honestly that nobody is identified"
+        );
+        assert_eq!(wake::watch_cell("t132c8"), "✗ unidentified");
     });
 }
 
@@ -384,7 +496,11 @@ fn canary_a_sentinel_past_the_threshold_reads_stale() {
         bare_touch(&p);
         age(&p, wake::WATCH_STALE_SECS + 45);
 
-        assert!(!wake::is_watching("t132stale"));
+        assert!(!wake::watching_by_holder("t132stale"));
+        assert!(
+            !wake::is_watching("t132stale"),
+            "past the threshold nothing is running, so the title is free"
+        );
         let cell = wake::watch_cell("t132stale");
         assert!(cell.starts_with("✗ stale"), "cell was {cell:?}");
     });
