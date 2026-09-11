@@ -35,6 +35,11 @@ isolation-guard = []
 [dev-dependencies]
 base = { path = ".", features = ["isolation-guard"] }
 tempfile = "3"
+# `tests/update_release_request_test.rs` inspects the `ureq::Request` the updater
+# builds, so it has to be able to name that type. An integration test links
+# `base` as an external crate and does not inherit its dependencies.
+# Same crate and version the binary already links; nothing new enters the tree.
+ureq = { version = "2", features = ["json"] }
 # The dashboard's node/edge handlers are part of the read surface ruling 4
 # governs, so `tests/transient_kinds_test.rs` drives them directly. Same crate
 # and version the binary already links; nothing new enters the tree.
