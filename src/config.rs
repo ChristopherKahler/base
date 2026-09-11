@@ -768,27 +768,36 @@ pub enum ConfigFault {
     HomeUnresolvable,
 }
 
+impl ConfigFault {
+    /// What went wrong, WITHOUT the consequence clause.
+    ///
+    /// [`Display`] appends "base is running on DEFAULT settings, not yours",
+    /// which is exactly right where a fault makes `BaseConfig` fall back to its
+    /// defaults -- and wrong anywhere else. `scaffold`'s registry read hits the
+    /// same file for a different reason and owes the operator a different
+    /// consequence, so it borrows the cause and states its own. (#158 leg C)
+    pub fn cause(&self) -> String {
+        match self {
+            Self::Unreadable { path, err } => format!("cannot read {} ({err})", path.display()),
+            Self::Unparseable { path, err } => format!("cannot parse {} ({err})", path.display()),
+            Self::Mismatched { paths, err } => {
+                let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                format!("{} is valid TOML but not valid settings ({err})", names.join(" + "))
+            }
+            Self::HomeUnresolvable => {
+                "cannot determine a home directory, so no base.toml could be read".to_string()
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for ConfigFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Every arm ends with the consequence, because a path and a parse error
         // alone do not tell the operator the thing that actually matters: the
         // settings they chose are NOT the settings base is running on.
         const TAIL: &str = "base is running on DEFAULT settings, not yours";
-        match self {
-            Self::Unreadable { path, err } => {
-                write!(f, "cannot read {} ({err}) -- {TAIL}", path.display())
-            }
-            Self::Unparseable { path, err } => {
-                write!(f, "cannot parse {} ({err}) -- {TAIL}", path.display())
-            }
-            Self::Mismatched { paths, err } => {
-                let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-                write!(f, "{} is valid TOML but not valid settings ({err}) -- {TAIL}", names.join(" + "))
-            }
-            Self::HomeUnresolvable => {
-                write!(f, "cannot determine a home directory, so no base.toml could be read -- {TAIL}")
-            }
-        }
+        write!(f, "{} -- {TAIL}", self.cause())
     }
 }
 

@@ -106,7 +106,11 @@ pub fn run(target: &Path) -> Result<()> {
     print!("   ↳ sync CLAUDE.md registry ... ");
     match sync_claude_md_registry() {
         Ok(n) => println!("✓ ({n} workspaces)"),
-        Err(e) => println!("⊘ ({e})"),
+        // STDERR, not stdout. `scaffold` keeps going after this -- the write was
+        // refused, so the registry is already safe -- but a refusal that scrolls
+        // past in the middle of a nine-step progress list is a refusal nobody
+        // reads, and this one means a file on disk is broken.
+        Err(e) => eprintln!("⊘ ({e})"),
     }
 
     // Step 5: Initialize graph
@@ -160,19 +164,59 @@ const WS_START: &str =
     "<!-- BASE:WORKSPACES:START — auto-generated from ~/.base-gbl/base.toml; do not edit between markers -->";
 const WS_END: &str = "<!-- BASE:WORKSPACES:END -->";
 
+/// What the global registry says, or why it could not be read.
+///
+/// THREE states, not two, and the third is the entire point of this type.
+/// `registered_workspace_paths` returned `Vec<String>` and answered ALL of them
+/// with an empty vec: no home, no file, an unreadable file and an unparseable one
+/// all came back as "there are no registered workspaces". That empty vec reached
+/// `build_workspace_block`, which wrote `- (none registered)` over the operator's
+/// real registry in `~/.claude/CLAUDE.md`. (#158 leg C -- the data-loss leg.)
+///
+/// The codebase already drew this distinction one function away:
+/// `workspace_is_registered` has an `Err(_)` arm that falls back to a raw line
+/// scan precisely BECAUSE an unparseable registry still carries real
+/// registrations. This read is the one that failed to draw it.
+enum RegistryRead {
+    /// The registry was read. It may legitimately be empty.
+    Paths(Vec<String>),
+    /// There is no `base.toml` at all. Nothing is registered, and saying so is
+    /// the truth rather than a guess.
+    Absent,
+    /// There IS a registry and it could not be turned into paths. Nothing about
+    /// the real registrations is known, so nothing may be written about them.
+    Fault(crate::config::ConfigFault),
+}
+
 /// Read `[[workspace]]` paths from the global registry (`~/.base-gbl/base.toml`).
-fn registered_workspace_paths() -> Vec<String> {
+fn read_registered_workspaces() -> RegistryRead {
     #[derive(serde::Deserialize)]
     struct WsOnly { #[serde(default)] workspace: Vec<WsPath> }
     #[derive(serde::Deserialize)]
     struct WsPath { path: String }
 
-    let Some(home) = crate::home::home_root() else { return Vec::new() };
+    let Some(home) = crate::home::home_root() else {
+        return RegistryRead::Fault(crate::config::ConfigFault::HomeUnresolvable);
+    };
     let toml_path = home.join(".base-gbl").join("base.toml");
-    let Ok(content) = std::fs::read_to_string(&toml_path) else { return Vec::new() };
-    toml::from_str::<WsOnly>(&content)
-        .map(|w| w.workspace.into_iter().map(|e| e.path).collect())
-        .unwrap_or_default()
+    let content = match std::fs::read_to_string(&toml_path) {
+        Ok(c) => c,
+        // The one state that honestly means "nothing is registered".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RegistryRead::Absent,
+        Err(e) => {
+            return RegistryRead::Fault(crate::config::ConfigFault::Unreadable {
+                path: toml_path,
+                err: e.to_string(),
+            });
+        }
+    };
+    match toml::from_str::<WsOnly>(&content) {
+        Ok(w) => RegistryRead::Paths(w.workspace.into_iter().map(|e| e.path).collect()),
+        Err(e) => RegistryRead::Fault(crate::config::ConfigFault::Unparseable {
+            path: toml_path,
+            err: e.to_string(),
+        }),
+    }
 }
 
 fn tildify(path: &str, home: &Path) -> String {
@@ -234,7 +278,29 @@ pub fn sync_claude_md_registry() -> Result<usize> {
     if !claude_md.exists() {
         return Ok(0);
     }
-    let paths = registered_workspace_paths();
+    // Read the registry BEFORE touching CLAUDE.md, and refuse on a fault.
+    //
+    // The block this function writes is generated ENTIRELY from the registry, so
+    // a registry that cannot be read leaves nothing honest to write -- and the
+    // only safe action on a file that already holds the operator's real
+    // registrations is to write nothing at all. An empty list is a CLAIM that
+    // nothing is registered; it must never be the way base says "I could not
+    // tell".
+    let paths = match read_registered_workspaces() {
+        RegistryRead::Paths(p) => p,
+        // No base.toml means nothing is registered. The block states that
+        // correctly, and this is the ordinary first-run path.
+        RegistryRead::Absent => Vec::new(),
+        RegistryRead::Fault(fault) => {
+            anyhow::bail!(
+                "refusing to rewrite {}: {}. The registered-workspaces block is \
+                 generated from that file, so rewriting it now would replace your \
+                 registrations with '(none registered)'.",
+                claude_md.display(),
+                fault.cause()
+            );
+        }
+    };
     let content = std::fs::read_to_string(&claude_md)?;
     let block = build_workspace_block(&paths, &home);
     let updated = splice_workspace_block(&content, &block);

@@ -125,6 +125,46 @@ fn run(root: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+// ─── The binary has to be the one we just built ────────────────────────────
+
+/// Refuse to measure a `base` binary that does not contain the code under test.
+///
+/// MEASURED 2026-09-11: `target/debug/base` — the exact path `CARGO_BIN_EXE_base`
+/// names — held a build with pre-leg-B behaviour while its mtime (11:28:54) was
+/// NEWER than every source file in `src/` (newest 11:26:55). An mtime check would
+/// have called it fresh and been wrong, which is why this one is BEHAVIOURAL.
+///
+/// Cargo builds the bin with one feature set for `cargo build` and another for
+/// `cargo test` (the self-dev-dependency turns on `isolation-guard`), and both
+/// uplift to that same path, so running one after the other can leave it holding
+/// the other build. `cargo test --no-run` did not correct it and `cargo test`
+/// put the stale one back; only `cargo clean -p base` dislodged it.
+///
+/// A test that runs against a stale binary is indistinguishable from a guard
+/// that cannot fire, so this refuses by name rather than producing a red that
+/// blames the product.
+///
+/// The marker is leg A's config-fault report, which is committed, pushed, and
+/// independent of every exit code this file asserts.
+fn assert_binary_contains_the_code_under_test() {
+    let h = home_with(Config::Unparseable);
+    let (_code, _out, err) = run(h.path(), &["hooks", "manifest"]);
+    assert!(
+        err.contains("DEFAULT settings, not yours"),
+        "STALE BINARY. {BIN} does not carry leg A's config-fault report, so its          exit codes are not this branch's exit codes and nothing here would mean          anything.
+
+Rebuild with:
+    cargo clean -p base && cargo test
+
+         stderr was: {err}"
+    );
+}
+
+#[test]
+fn the_binary_under_test_is_not_stale() {
+    assert_binary_contains_the_code_under_test();
+}
+
 // ─── The invariant, swept ──────────────────────────────────────────────────
 
 /// Every failing branch of `base config`, the state that reaches it, and a
@@ -161,6 +201,7 @@ const FAILING: &[(&str, Config, &[&str], &str)] = &[
 /// the message names the cause it actually hit.
 #[test]
 fn exit_code_follows_the_message_on_every_failing_branch() {
+    assert_binary_contains_the_code_under_test();
     let mut wrong = Vec::new();
     for (name, state, args, expected) in FAILING {
         let h = home_with(*state);
@@ -204,6 +245,7 @@ fn exit_code_follows_the_message_on_every_failing_branch() {
 /// always exited non-zero would pass every row and be useless.
 #[test]
 fn the_succeeding_branches_still_exit_zero() {
+    assert_binary_contains_the_code_under_test();
     // list
     let h = home_with(Config::Healthy);
     let (code, out, err) = run(h.path(), &["config", "list"]);
@@ -236,6 +278,7 @@ fn the_succeeding_branches_still_exit_zero() {
 /// operator, in as many words, that it had updated a setting it had not written.
 #[test]
 fn config_set_never_claims_success_over_a_write_it_did_not_make() {
+    assert_binary_contains_the_code_under_test();
     let h = home_with(Config::ReadOnly);
     let path = global_toml(h.path());
     let before = std::fs::read(&path).unwrap();
@@ -262,6 +305,7 @@ fn config_set_never_claims_success_over_a_write_it_did_not_make() {
 /// mirrors `scaffold::register_workspace` rather than being a second spelling.
 #[test]
 fn set_against_an_absent_config_refuses_and_names_base_install() {
+    assert_binary_contains_the_code_under_test();
     let h = home_with(Config::Absent);
     let (code, _out, err) = run(h.path(), &["config", "set", "update.auto", "true"]);
 
@@ -281,6 +325,7 @@ fn set_against_an_absent_config_refuses_and_names_base_install() {
 /// 0 anyway. The message was right; the exit code contradicted it.
 #[test]
 fn list_against_an_absent_config_refuses_and_names_base_install() {
+    assert_binary_contains_the_code_under_test();
     let h = home_with(Config::Absent);
     let (code, _out, err) = run(h.path(), &["config", "list"]);
 
@@ -296,6 +341,7 @@ fn list_against_an_absent_config_refuses_and_names_base_install() {
 /// will do. Reading a default is honest. Silently discarding a WRITE is not.
 #[test]
 fn get_against_an_absent_config_answers_from_the_default_and_exits_zero() {
+    assert_binary_contains_the_code_under_test();
     let h = home_with(Config::Absent);
     let (code, out, err) = run(h.path(), &["config", "get", "update.auto"]);
 

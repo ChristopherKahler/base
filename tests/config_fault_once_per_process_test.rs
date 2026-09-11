@@ -20,6 +20,18 @@
 //! the same thing about the same file twice in one command. The second assertion
 //! in this file pins that two-load shape, so the test cannot quietly degrade into
 //! proving nothing if a load site is ever removed.
+//!
+//! ONE HARNESS TRAP THIS FILE CANNOT GUARD AGAINST ITSELF, named so the next
+//! reader does not lose an hour to it. `CARGO_BIN_EXE_base` can name a STALE
+//! binary: cargo builds the bin with one feature set for `cargo build` and
+//! another for `cargo test` (the self-dev-dependency turns on
+//! `isolation-guard`) and both uplift to the same `target/debug/base`, so
+//! running one after the other can leave that path holding the other build.
+//! Measured 2026-09-11 with an mtime NEWER than every source file, so an mtime
+//! check passes it. `cargo test --no-run` does not correct it; `cargo clean -p
+//! base` does. The tests below assert behaviour only the current code produces,
+//! so a stale binary shows up as a red here rather than a false green — but the
+//! red will blame the product, and the fix is `cargo clean -p base && cargo test`.
 
 use std::path::Path;
 use std::process::Command;
