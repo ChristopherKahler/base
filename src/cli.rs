@@ -3164,8 +3164,13 @@ pub fn run() {
                 .as_ref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or(cwd.clone());
+            // `die`, not a bare eprintln. This arm sits inside `run()`, which
+            // returns `()`, so printing the error and falling through exits 0 —
+            // the same defect leg B removed from the `config` arm, and the
+            // reason `scaffold` reported success over a refused registry sync
+            // even once `scaffold::run` started returning Err.
             if let Err(e) = base::scaffold::run(&target) {
-                eprintln!("Scaffold failed: {e}");
+                die("Scaffold failed", e);
             }
         }
 
@@ -3211,7 +3216,21 @@ pub fn run() {
         // ─── Workspace registry ───────────────────────────────
         Some(Commands::Workspace { action }) => match action {
             WorkspaceAction::Sync => match base::scaffold::sync_claude_md_registry() {
-                Ok(n) => println!("✓ synced {n} workspace(s) into ~/.claude/CLAUDE.md"),
+                // A count is not a loss. "synced 0 workspace(s)" reads as "there
+                // were none to sync" whether there were none or whether three
+                // were just removed, and the operator cannot tell those apart
+                // from the message that is supposed to describe what happened.
+                Ok(s) if s.cleared() > 0 => println!(
+                    "✓ ~/.claude/CLAUDE.md now lists {} workspace(s) — REMOVED {} that \
+                     ~/.base-gbl/base.toml no longer registers (it listed {} before)",
+                    s.written,
+                    s.cleared(),
+                    s.previous
+                ),
+                Ok(s) => println!(
+                    "✓ synced {} workspace(s) into ~/.claude/CLAUDE.md",
+                    s.written
+                ),
                 Err(e) => die("Failed", e),
             },
         },

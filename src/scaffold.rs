@@ -104,13 +104,31 @@ pub fn run(target: &Path) -> Result<()> {
     // Step 4b: Mirror the registry into ~/.claude/CLAUDE.md so Claude is auto-aware
     // of every registered workspace without anyone having to remember to edit it.
     print!("   ↳ sync CLAUDE.md registry ... ");
+    // Held, not returned, so the steps after this one still run: the write was
+    // REFUSED, so the registry is already safe, and steps 5 onward are
+    // independent of it. The operator gets every piece of work that was still
+    // safe to do AND a non-zero exit, rather than one or the other.
+    let mut registry_refusal: Option<anyhow::Error> = None;
     match sync_claude_md_registry() {
-        Ok(n) => println!("✓ ({n} workspaces)"),
-        // STDERR, not stdout. `scaffold` keeps going after this -- the write was
-        // refused, so the registry is already safe -- but a refusal that scrolls
-        // past in the middle of a nine-step progress list is a refusal nobody
-        // reads, and this one means a file on disk is broken.
-        Err(e) => eprintln!("⊘ ({e})"),
+        Ok(s) if s.cleared() > 0 => println!(
+            "✓ ({} workspaces — REMOVED {} no longer in base.toml)",
+            s.written,
+            s.cleared()
+        ),
+        Ok(s) => println!("✓ ({} workspaces)", s.written),
+        Err(e) => {
+            // TERMINATE THE STDOUT LINE HERE. The step opened with a `print!`
+            // and no newline, and the refusal itself goes to stderr, so without
+            // this the progress list reads "sync CLAUDE.md registry ... " and
+            // step 5 continues ON THE SAME LINE. A reader of stdout alone sees
+            // this step start and never finish.
+            println!("REFUSED — see stderr");
+            // STDERR for the reason, because a refusal that scrolls past inside
+            // a nine-step progress list is a refusal nobody reads, and this one
+            // means a file on disk is broken.
+            eprintln!("⊘ ({e})");
+            registry_refusal = Some(e);
+        }
     }
 
     // Step 5: Initialize graph
@@ -144,7 +162,15 @@ pub fn run(target: &Path) -> Result<()> {
     }
 
     println!("\n═══════════════════════════════════════");
-    println!("✓ Workspace scaffolded");
+    // The banner is a claim about the whole command, so it cannot say ✓ while a
+    // step refused. `base scaffold` is the command the #158 reporter actually
+    // ran; reporting success here is the same defect as `config set` printing
+    // "Updated" over a write it did not make.
+    if registry_refusal.is_some() {
+        println!("⊘ Workspace scaffolded — ONE STEP REFUSED, see stderr");
+    } else {
+        println!("✓ Workspace scaffolded");
+    }
     println!("═══════════════════════════════════════\n");
     println!("  Path: {}", target.display());
     println!("  Config: .base/base.toml");
@@ -157,7 +183,12 @@ pub fn run(target: &Path) -> Result<()> {
     print!("{}", crate::first_run::text());
     crate::first_run::mark_shown();
 
-    Ok(())
+    // The exit code follows the message (#158 leg B's invariant, at a different
+    // command). A refused step is a failed command, however much else succeeded.
+    match registry_refusal {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 const WS_START: &str =
@@ -269,14 +300,56 @@ fn splice_workspace_block(content: &str, block: &str) -> String {
     out
 }
 
+/// What one sync did, in the terms an operator cares about.
+///
+/// `written` alone is not enough to describe the outcome, and reporting only the
+/// count is what made the old message false: "synced 0 workspace(s)" reads as
+/// "there were none to sync" whether there were none or whether three were just
+/// removed. A count is not a loss. (#158 leg C)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistrySync {
+    /// How many registrations the block names now.
+    pub written: usize,
+    /// How many it named before this run.
+    pub previous: usize,
+}
+
+impl RegistrySync {
+    /// How many registrations this run removed from the block.
+    pub fn cleared(&self) -> usize {
+        self.previous.saturating_sub(self.written)
+    }
+}
+
+/// Count the registration lines inside the managed block.
+///
+/// Entries are written as ``- `path` `` by `build_workspace_block`, so the
+/// backtick is what distinguishes a real entry from the literal
+/// `- (none registered)` placeholder, which must count as zero.
+fn count_block_entries(content: &str) -> usize {
+    let (Some(si), Some(ei)) = (
+        content.find("BASE:WORKSPACES:START"),
+        content.find("BASE:WORKSPACES:END"),
+    ) else {
+        return 0;
+    };
+    if ei <= si {
+        return 0;
+    }
+    content[si..ei]
+        .lines()
+        .filter(|l| l.trim_start().starts_with("- `"))
+        .count()
+}
+
 /// Regenerate the managed registered-workspaces block in `~/.claude/CLAUDE.md` from
 /// the global registry. Idempotent; only ever rewrites between the markers. No-op if
-/// CLAUDE.md is absent. Returns the number of workspaces written.
-pub fn sync_claude_md_registry() -> Result<usize> {
+/// CLAUDE.md is absent. Returns what the sync did, not merely how many it wrote.
+pub fn sync_claude_md_registry() -> Result<RegistrySync> {
     let home = crate::home::home_root().context("Cannot determine home directory")?;
     let claude_md = home.join(".claude").join("CLAUDE.md");
     if !claude_md.exists() {
-        return Ok(0);
+        return Ok(RegistrySync { written: 0, previous: 0 });
     }
     // Read the registry BEFORE touching CLAUDE.md, and refuse on a fault.
     //
@@ -302,6 +375,7 @@ pub fn sync_claude_md_registry() -> Result<usize> {
         }
     };
     let content = std::fs::read_to_string(&claude_md)?;
+    let previous = count_block_entries(&content);
     let block = build_workspace_block(&paths, &home);
     let updated = splice_workspace_block(&content, &block);
     if updated != content {
@@ -309,7 +383,7 @@ pub fn sync_claude_md_registry() -> Result<usize> {
         std::fs::write(&tmp, &updated)?;
         std::fs::rename(&tmp, &claude_md)?;
     }
-    Ok(paths.len())
+    Ok(RegistrySync { written: paths.len(), previous })
 }
 
 /// Add a workspace path to ~/.base-gbl/base.toml [[workspace]] if not already present.

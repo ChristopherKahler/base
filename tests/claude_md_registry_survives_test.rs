@@ -395,3 +395,153 @@ fn readable_and_empty_is_not_the_same_state_as_unreadable() {
         "the broken one wrote nothing at all"
     );
 }
+
+// ─── A count is not a loss ─────────────────────────────────────────────────
+
+/// `✓ synced 0 workspace(s)` is FALSE when three registrations were just
+/// removed. It reports a COUNT where the operator needs a LOSS, and the two
+/// cases it cannot distinguish — "there were none" and "there were three and now
+/// there are none" — are exactly the ones that matter.
+///
+/// This is the message half of the residual. Whether sync SHOULD clear a
+/// populated block when `base.toml` is absent is a separate design question,
+/// ruled out of this lane and logged as `N-SYNC-CLEARS-ON-ABSENT-REGISTRY`.
+/// Honest reporting does not depend on settling that.
+#[test]
+fn a_sync_that_removes_registrations_reports_the_loss_not_a_count() {
+    assert_binary_contains_the_code_under_test();
+    // Absent registry, populated block: the case that produced the false line.
+    let f = Fake::new(None);
+    assert_registrations_present(&f, "precondition");
+
+    let (code, out, err) = f.run(&["workspace", "sync"]);
+
+    assert_eq!(code, 0, "absent is not a fault: {err}");
+    assert!(
+        out.contains("REMOVED") && out.contains('3'),
+        "it has to say what it took away, and how many: {out}"
+    );
+    assert!(
+        !out.contains("synced 0 workspace(s)"),
+        "and must NOT report a bare count, which reads as 'there were none': {out}"
+    );
+}
+
+/// The control. A sync that removes nothing keeps the plain message — otherwise
+/// every ordinary sync would shout about a loss that did not happen.
+#[test]
+fn a_sync_that_removes_nothing_keeps_the_plain_message() {
+    assert_binary_contains_the_code_under_test();
+    let f = Fake::new(Some(&healthy_registry()));
+
+    let (code, out, err) = f.run(&["workspace", "sync"]);
+
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("synced 3 workspace(s)"), "{out}");
+    assert!(
+        !out.contains("REMOVED"),
+        "nothing was removed, so nothing may claim it was: {out}"
+    );
+}
+
+/// The placeholder must not be counted as a registration, or a block reading
+/// `- (none registered)` would report a phantom loss of one on the next sync.
+#[test]
+fn the_none_registered_placeholder_counts_as_zero_not_one() {
+    assert_binary_contains_the_code_under_test();
+    let f = Fake::new(None);
+    // First sync clears the three and writes the placeholder.
+    let (_, out1, _) = f.run(&["workspace", "sync"]);
+    assert!(out1.contains("REMOVED"), "precondition: the first sync cleared them: {out1}");
+
+    // Second sync: the block now holds only the placeholder, so nothing is lost.
+    let (code, out2, err) = f.run(&["workspace", "sync"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        !out2.contains("REMOVED"),
+        "the placeholder is not a registration, so this sync removed nothing: {out2}"
+    );
+}
+
+// ─── base scaffold: the command the #158 reporter actually ran ─────────────
+
+/// THE measurement for this half of the leg, and it is the reporter's own
+/// command. `base scaffold` reported SUCCESS over a refused registry sync: the
+/// step printed nothing terminal on stdout, the banner said "✓ Workspace
+/// scaffolded", and the process exited 0.
+///
+/// It needed TWO fixes and either alone leaves rc at 0. `scaffold::run` now
+/// returns Err, AND the `cli.rs` Scaffold arm now calls `die` instead of
+/// printing the error and falling through — that arm sits inside `run()`, which
+/// returns `()`, so a bare `eprintln!` there is a normal exit. Same shape as the
+/// twelve rc-0 branches leg B removed.
+#[test]
+fn scaffold_exits_non_zero_when_the_registry_sync_is_refused() {
+    assert_binary_contains_the_code_under_test();
+    let f = Fake::new(Some(&broken_registry()));
+    let before = f.claude_md_bytes();
+
+    let target = f.root().join("newws");
+    std::fs::create_dir_all(&target).unwrap();
+    let (code, out, err) = f.run(&["scaffold", target.to_str().unwrap()]);
+
+    assert_ne!(
+        code, 0,
+        "a refused step is a failed command.
+stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert!(
+        !out.contains("✓ Workspace scaffolded"),
+        "the banner is a claim about the WHOLE command and one step refused: {out}"
+    );
+    assert_eq!(before, f.claude_md_bytes(), "and the registry is still untouched");
+}
+
+/// The dangling line. Step 4b opens with a `print!` and no newline; the refusal
+/// goes to stderr, so without a terminator on stdout the progress list reads
+/// "sync CLAUDE.md registry ... " and step 5 continues ON THE SAME LINE. A
+/// reader of stdout alone sees the step start and never finish.
+#[test]
+fn the_refused_step_still_terminates_its_own_stdout_line() {
+    assert_binary_contains_the_code_under_test();
+    let f = Fake::new(Some(&broken_registry()));
+    let target = f.root().join("newws");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let (_code, out, _err) = f.run(&["scaffold", target.to_str().unwrap()]);
+
+    let line = out
+        .lines()
+        .find(|l| l.contains("sync CLAUDE.md registry"))
+        .unwrap_or_else(|| panic!("step 4b did not appear on stdout at all:
+{out}"));
+    assert!(
+        line.contains("REFUSED"),
+        "the step has to close its own line before the next one starts: {line:?}"
+    );
+    assert!(
+        !line.contains("5."),
+        "step 5 must not be sharing this line: {line:?}"
+    );
+}
+
+/// The control: an ordinary scaffold still succeeds and still exits 0. Without
+/// it, a change that made scaffold always fail would pass both tests above.
+#[test]
+fn an_ordinary_scaffold_still_succeeds_and_exits_zero() {
+    assert_binary_contains_the_code_under_test();
+    let f = Fake::new(Some(&healthy_registry()));
+    let target = f.root().join("newws");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let (code, out, err) = f.run(&["scaffold", target.to_str().unwrap()]);
+
+    assert_eq!(code, 0, "a good registry scaffolds fine.
+stderr:
+{err}");
+    assert!(out.contains("✓ Workspace scaffolded"), "{out}");
+    assert!(!out.contains("REFUSED"), "{out}");
+}
