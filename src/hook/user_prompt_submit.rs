@@ -121,28 +121,52 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         // always-on domain. Same shape, and the same fix, as the early return
         // `base context` used to take in `domain::query`.
         //
-        // THE WALK BLOCK ONLY. The `<context-bracket>` line and the bracket
-        // rules stay skipped on this path. Serving them here costs 2931 bytes
-        // at FRESH and 3696 at DEPLETED against 125 for the walk, and the walk
-        // is scoped "query based, surgical, relevant" -- so their absence is a
-        // separate question, tracked as N-BRACKET-DEAD-WITHOUT-A-MATCHED-DOMAIN
-        // and deliberately not answered here.
+        // AND N-BRACKET-DEAD-WITHOUT-A-MATCHED-DOMAIN, the same early return
+        // costing the same users a second feature. The bracket line and its
+        // rules are tier-gated, never domain-gated: they are re-sent every
+        // prompt precisely because they are the layer that must not erode as
+        // context fills, which a once-per-session injection cannot guarantee.
+        // Skipping them here made them erode fastest for the user with the
+        // fewest domains -- and on an install whose domains are all
+        // `mode = "triggered"`, erode to nothing.
+        //
+        // `prompt_count_for(session_id)`, NOT the raw `session.prompt_count`.
+        // Of the four return sites in this function this was the only one
+        // reaching for the raw counter, and the main path below prints the
+        // per-session number -- so the raw one would show a user two different
+        // prompt numbers depending on whether a domain happened to match, each
+        // inflated by every concurrent session sharing the workspace.
+        //
+        // The returned `HookEventData` keeps `session.prompt_count` unchanged.
+        // That field feeds the JSONL log rather than the prompt, it has always
+        // carried that number here, and whether it should is a separate
+        // question from what the reader sees.
+        //
+        // Built as one string and printed once, like the main path below. Two
+        // `print!` calls would do the same thing, but a literal ending in a
+        // newline trips clippy's `print_with_newline` under `-D warnings`.
         //
         // Nothing to dedup against: `domain_served` is filled by the domain
         // loop below, which an empty `matched` makes a no-op.
         //
-        // No lean-mode gate either. `lean_mode` needs `prompt_num`, computed
-        // below this return -- and the walk on the main path is not gated on
-        // it either, so gating here would be the one place in the hook where
+        // No lean-mode gate either. `lean_mode` needs the prompt number
+        // computed below this return -- and the walk on the main path is not
+        // gated on it, so gating here would be the one place in the hook where
         // the walk still consulted it.
+        let nomatch_prompt_num = session.prompt_count_for(session_id);
+        let mut out = format!(
+            "<context-bracket>[{bracket}] (prompt {nomatch_prompt_num})</context-bracket>\n\n"
+        );
+        out.push_str(&bracket_rules);
         if let Some(ref store) = graph_store {
             let nothing_served = std::collections::HashSet::new();
             let walked =
                 crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &nothing_served);
             // Dedup, render and mark as one unit -- see `render_walk_block`.
             let w = render_walk_block(&mut session, walked, config.injection.walk_budget);
-            print!("{}", w.block);
+            out.push_str(&w.block);
         }
+        print!("{out}");
         // Still save session state (prompt_count) even if nothing matched.
         // AFTER the walk, so the marks it just wrote are in what gets saved --
         // otherwise dedup resets every prompt and the walk re-serves forever.
