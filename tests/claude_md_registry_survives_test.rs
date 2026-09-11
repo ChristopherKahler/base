@@ -38,6 +38,10 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_base");
 
+/// A newline, as a constant, because a char literal for it does not survive
+/// being written through a shell heredoc and a Python string on the way here.
+const NEWLINE: char = 10u8 as char;
+
 /// Three workspaces an operator would lose. Real-looking, and one of them is the
 /// Windows shape whose raw paste is what breaks the file in the first place.
 const REGISTERED: [&str; 3] = [
@@ -544,4 +548,60 @@ stderr:
 {err}");
     assert!(out.contains("✓ Workspace scaffolded"), "{out}");
     assert!(!out.contains("REFUSED"), "{out}");
+}
+
+/// C-10. The same defect as C-9, at step 4, on the path C-9 could NOT reach.
+///
+/// When `base.toml` is UNREADABLE, `register_workspace` fails at step 4 and the
+/// `?` carries the error out — so step 4b never runs and C-9's terminator is
+/// never exercised. That is the #158 reporter's own path, and it was left
+/// reading "4. Register workspace ... " with the next output glued to the end.
+///
+/// Shipping C-9 while leaving this would mean the acceptance criterion still
+/// fails on the case the row is actually about.
+#[test]
+fn the_aborting_step_four_also_terminates_its_own_stdout_line() {
+    assert_binary_contains_the_code_under_test();
+    let f = Fake::with_unreadable_registry();
+    let target = f.root().join("newws");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let (code, out, err) = f.run(&["scaffold", target.to_str().unwrap()]);
+
+    assert_ne!(code, 0, "an unreadable registry is a failed scaffold: {err}");
+    let line = out
+        .lines()
+        .find(|l| l.contains("Register workspace"))
+        .unwrap_or_else(|| panic!("step 4 never appeared on stdout:
+{out}"));
+    assert!(
+        line.contains("FAILED"),
+        "step 4 must close its own line when it aborts: {line:?}"
+    );
+    // The real assertion: the line ENDS. `lines()` already split on the newline,
+    // so reaching here with a found line proves a terminator followed it — but
+    // pin the glue case explicitly, because that is the symptom.
+    assert!(
+        !line.contains("5."),
+        "the next step must not be glued to this line: {line:?}"
+    );
+    assert!(
+        out.ends_with(NEWLINE),
+        "stdout must not end mid-line either: {out:?}"
+    );
+}
+
+/// The control: an ordinary scaffold does not print step 4 as failed.
+#[test]
+fn step_four_reports_failure_only_when_it_fails() {
+    assert_binary_contains_the_code_under_test();
+    let f = Fake::new(Some(&healthy_registry()));
+    let target = f.root().join("newws");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let (code, out, _err) = f.run(&["scaffold", target.to_str().unwrap()]);
+
+    assert_eq!(code, 0);
+    let line = out.lines().find(|l| l.contains("Register workspace")).unwrap();
+    assert!(!line.contains("FAILED"), "{line:?}");
 }

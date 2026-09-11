@@ -99,7 +99,16 @@ pub fn run(target: &Path) -> Result<()> {
         .unwrap_or_else(|_| target.to_path_buf())
         .to_string_lossy()
         .to_string();
-    register_workspace(&target_str)?;
+    // C-10, and it is C-9's defect at a different step. This line opened with a
+    // `print!` and no newline; on the UNREADABLE path `register_workspace` fails
+    // here and the `?` carries the error out, so stdout was left reading
+    // "4. Register workspace ... " with the next thing glued to the end of it —
+    // and that is the #158 reporter's own path, the one C-9's measurement could
+    // not reach because step 4b is never reached when this aborts.
+    if let Err(e) = register_workspace(&target_str) {
+        println!("FAILED — see stderr");
+        return Err(e);
+    }
 
     // Step 4b: Mirror the registry into ~/.claude/CLAUDE.md so Claude is auto-aware
     // of every registered workspace without anyone having to remember to edit it.
