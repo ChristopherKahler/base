@@ -747,36 +747,176 @@ impl Default for SyncConfig {
     }
 }
 
+/// A `base.toml` that EXISTS but could not become settings.
+///
+/// There is deliberately NO `Absent` variant. A missing `base.toml` is a normal
+/// first run, not a fault, and collapsing those two states is the defect this
+/// type exists to remove (#158): absent, empty and unreadable are three
+/// different things and only the last two are worth speaking about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigFault {
+    /// The file is there and could not be read: permissions, a directory in its
+    /// place, an I/O error. Anything except "not found".
+    Unreadable { path: PathBuf, err: String },
+    /// The file was read and is not valid TOML.
+    Unparseable { path: PathBuf, err: String },
+    /// Valid TOML, wrong shape for `BaseConfig`. One wrongly typed field --
+    /// `auto = "yes"` where a bool belongs -- used to discard every OTHER
+    /// setting in the file as well, silently.
+    Mismatched { paths: Vec<PathBuf>, err: String },
+    /// No home directory could be resolved, so neither tier could be located.
+    HomeUnresolvable,
+}
+
+impl std::fmt::Display for ConfigFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every arm ends with the consequence, because a path and a parse error
+        // alone do not tell the operator the thing that actually matters: the
+        // settings they chose are NOT the settings base is running on.
+        const TAIL: &str = "base is running on DEFAULT settings, not yours";
+        match self {
+            Self::Unreadable { path, err } => {
+                write!(f, "cannot read {} ({err}) -- {TAIL}", path.display())
+            }
+            Self::Unparseable { path, err } => {
+                write!(f, "cannot parse {} ({err}) -- {TAIL}", path.display())
+            }
+            Self::Mismatched { paths, err } => {
+                let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                write!(f, "{} is valid TOML but not valid settings ({err}) -- {TAIL}", names.join(" + "))
+            }
+            Self::HomeUnresolvable => {
+                write!(f, "cannot determine a home directory, so no base.toml could be read -- {TAIL}")
+            }
+        }
+    }
+}
+
+/// Report config faults on stderr, at most once per process.
+///
+/// ONCE PER PROCESS, not once per call, because one `base scaffold` calls
+/// `BaseConfig::load` three times (`scaffold.rs:114`, `install.rs:977` and
+/// `install.rs:1520`) and the operator does not need telling three times. The
+/// empty case returns before touching the latch, so a healthy first load does
+/// not spend it and a fault arriving later still speaks.
+///
+/// STDERR, deliberately, and the reason is specific rather than stylistic.
+/// `hook/mod.rs:136` is one of the nine production call sites, so this runs
+/// inside a hook. A hook STDOUT is a parsed contract: on pre-tool-use,
+/// post-tool-use and stop it must be exactly one JSON envelope, and on
+/// session-start and user-prompt-submit it is the injected text itself. Stderr
+/// is the operator-diagnostic channel on every one of those paths -- `dispatch`
+/// at `hook/mod.rs:67` fails open to "stderr only, exit 0, empty stdout", and
+/// `post_tool_use.rs` records that "stderr stays stderr -- those lines are
+/// operator diagnostics, not model context". A config warning must never be
+/// able to change one byte of hook stdout, and a test asserts exactly that.
+fn report_config_faults_once(faults: &[ConfigFault]) {
+    if faults.is_empty() {
+        return;
+    }
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    REPORTED.call_once(|| {
+        for fault in faults {
+            eprintln!("base: {fault}");
+        }
+    });
+}
+
 impl BaseConfig {
     /// Load config: global `~/.base-gbl/base.toml` as base, workspace `.base/base.toml` overlaid on top.
     /// Workspace sections override global at the key level; missing sections inherit from global.
+    ///
+    /// A config that cannot be read or parsed is REPORTED (once per process)
+    /// rather than silently replaced by defaults. The signature is unchanged on
+    /// purpose: six of the nine production call sites have no useful error path
+    /// and would each end in `unwrap_or_default()`, which would copy the silent
+    /// default to six places instead of removing it from one. A caller that
+    /// needs to ACT on a fault uses [`BaseConfig::load_reporting`].
     pub fn load(cwd: &Path) -> Self {
-        Self::try_load(cwd).unwrap_or_default()
+        let (config, faults) = Self::load_reporting(cwd);
+        report_config_faults_once(&faults);
+        config
     }
 
-    fn try_load(cwd: &Path) -> Option<Self> {
-        let home = crate::home::home_root()?;
+    /// Load, and say what could not be read.
+    ///
+    /// The returned list is empty on a healthy load AND on a first run with no
+    /// `base.toml` anywhere -- absent is not a fault, which is why
+    /// [`ConfigFault`] has no variant for it. Every other outcome that used to
+    /// collapse into `default()` now names itself here.
+    pub fn load_reporting(cwd: &Path) -> (Self, Vec<ConfigFault>) {
+        let mut faults = Vec::new();
+
+        let Some(home) = crate::home::home_root() else {
+            faults.push(ConfigFault::HomeUnresolvable);
+            return (Self::default(), faults);
+        };
         let global_path = home.join(".base-gbl").join("base.toml");
         let ws_path = cwd.join(".base").join("base.toml");
 
-        let global = Self::load_toml_table(&global_path);
-        let workspace = Self::load_toml_table(&ws_path);
+        let global = Self::read_table(&global_path, &mut faults);
+        let workspace = Self::read_table(&ws_path, &mut faults);
+
+        // Only the files that actually produced a table are named as sources of
+        // a shape error. Asking the filesystem again with `exists()` would cost
+        // a syscall and could disagree with what was just read.
+        let mut sources = Vec::new();
+        if global.is_some() {
+            sources.push(global_path);
+        }
+        if workspace.is_some() {
+            sources.push(ws_path);
+        }
 
         let merged = match (global, workspace) {
             (Some(g), Some(w)) => merge_toml_tables(g, w),
             (Some(g), None) => g,
             (None, Some(w)) => w,
-            (None, None) => return None,
+            (None, None) => return (Self::default(), faults),
         };
 
-        toml::Value::Table(merged).try_into().ok()
+        match toml::Value::Table(merged).try_into() {
+            Ok(config) => (config, faults),
+            Err(e) => {
+                faults.push(ConfigFault::Mismatched {
+                    paths: sources,
+                    err: e.to_string(),
+                });
+                (Self::default(), faults)
+            }
+        }
     }
 
-    fn load_toml_table(path: &Path) -> Option<toml::Table> {
-        let content = std::fs::read_to_string(path).ok()?;
-        content.parse::<toml::Table>().ok()
+    /// One tier table. Returns `None` for "nothing to merge from here", and
+    /// pushes a fault for every reason EXCEPT the file being absent.
+    ///
+    /// This single match arm is the honest-envelope law in code: the read used
+    /// to end `.ok()?`, which made a missing file and an unreadable one
+    /// indistinguishable to everything downstream.
+    fn read_table(path: &Path, faults: &mut Vec<ConfigFault>) -> Option<toml::Table> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            // The one quiet case: no file is a normal first run.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                faults.push(ConfigFault::Unreadable {
+                    path: path.to_path_buf(),
+                    err: e.to_string(),
+                });
+                return None;
+            }
+        };
+        match content.parse::<toml::Table>() {
+            Ok(table) => Some(table),
+            Err(e) => {
+                faults.push(ConfigFault::Unparseable {
+                    path: path.to_path_buf(),
+                    err: e.to_string(),
+                });
+                None
+            }
+        }
     }
-
 }
 
 /// Deep-merge two TOML tables. Overlay values win; nested tables merge recursively.
