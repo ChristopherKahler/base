@@ -131,10 +131,10 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         // Nothing to dedup against: `domain_served` is filled by the domain
         // loop below, which an empty `matched` makes a no-op.
         //
-        // No lean-mode gate either: `lean_mode` needs `prompt_num`, computed
-        // below this return, and the next commit removes the walk's lean gate
-        // on the main path. Adding one here would be building what that commit
-        // deletes.
+        // No lean-mode gate either. `lean_mode` needs `prompt_num`, computed
+        // below this return -- and the walk on the main path is not gated on
+        // it either, so gating here would be the one place in the hook where
+        // the walk still consulted it.
         if let Some(ref store) = graph_store {
             let nothing_served = std::collections::HashSet::new();
             let walked =
@@ -332,22 +332,31 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
 
     // ─── Prompt-time traversal ───────────────────────────────────────────
     // AFTER the domain loop, not before: it dedups against the IRIs those
-    // blocks served, and it cannot do that before they have run. Skipped in
-    // lean mode with the neighbourhood, for the same reason.
+    // blocks served, and it cannot do that before they have run.
+    //
+    // NOT gated on lean mode, deliberately. The flag it used to sit behind was
+    // introduced by fb1cd48 (2026-06-01) for the NEIGHBOURHOOD, three months
+    // before this walk existed -- `git show fb1cd48:src/hook/user_prompt_submit.rs`
+    // contains no walk at all. 29ff99a (2026-09-07) then hung the walk on the
+    // same flag without the question being asked, so there was never a design
+    // intent here to preserve.
+    //
+    // And the saving was not real. Skipping the injection does not reduce what
+    // the session consumes, it moves the cost and makes it larger: the session
+    // then spends more than the block's bytes running recall, greps and file
+    // reads to find by hand what the block would have handed it. An injection is
+    // cheaper than the search it replaces. Prompts 1 and 2 are usually where
+    // someone starts work, which is where that signal is worth most.
+    //
+    // The NEIGHBOURHOOD skip above still honours lean mode. That is what the
+    // flag was built for and it is untouched.
     //
     // The maps, the closures and the reasons for both now live in
     // `walk::walk_from_text`, which `base context` calls as well. One seam, so the
     // command and the prompt path cannot answer differently about the same graph.
-    let walked = match (&graph_store, lean_mode) {
-        (Some(store), false) => Some(crate::hook::walk::walk_from_text(
-            store,
-            cwd,
-            config,
-            &prompt,
-            &domain_served,
-        )),
-        _ => None,
-    };
+    let walked = graph_store.as_ref().map(|store| {
+        crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &domain_served)
+    });
 
     // The walk's block rides after the domain blocks, so a reader sees the
     // configured layer first and the named-thing layer as the specific addition.
