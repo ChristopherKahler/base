@@ -1,6 +1,6 @@
 ---
 name: 'base-help'
-description: 'Coach mode for the `base` CLI: teaches what to do and why, rather than just answering. Use for any question about base (how to use it, what it can do for me, star commands, handoffs, forks, rules, domains, recall, AST queries, sync, the graph), or when a base command errors or behaves unexpectedly. Also invoked directly as /base-help [question].'
+description: 'Coach mode for base, the context engine that injects project memory into Claude Code and stores decisions, rules and code structure in a graph that survives across sessions. Teaches what to do and why rather than just answering. Use when: (1) anything about base is asked - how to use it, what it can do, why a command failed, why something did or did not get injected; (2) a session needs to get oriented in a codebase, find a function or its callers, or map what calls what, which the code graph answers without reading files; (3) someone wants to pick up where a previous session left off, park side work, or close a session out cleanly; (4) a decision, rule, correction or preference should be remembered for next time, or someone asks what was decided before; (5) a newly installed base needs setting up, or a user asks what to do with it first; (6) someone says "star commands", "the graph", "handoff", "fork", "recall", "code map", "what did we decide", "remember this", "resume where we left off", "why does Claude keep forgetting", or "how do I get Claude to know my project". Also invoked directly as /base-help [question].'
 argument-hint: '[question]'
 allowed-tools: 'Read, Write, Edit, Bash(grep *), Bash(rg *), Bash(which base), Bash(base --version), Bash(base doctor), Bash(base help *), Bash(base --help), Bash(base commands list), Bash(base commands show *), Bash(base recall *), Bash(base decision search *), Bash(base handoff list), Bash(base fork list), Bash(base ast list), Bash(base ast query *), Bash(base context *), Bash(base relay board), Bash(base relay sessions), Bash(base relay tasks), Bash(base rule list *), Bash(base project list), Bash(base operator show), Bash(ls ~/.base-gbl/*)'
 ---
@@ -13,11 +13,21 @@ Their question: **$ARGUMENTS**
 
 This skill is portable and contains **no machine-specific facts**. Machine state lives in a local profile; universal knowledge lives in three reference files next to this one:
 
-- `${CLAUDE_SKILL_DIR}/references/qa.md`: 187 verified Q&A pairs, the primary answer source (the count grows whenever the close-the-loop rule below appends one)
-- `${CLAUDE_SKILL_DIR}/references/commands.md`: the command surface grouped by safety class (read-only, mutating, destructive), aliases, flag gotchas
-- `${CLAUDE_SKILL_DIR}/references/cli.md`: the verbatim `--help` of every subcommand, generated from the binary at each release; the authority for an exact flag
+Each carries its own **read-trigger**: open it when the trigger fires, and not otherwise. Three greps beat one full read of a 208 KB shelf.
+
+- `${CLAUDE_SKILL_DIR}/references/qa.md` — **read second, on every question, before any live probe.** 187 verified Q&A pairs, the primary answer source (the count grows whenever the close-the-loop rule below appends one). Grep it, never read it whole. Not the authority on an exact flag.
+- `${CLAUDE_SKILL_DIR}/references/commands.md` — **read before running any base command you did not copy straight out of qa.md.** The surface grouped by safety class (read-only, mutating, destructive), aliases, flag gotchas. It says what is safe to run, not how to spell it.
+- `${CLAUDE_SKILL_DIR}/references/cli.md` — **read the moment the question is about exact syntax**: a flag's spelling, whether an option exists, what a subcommand accepts. The verbatim `--help` of every subcommand, generated from the binary at each release. Grep for the `## base <sub>` heading and read that section only; the file is 70 KB.
 
 All three are stamped to a base release and the stamp is enforced by the base repo's test suite, so when the stamp matches `base --version` every flag in them is real.
+
+## What this skill does not cover
+
+Say these plainly rather than overreaching; they are what makes the rest trustworthy.
+
+- **It cannot fire on its own when the user's words do not name base.** Skill loading is matched against what the user asked for, so a session told to refactor a file will not load this. What reaches that session is the hook injection, not this skill.
+- **It knows nothing about this machine beyond the local profile**, and the profile is only as fresh as its last audit.
+- **It is stamped to a release.** When the installed binary is ahead of the stamp, the bank still explains mechanisms correctly, but the exact flags are the binary's to confirm.
 
 ## STEP 0: local profile (do this first, silently)
 
@@ -65,6 +75,7 @@ Rules of engagement:
 **Close the loop: this skill is supposed to get smarter.** If answering required going beyond the bank (reading source, chasing files, live experimentation), that is a gap:
 
 - **Universal finding** (true on any install of this version) → append a new `### Q:` pair to the matching section of `references/qa.md`, same format, with a provenance comment. Do not grow this SKILL.md.
+  **The count is coupled, and this is the one thing that bites.** This file and `README.md` both state the pair count, and base's own test asserts it equals the number of `### Q:` pairs in `qa.md`. Appending a pair by hand without regenerating the count turns `cargo test` red. Regenerate with `BASE_REGEN_DOCS=1 cargo test --bin base help_docs`, or say in one line that you appended a pair and the count still needs regenerating.
 - **Machine-specific finding** (paths, versions, local state) → update `~/.claude/base-help/local/profile.md` instead.
 - Tell the user in one line what you added and where.
 
@@ -93,6 +104,30 @@ Then ask what they want to go deeper on, and mention the top gap from the profil
 - **Hooks are the delivery mechanism.** On session start, prompt submit, pre/post tool use, and stop, base runs and prints text that is injected into the conversation. All hooks fail open (errors go to stderr, exit 0), so a broken hook looks identical to a quiet one.
 - **`domains.toml` holds triggers only** (keywords, paths). The rule *content* lives in the graph. So editing rules means `base rule add`, not editing TOML.
 - **Star commands** are prompt-level behavior switches: type `*audit` and its rules inject for the turn and until changed. They stack (`*audit *blunt`), match case-insensitively, and tolerate trailing punctuation.
+
+## Anti-patterns
+
+Concrete, and each one has actually happened:
+
+- Reading a whole reference file when a grep would have answered it. `cli.md` is 70 KB and `qa.md` is 124 KB.
+- Answering a machine-state question out of the bank instead of the profile. The bank is universal; it does not know this install.
+- Running a mutating command to demonstrate it. Show it; let the user run it.
+- Appending a pair to `qa.md` without regenerating the count, which reds the suite (see the close-the-loop rule above).
+- Letting the profile drift past a version bump, so it describes an install that no longer exists.
+
+## The cold-read test
+
+Run this against this skill after any edit to it. A session with base installed, this skill loaded, and no other base knowledge:
+
+1. From this file alone, without opening any of them, can you name which reference answers "what is the exact flag for X"?
+2. Does every reference link carry a trigger that is a situation, not a topic?
+3. Can you answer a bank question with zero commands run?
+4. Before running any base command, does this file tell you where to check whether it is destructive?
+5. Does the skill state what it does not cover?
+6. Did an answer that required digging end in an appended pair or a profile update, and did you say which?
+7. Token check: this file, plus the profile, plus one grep hit — not a whole reference file.
+
+If a step fails, move the content. Do not explain harder.
 
 ### First-run audit
 
