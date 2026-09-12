@@ -7,6 +7,13 @@ fails when the version in `Cargo.toml` has no entry here.
 
 Releases before 0.13.3 are tagged in the repository but are not written up.
 
+## 0.15.2 (2026-09-12)
+
+### Fixed
+
+- **hook**: the prompt-time walk and the context bracket reach the prompts they were missing ([#160](https://github.com/ChristopherKahler/base/issues/160))
+- a tool that cannot read its own config, or reach its own release API, now says so ([#158](https://github.com/ChristopherKahler/base/issues/158)) ([#159](https://github.com/ChristopherKahler/base/issues/159))
+
 ## 0.15.1 (2026-09-10)
 
 ### Fixed
