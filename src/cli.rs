@@ -1429,6 +1429,49 @@ fn die(prefix: &str, e: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+/// Read the global `base.toml` for a `config` subcommand, or exit non-zero.
+///
+/// ABSENT comes back as `None` rather than as an error, because the three
+/// subcommands answer that state differently and only they can decide: `get`
+/// falls through to the compiled-in default, `list` and `set` refuse. Unreadable
+/// and unparseable are faults on every path and exit from here.
+///
+/// #158 leg B. Every one of these used to `eprintln!` and then `return` out of a
+/// `run()` that yields `()` -- which is a NORMAL exit. A config that would not
+/// parse reported SUCCESS to the shell, so `&&` chains, scripts and CI steps
+/// carried on as though the settings had been read.
+fn read_global_config(path: &std::path::Path) -> Option<toml::Value> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        // The one quiet case. What it MEANS is the caller's decision, not this
+        // function's -- collapsing absent into unreadable here is the same
+        // defect this issue exists to remove, one layer up.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => die(&format!("Cannot read {}", path.display()), e),
+    };
+    match content.parse::<toml::Value>() {
+        Ok(v) => Some(v),
+        Err(e) => die(&format!("Failed to parse {}", path.display()), e),
+    }
+}
+
+/// The one answer to "there is no global `base.toml`".
+///
+/// `base install` is what creates that file (`install::create_global_tier`), so
+/// its absence means install never ran -- not that this command should write a
+/// bare one. The file install writes carries documented section comments that a
+/// `config set` could not reproduce, and a silently degraded config the operator
+/// later reads as theirs is the same class of harm as the silent default.
+///
+/// The wording mirrors `scaffold::register_workspace` rather than inventing a
+/// second spelling for one state.
+fn no_global_config() -> ! {
+    die(
+        "Error",
+        anyhow::anyhow!("no ~/.base-gbl/base.toml (run base install first)"),
+    )
+}
+
 /// Which tier a write targets: `-g/--global` swaps cwd for `~/.base-gbl`, so
 /// the global tier is something you opt into rather than something you land in
 /// (issue #8). Without the flag, tier-bound writes resolve from cwd and fail
@@ -3121,8 +3164,13 @@ pub fn run() {
                 .as_ref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or(cwd.clone());
+            // `die`, not a bare eprintln. This arm sits inside `run()`, which
+            // returns `()`, so printing the error and falling through exits 0 —
+            // the same defect leg B removed from the `config` arm, and the
+            // reason `scaffold` reported success over a refused registry sync
+            // even once `scaffold::run` started returning Err.
             if let Err(e) = base::scaffold::run(&target) {
-                eprintln!("Scaffold failed: {e}");
+                die("Scaffold failed", e);
             }
         }
 
@@ -3168,7 +3216,21 @@ pub fn run() {
         // ─── Workspace registry ───────────────────────────────
         Some(Commands::Workspace { action }) => match action {
             WorkspaceAction::Sync => match base::scaffold::sync_claude_md_registry() {
-                Ok(n) => println!("✓ synced {n} workspace(s) into ~/.claude/CLAUDE.md"),
+                // A count is not a loss. "synced 0 workspace(s)" reads as "there
+                // were none to sync" whether there were none or whether three
+                // were just removed, and the operator cannot tell those apart
+                // from the message that is supposed to describe what happened.
+                Ok(s) if s.cleared() > 0 => println!(
+                    "✓ ~/.claude/CLAUDE.md now lists {} workspace(s) — REMOVED {} that \
+                     ~/.base-gbl/base.toml no longer registers (it listed {} before)",
+                    s.written,
+                    s.cleared(),
+                    s.previous
+                ),
+                Ok(s) => println!(
+                    "✓ synced {} workspace(s) into ~/.claude/CLAUDE.md",
+                    s.written
+                ),
                 Err(e) => die("Failed", e),
             },
         },
@@ -3661,18 +3723,21 @@ pub fn run() {
 
         // ─── Config ────────────────────────────────────────
         Some(Commands::Config { action }) => {
-            let home = base::home::home_root().expect("Cannot determine home directory");
+            // `die`, not `expect`. Every sibling arm in this file reports a
+            // failure through `die` and exits 1; this one PANICKED at rc 101 for
+            // the same condition, so one fault produced two different exit codes
+            // depending on which command the operator happened to run. (#158 N5)
+            let Some(home) = base::home::home_root() else {
+                die("Error", anyhow::anyhow!("cannot determine home directory"));
+            };
             let path = home.join(".base-gbl").join("base.toml");
 
             match action {
                 ConfigAction::List => {
-                    let Ok(content) = std::fs::read_to_string(&path) else {
-                        eprintln!("Cannot read base.toml at {}", path.display());
-                        return;
-                    };
-                    let Ok(val) = content.parse::<toml::Value>() else {
-                        eprintln!("Failed to parse base.toml");
-                        return;
+                    // `list` reads the FILE, so an absent one has nothing to
+                    // list and is refused with the remedy named.
+                    let Some(val) = read_global_config(&path) else {
+                        no_global_config();
                     };
                     if let Some(table) = val.as_table() {
                         for (section, v) in table {
@@ -3685,19 +3750,22 @@ pub fn run() {
                     }
                 }
                 ConfigAction::Get { key } => {
-                    let Ok(content) = std::fs::read_to_string(&path) else {
-                        eprintln!("Cannot read base.toml");
-                        return;
-                    };
-                    let Ok(val) = content.parse::<toml::Value>() else {
-                        eprintln!("Failed to parse base.toml");
-                        return;
-                    };
+                    // The usage check runs first, and before the file is read: a
+                    // malformed key is wrong whatever the file happens to say.
                     let parts: Vec<&str> = key.splitn(2, '.').collect();
                     if parts.len() != 2 {
-                        eprintln!("Key must be section.field (e.g. memory.mode)");
-                        return;
+                        die(
+                            "Error",
+                            anyhow::anyhow!("key must be section.field (e.g. memory.mode)"),
+                        );
                     }
+                    // ABSENT is not a failure for `get`, and the asymmetry with
+                    // `set` is deliberate. Nearly every setting has a default
+                    // that is what the machine actually does, so a machine with
+                    // no base.toml can still be asked what it will do: reading a
+                    // default is honest. Silently discarding a WRITE is not.
+                    let val = read_global_config(&path)
+                        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
                     // A key absent from base.toml is not an absent key: nearly
                     // every one of them has a default that is what the machine
                     // actually does. `base config get update.auto` used to say
@@ -3713,19 +3781,16 @@ pub fn run() {
                     }
                 }
                 ConfigAction::Set { key, value } => {
-                    let Ok(content) = std::fs::read_to_string(&path) else {
-                        eprintln!("Cannot read base.toml");
-                        return;
-                    };
-                    let Ok(mut doc) = content.parse::<toml::Value>() else {
-                        eprintln!("Failed to parse base.toml");
-                        return;
-                    };
                     let parts: Vec<&str> = key.splitn(2, '.').collect();
                     if parts.len() != 2 {
-                        eprintln!("Key must be section.field (e.g. memory.mode)");
-                        return;
+                        die(
+                            "Error",
+                            anyhow::anyhow!("key must be section.field (e.g. memory.mode)"),
+                        );
                     }
+                    let Some(mut doc) = read_global_config(&path) else {
+                        no_global_config();
+                    };
                     let section = parts[0];
                     let field = parts[1];
 
@@ -3739,25 +3804,31 @@ pub fn run() {
                         toml::Value::String(value.clone())
                     };
 
-                    let table = doc.as_table_mut().unwrap();
+                    let Some(table) = doc.as_table_mut() else {
+                        die(
+                            "Error",
+                            anyhow::anyhow!("{} is not a TOML table", path.display()),
+                        );
+                    };
                     let sec = table.entry(section).or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-                    if let Some(sec_table) = sec.as_table_mut() {
-                        sec_table.insert(field.to_string(), new_val.clone());
-                    } else {
-                        eprintln!("Section '{section}' is not a table");
-                        return;
-                    }
+                    let Some(sec_table) = sec.as_table_mut() else {
+                        die("Error", anyhow::anyhow!("section '{section}' is not a table"));
+                    };
+                    sec_table.insert(field.to_string(), new_val.clone());
 
-                    match toml::to_string_pretty(&doc) {
-                        Ok(out) => {
-                            if let Err(e) = std::fs::write(&path, out) {
-                                eprintln!("Failed to write base.toml: {e}");
-                            } else {
-                                println!("Updated {key} = {new_val}");
-                            }
-                        }
-                        Err(e) => eprintln!("Failed to serialize: {e}"),
+                    let out = match toml::to_string_pretty(&doc) {
+                        Ok(out) => out,
+                        Err(e) => die("Failed to serialize base.toml", e),
+                    };
+                    // THE leg B line. This used to `eprintln!` and fall through
+                    // with NO `return` at all, so `base config set` against a
+                    // read-only file printed an error and exited 0 -- reporting
+                    // success over a write it did not make. The write IS the
+                    // command: if it did not land, the command failed.
+                    if let Err(e) = std::fs::write(&path, out) {
+                        die(&format!("Failed to write {}", path.display()), e);
                     }
+                    println!("Updated {key} = {new_val}");
                 }
             }
         },

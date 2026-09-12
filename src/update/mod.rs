@@ -9,8 +9,22 @@
 //! release pipeline never publishes to, so `base update` could not deliver the
 //! releases actually being cut. GitHub releases are the single source of truth now.
 //!
-//! No license. No account. No identifiers leave the machine. The only request is an
-//! anonymous GET of a public repo's latest release, plus the asset download.
+//! No license. No account. No identifiers leave the machine. The release check is a
+//! GET of a public repo's latest release, plus the asset download.
+//!
+//! That check is anonymous unless the operator's own environment already holds a
+//! GitHub token. `GITHUB_TOKEN` or `GH_TOKEN`, if either is set, is sent as an
+//! `Authorization` header, because an anonymous check is rate limited per IP
+//! address and a shared or busy address runs out of budget -- at which point the
+//! tool can no longer tell anyone that a new version exists.
+//!
+//! Nothing is read that the operator did not already put in their own
+//! environment, and the token can only ever reach `api.github.com`: the address
+//! below is a hardcoded constant, with no setting and no environment variable
+//! that can point this request anywhere else. That is deliberate. There is no
+//! signature check and no checksum check in the download path, so the constant
+//! is the only thing vouching for what gets installed, and making it overridable
+//! would turn a redirected update into arbitrary code execution.
 
 use std::path::{Path, PathBuf};
 
@@ -63,15 +77,79 @@ fn is_current(current: &str, latest: &str) -> bool {
     semver_tuple(current) >= semver_tuple(latest)
 }
 
+/// The two variables a GitHub token conventionally lives in, in the order `gh`
+/// itself resolves them.
+const TOKEN_VARS: [&str; 2] = ["GITHUB_TOKEN", "GH_TOKEN"];
+
+/// A token already sitting in the operator's environment, or `None` for an
+/// anonymous check.
+///
+/// These two variables and nothing else. `plugin::dist` resolves a token from
+/// further sources, ending in a `gh auth token` subprocess, and that is right
+/// for a one-off plugin download and wrong here: `hook/session_start.rs` runs
+/// the update check on EVERY session start, so a subprocess on this path is one
+/// spawn per session — and on a machine with no `gh` installed, one FAILED spawn
+/// per session, forever, to learn nothing. This path reads two environment
+/// variables and touches nothing else.
+fn token_from_env() -> Option<String> {
+    TOKEN_VARS
+        .iter()
+        .find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()))
+}
+
+/// Say what actually went wrong with the release check.
+///
+/// Every failure used to be wrapped in "could not reach the GitHub releases
+/// API", status codes included. That sentence is true only of a transport
+/// failure. On a rate limit it sent the operator off to check a network that was
+/// working perfectly, and hid the one thing that fixes it: a token.
+fn describe_release_api_error(err: Box<ureq::Error>) -> anyhow::Error {
+    match *err {
+        ureq::Error::Status(403, ref r) if r.header("x-ratelimit-remaining") == Some("0") => {
+            anyhow::anyhow!(
+                "GitHub rate limit reached for this machine's IP address, so the \
+                 release check was refused. Set GITHUB_TOKEN or GH_TOKEN to check \
+                 as yourself, which raises the limit."
+            )
+        }
+        ureq::Error::Status(403, _) => {
+            anyhow::anyhow!("GitHub refused the release check (403 forbidden)")
+        }
+        ureq::Error::Status(code, _) => {
+            anyhow::anyhow!("the GitHub releases API answered with status {code}")
+        }
+        ureq::Error::Transport(t) => {
+            anyhow::anyhow!("could not reach the GitHub releases API: {t}")
+        }
+    }
+}
+
 /// The latest release: its tag (leading `v` stripped) and the download URL for
 /// this platform's asset.
-fn fetch_latest_release() -> Result<(String, String)> {
-    let resp = ureq::get(LATEST_RELEASE_API)
+///
+/// `send` is the transport, supplied by the caller. Production passes a closure
+/// that calls the request. A test passes one that reads the request and answers
+/// it from memory, so no socket is opened anywhere.
+///
+/// The request is built HERE and in no other place in this file, and that is the
+/// point rather than an accident of style. With a single construction site there
+/// is nowhere else for this module to build a release request, so no later edit
+/// can quietly route around the header wiring below, and the request a test
+/// inspects is the same object production sends.
+pub fn fetch_latest_release<F>(send: F) -> Result<(String, String)>
+where
+    F: Fn(ureq::Request) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+{
+    let req = ureq::get(LATEST_RELEASE_API)
         .timeout(std::time::Duration::from_secs(API_TIMEOUT_SECS))
         .set("user-agent", USER_AGENT)
-        .set("accept", "application/vnd.github+json")
-        .call()
-        .context("could not reach the GitHub releases API")?;
+        .set("accept", "application/vnd.github+json");
+    let req = match token_from_env() {
+        Some(t) => req.set("authorization", &format!("Bearer {t}")),
+        None => req,
+    };
+
+    let resp = send(req).map_err(describe_release_api_error)?;
 
     let json: serde_json::Value = resp.into_json().context("malformed release JSON")?;
 
@@ -510,7 +588,7 @@ fn auto_install_dest() -> Result<PathBuf> {
 /// The background path: no output, no ceremony, just get current.
 fn run_quiet(force: bool) -> Result<Option<String>> {
     let current = env!("CARGO_PKG_VERSION");
-    let (latest, url) = fetch_latest_release()?;
+    let (latest, url) = fetch_latest_release(|req| req.call().map_err(Box::new))?;
     if !force && is_current(current, &latest) {
         return Ok(None);
     }
@@ -539,7 +617,7 @@ fn run_verbose(check_only: bool, force: bool) -> Result<Option<String>> {
     let current = env!("CARGO_PKG_VERSION");
     println!("base {current} — checking GitHub releases …");
 
-    let (latest, url) = fetch_latest_release()?;
+    let (latest, url) = fetch_latest_release(|req| req.call().map_err(Box::new))?;
 
     if !force && is_current(current, &latest) {
         println!("✓ already up to date (base {current}).");

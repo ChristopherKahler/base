@@ -747,36 +747,214 @@ impl Default for SyncConfig {
     }
 }
 
+/// A `base.toml` that EXISTS but could not become settings.
+///
+/// There is deliberately NO `Absent` variant. A missing `base.toml` is a normal
+/// first run, not a fault, and collapsing those two states is the defect this
+/// type exists to remove (#158): absent, empty and unreadable are three
+/// different things and only the last two are worth speaking about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigFault {
+    /// The file is there and could not be read: permissions, a directory in its
+    /// place, an I/O error. Anything except "not found".
+    Unreadable { path: PathBuf, err: String },
+    /// The file was read and is not valid TOML.
+    Unparseable { path: PathBuf, err: String },
+    /// Valid TOML, wrong shape for `BaseConfig`. One wrongly typed field --
+    /// `auto = "yes"` where a bool belongs -- used to discard every OTHER
+    /// setting in the file as well, silently.
+    Mismatched { paths: Vec<PathBuf>, err: String },
+    /// No home directory could be resolved, so neither tier could be located.
+    HomeUnresolvable,
+}
+
+impl ConfigFault {
+    /// What went wrong, WITHOUT the consequence clause.
+    ///
+    /// [`Display`] appends "base is running on DEFAULT settings, not yours",
+    /// which is exactly right where a fault makes `BaseConfig` fall back to its
+    /// defaults -- and wrong anywhere else. `scaffold`'s registry read hits the
+    /// same file for a different reason and owes the operator a different
+    /// consequence, so it borrows the cause and states its own. (#158 leg C)
+    pub fn cause(&self) -> String {
+        match self {
+            Self::Unreadable { path, err } => format!("cannot read {} ({err})", path.display()),
+            Self::Unparseable { path, err } => format!("cannot parse {} ({err})", path.display()),
+            Self::Mismatched { paths, err } => {
+                let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                format!("{} is valid TOML but not valid settings ({err})", names.join(" + "))
+            }
+            Self::HomeUnresolvable => {
+                "cannot determine a home directory, so no base.toml could be read".to_string()
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every arm ends with the consequence, because a path and a parse error
+        // alone do not tell the operator the thing that actually matters: the
+        // settings they chose are NOT the settings base is running on.
+        const TAIL: &str = "base is running on DEFAULT settings, not yours";
+        write!(f, "{} -- {TAIL}", self.cause())
+    }
+}
+
+/// Report config faults on stderr, at most once per process.
+///
+/// ONCE PER PROCESS, not once per call, because one `base scaffold` calls
+/// `BaseConfig::load` three times (`scaffold.rs:114`, `install.rs:977` and
+/// `install.rs:1520`) and the operator does not need telling three times. The
+/// empty case returns before touching the latch, so a healthy first load does
+/// not spend it and a fault arriving later still speaks.
+///
+/// STDERR, deliberately, and the reason is specific rather than stylistic.
+/// `hook/mod.rs:136` is one of the nine production call sites, so this runs
+/// inside a hook. A hook STDOUT is a parsed contract: on pre-tool-use,
+/// post-tool-use and stop it must be exactly one JSON envelope, and on
+/// session-start and user-prompt-submit it is the injected text itself. Stderr
+/// is the operator-diagnostic channel on every one of those paths -- `dispatch`
+/// at `hook/mod.rs:67` fails open to "stderr only, exit 0, empty stdout", and
+/// `post_tool_use.rs` records that "stderr stays stderr -- those lines are
+/// operator diagnostics, not model context". A config warning must never be
+/// able to change one byte of hook stdout, and a test asserts exactly that.
+fn report_config_faults_once(faults: &[ConfigFault]) {
+    report_config_faults(faults, &FAULTS_REPORTED);
+}
+
+/// The one report this process gets.
+///
+/// A `static` rather than a field because there is no object to hang it on:
+/// `load` is an associated function reached from nine unrelated call sites, none
+/// of which share any state.
+static FAULTS_REPORTED: std::sync::Once = std::sync::Once::new();
+
+/// The body of [`report_config_faults_once`], with the latch passed in. Returns
+/// whether THIS call was the one that spoke.
+///
+/// The latch is a parameter for exactly one reason: a `std::sync::Once` cannot be
+/// re-armed, and `cargo test` runs a file's tests inside one process, so a
+/// process-global latch would let whichever test reported first decide the result
+/// of every other one. That is a flaky instrument, not a test.
+///
+/// Production never passes anything but `FAULTS_REPORTED`, so shipped behaviour is
+/// unchanged. And because an injected latch can only ever prove the latch -- never
+/// that production wires the real one -- the once-per-process claim is ALSO proved
+/// end to end against the shipped binary, in
+/// `tests/config_fault_once_per_process_test.rs`.
+fn report_config_faults(faults: &[ConfigFault], latch: &std::sync::Once) -> bool {
+    // Before the latch, deliberately. A healthy load must not spend the one report
+    // the process gets, or a file that broke later in the same process would say
+    // nothing -- which is this defect again, one level up.
+    if faults.is_empty() {
+        return false;
+    }
+    let mut spoke = false;
+    latch.call_once(|| {
+        spoke = true;
+        for fault in faults {
+            eprintln!("base: {fault}");
+        }
+    });
+    spoke
+}
+
 impl BaseConfig {
     /// Load config: global `~/.base-gbl/base.toml` as base, workspace `.base/base.toml` overlaid on top.
     /// Workspace sections override global at the key level; missing sections inherit from global.
+    ///
+    /// A config that cannot be read or parsed is REPORTED (once per process)
+    /// rather than silently replaced by defaults. The signature is unchanged on
+    /// purpose: six of the nine production call sites have no useful error path
+    /// and would each end in `unwrap_or_default()`, which would copy the silent
+    /// default to six places instead of removing it from one. A caller that
+    /// needs to ACT on a fault uses [`BaseConfig::load_reporting`].
     pub fn load(cwd: &Path) -> Self {
-        Self::try_load(cwd).unwrap_or_default()
+        let (config, faults) = Self::load_reporting(cwd);
+        report_config_faults_once(&faults);
+        config
     }
 
-    fn try_load(cwd: &Path) -> Option<Self> {
-        let home = crate::home::home_root()?;
+    /// Load, and say what could not be read.
+    ///
+    /// The returned list is empty on a healthy load AND on a first run with no
+    /// `base.toml` anywhere -- absent is not a fault, which is why
+    /// [`ConfigFault`] has no variant for it. Every other outcome that used to
+    /// collapse into `default()` now names itself here.
+    pub fn load_reporting(cwd: &Path) -> (Self, Vec<ConfigFault>) {
+        let mut faults = Vec::new();
+
+        let Some(home) = crate::home::home_root() else {
+            faults.push(ConfigFault::HomeUnresolvable);
+            return (Self::default(), faults);
+        };
         let global_path = home.join(".base-gbl").join("base.toml");
         let ws_path = cwd.join(".base").join("base.toml");
 
-        let global = Self::load_toml_table(&global_path);
-        let workspace = Self::load_toml_table(&ws_path);
+        let global = Self::read_table(&global_path, &mut faults);
+        let workspace = Self::read_table(&ws_path, &mut faults);
+
+        // Only the files that actually produced a table are named as sources of
+        // a shape error. Asking the filesystem again with `exists()` would cost
+        // a syscall and could disagree with what was just read.
+        let mut sources = Vec::new();
+        if global.is_some() {
+            sources.push(global_path);
+        }
+        if workspace.is_some() {
+            sources.push(ws_path);
+        }
 
         let merged = match (global, workspace) {
             (Some(g), Some(w)) => merge_toml_tables(g, w),
             (Some(g), None) => g,
             (None, Some(w)) => w,
-            (None, None) => return None,
+            (None, None) => return (Self::default(), faults),
         };
 
-        toml::Value::Table(merged).try_into().ok()
+        match toml::Value::Table(merged).try_into() {
+            Ok(config) => (config, faults),
+            Err(e) => {
+                faults.push(ConfigFault::Mismatched {
+                    paths: sources,
+                    err: e.to_string(),
+                });
+                (Self::default(), faults)
+            }
+        }
     }
 
-    fn load_toml_table(path: &Path) -> Option<toml::Table> {
-        let content = std::fs::read_to_string(path).ok()?;
-        content.parse::<toml::Table>().ok()
+    /// One tier table. Returns `None` for "nothing to merge from here", and
+    /// pushes a fault for every reason EXCEPT the file being absent.
+    ///
+    /// This single match arm is the honest-envelope law in code: the read used
+    /// to end `.ok()?`, which made a missing file and an unreadable one
+    /// indistinguishable to everything downstream.
+    fn read_table(path: &Path, faults: &mut Vec<ConfigFault>) -> Option<toml::Table> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            // The one quiet case: no file is a normal first run.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                faults.push(ConfigFault::Unreadable {
+                    path: path.to_path_buf(),
+                    err: e.to_string(),
+                });
+                return None;
+            }
+        };
+        match content.parse::<toml::Table>() {
+            Ok(table) => Some(table),
+            Err(e) => {
+                faults.push(ConfigFault::Unparseable {
+                    path: path.to_path_buf(),
+                    err: e.to_string(),
+                });
+                None
+            }
+        }
     }
-
 }
 
 /// Deep-merge two TOML tables. Overlay values win; nested tables merge recursively.
@@ -970,5 +1148,294 @@ mod tests {
             std::fs::create_dir_all(&orphan).unwrap();
             assert_eq!(find_workspace_base(&orphan), None);
         });
+    }
+
+    // ─── #158 leg A — a config that cannot be read is reported, never swallowed ───
+    //
+    // These observe `load_reporting`, which is pure and returns the faults. That is
+    // NOT a channel any operator reads, so every claim below is re-proved against
+    // the shipped binary's stderr and exit code in
+    // `tests/config_fault_surface_test.rs`. Green here and silent there would mean
+    // nothing was fixed.
+
+    /// The global `base.toml` inside an isolated fake home, with its parent made.
+    /// Returns the path so a test can corrupt exactly that file and nothing else.
+    fn fake_global_toml(home: &Path) -> PathBuf {
+        let dir = home.join(".base-gbl");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("base.toml")
+    }
+
+    /// The headline of #158: a file that exists and does not parse has to SPEAK,
+    /// and what it says has to be actionable — which file, and what is wrong.
+    #[test]
+    fn an_unparseable_global_config_reports_its_path_and_the_parse_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let path = fake_global_toml(tmp.path());
+            std::fs::write(&path, "[update]\nauto = \n").unwrap();
+
+            let (config, faults) = BaseConfig::load_reporting(tmp.path());
+
+            assert_eq!(faults.len(), 1, "one broken file is one fault: {faults:?}");
+            match &faults[0] {
+                ConfigFault::Unparseable { path: p, err } => {
+                    assert_eq!(p, &path, "the fault names the file the operator must fix");
+                    assert!(!err.is_empty(), "and carries the parser's own words");
+                }
+                other => panic!("an unparseable file is Unparseable, not {other:?}"),
+            }
+            // The settings really are gone. That is the truth the operator needs
+            // told, not hidden — what changed is that it is no longer SILENT.
+            assert_eq!(config.update.auto, BaseConfig::default().update.auto);
+        });
+    }
+
+    /// Exists and cannot be read is a third state, and it used to be
+    /// indistinguishable from absent. A directory where the file belongs fails
+    /// `read_to_string` with something that is NOT `NotFound`, on every platform,
+    /// without depending on the uid the suite happens to run as — `chmod 000` is a
+    /// no-op for root and would make this test silently stop measuring.
+    #[test]
+    fn an_unreadable_global_config_is_a_fault_and_is_not_confused_with_an_absent_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let path = fake_global_toml(tmp.path());
+            std::fs::create_dir_all(&path).unwrap();
+
+            let (_config, faults) = BaseConfig::load_reporting(tmp.path());
+
+            assert_eq!(faults.len(), 1, "{faults:?}");
+            match &faults[0] {
+                ConfigFault::Unreadable { path: p, err } => {
+                    assert_eq!(p, &path);
+                    assert!(!err.is_empty(), "the OS error is what tells them why");
+                }
+                other => panic!("a file that exists and cannot be read is Unreadable, not {other:?}"),
+            }
+        });
+    }
+
+    /// N2, and the widest of the four collapse points. `try_into()` is
+    /// all-or-nothing: one wrongly typed field — `auto = "yes"` where a bool
+    /// belongs — used to discard every OTHER setting in the file along with it,
+    /// silently. A one-character typo cost the operator their whole configuration.
+    #[test]
+    fn a_single_wrongly_typed_field_no_longer_discards_every_other_setting_in_silence() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let path = fake_global_toml(tmp.path());
+            // Valid TOML that is not valid settings: it parses, then fails to convert.
+            std::fs::write(
+                &path,
+                "[update]\nauto = \"yes\"\n\n[namespace]\nprefix = \"chosen-by-the-operator\"\n",
+            )
+            .unwrap();
+
+            let (config, faults) = BaseConfig::load_reporting(tmp.path());
+
+            assert_eq!(faults.len(), 1, "{faults:?}");
+            match &faults[0] {
+                ConfigFault::Mismatched { paths, err } => {
+                    assert!(
+                        paths.contains(&path),
+                        "the file that produced the table is named: {paths:?}"
+                    );
+                    assert!(!err.is_empty());
+                }
+                other => panic!("valid TOML of the wrong shape is Mismatched, not {other:?}"),
+            }
+            // The unrelated setting IS still lost — this leg does not change that,
+            // because the conversion is all-or-nothing. It is now announced.
+            assert_eq!(
+                config.namespace.prefix,
+                BaseConfig::default().namespace.prefix,
+                "precondition for the report mattering: the good setting really did go"
+            );
+        });
+    }
+
+    /// The control that makes every test above mean something. Absent is NOT a
+    /// fault: a first run has no `base.toml` anywhere and must stay completely
+    /// quiet, or the warning becomes noise everyone learns to scroll past.
+    #[test]
+    fn an_absent_config_is_not_a_fault_in_either_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            std::fs::create_dir_all(tmp.path().join(".base-gbl")).unwrap();
+            let ws = tmp.path().join("ws");
+            std::fs::create_dir_all(ws.join(".base")).unwrap();
+            assert!(
+                !tmp.path().join(".base-gbl").join("base.toml").exists(),
+                "precondition: no global file"
+            );
+            assert!(
+                !ws.join(".base").join("base.toml").exists(),
+                "precondition: no workspace file"
+            );
+
+            let (config, faults) = BaseConfig::load_reporting(&ws);
+
+            assert!(faults.is_empty(), "a first run is not a fault: {faults:?}");
+            assert_eq!(config.update.auto, BaseConfig::default().update.auto);
+        });
+    }
+
+    /// The other control: a good file is silent AND its settings are the ones in
+    /// force. A "fix" that reported on every load would pass the broken arms and
+    /// fail here.
+    #[test]
+    fn a_healthy_config_reports_nothing_and_its_settings_are_honoured() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            std::fs::write(fake_global_toml(tmp.path()), "[update]\nauto = false\n").unwrap();
+
+            let (config, faults) = BaseConfig::load_reporting(tmp.path());
+
+            assert!(faults.is_empty(), "a good file has nothing to report: {faults:?}");
+            assert!(
+                !config.update.auto,
+                "and the setting the operator chose is the one in force"
+            );
+        });
+    }
+
+    /// Two tiers, one broken. The fault has to name the file that is actually
+    /// broken or the operator edits the wrong one — and the tier that still reads
+    /// must keep applying, so a broken overlay does not cost them settings that
+    /// are perfectly readable.
+    #[test]
+    fn a_broken_workspace_config_names_the_workspace_file_and_spares_the_global_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            std::fs::write(fake_global_toml(tmp.path()), "[update]\nauto = false\n").unwrap();
+            let ws = tmp.path().join("ws");
+            std::fs::create_dir_all(ws.join(".base")).unwrap();
+            let ws_toml = ws.join(".base").join("base.toml");
+            std::fs::write(&ws_toml, "this is not toml {{{\n").unwrap();
+
+            let (config, faults) = BaseConfig::load_reporting(&ws);
+
+            assert_eq!(faults.len(), 1, "only the broken tier faults: {faults:?}");
+            match &faults[0] {
+                ConfigFault::Unparseable { path, .. } => assert_eq!(
+                    path, &ws_toml,
+                    "the workspace file is the broken one; naming the global file would send them to the wrong place"
+                ),
+                other => panic!("{other:?}"),
+            }
+            assert!(
+                !config.update.auto,
+                "the readable global tier still applies — a broken overlay is not a reset"
+            );
+        });
+    }
+
+    /// DoD 15 / N3 — the shipped claim this defect makes false.
+    ///
+    /// `config.rs` documents the pin as `base config set update.auto false`, and
+    /// `hook/session_start.rs` calls `auto_update` on EVERY session start, gated on
+    /// that flag, whose default is `true`. So an unparseable file silently un-pins
+    /// the machine and it resumes updating itself.
+    ///
+    /// This test states the residual honestly instead of hiding it: the pin IS
+    /// lost, because a file that will not parse cannot say `false`. What leg A
+    /// closes is the SILENCE. `load` reports before returning, and `hook/mod.rs`
+    /// loads before it dispatches to `session_start::handle`, so the operator is
+    /// told before `auto_update` is ever reached.
+    #[test]
+    fn a_pinned_machine_that_loses_its_config_is_never_silent_about_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let path = fake_global_toml(tmp.path());
+
+            // The pin works, and is quiet.
+            std::fs::write(&path, "[update]\nauto = false\n").unwrap();
+            let (pinned, quiet) = BaseConfig::load_reporting(tmp.path());
+            assert!(!pinned.update.auto, "precondition: the machine is pinned");
+            assert!(quiet.is_empty(), "precondition: a good file says nothing");
+
+            // The file stops parsing, which is exactly what #158 reports.
+            std::fs::write(&path, "[update]\nauto = false\n[[[ broken\n").unwrap();
+            let (after, faults) = BaseConfig::load_reporting(tmp.path());
+
+            assert!(
+                after.update.auto,
+                "the pin is genuinely lost — reporting that honestly is the point"
+            );
+            assert!(!faults.is_empty(), "and it is NO LONGER SILENT, which is the fix");
+            assert!(
+                faults
+                    .iter()
+                    .any(|f| f.to_string().contains(&path.display().to_string())),
+                "the report names the file that lost the pin: {faults:?}"
+            );
+        });
+    }
+
+    /// A message has to carry the consequence, not only the cause. "cannot parse X"
+    /// tells an operator a file is broken; it does not tell them that the settings
+    /// they chose are not the settings running.
+    #[test]
+    fn every_fault_names_its_consequence_as_well_as_its_cause() {
+        let faults = [
+            ConfigFault::Unreadable {
+                path: PathBuf::from("/probe/a.toml"),
+                err: "permission denied".into(),
+            },
+            ConfigFault::Unparseable {
+                path: PathBuf::from("/probe/b.toml"),
+                err: "expected value".into(),
+            },
+            ConfigFault::Mismatched {
+                paths: vec![PathBuf::from("/probe/c.toml")],
+                err: "invalid type".into(),
+            },
+            ConfigFault::HomeUnresolvable,
+        ];
+        for f in &faults {
+            let msg = f.to_string();
+            assert!(
+                msg.contains("DEFAULT settings, not yours"),
+                "a fault says what it COST, not only what went wrong: {msg}"
+            );
+        }
+        assert!(faults[0].to_string().contains("/probe/a.toml"));
+        assert!(faults[1].to_string().contains("/probe/b.toml"));
+        assert!(faults[2].to_string().contains("/probe/c.toml"));
+        assert!(
+            faults[0].to_string().contains("permission denied"),
+            "the underlying error survives into the message"
+        );
+    }
+
+    /// The guard is "once per process", not "once per call": one `base scaffold`
+    /// calls `load` three times and the operator does not need telling three times.
+    ///
+    /// The empty case must return BEFORE the latch. If a healthy load spent it, a
+    /// file that broke later in the same process would say nothing — which is the
+    /// defect again, one level up. The latch is a parameter here for exactly this
+    /// test: a process-global `Once` cannot be re-armed, so any other test that
+    /// happened to report first would decide this one's result.
+    #[test]
+    fn the_report_latch_fires_once_and_an_empty_report_does_not_spend_it() {
+        let latch = std::sync::Once::new();
+        let fault = [ConfigFault::HomeUnresolvable];
+
+        assert!(
+            !report_config_faults(&[], &latch),
+            "nothing to say means nothing said"
+        );
+        assert!(
+            !latch.is_completed(),
+            "and a healthy load must not spend the one report the process gets"
+        );
+
+        assert!(report_config_faults(&fault, &latch), "the first real fault speaks");
+        assert!(latch.is_completed());
+        assert!(
+            !report_config_faults(&fault, &latch),
+            "and the second, third and fourth do not"
+        );
     }
 }
