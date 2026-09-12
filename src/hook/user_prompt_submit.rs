@@ -113,7 +113,63 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     };
     let matched = match_domains_auto(&prompt, &domains, &active_paths, &trigger_ctx);
     if matched.is_empty() {
-        // Still save session state (prompt_count) even if nothing matched
+        // N-WALK-DEAD-WITHOUT-A-MATCHED-DOMAIN. The walk resolves what the
+        // PROMPT TEXT names, which has nothing to do with whether a domain
+        // trigger fired. Returning here without running it left every machine
+        // whose domains are all `mode = "triggered"` with no prompt-time
+        // traversal at all -- the headline claim dead on any install with no
+        // always-on domain. Same shape, and the same fix, as the early return
+        // `base context` used to take in `domain::query`.
+        //
+        // AND N-BRACKET-DEAD-WITHOUT-A-MATCHED-DOMAIN, the same early return
+        // costing the same users a second feature. The bracket line and its
+        // rules are tier-gated, never domain-gated: they are re-sent every
+        // prompt precisely because they are the layer that must not erode as
+        // context fills, which a once-per-session injection cannot guarantee.
+        // Skipping them here made them erode fastest for the user with the
+        // fewest domains -- and on an install whose domains are all
+        // `mode = "triggered"`, erode to nothing.
+        //
+        // `prompt_count_for(session_id)`, NOT the raw `session.prompt_count`.
+        // Of the four return sites in this function this was the only one
+        // reaching for the raw counter, and the main path below prints the
+        // per-session number -- so the raw one would show a user two different
+        // prompt numbers depending on whether a domain happened to match, each
+        // inflated by every concurrent session sharing the workspace.
+        //
+        // The returned `HookEventData` keeps `session.prompt_count` unchanged.
+        // That field feeds the JSONL log rather than the prompt, it has always
+        // carried that number here, and whether it should is a separate
+        // question from what the reader sees.
+        //
+        // Built as one string and printed once, like the main path below. Two
+        // `print!` calls would do the same thing, but a literal ending in a
+        // newline trips clippy's `print_with_newline` under `-D warnings`.
+        //
+        // Nothing to dedup against: `domain_served` is filled by the domain
+        // loop below, which an empty `matched` makes a no-op.
+        //
+        // No lean-mode gate either. `lean_mode` needs the prompt number
+        // computed below this return -- and the walk on the main path is not
+        // gated on it, so gating here would be the one place in the hook where
+        // the walk still consulted it.
+        let nomatch_prompt_num = session.prompt_count_for(session_id);
+        let mut out = format!(
+            "<context-bracket>[{bracket}] (prompt {nomatch_prompt_num})</context-bracket>\n\n"
+        );
+        out.push_str(&bracket_rules);
+        if let Some(ref store) = graph_store {
+            let nothing_served = std::collections::HashSet::new();
+            let walked =
+                crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &nothing_served);
+            // Dedup, render and mark as one unit -- see `render_walk_block`.
+            let w = render_walk_block(&mut session, walked, config.injection.walk_budget);
+            out.push_str(&w.block);
+        }
+        print!("{out}");
+        // Still save session state (prompt_count) even if nothing matched.
+        // AFTER the walk, so the marks it just wrote are in what gets saved --
+        // otherwise dedup resets every prompt and the walk re-serves forever.
         if let Some(ref base_dir) = base_dir {
             let _ = session.save(base_dir);
         }
@@ -300,99 +356,49 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
 
     // ─── Prompt-time traversal ───────────────────────────────────────────
     // AFTER the domain loop, not before: it dedups against the IRIs those
-    // blocks served, and it cannot do that before they have run. Skipped in
-    // lean mode with the neighbourhood, for the same reason.
+    // blocks served, and it cannot do that before they have run.
     //
-    // `maps_from_store` and not `graph_query::load_graph`: the store is already
-    // parsed above, and load_graph would parse it a second time AND read the
-    // workspace graph only, so this layer would disagree with the domain layer
-    // beside it about what the graph contains.
+    // NOT gated on lean mode, deliberately. The flag it used to sit behind was
+    // introduced by fb1cd48 (2026-06-01) for the NEIGHBOURHOOD, three months
+    // before this walk existed -- `git show fb1cd48:src/hook/user_prompt_submit.rs`
+    // contains no walk at all. 29ff99a (2026-09-07) then hung the walk on the
+    // same flag without the question being asked, so there was never a design
+    // intent here to preserve.
     //
-    // include_ast = false. The CLI passes true because `base graph neighbors`
-    // is expected to walk into call graphs; this walk resolves projects,
-    // decisions, people and documents, and parsing a 23.6 MB AST sidecar on
-    // every prompt to serve none of it is the kind of cost nobody sees.
-    let walked = match (&graph_store, lean_mode) {
-        (Some(store), false) => crate::graph_query::maps_from_store(store, cwd, &config.namespace, false)
-            .ok()
-            .map(|maps| {
-                crate::hook::walk::walk(
-                    &maps,
-                    &config.namespace,
-                    &prompt,
-                    &domain_served,
-                    // One list, every reader (ruling 4): the same seam the graph
-                    // commands, recall, the domain block and the dashboard consult.
-                    // A substring test stood here until PR #50 landed (kite F4).
-                    &|id: &str| crate::ontology::transient::is_transient_iri(&config.namespace, id),
-                    // The drift fork's fill. `None` means the record still stands;
-                    // `Some(head)` is the record that replaced it, so the walk
-                    // re-anchors rather than dropping the edge that reached it.
-                    //
-                    // `store` is the one `load_merged` already parsed above — the
-                    // whole reason this closure takes it rather than calling
-                    // `load_graph`. A load here would be a second full parse on
-                    // every prompt, and `store::GRAPH_LOADS` would catch it as a
-                    // red test rather than as a session that got quietly slower.
-                    //
-                    // `graph_query` ids carry angle brackets and `resolve_head`
-                    // walks bare IRIs, so the brackets come off and go back on.
-                    &|id: &str| {
-                        let bare = id.trim_start_matches('<').trim_end_matches('>');
-                        let head = crate::supersede::resolve_head(store, &config.namespace, bare);
-                        (head != bare).then(|| format!("<{head}>"))
-                    },
-                )
-            }),
-        _ => None,
-    };
+    // And the saving was not real. Skipping the injection does not reduce what
+    // the session consumes, it moves the cost and makes it larger: the session
+    // then spends more than the block's bytes running recall, greps and file
+    // reads to find by hand what the block would have handed it. An injection is
+    // cheaper than the search it replaces. Prompts 1 and 2 are usually where
+    // someone starts work, which is where that signal is worth most.
+    //
+    // The NEIGHBOURHOOD skip above still honours lean mode. That is what the
+    // flag was built for and it is untouched.
+    //
+    // The maps, the closures and the reasons for both now live in
+    // `walk::walk_from_text`, which `base context` calls as well. One seam, so the
+    // command and the prompt path cannot answer differently about the same graph.
+    let walked = graph_store.as_ref().map(|store| {
+        crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &domain_served)
+    });
 
     // The walk's block rides after the domain blocks, so a reader sees the
     // configured layer first and the named-thing layer as the specific addition.
     let mut walk_note = String::new();
     if let Some(walked) = walked {
-        // Once per session per node, not once per prompt. Naming the same
-        // project in five consecutive prompts is one context, not five: the
-        // domain layer above has always worked this way and the record layer
-        // has no reason to be noisier. Keyed on the resolved IRI rather than the
-        // spelling, so "First Client Kit" and "first-client-kit" are one entry.
-        let mut fresh: Vec<(crate::hook::walk::Resolved, Vec<crate::hook::walk::Record>)> = Vec::new();
-        let mut walk_deduped = 0usize;
-        for (r, recs) in walked {
-            let key = format!("walk:{}", r.id);
-            let h = crate::domain::session::rules_hash(std::slice::from_ref(&r.id));
-            if session.is_injected(&key, h) {
-                walk_deduped += 1;
-                continue;
-            }
-            // NOT marked here. Marking before the render means a name whose
-            // records are all cut by the byte budget is recorded as injected and
-            // never shown again this session -- the budget quietly becoming a
-            // permanent suppression, which looks exactly like dedup working.
-            // Marked below, against what actually rendered.
-            fresh.push((r, recs));
+        // Dedup, render and mark as one unit -- see `render_walk_block`. The
+        // no-match return above is the other caller, and it needs all three for
+        // the same reasons this path does.
+        let w = render_walk_block(&mut session, walked, config.injection.walk_budget);
+        if config.devmode.enabled && w.deduped > 0 {
+            walk_note.push_str(&format!("  walk: {} name(s) already injected this session\n", w.deduped));
         }
-        let walked = fresh;
-        if config.devmode.enabled && walk_deduped > 0 {
-            walk_note.push_str(&format!("  walk: {walk_deduped} name(s) already injected this session\n"));
-        }
-        let walked = &walked;
-        let (block, dropped) = crate::hook::walk::render(walked, config.injection.walk_budget);
-        if !block.is_empty() {
-            output.push_str(&block);
+        if !w.block.is_empty() {
+            output.push_str(&w.block);
             injected_any = true;
         }
-        // Mark only what the reader actually got. A name the budget squeezed out
-        // entirely was not served, so it must be free to come back next prompt.
-        for (r, _) in walked {
-            if block.contains(&format!("name=\"{}\"", r.name)) {
-                let key = format!("walk:{}", r.id);
-                session
-                    .mark_injected(&key, crate::domain::session::rules_hash(std::slice::from_ref(&r.id)));
-            }
-        }
         if config.devmode.enabled {
-            for (r, recs) in walked {
+            for (r, recs) in &w.served {
                 walk_note.push_str(&format!(
                     "  walk: {} → {} ({}) {} hop(s), {} record(s){}\n",
                     r.name,
@@ -403,8 +409,8 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
                     if r.ties > 1 { format!(", {} same-kind ties", r.ties) } else { String::new() },
                 ));
             }
-            if dropped > 0 {
-                walk_note.push_str(&format!("  walk: {dropped} record(s) dropped by walk_budget\n"));
+            if w.dropped > 0 {
+                walk_note.push_str(&format!("  walk: {} record(s) dropped by walk_budget\n", w.dropped));
             }
         }
     }
@@ -496,6 +502,68 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         session_id: None, // populated by run() after handle returns
         ..Default::default()
     })
+}
+
+/// The walk's three steps as one unit: dedup against what this session already
+/// served, render under the byte budget, then mark only what the reader
+/// actually got.
+///
+/// They are a unit because splitting them produces a defect in one of two
+/// directions, and a single-prompt test sees neither. Drop the dedup and a name
+/// resolved once is re-served on every following prompt. Mark before the render
+/// rather than after, and a name whose records were all cut by the budget is
+/// recorded as injected and never shown again this session -- the budget
+/// quietly becoming a permanent suppression, which looks exactly like dedup
+/// working.
+///
+/// Two callers, both in `handle`: the no-match early return and the main path
+/// below it. `domain::query::context_pull` is deliberately not a third -- it
+/// has no session, so it has nothing to dedup against and nothing to mark.
+struct WalkBlock {
+    /// The rendered block. Empty when nothing survived dedup or the budget.
+    block: String,
+    /// How many names dedup dropped, for the devmode note.
+    deduped: usize,
+    /// How many records the budget dropped, for the devmode note.
+    dropped: usize,
+    /// What survived dedup, in render order, for the devmode per-name lines.
+    served: Vec<(crate::hook::walk::Resolved, Vec<crate::hook::walk::Record>)>,
+}
+
+fn render_walk_block(
+    session: &mut SessionState,
+    walked: Vec<(crate::hook::walk::Resolved, Vec<crate::hook::walk::Record>)>,
+    budget: usize,
+) -> WalkBlock {
+    // Once per session per node, not once per prompt. Naming the same project
+    // in five consecutive prompts is one context, not five: the domain layer
+    // has always worked this way and the record layer has no reason to be
+    // noisier. Keyed on the resolved IRI rather than the spelling, so
+    // "First Client Kit" and "first-client-kit" are one entry.
+    let mut served: Vec<(crate::hook::walk::Resolved, Vec<crate::hook::walk::Record>)> = Vec::new();
+    let mut deduped = 0usize;
+    for (r, recs) in walked {
+        let key = format!("walk:{}", r.id);
+        let h = crate::domain::session::rules_hash(std::slice::from_ref(&r.id));
+        if session.is_injected(&key, h) {
+            deduped += 1;
+            continue;
+        }
+        // NOT marked here -- see the doc comment above. Marked below, against
+        // what actually rendered.
+        served.push((r, recs));
+    }
+    let (block, dropped) = crate::hook::walk::render(&served, budget);
+    // Mark only what the reader actually got. A name the budget squeezed out
+    // entirely was not served, so it must be free to come back next prompt.
+    for (r, _) in &served {
+        if block.contains(&format!("name=\"{}\"", r.name)) {
+            let key = format!("walk:{}", r.id);
+            session
+                .mark_injected(&key, crate::domain::session::rules_hash(std::slice::from_ref(&r.id)));
+        }
+    }
+    WalkBlock { block, deduped, dropped, served }
 }
 
 // ─── DEVMODE output ─────────────────────────────────────────
