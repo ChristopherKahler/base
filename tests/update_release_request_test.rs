@@ -114,19 +114,19 @@ fn ok_release_response() -> ureq::Response {
 
 /// A 403 that is out of API budget. `x-ratelimit-remaining: 0` is the only thing
 /// that distinguishes this from a plain refusal.
-fn rate_limited_403() -> ureq::Error {
+fn rate_limited_403() -> Box<ureq::Error> {
     let resp: ureq::Response = "HTTP/1.1 403 Forbidden\r\nx-ratelimit-remaining: 0\r\n\r\n"
         .parse()
         .expect("canned 403 parses");
-    ureq::Error::Status(403, resp)
+    Box::new(ureq::Error::Status(403, resp))
 }
 
 /// A 403 with budget to spare: a real refusal, not a rate limit.
-fn plain_403() -> ureq::Error {
+fn plain_403() -> Box<ureq::Error> {
     let resp: ureq::Response = "HTTP/1.1 403 Forbidden\r\nx-ratelimit-remaining: 4999\r\n\r\n"
         .parse()
         .expect("canned 403 parses");
-    ureq::Error::Status(403, resp)
+    Box::new(ureq::Error::Status(403, resp))
 }
 
 /// A genuine `ureq` transport failure.
@@ -137,7 +137,7 @@ fn plain_403() -> ureq::Error {
 /// `parse_url()?` before it constructs a `Unit` or calls `unit::connect`, and a
 /// URL with no host fails that parse. ureq's own `disallow_empty_host` test
 /// asserts this same call yields `ErrorKind::InvalidUrl`.
-fn transport_failure() -> ureq::Error {
+fn transport_failure() -> Box<ureq::Error> {
     let err = ureq::get("file:///some/path")
         .call()
         .expect_err("a url with no host cannot succeed");
@@ -145,14 +145,14 @@ fn transport_failure() -> ureq::Error {
         matches!(err, ureq::Error::Transport(_)),
         "expected a transport failure, got {err:?}"
     );
-    err
+    Box::new(err)
 }
 
 /// Drive the product and collect the `authorization` header off every request it
 /// actually built, in order.
 fn auth_headers_seen<F>(answer: F) -> (Vec<Option<String>>, anyhow::Result<(String, String)>)
 where
-    F: Fn(usize) -> std::result::Result<ureq::Response, ureq::Error>,
+    F: Fn(usize) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
 {
     let seen: RefCell<Vec<Option<String>>> = RefCell::new(Vec::new());
     let out = fetch_latest_release(|req| {
@@ -168,14 +168,21 @@ where
 
 // ── D-2: the token reaches the request the product builds ──────────────────
 
+/// The `authorization`, `user-agent` and `accept` headers read off one request
+/// the product built, in that order.
+///
+/// Named rather than written inline because `clippy::type_complexity` is right:
+/// `RefCell<Vec<(Option<String>, Option<String>, Option<String>)>>` says nothing
+/// about what the three slots hold, and the asserts below index them by number.
+type HeadersSeen = (Option<String>, Option<String>, Option<String>);
+
 #[test]
 fn token_in_the_environment_reaches_the_request_the_updater_builds() {
     let _lock = env_lock();
     let env = TokenEnv::cleared();
     env.set("GITHUB_TOKEN", "gho_shrike_github_token");
 
-    let seen: RefCell<Vec<(Option<String>, Option<String>, Option<String>)>> =
-        RefCell::new(Vec::new());
+    let seen: RefCell<Vec<HeadersSeen>> = RefCell::new(Vec::new());
     let out = fetch_latest_release(|req| {
         seen.borrow_mut().push((
             req.header("authorization").map(str::to_string),
@@ -344,7 +351,7 @@ fn a_status_that_is_not_403_names_the_status() {
         let resp: ureq::Response = "HTTP/1.1 500 Internal Server Error\r\n\r\n"
             .parse()
             .expect("canned 500 parses");
-        Err(ureq::Error::Status(500, resp))
+        Err(Box::new(ureq::Error::Status(500, resp)))
     })
     .expect_err("500 is not a release");
     let msg = err.to_string();

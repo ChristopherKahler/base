@@ -103,8 +103,8 @@ fn token_from_env() -> Option<String> {
 /// API", status codes included. That sentence is true only of a transport
 /// failure. On a rate limit it sent the operator off to check a network that was
 /// working perfectly, and hid the one thing that fixes it: a token.
-fn describe_release_api_error(err: ureq::Error) -> anyhow::Error {
-    match err {
+fn describe_release_api_error(err: Box<ureq::Error>) -> anyhow::Error {
+    match *err {
         ureq::Error::Status(403, ref r) if r.header("x-ratelimit-remaining") == Some("0") => {
             anyhow::anyhow!(
                 "GitHub rate limit reached for this machine's IP address, so the \
@@ -138,7 +138,7 @@ fn describe_release_api_error(err: ureq::Error) -> anyhow::Error {
 /// inspects is the same object production sends.
 pub fn fetch_latest_release<F>(send: F) -> Result<(String, String)>
 where
-    F: Fn(ureq::Request) -> std::result::Result<ureq::Response, ureq::Error>,
+    F: Fn(ureq::Request) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
 {
     let req = ureq::get(LATEST_RELEASE_API)
         .timeout(std::time::Duration::from_secs(API_TIMEOUT_SECS))
@@ -588,7 +588,7 @@ fn auto_install_dest() -> Result<PathBuf> {
 /// The background path: no output, no ceremony, just get current.
 fn run_quiet(force: bool) -> Result<Option<String>> {
     let current = env!("CARGO_PKG_VERSION");
-    let (latest, url) = fetch_latest_release(|req| req.call())?;
+    let (latest, url) = fetch_latest_release(|req| req.call().map_err(Box::new))?;
     if !force && is_current(current, &latest) {
         return Ok(None);
     }
@@ -617,7 +617,7 @@ fn run_verbose(check_only: bool, force: bool) -> Result<Option<String>> {
     let current = env!("CARGO_PKG_VERSION");
     println!("base {current} — checking GitHub releases …");
 
-    let (latest, url) = fetch_latest_release(|req| req.call())?;
+    let (latest, url) = fetch_latest_release(|req| req.call().map_err(Box::new))?;
 
     if !force && is_current(current, &latest) {
         println!("✓ already up to date (base {current}).");
