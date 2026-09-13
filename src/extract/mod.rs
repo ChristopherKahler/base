@@ -7,7 +7,7 @@ pub mod paul_toml;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::config::{BaseConfig, NamespaceConfig};
 use crate::changelog::Change;
@@ -44,6 +44,8 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
         extracted: 0,
         skipped: 0,
     };
+
+    let mut failed = 0;
 
     // Walk workspace for matching files
     let files = discover_files(cwd, &config.sync);
@@ -103,11 +105,9 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
 
                     // Delete old document-style IRI for this file
                     let del_old = format!("{prefixes}\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{file_iri}> ?p ?o }} }}");
-                    let _ = store.update(&del_old);
 
                     // Delete existing project triples (idempotent re-extract)
-                    let del_proj = format!("{prefixes}\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{project_iri}> ?p ?o }} }}");
-                    let _ = store.update(&del_proj);
+                    let del_proj = format!("DELETE WHERE {{ GRAPH <{graph_iri}> {{ <{project_iri}> ?p ?o }} }}");
 
                     // Insert triples under the project IRI
                     let now = crud::now_iso();
@@ -117,9 +117,13 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
                         body.push_str(&format!("    <{project_iri}> {pred} {val} .\n"));
                     }
                     body.push_str(&format!("    <{project_iri}> {p}:lastExtracted \"{now}\"^^xsd:dateTime .\n"));
-                    let ins = format!("{prefixes}\nINSERT DATA {{ GRAPH <{graph_iri}> {{\n{body}}} }}");
-                    if store.update(&ins).is_ok() {
-                        report.extracted += 1;
+                    let ins = format!("{del_old};\n{del_proj};\nINSERT DATA {{ GRAPH <{graph_iri}> {{\n{body}}} }}");
+                    match store.update(&ins) {
+                        Ok(()) => report.extracted += 1,
+                        Err(e) => {
+                            eprintln!("[sync] {rel_path}: inserting triples: {e}");
+                            failed += 1;
+                        }
                     }
                     continue;
                 }
@@ -140,11 +144,11 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
             continue;
         };
 
-        // DELETE existing triples for this file IRI (idempotent re-extraction)
-        let delete_sparql = format!(
+        // Delete and insert in one update: a rejected file must not erase its
+        // previous triples when the rest of this batch is persisted.
+        let mut delete_sparql = format!(
             "{prefixes}\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{file_iri}> ?p ?o }} }}"
         );
-        let _ = store.update(&delete_sparql);
 
         // INSERT fresh triples
         let now = crud::now_iso();
@@ -169,16 +173,17 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
         ));
         // Clean up old entity triples for entities owned by this document
         for entity_iri in &entity_iris {
-            let del_entity = format!("{prefixes}\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{entity_iri}> ?p ?o }} }}");
-            let _ = store.update(&del_entity);
+            delete_sparql.push_str(&format!(";\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{entity_iri}> ?p ?o }} }}"));
         }
 
         let insert_sparql = format!(
-            "{prefixes}\nINSERT DATA {{\n  GRAPH <{graph_iri}> {{\n{insert_body}  }}\n}}"
+            "{delete_sparql};\nINSERT DATA {{\n  GRAPH <{graph_iri}> {{\n{insert_body}  }}\n}}"
         );
-        store
-            .update(&insert_sparql)
-            .with_context(|| format!("inserting triples for {rel_path}"))?;
+        if let Err(e) = store.update(&insert_sparql) {
+            eprintln!("[sync] {rel_path}: inserting triples: {e}");
+            failed += 1;
+            continue;
+        }
 
         report.extracted += 1;
     }
@@ -192,6 +197,14 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
     let delta = crate::store::delta_since(store, std::slice::from_ref(&graph_iri), before);
     let ops = delta.to_ops();
     locked.write(Change::OpWithDelta("extract.markdown", &ops))?;
+    // Persist the successful files before the CLI turns a partial sync into a
+    // nonzero exit. Keep ordinary (non-failure) skips separate in the summary.
+    if failed > 0 {
+        anyhow::bail!(
+            "{} scanned, {} extracted, {} skipped, {failed} failed",
+            report.scanned, report.extracted, report.skipped
+        );
+    }
     Ok(report)
 }
 

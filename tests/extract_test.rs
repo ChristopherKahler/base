@@ -155,3 +155,130 @@ fn sync_respects_exclude_patterns() {
     let report = extract::sync(tmp.path(), &config, false).unwrap();
     assert_eq!(report.extracted, 1, "Only non-excluded file should be extracted");
 }
+
+#[test]
+fn sync_persists_good_files_when_one_file_has_invalid_triples() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+    // Sorted discovery puts a good file on each side of the failure.
+    write_md(tmp.path(), "a-good.md", "title: First good", "");
+    write_md(tmp.path(), "b-bad.md", "title: Bad\nrelated: bad<target", "");
+    write_md(tmp.path(), "c-good.md", "title: Second good", "");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_base"))
+        .arg("sync")
+        .current_dir(tmp.path())
+        .env("BASE_HOME", home.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("sync status: {}\nstdout: {}\nstderr: {stderr}",
+        output.status, String::from_utf8_lossy(&output.stdout));
+    assert!(!output.status.success(), "partial sync must exit nonzero");
+    assert!(stderr.contains("b-bad.md"), "missing failed file: {stderr}");
+    assert!(stderr.contains("IRI"), "missing insertion error: {stderr}");
+
+    // Reload from disk: checking the in-memory store would miss the lost batch.
+    let store = base::store::load_graph(&tmp.path().join(".base/graph.nq")).unwrap();
+    let p = ns().prefix;
+    let u = ns().uri;
+    for name in ["First good", "Second good"] {
+        let sparql = format!(
+            "PREFIX {p}: <{u}>\nASK {{ GRAPH ?g {{ ?doc a {p}:Document ; {p}:name \"{name}\" }} }}"
+        );
+        match store.query(&sparql).unwrap() {
+            QueryResults::Boolean(yes) => assert!(yes, "{name} must persist despite bad file"),
+            _ => panic!("Expected boolean"),
+        }
+    }
+    let bad_iri = extract::file_iri_from_path(&ns(), "b-bad.md");
+    match store.query(&format!("ASK {{ GRAPH ?g {{ <{bad_iri}> ?p ?o }} }}")).unwrap() {
+        QueryResults::Boolean(yes) => assert!(!yes, "bad file must not be inserted"),
+        _ => panic!("Expected boolean"),
+    }
+    assert!(stderr.contains("3 scanned, 2 extracted, 0 skipped, 1 failed"),
+        "missing partial summary: {stderr}");
+}
+
+#[test]
+fn sync_rejected_file_keeps_its_previous_triples() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+    write_md(tmp.path(), "note.md", "title: Original", "");
+    extract::sync(tmp.path(), &default_config(), false).unwrap();
+    let graph = tmp.path().join(".base/graph.nq");
+    let before = std::fs::read_to_string(&graph).unwrap();
+
+    write_md(tmp.path(), "note.md", "title: Rejected\nrelated: bad<target", "");
+    assert!(extract::sync(tmp.path(), &default_config(), false).is_err());
+    let after = std::fs::read_to_string(&graph).unwrap();
+    let mut before_lines: Vec<_> = before.lines().collect();
+    let mut after_lines: Vec<_> = after.lines().collect();
+    before_lines.sort();
+    after_lines.sort();
+    assert_eq!(after_lines, before_lines);
+}
+
+#[test]
+fn sync_rejected_paul_json_keeps_its_previous_triples() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+    let mut config = default_config();
+    config.sync.include.push("**/.paul/paul.json".into());
+    let path = "apps/myapp/.paul/paul.json";
+    write_paul_json(tmp.path(), path, r#"{"name":"myapp","version":"original"}"#);
+    assert_eq!(extract::sync(tmp.path(), &config, false).unwrap().extracted, 1);
+    let graph = tmp.path().join(".base/graph.nq");
+    // Include a legacy Document subject: both DELETEs must roll back.
+    let locked = base::store::lock_and_load_graph(&graph).unwrap();
+    let store = locked.store();
+    let document = extract::file_iri_from_path(&ns(), path);
+    let workspace = base::crud::workspace_graph_iri(&ns(), &base::crud::workspace_slug(tmp.path()));
+    store.update(&format!(
+        "INSERT DATA {{ GRAPH <{workspace}> {{ <{document}> <{}name> \"legacy\" }} }}", ns().uri
+    )).unwrap();
+    locked.write(base::changelog::Change::Op("test.seed-legacy")).unwrap();
+    drop(locked);
+    let before = std::fs::read_to_string(&graph).unwrap();
+    assert!(before.contains("original"), "positive control: project must be on disk");
+    assert!(before.contains("legacy"), "positive control: legacy document must be on disk");
+
+    // Valid JSON whose decoded quote makes the emitted SPARQL invalid.
+    write_paul_json(tmp.path(), path, r#"{"name":"myapp","version":"bad\"version"}"#);
+    let result = extract::sync(tmp.path(), &config, false);
+    let after = std::fs::read_to_string(&graph).unwrap();
+    let mut before_lines: Vec<_> = before.lines().collect();
+    let mut after_lines: Vec<_> = after.lines().collect();
+    before_lines.sort();
+    after_lines.sort();
+    assert_eq!(after_lines, before_lines, "rejected paul.json must preserve both subjects");
+    match result {
+        Err(e) => assert!(e.to_string().contains("1 scanned, 0 extracted, 0 skipped, 1 failed")),
+        Ok(_) => panic!("rejected paul.json must report a partial failure"),
+    }
+}
+
+#[test]
+fn sync_reports_invalid_relationship_field_and_value() {
+    for key in ["related", "relatedTo"] {
+        for value in ["[\"good\", \"bad<target\"]", "\n  - good\n  - bad<target"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+            write_md(tmp.path(), "invalid.md", &format!("title: Bad\n{key}: {value}"), "");
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_base"))
+                .arg("sync")
+                .current_dir(tmp.path())
+                .env("BASE_HOME", home.path())
+                .output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success());
+            assert!(stderr.lines().any(|line| {
+                line.starts_with("[frontmatter] invalid.md:")
+                    && line.contains(&format!("key `{key}`"))
+                    && line.contains("value \"bad<target\"")
+            }), "missing file, original field, and offending item: {stderr}");
+        }
+    }
+}

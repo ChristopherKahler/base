@@ -53,13 +53,37 @@ pub fn extract_with_project(content: &str, file_path: &str, ns: &NamespaceConfig
             // inside the boundary, which is worse than dropping it.
             "relatedto" | "related" => {
                 for entity in parse_list(value) {
-                    let entity_slug = entity
+                    // Obsidian properties carry wikilinks; MOP values already
+                    // name the target. Only unwrap wikilinks before applying
+                    // the existing MOP path/case rule.
+                    let wikilink = entity.strip_prefix("[[")
+                        .and_then(|s| s.strip_suffix("]]"));
+                    let target = wikilink
+                        .map(|s| s.split(['|', '#']).next().unwrap_or(s).trim())
+                        .unwrap_or(&entity);
+                    let mut entity_slug = target
                         .replace(['/', '\\', '.', ' '], "-")
                         .to_lowercase();
-                    triples.push((
-                        format!("{p}:relatedTo"),
-                        format!("<{}entity/{}>", ns.uri, entity_slug),
-                    ));
+                    if wikilink.is_some() {
+                        // Encode the target as one IRI path segment. Keep the
+                        // MOP path/case rule above; never rewrite bare values.
+                        entity_slug = entity_slug.bytes().map(|b| {
+                            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'~') {
+                                char::from(b).to_string()
+                            } else {
+                                format!("%{b:02X}")
+                            }
+                        }).collect();
+                    }
+                    let iri = format!("{}entity/{}", ns.uri, entity_slug);
+                    if let Err(e) = oxigraph::model::NamedNode::new(iri.clone()) {
+                        // Diagnose here, while the original field and value
+                        // are available. Sync still rejects the entire file.
+                        eprintln!(
+                            "[frontmatter] {file_path}: key `{key}` value {entity:?}: invalid relationship IRI: {e}"
+                        );
+                    }
+                    triples.push((format!("{p}:relatedTo"), format!("<{iri}>")));
                 }
             }
             _ => {
@@ -255,9 +279,28 @@ fn trim_scalar(s: &str) -> String {
 }
 
 fn parse_list(value: &str) -> Vec<String> {
-    let trimmed = value.trim().trim_start_matches('[').trim_end_matches(']');
+    let trimmed = value.trim();
+    // Remove one array wrapper, never the brackets of a wikilink. Block
+    // sequences arrive as `[[one]], [[two]]`; an unquoted inline array of
+    // wikilinks starts with three brackets instead.
+    let trimmed = if !trimmed.starts_with("[[") || trimmed.starts_with("[[[") {
+        trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    // A comma inside a wikilink target or alias is not a list separator.
+    let mut in_wikilink = false;
+    let mut previous = '\0';
     trimmed
-        .split(',')
+        .split(|c| {
+            if previous == '[' && c == '[' {
+                in_wikilink = true;
+            } else if previous == ']' && c == ']' {
+                in_wikilink = false;
+            }
+            previous = c;
+            c == ',' && !in_wikilink
+        })
         .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
         .filter(|s| !s.is_empty())
         .collect()
@@ -724,6 +767,108 @@ Run tests with `cargo test`.
         // References (wikilink + markdown link + @-mention)
         let refs: Vec<_> = triples.iter().filter(|(p, _)| p.contains("references")).collect();
         assert!(refs.len() >= 3);
+    }
+
+    // #162: exact edge values, both spellings and both YAML list forms.
+    fn assert_relationship_values(items: &[&str], slugs: &[&str]) {
+        let expected: Vec<_> = slugs.iter()
+            .map(|slug| (format!("{}:relatedTo", ns().prefix), format!("<{}entity/{slug}>", ns().uri)))
+            .collect();
+        for key in ["related", "relatedTo"] {
+            let quoted: Vec<_> = items.iter().map(|s| format!("\"{s}\"")).collect();
+            for value in [
+                format!("[{}]", quoted.join(", ")),
+                format!("\n  - {}", quoted.join("\n  - ")),
+                format!("[{}]", items.join(", ")),
+                format!("\n  - {}", items.join("\n  - ")),
+            ] {
+                let content = format!("---\n{key}: {value}\n---\n");
+                let triples = extract_with_project(&content, "test.md", &ns(), None).unwrap();
+                let actual: Vec<_> = related_edges(&triples).into_iter().cloned().collect();
+                assert_eq!(actual, expected, "{content}");
+            }
+        }
+    }
+
+    #[test]
+    fn related_wikilink_note() {
+        assert_relationship_values(&["[[Note]]"], &["note"]);
+    }
+
+    #[test]
+    fn related_wikilink_alias() {
+        assert_relationship_values(&["[[Note|alias]]"], &["note"]);
+    }
+
+    #[test]
+    fn related_wikilink_commas_stay_inside_the_item() {
+        assert_relationship_values(
+            &["[[Note|an alias, with comma]]", "[[Other,Note]]", "bare-stem"],
+            &["note", "other%2Cnote", "bare-stem"],
+        );
+    }
+
+    #[test]
+    fn related_wikilink_path_uses_mop_rule() {
+        assert_relationship_values(&["[[folder/Note]]"], &["folder-note"]);
+    }
+
+    #[test]
+    fn related_wikilink_heading() {
+        assert_relationship_values(&["[[Note#heading]]"], &["note"]);
+    }
+
+    #[test]
+    fn related_wikilinks_multiple_items() {
+        assert_relationship_values(
+            &["[[Note]]", "[[Other|alias]]", "[[folder/Note]]", "[[Third#heading]]",
+              "[[folder/Fourth#heading|alias]]", "bare-stem"],
+            &["note", "other", "folder-note", "third", "folder-fourth", "bare-stem"],
+        );
+    }
+
+    #[test]
+    fn related_wikilink_targets_are_iri_safe() {
+        for (target, slug) in [
+            ("Note<tail", "note%3Ctail"),
+            ("Note>tail", "note%3Etail"),
+            ("Note{tail", "note%7Btail"),
+            ("Note}tail", "note%7Dtail"),
+            ("Note^tail", "note%5Etail"),
+            ("Note`tail", "note%60tail"),
+            ("Note[tail", "note%5Btail"),
+            ("Note]tail", "note%5Dtail"),
+            ("Note%tail", "note%25tail"),
+            ("Note%20tail", "note%2520tail"),
+            ("Café東京", "caf%C3%A9%E6%9D%B1%E4%BA%AC"),
+        ] {
+            let item = format!("[[{target}]]");
+            assert_relationship_values(&[&item], &[slug]);
+            // Exercise the same SPARQL parser as sync, not only string output.
+            let content = format!("---\nrelated: [\"{item}\"]\n---\n");
+            let triples = extract_with_project(&content, "test.md", &ns(), None).unwrap();
+            let body = triples.iter().map(|(pred, val)| {
+                format!("<{}document/test> {pred} {val} .", ns().uri)
+            }).collect::<Vec<_>>().join("\n");
+            oxigraph::store::Store::new().unwrap().update(
+                &format!("{}\nINSERT DATA {{ {body} }}", crate::crud::prefixes(&ns()))
+            ).unwrap();
+        }
+    }
+
+    #[test]
+    fn related_bare_values_are_unchanged() {
+        assert_relationship_values(
+            &["Note", "folder/Note", "../Folder/My Note.md", "Some_Stem", "Note#heading"],
+            &["note", "folder-note", "---folder-my-note-md", "some_stem", "note#heading"],
+        );
+        assert_relationship_values(&["single-stem"], &["single-stem"]);
+        assert_relationship_values(
+            &["Note<tail", "Note>tail", "Note{tail", "Note}tail", "Note^tail",
+              "Note`tail", "Note[tail", "Note]tail", "Note%tail", "Café東京"],
+            &["note<tail", "note>tail", "note{tail", "note}tail", "note^tail",
+              "note`tail", "note[tail", "note]tail", "note%tail", "café東京"],
+        );
     }
 
     // --- #115: ONE key for relatedTo, both paths, inline AND block ---
