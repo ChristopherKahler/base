@@ -139,10 +139,14 @@ pub fn handle(
         // prompt hook owns the counter, and a tool call must not advance a session's
         // depth. A tier change re-serves the rules now in force, once, so the record
         // has to know which tier it was told them at.
-        let tier = session.bracket_for(
+        //
+        // And it is the tier the PROMPT hook last computed (`petrel` FINDING 1), never one this hook derives
+        // on its own. The prompt hook reads the transcript's percentage; this event carries none, and a tier
+        // taken from the prompt count disagreed with it in percent mode, so every switch between the two hooks
+        // served the same rules again.
+        let tier = session.served_tier(
             &config.bracket,
             event.get("session_id").and_then(|v| v.as_str()),
-            None,
         );
 
         for domain_def in &matched {

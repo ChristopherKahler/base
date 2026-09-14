@@ -29,6 +29,17 @@ impl fmt::Display for Bracket {
 }
 
 impl Bracket {
+    /// The tier a label names, exactly as `Display` writes it. `None` for anything else.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "FRESH" => Some(Self::Fresh),
+            "MODERATE" => Some(Self::Moderate),
+            "DEPLETED" => Some(Self::Depleted),
+            "CRITICAL" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+
     /// Rules to inject at this tier: `always` first, then the tier's own bucket.
     ///
     /// Additive rather than exclusive — a DEPLETED prompt gets `always` + `depleted`.
@@ -180,6 +191,15 @@ pub struct SessionState {
     /// back on exactly the long sessions the ruling was written for.
     #[serde(default)]
     pub bracket_shown: HashMap<String, String>,
+    /// Scoped key → the bracket tier the PROMPT hook most recently computed for this session.
+    ///
+    /// `petrel`'s FINDING 1 on `5c099d1`. The prompt hook reads its tier from the transcript's real
+    /// percentage. The tool hook's event carries no such reading, so it fell back to the prompt count. Both
+    /// write one per-rule record that re-opens whenever its stored tier differs, so in percent mode every
+    /// switch between a prompt and a tool call served the same rules again. The prompt hook owns the counter
+    /// and the reading, so it records the tier here, and every tool-hook branch reads this one value.
+    #[serde(default)]
+    pub bracket_tier: HashMap<String, String>,
 }
 
 impl SessionState {
@@ -294,6 +314,7 @@ impl SessionState {
         self.ast_injected.retain(|k, _| !k.starts_with(&prefix));
         self.standards_injected.retain(|k, _| !k.starts_with(&prefix));
         self.bracket_shown.retain(|k, _| !k.starts_with(&prefix));
+        self.bracket_tier.retain(|k, _| !k.starts_with(&prefix));
         self.rules_shown.retain(|k, _| !k.starts_with(&prefix));
         self.dirty_apps.retain(|k| !k.starts_with(&prefix));
         self.prompt_counts.remove(session_id);
@@ -387,6 +408,22 @@ impl SessionState {
         } else {
             Bracket::Critical
         }
+    }
+
+    /// Record the tier the prompt hook computed, for the tool hook to serve at (`petrel` FINDING 1).
+    pub fn record_tier(&mut self, tier: Bracket) {
+        let key = self.scoped("tier");
+        self.bracket_tier.insert(key, tier.to_string());
+    }
+
+    /// The tier a tool call serves at: the one the prompt hook last computed for this session, so the two
+    /// hooks agree about what was served. Before the session's first prompt there is none, and the prompt
+    /// count decides, which is what the tool hook always did.
+    pub fn served_tier(&self, config: &BracketConfig, session_id: Option<&str>) -> Bracket {
+        self.bracket_tier
+            .get(&self.scoped("tier"))
+            .and_then(|t| Bracket::from_label(t))
+            .unwrap_or_else(|| self.bracket_for(config, session_id, None))
     }
 
     /// Whether to force-refresh dedup (re-inject all domains) this prompt.

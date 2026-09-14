@@ -43,8 +43,14 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // Track prompt count and derive bracket
     session.increment_prompt_for(session_id);
     let bracket = session.bracket_for(&config.bracket, session_id, context_pct);
+    // The tool hook serves at this same tier (`petrel` FINDING 1). Its event carries no transcript reading,
+    // and a tier it computed from the prompt count instead re-opened every rule record in percent mode.
+    session.record_tier(bracket);
 
-    // Force-refresh dedup in DEPLETED/CRITICAL on interval
+    // Force-refresh in DEPLETED and CRITICAL, on an interval. `clear_dedup` clears this session's domain-block
+    // hashes (`injected`) and standards hashes, so a matched domain's neighbourhood, query and steering lines
+    // are served again. It does NOT clear the per-rule record (`rules_shown`) or the bracket block: since F9
+    // a rule is shown again on a tier change, not on an interval, which is spec F8's table (`petrel` F2).
     if session.should_force_refresh_for(&config.bracket, session_id, context_pct) {
         session.clear_dedup();
     }
@@ -58,10 +64,6 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // `{bracket_rules}`, so gating the string rather than the printers means a new
     // return site added later cannot forget the rule.
     //
-    // The short-circuit order matters: `claim_bracket_block` is not called when the
-    // render is empty. base ships no bracket rules, so a default install renders
-    // nothing at every tier, and claiming a tier for a block that was never printed
-    // would silence the first real one after an operator configures some.
     // The short-circuit order matters: `claim_bracket_block` is not called when the
     // render is empty. base ships no bracket rules, so a default install renders
     // nothing at every tier, and claiming a tier for a block that was never printed
