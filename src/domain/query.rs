@@ -40,6 +40,25 @@ pub fn query_domain_from_graph(
     let pfx = crud::prefixes(ns);
 
     // Query 1: Get rules ordered by priority, with optional rationale (Phase 26)
+    //
+    // The superseded filter belongs here for the same reason it belongs on the
+    // neighbourhood query below: this is a SERVING surface. `crud::rule::fetch`
+    // (`crud/rule.rs:140`) has excluded superseded rules from `base rule list`
+    // since #59, and this query never did — so a rule was hidden from the command
+    // that lists rules and injected into every prompt that matched the domain.
+    // base-config carries that pair live today: "build on Windows natively" and
+    // the later rule that says the first one is wrong.
+    //
+    // INSIDE the `GRAPH ?g` group, beside the pattern it constrains. Outside every
+    // GRAPH group the pattern matches the default graph, where base keeps nothing,
+    // so NOT EXISTS is always true and the filter excludes nothing while reading
+    // like a working one. That shipped once as F16 (`crud/note.rs`, 2026-09-06).
+    //
+    // SERVING SURFACES ONLY (auk, 2026-09-14, after petrel). base keeps superseded
+    // records on purpose — the superseded record is the drift evidence — so this
+    // filter never reaches storage, `base graph supersede`, or an explicit query
+    // command, and `--include-superseded` is untouched.
+    let no_superseded_rule = crate::supersede::sparql_exclude_superseded(ns, "rule");
     let rules_sparql = format!(
         "{pfx}\n\
          SELECT ?rule ?text ?rationale WHERE {{\n\
@@ -48,6 +67,7 @@ pub fn query_domain_from_graph(
              ?rule {p}:ruleText ?text .\n\
              OPTIONAL {{ ?rule {p}:priority ?pri }}\n\
              OPTIONAL {{ ?rule {p}:rationale ?rationale }}\n\
+             {no_superseded_rule}\
            }}\n\
          }}\n\
          ORDER BY xsd:integer(?pri)"

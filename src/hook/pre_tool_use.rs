@@ -566,6 +566,19 @@ fn query_rules_from_graph(
     let domain_iri = crud::build_iri(ns, "domain", &domain_slug);
     let pfx = crud::prefixes(ns);
 
+    // Superseded rules are dropped here for the same reason they are dropped in
+    // `domain::query::query_domain_from_graph`: both are SERVING surfaces, and
+    // serving a rule that a later rule corrected hands the agent both halves of a
+    // contradiction with nothing to tell them apart. Placed INSIDE the `GRAPH ?g`
+    // group — outside it the pattern matches the default graph, where base keeps
+    // nothing, so it would exclude nothing while reading like a working filter.
+    //
+    // `xsd:integer(?pri)`, not `?pri`. A plain string sort compares "10" against
+    // "2" and puts the eleventh rule second — the #29 shape. `crud/rule.rs` and
+    // `domain/query.rs` both cast already; this query was the one left behind, so
+    // the pre-tool block and the prompt block disagreed about rule order on any
+    // domain with more than ten rules. base-config has seventeen.
+    let no_superseded_rule = crate::supersede::sparql_exclude_superseded(ns, "rule");
     let sparql = format!(
         "{pfx}\n\
          SELECT ?text ?rationale WHERE {{\n\
@@ -574,9 +587,10 @@ fn query_rules_from_graph(
              ?rule {p}:ruleText ?text .\n\
              OPTIONAL {{ ?rule {p}:priority ?pri }}\n\
              OPTIONAL {{ ?rule {p}:rationale ?rationale }}\n\
+             {no_superseded_rule}\
            }}\n\
          }}\n\
-         ORDER BY ?pri"
+         ORDER BY xsd:integer(?pri)"
     );
 
     match crate::store::query(store, &sparql) {
