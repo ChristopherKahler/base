@@ -62,7 +62,8 @@ fn session_start_emits_active_projects() {
 
     // Capture stdout by calling handle (it prints to stdout)
     // We verify no error; full stdout capture tested via CLI integration
-    let result = session_start::handle(&config, tmp.path(), None);
+    let mut out = session_start::SessionOutput::new();
+    let result = session_start::handle(&config, tmp.path(), None, &mut out);
     assert!(result.is_ok(), "session-start should succeed: {result:?}");
 }
 
@@ -72,7 +73,8 @@ fn session_start_silent_when_no_trig() {
     // No .base/ directory at all
     let config = BaseConfig::default();
 
-    let result = session_start::handle(&config, tmp.path(), None);
+    let mut out = session_start::SessionOutput::new();
+    let result = session_start::handle(&config, tmp.path(), None, &mut out);
     assert!(
         result.is_ok(),
         "session-start with no TriG should succeed silently"
@@ -90,8 +92,17 @@ fn session_start_failopen_on_malformed_trig() {
 
     // Should return an error, but the dispatch wrapper catches it (fail-open)
     // At the handler level, an error is expected here
-    let result = session_start::handle(&config, tmp.path(), None);
+    let mut out = session_start::SessionOutput::new();
+    let result = session_start::handle(&config, tmp.path(), None, &mut out);
     assert!(result.is_err(), "Malformed TriG should error at handler level");
+    // Rank 00 commit B: the handler collects instead of printing, and what it collected before
+    // the error must survive it, as it survived on stdout before. The unhealthy-graph warning
+    // is exactly what precedes this error.
+    assert!(
+        out.fragments().parts().iter().any(|p| p.kind == "graph-unhealthy"),
+        "the warning collected before the error is gone: {:?}",
+        out.fragments().parts().iter().map(|p| p.kind.as_str()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -140,7 +151,8 @@ SELECT ?name WHERE {
         ..BaseConfig::default()
     };
 
-    let result = session_start::handle(&config, tmp.path(), None);
+    let mut out = session_start::SessionOutput::new();
+    let result = session_start::handle(&config, tmp.path(), None, &mut out);
     assert!(
         result.is_ok(),
         "session-start with custom namespace should succeed: {result:?}"

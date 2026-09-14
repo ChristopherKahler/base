@@ -11,7 +11,7 @@
 //!
 //! Every hook event's output is assembled here as ranked blocks, trimmed to its budget, and
 //! only then emitted. The unit is UTF-16 code units, because the host is JavaScript and its
-//! limit is a JS string length. On the reference output bytes over-count by 873 and `char`s
+//! limit is a JS string length. On the reference output bytes over-count by 871 and `char`s
 //! under-count by 2, so neither is the number the host applies.
 //!
 //! Output written to stderr is outside every budget by construction: Claude Code feeds only a
@@ -137,16 +137,15 @@ impl Block {
     pub fn items(mut self, total: usize, shown: usize) -> Self {
         self.items_total = total;
         self.full_shown = shown.min(total);
-        if let Some((_, s)) = self.shortened.as_mut() {
-            *s = (*s).min(self.full_shown);
-        }
         self.refresh_floor();
         self
     }
 
-    /// The middle rendering, listing `shown` items.
+    /// The middle rendering, listing `shown` items. Call it before or after [`Block::items`]:
+    /// the count is clamped to the full rendering's when it is read, never when it is stored,
+    /// so the order of the two calls cannot change what the ledger records.
     pub fn with_shortened(mut self, text: impl Into<String>, shown: usize) -> Self {
-        self.shortened = Some((text.into(), shown.min(self.full_shown)));
+        self.shortened = Some((text.into(), shown));
         self
     }
 
@@ -174,7 +173,7 @@ impl Block {
     pub fn items_shown(&self) -> usize {
         match (self.level, &self.shortened) {
             (Level::Full, _) | (Level::Shortened, None) => self.full_shown,
-            (Level::Shortened, Some((_, shown))) => *shown,
+            (Level::Shortened, Some((_, shown))) => (*shown).min(self.full_shown),
             (Level::Collapsed, _) => 0,
         }
     }
@@ -226,6 +225,12 @@ impl FullOutput {
         FullOutput(FullState::Off)
     }
 
+    /// No file, for a reason that is not an I/O error, such as no directory to hold it. The
+    /// reason reaches every floor that would have named the file.
+    pub fn not_written(reason: impl Into<String>) -> Self {
+        FullOutput(FullState::Failed(reason.into()))
+    }
+
     pub fn written_path(&self) -> Option<&str> {
         match &self.0 {
             FullState::Written(p) => Some(p),
@@ -255,11 +260,21 @@ fn write_via_temp(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
+    // One temp name per process. Two sessions starting in one workspace write the same file,
+    // and a shared temp name would let one of them rename the other's half-written bytes.
+    let tmp = temp_path(path);
     std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)
+    // The rename retries the Windows lock family, as the graph write does. A rename that still
+    // fails must not leave the temp behind: nothing else would ever remove it.
+    crate::store::rename_with_retry(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+fn temp_path(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    PathBuf::from(tmp)
 }
 
 /// What a header renderer can see: every block at its final level, the ledger, and where the
@@ -490,6 +505,118 @@ fn push_line(s: &mut String, text: &str) {
     if !t.is_empty() {
         s.push_str(t);
         s.push('\n');
+    }
+}
+
+/// One block's worth of print-site output, collected by [`Fragments`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Part {
+    /// Unique within one output: the kind, or `kind#2` when a kind comes back after another
+    /// block, so [`Emission::push`] never refuses a part and loses its text.
+    pub id: String,
+    /// What printed it. A block's floor and command are looked up by kind.
+    pub kind: String,
+    pub text: String,
+    /// How many items the text lists.
+    pub items: usize,
+}
+
+/// The print sites of one hook event, collected in the order they printed, before any of
+/// them reaches stdout.
+///
+/// Session start printed from 32 sites, and the bytes between two blocks were whatever the
+/// two sites happened to write. Where one ended without a newline and the next started
+/// without one, two blocks shared a line: measured 2026-09-14, the wake contract's header
+/// sat on the same line as `</base-context-triggers>`.
+///
+/// Every site hands its exact fragment here, newlines included. Fragments of one kind in a
+/// row are one block, byte for byte. [`Emission`] ends each block with exactly one newline,
+/// so between two blocks the collector keeps the rest: with `T` the newlines after the last
+/// visible character and `L` the newlines the next fragment starts with, the next block
+/// starts with `T + L - 1` of them. A fragment made only of newlines adds to `T`. The first
+/// block keeps all `T + L`. Where `T + L` is zero the old bytes had no newline between two
+/// blocks and the new output has one: a glue point, a difference the byte-identity ruling
+/// allows. The other is the very end, which always carries exactly one newline.
+#[derive(Debug, Default)]
+pub struct Fragments {
+    parts: Vec<Part>,
+    carry: usize,
+    withheld: Vec<Withheld>,
+}
+
+impl Fragments {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// One print site's exact output. `items` counts what it lists.
+    pub fn push(&mut self, kind: &str, fragment: &str, items: usize) {
+        let body = fragment.trim_start_matches('\n');
+        let lead = fragment.len() - body.len();
+        if body.is_empty() {
+            self.carry += lead;
+            return;
+        }
+        let content = body.trim_end_matches('\n');
+        let gap = self.carry + lead;
+        self.carry = body.len() - content.len();
+        if let Some(last) = self.parts.last_mut()
+            && last.kind == kind
+        {
+            last.text.push_str(&"\n".repeat(gap));
+            last.text.push_str(content);
+            last.items += items;
+            return;
+        }
+        let keep = if self.parts.is_empty() {
+            gap
+        } else {
+            gap.saturating_sub(1)
+        };
+        let earlier = self.parts.iter().filter(|p| p.kind == kind).count();
+        let id = if earlier == 0 {
+            kind.to_string()
+        } else {
+            format!("{kind}#{}", earlier + 1)
+        };
+        self.parts.push(Part {
+            id,
+            kind: kind.to_string(),
+            text: format!("{}{content}", "\n".repeat(keep)),
+            items,
+        });
+    }
+
+    /// Record content removed by a path outside the trimmer, such as a signal skipped because
+    /// its output had not changed since it was last shown.
+    pub fn note_withheld(&mut self, block: &str, items: usize, reason: Reason, command: &str) {
+        self.withheld.push(Withheld {
+            block: block.to_string(),
+            items,
+            reason,
+            command: command.to_string(),
+        });
+    }
+
+    pub fn parts(&self) -> &[Part] {
+        &self.parts
+    }
+
+    pub fn withheld(&self) -> &[Withheld] {
+        &self.withheld
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+
+    /// Newlines after the last visible character. The emission prints exactly one there.
+    pub fn trailing_newlines(&self) -> usize {
+        self.carry
+    }
+
+    pub fn into_parts(self) -> (Vec<Part>, Vec<Withheld>) {
+        (self.parts, self.withheld)
     }
 }
 
@@ -786,5 +913,147 @@ mod tests {
         let failed = write_full_output(&blocker.join("last-session-start.md"), &body);
         assert_eq!(failed.written_path(), None);
         assert!(failed.failure().is_some_and(|m| m.contains("not-a-dir")));
+    }
+
+    #[test]
+    fn with_shortened_and_items_record_the_same_ledger_in_either_order() {
+        // petrel's commit A finding A1: the shortened count was clamped when stored, so building
+        // it before `items` recorded 0 shown and the ledger claimed 10 withheld for a list of 5.
+        let ledger = |b: Block| {
+            let mut e = Emission::new(10, 10);
+            assert!(e.push(b));
+            e.render(&FullOutput::off(), None).withheld
+        };
+        let floor = "forks 157";
+        let items_first = Block::new(
+            "forks",
+            Rank::Secondary,
+            "F".repeat(200),
+            floor,
+            "base fork list",
+        )
+        .items(10, 10)
+        .with_shortened("F".repeat(50), 5);
+        let shortened_first = Block::new(
+            "forks",
+            Rank::Secondary,
+            "F".repeat(200),
+            floor,
+            "base fork list",
+        )
+        .with_shortened("F".repeat(50), 5)
+        .items(10, 10);
+        let first = ledger(items_first);
+        let rows: Vec<(Reason, usize)> = first.iter().map(|w| (w.reason, w.items)).collect();
+        assert_eq!(rows, [(Reason::ListCut, 5), (Reason::Collapsed, 5)]);
+        assert_eq!(
+            ledger(shortened_first),
+            first,
+            "the order of the two builder calls changed the ledger"
+        );
+    }
+
+    #[test]
+    fn a_failed_full_output_write_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A non-empty directory where the file should go: the temp is written, the rename fails.
+        let in_the_way = tmp.path().join("last-session-start.md");
+        std::fs::create_dir_all(in_the_way.join("child")).expect("directory in the way");
+        let failed = write_full_output(&in_the_way, "body");
+        assert!(failed.written_path().is_none());
+        assert!(
+            failed.failure().is_some(),
+            "a rename over a directory reports its failure"
+        );
+        let left: Vec<String> = std::fs::read_dir(tmp.path())
+            .expect("list")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "temp files left behind: {left:?}");
+    }
+
+    #[test]
+    fn the_full_output_temp_name_is_per_process() {
+        let path = Path::new("/ws/.base/last-session-start.md");
+        let tmp = temp_path(path).display().to_string();
+        assert_eq!(
+            tmp,
+            format!("/ws/.base/last-session-start.md.{}.tmp", std::process::id())
+        );
+    }
+
+    /// The emission's text for collected parts: each part one `Tail` block, no header, no trim.
+    fn emitted(f: Fragments) -> String {
+        let (parts, _) = f.into_parts();
+        let mut e = Emission::new(usize::MAX, usize::MAX);
+        for p in parts {
+            let items = p.items;
+            assert!(e.push(Block::new(p.id, Rank::Tail, p.text, "", "cmd").items(items, items)));
+        }
+        e.render(&FullOutput::off(), None).text
+    }
+
+    fn collected(sites: &[(&str, &str)]) -> Fragments {
+        let mut f = Fragments::new();
+        for (kind, fragment) in sites {
+            f.push(kind, fragment, 1);
+        }
+        f
+    }
+
+    #[test]
+    fn fragments_keep_every_newline_between_blocks_except_at_a_glue_point() {
+        // The old sites' fragments, and what the emission prints. The old bytes are the
+        // fragments joined; the only differences allowed are the glue newline and the end.
+        let rows: [(&[(&str, &str)], &str); 6] = [
+            // W1.4 row 1: the output ends in a newline and the next site starts with one. The
+            // blank line survives.
+            (
+                &[("inject", "X\n"), ("triggers", "\n<t>\n</t>")],
+                "X\n\n<t>\n</t>\n",
+            ),
+            // Row 2: no newline at the end, the next site starts with one. One line break.
+            (&[("diag", "<d>"), ("proto", "\nP")], "<d>\nP\n"),
+            // Row 3: a newline at the end, the next site starts without one. One line break.
+            (&[("a", "A\n"), ("b", "B")], "A\nB\n"),
+            // Row 4: neither. The glue point: the one newline the emission adds.
+            (&[("triggers", "</t>"), ("wake", "=== W")], "</t>\n=== W\n"),
+            // The carry: two trailing newlines and a site of newlines only all reach the next block.
+            (&[("a", "A\n\n"), ("sep", "\n"), ("b", "B")], "A\n\n\nB\n"),
+            // The first block keeps all of its leading newlines.
+            (&[("a", "\n\nA")], "\n\nA\n"),
+        ];
+        for (sites, want) in rows {
+            let old: String = sites.iter().map(|(_, f)| *f).collect();
+            assert_eq!(emitted(collected(sites)), want, "old bytes were {old:?}");
+        }
+    }
+
+    #[test]
+    fn a_site_of_newlines_only_makes_no_block() {
+        let mut f = Fragments::new();
+        f.push("separator", "\n\n", 0);
+        assert!(f.is_empty());
+        assert_eq!(f.trailing_newlines(), 2);
+    }
+
+    #[test]
+    fn one_kind_in_a_row_is_one_block_and_a_returning_kind_gets_its_own_id() {
+        let mut f = Fragments::new();
+        f.push("unhealthy", "L1\n", 1);
+        f.push("unhealthy", "L2\n", 1);
+        f.push("pulse", "P", 1);
+        f.push("unhealthy", "\nL3", 1);
+        let ids: Vec<&str> = f.parts().iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["unhealthy", "pulse", "unhealthy#2"]);
+        assert_eq!(f.parts()[0].text, "L1\nL2");
+        assert_eq!(f.parts()[0].items, 2);
+        assert_eq!(
+            emitted(f),
+            "L1\nL2\nP\nL3\n",
+            "nothing refused, nothing lost"
+        );
     }
 }

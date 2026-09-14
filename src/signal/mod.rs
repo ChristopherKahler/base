@@ -5,58 +5,135 @@ pub mod memory;
 pub mod pulse;
 pub mod suppression;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
 use crate::config::BaseConfig;
 
-/// A signal result: name, priority (lower = higher), and output text.
-struct SignalResult {
-    name: String,
-    priority: u32,
-    output: String,
+/// Signals that surface every session until acted on. Never skipped as unchanged.
+const PERSISTENT: [&str; 3] = ["handoff", "reminder", "fork"];
+
+/// One block of a signal's output.
+pub struct SignalBlock {
+    /// The block's kind in the session-start emission. Its floor and command are keyed on it.
+    pub kind: &'static str,
+    pub text: String,
+    /// How many items the text lists.
+    pub items: usize,
 }
 
-/// Combined signal output: content (suppression-checked) + diagnostics (always emitted).
+/// One signal's output. Its blocks' texts joined are exactly what the signal rendered, and the
+/// suppression hash is taken over that joined text, as it always was.
+pub struct Signal {
+    pub name: &'static str,
+    pub blocks: Vec<SignalBlock>,
+    hash: u64,
+}
+
+impl Signal {
+    fn new(name: &'static str, blocks: Vec<SignalBlock>) -> Self {
+        let text: String = blocks.iter().map(|b| b.text.as_str()).collect();
+        let hash = suppression::hash_output(&text);
+        Signal { name, blocks, hash }
+    }
+
+    fn single(name: &'static str, kind: &'static str, text: String, items: usize) -> Self {
+        Self::new(name, vec![SignalBlock { kind, text, items }])
+    }
+}
+
+/// Every signal with something to say, split by whether it is shown this session.
+///
+/// Nothing is dropped here for size. The old `[signal] max_chars` cap dropped whole signals past
+/// 2,000 bytes, exempted the four largest, and reported the drop in one line at the tail, which
+/// the host's cut had already removed (measured 2026-09-14: character 40,159 of 45,232). The
+/// session-start emission now measures and trims everything, and says what it trimmed.
+#[derive(Default)]
 pub struct SignalOutput {
-    pub content: String,
+    signals: Vec<Signal>,
+    unchanged: Vec<Signal>,
     /// No-match tags: `<hook-query:no-match>` for each query that ran but found nothing.
     /// Always emitted — bypass suppression so operator can verify queries executed.
     pub diagnostics: Vec<String>,
+    state: Option<(PathBuf, suppression::SignalState)>,
 }
 
-/// Run all signals with suppression and budget cap. Returns content + diagnostics.
+impl SignalOutput {
+    /// Signals to show this session, in emission order.
+    pub fn signals(&self) -> &[Signal] {
+        &self.signals
+    }
+
+    /// Signals skipped because their output has not changed since they were last shown in full.
+    pub fn unchanged(&self) -> &[Signal] {
+        &self.unchanged
+    }
+
+    /// Nothing to show this session.
+    pub fn is_empty(&self) -> bool {
+        self.signals.is_empty()
+    }
+
+    /// Record as shown each signal whose every block `rendered_in_full` accepts, then save.
+    ///
+    /// The record is what lets a later session skip an unchanged signal, so it has to follow
+    /// what reached the output. A signal the budget collapsed was not shown: it stays
+    /// unrecorded, and the next session shows it again.
+    pub fn record_shown(mut self, rendered_in_full: impl Fn(&str) -> bool) {
+        let Some((base_dir, mut state)) = self.state.take() else {
+            return;
+        };
+        for s in &self.signals {
+            if s.blocks.iter().all(|b| rendered_in_full(b.kind)) {
+                state.update(s.name, s.hash);
+            }
+        }
+        let _ = state.save(&base_dir);
+    }
+}
+
+/// Run all signals and apply suppression. Returns what to show, what was skipped as unchanged,
+/// and diagnostics.
 pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<SignalOutput> {
     if !config.signal.enabled {
-        return Ok(SignalOutput { content: String::new(), diagnostics: vec![] });
+        return Ok(SignalOutput::default());
     }
 
     let ns = &config.namespace;
     let sig = &config.signal;
     let base_dir = crate::config::find_workspace_base(cwd);
 
-    let mut results: Vec<SignalResult> = Vec::new();
+    // (priority, signal): lower priority first, push order kept within a priority.
+    let mut results: Vec<(u32, Signal)> = Vec::new();
     let mut diagnostics: Vec<String> = Vec::new();
 
     match memory::run(cwd, config) {
         Ok(output) if !output.is_empty() => {
-            results.push(SignalResult { name: "memory".into(), priority: 0, output });
+            results.push((0, Signal::single("memory", "memory", output, 1)));
         }
         Ok(_) => {}
         Err(e) => eprintln!("base: signal 'memory' failed: {e}"),
     }
 
-    match active_awareness::run(cwd, config) {
-        Ok(output) if !output.is_empty() => {
-            results.push(SignalResult { name: "active-awareness".into(), priority: 1, output });
+    match active_awareness::run_sections(cwd, config) {
+        Ok(sections) if !sections.is_empty() => {
+            let blocks = sections
+                .into_iter()
+                .map(|s| SignalBlock {
+                    kind: s.kind,
+                    text: s.text,
+                    items: s.items,
+                })
+                .collect();
+            results.push((1, Signal::new("active-awareness", blocks)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-active-awareness:no-match>")),
         Err(e) => eprintln!("base: signal 'active-awareness' failed: {e}"),
     }
     match pulse::run(cwd, ns, sig) {
         Ok(output) if !output.is_empty() => {
-            results.push(SignalResult { name: "pulse".into(), priority: 2, output });
+            results.push((2, Signal::single("pulse", "pulse", output, 1)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-pulse:no-match>")),
         Err(e) => eprintln!("base: signal 'pulse' failed: {e}"),
@@ -69,7 +146,7 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         match flow_resurface::run(cwd, ns, &config.flow, hook) {
             Ok((output, flow_diags)) => {
                 if !output.is_empty() {
-                    results.push(SignalResult { name: "flow-resurface".into(), priority: 2, output });
+                    results.push((2, Signal::single("flow-resurface", "flow-resurface", output, 1)));
                 }
                 diagnostics.extend(flow_diags);
             }
@@ -78,92 +155,63 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     }
 
     // Handoff + reminder resurface — persistent until dismissed. Their own signals so they
-    // bypass suppression AND the budget cap: they must surface EVERY session until acted on.
+    // are never skipped as unchanged: they must surface EVERY session until acted on.
     match flow_resurface::handoff_scan(cwd, ns) {
-        Ok(output) if !output.is_empty() => {
-            results.push(SignalResult { name: "handoff".into(), priority: 0, output });
+        Ok((output, n)) if !output.is_empty() => {
+            results.push((0, Signal::single("handoff", "handoffs", output, n)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-handoff-scan:no-match>")),
         Err(e) => eprintln!("base: signal 'handoff' failed: {e}"),
     }
     match flow_resurface::reminder_scan(cwd, ns) {
-        Ok(output) if !output.is_empty() => {
-            results.push(SignalResult { name: "reminder".into(), priority: 0, output });
+        Ok((output, n)) if !output.is_empty() => {
+            results.push((0, Signal::single("reminder", "reminders", output, n)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-reminder-scan:no-match>")),
         Err(e) => eprintln!("base: signal 'reminder' failed: {e}"),
     }
     // Forks — parallel side-work build-specs. Persistent like handoffs: their own
-    // signal so they bypass suppression AND the budget cap and surface every
-    // session until picked up, snoozed, or archived. Additive (multiple open).
+    // signal so they are never skipped as unchanged and surface every session until
+    // picked up, snoozed, or archived. Additive (multiple open).
     match flow_resurface::fork_scan(cwd, ns) {
-        Ok(output) if !output.is_empty() => {
-            results.push(SignalResult { name: "fork".into(), priority: 0, output });
+        Ok((output, n)) if !output.is_empty() => {
+            results.push((0, Signal::single("fork", "forks", output, n)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-fork-scan:no-match>")),
         Err(e) => eprintln!("base: signal 'fork' failed: {e}"),
     }
 
     // Sort by priority
-    results.sort_by_key(|r| r.priority);
+    results.sort_by_key(|(priority, _)| *priority);
 
-    // Apply suppression: skip signals whose output hasn't changed
-    let mut state = base_dir
+    // Suppression: skip signals whose output has not changed since they were last shown
+    let state = base_dir
         .as_deref()
         .map(suppression::SignalState::load)
         .unwrap_or_default();
 
-    let novel: Vec<&SignalResult> = results
-        .iter()
-        .filter(|r| {
-            // Handoffs/reminders/forks are persistent — never suppress; they surface every session.
-            if r.name == "handoff" || r.name == "reminder" || r.name == "fork" {
-                return true;
-            }
-            let hash = suppression::hash_output(&r.output);
-            state.is_novel(&r.name, hash)
-        })
-        .collect();
-
-    if novel.is_empty() {
-        return Ok(SignalOutput { content: String::new(), diagnostics });
-    }
-
-    // Apply budget cap
-    let mut combined = String::new();
-    let mut chars_used = 0;
-    let mut dropped = 0;
-
-    for result in &novel {
-        // active-awareness (priority 1) and persistent handoff/reminder/fork always emit.
-        let always = result.priority == 1
-            || result.name == "handoff"
-            || result.name == "reminder"
-            || result.name == "fork";
-        if always || chars_used + result.output.len() <= sig.max_chars {
-            combined.push_str(&result.output);
-            combined.push('\n');
-            chars_used += result.output.len();
-
-            // Update suppression state for emitted signals
-            let hash = suppression::hash_output(&result.output);
-            state.update(&result.name, hash);
+    let mut signals = Vec::new();
+    let mut unchanged = Vec::new();
+    for (_, s) in results {
+        if PERSISTENT.contains(&s.name) || state.is_novel(s.name, s.hash) {
+            signals.push(s);
         } else {
-            dropped += 1;
+            unchanged.push(s);
         }
     }
 
-    if dropped > 0 {
-        combined.push_str(&format!("[+{dropped} signals suppressed — budget cap]\n"));
-    }
-
-    // Save suppression state
-    if let Some(ref base_dir) = base_dir {
-        let _ = state.save(base_dir);
-    }
+    // The state is saved only when something was novel, as it always was: a session with
+    // nothing new to show leaves the file alone.
+    let state = if signals.is_empty() {
+        None
+    } else {
+        base_dir.map(|dir| (dir, state))
+    };
 
     Ok(SignalOutput {
-        content: combined.trim_end().to_string(),
+        signals,
+        unchanged,
         diagnostics,
+        state,
     })
 }

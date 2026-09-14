@@ -148,19 +148,30 @@ fn run_event(
 
     match event {
         "session-start" => {
-            session_start::handle(&config, &cwd, session_id.as_deref())?;
-            // Relay inbox push: pending messages addressed to this session
-            // (unregistered sessions get a one-line notice that a relay is live).
-            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true, false) {
-                print!("{block}");
+            // Everything session start says is collected, measured against
+            // `[budget] session_start_chars`, and printed ONCE (rank 00). The untrimmed text
+            // goes to `.base/last-session-start.md` before anything prints.
+            let mut out = session_start::SessionOutput::new();
+            let handled = session_start::handle(&config, &cwd, session_id.as_deref(), &mut out);
+            if handled.is_ok() {
+                // Relay inbox push: pending messages addressed to this session
+                // (unregistered sessions get a one-line notice that a relay is live).
+                if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true, false) {
+                    out.push("relay-inbox", &block, 1);
+                }
+                // Session-targeted task relay: refresh liveness + announce any tasks
+                // assigned to this session (loud, re-announced on each new session).
+                if let Some(sid) = session_id.as_deref()
+                    && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::SessionStart, true)
+                {
+                    out.push("relay-tick", &block, 1);
+                }
             }
-            // Session-targeted task relay: refresh liveness + announce any tasks
-            // assigned to this session (loud, re-announced on each new session).
-            if let Some(sid) = session_id.as_deref()
-                && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::SessionStart, true)
-            {
-                print!("{block}");
-            }
+            // A handler error still prints what it collected first: those sites had printed
+            // before the error, and the unhealthy-graph warning is exactly what precedes one.
+            let rendered = out.finish(&config, &cwd);
+            print!("{}", rendered.text);
+            handled?;
             Ok(HookEventData { session_id, ..Default::default() })
         }
         "pre-tool-use" => {

@@ -1,5 +1,7 @@
 use base::config::{BaseConfig, NamespaceConfig};
 use base::crud;
+use base::emit::{Level, Reason};
+use base::hook::session_start::SessionOutput;
 use base::signal;
 
 fn test_config() -> BaseConfig {
@@ -71,11 +73,18 @@ fn suppression_skips_unchanged_signals() {
 
     // First run — should produce output
     let output1 = signal::run_signals(tmp.path(), &config, "test").unwrap();
-    assert!(!output1.content.is_empty(), "First run should produce output");
+    assert!(!output1.is_empty(), "First run should produce output");
+    // Rank 00 commit B: run_signals no longer records what it returns. Session start records a
+    // signal only after it rendered in full; this stands in for a start where everything fit.
+    output1.record_shown(|_| true);
 
     // Second run — nothing changed, should be suppressed
     let output2 = signal::run_signals(tmp.path(), &config, "test").unwrap();
-    assert!(output2.content.is_empty(), "Second run should be suppressed (no changes)");
+    assert!(output2.is_empty(), "Second run should be suppressed (no changes)");
+    assert!(
+        !output2.unchanged().is_empty(),
+        "a suppressed signal is reported as unchanged, never dropped without a trace"
+    );
 }
 
 #[test]
@@ -86,30 +95,139 @@ fn suppression_re_emits_on_change() {
 
     let config = test_config();
 
-    // First run
-    signal::run_signals(tmp.path(), &config, "test").unwrap();
+    // First run, recorded as shown in full the way session start records it, so the re-emit
+    // below comes from the change and not from a record that was never written (commit B).
+    signal::run_signals(tmp.path(), &config, "test")
+        .unwrap()
+        .record_shown(|_| true);
 
     // Change data — add a new project
     crud::project::add(tmp.path(), &ns(), "New Project", "active", None).unwrap();
 
     // Third run — data changed, should re-emit
     let output3 = signal::run_signals(tmp.path(), &config, "test").unwrap();
-    assert!(!output3.content.is_empty(), "Should re-emit after data change");
+    assert!(!output3.is_empty(), "Should re-emit after data change");
 }
 
 #[test]
-fn budget_cap_truncates() {
+fn a_signal_collapsed_by_the_budget_is_shown_again_next_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+    seed_workspace(tmp.path());
+    let config = test_config();
+
+    // Session one: every block rendered in full except the task list, which the budget collapsed.
+    signal::run_signals(tmp.path(), &config, "test")
+        .unwrap()
+        .record_shown(|kind| kind != "tasks");
+
+    let output = signal::run_signals(tmp.path(), &config, "test").unwrap();
+    let shown: Vec<&str> = output.signals().iter().map(|s| s.name).collect();
+    let skipped: Vec<&str> = output.unchanged().iter().map(|s| s.name).collect();
+    assert!(
+        shown.contains(&"active-awareness"),
+        "a signal that did not render in full is shown again: shown {shown:?}"
+    );
+    assert!(
+        skipped.contains(&"pulse"),
+        "control: a signal that rendered in full is skipped: skipped {skipped:?}"
+    );
+}
+
+#[test]
+fn an_over_budget_signal_collapses_to_a_floor_with_a_ledger_row() {
+    // Replaces `budget_cap_truncates` (rank 00 commit B). That test pinned the `[signal]
+    // max_chars` branch inside run_signals, which dropped whole signals past the cap, exempted
+    // the four largest and reported the drop in one line at the tail. The branch is gone:
+    // nothing is dropped inside run_signals, and session start trims to `[budget]
+    // session_start_chars` instead. What the old test was for still holds, and is asserted
+    // here: a small budget never loses a block without a trace.
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
     seed_workspace(tmp.path());
 
     let mut config = test_config();
-    config.signal.max_chars = 50; // Very small budget
+    config.signal.max_chars = 50; // the legacy key: read by nothing now
+    config.budget.session_start_chars = 60;
+    config.budget.write_full_output = false;
 
     let output = signal::run_signals(tmp.path(), &config, "test").unwrap();
-    // Active-awareness (priority 1) should always appear regardless of budget
-    // Lower-priority signals may be dropped
-    assert!(!output.content.is_empty(), "Priority 1 signal should always emit");
+    let names: Vec<&str> = output.signals().iter().map(|s| s.name).collect();
+    assert!(
+        names.contains(&"active-awareness") && names.contains(&"pulse"),
+        "nothing is dropped for size before the budget: {names:?}"
+    );
+
+    let mut out = SessionOutput::new();
+    out.push_signals(output);
+    let rendered = out.finish(&config, tmp.path());
+    assert!(!rendered.text.is_empty(), "the output is not empty");
+    let collapsed: Vec<&str> = rendered
+        .blocks
+        .iter()
+        .filter(|b| b.level() == Level::Collapsed)
+        .map(|b| b.id())
+        .collect();
+    assert!(
+        !collapsed.is_empty(),
+        "a 60-unit budget collapses something: {}",
+        rendered.text
+    );
+    for id in &collapsed {
+        assert!(
+            rendered
+                .withheld
+                .iter()
+                .any(|w| w.block == *id && w.reason == Reason::Collapsed),
+            "{id} collapsed without a ledger row"
+        );
+        assert!(
+            rendered.text.lines().any(|l| l.starts_with(&format!("{id} "))),
+            "{id} collapsed without its floor line: {}",
+            rendered.text
+        );
+    }
+}
+
+#[test]
+fn a_signal_skipped_as_unchanged_leaves_a_ledger_row_per_block() {
+    // T7, the hash skip (rank 00 commit B). A signal skipped because its output has not changed
+    // prints nothing, as before, and now leaves a ledger row for every block it would have printed.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+    seed_workspace(tmp.path());
+    let mut config = test_config();
+    config.budget.write_full_output = false;
+
+    let mut first = SessionOutput::new();
+    first.push_signals(signal::run_signals(tmp.path(), &config, "test").unwrap());
+    // Everything fits the default budget, so every signal is recorded as shown in full.
+    let _ = first.finish(&config, tmp.path());
+
+    let again = signal::run_signals(tmp.path(), &config, "test").unwrap();
+    let skipped: Vec<(&'static str, usize)> = again
+        .unchanged()
+        .iter()
+        .flat_map(|s| s.blocks.iter().map(|b| (b.kind, b.items)))
+        .collect();
+    assert!(
+        !skipped.is_empty(),
+        "nothing was skipped as unchanged, so this measured nothing"
+    );
+
+    let mut second = SessionOutput::new();
+    second.push_signals(again);
+    let rendered = second.finish(&config, tmp.path());
+    for (kind, items) in &skipped {
+        assert!(
+            rendered
+                .withheld
+                .iter()
+                .any(|w| w.block == *kind && w.items == *items && w.reason == Reason::HashUnchanged),
+            "{kind}: skipped as unchanged without a ledger row. ledger: {:?}",
+            rendered.withheld
+        );
+    }
 }
 
 #[test]
@@ -122,6 +240,6 @@ fn disabled_signals_emit_nothing() {
     config.signal.enabled = false;
 
     let output = signal::run_signals(tmp.path(), &config, "test").unwrap();
-    assert!(output.content.is_empty(), "Disabled signals should emit nothing");
+    assert!(output.is_empty(), "Disabled signals should emit nothing");
     assert!(output.diagnostics.is_empty(), "Disabled signals should emit no diagnostics");
 }

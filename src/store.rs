@@ -1043,8 +1043,10 @@ fn write_back_inner<W: Write>(
 const RENAME_ATTEMPTS: usize = 5;
 const RENAME_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(15);
 
-/// `fs::rename`, retried only while the error is the transient lock family.
-fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+/// `fs::rename`, retried only while the error is the transient lock family. Shared with the
+/// session-start full-output write (`emit::write_full_output`), which meets the same Windows
+/// handles on a file Claude reads.
+pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut delay = RENAME_BASE_DELAY;
     let mut last: Option<std::io::Error> = None;
 

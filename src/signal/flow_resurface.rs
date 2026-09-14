@@ -16,7 +16,8 @@ pub fn run(cwd: &Path, ns: &NamespaceConfig, flow: &FlowConfig, hook: &str) -> R
     let mut diagnostics: Vec<String> = Vec::new();
 
     // NOTE: handoff_scan + reminder_scan are run as their own signals in signal::mod
-    // (priority 0, budget- and suppression-exempt) so they surface EVERY session.
+    // (priority 0, never skipped as unchanged) so they surface EVERY session. Like every
+    // block, they are measured against the session-start budget.
 
     // Sub-query 1: Blocked-by scan
     match blocked_by_scan(cwd, ns) {
@@ -144,10 +145,11 @@ fn deferred_orphan_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
 }
 
 /// Find OPEN handoffs whose `resurfaceAt` is in the past, across global + workspace
-/// tiers, and render the lettered "pick up where you left off" delegation block.
-pub fn handoff_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
+/// tiers, and render the lettered "pick up where you left off" delegation block. Returns the
+/// block and how many handoffs it lists.
+pub fn handoff_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)> {
     let Some(store) = crate::store::load_merged(cwd) else {
-        return Ok(String::new());
+        return Ok((String::new(), 0));
     };
     let now = chrono::Local::now();
     let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
@@ -171,7 +173,7 @@ pub fn handoff_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
     );
 
     let QueryResults::Solutions(solutions) = crate::store::query(&store, &sparql)? else {
-        return Ok(String::new());
+        return Ok((String::new(), 0));
     };
 
     let rows: Vec<(String, String, String, String)> = solutions
@@ -189,7 +191,7 @@ pub fn handoff_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
         .collect();
 
     if rows.is_empty() {
-        return Ok(String::new());
+        return Ok((String::new(), 0));
     }
 
     let mut out = String::from("[Pick up where you left off]\n");
@@ -211,16 +213,17 @@ pub fn handoff_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
         letter_map.join(", ")
     ));
 
-    Ok(out)
+    Ok((out, rows.len()))
 }
 
 /// Find OPEN forks (kind = "fork") whose `resurfaceAt` is in the past, across
 /// global + workspace tiers, and render the "Forks" block. Forks are additive
 /// parallel side-work — multiple surface at once, each summoned by its title
-/// (== slug == doc basename), distinct from the single Handoff resume line.
-pub fn fork_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
+/// (== slug == doc basename), distinct from the single Handoff resume line. Returns the block
+/// and how many forks it lists.
+pub fn fork_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)> {
     let Some(store) = crate::store::load_merged(cwd) else {
-        return Ok(String::new());
+        return Ok((String::new(), 0));
     };
     let now = chrono::Local::now();
     let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
@@ -243,7 +246,7 @@ pub fn fork_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
     );
 
     let QueryResults::Solutions(solutions) = crate::store::query(&store, &sparql)? else {
-        return Ok(String::new());
+        return Ok((String::new(), 0));
     };
 
     let rows: Vec<(String, String, String, String)> = solutions
@@ -261,7 +264,7 @@ pub fn fork_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
         .collect();
 
     if rows.is_empty() {
-        return Ok(String::new());
+        return Ok((String::new(), 0));
     }
 
     let mut out = String::from("[Forks]\n");
@@ -279,13 +282,14 @@ pub fn fork_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
          `base fork snooze <title> <N>`; \"archive <title>\" → run `base fork archive <title>`.",
     );
 
-    Ok(out)
+    Ok((out, rows.len()))
 }
 
 /// Surface reminders whose `resurfaceAt` time has passed, across global + workspace tiers.
-pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
+/// Returns the block and how many reminders it lists.
+pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)> {
     let Some(store) = crate::store::load_merged(cwd) else {
-        return Ok(String::new());
+        return Ok((String::new(), 0));
     };
     let now_str = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
     let p = &ns.prefix;
@@ -303,7 +307,7 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
     );
 
     let QueryResults::Solutions(solutions) = crate::store::query(&store, &sparql)? else {
-        return Ok(String::new());
+        return Ok((String::new(), 0));
     };
 
     let rows: Vec<(String, String)> = solutions
@@ -321,7 +325,7 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
         .collect();
 
     if rows.is_empty() {
-        return Ok(String::new());
+        return Ok((String::new(), 0));
     }
 
     let mut out = String::from("[Reminders]\n");
@@ -332,7 +336,7 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
         "BEHAVIOR: These reminders are due now — surface them to the operator in your first reply. \
          Clear a handled one with `base reminder remove <slug>`.",
     );
-    Ok(out)
+    Ok((out, rows.len()))
 }
 
 /// Find notes with mentionCount >= threshold — recurring ideas that should be promoted.
