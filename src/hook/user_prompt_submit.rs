@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::config::BaseConfig;
 use crate::domain;
 use crate::domain::matcher::{match_domains_auto, TriggerContext};
-use crate::domain::query::{query_domain_from_graph, resolve_and_run_query, format_toml_rules};
+use crate::domain::query::resolve_and_run_query;
 use crate::domain::session::{rules_hash, Bracket, SessionState};
 
 pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Result<super::HookEventData> {
@@ -232,18 +232,28 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     for dm in &matched {
         let domain_def = dm.domain;
 
-        // Try graph-backed injection first, fall back to TOML rules
-        let (rules_text, neighborhood_text) = match &graph_store {
-            Some(store) => {
-                let (r, n, served) = query_domain_from_graph(store, config, domain_def);
+        // The rules and the neighbourhood are read separately now, because they are
+        // deduped differently: the rules per RULE (F9), the neighbourhood as a block.
+        let rules = crate::domain::rules::rules_for_domain(graph_store.as_ref(), config, domain_def);
+        let fresh: Vec<(usize, &crate::domain::rules::ServedRule)> = rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| session.claim_rule(&r.id, r.content_hash, bracket, None))
+            .collect();
+        // Only what the reader is actually handed is marked as served, so the walk
+        // still resolves a rule this block held back.
+        domain_served.extend(fresh.iter().filter_map(|(_, r)| r.iri.clone()));
+        let rules_text =
+            crate::domain::rules::render_block("DOMAIN", &fresh, rules.len(), &domain_def.name);
+
+        let neighborhood_text = match (&graph_store, lean_mode) {
+            (Some(store), false) => {
+                let (n, served) =
+                    crate::domain::query::query_domain_neighborhood(store, config, domain_def);
                 domain_served.extend(served);
-                if lean_mode {
-                    (r, String::new()) // skip neighborhood in lean mode
-                } else {
-                    (r, n)
-                }
+                n
             }
-            None => (format_toml_rules(domain_def), String::new()),
+            _ => String::new(),
         };
 
         // ─── Steering layer (v0.4): role / linked commands / output-mode / format ───
@@ -327,19 +337,27 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         }
         let domain_output = sections.join("\n");
 
-        // Dedup: hash combined output (rules + neighborhood), skip if unchanged.
-        // Hash over SORTED lines — SPARQL result order shifts when the graph
-        // file is rewritten (post-tool-use fires on every edit), and an
-        // order-sensitive hash would re-inject unchanged content every prompt.
+        // The rules have already been deduped one at a time above. What is hashed
+        // here is everything ELSE the block carries — the neighbourhood, the query,
+        // the steering lines — which is still a block and still deduped as one.
+        //
+        // Hash over SORTED lines: SPARQL result order shifts when the graph file is
+        // rewritten (post-tool-use fires on every edit), and an order-sensitive hash
+        // would re-inject unchanged content every prompt.
         let combined_hash = {
-            let mut lines: Vec<String> = domain_output.lines().map(String::from).collect();
+            let mut lines: Vec<String> = domain_output
+                .lines()
+                .filter(|l| !rules_text.contains(*l))
+                .map(String::from)
+                .collect();
             lines.sort();
             rules_hash(&lines)
         };
-        // Count actual injected rules (from graph, not TOML)
-        let injected_rule_count = rules_text.lines().filter(|l| l.starts_with("  ")).count();
+        let injected_rule_count = fresh.len();
 
-        if session.is_injected(&domain_def.name, combined_hash) {
+        // A fresh rule is served even when nothing else about the block changed. The
+        // block hash can only suppress the block when it carries no new rule.
+        if rules_text.is_empty() && session.is_injected(&domain_def.name, combined_hash) {
             deduped_count += 1;
             let dedup_reason = if config.devmode.enabled {
                 format!("dedup [{}]", dm.reason)

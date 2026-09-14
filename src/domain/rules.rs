@@ -67,6 +67,34 @@ pub struct ServedRule {
     pub iri: Option<String>,
 }
 
+/// Render the rules this event should carry, under `header`, keeping each rule's own
+/// number so a reader can find it again with `base rule list`.
+///
+/// `shown` is the subset that survived the per-rule dedup, paired with each rule's
+/// index in the full list. `total` is how many the domain has, so the pointer line can
+/// say what was held back rather than leaving the reader to wonder.
+///
+/// Empty when nothing survived: a header with no rules under it costs the reader a
+/// line and tells them nothing.
+pub fn render_block(header: &str, shown: &[(usize, &ServedRule)], total: usize, domain: &str) -> String {
+    if shown.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("[{header}: {domain}]\n");
+    for (i, rule) in shown {
+        out.push_str(&format!("  {i}. {}\n", rule.rendered));
+    }
+    let withheld = total.saturating_sub(shown.len());
+    if withheld > 0 {
+        // F16's shape. One line in place of the rules this session has already been
+        // told, which is the whole point of dedup per rule rather than per block.
+        out.push_str(&format!(
+            "  ({withheld} more {domain} rule(s) already served this session · all: base rule list --domain {domain})\n"
+        ));
+    }
+    out
+}
+
 /// Collapse whitespace so that a reflow of a rule in `domains.toml` is the same rule.
 fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")

@@ -101,6 +101,21 @@ fn process_session() -> Option<&'static str> {
     PROCESS_SESSION.get().map(String::as_str)
 }
 
+/// What one session was told about one rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShownRule {
+    /// Unix seconds. Not read yet; it is what the action throttle (F5, at most once
+    /// per 10 minutes per rule) will compare against, and recording it now means the
+    /// throttle does not need a migration of everyone's `.session` to start working.
+    pub at: u64,
+    /// The bracket tier in force when it was shown. A tier change re-serves the rules
+    /// now in force, once (F8).
+    pub tier: String,
+    /// A hash of what was actually rendered. A text or rationale edit changes it, so
+    /// an edited rule is shown again (F8's last line).
+    pub content: u64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SessionState {
     /// Session this instance is acting for. Not persisted — it is set at load and
@@ -143,6 +158,19 @@ pub struct SessionState {
     /// long sessions get a top-of-awareness restore.
     #[serde(default)]
     pub standards_injected: HashMap<String, u64>,
+    /// Scoped key → what this session was told about one rule, and when.
+    ///
+    /// F9: dedup per RULE, not per domain block. Before this the unit was the block,
+    /// so adding one rule to a seventeen-rule domain handed the reader all seventeen
+    /// again, sixteen of which it had already been told this session.
+    ///
+    /// The key carries the SCOPE, which is what lets one map serve all four kinds
+    /// without a second one: a topic or always rule is keyed on its id alone and is
+    /// therefore once per session, while a place or action rule is keyed on its id
+    /// AND the place or action that matched, and is therefore once per place and once
+    /// per action.
+    #[serde(default)]
+    pub rules_shown: HashMap<String, ShownRule>,
     /// Scoped key → the bracket tier whose rules block this session has been shown.
     ///
     /// Deliberately NOT cleared by [`SessionState::clear_dedup`]. The DEPLETED and
@@ -266,6 +294,7 @@ impl SessionState {
         self.ast_injected.retain(|k, _| !k.starts_with(&prefix));
         self.standards_injected.retain(|k, _| !k.starts_with(&prefix));
         self.bracket_shown.retain(|k, _| !k.starts_with(&prefix));
+        self.rules_shown.retain(|k, _| !k.starts_with(&prefix));
         self.dirty_apps.retain(|k| !k.starts_with(&prefix));
         self.prompt_counts.remove(session_id);
         self.last_seen.remove(session_id);
@@ -409,6 +438,46 @@ impl SessionState {
         let prefix = format!("{}{SCOPE_SEP}", self.active_scope());
         self.injected.retain(|k, _| !k.starts_with(&prefix));
         self.standards_injected.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    /// Claim one rule for this session: true when it should be served now, false
+    /// when this session has already been told it.
+    ///
+    /// F9. The unit of dedup is the rule, not the domain block. `scope` is the place
+    /// or the action that matched, and `None` for a rule serving on its topic, on
+    /// always, or through its domain's trigger — so a place rule is claimed once per
+    /// place and an action rule once per action, out of the same map.
+    ///
+    /// Three things re-open a claim, and they are F8's table:
+    ///   - the bracket changed tier, so the rules now in force are served once more;
+    ///   - the rule's own text or rationale changed, so it is a different rule to read;
+    ///   - a new Claude session, which has its own scope and has been told nothing.
+    ///
+    /// It DECIDES and RECORDS in one call, the way `claim_bracket_block` does, so two
+    /// call sites cannot drift into disagreeing about what was served.
+    pub fn claim_rule(
+        &mut self,
+        rule_id: &str,
+        content: u64,
+        tier: Bracket,
+        scope: Option<&str>,
+    ) -> bool {
+        let key = match scope {
+            Some(s) => self.scoped(&format!("r{SCOPE_SEP}{rule_id}{SCOPE_SEP}{s}")),
+            None => self.scoped(&format!("r{SCOPE_SEP}{rule_id}")),
+        };
+        let tier = tier.to_string();
+        if let Some(prev) = self.rules_shown.get(&key)
+            && prev.tier == tier
+            && prev.content == content
+        {
+            return false;
+        }
+        self.rules_shown.insert(
+            key,
+            ShownRule { at: Self::now_secs(), tier, content },
+        );
+        true
     }
 
     /// Claim the bracket-rules block for `tier`: true the first time this session

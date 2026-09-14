@@ -135,6 +135,16 @@ pub fn handle(
         };
         let matched = match_by_file(&domains, &file_path_strings, &trigger_ctx);
 
+        // The bracket tier this hook is serving at, READ and never incremented: the
+        // prompt hook owns the counter, and a tool call must not advance a session's
+        // depth. A tier change re-serves the rules now in force, once, so the record
+        // has to know which tier it was told them at.
+        let tier = session.bracket_for(
+            &config.bracket,
+            event.get("session_id").and_then(|v| v.as_str()),
+            None,
+        );
+
         for domain_def in &matched {
             // Read the rules FIRST, then key the dedup on what came back.
             //
@@ -153,23 +163,34 @@ pub fn handle(
             // be deduped. That is the price of a key that describes the payload, and
             // the defect it removes is a rule the operator added never arriving.
             let rules = domain::rules::rules_for_domain(graph_store.as_ref(), config, domain_def);
-            let rules_hash = domain::session::rules_hash(
-                &rules.iter().map(|r| r.rendered.clone()).collect::<Vec<_>>(),
-            );
-            if session.is_injected(&domain_def.name, rules_hash) {
+
+            // Dedup per RULE, not per domain block (F9). Before this the whole block
+            // was one unit, so adding a single rule to a seventeen-rule domain handed
+            // the reader all seventeen again, sixteen of which it had already been
+            // told this session. Measured live 2026-09-14: editing BASE-WORK-ORDER.md
+            // served all thirteen basemode rules, for an edit to a base work order.
+            //
+            // Scope is `None`, which means once per session and again on a tier
+            // change. A rule has no matchers yet, so it is serving through its
+            // domain's trigger, and K4 says an unconverted rule keeps exactly the
+            // behaviour it has today until an operator approves a conversion.
+            //
+            // `claim_rule` records as it decides, so this loop cannot claim a rule it
+            // then fails to render: everything that survives the filter is rendered.
+            let fresh: Vec<(usize, &domain::rules::ServedRule)> = rules
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| session.claim_rule(&r.id, r.content_hash, tier, None))
+                .collect();
+            if fresh.is_empty() && !rules.is_empty() {
                 data.suppressed += 1;
                 continue;
             }
-
-            let rules_text = if rules.is_empty() {
-                String::new()
-            } else {
-                let mut out = format!("[FILE MATCH: {}]\n", domain_def.name);
-                for (i, rule) in rules.iter().enumerate() {
-                    out.push_str(&format!("  {i}. {}\n", rule.rendered));
-                }
-                out
-            };
+            if !fresh.is_empty() {
+                session_dirty = true;
+            }
+            let rules_text =
+                domain::rules::render_block("FILE MATCH", &fresh, rules.len(), &domain_def.name);
 
             // Query-triggered injection for filepath-matched domains
             let query_text = match (&graph_store, &domain_def.query) {
@@ -192,8 +213,7 @@ pub fn handle(
                     output.push('\n');
                 }
                 data.domains_matched.push(domain_def.name.clone());
-                data.rules_injected += rules_text.lines().filter(|l| l.starts_with("  ")).count();
-                session.mark_injected(&domain_def.name, rules_hash);
+                data.rules_injected += fresh.len();
                 session_dirty = true;
             }
         }

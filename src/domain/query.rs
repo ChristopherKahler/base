@@ -19,6 +19,22 @@ fn walk_key(term: TermRef<'_>) -> Option<String> {
     }
 }
 
+/// A domain's 1-hop neighbourhood, without its rules.
+///
+/// The prompt hook needs these two halves separately: it filters the rules per rule
+/// (F9) and renders only what this session has not been told, while the neighbourhood
+/// is still a block. [`query_domain_from_graph`] stays as the both-halves reader for
+/// every other caller, and both go through `domain::rules` for the rules half, so
+/// there is still exactly one place that knows what a rule is.
+pub fn query_domain_neighborhood(
+    store: &oxigraph::store::Store,
+    config: &BaseConfig,
+    domain_def: &domain::DomainDef,
+) -> (String, Vec<String>) {
+    let (_rules, neighborhood, served) = query_domain_from_graph(store, config, domain_def);
+    (neighborhood, served)
+}
+
 /// Query a domain's rules and 1-hop neighborhood from the graph.
 /// Returns (rules_text, neighborhood_text, served). Falls back to TOML if graph query fails.
 pub fn query_domain_from_graph(
