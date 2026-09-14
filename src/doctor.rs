@@ -396,6 +396,14 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         .collect();
     warnings.extend(leaked_global_handoffs());
     warnings.extend(coach_drift());
+    // `auk`'s HARD RULE (2026-09-14): a rule with no matcher of its own is served by its domain's triggers exactly as
+    // before, never dropped, and counted here (F11's DETAIL, K4).
+    let unconverted = unconverted_rule_count(cwd);
+    if unconverted > 0 {
+        warnings.push(format!(
+            "rules: {unconverted} rules with no matcher of their own, served by their domain's triggers (base rule list)"
+        ));
+    }
     // #20: a failed hook is invisible everywhere else (fail-open by design); doctor names it.
     // The cwd PARAM, not the process cwd: `diagnose` is called with a path and
     // shadowing it with `std::env::current_dir()` made this section untestable and
@@ -431,6 +439,28 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         trigger_faults,
         seam: store::LOCK_SEAM_MARKER,
     }
+}
+
+/// Live rules, in every domain that injects, that carry no matcher of their own (F11's DETAIL: "`base doctor` lists
+/// rules with no matcher of their own"). Read-only: no domain sync, so doctor never writes the graph.
+fn unconverted_rule_count(cwd: &Path) -> usize {
+    let config = crate::config::BaseConfig::load(cwd);
+    let domains = crate::domain::load_domains(cwd);
+    let store = store::load_merged(cwd);
+    let converted: std::collections::HashSet<String> =
+        crate::domain::rules::rules_with_matchers(store.as_ref(), &config, &domains)
+            .into_iter()
+            .map(|c| c.rule.id)
+            .collect();
+    let mut unconverted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for domain_def in domains.iter().filter(|d| d.auto_inject) {
+        for rule in crate::domain::rules::rules_for_domain(store.as_ref(), &config, domain_def) {
+            if !converted.contains(&rule.id) {
+                unconverted.insert(rule.id);
+            }
+        }
+    }
+    unconverted.len()
 }
 
 /// Every inert path trigger, per tier, as the sentence `add-trigger` refuses with

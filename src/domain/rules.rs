@@ -1114,6 +1114,38 @@ fn first_hit(c: &Converted, event: &Event<'_>, parts: &[Vec<String>], cx: &Selec
     }
 }
 
+/// What [`select`] returned, as the reader receives it (F16's shapes): one header per reason, the rules under it in
+/// the order `select` chose them, then F6's pointer line for every domain whose topic rules the cap withheld.
+///
+/// Empty when nothing was served, which is also when nothing was withheld: the cap only withholds past `topic_max`.
+pub fn render_selection(selection: &Selection) -> String {
+    let mut groups: Vec<(String, Vec<&ServedRule>)> = Vec::new();
+    for served in &selection.served {
+        let header = match &served.why {
+            Why::Always => "[base rules · always]".to_string(),
+            Why::Place(place) => format!("[base rule · place: {place}]"),
+            Why::Action(action) => format!("[base rule · before: {action}]"),
+            Why::Topic(_) => format!("[base rules · topic: {}]", served.rule.domain),
+        };
+        match groups.iter_mut().find(|(h, _)| *h == header) {
+            Some((_, rules)) => rules.push(&served.rule),
+            None => groups.push((header, vec![&served.rule])),
+        }
+    }
+    let mut out = String::new();
+    for (header, rules) in groups {
+        out.push_str(&header);
+        out.push('\n');
+        for rule in rules {
+            out.push_str(&format!("  - {}\n", rule.rendered));
+        }
+    }
+    for (domain, withheld) in &selection.topic_withheld {
+        out.push_str(&format!("  ({withheld} more {domain} rules · all: base rule list --domain {domain})\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod model_tests {
     use super::*;
