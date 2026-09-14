@@ -297,6 +297,28 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             && output_mode_line.is_none()
             && format_line.is_none()
         {
+            // A domain that HAS rules and had every one of them already served this
+            // session is not "contributes nothing". It is a dedup, and it has to be
+            // COUNTED as one.
+            //
+            // Since F9 dedups one rule at a time, a fully served domain arrives here
+            // with an empty `rules_text`, and a domain carrying nothing else used to
+            // `continue` before the dedup branch below ever ran. The injection was
+            // right and the report was not: the domain dropped out of
+            // `HookEventData::suppressed`, which feeds the JSONL log, and out of the
+            // devmode dedup list. A domain that silently vanishes from the count reads
+            // as a domain that never matched — a false clean bill in the telemetry.
+            // `graph_injection_test::dedup_skips_unchanged_graph_injection` caught it
+            // on the first full-suite run after F9 landed.
+            if !rules.is_empty() {
+                deduped_count += 1;
+                let dedup_reason = if config.devmode.enabled {
+                    format!("dedup [{}]", dm.reason)
+                } else {
+                    "dedup".into()
+                };
+                loaded_domains.push((domain_def.name.clone(), dedup_reason, 0));
+            }
             continue;
         }
 
