@@ -14,6 +14,7 @@ pub mod crud;
 pub mod dashboard;
 pub mod doctor;
 pub mod doorbell;
+pub mod emit;
 pub mod domain;
 pub mod extension;
 pub mod graph;
