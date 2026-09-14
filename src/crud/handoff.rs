@@ -6,6 +6,7 @@ use oxigraph::store::Store;
 
 use crate::config::NamespaceConfig;
 use crate::crud;
+use crate::crud::{all_tier_files, tier_label_of_file};
 
 /// Resolve the target graph file + graph IRI for a write.
 ///
@@ -22,53 +23,6 @@ fn write_tier(cwd: &Path, ns: &NamespaceConfig) -> Result<(PathBuf, String)> {
     )?;
     let ws_slug = crud::workspace_slug(cwd);
     Ok((base.join("graph.nq"), crud::workspace_graph_iri(ns, &ws_slug)))
-}
-
-/// Every existing graph file across tiers — used for tier-agnostic mutations
-/// (snooze/archive) so a handoff is updated wherever it lives.
-///
-/// Takes `gbl_root` rather than resolving the home directory itself. This
-/// function is why the fork exists: reaching for the home directory here meant
-/// every test that archived a fixture handoff rewrote the operator's real
-/// global graph. As a parameter the compiler will not let a caller — test or
-/// otherwise — forget to say which root it means.
-fn all_tier_files(gbl_root: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if let Some(home) = gbl_root {
-        let gbl = home.join(".base-gbl").join(".base").join("graph.nq");
-        if gbl.exists() {
-            files.push(gbl);
-        }
-    }
-    if let Some(base) = crate::config::find_workspace_base(cwd) {
-        let ws = base.join("graph.nq");
-        if ws.exists() {
-            files.push(ws);
-        }
-    }
-    // Dedupe by canonical path. Under `-g` the global tier IS the workspace, so
-    // both entries resolve to one file and the UPDATE ran twice on it — visible
-    // in production as two identical archive lines in changes.jsonl at the same
-    // second (global feed, 2026-09-07 15:07:48).
-    let mut seen: Vec<PathBuf> = Vec::new();
-    files.retain(|f| {
-        let key = f.canonicalize().unwrap_or_else(|_| f.clone());
-        if seen.contains(&key) {
-            false
-        } else {
-            seen.push(key);
-            true
-        }
-    });
-    files
-}
-
-/// Which tier `file` belongs to, for the operator-facing line.
-fn tier_label(file: &Path, gbl_root: Option<&Path>) -> &'static str {
-    match gbl_root {
-        Some(h) if file.starts_with(h.join(".base-gbl")) => "global tier",
-        _ => "workspace tier",
-    }
 }
 
 /// Does `file` hold this handoff/fork at all?
@@ -271,7 +225,7 @@ pub fn create(
     // The other tier is READ only. `create` acts on the tier it writes to (#61);
     // naming what it did not touch is the honest half of that ruling.
     let other_tier_open = other_tier_file(gbl_root, cwd, &path).and_then(|other| {
-        open_handoff_in(&other, ns, &project).map(|s| (s, tier_label(&other, gbl_root).to_string()))
+        open_handoff_in(&other, ns, &project).map(|s| (s, tier_label_of_file(&other, gbl_root).to_string()))
     });
 
     mutate_file(
@@ -281,7 +235,7 @@ pub fn create(
     )?;
     Ok(CreateOutcome {
         slug,
-        tier: tier_label(&path, gbl_root).to_string(),
+        tier: tier_label_of_file(&path, gbl_root).to_string(),
         archived_prior,
         other_tier_open,
     })
@@ -488,7 +442,7 @@ fn apply_to_tiers(
     let mut changed = Vec::new();
     for f in all_tier_files(gbl_root, cwd) {
         if mutate_file_if_holds(&f, ns, slug, sparql)? {
-            changed.push(tier_label(&f, gbl_root).to_string());
+            changed.push(tier_label_of_file(&f, gbl_root).to_string());
         }
     }
     Ok(changed)
@@ -498,6 +452,6 @@ fn apply_to_tiers(
 pub fn searched_tiers(gbl_root: Option<&Path>, cwd: &Path) -> Vec<String> {
     all_tier_files(gbl_root, cwd)
         .iter()
-        .map(|f| format!("{} ({})", f.display(), tier_label(f, gbl_root)))
+        .map(|f| format!("{} ({})", f.display(), tier_label_of_file(f, gbl_root)))
         .collect()
 }
