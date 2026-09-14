@@ -7,10 +7,20 @@ use crate::config::BaseConfig;
 use crate::crud;
 use crate::store;
 
-/// SPARQL expression normalizing a stored `?path` literal's separators to `/`.
-/// The doubled backslashes are a SPARQL string escape wrapping a regex escape:
-/// the pattern it compiles to is a single literal `\`.
-const PATH_SEP_NORM: &str = r#"REPLACE(STR(?path), "\\\\", "/")"#;
+/// SPARQL expression normalizing a stored path literal's separators to `/`.
+///
+/// The doubled backslashes are a SPARQL string escape wrapping a regex escape: the
+/// pattern it compiles to is a single literal `\`.
+///
+/// Takes the variable name because the two arms bind different ones — `?path` for a
+/// project directory and `?doc` for a handoff file. This was a `const` with `?path`
+/// baked in, and reusing it verbatim from the `?doc` arm would have emitted SPARQL
+/// normalising a variable that arm never binds: it would match nothing, change nothing,
+/// and report a perfectly clean run. A knock-out that cannot go red is the exact defect
+/// class this round exists to remove.
+fn path_sep_norm(var: &str) -> String {
+    format!(r#"REPLACE(STR(?{var}), "\\\\", "/")"#)
+}
 
 /// PostToolUse: section AST context on a partial read, extension `inject` nudges, and
 /// the directory-move nudges.
@@ -50,9 +60,15 @@ pub fn handle(
         return Ok((data, output));
     }
 
-    // ─── lastActive timestamp update (existing behavior) ─────
-    let trig_path = find_workspace_trig(cwd);
-    if let Some(ref tp) = trig_path {
+    // ─── lastActive timestamp update ─────
+    //
+    // Every tier, not just the one above cwd. Measured 2026-09-14: 64 of the 339
+    // records carrying `handoffDoc` live in the GLOBAL tier and are routinely opened
+    // from a workspace cwd, so a single-tier update reaches 275 of them and reports a
+    // clean run over the other 64.
+    let gbl_root = crate::home::home_root();
+    for tp in crud::all_tier_files(gbl_root.as_deref(), cwd) {
+        let tp = &tp;
         // This fires on EVERY tool call, so it is the writer most likely to be
         // mid-dump when another base process renames over the same graph.
         let _lock = store::lock_graph(tp)?;
@@ -62,6 +78,8 @@ pub fn handle(
         let mut applied: Vec<String> = Vec::new();
 
         for file_path in &file_paths {
+            // ARM 1 — project directories, matched by PREFIX. `?path` stores a
+            // directory, so a file beneath it is a touch of that project.
             let sparql = format!(
                 "PREFIX {p}: <{u}>\n\
                  PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
@@ -83,11 +101,41 @@ pub fn handle(
                 // — normalizing only the probe would break every Windows graph
                 // whose project paths are already stored backslashed.
                 file = crud::path_literal(&file_path.to_string_lossy()),
-                norm = PATH_SEP_NORM,
+                norm = path_sep_norm("path"),
             );
 
             if graph.update(&sparql).is_ok() {
                 applied.push(sparql);
+            }
+
+            // ARM 2 — handoff and fork documents, matched EXACTLY. `?handoffDoc` stores
+            // a FILE, so equality is the correct test: a prefix match would let
+            // `<doc>.md.bak` register as a touch of `<doc>.md`.
+            //
+            // Forks need no arm of their own. Measured 2026-09-14: there is no `#Fork`
+            // type in the graph at all — every one of the 339 records is `rdf:type
+            // #Handoff` carrying `handoffDoc`, and a `kind` literal is the only thing
+            // separating the 219 forks from the 120 handoffs. One predicate covers both.
+            let sparql_doc = format!(
+                "PREFIX {p}: <{u}>\n\
+                 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+                 DELETE {{ GRAPH ?g {{ ?entity {p}:lastActive ?old }} }}\n\
+                 INSERT {{ GRAPH ?g {{ ?entity {p}:lastActive \"{now}\"^^xsd:dateTime }} }}\n\
+                 WHERE {{\n\
+                   GRAPH ?g {{\n\
+                     ?entity {p}:handoffDoc ?doc .\n\
+                     FILTER({norm} = \"{file}\")\n\
+                     OPTIONAL {{ ?entity {p}:lastActive ?old }}\n\
+                   }}\n\
+                 }}",
+                p = config.namespace.prefix,
+                u = config.namespace.uri,
+                file = crud::path_literal(&file_path.to_string_lossy()),
+                norm = path_sep_norm("doc"),
+            );
+
+            if graph.update(&sparql_doc).is_ok() {
+                applied.push(sparql_doc);
             }
         }
 
@@ -575,13 +623,6 @@ fn basename(p: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn find_workspace_trig(cwd: &Path) -> Option<PathBuf> {
-    crate::config::walk_up(cwd, |dir| {
-        let candidate = dir.join(".base").join("graph.nq");
-        candidate.exists().then_some(candidate)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,27 +654,7 @@ mod tests {
         assert!(paths.is_empty());
     }
 
-    #[test]
-    fn find_workspace_trig_walks_up() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base_dir = tmp.path().join(".base");
-        std::fs::create_dir_all(&base_dir).unwrap();
-        std::fs::write(base_dir.join("graph.nq"), "# test").unwrap();
 
-        let sub = tmp.path().join("deep").join("nested");
-        std::fs::create_dir_all(&sub).unwrap();
-
-        let found = find_workspace_trig(&sub);
-        assert!(found.is_some());
-        assert!(found.unwrap().ends_with(".base/graph.nq"));
-    }
-
-    #[test]
-    fn find_workspace_trig_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let found = find_workspace_trig(tmp.path());
-        assert!(found.is_none());
-    }
 
     #[test]
     fn design_file_extensions_and_paths() {
