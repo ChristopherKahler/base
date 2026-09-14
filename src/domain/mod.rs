@@ -25,6 +25,11 @@ pub enum RuleEntry {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rationale: Option<String>,
+        /// The rule's own triggers: `[[domain.rules.match]]` tables (spec F2, F3, F12). Absent on every rule
+        /// until an operator approves a conversion (K4), and not written back when empty, so a file with no
+        /// matchers round-trips unchanged.
+        #[serde(default, rename = "match", skip_serializing_if = "Vec::is_empty")]
+        matchers: Vec<crate::domain::rules::Matcher>,
     },
 }
 
@@ -51,6 +56,14 @@ impl RuleEntry {
     /// otherwise just `text`.
     pub fn render(&self) -> String {
         render_rule(self.text(), self.rationale())
+    }
+
+    /// The rule's own matchers, as written. Empty for a bare string and for every unconverted rule.
+    pub fn matchers(&self) -> &[crate::domain::rules::Matcher] {
+        match self {
+            RuleEntry::Bare(_) => &[],
+            RuleEntry::Detailed { matchers, .. } => matchers,
+        }
     }
 }
 

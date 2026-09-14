@@ -1153,6 +1153,22 @@ pub enum RuleAction {
         /// pair in the same write, so serving surfaces stop returning the old one
         #[arg(long)]
         supersedes: Option<String>,
+        /// When the rule matters: always, place, action or topic (repeatable). A kind that
+        /// --place, --tool, --command or --words already implies need not be given
+        #[arg(long)]
+        kind: Vec<String>,
+        /// A folder, or a file the rule names (repeatable). Makes it a place rule
+        #[arg(long)]
+        place: Vec<String>,
+        /// A tool name, MCP tools included (repeatable). Makes it an action rule
+        #[arg(long)]
+        tool: Vec<String>,
+        /// A command, e.g. "base relay ping --to chris" (repeatable). Makes it an action rule
+        #[arg(long)]
+        command: Vec<String>,
+        /// Topic words and phrases, comma-separated: "ping chris, relay ping". Makes it a topic rule
+        #[arg(long)]
+        words: Option<String>,
     },
     /// List rules for a domain from the graph
     List {
@@ -2913,9 +2929,20 @@ pub fn run() {
         Some(Commands::Rule { global, action }) => {
             let rule_cwd = tier_cwd(&cwd, global);
             match action {
-                RuleAction::Add { domain: name, text, rationale, supersedes } => {
-                    match crud::rule::add_with(&rule_cwd, &config.namespace, &name, &text, rationale.as_deref(), supersedes.as_deref()) {
-                        Ok(index) => println!("Rule {index} added to domain '{name}'"),
+                RuleAction::Add { domain: name, text, rationale, supersedes, kind, place, tool, command, words } => {
+                    // F11: matchers are captured when the rule is created. A kind that needs a value it was not
+                    // given is refused here, never stored as a matcher that cannot fire.
+                    let matchers = match domain::rules::matchers_from_flags(&kind, &place, &tool, &command, words.as_deref()) {
+                        Ok(m) => m,
+                        Err(msg) => die("Failed", msg),
+                    };
+                    match crud::rule::add_with_matchers(&rule_cwd, &config.namespace, &name, &text, rationale.as_deref(), supersedes.as_deref(), &matchers) {
+                        Ok(index) => {
+                            println!("Rule {index} added to domain '{name}'");
+                            if !matchers.is_empty() {
+                                println!("  match: {}", domain::rules::describe_matchers(&matchers));
+                            }
+                        }
                         Err(e) => die("Failed", e),
                     }
                 }

@@ -115,9 +115,7 @@ fn process_session() -> Option<&'static str> {
 /// What one session was told about one rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShownRule {
-    /// Unix seconds. Not read yet; it is what the action throttle (F5, at most once
-    /// per 10 minutes per rule) will compare against, and recording it now means the
-    /// throttle does not need a migration of everyone's `.session` to start working.
+    /// Unix seconds. The action throttle (F5, at most once per 10 minutes per rule) compares against it.
     pub at: u64,
     /// The bracket tier in force when it was shown. A tier change re-serves the rules
     /// now in force, once (F8).
@@ -125,6 +123,17 @@ pub struct ShownRule {
     /// A hash of what was actually rendered. A text or rationale edit changes it, so
     /// an edited rule is shown again (F8's last line).
     pub content: u64,
+}
+
+/// How a rule's record decides that it is due again (spec F8's table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReShow {
+    /// Always, place and topic, and every rule with no matcher: once per session per scope, again when the
+    /// bracket changes tier (when `on_tier_change`), and again when its text or rationale changes.
+    PerSession { on_tier_change: bool },
+    /// Action: every time its action runs, at most once per `secs`, and again when its content changes. A tier
+    /// change does not re-fire it, because it fires on its action and not on a tier.
+    Throttle { secs: u64 },
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -273,7 +282,7 @@ impl SessionState {
             .is_some_and(|(scope, _)| scope == self.active_scope())
     }
 
-    fn now_secs() -> u64 {
+    pub fn now_secs() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs())
@@ -499,22 +508,40 @@ impl SessionState {
         tier: Bracket,
         scope: Option<&str>,
     ) -> bool {
-        let key = match scope {
-            Some(s) => self.scoped(&format!("r{SCOPE_SEP}{rule_id}{SCOPE_SEP}{s}")),
-            None => self.scoped(&format!("r{SCOPE_SEP}{rule_id}")),
-        };
-        let tier = tier.to_string();
-        if let Some(prev) = self.rules_shown.get(&key)
-            && prev.tier == tier
-            && prev.content == content
-        {
+        let now = Self::now_secs();
+        if !self.rule_due(rule_id, content, tier, scope, ReShow::PerSession { on_tier_change: true }, now) {
             return false;
         }
-        self.rules_shown.insert(
-            key,
-            ShownRule { at: Self::now_secs(), tier, content },
-        );
+        self.mark_rule_shown(rule_id, content, tier, scope, now);
         true
+    }
+
+    fn rule_key(&self, rule_id: &str, scope: Option<&str>) -> String {
+        match scope {
+            Some(s) => self.scoped(&format!("r{SCOPE_SEP}{rule_id}{SCOPE_SEP}{s}")),
+            None => self.scoped(&format!("r{SCOPE_SEP}{rule_id}")),
+        }
+    }
+
+    /// Whether a rule is due to be shown, recording NOTHING (F8). `domain::rules::select` asks this first and
+    /// records only what it returns, so a rule the topic cap cut is never marked as shown.
+    pub fn rule_due(&self, rule_id: &str, content: u64, tier: Bracket, scope: Option<&str>, reshow: ReShow, now: u64) -> bool {
+        let Some(prev) = self.rules_shown.get(&self.rule_key(rule_id, scope)) else {
+            return true;
+        };
+        if prev.content != content {
+            return true;
+        }
+        match reshow {
+            ReShow::PerSession { on_tier_change } => on_tier_change && prev.tier != tier.to_string(),
+            ReShow::Throttle { secs } => now.saturating_sub(prev.at) >= secs,
+        }
+    }
+
+    /// Record that a rule was shown at `now`, at this tier.
+    pub fn mark_rule_shown(&mut self, rule_id: &str, content: u64, tier: Bracket, scope: Option<&str>, now: u64) {
+        let key = self.rule_key(rule_id, scope);
+        self.rules_shown.insert(key, ShownRule { at: now, tier: tier.to_string(), content });
     }
 
     /// Claim the bracket-rules block for `tier`: true the first time this session

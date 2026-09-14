@@ -262,6 +262,47 @@ pub struct BaseConfig {
     pub relay: RelayConfig,
     #[serde(default)]
     pub workspace: Vec<WorkspaceEntry>,
+    #[serde(default)]
+    pub rules: RulesConfig,
+}
+
+// ─── Rules Config (spec Part H, commit 4) ───────────────────
+
+/// `[rules]`: how rules that carry matchers of their own are served (spec F5, F6, F8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RulesConfig {
+    /// Topic rules served per prompt, at most (F6).
+    #[serde(default = "default_topic_max")]
+    pub topic_max: usize,
+    /// The score a topic rule needs (F6, A5). 0.75 is above anything rule-text words reach alone (0.5), so one
+    /// common word from a long rule cannot fire it (`auk`, 2026-09-14).
+    #[serde(default = "default_topic_min_score")]
+    pub topic_min_score: f32,
+    /// An action rule shows at most once per this many minutes, per rule, per session (F5, LOCKED default 10).
+    #[serde(default = "default_action_throttle_minutes")]
+    pub action_throttle_minutes: u64,
+    /// Place, topic and always rules show again once when the bracket changes tier (F8).
+    #[serde(default = "default_true")]
+    pub reshow_on_tier_change: bool,
+    /// Show rules again after a compaction. LOCKED off by default (F8).
+    #[serde(default)]
+    pub reshow_on_compact: bool,
+}
+
+fn default_topic_max() -> usize { 5 }
+fn default_topic_min_score() -> f32 { 0.75 }
+fn default_action_throttle_minutes() -> u64 { 10 }
+
+impl Default for RulesConfig {
+    fn default() -> Self {
+        Self {
+            topic_max: default_topic_max(),
+            topic_min_score: default_topic_min_score(),
+            action_throttle_minutes: default_action_throttle_minutes(),
+            reshow_on_tier_change: default_true(),
+            reshow_on_compact: false,
+        }
+    }
 }
 
 // ─── Standards Config (MIDAS standards-injection layer) ─────
