@@ -70,7 +70,9 @@ pub fn run(target: &Path) -> Result<()> {
 
 # [signal]             # session-start injection (active set, handoffs, reminders)
 # enabled = true
-# max_chars = 2000     # injection budget per session-start
+
+# [budget]             # what a hook may print, in UTF-16 units (Claude Code's unit)
+# session_start_chars = 9000
 
 # [flow]               # resurface scans: unblocked, deferred-due, recurring ideas
 # enabled = true

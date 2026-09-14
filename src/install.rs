@@ -534,7 +534,16 @@ refresh_interval = 5      # re-survey window pressure every N prompts
 #   reminder_scan    → [Reminders]
 [signal]
 enabled = true            # master switch for all session-start injection
-max_chars = 2000          # injection budget per session-start (truncates past it)
+
+# ─── [budget] — how much a hook may print ────────────────────
+# Claude Code saves hook output over its limit to a file and shows Claude only
+# the first 2,000 characters. base measures what it is about to print, in UTF-16
+# units (the unit Claude Code counts), and cuts the bottom blocks to one line each,
+# naming where the rest is. Measured on Claude Code 2.1.269. The old
+# [signal] max_chars is read by nothing.
+[budget]
+session_start_chars = 9000   # everything session start prints
+write_full_output = true     # the untrimmed session start also goes to .base/last-session-start.md
 
 # ─── [sync] — graph extraction globs ─────────────────────────
 # Which files `base sync` reads to extract metadata/AST into the graph.

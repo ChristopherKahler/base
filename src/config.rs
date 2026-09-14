@@ -237,6 +237,8 @@ pub struct BaseConfig {
     #[serde(default)]
     pub signal: SignalConfig,
     #[serde(default)]
+    pub budget: BudgetConfig,
+    #[serde(default)]
     pub bracket: BracketConfig,
     #[serde(default)]
     pub devmode: DevmodeConfig,
@@ -739,6 +741,10 @@ pub struct StageDef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalConfig {
+    /// LEGACY, read by nothing. It capped three small signals, exempted the four largest and
+    /// counted bytes; `[budget] session_start_chars` replaced it (spec A8). Kept so an existing
+    /// `base.toml` still loads it and `base doctor` can name it as legacy. It is not the session
+    /// start budget: 2,000 would cut the map itself.
     #[serde(default = "default_max_chars")]
     pub max_chars: usize,
     #[serde(default = "default_signal_enabled")]
@@ -759,6 +765,57 @@ impl Default for SignalConfig {
             max_chars: default_max_chars(),
             enabled: default_signal_enabled(),
             scope: default_signal_scope(),
+        }
+    }
+}
+
+// ─── Budget Config ───────────────────────────────────────────
+
+/// How much each hook event may print, in UTF-16 code units: the unit Claude Code's limit
+/// counts. Output over the host's limit is saved to a file and Claude sees a 2,000-character
+/// preview of it, so base measures and trims before it prints. Measured on Claude Code 2.1.269.
+///
+/// Read today by session start: `session_start_chars`, `first_screen_chars` and
+/// `write_full_output`. `prompt_chars`, `pre_tool_chars` and `post_tool_chars` are read by
+/// nothing yet; the prompt and tool hooks take them in their own commits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    #[serde(default = "default_session_start_chars")]
+    pub session_start_chars: usize,
+    #[serde(default = "default_prompt_chars")]
+    pub prompt_chars: usize,
+    #[serde(default = "default_pre_tool_chars")]
+    pub pre_tool_chars: usize,
+    #[serde(default = "default_post_tool_chars")]
+    pub post_tool_chars: usize,
+    /// The header, the instructions and due-now items must fit inside this many units (spec A5).
+    #[serde(default = "default_first_screen_chars")]
+    pub first_screen_chars: usize,
+    /// The Claude Code version the defaults were measured on. The limit is the host's and can move.
+    #[serde(default = "default_measured_on")]
+    pub measured_on: String,
+    /// Write the untrimmed session start to `.base/last-session-start.md` before printing (spec A6).
+    #[serde(default = "default_true")]
+    pub write_full_output: bool,
+}
+
+fn default_session_start_chars() -> usize { 9000 }
+fn default_prompt_chars() -> usize { 4000 }
+fn default_pre_tool_chars() -> usize { 2500 }
+fn default_post_tool_chars() -> usize { 1000 }
+fn default_first_screen_chars() -> usize { 2000 }
+fn default_measured_on() -> String { "claude-code 2.1.269".into() }
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            session_start_chars: default_session_start_chars(),
+            prompt_chars: default_prompt_chars(),
+            pre_tool_chars: default_pre_tool_chars(),
+            post_tool_chars: default_post_tool_chars(),
+            first_screen_chars: default_first_screen_chars(),
+            measured_on: default_measured_on(),
+            write_full_output: default_true(),
         }
     }
 }
@@ -1114,6 +1171,17 @@ mod tests {
     /// `base config get update.auto` used to say "not found" about a setting
     /// whose default is true, because `get` reads the file and the file says
     /// nothing until you have overridden it.
+    #[test]
+    fn the_budget_keys_default_to_spec_part_h_and_read_back_when_set() {
+        assert_eq!(default_value("budget", "session_start_chars"), Some(toml::Value::Integer(9000)));
+        assert_eq!(default_value("budget", "first_screen_chars"), Some(toml::Value::Integer(2000)));
+        assert_eq!(default_value("budget", "write_full_output"), Some(toml::Value::Boolean(true)));
+        let cfg: BaseConfig =
+            toml::from_str("[budget]\nsession_start_chars = 1234\n").expect("a budget section parses");
+        assert_eq!(cfg.budget.session_start_chars, 1234);
+        assert_eq!(cfg.budget.prompt_chars, 4000, "an unset key keeps its default");
+    }
+
     #[test]
     fn default_value_answers_for_a_key_the_file_never_mentions() {
         assert_eq!(default_value("update", "auto"), Some(toml::Value::Boolean(true)));

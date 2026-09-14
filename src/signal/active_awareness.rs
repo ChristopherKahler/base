@@ -21,8 +21,26 @@ struct Wrow {
 /// Protocol's reconcile is the single source of "deferred"; this renders what's left in a
 /// working state, **scoped to the current workspace**: projects homed elsewhere collapse
 /// into a one-line `elsewhere:` pointer, while the operator's own un-homed (path-less)
-/// projects stay visible. Priority 1 (highest — never dropped by budget cap).
+/// projects stay visible. Priority 1.
 pub fn run(cwd: &Path, config: &BaseConfig) -> Result<String> {
+    Ok(run_sections(cwd, config)?
+        .into_iter()
+        .map(|s| s.text)
+        .collect())
+}
+
+/// One section of the working set: its block kind in the session-start emission, its text,
+/// and how many rows it lists.
+pub struct Section {
+    pub kind: &'static str,
+    pub text: String,
+    pub items: usize,
+}
+
+/// The working set as its sections, in order: blocked, active projects, active tasks. Joined,
+/// their texts are exactly what [`run`] returns. Session start takes each one as its own block,
+/// so a long task list can collapse to one line without taking the projects with it.
+pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<Vec<Section>> {
     let ns = &config.namespace;
     let p = &ns.prefix;
     let sparql = format!(
@@ -44,7 +62,7 @@ pub fn run(cwd: &Path, config: &BaseConfig) -> Result<String> {
 
     let results = crud::load_and_query(cwd, ns, &sparql)?;
     let QueryResults::Solutions(solutions) = results else {
-        return Ok(String::new());
+        return Ok(Vec::new());
     };
 
     let cell = |row: &QuerySolution, k: &str| {
@@ -71,7 +89,7 @@ pub fn run(cwd: &Path, config: &BaseConfig) -> Result<String> {
         scope::current_workspace(&canon_cwd, &registry)
     };
 
-    Ok(render_working_set(&rows, current.as_deref(), &registry))
+    Ok(render_sections(&rows, current.as_deref(), &registry))
 }
 
 const PROJECT_TYPES: [&str; 4] = ["Project", "App", "Framework", "TrackingProject"];
@@ -82,7 +100,10 @@ const PROJECT_TYPES: [&str; 4] = ["Project", "App", "Framework", "TrackingProjec
 /// the operator's own work, not foreign contamination); collapse projects homed in OTHER
 /// registered workspaces into a one-line `elsewhere:` pointer. When `current` is None (CWD
 /// under no registered workspace) nothing is scoped — the global view (today's behavior).
-fn render_working_set(rows: &[Wrow], current: Option<&str>, registry: &[WorkspaceEntry]) -> String {
+///
+/// Each section keeps the blank line that followed it in the single block, and the last one is
+/// trimmed at the end as that block was, so joining the sections gives the old block exactly.
+fn render_sections(rows: &[Wrow], current: Option<&str>, registry: &[WorkspaceEntry]) -> Vec<Section> {
     let home_of = |path: &str| -> Home {
         let canon = if path.is_empty() { None } else { Some(scope::canonical_str(path)) };
         scope::home(canon.as_deref(), registry)
@@ -98,7 +119,7 @@ fn render_working_set(rows: &[Wrow], current: Option<&str>, registry: &[Workspac
     };
     let is_project = |ty: &str| PROJECT_TYPES.contains(&ty);
 
-    let mut output = String::new();
+    let mut sections: Vec<Section> = Vec::new();
 
     // [Blocked] — scoped projects (tasks pass through; see [Active Tasks] note).
     let blocked: Vec<&Wrow> = rows
@@ -106,12 +127,17 @@ fn render_working_set(rows: &[Wrow], current: Option<&str>, registry: &[Workspac
         .filter(|r| r.status == "blocked" && (!is_project(&r.ty) || in_briefing(&r.path)))
         .collect();
     if !blocked.is_empty() {
-        output.push_str("[Blocked]\n");
+        let mut output = String::from("[Blocked]\n");
         for r in &blocked {
             let reason = if r.blocked_by.is_empty() { "unknown" } else { &r.blocked_by };
             output.push_str(&format!("- {}: {reason}\n", r.name));
         }
         output.push('\n');
+        sections.push(Section {
+            kind: "blocked",
+            text: output,
+            items: blocked.len(),
+        });
     }
 
     // [Active Projects] — scoped to current workspace + un-homed.
@@ -120,7 +146,7 @@ fn render_working_set(rows: &[Wrow], current: Option<&str>, registry: &[Workspac
         .filter(|r| r.status != "blocked" && is_project(&r.ty) && in_briefing(&r.path))
         .collect();
     if !projects.is_empty() {
-        output.push_str("[Active Projects]\n");
+        let mut output = String::from("[Active Projects]\n");
         for r in &projects {
             if r.next.is_empty() {
                 output.push_str(&format!("- {} ({})\n", r.name, r.status));
@@ -145,6 +171,11 @@ fn render_working_set(rows: &[Wrow], current: Option<&str>, registry: &[Workspac
             ));
         }
         output.push('\n');
+        sections.push(Section {
+            kind: "projects",
+            text: output,
+            items: projects.len(),
+        });
     }
 
     // [Active Tasks] — NOT workspace-scoped yet (tasks carry no #path; needs a
@@ -154,19 +185,36 @@ fn render_working_set(rows: &[Wrow], current: Option<&str>, registry: &[Workspac
         .filter(|r| r.ty == "Task" && r.status != "blocked")
         .collect();
     if !tasks.is_empty() {
-        output.push_str("[Active Tasks]\n");
+        let mut output = String::from("[Active Tasks]\n");
         for r in &tasks {
             output.push_str(&format!("- {} ({})\n", r.name, r.status));
         }
         output.push('\n');
+        sections.push(Section {
+            kind: "tasks",
+            text: output,
+            items: tasks.len(),
+        });
     }
 
-    output.trim_end().to_string()
+    if let Some(last) = sections.last_mut() {
+        let end = last.text.trim_end().len();
+        last.text.truncate(end);
+    }
+    sections
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sections joined: the single block the signal rendered before it was split.
+    fn render_working_set(rows: &[Wrow], current: Option<&str>, registry: &[WorkspaceEntry]) -> String {
+        render_sections(rows, current, registry)
+            .into_iter()
+            .map(|s| s.text)
+            .collect()
+    }
 
     fn row(ty: &str, name: &str, path: &str) -> Wrow {
         Wrow {
@@ -210,5 +258,23 @@ mod tests {
         let out = render_working_set(&rows, None, &registry);
         assert!(out.contains("ForeignA"), "global fallback shows all");
         assert!(!out.contains("elsewhere:"), "no pointer when unscoped");
+    }
+
+    #[test]
+    fn sections_join_to_the_single_block_and_carry_their_counts() {
+        let registry = reg(&[]);
+        let mut stuck = row("Project", "Stuck", "");
+        stuck.status = "blocked".into();
+        stuck.blocked_by = "API keys".into();
+        let rows = vec![stuck, row("Project", "Alpha", ""), row("Task", "T1", ""), row("Task", "T2", "")];
+        let kinds: Vec<(&str, usize)> = render_sections(&rows, None, &registry)
+            .iter()
+            .map(|s| (s.kind, s.items))
+            .collect();
+        assert_eq!(kinds, [("blocked", 1), ("projects", 1), ("tasks", 2)]);
+        assert_eq!(
+            render_working_set(&rows, None, &registry),
+            "[Blocked]\n- Stuck: API keys\n\n[Active Projects]\n- Alpha (active)\n\n[Active Tasks]\n- T1 (active)\n- T2 (active)"
+        );
     }
 }

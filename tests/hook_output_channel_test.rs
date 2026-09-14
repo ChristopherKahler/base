@@ -181,10 +181,14 @@ fn the_events_that_deliver_plain_stdout_still_use_it() {
         let end = rest.find("\n        }\n").map(|i| i + start).unwrap_or(src.len());
         src[start..end].to_string()
     };
-    for arm in ["\"session-start\" =>", "\"user-prompt-submit\" =>"] {
-        let body = arm_of(arm);
-        assert!(body.contains("print!(\"{block}\")"), "{arm} must keep plain stdout — the host delivers it there");
-    }
+    // Rank 00 commit B: session start collects its blocks, the relay blocks with them, and prints
+    // the measured emission once, so the literal `print!("{block}")` left this arm. What the
+    // assertion is for is unchanged, plain stdout and no envelope, and it still fails if either goes.
+    let session_start = arm_of("\"session-start\" =>");
+    assert!(session_start.contains("print!("), "session-start must keep plain stdout — the host delivers it there");
+    assert!(!session_start.contains("hookSpecificOutput"), "session-start must not use the envelope");
+    let prompt = arm_of("\"user-prompt-submit\" =>");
+    assert!(prompt.contains("print!(\"{block}\")"), "user-prompt-submit must keep plain stdout — the host delivers it there");
     for arm in ["\"pre-tool-use\" =>", "\"post-tool-use\" =>"] {
         let body = arm_of(arm);
         assert!(body.contains("hookSpecificOutput"), "{arm} must use the envelope");

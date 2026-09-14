@@ -1,22 +1,37 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use oxigraph::sparql::QueryResults;
 
 use crate::config::{load_queries, BaseConfig};
+use crate::emit::{self, Block, Emission, Fragments, FullOutput, Level, Rank, Reason, Rendered};
 use crate::ontology;
+use crate::signal::SignalOutput;
 use crate::store;
 
-pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Result<()> {
+/// Run session start and collect everything it has to say into `out`. Prints nothing: the
+/// dispatcher adds the relay blocks and prints [`SessionOutput::finish`]'s text once. What was
+/// collected before an error stays in `out`, as it used to stay on stdout.
+pub fn handle(
+    config: &BaseConfig,
+    cwd: &Path,
+    session_id: Option<&str>,
+    out: &mut SessionOutput,
+) -> Result<()> {
     // Surface graph corruption at boot — loud, before any other output, so a
     // broken graph announces itself immediately instead of degrading silently.
-    warn_unhealthy_graphs(cwd);
+    warn_unhealthy_graphs(cwd, out);
 
     // Proactive graph hygiene (Phase 52): compact any tier graph that has ballooned
     // past the threshold so graphs never balloon on a user's machine. Low-frequency
     // path; backup-first + atomic + cooldown-gated; skips an unhealthy graph.
     for outcome in crate::graph::auto_compact_tiers(&config.graph, cwd) {
-        println!("{}", crate::graph::format_auto_compact_notice(&outcome));
+        out.push(
+            "auto-compact",
+            &format!("{}\n", crate::graph::format_auto_compact_notice(&outcome)),
+            1,
+        );
     }
 
     // Clear session dedup state for fresh session
@@ -56,7 +71,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
             crate::migrate::Trigger::SessionStart,
         ));
         if !notice.is_empty() {
-            print!("{notice}");
+            out.push("migrate", &notice, 1);
         }
     }
 
@@ -65,9 +80,13 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
     // is not in settings.json never fires — silently.
     let added = crate::install::ensure_hooks_wired();
     if !added.is_empty() {
-        println!(
-            "[hooks] wired base hook {} into ~/.claude/settings.json (new in this release; live from the next session).",
-            added.join(", ")
+        out.push(
+            "hooks-wired",
+            &format!(
+                "[hooks] wired base hook {} into ~/.claude/settings.json (new in this release; live from the next session).\n",
+                added.join(", ")
+            ),
+            1,
         );
     }
 
@@ -79,13 +98,13 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
     // It is exclusive with the update notice below by construction: a home with
     // a swap in update.log is not on its first run, it is on its fourth.
     if let Some(msg) = crate::first_run::session_start_message() {
-        print!("{msg}");
+        out.push("first-run", &msg, 1);
     }
 
     // Same cluster, same reason: this is the new binary's first session, and it
     // is the only process that can say what it is now running.
     if let Some(notice) = crate::update::session_start_notice() {
-        println!("{notice}");
+        out.push("update-applied", &format!("{notice}\n"), 1);
     }
 
     // The installed CLAUDE.md contract refreshes here, once per version, for the
@@ -93,10 +112,18 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
     // carries the old text, so only the new binary's first session can write its own.
     match crate::install::ensure_claude_md_current() {
         Some(crate::install::ClaudeMdRefresh::Refreshed) => {
-            println!("[contract] refreshed the BASE CLI section of ~/.claude/CLAUDE.md to this release.");
+            out.push(
+                "contract",
+                "[contract] refreshed the BASE CLI section of ~/.claude/CLAUDE.md to this release.\n",
+                1,
+            );
         }
         Some(crate::install::ClaudeMdRefresh::Duplicate(n)) => {
-            println!("[contract] ~/.claude/CLAUDE.md carries {n} '## BASE CLI' sections; base refreshes none until one remains.");
+            out.push(
+                "contract",
+                &format!("[contract] ~/.claude/CLAUDE.md carries {n} '## BASE CLI' sections; base refreshes none until one remains.\n"),
+                1,
+            );
         }
         _ => {}
     }
@@ -116,11 +143,15 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
         if let Some(t) = crate::hook::hook_failure_summary(&base_dir)
             && t.broken_now
         {
-            println!("[hooks] {tier} tier {} Run `base doctor`.", t.summary);
+            out.push(
+                "hooks-health",
+                &format!("[hooks] {tier} tier {} Run `base doctor`.\n", t.summary),
+                1,
+            );
         }
     }
     if let Some(line) = crate::hook::automap::session_start_notice(cwd) {
-        println!("{line}");
+        out.push("automap", &format!("{line}\n"), 1);
     }
 
     // Mechanical reconcile (task-artifact protocol): replace hook-stamped lastActive
@@ -131,39 +162,51 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
 
     // Emit operator profile (if configured)
     if let Some(profile) = crate::operator::load() {
-        println!("{}", crate::operator::format_block(&profile));
+        out.push(
+            "operator",
+            &format!("{}\n", crate::operator::format_block(&profile)),
+            1,
+        );
     }
 
     // Silent self-update, then the legacy check/banner for pinned installs.
     auto_update(config);
-    check_and_banner();
+    check_and_banner(out);
 
     // Try signals first (Phase 5) — primary injection source
     let mut diagnostics: Vec<String> = Vec::new();
 
     if let Ok(signal_result) = crate::signal::run_signals(cwd, config, "session-start") {
-        diagnostics.extend(signal_result.diagnostics);
+        diagnostics.extend(signal_result.diagnostics.iter().cloned());
+        let any_signal = !signal_result.is_empty();
+        out.push_signals(signal_result);
 
-        if !signal_result.content.is_empty() {
-            print!("{}", signal_result.content);
-
+        if any_signal {
             // Flow protocol injection (static behavioral rules) — after signals
             if config.flow.enabled && config.flow.protocol {
-                print!("\n{}", crate::hook::flow::protocol_block());
+                out.push(
+                    "flow-protocol",
+                    &format!("\n{}", crate::hook::flow::protocol_block()),
+                    1,
+                );
             }
 
             // Diagnostics: always emitted, bypass suppression
             if !diagnostics.is_empty() {
-                print!("\n{}", diagnostics.join("\n"));
+                out.push(
+                    "diagnostics",
+                    &format!("\n{}", diagnostics.join("\n")),
+                    diagnostics.len(),
+                );
             }
 
             // Extension status injection (Phase 23)
-            inject_extension_status(config, cwd);
+            inject_extension_status(config, cwd, out);
 
             // Context triggers cheat-sheet (Phase 21)
             let triggers = crate::domain::query::context_triggers_block(cwd);
             if !triggers.is_empty() {
-                print!("\n{triggers}");
+                out.push("triggers", &format!("\n{triggers}"), 1);
             }
 
             return Ok(());
@@ -176,7 +219,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
     if trig_files.is_empty() {
         // Emit diagnostics even when no graph files found
         if !diagnostics.is_empty() {
-            print!("{}", diagnostics.join("\n"));
+            out.push("diagnostics", &diagnostics.join("\n"), diagnostics.len());
         }
         return Ok(());
     }
@@ -188,6 +231,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
 
     let queries = load_queries(cwd, config);
     let mut output = String::new();
+    let mut queries_shown = 0usize;
 
     for qdef in &queries {
         let sparql = format!(
@@ -206,39 +250,217 @@ pub fn handle(config: &BaseConfig, cwd: &Path, session_id: Option<&str>) -> Resu
             if !section.is_empty() {
                 output.push_str(&section);
                 output.push('\n');
+                queries_shown += 1;
             }
         }
     }
 
     if !output.is_empty() {
-        print!("{}", output.trim_end());
+        out.push("queries", output.trim_end(), queries_shown);
     }
 
     // Flow protocol injection — also in fallback path
     if config.flow.enabled && config.flow.protocol {
         if !output.is_empty() {
-            println!();
+            out.newline();
         }
-        print!("{}", crate::hook::flow::protocol_block());
+        out.push("flow-protocol", crate::hook::flow::protocol_block(), 1);
     }
 
     // Diagnostics: always emitted at end of output
     if !diagnostics.is_empty() {
         if !output.is_empty() || (config.flow.enabled && config.flow.protocol) {
-            println!();
+            out.newline();
         }
-        print!("{}", diagnostics.join("\n"));
+        out.push("diagnostics", &diagnostics.join("\n"), diagnostics.len());
     }
 
     // Extension status injection (Phase 23)
-    inject_extension_status(config, cwd);
+    inject_extension_status(config, cwd, out);
 
     Ok(())
 }
 
+/// Every block holds one rank in this commit, so the emission keeps the order the sites used to
+/// print in: the byte-identity ruling for the routing commit (lane doc W1.1-W1.5). The layout
+/// commit ranks them per spec B1.
+const SESSION_START_RANK: Rank = Rank::Tail;
+
+/// Blocks whose producer marks them shown while producing them: a welcome stamped, an update
+/// marked noticed, relay messages marked delivered, a task marked announced, a wake nudge
+/// stamped. Collapsed, their text would never be seen, so their floor names the full-output
+/// file, which is written before anything prints.
+pub const SHOWN_ONCE: [&str; 4] = ["first-run", "update-applied", "relay-inbox", "relay-tick"];
+
+/// The command that prints all of a block, where one exists. A block without one collapses to
+/// a line naming the full-output file instead.
+pub fn command_for(kind: &str) -> Option<&'static str> {
+    match kind {
+        "graph-unhealthy" | "hooks-health" => Some("base doctor"),
+        "operator" => Some("base operator show"),
+        "handoffs" => Some("base handoff list"),
+        "reminders" => Some("base reminder list"),
+        "forks" => Some("base fork list"),
+        "projects" => Some("base project list --all"),
+        "tasks" => Some("base task list"),
+        "extensions" => Some("base extension list"),
+        _ => None,
+    }
+}
+
+/// The one line a block becomes when the budget cannot afford it (spec A4): its kind, its
+/// count, and where the rest is.
+pub fn floor_line(kind: &str, items: usize, full: &FullOutput) -> String {
+    if let Some(command) = command_for(kind) {
+        return format!("{kind} {items} · all: {command}");
+    }
+    match (full.written_path(), full.failure()) {
+        (Some(path), _) => format!("{kind} {items} · full text: {path}"),
+        (None, Some(why)) => {
+            format!("{kind} {items} · not shown, and the full output was not written: {why}")
+        }
+        (None, None) => {
+            format!("{kind} {items} · not shown, and [budget] write_full_output is false")
+        }
+    }
+}
+
+/// Where the untrimmed session start goes (spec A6): the workspace `.base` when one resolves,
+/// else the global tier's `.base` when it exists. Never created here, so a session opened
+/// outside every tier gets no file and its floors say so.
+fn full_output_path(cwd: &Path) -> Option<PathBuf> {
+    crate::config::find_workspace_base(cwd)
+        .or_else(|| crate::config::global_base_dir().filter(|dir| dir.is_dir()))
+        .map(|dir| dir.join("last-session-start.md"))
+}
+
+fn kind_of(id: &str) -> &str {
+    id.split('#').next().unwrap_or(id)
+}
+
+/// Everything session start will print, collected before any of it reaches stdout.
+///
+/// Session start printed from 32 sites as it went, so nothing could measure the output before
+/// the host cut it: 45,232 characters on 2026-09-14, of which Claude saw the first 2,000. Each
+/// site now hands its exact text to this collector. The dispatcher adds the relay blocks and
+/// prints the text [`SessionOutput::finish`] returns, once.
+#[derive(Default)]
+pub struct SessionOutput {
+    fragments: Fragments,
+    signals: Option<SignalOutput>,
+}
+
+impl SessionOutput {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// One print site's exact output, newlines included. `items` counts what it lists.
+    pub fn push(&mut self, kind: &str, text: &str, items: usize) {
+        self.fragments.push(kind, text, items);
+    }
+
+    /// A bare line break between two sites, which belongs to neither.
+    pub fn newline(&mut self) {
+        self.fragments.push("", "\n", 0);
+    }
+
+    pub fn fragments(&self) -> &Fragments {
+        &self.fragments
+    }
+
+    /// The signal blocks, joined exactly as the combined signal string was: each signal's output
+    /// followed by one newline, and the end of the whole trimmed. Signals skipped as unchanged
+    /// print nothing, as before, and now leave a ledger row per block.
+    pub fn push_signals(&mut self, signals: SignalOutput) {
+        let mut sites: Vec<(&'static str, String, usize)> = Vec::new();
+        for signal in signals.signals() {
+            for block in &signal.blocks {
+                sites.push((block.kind, block.text.clone(), block.items));
+            }
+            sites.push(("", "\n".to_string(), 0));
+        }
+        while sites.last().is_some_and(|site| site.1.trim_end().is_empty()) {
+            sites.pop();
+        }
+        if let Some(last) = sites.last_mut() {
+            let end = last.1.trim_end().len();
+            last.1.truncate(end);
+        }
+        for (kind, text, items) in &sites {
+            self.fragments.push(kind, text, *items);
+        }
+        for signal in signals.unchanged() {
+            for block in &signal.blocks {
+                self.fragments.note_withheld(
+                    block.kind,
+                    block.items,
+                    Reason::HashUnchanged,
+                    command_for(block.kind).unwrap_or(""),
+                );
+            }
+        }
+        self.signals = Some(signals);
+    }
+
+    /// Write the untrimmed output, trim to `[budget] session_start_chars`, and record which
+    /// signals were shown in full. Prints nothing: the caller prints the returned text.
+    pub fn finish(self, config: &BaseConfig, cwd: &Path) -> Rendered {
+        let budget = &config.budget;
+        let (parts, withheld) = self.fragments.into_parts();
+
+        let mut untrimmed = Emission::new(budget.session_start_chars, budget.first_screen_chars);
+        for part in &parts {
+            let block = Block::new(part.id.clone(), SESSION_START_RANK, part.text.clone(), "", "")
+                .items(part.items, part.items);
+            let pushed = untrimmed.push(block);
+            debug_assert!(pushed, "part ids are unique by construction");
+        }
+        let full = if !budget.write_full_output {
+            FullOutput::off()
+        } else if let Some(path) = full_output_path(cwd) {
+            let written = emit::write_full_output(&path, &untrimmed.full_text());
+            if let Some(why) = written.failure() {
+                eprintln!("base: session start could not write its full output: {why}");
+            }
+            written
+        } else {
+            FullOutput::not_written("no workspace .base and no global .base directory to hold it")
+        };
+
+        let mut emission = Emission::new(budget.session_start_chars, budget.first_screen_chars);
+        for part in parts {
+            let floor = floor_line(&part.kind, part.items, &full);
+            let command = command_for(&part.kind)
+                .or(full.written_path())
+                .unwrap_or("")
+                .to_string();
+            let block = Block::new(part.id, SESSION_START_RANK, part.text, floor, command)
+                .items(part.items, part.items);
+            let pushed = emission.push(block);
+            debug_assert!(pushed, "part ids are unique by construction");
+        }
+        for row in withheld {
+            emission.note_withheld(row.block, row.items, row.reason, row.command);
+        }
+        let rendered = emission.render(&full, None);
+
+        if let Some(signals) = self.signals {
+            let in_full: HashSet<&str> = rendered
+                .blocks
+                .iter()
+                .filter(|b| b.level() == Level::Full)
+                .map(|b| kind_of(b.id()))
+                .collect();
+            signals.record_shown(|kind| in_full.contains(kind));
+        }
+        rendered
+    }
+}
+
 /// Inject extension status lines and run extension session-start SPARQL queries.
 /// Fail-open: malformed extensions, missing query files, and query errors all skip silently.
-fn inject_extension_status(config: &BaseConfig, cwd: &Path) {
+fn inject_extension_status(config: &BaseConfig, cwd: &Path, out: &mut SessionOutput) {
     let extensions = crate::extension::load_extensions();
     if extensions.is_empty() {
         return;
@@ -250,7 +472,7 @@ fn inject_extension_status(config: &BaseConfig, cwd: &Path) {
             && let Some(ss) = &hooks.session_start
         {
             if let Some(inject) = &ss.inject {
-                println!("{inject}");
+                out.push("extensions", &format!("{inject}\n"), 1);
             }
 
             // Run extension SPARQL queries
@@ -289,12 +511,16 @@ fn inject_extension_status(config: &BaseConfig, cwd: &Path) {
                         Ok(oxigraph::sparql::QueryResults::Solutions(solutions)) => {
                             let rows: Vec<_> = solutions.filter_map(|r| r.ok()).collect();
                             if !rows.is_empty() {
-                                println!(
-                                    "<ext:{}-query>\n{} result(s) from {}\n</ext:{}-query>",
-                                    ext.name,
-                                    rows.len(),
-                                    query_rel_path,
-                                    ext.name
+                                out.push(
+                                    "extensions",
+                                    &format!(
+                                        "<ext:{}-query>\n{} result(s) from {}\n</ext:{}-query>\n",
+                                        ext.name,
+                                        rows.len(),
+                                        query_rel_path,
+                                        ext.name
+                                    ),
+                                    1,
                                 );
                             }
                         }
@@ -358,7 +584,7 @@ fn auto_update(config: &BaseConfig) {
     crate::update::spawn_background_update();
 }
 
-fn check_and_banner() {
+fn check_and_banner(out: &mut SessionOutput) {
     let Some(mut manifest) = crate::manifest::Manifest::load() else {
         return; // No manifest = nothing to check
     };
@@ -376,7 +602,7 @@ fn check_and_banner() {
     // only thing that quiets the banner, which is what the snooze is for.
     if !pending.is_empty() {
         if !crate::manifest::is_snoozed(&manifest) {
-            print!("{}", crate::manifest::format_update_banner(pending));
+            out.push("update-banner", &crate::manifest::format_update_banner(pending), 1);
         }
         // The update is already known; no HTTP check this session.
         return;
@@ -395,7 +621,7 @@ fn check_and_banner() {
 
     // The activation gate that used to sit here is gone with the feature.
     if let Ok(Some(ref pending)) = result {
-        print!("{}", crate::manifest::format_update_banner(pending));
+        out.push("update-banner", &crate::manifest::format_update_banner(pending), 1);
     }
 }
 
@@ -449,7 +675,9 @@ fn ingest_paul_projects(config: &BaseConfig, cwd: &Path) {
 /// workspace with no graph yet) and healthy tiers emit nothing — zero noise,
 /// per the suppression principle. The hook's "loud" channel is THIS stdout
 /// block, never a nonzero exit code (a corrupt graph must never stop a session).
-fn warn_unhealthy_graphs(cwd: &Path) {
+fn warn_unhealthy_graphs(cwd: &Path, out: &mut SessionOutput) {
+    use std::fmt::Write as _;
+
     let mut tiers: Vec<(&str, PathBuf)> = Vec::new();
 
     // Global tier: ~/.base-gbl/.base/graph.nq
@@ -477,14 +705,16 @@ fn warn_unhealthy_graphs(cwd: &Path) {
         }
         if let store::GraphHealth::Unhealthy { reason, bad_line } = store::graph_health(&path) {
             let line = bad_line.map(|n| format!(" (line {n})")).unwrap_or_default();
-            println!("═══════════════════════════════════════");
-            println!("⚠️  BASE GRAPH UNHEALTHY — {tier} tier");
-            println!("   {}", path.display());
-            println!("   {reason}{line}");
-            println!("   recall / learn / sync are DEGRADED until repaired.");
-            println!("   Repair: run `base doctor` once available (v0.5),");
-            println!("           or repair manually per GRAPH-DURABILITY.md");
-            println!("═══════════════════════════════════════");
+            let mut block = String::new();
+            let _ = writeln!(block, "═══════════════════════════════════════");
+            let _ = writeln!(block, "⚠️  BASE GRAPH UNHEALTHY — {tier} tier");
+            let _ = writeln!(block, "   {}", path.display());
+            let _ = writeln!(block, "   {reason}{line}");
+            let _ = writeln!(block, "   recall / learn / sync are DEGRADED until repaired.");
+            let _ = writeln!(block, "   Repair: run `base doctor` once available (v0.5),");
+            let _ = writeln!(block, "           or repair manually per GRAPH-DURABILITY.md");
+            let _ = writeln!(block, "═══════════════════════════════════════");
+            out.push("graph-unhealthy", &block, 1);
         }
     }
 }
