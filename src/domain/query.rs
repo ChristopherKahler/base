@@ -39,97 +39,22 @@ pub fn query_domain_from_graph(
     let domain_iri = crud::build_iri(ns, "domain", &domain_slug);
     let pfx = crud::prefixes(ns);
 
-    // Query 1: Get rules ordered by priority, with optional rationale (Phase 26)
-    //
-    // The superseded filter belongs here for the same reason it belongs on the
-    // neighbourhood query below: this is a SERVING surface. `crud::rule::fetch`
-    // (`crud/rule.rs:140`) has excluded superseded rules from `base rule list`
-    // since #59, and this query never did — so a rule was hidden from the command
-    // that lists rules and injected into every prompt that matched the domain.
-    // base-config carries that pair live today: "build on Windows natively" and
-    // the later rule that says the first one is wrong.
-    //
-    // INSIDE the `GRAPH ?g` group, beside the pattern it constrains. Outside every
-    // GRAPH group the pattern matches the default graph, where base keeps nothing,
-    // so NOT EXISTS is always true and the filter excludes nothing while reading
-    // like a working one. That shipped once as F16 (`crud/note.rs`, 2026-09-06).
-    //
-    // SERVING SURFACES ONLY (auk, 2026-09-14, after petrel). base keeps superseded
-    // records on purpose — the superseded record is the drift evidence — so this
-    // filter never reaches storage, `base graph supersede`, or an explicit query
-    // command, and `--include-superseded` is untouched.
-    let no_superseded_rule = crate::supersede::sparql_exclude_superseded(ns, "rule");
-    let rules_sparql = format!(
-        "{pfx}\n\
-         SELECT ?rule ?text ?rationale WHERE {{\n\
-           GRAPH ?g {{\n\
-             <{domain_iri}> {p}:hasRule ?rule .\n\
-             ?rule {p}:ruleText ?text .\n\
-             OPTIONAL {{ ?rule {p}:priority ?pri }}\n\
-             OPTIONAL {{ ?rule {p}:rationale ?rationale }}\n\
-             {no_superseded_rule}\
-           }}\n\
-         }}\n\
-         ORDER BY xsd:integer(?pri)"
-    );
-
-    let rules_text = match crate::store::query(store, &rules_sparql) {
-        Ok(oxigraph::sparql::QueryResults::Solutions(solutions)) => {
-            let rules: Vec<String> = solutions
-                .filter_map(|r| r.ok())
-                .filter_map(|row| {
-                    let text = match row.get("text")?.into() {
-                        TermRef::Literal(l) => l.value().to_string(),
-                        _ => return None,
-                    };
-                    if text.is_empty() {
-                        return None;
-                    }
-                    let rationale = row.get("rationale").and_then(|t| match t.into() {
-                        TermRef::Literal(l) => {
-                            let v = l.value().to_string();
-                            (!v.is_empty()).then_some(v)
-                        }
-                        _ => None,
-                    });
-                    if let Some(key) = row.get("rule").and_then(|t| walk_key(t.into())) {
-                        served.push(key);
-                    }
-                    Some(domain::render_rule(&text, rationale.as_deref()))
-                })
-                .collect();
-
-            // Dedupe identical rules, preserving priority order.
-            //
-            // The SPARQL above matches inside an UNBOUND `GRAPH ?g`, and the store
-            // is a MERGE of the global and workspace tiers. A domain declared once
-            // in the global domains.toml gets synced into both tiers' graphs (under
-            // ws/base-gbl and ws/<workspace> respectively), so the same rule is a
-            // distinct QUAD in each and matches twice — rendering every rule double.
-            //
-            // Deduping here rather than with SPARQL DISTINCT on purpose: DISTINCT
-            // would have to project ?pri to keep ORDER BY legal, and differing
-            // priorities across tiers would then defeat it. Identical rendered text
-            // is the thing that must appear once, whatever the graph topology.
-            let rules = {
-                let mut seen = std::collections::HashSet::new();
-                rules
-                    .into_iter()
-                    .filter(|r| seen.insert(r.clone()))
-                    .collect::<Vec<String>>()
-            };
-
-            if rules.is_empty() {
-                format_toml_rules(domain_def)
-            } else {
-                let mut out = format!("[DOMAIN: {}]\n", domain_def.name);
-                for (i, rule) in rules.iter().enumerate() {
-                    out.push_str(&format!("  {i}. {rule}\n"));
-                }
-                out
-            }
+    // The query, the superseded filter, the integer sort and the cross-tier
+    // dedupe now live once, in `domain::rules`. This surface renders; it does not
+    // also decide what a rule is. The copy that used to sit here and the copy in
+    // `pre_tool_use.rs` had already drifted apart on the sort.
+    let rules = crate::domain::rules::rules_for_domain(Some(store), config, domain_def);
+    // Every rule IRI this block served, so the prompt-time walk does not list the
+    // same record again under its own heading (#65).
+    served.extend(rules.iter().filter_map(|r| r.iri.clone()));
+    let rules_text = if rules.is_empty() {
+        String::new()
+    } else {
+        let mut out = format!("[DOMAIN: {}]\n", domain_def.name);
+        for (i, rule) in rules.iter().enumerate() {
+            out.push_str(&format!("  {i}. {}\n", rule.rendered));
         }
-        _ => format_toml_rules(domain_def),
+        out
     };
 
     // Query 2: 1-hop neighborhood (decisions linked to this domain, projects with hasDomain).

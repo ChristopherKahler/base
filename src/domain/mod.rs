@@ -1,6 +1,7 @@
 pub mod link;
 pub mod matcher;
 pub mod query;
+pub mod rules;
 pub mod session;
 pub mod sync;
 pub mod transcript;

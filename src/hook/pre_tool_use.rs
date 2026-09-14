@@ -136,17 +136,39 @@ pub fn handle(
         let matched = match_by_file(&domains, &file_path_strings, &trigger_ctx);
 
         for domain_def in &matched {
-            // Session dedup: skip if this domain's rules were already injected.
-            // Hash the rendered rules (text + rationale) so a rationale edit re-injects.
-            let rules_hash = domain::session::rules_hash(&domain_def.rendered_rules());
+            // Read the rules FIRST, then key the dedup on what came back.
+            //
+            // Until 0.16.0 this was the other way round: the key was
+            // `rules_hash(&domain_def.rendered_rules())`, which renders the TOML,
+            // and the payload was `query_rules_from_graph`, which reads the graph.
+            // A domain whose rules live only in the graph — which is every domain
+            // whose rules were added with `base rule add` — has an EMPTY
+            // `rendered_rules()`, so its key was a constant. The first tool call
+            // injected and marked it; every later call in that session computed the
+            // same constant and was suppressed, however the rules had changed. The
+            // reverse cost the other way: a domains.toml edit changed the key and
+            // re-injected text the reader had already seen.
+            //
+            // Reading before deciding costs one query on a domain that turns out to
+            // be deduped. That is the price of a key that describes the payload, and
+            // the defect it removes is a rule the operator added never arriving.
+            let rules = domain::rules::rules_for_domain(graph_store.as_ref(), config, domain_def);
+            let rules_hash = domain::session::rules_hash(
+                &rules.iter().map(|r| r.rendered.clone()).collect::<Vec<_>>(),
+            );
             if session.is_injected(&domain_def.name, rules_hash) {
                 data.suppressed += 1;
                 continue;
             }
 
-            let rules_text = match &graph_store {
-                Some(store) => query_rules_from_graph(store, config, domain_def),
-                None => format_toml_rules(domain_def),
+            let rules_text = if rules.is_empty() {
+                String::new()
+            } else {
+                let mut out = format!("[FILE MATCH: {}]\n", domain_def.name);
+                for (i, rule) in rules.iter().enumerate() {
+                    out.push_str(&format!("  {i}. {}\n", rule.rendered));
+                }
+                out
             };
 
             // Query-triggered injection for filepath-matched domains
@@ -554,92 +576,6 @@ fn match_by_file<'a>(
         .collect()
 }
 
-/// Query rules for a domain from the graph. Returns formatted text.
-fn query_rules_from_graph(
-    store: &oxigraph::store::Store,
-    config: &BaseConfig,
-    domain_def: &domain::DomainDef,
-) -> String {
-    let ns = &config.namespace;
-    let p = &ns.prefix;
-    let domain_slug = crud::slugify(&domain_def.name);
-    let domain_iri = crud::build_iri(ns, "domain", &domain_slug);
-    let pfx = crud::prefixes(ns);
-
-    // Superseded rules are dropped here for the same reason they are dropped in
-    // `domain::query::query_domain_from_graph`: both are SERVING surfaces, and
-    // serving a rule that a later rule corrected hands the agent both halves of a
-    // contradiction with nothing to tell them apart. Placed INSIDE the `GRAPH ?g`
-    // group — outside it the pattern matches the default graph, where base keeps
-    // nothing, so it would exclude nothing while reading like a working filter.
-    //
-    // `xsd:integer(?pri)`, not `?pri`. A plain string sort compares "10" against
-    // "2" and puts the eleventh rule second — the #29 shape. `crud/rule.rs` and
-    // `domain/query.rs` both cast already; this query was the one left behind, so
-    // the pre-tool block and the prompt block disagreed about rule order on any
-    // domain with more than ten rules. base-config has seventeen.
-    let no_superseded_rule = crate::supersede::sparql_exclude_superseded(ns, "rule");
-    let sparql = format!(
-        "{pfx}\n\
-         SELECT ?text ?rationale WHERE {{\n\
-           GRAPH ?g {{\n\
-             <{domain_iri}> {p}:hasRule ?rule .\n\
-             ?rule {p}:ruleText ?text .\n\
-             OPTIONAL {{ ?rule {p}:priority ?pri }}\n\
-             OPTIONAL {{ ?rule {p}:rationale ?rationale }}\n\
-             {no_superseded_rule}\
-           }}\n\
-         }}\n\
-         ORDER BY xsd:integer(?pri)"
-    );
-
-    match crate::store::query(store, &sparql) {
-        Ok(oxigraph::sparql::QueryResults::Solutions(solutions)) => {
-            let rules: Vec<String> = solutions
-                .filter_map(|r| r.ok())
-                .filter_map(|row| {
-                    let text = match row.get("text")?.into() {
-                        TermRef::Literal(l) => l.value().to_string(),
-                        _ => return None,
-                    };
-                    if text.is_empty() {
-                        return None;
-                    }
-                    let rationale = row.get("rationale").and_then(|t| match t.into() {
-                        TermRef::Literal(l) => {
-                            let v = l.value().to_string();
-                            (!v.is_empty()).then_some(v)
-                        }
-                        _ => None,
-                    });
-                    Some(domain::render_rule(&text, rationale.as_deref()))
-                })
-                .collect();
-
-            if rules.is_empty() {
-                format_toml_rules(domain_def)
-            } else {
-                let mut out = format!("[FILE MATCH: {}]\n", domain_def.name);
-                for (i, rule) in rules.iter().enumerate() {
-                    out.push_str(&format!("  {i}. {rule}\n"));
-                }
-                out
-            }
-        }
-        _ => format_toml_rules(domain_def),
-    }
-}
-
-fn format_toml_rules(domain_def: &domain::DomainDef) -> String {
-    if domain_def.rules.is_empty() {
-        return String::new();
-    }
-    let mut out = format!("[FILE MATCH: {}]\n", domain_def.name);
-    for (i, rule) in domain_def.rules.iter().enumerate() {
-        out.push_str(&format!("  {i}. {}\n", rule.render()));
-    }
-    out
-}
 
 /// Query PAUL FileChange and Decision entities linked to a file path.
 /// Returns formatted context string for hook injection.
