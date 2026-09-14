@@ -9,7 +9,10 @@
 //! prompt at FRESH and 1,878 at MODERATE, in a session where the same text also sat in
 //! `~/.claude/CLAUDE.md`.
 //!
-//! Red at `0ace1ba`: every prompt carries a block. Green after: prompt 1 carries FRESH,
+//! Red with the API present and the gate absent (commit 2a): every prompt carries a block.
+//! This test cannot compile at `0ace1ba` -- `claim_bracket_block` and
+//! `bracket_rules_injected` do not exist there -- so no run of it at `0ace1ba` ever
+//! happened. Green after: prompt 1 carries FRESH,
 //! prompts 2 carries nothing, the first prompt after the tier change carries MODERATE,
 //! and the one after that carries nothing.
 
@@ -128,7 +131,8 @@ fn the_prompt_hook_sends_the_block_once_per_tier() {
             got,
             vec![true, false, true, false],
             "prompt 1 FRESH, prompt 2 nothing, prompt 3 is the first MODERATE prompt so it \
-             carries MODERATE, prompt 4 nothing. At 0ace1ba this is [true, true, true, true]."
+             carries MODERATE, prompt 4 nothing. With the API present and the gate absent this \
+             is [true, true, true, true]; the test cannot compile at 0ace1ba."
         );
     });
 }
