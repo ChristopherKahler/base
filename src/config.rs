@@ -361,8 +361,14 @@ pub struct BracketConfig {
 /// prompt receives `always` + `depleted`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BracketRules {
-    /// Injected every prompt at every tier. For rules that must not erode —
-    /// the layer that survives a long session because it is re-sent, not remembered.
+    /// Injected with every tier's block, ahead of that tier's own entries, so the
+    /// permanent rules keep a stable position whatever the tier.
+    ///
+    /// NOT every prompt. K1 (Chris, 2026-09-12) ruled the whole block is served once
+    /// when it first applies and again only when the bracket changes tier. The older
+    /// wording here — "injected every prompt", "survives because it is re-sent" —
+    /// described the behaviour this key had before that ruling, and a comment left
+    /// contradicting the code is how the next reader restores the behaviour.
     #[serde(default)]
     pub always: Vec<String>,
     #[serde(default)]

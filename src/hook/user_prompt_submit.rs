@@ -49,11 +49,30 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         session.clear_dedup();
     }
 
-    // Bracket rules — tier-gated, never deduped. Re-injecting every prompt IS the
-    // feature: these are the rules that must not erode as context fills, which a
-    // once-per-session domain injection cannot guarantee. Built before the *command
-    // branch so a star command cannot bypass them.
+    // Bracket rules — tier-gated, and served ONCE per tier (F7, ruled by Chris as K1
+    // on 2026-09-12: "no, inject one time, then no more, inject only when bracket
+    // changes the rules for that bracket"). Built before the *command branch so a
+    // star command cannot bypass them.
+    //
+    // This variable is the gate for all four return sites below. Each of them prints
+    // `{bracket_rules}`, so gating the string rather than the printers means a new
+    // return site added later cannot forget the rule.
+    //
+    // The short-circuit order matters: `claim_bracket_block` is not called when the
+    // render is empty. base ships no bracket rules, so a default install renders
+    // nothing at every tier, and claiming a tier for a block that was never printed
+    // would silence the first real one after an operator configures some.
+    // The short-circuit order matters: `claim_bracket_block` is not called when the
+    // render is empty. base ships no bracket rules, so a default install renders
+    // nothing at every tier, and claiming a tier for a block that was never printed
+    // would silence the first real one after an operator configures some.
     let bracket_rules = crate::domain::session::format_bracket_rules(bracket, &config.bracket.rules);
+    let bracket_rules = if bracket_rules.is_empty() || !session.claim_bracket_block(bracket) {
+        String::new()
+    } else {
+        bracket_rules
+    };
+    let bracket_injected = !bracket_rules.is_empty();
 
     // Deferred from above: nothing else to do without domains, but the bracket
     // block still goes out.
@@ -64,6 +83,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         print!("{bracket_rules}");
         return Ok(super::HookEventData {
             prompt_num: Some(session.prompt_count_for(session_id)),
+            bracket_rules_injected: bracket_injected,
             ..Default::default()
         });
     }
@@ -88,6 +108,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             print!("{bracket_rules}{cmd_output}");
             return Ok(super::HookEventData {
                 prompt_num: Some(session.prompt_count_for(session_id)),
+                bracket_rules_injected: bracket_injected,
                 ..Default::default()
             });
         }
@@ -123,12 +144,15 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         //
         // AND N-BRACKET-DEAD-WITHOUT-A-MATCHED-DOMAIN, the same early return
         // costing the same users a second feature. The bracket line and its
-        // rules are tier-gated, never domain-gated: they are re-sent every
-        // prompt precisely because they are the layer that must not erode as
-        // context fills, which a once-per-session injection cannot guarantee.
-        // Skipping them here made them erode fastest for the user with the
-        // fewest domains -- and on an install whose domains are all
-        // `mode = "triggered"`, erode to nothing.
+        // rules are tier-gated, never domain-gated, so withholding them because
+        // an unrelated domain trigger did not fire left the user with the fewest
+        // domains getting nothing at all -- and on an install whose domains are
+        // all `mode = "triggered"`, nothing ever.
+        //
+        // Under K1 the block itself is now served once per tier rather than every
+        // prompt; that gate lives where `bracket_rules` is built, above, so this
+        // return prints whatever the gate already decided. The reason this return
+        // must not skip it is unchanged: it is not domain-gated.
         //
         // `prompt_count_for(session_id)`, NOT the raw `session.prompt_count`.
         // Of the four return sites in this function this was the only one
@@ -175,6 +199,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         }
         return Ok(super::HookEventData {
             prompt_num: Some(session.prompt_count),
+            bracket_rules_injected: bracket_injected,
             ..Default::default()
         });
     }
@@ -500,6 +525,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         tool_name: None,
         file_path: None,
         session_id: None, // populated by run() after handle returns
+        bracket_rules_injected: bracket_injected,
         ..Default::default()
     })
 }

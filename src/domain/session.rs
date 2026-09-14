@@ -143,6 +143,15 @@ pub struct SessionState {
     /// long sessions get a top-of-awareness restore.
     #[serde(default)]
     pub standards_injected: HashMap<String, u64>,
+    /// Scoped key → the bracket tier whose rules block this session has been shown.
+    ///
+    /// Deliberately NOT cleared by [`SessionState::clear_dedup`]. The DEPLETED and
+    /// CRITICAL force-refresh exists to restore domain rules that erode as context
+    /// fills; K1 says the bracket block is served once per tier and nothing else,
+    /// so a force-refresh that re-sent it would put the old every-prompt behaviour
+    /// back on exactly the long sessions the ruling was written for.
+    #[serde(default)]
+    pub bracket_shown: HashMap<String, String>,
 }
 
 impl SessionState {
@@ -256,6 +265,7 @@ impl SessionState {
         self.injected.retain(|k, _| !k.starts_with(&prefix));
         self.ast_injected.retain(|k, _| !k.starts_with(&prefix));
         self.standards_injected.retain(|k, _| !k.starts_with(&prefix));
+        self.bracket_shown.retain(|k, _| !k.starts_with(&prefix));
         self.dirty_apps.retain(|k| !k.starts_with(&prefix));
         self.prompt_counts.remove(session_id);
         self.last_seen.remove(session_id);
@@ -399,6 +409,36 @@ impl SessionState {
         let prefix = format!("{}{SCOPE_SEP}", self.active_scope());
         self.injected.retain(|k, _| !k.starts_with(&prefix));
         self.standards_injected.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    /// Claim the bracket-rules block for `tier`: true the first time this session
+    /// is served that tier's block, false afterwards, and true again the first time
+    /// a DIFFERENT tier is in force.
+    ///
+    /// K1, ruled by Chris 2026-09-12: "no, inject one time, then no more, inject only
+    /// when bracket changes the rules for that bracket." Before this, the block was
+    /// exempt from dedup by design and rode every prompt — 2,931 bytes per prompt at
+    /// FRESH and 1,878 at MODERATE on the operator's machine, measured 2026-09-12,
+    /// while the same text also sat in `~/.claude/CLAUDE.md`.
+    ///
+    /// It DECIDES and RECORDS in one call, so the four return sites in the prompt
+    /// hook cannot drift apart: a gate applied at three of them is a gate a user
+    /// routes around by having no domains configured. Call it only once the block
+    /// has actually rendered to something — claiming a tier for a block that was
+    /// never printed would silence the first real one after an operator configures
+    /// bracket rules mid-session.
+    ///
+    /// A change BACK to an earlier tier serves that tier's block again. The rules
+    /// now in force have not been served since they came into force, which is what
+    /// the ruling is about.
+    pub fn claim_bracket_block(&mut self, tier: Bracket) -> bool {
+        let key = self.scoped("bracket");
+        let tier = tier.to_string();
+        if self.bracket_shown.get(&key).is_some_and(|shown| *shown == tier) {
+            return false;
+        }
+        self.bracket_shown.insert(key, tier);
+        true
     }
 
     /// Whether this standard was already injected this session with the same
