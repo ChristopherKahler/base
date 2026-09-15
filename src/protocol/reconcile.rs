@@ -525,12 +525,16 @@ pub fn apply_records(
     if ops.is_empty() {
         return Ok((0, 0));
     }
-    store::mutate_and_write(store, file, "", store::Scope::Wide, store::Intent::Knowledge, |st| {
-        for op in &ops {
-            st.update(&format!("{pfx}\n{op}"))
-                .with_context(|| format!("deferral update failed: {op}"))?;
-        }
-        Ok(Some(ops.join(";\n")))
+    // The lock lives with the WRITE, as it does in `apply` (lock_tripwire_test): re-entrant, so the
+    // `reconcile_records` caller that already holds it pays nothing.
+    store::with_graph_lock(file, || {
+        store::mutate_and_write(store, file, "", store::Scope::Wide, store::Intent::Knowledge, |st| {
+            for op in &ops {
+                st.update(&format!("{pfx}\n{op}"))
+                    .with_context(|| format!("deferral update failed: {op}"))?;
+            }
+            Ok(Some(ops.join(";\n")))
+        })
     })?;
     Ok((n_deferred, n_revived))
 }

@@ -591,7 +591,7 @@ pub fn instruction_block(letters: &[(char, String)], deferred: usize) -> String 
          5. Every block below is a summary. Its full list is the command on its line, and the whole untrimmed output is the file on line 1. Never guess; run it.",
     );
     if deferred > 0 {
-        s.push_str("\n6. Deferred = open but paused, not listed here; each block gives the count and the command. Bring one back: base handoff show <what they said> (forks: base fork show).");
+        s.push_str("\n6. Deferred = open but paused, not listed; each block counts them. Bring one back: `base handoff show <words>` (forks: `base fork show`).");
     }
     if !letters.is_empty() {
         let map: Vec<String> = letters

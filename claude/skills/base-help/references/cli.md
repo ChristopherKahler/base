@@ -16,6 +16,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base ast ensure`
 - `base project` (alias: p)
 - `base project add` (alias: a)
+- `base project deferred`
 - `base project list` (alias: l)
 - `base project get`
 - `base project peer`
@@ -25,12 +26,14 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base project delete`
 - `base milestone` (alias: m)
 - `base milestone add` (alias: a)
+- `base milestone deferred`
 - `base milestone list` (alias: l)
 - `base milestone get`
 - `base milestone update` (alias: u)
 - `base milestone delete`
 - `base task` (alias: t)
 - `base task add` (alias: a)
+- `base task deferred`
 - `base task list` (alias: l)
 - `base task get`
 - `base task update` (alias: u)
@@ -54,16 +57,21 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base reminder` (alias: r)
 - `base reminder add`
 - `base reminder list`
+- `base reminder snooze`
+- `base reminder archive`
 - `base reminder remove`
 - `base handoff`
 - `base handoff create`
 - `base handoff list`
 - `base handoff show`
+- `base handoff deferred`
 - `base handoff snooze`
 - `base handoff archive`
 - `base fork`
 - `base fork create`
 - `base fork list`
+- `base fork show`
+- `base fork deferred`
 - `base fork snooze`
 - `base fork archive`
 - `base sync`
@@ -349,15 +357,16 @@ Manage projects
 Usage: base project <COMMAND>
 
 Commands:
-  add     Add a new project [aliases: a]
-  list    List projects (defaults to the current workspace; cross-awareness via flags) [aliases: l]
-  get     Show a specific project (accepts slug or display name)
-  peer    Make a project also surface in another workspace (additive peerWorkspace edge)
-  repath  Re-point a project's folder path (graph + domain trigger) after it moves
-  update  Update a project (accepts slug or display name) [aliases: u]
-  move    Re-home a project to another workspace graph (node + tasks + domain + decisions/rules/notes). AST regenerates at the destination. PREVIEW unless --yes
-  delete  Delete a project. Refuses a non-empty project unless --force (which cascade- deletes tasks/milestones/decisions/rules). PREVIEW unless --yes
-  help    Print this message or the help of the given subcommand(s)
+  add       Add a new project [aliases: a]
+  deferred  List deferred projects: open but paused, not listed at session start
+  list      List projects (defaults to the current workspace; cross-awareness via flags) [aliases: l]
+  get       Show a specific project (accepts slug or display name)
+  peer      Make a project also surface in another workspace (additive peerWorkspace edge)
+  repath    Re-point a project's folder path (graph + domain trigger) after it moves
+  update    Update a project (accepts slug or display name) [aliases: u]
+  move      Re-home a project to another workspace graph (node + tasks + domain + decisions/rules/notes). AST regenerates at the destination. PREVIEW unless --yes
+  delete    Delete a project. Refuses a non-empty project unless --force (which cascade- deletes tasks/milestones/decisions/rules). PREVIEW unless --yes
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -384,6 +393,18 @@ Options:
       --stage <STAGE>
           Protocol lifecycle stage the project starts in (default: first stage)
 
+  -h, --help
+          Print help
+```
+
+## base project deferred
+
+```text
+List deferred projects: open but paused, not listed at session start
+
+Usage: base project deferred
+
+Options:
   -h, --help
           Print help
 ```
@@ -555,12 +576,13 @@ Manage milestones (epics within a project)
 Usage: base milestone <COMMAND>
 
 Commands:
-  add     Add a milestone to a project [aliases: a]
-  list    List milestones (optionally filtered by project) [aliases: l]
-  get     Show a specific milestone
-  update  Update a milestone [aliases: u]
-  delete  Delete a milestone. Tasks are DETACHED to project-level by default; --force cascade-deletes them. PREVIEW unless --yes
-  help    Print this message or the help of the given subcommand(s)
+  add       Add a milestone to a project [aliases: a]
+  deferred  List deferred milestones: open but paused, not listed at session start
+  list      List milestones (optionally filtered by project) [aliases: l]
+  get       Show a specific milestone
+  update    Update a milestone [aliases: u]
+  delete    Delete a milestone. Tasks are DETACHED to project-level by default; --force cascade-deletes them. PREVIEW unless --yes
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -584,6 +606,18 @@ Options:
   -d, --description <DESCRIPTION>
           
 
+  -h, --help
+          Print help
+```
+
+## base milestone deferred
+
+```text
+List deferred milestones: open but paused, not listed at session start
+
+Usage: base milestone deferred
+
+Options:
   -h, --help
           Print help
 ```
@@ -677,14 +711,15 @@ Manage tasks
 Usage: base task <COMMAND>
 
 Commands:
-  add     Add a task to a project (optionally under a milestone) [aliases: a]
-  list    List tasks (filter by project, milestone, or label) [aliases: l]
-  get     Show a specific task (all fields; accepts slug or display name)
-  update  Update a task's mutable fields (accepts slug or display name) [aliases: u]
-  delete  Delete a task node + its edges. PREVIEW unless --yes
-  done    Mark a task as completed
-  tag     Attach/detach free-form labels on a task (the dashboard's tagging facet)
-  help    Print this message or the help of the given subcommand(s)
+  add       Add a task to a project (optionally under a milestone) [aliases: a]
+  deferred  List deferred tasks: open but paused, not listed at session start
+  list      List tasks (filter by project, milestone, or label) [aliases: l]
+  get       Show a specific task (all fields; accepts slug or display name)
+  update    Update a task's mutable fields (accepts slug or display name) [aliases: u]
+  delete    Delete a task node + its edges. PREVIEW unless --yes
+  done      Mark a task as completed
+  tag       Attach/detach free-form labels on a task (the dashboard's tagging facet)
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -711,6 +746,18 @@ Options:
   -m, --milestone <MILESTONE>
           Milestone slug to group this task under
 
+  -h, --help
+          Print help
+```
+
+## base task deferred
+
+```text
+List deferred tasks: open but paused, not listed at session start
+
+Usage: base task deferred
+
+Options:
   -h, --help
           Print help
 ```
@@ -1140,10 +1187,12 @@ Manage reminders
 Usage: base reminder <COMMAND>
 
 Commands:
-  add     Add a reminder (provide one of --in, --at, or --due)
-  list    List all reminders
-  remove  Remove a reminder (hard delete)
-  help    Print this message or the help of the given subcommand(s)
+  add      Add a reminder (provide one of --in, --at, or --due)
+  list     List reminders
+  snooze   Move a reminder's surface time forward from now: 30s, 3m, 2h, 1d
+  archive  Archive a reminder: it stops surfacing and is kept. `remove` deletes
+  remove   Remove a reminder (hard delete)
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -1177,9 +1226,47 @@ Options:
 ## base reminder list
 
 ```text
-List all reminders
+List reminders
 
-Usage: base reminder list
+Usage: base reminder list [OPTIONS]
+
+Options:
+      --archived
+          List archived reminders instead of the live ones
+
+  -h, --help
+          Print help
+```
+
+## base reminder snooze
+
+```text
+Move a reminder's surface time forward from now: 30s, 3m, 2h, 1d
+
+Usage: base reminder snooze <SLUG> <DURATION>
+
+Arguments:
+  <SLUG>
+          
+
+  <DURATION>
+          
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base reminder archive
+
+```text
+Archive a reminder: it stops surfacing and is kept. `remove` deletes
+
+Usage: base reminder archive <SLUG>
+
+Arguments:
+  <SLUG>
+          
 
 Options:
   -h, --help
@@ -1210,12 +1297,13 @@ Manage session handoffs (resume docs surfaced at session start)
 Usage: base handoff [OPTIONS] <COMMAND>
 
 Commands:
-  create   Register a handoff doc (archives any prior open handoff for the project in this tier)
-  list     List handoffs across global + workspace tiers
-  show     Find one open handoff and print its doc path. Takes a letter from the last session start (A-J), a slug, a project name, or a few words. Several matches are listed and none is picked (exit 2); no match exits 1. Writes nothing
-  snooze   Snooze a handoff for N days (hide until then)
-  archive  Archive a handoff (stop resurfacing)
-  help     Print this message or the help of the given subcommand(s)
+  create    Register a handoff doc (archives any prior open handoff for the project in this tier)
+  list      List handoffs across global + workspace tiers
+  show      Find one open or deferred handoff and print its doc path. Takes a letter from the last session start (A-J), a key from `base handoff deferred` (D1, D2, ...), a slug, a project name, or a few words. A deferred match comes back to open, the only write it makes. Several matches are listed and none is picked (exit 2); no match exits 1
+  deferred  List deferred handoffs: open but paused, so session start does not list them. Each line carries a key (D1, D2, ...) that `base handoff show` takes, and the command that brings it back
+  snooze    Snooze a handoff for N days (hide until then)
+  archive   Archive a handoff (stop resurfacing)
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -g, --global
@@ -1261,13 +1349,25 @@ Options:
 ## base handoff show
 
 ```text
-Find one open handoff and print its doc path. Takes a letter from the last session start (A-J), a slug, a project name, or a few words. Several matches are listed and none is picked (exit 2); no match exits 1. Writes nothing
+Find one open or deferred handoff and print its doc path. Takes a letter from the last session start (A-J), a key from `base handoff deferred` (D1, D2, ...), a slug, a project name, or a few words. A deferred match comes back to open, the only write it makes. Several matches are listed and none is picked (exit 2); no match exits 1
 
 Usage: base handoff show <QUERY>...
 
 Arguments:
   <QUERY>...
           A letter, a slug, a project name, or loose words
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base handoff deferred
+
+```text
+List deferred handoffs: open but paused, so session start does not list them. Each line carries a key (D1, D2, ...) that `base handoff show` takes, and the command that brings it back
+
+Usage: base handoff deferred
 
 Options:
   -h, --help
@@ -1317,11 +1417,13 @@ Manage parallel side-work forks (build-specs surfaced at session start)
 Usage: base fork [OPTIONS] <COMMAND>
 
 Commands:
-  create   Register a fork build-spec (additive — does not archive sibling forks)
-  list     List forks across global + workspace tiers
-  snooze   Snooze a fork for N days (hide until then)
-  archive  Archive a fork (stop resurfacing)
-  help     Print this message or the help of the given subcommand(s)
+  create    Register a fork build-spec (additive — does not archive sibling forks)
+  list      List forks across global + workspace tiers
+  show      Find one fork by its title, project or a few words and print its doc path. A deferred fork it finds comes back to open. Several matches are listed and none is picked (exit 2); no match exits 1
+  deferred  List deferred forks: open but paused. Each line carries a key `base fork show` takes
+  snooze    Snooze a fork for N days (hide until then)
+  archive   Archive a fork (stop resurfacing)
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -g, --global
@@ -1358,6 +1460,34 @@ Options:
 List forks across global + workspace tiers
 
 Usage: base fork list
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base fork show
+
+```text
+Find one fork by its title, project or a few words and print its doc path. A deferred fork it finds comes back to open. Several matches are listed and none is picked (exit 2); no match exits 1
+
+Usage: base fork show <QUERY>...
+
+Arguments:
+  <QUERY>...
+          A key from `base fork deferred`, a title, a project name, or loose words
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base fork deferred
+
+```text
+List deferred forks: open but paused. Each line carries a key `base fork show` takes
+
+Usage: base fork deferred
 
 Options:
   -h, --help

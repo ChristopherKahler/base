@@ -1000,7 +1000,7 @@ fn each_block_ends_with_its_notice_and_a_block_with_zero_open_still_renders() {
     let line1 = out.lines().next().unwrap_or_default();
     assert!(line1.contains(" · deferred 7 · "), "line 1 lacks the deferred total: {line1}");
     assert!(
-        out.contains("Deferred = open but paused, not listed here; each block gives the count and the command. Bring one back: base handoff show <what they said> (forks: base fork show)."),
+        out.contains("Deferred = open but paused, not listed; each block counts them. Bring one back: `base handoff show <words>` (forks: `base fork show`)."),
         "the instruction block lacks the deferred line:\n{out}"
     );
 }
@@ -1245,7 +1245,14 @@ fn first_screen_holds_with_real_length_slugs_and_lane_3_lines() {
 
         let out = session_start(&seed);
         let letters = units_to_end_of_line(&out, "Letters: A=");
-        let due_last = units_to_end_of_line(&out, "Send the quarterly board pack");
+        // DUE NOW sorts oldest due first, so the 9-day reminder is the FIRST item and the 3-day one the LAST.
+        // The first draft measured the first item under the last item's name (green run, 2026-09-15).
+        let (first, last) = (out.find("Send the quarterly board pack"), out.find("Renew the wildcard certificate"));
+        assert!(
+            matches!((first, last), (Some(f), Some(l)) if f < l),
+            "{tag}: DUE NOW's two items are not both in full, oldest due first:\n{out}"
+        );
+        let due_last = units_to_end_of_line(&out, "Renew the wildcard certificate");
         println!(
             "FS1 {tag}: letters line ends at {letters} UTF-16 units, DUE NOW's last item at {due_last}; output {} units",
             out.encode_utf16().count()
@@ -1254,7 +1261,12 @@ fn first_screen_holds_with_real_length_slugs_and_lane_3_lines() {
         if with_deferred {
             assert!(out.lines().next().unwrap_or_default().contains(" · deferred 1 · "), "control: {out}");
         }
-        assert!(letters <= 2000, "{tag}: the letters line ends at unit {letters}, past the first screen");
-        assert!(due_last <= 2000, "{tag}: DUE NOW's last item ends at unit {due_last}, past the first screen");
+        // The bar is 1,990, not A5's 2,000: a 10-unit margin for the header's count digits, which this fixture
+        // does not max out (forks, tasks and deferred run to three digits on a real store). The ten slugs are
+        // already at the 50-character maximum, so no margin is owed to them (auk, verdicts, 2026-09-15).
+        // Lane 3 added the B3 line and the B2 count, so lane 3 keeps the screen inside the bar.
+        const BAR: usize = 1990;
+        assert!(letters <= BAR, "{tag}: the letters line ends at unit {letters}, past the {BAR}-unit bar");
+        assert!(due_last <= BAR, "{tag}: DUE NOW's last item ends at unit {due_last}, past the {BAR}-unit bar");
     }
 }
