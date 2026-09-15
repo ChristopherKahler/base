@@ -73,6 +73,7 @@ pub fn run(target: &Path) -> Result<()> {
 
 # [budget]             # what a hook may print, in UTF-16 units (Claude Code's unit)
 # session_start_chars = 9000
+# memory_chars = 4000
 
 # [flow]               # resurface scans: unblocked, deferred-due, recurring ideas
 # enabled = true

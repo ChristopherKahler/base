@@ -144,8 +144,8 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     }
 
     match memory::run(cwd, config) {
-        Ok(output) if !output.is_empty() => {
-            results.push((0, Signal::single("memory", "memory", output, 1, 1)));
+        Ok(block) if !block.text.is_empty() => {
+            results.push((0, Signal::single("memory", "memory", block.text, block.total, block.shown)));
         }
         Ok(_) => {}
         Err(e) => eprintln!("base: signal 'memory' failed: {e}"),
