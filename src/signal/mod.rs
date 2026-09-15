@@ -76,6 +76,8 @@ pub struct SignalOutput {
     /// The letter and slug of every handoff HANDOFFS lists, for the instruction block and the
     /// letters file `base handoff show` reads.
     pub letters: Vec<(char, String)>,
+    /// Records marked deferred across HANDOFFS, FORKS, PROJECTS, TASKS and MILESTONES, for line 1 (B2).
+    pub deferred: usize,
     state: Option<(PathBuf, suppression::SignalState)>,
 }
 
@@ -128,6 +130,7 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     let mut results: Vec<(u32, Signal)> = Vec::new();
     let mut diagnostics: Vec<String> = Vec::new();
     let mut letters: Vec<(char, String)> = Vec::new();
+    let mut deferred = 0usize;
     let layout = &config.session_start;
     if layout.handoffs_shown > crate::crud::handoff_show::MAX_SHOWN {
         eprintln!(
@@ -153,6 +156,7 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
 
     match active_awareness::run_sections(cwd, config) {
         Ok(sections) if !sections.is_empty() => {
+            deferred += sections.iter().map(|s| s.deferred).sum::<usize>();
             let blocks = sections
                 .into_iter()
                 .map(|s| SignalBlock {
@@ -196,7 +200,8 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     // Handoff + reminder resurface — persistent until dismissed. Their own signals so they
     // are never skipped as unchanged: they must surface EVERY session until acted on.
     match flow_resurface::handoff_scan(cwd, ns, layout) {
-        Ok((output, list)) if !output.is_empty() => {
+        Ok((output, list, parked)) if !output.is_empty() => {
+            deferred += parked;
             letters = list.letters();
             results.push((
                 0,
@@ -217,7 +222,8 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     // signal so they are never skipped as unchanged and surface every session until
     // picked up, snoozed, or archived. Additive (multiple open).
     match flow_resurface::fork_scan(cwd, ns, layout) {
-        Ok((output, open, shown)) if !output.is_empty() => {
+        Ok((output, open, shown, parked)) if !output.is_empty() => {
+            deferred += parked;
             results.push((0, Signal::single("fork", "forks", output, open, shown)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-fork-scan:no-match>")),
@@ -256,6 +262,7 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         unchanged,
         diagnostics,
         letters,
+        deferred,
         state,
     })
 }

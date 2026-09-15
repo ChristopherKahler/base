@@ -25,16 +25,18 @@
 //! Gated on `[protocol] enabled` for the *apply* path. The read-only [`plan`] is
 //! ungated so `base reconcile --dry-run` can preview before the protocol is enabled.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use oxigraph::model::Term;
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 
-use crate::config::{BaseConfig, NamespaceConfig};
+use crate::config::{BaseConfig, DeferKind, NamespaceConfig};
 use crate::crud;
+use crate::crud::deferred;
 use crate::store;
 
 /// Statuses that count as "working" — eligible to decay to `deferred` when cold.
@@ -110,7 +112,7 @@ pub fn reconcile(cwd: &Path, config: &BaseConfig) -> Result<ReconcileStats> {
         return Ok(ReconcileStats::default());
     };
     let roots = registered_roots(config);
-    let decisions = plan(&store, &config.namespace, &ws_root, &roots, config.protocol.stale_days as i64)?;
+    let decisions = plan(&store, &config.namespace, &ws_root, &roots, config.defer_days(DeferKind::Project))?;
     apply(&store, &config.namespace, &trig_path, &decisions)
 }
 
@@ -331,6 +333,288 @@ pub fn format_report(decisions: &[Decision], ws_root: &Path, stale_days: i64) ->
     s.push_str(&format!(
         "\nSummary: {} defer · {} revive · {} stay · {} unresolved · {} terminal · {} moved-needs-repath  (no graph writes)\n",
         defer.len(), revive.len(), hold.len(), nofolder.len(), terminal, moved
+    ));
+    s
+}
+
+// ─── Records: handoffs, forks, tasks and milestones (spec C5, lane 3 G0.3) ─────────
+
+/// Statuses a record never leaves by deferral: done, dropped or already closed.
+const RECORD_TERMINAL: &[&str] = &["archived", "complete", "completed", "deprecated"];
+
+/// One handoff, fork, task or milestone the deferral pass decided about.
+#[derive(Debug, Clone)]
+pub struct RecordDecision {
+    pub iri: String,
+    pub slug: String,
+    pub kind: DeferKind,
+    pub status: String,
+    /// Whole days on the clock `crud::deferred::clock` reads; `None` when the record carries no time.
+    pub days: Option<i64>,
+    /// The window `BaseConfig::defer_days` gives this kind.
+    pub window: i64,
+    pub action: Action,
+}
+
+#[derive(Debug, Default)]
+pub struct RecordStats {
+    pub scanned: usize,
+    pub deferred: usize,
+    pub revived: usize,
+}
+
+impl RecordStats {
+    pub fn changed(&self) -> bool {
+        self.deferred > 0 || self.revived > 0
+    }
+}
+
+/// Read-only: what the deferral pass would do with every handoff, fork, task and milestone in `store`.
+///
+/// Handoffs and forks defer and never revive on the clock. A Read of the doc moves `lastActive` (rank
+/// 03) and R7 rules that a Read does not revive, so reviving on a fresh clock would revive it one session
+/// later. Only `show` or a new registration brings one back.
+///
+/// Tasks and milestones revive on the clock, because it moves only on a deliberate base command, and only
+/// when the pass deferred them (`deferredReason` starting `auto:`): `task update --status deferred`
+/// stamps `lastActive` itself, so reviving an operator's own deferral would undo it next session start.
+///
+/// Never deferred: a terminal status, `blocked` (someone is waiting on it), a record carrying a due date
+/// (rank 07 moves it to DUE), a snoozed one (C7), and one with no clock at all, which is never deferred
+/// blind.
+pub fn plan_records(store: &Store, config: &BaseConfig, now: DateTime<Local>) -> Result<Vec<RecordDecision>> {
+    let ns = &config.namespace;
+    let p = &ns.prefix;
+    let select = format!(
+        "{pfx}\n\
+         SELECT ?e ?type ?status ?kind ?lastActive ?resurfaceAt ?why ?due WHERE {{\n\
+           GRAPH ?g {{\n\
+             ?e a ?type ;\n\
+               {p}:status ?status .\n\
+             FILTER(?type IN ({p}:Handoff, {p}:Task, {p}:Milestone))\n\
+             OPTIONAL {{ ?e {p}:kind ?kind }}\n\
+             OPTIONAL {{ ?e {p}:lastActive ?lastActive }}\n\
+             OPTIONAL {{ ?e {p}:resurfaceAt ?resurfaceAt }}\n\
+             OPTIONAL {{ ?e {p}:deferredReason ?why }}\n\
+             OPTIONAL {{ ?e {p}:due ?due }}\n\
+           }}\n\
+         }}",
+        pfx = crud::prefixes(ns)
+    );
+    let QueryResults::Solutions(solutions) = store::query(store, &select)? else {
+        return Ok(Vec::new());
+    };
+    let full = |t: Option<&Term>| -> Option<String> {
+        t.map(|term| match term {
+            Term::NamedNode(n) => n.as_str().to_string(),
+            Term::Literal(l) => l.value().to_string(),
+            other => other.to_string(),
+        })
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for sol in solutions.filter_map(|r| r.ok()) {
+        let (Some(iri), Some(ty), Some(status)) =
+            (full(sol.get("e")), full(sol.get("type")), full(sol.get("status")))
+        else {
+            continue;
+        };
+        // A subject holding two values for one field comes back as two rows; the first stands.
+        if !seen.insert(iri.clone()) {
+            continue;
+        }
+        let kind = if ty.ends_with("#Handoff") {
+            if full(sol.get("kind")).as_deref() == Some("fork") {
+                DeferKind::Fork
+            } else {
+                DeferKind::Handoff
+            }
+        } else if ty.ends_with("#Task") {
+            DeferKind::Task
+        } else {
+            DeferKind::Milestone
+        };
+        let last_active = full(sol.get("lastActive"));
+        let resurface_at = full(sol.get("resurfaceAt"));
+        let reason = full(sol.get("why"));
+        let dated = full(sol.get("due")).is_some_and(|d| !d.trim().is_empty());
+        let window = config.defer_days(kind);
+        let days = deferred::clock(last_active.as_deref(), resurface_at.as_deref(), now)
+            .map(|t| deferred::days_since(t, now));
+        let handoff_like = matches!(kind, DeferKind::Handoff | DeferKind::Fork);
+
+        let action = if RECORD_TERMINAL.contains(&status.as_str()) {
+            Action::Terminal
+        } else if status == "blocked" || dated {
+            Action::Hold
+        } else if deferred::is_snoozed(resurface_at.as_deref(), now) {
+            Action::Pinned
+        } else {
+            match days {
+                None => Action::Hold,
+                Some(d) if status == deferred::DEFERRED => {
+                    let auto = reason.as_deref().is_some_and(|r| r.starts_with(deferred::AUTO));
+                    if !handoff_like && auto && d < window {
+                        Action::Revive
+                    } else {
+                        Action::Hold
+                    }
+                }
+                Some(d) => {
+                    let working = !handoff_like || status == "open";
+                    if working && d >= window {
+                        Action::Defer
+                    } else {
+                        Action::Hold
+                    }
+                }
+            }
+        };
+        let slug = iri.rsplit('/').next().unwrap_or(&iri).to_string();
+        out.push(RecordDecision { iri, slug, kind, status, days, window, action });
+    }
+    Ok(out)
+}
+
+/// Apply one tier file's record plan to `store` and write the file once. The caller holds the file's
+/// lock and loaded `store` inside it. Returns how many were deferred and how many revived.
+pub fn apply_records(
+    store: &Store,
+    ns: &NamespaceConfig,
+    file: &Path,
+    decisions: &[RecordDecision],
+) -> Result<(usize, usize)> {
+    let p = &ns.prefix;
+    let pfx = crud::prefixes(ns);
+    let now = crud::now_iso();
+    let mut ops: Vec<String> = Vec::new();
+    let (mut n_deferred, mut n_revived) = (0usize, 0usize);
+    for d in decisions {
+        let s = &d.iri;
+        match d.action {
+            Action::Defer => {
+                let days = d.days.unwrap_or_default();
+                ops.push(format!(
+                    "DELETE {{ GRAPH ?g {{ <{s}> {p}:status ?old .\n\
+                                           <{s}> {p}:deferredReason ?w .\n\
+                                           <{s}> {p}:deferredAt ?a }} }}\n\
+                     INSERT {{ GRAPH ?g {{ <{s}> {p}:status \"deferred\" .\n\
+                                           <{s}> {p}:deferredReason \"auto: cold {days}d\" .\n\
+                                           <{s}> {p}:deferredAt \"{now}\"^^xsd:dateTime }} }}\n\
+                     WHERE  {{ GRAPH ?g {{ <{s}> {p}:status ?old }}\n\
+                       OPTIONAL {{ GRAPH ?g {{ <{s}> {p}:deferredReason ?w }} }}\n\
+                       OPTIONAL {{ GRAPH ?g {{ <{s}> {p}:deferredAt ?a }} }} }}"
+                ));
+                n_deferred += 1;
+            }
+            Action::Revive => {
+                ops.push(format!(
+                    "DELETE {{ GRAPH ?g {{ <{s}> {p}:status \"deferred\" .\n\
+                                           <{s}> {p}:deferredReason ?w .\n\
+                                           <{s}> {p}:deferredAt ?a }} }}\n\
+                     INSERT {{ GRAPH ?g {{ <{s}> {p}:status \"active\" }} }}\n\
+                     WHERE  {{ GRAPH ?g {{ <{s}> {p}:status \"deferred\" }}\n\
+                       OPTIONAL {{ GRAPH ?g {{ <{s}> {p}:deferredReason ?w }} }}\n\
+                       OPTIONAL {{ GRAPH ?g {{ <{s}> {p}:deferredAt ?a }} }} }}"
+                ));
+                n_revived += 1;
+            }
+            _ => {}
+        }
+    }
+    if ops.is_empty() {
+        return Ok((0, 0));
+    }
+    store::mutate_and_write(store, file, "", store::Scope::Wide, store::Intent::Knowledge, |st| {
+        for op in &ops {
+            st.update(&format!("{pfx}\n{op}"))
+                .with_context(|| format!("deferral update failed: {op}"))?;
+        }
+        Ok(Some(ops.join(";\n")))
+    })?;
+    Ok((n_deferred, n_revived))
+}
+
+/// Every tier file's record plan, read without a lock, for `base reconcile --dry-run`.
+pub fn plan_all_records(
+    gbl_root: Option<&Path>,
+    cwd: &Path,
+    config: &BaseConfig,
+) -> Result<Vec<(&'static str, Vec<RecordDecision>)>> {
+    let now = Local::now();
+    let mut out = Vec::new();
+    for file in crud::all_tier_files(gbl_root, cwd) {
+        let tier = crud::tier_label_of_file(&file, gbl_root);
+        let store = store::load_graph(&file)?;
+        out.push((tier, plan_records(&store, config, now)?));
+    }
+    Ok(out)
+}
+
+/// Run the deferral pass over every tier file and APPLY it (spec C5). Gated on `[defer] enabled`.
+///
+/// Plans on an unlocked load, because the post-tool hook locks every tier file on every tool call. Only a
+/// tier with at least one decision takes the lock, reloads inside it, plans again and writes, so in the
+/// steady state no session start takes the global lock at all.
+pub fn reconcile_records(gbl_root: Option<&Path>, cwd: &Path, config: &BaseConfig) -> Result<RecordStats> {
+    let mut stats = RecordStats::default();
+    if !config.defer.enabled {
+        return Ok(stats);
+    }
+    let now = Local::now();
+    for file in crud::all_tier_files(gbl_root, cwd) {
+        let first = plan_records(&store::load_graph(&file)?, config, now)?;
+        stats.scanned += first.len();
+        if !first.iter().any(|d| matches!(d.action, Action::Defer | Action::Revive)) {
+            continue;
+        }
+        let (d, r) = store::with_graph_lock(&file, || {
+            let store = store::load_graph(&file)?;
+            let plan = plan_records(&store, config, now)?;
+            apply_records(&store, &config.namespace, &file, &plan)
+        })?;
+        stats.deferred += d;
+        stats.revived += r;
+    }
+    Ok(stats)
+}
+
+/// The record half of `base reconcile --dry-run`: every WOULD DEFER and WOULD REVIVE line, by tier and
+/// type, and a count of everything else.
+pub fn format_records_report(config: &BaseConfig, plans: &[(&'static str, Vec<RecordDecision>)]) -> String {
+    let mut s = format!(
+        "\nDeferral dry-run — handoffs, forks, tasks, milestones ([defer] enabled = {}; a dry run plans either way)\n",
+        config.defer.enabled
+    );
+    let (mut defer, mut revive, mut other) = (0usize, 0usize, 0usize);
+    for (tier, plan) in plans {
+        for d in plan {
+            let word = deferred::nouns(d.kind).0;
+            let days = d.days.unwrap_or_default();
+            match d.action {
+                Action::Defer => {
+                    defer += 1;
+                    s.push_str(&format!(
+                        "  {tier} · {word} · WOULD DEFER · {} · untouched {days}d (window {}d)\n",
+                        d.slug, d.window
+                    ));
+                }
+                Action::Revive => {
+                    revive += 1;
+                    s.push_str(&format!(
+                        "  {tier} · {word} · WOULD REVIVE · {} · touched {days}d ago (window {}d)\n",
+                        d.slug, d.window
+                    ));
+                }
+                _ => other += 1,
+            }
+        }
+    }
+    if defer + revive == 0 {
+        s.push_str("  (nothing would change)\n");
+    }
+    s.push_str(&format!(
+        "Summary: {defer} defer · {revive} revive · {other} stay (no graph writes)\n"
     ));
     s
 }

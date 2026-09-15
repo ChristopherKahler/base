@@ -295,12 +295,13 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
     };
     let p = &ns.prefix;
     let sparql = format!(
-        "{pfx}\nSELECT ?h ?project ?status ?resurfaceAt WHERE {{\n\
+        "{pfx}\nSELECT ?h ?project ?status ?resurfaceAt ?lastActive WHERE {{\n\
            GRAPH ?g {{\n\
              ?h a {p}:Handoff ;\n\
                {p}:project ?project ;\n\
                {p}:status ?status .\n\
              OPTIONAL {{ ?h {p}:resurfaceAt ?resurfaceAt }}\n\
+             OPTIONAL {{ ?h {p}:lastActive ?lastActive }}\n\
              OPTIONAL {{ ?h {p}:kind ?kind }}\n\
              FILTER(!BOUND(?kind) || ?kind != \"fork\")\n\
            }}\n\
@@ -318,7 +319,7 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
                 };
                 let h = get("h");
                 let slug = h.rsplit('/').next().unwrap_or(&h).to_string();
-                vec![slug, get("project"), get("status"), get("resurfaceAt")]
+                vec![slug, get("project"), get("status"), get("resurfaceAt"), get("lastActive")]
             })
             .collect();
 
@@ -327,10 +328,10 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
             return Ok(());
         }
 
-        println!("| slug | project | status | resurfaceAt |");
-        println!("|------|---------|--------|-------------|");
+        println!("| slug | project | status | resurfaceAt | lastActive |");
+        println!("|------|---------|--------|-------------|------------|");
         for row in &rows {
-            println!("| {} | {} | {} | {} |", row[0], row[1], row[2], row[3]);
+            println!("| {} | {} | {} | {} | {} |", row[0], row[1], row[2], row[3], row[4]);
         }
     }
     Ok(())
@@ -432,7 +433,7 @@ pub fn archive(
 /// is the whole of #72's observable: 0.14.1 ran the UPDATE over each tier file
 /// and printed `archived` unconditionally, so a no-op and a real archive were
 /// indistinguishable from the outside.
-fn apply_to_tiers(
+pub(crate) fn apply_to_tiers(
     gbl_root: Option<&Path>,
     cwd: &Path,
     ns: &NamespaceConfig,

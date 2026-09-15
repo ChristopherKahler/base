@@ -1126,9 +1126,10 @@ pub enum HandoffAction {
     },
     /// List handoffs across global + workspace tiers
     List,
-    /// Find one open handoff and print its doc path. Takes a letter from the last session start
-    /// (A-J), a slug, a project name, or a few words. Several matches are listed and none is
-    /// picked (exit 2); no match exits 1. Writes nothing.
+    /// Find one open or deferred handoff and print its doc path. Takes a letter from the last session
+    /// start (A-J), a key from `base handoff deferred` (D1, D2, ...), a slug, a project name, or a few
+    /// words. A deferred match comes back to open, the only write it makes. Several matches are listed
+    /// and none is picked (exit 2); no match exits 1.
     Show {
         /// A letter, a slug, a project name, or loose words
         #[arg(required = true, num_args = 1..)]
@@ -2127,9 +2128,18 @@ pub fn run() {
                         &cwd,
                         &config.namespace,
                         &config.session_start,
+                        false,
                         &query.join(" "),
                     ) {
-                        Ok(found) => {
+                        Ok(mut found) => {
+                            // A deferred one-match comes back to open; nothing else writes (AMENDMENTS C).
+                            if let Err(e) = found.revive_if_deferred(
+                                base::home::home_root().as_deref(),
+                                &cwd,
+                                &config.namespace,
+                            ) {
+                                die("Failed", e);
+                            }
                             print!("{}", found.render(chrono::Local::now()));
                             let code = found.exit_code();
                             if code != 0 {
@@ -2216,8 +2226,29 @@ pub fn run() {
                 }
                 ForkAction::List => { if let Err(e) = crud::handoff::list_forks(&cwd, &config.namespace) { die("Error", e); } }
                 ForkAction::Show { query } => {
-                    // Law 11 commit 1: the surface, no behaviour.
-                    let _ = query;
+                    let home = base::home::home_root();
+                    match crud::handoff_show::resolve(
+                        home.as_deref(),
+                        &cwd,
+                        &config.namespace,
+                        &config.session_start,
+                        true,
+                        &query.join(" "),
+                    ) {
+                        Ok(mut found) => {
+                            if let Err(e) = found.revive_if_deferred(home.as_deref(), &cwd, &config.namespace) {
+                                die("Failed", e);
+                            }
+                            print!("{}", found.render(chrono::Local::now()));
+                            let code = found.exit_code();
+                            if code != 0 {
+                                use std::io::Write as _;
+                                let _ = std::io::stdout().flush();
+                                std::process::exit(code);
+                            }
+                        }
+                        Err(e) => die("Failed", e),
+                    }
                 }
                 ForkAction::Deferred => {
                     if let Err(e) = crud::deferred::list(base::home::home_root().as_deref(), &cwd, &config, base::config::DeferKind::Fork) { die("Error", e); }
@@ -3334,7 +3365,7 @@ pub fn run() {
             match base::protocol::reconcile::open_workspace(&cwd) {
                 None => eprintln!("base: no workspace graph found (run from inside a base workspace)"),
                 Some((store, trig_path, ws_root)) => {
-                    let stale = config.protocol.stale_days as i64;
+                    let stale = config.defer_days(base::config::DeferKind::Project);
                     let roots = base::protocol::reconcile::registered_roots(&config);
                     match base::protocol::reconcile::plan(&store, &config.namespace, &ws_root, &roots, stale) {
                         Err(e) => eprintln!("base: reconcile plan failed: {e}"),
@@ -3354,6 +3385,25 @@ pub fn run() {
                             }
                         }
                     }
+                }
+            }
+            // The record half: handoffs, forks, tasks and milestones, in every tier (spec C5). A dry run
+            // plans with [defer] off, as the project half always has, so it can be previewed first.
+            let home = base::home::home_root();
+            if dry_run {
+                match base::protocol::reconcile::plan_all_records(home.as_deref(), &cwd, &config) {
+                    Ok(plans) => print!("{}", base::protocol::reconcile::format_records_report(&config, &plans)),
+                    Err(e) => eprintln!("base: deferral plan failed: {e}"),
+                }
+            } else if !config.defer.enabled {
+                eprintln!("base: [defer] not enabled — refusing to defer handoffs, forks, tasks or milestones. Preview with `base reconcile --dry-run`.");
+            } else {
+                match base::protocol::reconcile::reconcile_records(home.as_deref(), &cwd, &config) {
+                    Ok(s) => println!(
+                        "base: defer — {} deferred, {} revived ({} records scanned)",
+                        s.deferred, s.revived, s.scanned
+                    ),
+                    Err(e) => eprintln!("base: defer failed: {e}"),
                 }
             }
         }

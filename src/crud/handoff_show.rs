@@ -4,7 +4,8 @@
 //! Chris never answers a session start with a letter. He says "get the handoff for the skyrim
 //! thing". So `show` takes a letter, a slug, a project name or a few loose words, prints the doc
 //! to read and what it matched, and when several handoffs match it lists them and picks none. It
-//! writes nothing: revival from deferred state is lane 3's, on this same command.
+//! writes only to revive: one match that is deferred comes back to open, and an open match, several
+//! matches or none write nothing (lane 3 verdicts, AMENDMENTS C).
 //!
 //! One selection serves session start and the letter path of `show`. The letters a session start
 //! printed are kept in a file beside its full output, so a letter names the handoff that session
@@ -19,7 +20,7 @@ use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{NamespaceConfig, SessionStartConfig};
+use crate::config::{DeferKind, NamespaceConfig, SessionStartConfig};
 use crate::crud;
 
 /// Spec B4: letters A to J, so never more than ten handoffs are listed.
@@ -255,6 +256,12 @@ pub enum Rule {
         letter: char,
         written_at: Option<String>,
     },
+    /// A key from the last `base handoff deferred` or `base fork deferred` (flag 5). `written_at` is
+    /// empty when the keys file could not be used.
+    Key {
+        key: String,
+        written_at: String,
+    },
     Slug,
     Project,
     /// The handoffs sharing the most words with the query: `shared` of the query's `of` words.
@@ -264,16 +271,34 @@ pub enum Rule {
     },
 }
 
+/// A deferred record's reason and date, read beside it so `show` can say what it brought back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parked {
+    pub reason: Option<String>,
+    pub deferred_at: Option<String>,
+}
+
+/// One record `show` can answer with: open, or deferred and carrying its [`Parked`] facts.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub handoff: OpenHandoff,
+    pub parked: Option<Parked>,
+}
+
 /// What `show` found. One match is an answer, several are a question, none is a miss.
 #[derive(Debug, Clone)]
 pub struct Resolution {
     pub query: String,
-    pub matches: Vec<OpenHandoff>,
+    /// `handoff` or `fork`: the kind searched, and the word every line uses.
+    pub noun: &'static str,
+    pub matches: Vec<Candidate>,
     pub rule: Option<Rule>,
-    /// Said beside the answer: a letter rebuilt now, or a letter whose handoff is no longer open.
+    /// Said beside the answer: a letter rebuilt now, a key refused, a letter whose record is gone.
     pub notes: Vec<String>,
     /// The tier files searched, named when nothing matched.
     pub searched: Vec<String>,
+    /// Set by [`Resolution::revive_if_deferred`] when the one match was deferred and is open now.
+    pub revived: Option<Parked>,
 }
 
 /// A query of exactly one letter from A to J, in either case.
@@ -290,30 +315,127 @@ fn words(text: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Find the open handoff a person means. Reads every tier file and writes nothing.
+/// The open and deferred handoffs, or forks, in one store: everything `show` may answer with. Forks share
+/// the record type and are told apart by their `kind` literal, as `open_handoffs` tells them apart.
+fn candidates(store: &Store, ns: &NamespaceConfig, fork: bool, tier: &str) -> Result<Vec<Candidate>> {
+    let p = &ns.prefix;
+    let kind = if fork {
+        format!("?h {p}:kind \"fork\" .")
+    } else {
+        format!("OPTIONAL {{ ?h {p}:kind ?kind }}\n             FILTER(!BOUND(?kind) || ?kind != \"fork\")")
+    };
+    let sparql = format!(
+        "{pfx}\nSELECT ?h ?status ?project ?doc ?created ?why ?at WHERE {{\n\
+           GRAPH ?g {{\n\
+             ?h a {p}:Handoff ;\n\
+               {p}:status ?status ;\n\
+               {p}:project ?project ;\n\
+               {p}:handoffDoc ?doc ;\n\
+               {p}:createdAt ?created .\n\
+             FILTER(?status IN (\"open\", \"{deferred}\"))\n\
+             {kind}\n\
+             OPTIONAL {{ ?h {p}:deferredReason ?why }}\n\
+             OPTIONAL {{ ?h {p}:deferredAt ?at }}\n\
+           }}\n\
+         }}\n\
+         ORDER BY DESC(?created) ?h",
+        pfx = crud::prefixes(ns),
+        deferred = crud::deferred::DEFERRED
+    );
+    let QueryResults::Solutions(solutions) = crate::store::query(store, &sparql)? else {
+        return Ok(Vec::new());
+    };
+    let mut seen = HashSet::new();
+    let mut rows = Vec::new();
+    for row in solutions.filter_map(|r| r.ok()) {
+        let get = |k: &str| {
+            row.get(k)
+                .map(|t| crud::term_display(t.into()))
+                .unwrap_or_default()
+        };
+        let h = get("h");
+        let slug = h.rsplit('/').next().unwrap_or(&h).to_string();
+        // A subject holding two values for one field comes back as two rows; the first stands.
+        if !seen.insert(slug.clone()) {
+            continue;
+        }
+        let opt = |k: &str| Some(get(k)).filter(|s| !s.is_empty());
+        let parked = (get("status") == crud::deferred::DEFERRED).then(|| Parked {
+            reason: opt("why"),
+            deferred_at: opt("at"),
+        });
+        rows.push(Candidate {
+            handoff: OpenHandoff {
+                slug,
+                project: get("project"),
+                doc: get("doc"),
+                created: get("created"),
+                tier: Some(tier.to_string()),
+            },
+            parked,
+        });
+    }
+    Ok(rows)
+}
+
+/// Find the handoff, or with `fork` the fork, a person means: open or deferred, in every tier file.
+/// Reads only. Bringing a deferred one-match back is [`Resolution::revive_if_deferred`], the one write.
 pub fn resolve(
     gbl_root: Option<&Path>,
     cwd: &Path,
     ns: &NamespaceConfig,
     cfg: &SessionStartConfig,
+    fork: bool,
     query: &str,
 ) -> Result<Resolution> {
     let query = query.trim().to_string();
-    let mut all: Vec<OpenHandoff> = Vec::new();
+    let noun = if fork { "fork" } else { "handoff" };
+    let mut all: Vec<Candidate> = Vec::new();
     for file in crud::all_tier_files(gbl_root, cwd) {
         let store = crate::store::load_or_empty(&file)?;
         let tier = crud::tier_label_of_file(&file, gbl_root);
-        all.extend(open_handoffs(&store, ns, false, Some(tier))?);
+        all.extend(candidates(&store, ns, fork, tier)?);
     }
     let mut out = Resolution {
         query: query.clone(),
+        noun,
         matches: Vec::new(),
         rule: None,
         notes: Vec::new(),
         searched: crud::handoff::searched_tiers(gbl_root, cwd),
+        revived: None,
     };
 
-    if let Some(letter) = as_letter(&query) {
+    // A key from the last deferred listing is a lookup, verified again here and never trusted alone
+    // (flag 5b): the slug must still exist and still be deferred, or the key is refused.
+    if let Some(key) = crud::deferred::as_key(&query) {
+        let kind = if fork { DeferKind::Fork } else { DeferKind::Handoff };
+        match crud::deferred::key_slug(kind, &key) {
+            Ok((slug, written_at)) => {
+                out.matches = all
+                    .iter()
+                    .filter(|c| c.handoff.slug == slug && c.parked.is_some())
+                    .cloned()
+                    .collect();
+                if out.matches.is_empty() {
+                    out.notes.push(format!(
+                        "key {key} was {slug}, which is no longer a deferred {noun}; re-list: base {noun} deferred"
+                    ));
+                }
+                out.rule = Some(Rule::Key { key, written_at });
+            }
+            Err(why) => {
+                out.notes.push(why);
+                out.rule = Some(Rule::Key {
+                    key,
+                    written_at: String::new(),
+                });
+            }
+        }
+        return Ok(out);
+    }
+
+    if !fork && let Some(letter) = as_letter(&query) {
         let dir = session_start_dir(cwd);
         let (slug, written_at) = match read_letters(dir.as_deref()) {
             Letters::Read { written_at, map } => {
@@ -342,10 +464,10 @@ pub fn resolve(
         out.rule = Some(Rule::Letter { letter, written_at });
         match slug {
             Some(slug) => {
-                out.matches = all.iter().filter(|h| h.slug == slug).cloned().collect();
+                out.matches = all.iter().filter(|c| c.handoff.slug == slug).cloned().collect();
                 if out.matches.is_empty() {
                     out.notes.push(format!(
-                        "letter {letter} was {slug}, which is no longer an open handoff"
+                        "letter {letter} was {slug}, which is no longer an open or deferred handoff"
                     ));
                 }
             }
@@ -354,7 +476,7 @@ pub fn resolve(
         return Ok(out);
     }
 
-    let by_slug: Vec<OpenHandoff> = all.iter().filter(|h| h.slug == query).cloned().collect();
+    let by_slug: Vec<Candidate> = all.iter().filter(|c| c.handoff.slug == query).cloned().collect();
     if !by_slug.is_empty() {
         out.matches = by_slug;
         out.rule = Some(Rule::Slug);
@@ -362,9 +484,9 @@ pub fn resolve(
     }
 
     let wanted = query.to_lowercase();
-    let by_project: Vec<OpenHandoff> = all
+    let by_project: Vec<Candidate> = all
         .iter()
-        .filter(|h| h.project.to_lowercase() == wanted)
+        .filter(|c| c.handoff.project.to_lowercase() == wanted)
         .cloned()
         .collect();
     if !by_project.is_empty() {
@@ -374,9 +496,10 @@ pub fn resolve(
     }
 
     let asked = words(&query);
-    let scored: Vec<(usize, &OpenHandoff)> = all
+    let scored: Vec<(usize, &Candidate)> = all
         .iter()
-        .map(|h| {
+        .map(|c| {
+            let h = &c.handoff;
             let mut have = words(&h.slug);
             have.extend(words(&h.project));
             have.extend(words(
@@ -385,7 +508,7 @@ pub fn resolve(
                     .and_then(|s| s.to_str())
                     .unwrap_or(""),
             ));
-            (asked.intersection(&have).count(), h)
+            (asked.intersection(&have).count(), c)
         })
         .collect();
     let best = scored.iter().map(|(n, _)| *n).max().unwrap_or(0);
@@ -393,7 +516,7 @@ pub fn resolve(
         out.matches = scored
             .into_iter()
             .filter(|(n, _)| *n == best)
-            .map(|(_, h)| h.clone())
+            .map(|(_, c)| c.clone())
             .collect();
         out.rule = Some(Rule::Words {
             shared: best,
@@ -413,6 +536,28 @@ impl Resolution {
         }
     }
 
+    /// When the one match is deferred, bring it back to open in every tier holding it and remember what it
+    /// was. An open match, several matches and none write nothing (verdicts, AMENDMENTS C): a question never
+    /// revives anything, and an open record's clock moves through the Read of the doc this command prints.
+    pub fn revive_if_deferred(&mut self, gbl_root: Option<&Path>, cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
+        let [one] = self.matches.as_slice() else {
+            return Ok(());
+        };
+        let Some(parked) = one.parked.clone() else {
+            return Ok(());
+        };
+        let slug = one.handoff.slug.clone();
+        let written = crud::deferred::revive_handoff(gbl_root, cwd, ns, &slug)?;
+        if written.is_empty() {
+            anyhow::bail!(
+                "{} {slug} matched as deferred, but no tier held it when the revival ran; nothing was written",
+                self.noun
+            );
+        }
+        self.revived = Some(parked);
+        Ok(())
+    }
+
     fn rule_text(&self) -> String {
         match &self.rule {
             Some(Rule::Letter {
@@ -423,6 +568,9 @@ impl Resolution {
                 letter,
                 written_at: None,
             }) => format!("letter {letter}, from a list rebuilt now"),
+            Some(Rule::Key { key, written_at }) => {
+                format!("key {key} from base {} deferred at {written_at}", self.noun)
+            }
             Some(Rule::Slug) => "the slug".to_string(),
             Some(Rule::Project) => "the project name".to_string(),
             Some(Rule::Words { shared, of }) => format!("{shared} of {of} words"),
@@ -430,9 +578,11 @@ impl Resolution {
         }
     }
 
-    /// What `base handoff show` prints. The doc path is the first line of an answer.
+    /// What `base handoff show` and `base fork show` print. The doc path is the first line of an answer.
     pub fn render(&self, now: chrono::DateTime<chrono::Local>) -> String {
-        let line = |h: &OpenHandoff| {
+        let noun = self.noun;
+        let line = |c: &Candidate| {
+            let h = &c.handoff;
             format!(
                 "{} · project {} · {} · {}d",
                 h.slug,
@@ -444,25 +594,53 @@ impl Resolution {
         let mut s = String::new();
         match self.matches.as_slice() {
             [one] => {
-                let _ = writeln!(s, "doc: {}", one.doc);
-                let _ = writeln!(s, "handoff: {}", line(one));
+                let _ = writeln!(s, "doc: {}", one.handoff.doc);
+                let _ = writeln!(s, "{noun}: {}", line(one));
                 let _ = writeln!(s, "matched: {}", self.rule_text());
+                if let Some(p) = &self.revived {
+                    let why = p.reason.as_deref().unwrap_or("no reason recorded");
+                    let at = p
+                        .deferred_at
+                        .as_deref()
+                        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
+                    match at {
+                        Some(at) => {
+                            let days = now.signed_duration_since(at).num_days();
+                            let _ = writeln!(s, "revived: deferred {days} days ago ({why})");
+                        }
+                        None => {
+                            let _ = writeln!(s, "revived: was deferred ({why})");
+                        }
+                    }
+                }
             }
             [] => {
-                let _ = writeln!(s, "no open handoff matches \"{}\"", self.query);
+                if let Some(Rule::Key { key, .. }) = &self.rule {
+                    let _ = writeln!(s, "key {key} does not name a deferred {noun} now");
+                } else {
+                    let _ = writeln!(s, "no open {noun} matches \"{}\"", self.query);
+                    let _ = writeln!(s, "no deferred {noun} matches either");
+                }
                 let _ = writeln!(s, "searched: {}", self.searched.join("; "));
-                let _ = writeln!(s, "every handoff, open or not: base handoff list");
+                let _ = writeln!(s, "every {noun}, open or not: base {noun} list");
             }
             many => {
+                let parked = many.iter().filter(|c| c.parked.is_some()).count();
+                let (open_word, parked_note) = if parked == 0 {
+                    ("open ", String::new())
+                } else {
+                    ("", format!(" ({parked} deferred)"))
+                };
                 let _ = writeln!(
                     s,
-                    "{} open handoffs match \"{}\" by {}. None was picked; run base handoff show <slug> for one:",
+                    "{} {open_word}{noun}s match \"{}\"{parked_note} by {}. None was picked; run base {noun} show <slug> for one:",
                     many.len(),
                     self.query,
                     self.rule_text()
                 );
-                for h in many {
-                    let _ = writeln!(s, "  {}", line(h));
+                for c in many {
+                    let tail = if c.parked.is_some() { " · deferred" } else { "" };
+                    let _ = writeln!(s, "  {}{tail}", line(c));
                 }
             }
         }

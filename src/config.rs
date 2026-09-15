@@ -748,11 +748,25 @@ pub enum DeferKind {
 pub const DEFER_DAYS_FALLBACK: i64 = 10;
 
 impl BaseConfig {
-    /// Whole days before an untouched record of `kind` is deferred, in spec Part H's order.
+    /// Whole days before an untouched record of `kind` is deferred, in spec Part H's order. `mode =
+    /// "global"` gives every type `global_days`, then 10. Any other mode, or none, reads the type's own
+    /// `[defer.days]` value, then `global_days`, then 10. A project with no key of its own reads
+    /// `[protocol] stale_days` instead, which the project engine has always read (spec G6).
     pub fn defer_days(&self, kind: DeferKind) -> i64 {
-        // Law 11 commit 1: the surface, no behaviour.
-        let _ = kind;
-        DEFER_DAYS_FALLBACK
+        let d = &self.defer;
+        if d.mode.as_deref() == Some("global") {
+            return d.global_days.unwrap_or(DEFER_DAYS_FALLBACK);
+        }
+        let own = match kind {
+            DeferKind::Handoff => d.days.handoff,
+            DeferKind::Fork => d.days.fork,
+            DeferKind::Task => d.days.task,
+            DeferKind::Milestone => d.days.milestone,
+            DeferKind::Project => {
+                return d.days.project.unwrap_or(self.protocol.stale_days as i64);
+            }
+        };
+        own.or(d.global_days).unwrap_or(DEFER_DAYS_FALLBACK)
     }
 }
 

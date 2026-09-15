@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use oxigraph::sparql::QueryResults;
 
-use crate::config::{FlowConfig, NamespaceConfig, SessionStartConfig};
+use crate::config::{DeferKind, FlowConfig, NamespaceConfig, SessionStartConfig};
 use crate::crud;
 use crate::crud::handoff_show::{self, HandoffList};
 
@@ -100,7 +100,9 @@ fn blocked_by_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
     Ok(output)
 }
 
-/// Find deferred entities with a resurfaceAt date in the past.
+/// Find deferred entities with a resurfaceAt date in the past. A record the deferral pass parked
+/// (`deferredReason` starting `auto:`) is left out: every one carries a past `resurfaceAt`, so the
+/// first pass would otherwise print all of them here. An operator's own "defer until" still shows.
 fn deferred_orphan_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
     let now_str = chrono::Local::now()
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
@@ -113,6 +115,7 @@ fn deferred_orphan_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
                {p}:status \"deferred\" ;\n\
                {p}:resurfaceAt ?resurfaceAt .\n\
              FILTER(?resurfaceAt < \"{now_str}\"^^xsd:dateTime)\n\
+             FILTER NOT EXISTS {{ ?entity {p}:deferredReason ?why . FILTER(STRSTARTS(STR(?why), \"auto:\")) }}\n\
            }}\n\
          }}\n\
          ORDER BY ?resurfaceAt"
@@ -148,20 +151,23 @@ fn deferred_orphan_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
 /// The HANDOFFS block (spec B4, B5): open handoffs whose `resurfaceAt` has passed, across the
 /// global and workspace tiers, newest created first, one per project, at most ten, lettered from A.
 /// A line is the project, the codename read off the slug (the slug itself when it has no codename
-/// shape) and the age. No path: `base handoff show` finds the doc. Returns the block and the list,
-/// whose letters the instruction block and the letters file carry.
+/// shape) and the age. No path: `base handoff show` finds the doc. Returns the block, the list, whose
+/// letters the instruction block and the letters file carry, and how many handoffs are deferred.
 pub fn handoff_scan(
     cwd: &Path,
     ns: &NamespaceConfig,
     cfg: &SessionStartConfig,
-) -> Result<(String, HandoffList)> {
+) -> Result<(String, HandoffList, usize)> {
     let Some(store) = crate::store::load_merged(cwd) else {
-        return Ok((String::new(), HandoffList::default()));
+        return Ok((String::new(), HandoffList::default(), 0));
     };
     let rows = handoff_show::open_handoffs(&store, ns, true, None)?;
     let list = handoff_show::session_start_list(rows, cfg);
-    if list.shown.is_empty() {
-        return Ok((String::new(), list));
+    // C8: a block with nothing open and something deferred still renders, so its notice has a place.
+    let deferred = crud::deferred::count_in(&store, ns, DeferKind::Handoff)?;
+    let notice = crud::deferred::notice(DeferKind::Handoff, deferred);
+    if list.shown.is_empty() && notice.is_none() {
+        return Ok((String::new(), list, deferred));
     }
 
     let now = chrono::Local::now();
@@ -185,20 +191,24 @@ pub fn handoff_scan(
             h.age_days(now)
         ));
     }
-    Ok((out.trim_end().to_string(), list))
+    if let Some(line) = notice {
+        out.push_str(&format!("  {line}\n"));
+    }
+    Ok((out.trim_end().to_string(), list, deferred))
 }
 
 /// The FORKS block (spec B6): open forks whose `resurfaceAt` has passed, across both tiers. The
 /// count, the newest `forks_shown` of them (title, project, age; no path) and the command that
 /// lists them all. Forks are additive side-work, several open at once, each summoned by its title
-/// (== slug == doc basename). Returns the block, how many are open, and how many it lists.
+/// (== slug == doc basename). Returns the block, how many are open, how many it lists, and how many
+/// forks are deferred.
 pub fn fork_scan(
     cwd: &Path,
     ns: &NamespaceConfig,
     cfg: &SessionStartConfig,
-) -> Result<(String, usize, usize)> {
+) -> Result<(String, usize, usize, usize)> {
     let Some(store) = crate::store::load_merged(cwd) else {
-        return Ok((String::new(), 0, 0));
+        return Ok((String::new(), 0, 0, 0));
     };
     let now = chrono::Local::now();
     let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
@@ -221,7 +231,7 @@ pub fn fork_scan(
     );
 
     let QueryResults::Solutions(solutions) = crate::store::query(&store, &sparql)? else {
-        return Ok((String::new(), 0, 0));
+        return Ok((String::new(), 0, 0, 0));
     };
 
     let rows: Vec<(String, String, String)> = solutions
@@ -238,8 +248,11 @@ pub fn fork_scan(
         })
         .collect();
 
-    if rows.is_empty() {
-        return Ok((String::new(), 0, 0));
+    // C8: a block with nothing open and something deferred still renders, so its notice has a place.
+    let deferred = crud::deferred::count_in(&store, ns, DeferKind::Fork)?;
+    let notice = crud::deferred::notice(DeferKind::Fork, deferred);
+    if rows.is_empty() && notice.is_none() {
+        return Ok((String::new(), 0, 0, deferred));
     }
 
     let shown = rows.len().min(cfg.forks_shown);
@@ -253,8 +266,11 @@ pub fn fork_scan(
             .unwrap_or(0);
         out.push_str(&format!("  {slug} · {project} · {days}d\n"));
     }
+    if let Some(line) = notice {
+        out.push_str(&format!("  {line}\n"));
+    }
 
-    Ok((out.trim_end().to_string(), rows.len(), shown))
+    Ok((out.trim_end().to_string(), rows.len(), shown, deferred))
 }
 
 /// The DUE NOW block (spec B1 row 3): reminders whose `resurfaceAt` time has passed, across both

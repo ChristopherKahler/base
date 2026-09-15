@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Result;
 use oxigraph::sparql::{QueryResults, QuerySolution};
 
-use crate::config::{BaseConfig, WorkspaceEntry};
+use crate::config::{BaseConfig, DeferKind, WorkspaceEntry};
 use crate::crud;
 use crate::scope::{self, Home};
 
@@ -43,6 +43,8 @@ pub struct Section {
     pub text: String,
     pub shown: usize,
     pub total: usize,
+    /// Records of this block's kind marked deferred: counted on its notice line, never listed (C8).
+    pub deferred: usize,
 }
 
 /// The working set as its sections, in order: projects, tasks, milestones, blocked (spec B6, board
@@ -64,7 +66,7 @@ pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<Vec<Section>> {
              OPTIONAL {{ ?entity {p}:blockedBy ?blockedBy }}\n\
              OPTIONAL {{ ?entity {p}:path ?path }}\n\
              FILTER(?type IN ({p}:Project, {p}:App, {p}:Framework, {p}:TrackingProject, {p}:Task, {p}:Milestone))\n\
-             FILTER(?status NOT IN (\"deferred\", \"complete\", \"completed\", \"archived\"))\n\
+             FILTER(?status NOT IN (\"complete\", \"completed\", \"archived\"))\n\
            }}\n\
            OPTIONAL {{ GRAPH ?tg {{ ?taskOf {p}:hasTask ?entity }} }}\n\
            OPTIONAL {{ GRAPH ?mg {{ ?milestoneOf {p}:hasMilestone ?entity }} }}\n\
@@ -159,18 +161,26 @@ fn render_sections(
         chrono::DateTime::parse_from_rfc3339(&r.last_active)
             .is_ok_and(|dt| dt.with_timezone(&chrono::Utc) >= since)
     };
+    // Deferred rows are read so each block can count them (C8). They are never listed and never counted
+    // as working: the notice line is the only place they appear.
+    let working = |r: &Wrow| r.status != "blocked" && r.status != crud::deferred::DEFERRED;
+    let parked = |r: &Wrow| r.status == crud::deferred::DEFERRED;
 
     let mut sections: Vec<Section> = Vec::new();
 
     // PROJECTS — scoped to the current workspace + un-homed; the recent ones listed.
     let projects: Vec<&Wrow> = rows
         .iter()
-        .filter(|r| r.status != "blocked" && is_project(&r.ty) && in_briefing(&r.path))
+        .filter(|r| working(r) && is_project(&r.ty) && in_briefing(&r.path))
         .collect();
+    let parked_projects = rows
+        .iter()
+        .filter(|r| parked(r) && is_project(&r.ty) && in_briefing(&r.path))
+        .count();
     let recent: Vec<&Wrow> = projects.iter().copied().filter(|r| touched(r)).collect();
     let recent_name: HashMap<&str, &str> =
         recent.iter().map(|r| (r.id.as_str(), r.name.as_str())).collect();
-    if !projects.is_empty() {
+    if !projects.is_empty() || parked_projects > 0 {
         let mut output = format!(
             "PROJECTS ({} active, touched in {days} days: {}) · all: base project list --all\n",
             projects.len(),
@@ -186,7 +196,7 @@ fn render_sections(
         // Cross-workspace count: projects homed in OTHER registered workspaces.
         let mut elsewhere_ws: BTreeSet<String> = BTreeSet::new();
         let mut elsewhere_n = 0usize;
-        for r in rows.iter().filter(|r| r.status != "blocked" && is_project(&r.ty)) {
+        for r in rows.iter().filter(|r| working(r) && is_project(&r.ty)) {
             if let Home::Workspace(w) = home_of(&r.path)
                 && current.map(|c| w.as_str() != c).unwrap_or(false) {
                     elsewhere_n += 1;
@@ -199,24 +209,26 @@ fn render_sections(
                 elsewhere_ws.len()
             ));
         }
+        if let Some(line) = crud::deferred::notice(DeferKind::Project, parked_projects) {
+            output.push_str(&format!("  {line}\n"));
+        }
         sections.push(Section {
             kind: "projects",
             text: output.trim_end().to_string(),
             shown: recent.len(),
             total: projects.len(),
+            deferred: parked_projects,
         });
     }
 
     // TASKS and MILESTONES — every working one counted, the ones on a recent project listed.
-    for (kind, ty, title, command) in [
-        ("tasks", "Task", "TASKS", "base task list"),
-        ("milestones", "Milestone", "MILESTONES", "base milestone list"),
+    for (kind, ty, title, command, defer_kind) in [
+        ("tasks", "Task", "TASKS", "base task list", DeferKind::Task),
+        ("milestones", "Milestone", "MILESTONES", "base milestone list", DeferKind::Milestone),
     ] {
-        let all: Vec<&Wrow> = rows
-            .iter()
-            .filter(|r| r.ty == ty && r.status != "blocked")
-            .collect();
-        if all.is_empty() {
+        let all: Vec<&Wrow> = rows.iter().filter(|r| r.ty == ty && working(r)).collect();
+        let parked_here = rows.iter().filter(|r| r.ty == ty && parked(r)).count();
+        if all.is_empty() && parked_here == 0 {
             continue;
         }
         let listed: Vec<(&Wrow, &str)> = all
@@ -236,11 +248,15 @@ fn render_sections(
         for (r, project) in &listed {
             output.push_str(&format!("  {} · {project}\n", r.name));
         }
+        if let Some(line) = crud::deferred::notice(defer_kind, parked_here) {
+            output.push_str(&format!("  {line}\n"));
+        }
         sections.push(Section {
             kind,
             text: output.trim_end().to_string(),
             shown: listed.len(),
             total: all.len(),
+            deferred: parked_here,
         });
     }
 
@@ -260,6 +276,7 @@ fn render_sections(
             text: output.trim_end().to_string(),
             shown: blocked.len(),
             total: blocked.len(),
+            deferred: 0,
         });
     }
 

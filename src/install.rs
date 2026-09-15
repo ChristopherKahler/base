@@ -1628,6 +1628,14 @@ Each app keeps its own self-contained map at `<app>/.base-ast/ast.ttl`, register
 - `base task add --project X --name "..."` (or `base t a -p X -n "..."`) — add a task
 - `base task done <slug>` — mark complete
 
+### Deferred work
+
+Deferred means open but paused: a handoff, fork, task or milestone nobody has touched inside its window. Session start does not list it, and every block ends with its count and the command that lists it. Nothing deferred is lost.
+
+Bring one back with `base handoff show <what the user said>` (forks: `base fork show`), which revives a deferred match and prints its doc. A task or milestone comes back when a base command touches it, or with `base task update <slug> --status active`. List them with `base handoff deferred`, `base fork deferred`, `base task deferred`, `base milestone deferred` and `base project deferred`.
+
+Config: `[defer] enabled` (off unless set), `mode` (`"asset"` or `"global"`), `global_days` (10 when unset), and one `[defer.days]` key per type: `handoff`, `fork`, `task`, `milestone`, `project`. A project with no key reads `[protocol] stale_days`. Preview the pass with `base reconcile --dry-run`.
+
 ### Knowledge & memory
 
 - `base learn --text "..." --domain X --type insight` — structured memory with relational edges

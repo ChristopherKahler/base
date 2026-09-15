@@ -460,6 +460,7 @@ impl SessionOutput {
             .as_ref()
             .map(|s| s.letters.clone())
             .unwrap_or_default();
+        let deferred = self.signals.as_ref().map(|s| s.deferred).unwrap_or(0);
         if let Some(signals) = &self.signals {
             for signal in signals.signals() {
                 for block in &signal.blocks {
@@ -480,7 +481,7 @@ impl SessionOutput {
             placed.push(Placed {
                 id: "instructions".to_string(),
                 kind: "instructions".to_string(),
-                text: instruction_block(&letters),
+                text: instruction_block(&letters, deferred),
                 total: 0,
                 shown: 0,
             });
@@ -540,7 +541,8 @@ impl SessionOutput {
         for row in withheld {
             emission.note_withheld(row.block, row.items, row.reason, row.command);
         }
-        let rendered = emission.render(&full, Some(&header_line));
+        let header = |facts: &Facts<'_>| header_line(facts, deferred);
+        let rendered = emission.render(&full, Some(&header));
         if !rendered.first_screen_ok {
             eprintln!(
                 "base: session start's header, instructions and DUE NOW take more than the first {} units",
@@ -577,9 +579,9 @@ struct Placed {
 }
 
 /// Spec B3, with B7's BEHAVIOR lines merged in: what Claude does first, written before any data
-/// so no trim can remove it. It names only commands that exist; the deferred line arrives with
-/// lane 3's `base handoff deferred` (lane doc B16, flag 3).
-pub fn instruction_block(letters: &[(char, String)]) -> String {
+/// so no trim can remove it. It names only commands that exist. The deferred line (B3) prints when
+/// anything is deferred, so a session with nothing deferred keeps today's block byte for byte.
+pub fn instruction_block(letters: &[(char, String)], deferred: usize) -> String {
     let mut s = String::from(
         "DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:\n\
          1. Show DUE NOW, then HANDOFFS, exactly as lettered. Nothing prepended. No \"is this stale?\" questions.\n\
@@ -588,6 +590,9 @@ pub fn instruction_block(letters: &[(char, String)]) -> String {
          4. FORKS are open side-work, not a lettered choice; several stay open. `base fork snooze <title> <N>` · `base fork archive <title>`.\n\
          5. Every block below is a summary. Its full list is the command on its line, and the whole untrimmed output is the file on line 1. Never guess; run it.",
     );
+    if deferred > 0 {
+        s.push_str("\n6. Deferred = open but paused, not listed here; each block gives the count and the command. Bring one back: base handoff show <what they said> (forks: base fork show).");
+    }
     if !letters.is_empty() {
         let map: Vec<String> = letters
             .iter()
@@ -600,8 +605,10 @@ pub fn instruction_block(letters: &[(char, String)]) -> String {
 }
 
 /// Spec B2, line 1: every count, the withheld total, and where the untrimmed output is. Rendered
-/// from the blocks at their final level on every trim pass, so it is measured as it is printed.
-pub fn header_line(facts: &Facts<'_>) -> String {
+/// from the blocks at their final level on every trim pass, so it is measured as it is printed. The
+/// deferred total prints only when something is deferred, so a session with nothing deferred keeps
+/// today's line byte for byte.
+pub fn header_line(facts: &Facts<'_>, deferred: usize) -> String {
     let total = |id: &str| facts.block(id).map(Block::items_total).unwrap_or(0);
     let handoffs_shown = facts.block("handoffs").map(Block::items_shown).unwrap_or(0);
     let full = match (facts.full.written_path(), facts.full.failure()) {
@@ -609,8 +616,13 @@ pub fn header_line(facts: &Facts<'_>) -> String {
         (None, Some(why)) => format!("not written ({why})"),
         (None, None) => "not written ([budget] write_full_output = false)".to_string(),
     };
+    let parked = if deferred > 0 {
+        format!(" · deferred {deferred}")
+    } else {
+        String::new()
+    };
     format!(
-        "[BASE START · {} due · handoffs {} open ({handoffs_shown} shown) · forks {} · projects {} · tasks {} · milestones {} · withheld {} · full: {full}]",
+        "[BASE START · {} due · handoffs {} open ({handoffs_shown} shown) · forks {} · projects {} · tasks {} · milestones {}{parked} · withheld {} · full: {full}]",
         total("reminders"),
         total("handoffs"),
         total("forks"),
@@ -800,6 +812,19 @@ fn reconcile_active_state(config: &BaseConfig, cwd: &Path) {
         cwd,
         &config.namespace,
     );
+    // Spec C5: handoffs, forks, tasks and milestones that went cold are deferred, in every tier, before
+    // signals render, so session start already shows the truth. Gated on `[defer] enabled`, false in code
+    // (lane 3 verdicts, AMENDMENTS B). Fail-open like the passes beside it.
+    match crate::protocol::reconcile::reconcile_records(crate::home::home_root().as_deref(), cwd, config) {
+        Ok(stats) if stats.changed() => {
+            eprintln!(
+                "base: defer — {} deferred, {} revived ({} records scanned)",
+                stats.deferred, stats.revived, stats.scanned
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("base: defer failed: {e}"),
+    }
     match crate::protocol::reconcile(cwd, config) {
         Ok(stats) if stats.changed() => {
             eprintln!(
