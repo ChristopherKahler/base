@@ -3,8 +3,9 @@ use std::path::Path;
 use anyhow::Result;
 use oxigraph::sparql::QueryResults;
 
-use crate::config::{FlowConfig, NamespaceConfig};
+use crate::config::{FlowConfig, NamespaceConfig, SessionStartConfig};
 use crate::crud;
+use crate::crud::handoff_show::{self, HandoffList};
 
 /// Flow resurface signal: surfaces items that need attention.
 /// Three sub-queries: blocked-by scan, deferred orphan scan, mention threshold.
@@ -144,92 +145,66 @@ fn deferred_orphan_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<String> {
     Ok(output)
 }
 
-/// Find OPEN handoffs whose `resurfaceAt` is in the past, across global + workspace
-/// tiers, and render the lettered "pick up where you left off" delegation block. Returns the
-/// block and how many handoffs it lists.
-pub fn handoff_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)> {
+/// The HANDOFFS block (spec B4, B5): open handoffs whose `resurfaceAt` has passed, across the
+/// global and workspace tiers, newest created first, one per project, at most ten, lettered from A.
+/// A line is the project, the codename read off the slug (the slug itself when it has no codename
+/// shape) and the age. No path: `base handoff show` finds the doc. Returns the block and the list,
+/// whose letters the instruction block and the letters file carry.
+pub fn handoff_scan(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    cfg: &SessionStartConfig,
+) -> Result<(String, HandoffList)> {
     let Some(store) = crate::store::load_merged(cwd) else {
-        return Ok((String::new(), 0));
+        return Ok((String::new(), HandoffList::default()));
     };
+    let rows = handoff_show::open_handoffs(&store, ns, true, None)?;
+    let list = handoff_show::session_start_list(rows, cfg);
+    if list.shown.is_empty() {
+        return Ok((String::new(), list));
+    }
+
     let now = chrono::Local::now();
-    let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
-    let p = &ns.prefix;
-    let sparql = format!(
-        "{pfx}\nSELECT ?h ?project ?doc ?created WHERE {{\n\
-           GRAPH ?g {{\n\
-             ?h a {p}:Handoff ;\n\
-               {p}:status \"open\" ;\n\
-               {p}:project ?project ;\n\
-               {p}:handoffDoc ?doc ;\n\
-               {p}:createdAt ?created ;\n\
-               {p}:resurfaceAt ?resurfaceAt .\n\
-             OPTIONAL {{ ?h {p}:kind ?kind }}\n\
-             FILTER(!BOUND(?kind) || ?kind != \"fork\")\n\
-             FILTER(?resurfaceAt <= \"{now_str}\"^^xsd:dateTime)\n\
-           }}\n\
-         }}\n\
-         ORDER BY ?created",
-        pfx = crud::prefixes(ns)
+    let mut out = format!(
+        "HANDOFFS ({} open, newest {} shown) · all: base handoff list\n",
+        list.open,
+        list.shown.len()
     );
-
-    let QueryResults::Solutions(solutions) = crate::store::query(&store, &sparql)? else {
-        return Ok((String::new(), 0));
-    };
-
-    let rows: Vec<(String, String, String, String)> = solutions
-        .filter_map(|r| r.ok())
-        .map(|row| {
-            let get = |k: &str| {
-                row.get(k)
-                    .map(|t| crud::term_display(t.into()))
-                    .unwrap_or_default()
-            };
-            let h = get("h");
-            let slug = h.rsplit('/').next().unwrap_or(&h).to_string();
-            (slug, get("project"), get("doc"), get("created"))
-        })
-        .collect();
-
-    if rows.is_empty() {
-        return Ok((String::new(), 0));
+    for l in &list.shown {
+        let h = &l.handoff;
+        let who = handoff_show::codename_of(&h.slug).unwrap_or(&h.slug);
+        let older = if l.older > 0 {
+            format!(" (+{} older)", l.older)
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "  {}) {} · {who} · {}d{older}\n",
+            l.letter,
+            h.project,
+            h.age_days(now)
+        ));
     }
-
-    let mut out = String::from("[Pick up where you left off]\n");
-    let mut letter_map: Vec<String> = Vec::new();
-    for (i, (slug, project, doc, created)) in rows.iter().enumerate() {
-        let letter = (b'A' + (i as u8 % 26)) as char;
-        let days = chrono::DateTime::parse_from_rfc3339(created)
-            .map(|dt| now.signed_duration_since(dt).num_days())
-            .unwrap_or(0);
-        out.push_str(&format!("{letter}) {project} · {doc} · {days}d\n"));
-        letter_map.push(format!("{letter}={slug}"));
-    }
-    out.push_str(&format!(
-        "BEHAVIOR: Render this as the FIRST thing in your reply — a clean lettered list \
-         (project · path · age), nothing prepended. Pure delegation: no \"is this stale?\" \
-         prompts. Operator replies with a letter → read that doc and resume; \
-         \"snooze <letter> <N>d\" → run `base handoff snooze <slug> <N>`; \
-         \"archive <letter>\" → run `base handoff archive <slug>`. Letter→slug: {}.",
-        letter_map.join(", ")
-    ));
-
-    Ok((out, rows.len()))
+    Ok((out.trim_end().to_string(), list))
 }
 
-/// Find OPEN forks (kind = "fork") whose `resurfaceAt` is in the past, across
-/// global + workspace tiers, and render the "Forks" block. Forks are additive
-/// parallel side-work — multiple surface at once, each summoned by its title
-/// (== slug == doc basename), distinct from the single Handoff resume line. Returns the block
-/// and how many forks it lists.
-pub fn fork_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)> {
+/// The FORKS block (spec B6): open forks whose `resurfaceAt` has passed, across both tiers. The
+/// count, the newest `forks_shown` of them (title, project, age; no path) and the command that
+/// lists them all. Forks are additive side-work, several open at once, each summoned by its title
+/// (== slug == doc basename). Returns the block, how many are open, and how many it lists.
+pub fn fork_scan(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    cfg: &SessionStartConfig,
+) -> Result<(String, usize, usize)> {
     let Some(store) = crate::store::load_merged(cwd) else {
-        return Ok((String::new(), 0));
+        return Ok((String::new(), 0, 0));
     };
     let now = chrono::Local::now();
     let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
     let p = &ns.prefix;
     let sparql = format!(
-        "{pfx}\nSELECT ?h ?project ?doc ?created WHERE {{\n\
+        "{pfx}\nSELECT ?h ?project ?created WHERE {{\n\
            GRAPH ?g {{\n\
              ?h a {p}:Handoff ;\n\
                {p}:kind \"fork\" ;\n\
@@ -241,15 +216,15 @@ pub fn fork_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)> {
              FILTER(?resurfaceAt <= \"{now_str}\"^^xsd:dateTime)\n\
            }}\n\
          }}\n\
-         ORDER BY ?created",
+         ORDER BY DESC(?created) ?h",
         pfx = crud::prefixes(ns)
     );
 
     let QueryResults::Solutions(solutions) = crate::store::query(&store, &sparql)? else {
-        return Ok((String::new(), 0));
+        return Ok((String::new(), 0, 0));
     };
 
-    let rows: Vec<(String, String, String, String)> = solutions
+    let rows: Vec<(String, String, String)> = solutions
         .filter_map(|r| r.ok())
         .map(|row| {
             let get = |k: &str| {
@@ -259,34 +234,32 @@ pub fn fork_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)> {
             };
             let h = get("h");
             let slug = h.rsplit('/').next().unwrap_or(&h).to_string();
-            (slug, get("project"), get("doc"), get("created"))
+            (slug, get("project"), get("created"))
         })
         .collect();
 
     if rows.is_empty() {
-        return Ok((String::new(), 0));
+        return Ok((String::new(), 0, 0));
     }
 
-    let mut out = String::from("[Forks]\n");
-    for (slug, project, doc, created) in &rows {
+    let shown = rows.len().min(cfg.forks_shown);
+    let mut out = format!(
+        "FORKS ({} open, newest {shown} shown) · all: base fork list\n",
+        rows.len()
+    );
+    for (slug, project, created) in rows.iter().take(shown) {
         let days = chrono::DateTime::parse_from_rfc3339(created)
             .map(|dt| now.signed_duration_since(dt).num_days())
             .unwrap_or(0);
-        out.push_str(&format!("- {slug} · {project} · {doc} · {days}d\n"));
+        out.push_str(&format!("  {slug} · {project} · {days}d\n"));
     }
-    out.push_str(
-        "BEHAVIOR: These are open parallel side-work forks — independent of the continuity \
-         handoff and of each other. To pick one up, name its title (the first field, == doc \
-         basename) → read that doc and build the feature autonomously. Multiple can stay open \
-         at once; do not treat these as a single lettered choice. \"snooze <title> <N>d\" → run \
-         `base fork snooze <title> <N>`; \"archive <title>\" → run `base fork archive <title>`.",
-    );
 
-    Ok((out, rows.len()))
+    Ok((out.trim_end().to_string(), rows.len(), shown))
 }
 
-/// Surface reminders whose `resurfaceAt` time has passed, across global + workspace tiers.
-/// Returns the block and how many reminders it lists.
+/// The DUE NOW block (spec B1 row 3): reminders whose `resurfaceAt` time has passed, across both
+/// tiers, oldest due first, each with the command that clears it. Returns the block and how many
+/// reminders it lists.
 pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)> {
     let Some(store) = crate::store::load_merged(cwd) else {
         return Ok((String::new(), 0));
@@ -328,15 +301,14 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)
         return Ok((String::new(), 0));
     }
 
-    let mut out = String::from("[Reminders]\n");
-    for (slug, name) in &rows {
-        out.push_str(&format!("- {name}  (clear: base reminder remove {slug})\n"));
+    let mut out = format!("DUE NOW ({}) · all: base reminder list\n", rows.len());
+    for (i, (slug, name)) in rows.iter().enumerate() {
+        out.push_str(&format!(
+            "  {} {name} · clear: base reminder remove {slug}\n",
+            i + 1
+        ));
     }
-    out.push_str(
-        "BEHAVIOR: These reminders are due now — surface them to the operator in your first reply. \
-         Clear a handled one with `base reminder remove <slug>`.",
-    );
-    Ok((out, rows.len()))
+    Ok((out.trim_end().to_string(), rows.len()))
 }
 
 /// Find notes with mentionCount >= threshold — recurring ideas that should be promoted.

@@ -160,11 +160,16 @@ fn run_event(
                     out.push("relay-inbox", &block, 1);
                 }
                 // Session-targeted task relay: refresh liveness + announce any tasks
-                // assigned to this session (loud, re-announced on each new session).
-                if let Some(sid) = session_id.as_deref()
-                    && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::SessionStart, true)
-                {
-                    out.push("relay-tick", &block, 1);
+                // assigned to this session (loud, re-announced on each new session), as two blocks
+                // that rank apart: the tasks delivered to this session and the wake contract (spec B1).
+                if let Some(sid) = session_id.as_deref() {
+                    let (tasks, wake) = relay_task_parts(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::SessionStart, true);
+                    if let Some(block) = tasks {
+                        out.push("relay-tasks", &block, 1);
+                    }
+                    if let Some(block) = wake {
+                        out.push("relay-wake", &block, 1);
+                    }
                 }
             }
             // A handler error still prints what it collected first: those sites had printed
@@ -291,6 +296,21 @@ fn relay_task_tick(
     phase: crate::relay::task_inbox::Phase,
     boundary: bool,
 ) -> Option<String> {
+    match relay_task_parts(session_id, cwd, relay, phase, boundary) {
+        (Some(d), Some(w)) => Some(format!("{d}\n{w}")),
+        (a, b) => a.or(b),
+    }
+}
+
+/// [`relay_task_tick`]'s two halves, kept apart: the tasks and pings delivered to this session, and
+/// the wake contract. Session start places them as two blocks; every other event joins them.
+fn relay_task_parts(
+    session_id: &str,
+    cwd: &std::path::Path,
+    relay: &crate::config::RelayConfig,
+    phase: crate::relay::task_inbox::Phase,
+    boundary: bool,
+) -> (Option<String>, Option<String>) {
     if boundary {
         // `[relay] enabled = false` stops the auto-codename; a session that
         // registered itself still keeps its liveness fresh.
@@ -329,10 +349,7 @@ fn relay_task_tick(
             )
         })
         .flatten();
-    match (delivered, wake) {
-        (Some(d), Some(w)) => Some(format!("{d}\n{w}")),
-        (a, b) => a.or(b),
-    }
+    (delivered, wake)
 }
 
 /// The hook log is bounded by its own writer (#22): over this size the last

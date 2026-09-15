@@ -10,67 +10,10 @@
 
 mod seed;
 
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-const BIN: &str = env!("CARGO_BIN_EXE_base");
-
-/// Exit code, stdout, stderr.
-fn run_session_start(seed: &seed::Seed, session: Option<&str>) -> (i32, String, String) {
-    let payload = serde_json::json!({
-        "cwd": seed.ws.display().to_string(),
-        "hook_event_name": "SessionStart",
-        "source": "startup",
-        "session_id": session,
-    })
-    .to_string();
-    let mut cmd = Command::new(BIN);
-    cmd.args(["hook", "session-start"])
-        .current_dir(&seed.ws)
-        .env("BASE_HOME", &seed.home)
-        .env("BASE_NO_AUTO_UPDATE", "1")
-        .env("BASE_AST_NO_SPAWN", "1")
-        .env_remove("BASE_NO_WAKE_NUDGE")
-        .env_remove("BASE_NO_AUTONAME")
-        .env_remove("BASE_RELAY_AS")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if session.is_some() {
-        // A fixed title, so the wake contract is part of the output and reads the same every run.
-        cmd.env("BASE_RELAY_AS", "seed-kite");
-    }
-    let mut child = cmd.spawn().expect("the base binary runs");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(payload.as_bytes())
-        .expect("payload written");
-    let out = child.wait_with_output().expect("the hook finishes");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
-}
-
-/// The unit Claude Code's limit counts, and the budget's.
-fn units(s: &str) -> usize {
-    s.encode_utf16().count()
-}
-
-fn measured(s: &str) -> String {
-    format!(
-        "bytes={} chars={} utf16={} lines={}",
-        s.len(),
-        s.chars().count(),
-        units(s),
-        s.lines().count()
-    )
-}
+use seed::{measured, run_session_start, units};
 
 const REAL_BUDGET: usize = 9000;
 
@@ -106,8 +49,10 @@ fn session_start_fits_its_budget_on_the_real_size_seed() {
         !stdout.is_empty(),
         "the hook printed nothing, so this measured nothing. stderr: {stderr}"
     );
+    // Commit C: the fork block's header is `FORKS (157 open, ...)` since the B layout, where it
+    // was `[Forks]`. The control is unchanged: either the block or its floor carries the seed's 157.
     assert!(
-        stdout.contains("[Forks]") || stdout.contains("forks 157 ·"),
+        stdout.contains("FORKS (157 open") || stdout.contains("forks 157 ·"),
         "the seed's 157 open forks are not in the output, so the seed was not read"
     );
     assert!(
@@ -162,9 +107,12 @@ fn a_collapsed_shown_once_block_leaves_its_text_in_the_full_output_file() {
     );
 
     let shown = file.display().to_string();
+    // Commit C: the relay tick is two blocks since the B layout, the tasks delivered to the
+    // session and the wake contract. The seed delivers no task, so the wake contract carries the case
+    // the single `relay-tick` block carried.
     let cases = [
         ("first-run", "base is installed."),
-        ("relay-tick", "=== RELAY WAKE CONTRACT"),
+        ("relay-wake", "=== RELAY WAKE CONTRACT"),
     ];
     for (kind, marker) in cases {
         assert!(

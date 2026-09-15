@@ -6,6 +6,7 @@ pub mod supersede;
 pub mod entity;
 pub mod goal;
 pub mod handoff;
+pub mod handoff_show;
 pub mod milestone;
 pub mod note;
 pub mod project;

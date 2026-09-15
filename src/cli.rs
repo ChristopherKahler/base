@@ -1112,6 +1112,14 @@ pub enum HandoffAction {
     },
     /// List handoffs across global + workspace tiers
     List,
+    /// Find one open handoff and print its doc path. Takes a letter from the last session start
+    /// (A-J), a slug, a project name, or a few words. Several matches are listed and none is
+    /// picked (exit 2); no match exits 1. Writes nothing.
+    Show {
+        /// A letter, a slug, a project name, or loose words
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+    },
     /// Snooze a handoff for N days (hide until then)
     Snooze { slug: String, days: i64 },
     /// Archive a handoff (stop resurfacing)
@@ -2077,6 +2085,26 @@ pub fn run() {
                     }
                 }
                 HandoffAction::List => { if let Err(e) = crud::handoff::list(&cwd, &config.namespace) { die("Error", e); } }
+                HandoffAction::Show { query } => {
+                    match crud::handoff_show::resolve(
+                        base::home::home_root().as_deref(),
+                        &cwd,
+                        &config.namespace,
+                        &config.session_start,
+                        &query.join(" "),
+                    ) {
+                        Ok(found) => {
+                            print!("{}", found.render(chrono::Local::now()));
+                            let code = found.exit_code();
+                            if code != 0 {
+                                use std::io::Write as _;
+                                let _ = std::io::stdout().flush();
+                                std::process::exit(code);
+                            }
+                        }
+                        Err(e) => die("Failed", e),
+                    }
+                }
                 HandoffAction::Snooze { slug, days } => {
                     match crud::handoff::snooze(
                         base::home::home_root().as_deref(),

@@ -5,7 +5,9 @@ use anyhow::Result;
 use oxigraph::sparql::QueryResults;
 
 use crate::config::{load_queries, BaseConfig};
-use crate::emit::{self, Block, Emission, Fragments, FullOutput, Level, Rank, Reason, Rendered};
+use crate::emit::{
+    self, Block, Emission, Facts, Fragments, FullOutput, Level, Rank, Reason, Rendered,
+};
 use crate::ontology;
 use crate::signal::SignalOutput;
 use crate::store;
@@ -281,16 +283,68 @@ pub fn handle(
     Ok(())
 }
 
-/// Every block holds one rank in this commit, so the emission keeps the order the sites used to
-/// print in: the byte-identity ruling for the routing commit (lane doc W1.1-W1.5). The layout
-/// commit ranks them per spec B1.
-const SESSION_START_RANK: Rank = Rank::Tail;
+/// Spec B1: every block's rank, and inside its rank its place. The trimmer takes the bottom of the
+/// lowest rank first, so the `Tail` order is B1 row 8's list read upward: diagnostics shrink first,
+/// pulse last, and the relay wake contract outlasts the operator profile and the notices. A kind
+/// missing from this table sorts after all of it, and `every_pushed_kind_has_a_place_in_the_layout`
+/// fails the build when one does.
+pub const LAYOUT: [(&str, Rank); 30] = [
+    ("instructions", Rank::Pinned),
+    ("graph-unhealthy", Rank::DueNow),
+    ("reminders", Rank::DueNow),
+    ("relay-inbox", Rank::DueNow),
+    ("handoffs", Rank::Primary),
+    ("forks", Rank::Secondary),
+    ("projects", Rank::Secondary),
+    ("tasks", Rank::Secondary),
+    ("milestones", Rank::Secondary),
+    ("blocked", Rank::Secondary),
+    ("pulse", Rank::Tail),
+    ("flow-resurface", Rank::Tail),
+    ("memory", Rank::Tail),
+    ("triggers", Rank::Tail),
+    ("relay-tasks", Rank::Tail),
+    ("relay-wake", Rank::Tail),
+    ("operator", Rank::Tail),
+    ("extensions", Rank::Tail),
+    ("queries", Rank::Tail),
+    ("flow-protocol", Rank::Tail),
+    ("auto-compact", Rank::Tail),
+    ("migrate", Rank::Tail),
+    ("hooks-wired", Rank::Tail),
+    ("first-run", Rank::Tail),
+    ("update-applied", Rank::Tail),
+    ("update-banner", Rank::Tail),
+    ("contract", Rank::Tail),
+    ("hooks-health", Rank::Tail),
+    ("automap", Rank::Tail),
+    ("diagnostics", Rank::Tail),
+];
+
+/// A kind's rank and its place in [`LAYOUT`].
+pub fn place(kind: &str) -> (Rank, usize) {
+    LAYOUT
+        .iter()
+        .position(|(k, _)| *k == kind)
+        .map(|i| (LAYOUT[i].1, i))
+        .unwrap_or((Rank::Tail, LAYOUT.len()))
+}
+
+/// The B1 data blocks. The instruction block is printed only when one of them has an item: its
+/// lines are about these blocks, and a session with none of them has nothing to follow.
+const DATA_BLOCKS: [&str; 6] = ["reminders", "handoffs", "forks", "projects", "tasks", "milestones"];
 
 /// Blocks whose producer marks them shown while producing them: a welcome stamped, an update
 /// marked noticed, relay messages marked delivered, a task marked announced, a wake nudge
 /// stamped. Collapsed, their text would never be seen, so their floor names the full-output
 /// file, which is written before anything prints.
-pub const SHOWN_ONCE: [&str; 4] = ["first-run", "update-applied", "relay-inbox", "relay-tick"];
+pub const SHOWN_ONCE: [&str; 5] = [
+    "first-run",
+    "update-applied",
+    "relay-inbox",
+    "relay-tasks",
+    "relay-wake",
+];
 
 /// The command that prints all of a block, where one exists. A block without one collapses to
 /// a line naming the full-output file instead.
@@ -303,6 +357,7 @@ pub fn command_for(kind: &str) -> Option<&'static str> {
         "forks" => Some("base fork list"),
         "projects" => Some("base project list --all"),
         "tasks" => Some("base task list"),
+        "milestones" => Some("base milestone list"),
         "extensions" => Some("base extension list"),
         _ => None,
     }
@@ -327,11 +382,9 @@ pub fn floor_line(kind: &str, items: usize, full: &FullOutput) -> String {
 
 /// Where the untrimmed session start goes (spec A6): the workspace `.base` when one resolves,
 /// else the global tier's `.base` when it exists. Never created here, so a session opened
-/// outside every tier gets no file and its floors say so.
+/// outside every tier gets no file and its floors say so. The letters file sits beside it.
 fn full_output_path(cwd: &Path) -> Option<PathBuf> {
-    crate::config::find_workspace_base(cwd)
-        .or_else(|| crate::config::global_base_dir().filter(|dir| dir.is_dir()))
-        .map(|dir| dir.join("last-session-start.md"))
+    crate::crud::handoff_show::session_start_dir(cwd).map(|dir| dir.join("last-session-start.md"))
 }
 
 fn kind_of(id: &str) -> &str {
@@ -369,27 +422,9 @@ impl SessionOutput {
         &self.fragments
     }
 
-    /// The signal blocks, joined exactly as the combined signal string was: each signal's output
-    /// followed by one newline, and the end of the whole trimmed. Signals skipped as unchanged
-    /// print nothing, as before, and now leave a ledger row per block.
+    /// Keep the signals for [`SessionOutput::finish`], which places their blocks by spec B1.
+    /// Signals skipped as unchanged print nothing, as before, and leave a ledger row per block.
     pub fn push_signals(&mut self, signals: SignalOutput) {
-        let mut sites: Vec<(&'static str, String, usize)> = Vec::new();
-        for signal in signals.signals() {
-            for block in &signal.blocks {
-                sites.push((block.kind, block.text.clone(), block.items));
-            }
-            sites.push(("", "\n".to_string(), 0));
-        }
-        while sites.last().is_some_and(|site| site.1.trim_end().is_empty()) {
-            sites.pop();
-        }
-        if let Some(last) = sites.last_mut() {
-            let end = last.1.trim_end().len();
-            last.1.truncate(end);
-        }
-        for (kind, text, items) in &sites {
-            self.fragments.push(kind, text, *items);
-        }
         for signal in signals.unchanged() {
             for block in &signal.blocks {
                 self.fragments.note_withheld(
@@ -403,18 +438,72 @@ impl SessionOutput {
         self.signals = Some(signals);
     }
 
-    /// Write the untrimmed output, trim to `[budget] session_start_chars`, and record which
-    /// signals were shown in full. Prints nothing: the caller prints the returned text.
+    /// Place every block by spec B1, write the untrimmed output and the letters, trim to
+    /// `[budget] session_start_chars` under the B2 header, and record which signals were shown in
+    /// full. Prints nothing: the caller prints the returned text.
     pub fn finish(self, config: &BaseConfig, cwd: &Path) -> Rendered {
         let budget = &config.budget;
         let (parts, withheld) = self.fragments.into_parts();
 
+        let mut placed: Vec<Placed> = parts
+            .into_iter()
+            .map(|part| Placed {
+                id: part.id,
+                kind: part.kind,
+                text: part.text,
+                total: part.items,
+                shown: part.items,
+            })
+            .collect();
+        let letters = self
+            .signals
+            .as_ref()
+            .map(|s| s.letters.clone())
+            .unwrap_or_default();
+        if let Some(signals) = &self.signals {
+            for signal in signals.signals() {
+                for block in &signal.blocks {
+                    placed.push(Placed {
+                        id: block.kind.to_string(),
+                        kind: block.kind.to_string(),
+                        text: block.text.clone(),
+                        total: block.total,
+                        shown: block.items,
+                    });
+                }
+            }
+        }
+        if placed
+            .iter()
+            .any(|p| p.total > 0 && DATA_BLOCKS.contains(&p.kind.as_str()))
+        {
+            placed.push(Placed {
+                id: "instructions".to_string(),
+                kind: "instructions".to_string(),
+                text: instruction_block(&letters),
+                total: 0,
+                shown: 0,
+            });
+        }
+        // Stable: blocks of one place keep the order they arrived in.
+        placed.sort_by_key(|p| place(&p.kind));
+        for (i, p) in placed.iter_mut().enumerate() {
+            // The sites' own leading and trailing newlines belonged to the old print order. In
+            // B1's order every block is one paragraph, a blank line before each but the first.
+            let body = p.text.trim_matches('\n');
+            p.text = if i == 0 {
+                body.to_string()
+            } else {
+                format!("\n{body}")
+            };
+        }
+
         let mut untrimmed = Emission::new(budget.session_start_chars, budget.first_screen_chars);
-        for part in &parts {
-            let block = Block::new(part.id.clone(), SESSION_START_RANK, part.text.clone(), "", "")
-                .items(part.items, part.items);
+        for p in &placed {
+            let block = Block::new(p.id.clone(), place(&p.kind).0, p.text.clone(), "", "")
+                .items(p.total, p.shown);
             let pushed = untrimmed.push(block);
-            debug_assert!(pushed, "part ids are unique by construction");
+            debug_assert!(pushed, "block ids are unique by construction");
         }
         let full = if !budget.write_full_output {
             FullOutput::off()
@@ -427,23 +516,43 @@ impl SessionOutput {
         } else {
             FullOutput::not_written("no workspace .base and no global .base directory to hold it")
         };
+        if self.signals.is_some()
+            && let Some(dir) = crate::crud::handoff_show::session_start_dir(cwd)
+        {
+            let kept = crate::crud::handoff_show::write_letters(&dir, &letters);
+            if let Some(why) = kept.failure() {
+                eprintln!("base: session start could not keep its handoff letters: {why}");
+            }
+        }
 
         let mut emission = Emission::new(budget.session_start_chars, budget.first_screen_chars);
-        for part in parts {
-            let floor = floor_line(&part.kind, part.items, &full);
-            let command = command_for(&part.kind)
+        for p in placed {
+            let floor = floor_line(&p.kind, p.total, &full);
+            let command = command_for(&p.kind)
                 .or(full.written_path())
                 .unwrap_or("")
                 .to_string();
-            let block = Block::new(part.id, SESSION_START_RANK, part.text, floor, command)
-                .items(part.items, part.items);
+            let block = Block::new(p.id, place(&p.kind).0, p.text, floor, command)
+                .items(p.total, p.shown);
             let pushed = emission.push(block);
-            debug_assert!(pushed, "part ids are unique by construction");
+            debug_assert!(pushed, "block ids are unique by construction");
         }
         for row in withheld {
             emission.note_withheld(row.block, row.items, row.reason, row.command);
         }
-        let rendered = emission.render(&full, None);
+        let rendered = emission.render(&full, Some(&header_line));
+        if !rendered.first_screen_ok {
+            eprintln!(
+                "base: session start's header, instructions and DUE NOW take more than the first {} units",
+                rendered.first_screen_u16
+            );
+        }
+        if rendered.over_budget {
+            eprintln!(
+                "base: session start printed {} units against [budget] session_start_chars = {}, with every block that can shrink already at its floor",
+                rendered.emitted_u16, rendered.budget_u16
+            );
+        }
 
         if let Some(signals) = self.signals {
             let in_full: HashSet<&str> = rendered
@@ -456,6 +565,60 @@ impl SessionOutput {
         }
         rendered
     }
+}
+
+/// One block on its way into the emission: where it goes, what it says, what it counts.
+struct Placed {
+    id: String,
+    kind: String,
+    text: String,
+    total: usize,
+    shown: usize,
+}
+
+/// Spec B3, with B7's BEHAVIOR lines merged in: what Claude does first, written before any data
+/// so no trim can remove it. It names only commands that exist; the deferred line arrives with
+/// lane 3's `base handoff deferred` (lane doc B16, flag 3).
+pub fn instruction_block(letters: &[(char, String)]) -> String {
+    let mut s = String::from(
+        "DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:\n\
+         1. Show DUE NOW, then HANDOFFS, exactly as lettered. Nothing prepended. No \"is this stale?\" questions.\n\
+         2. The user names a handoff by letter, project or a few words: run `base handoff show <what they said>` and read the doc it prints. Several matches: list them and ask.\n\
+         3. \"snooze <letter> <N>d\" → `base handoff snooze <slug> <N>` · \"archive <letter>\" → `base handoff archive <slug>` · a handled reminder → `base reminder remove <slug>`.\n\
+         4. FORKS are open side-work, not a lettered choice; several stay open. `base fork snooze <title> <N>` · `base fork archive <title>`.\n\
+         5. Every block below is a summary. Its full list is the command on its line, and the whole untrimmed output is the file on line 1. Never guess; run it.",
+    );
+    if !letters.is_empty() {
+        let map: Vec<String> = letters
+            .iter()
+            .map(|(letter, slug)| format!("{letter}={slug}"))
+            .collect();
+        s.push_str("\nLetters: ");
+        s.push_str(&map.join(" "));
+    }
+    s
+}
+
+/// Spec B2, line 1: every count, the withheld total, and where the untrimmed output is. Rendered
+/// from the blocks at their final level on every trim pass, so it is measured as it is printed.
+pub fn header_line(facts: &Facts<'_>) -> String {
+    let total = |id: &str| facts.block(id).map(Block::items_total).unwrap_or(0);
+    let handoffs_shown = facts.block("handoffs").map(Block::items_shown).unwrap_or(0);
+    let full = match (facts.full.written_path(), facts.full.failure()) {
+        (Some(path), _) => path.to_string(),
+        (None, Some(why)) => format!("not written ({why})"),
+        (None, None) => "not written ([budget] write_full_output = false)".to_string(),
+    };
+    format!(
+        "[BASE START · {} due · handoffs {} open ({handoffs_shown} shown) · forks {} · projects {} · tasks {} · milestones {} · withheld {} · full: {full}]",
+        total("reminders"),
+        total("handoffs"),
+        total("forks"),
+        total("projects"),
+        total("tasks"),
+        total("milestones"),
+        facts.withheld_total(),
+    )
 }
 
 /// Inject extension status lines and run extension session-start SPARQL queries.
@@ -846,5 +1009,65 @@ mod tests {
         // Must include the workspace graph we just created
         assert!(files.iter().any(|f| f.ends_with(".base/graph.nq")
             && !f.to_string_lossy().contains(".base-gbl")));
+    }
+
+    /// The string literals on one source line, in order. Push sites quote no quote.
+    fn literals(line: &str) -> Vec<&str> {
+        line.split('"').skip(1).step_by(2).collect()
+    }
+
+    /// Every kind a print site or a signal pushes has a place in spec B1's table. The kinds are read
+    /// off the sources, not listed from what this commit knows: a kind missing from `LAYOUT` sorts
+    /// after everything and is trimmed first without anyone having decided that. Proven by mutation
+    /// (a new table cannot run red before it exists): drop one row and this fails naming the site.
+    #[test]
+    fn every_pushed_kind_has_a_place_in_the_layout() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut sites: Vec<(String, String)> = Vec::new();
+        for file in [
+            "src/hook/session_start.rs",
+            "src/hook/mod.rs",
+            "src/signal/mod.rs",
+            "src/signal/active_awareness.rs",
+        ] {
+            let src = std::fs::read_to_string(root.join(file)).expect(file);
+            let lines: Vec<&str> = src.lines().take_while(|l| !l.starts_with("#[cfg(test)]")).collect();
+            for (n, line) in lines.iter().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                let kind = if let Some(at) = code.find("out.push(") {
+                    let after = &code[at + "out.push(".len()..];
+                    if after.is_empty() {
+                        lines.get(n + 1).and_then(|next| literals(next).first().copied())
+                    } else if after.starts_with('"') {
+                        literals(after).first().copied()
+                    } else {
+                        None
+                    }
+                } else if let Some(at) = code.find("Signal::single(") {
+                    literals(&code[at..]).get(1).copied()
+                } else if code.starts_with("kind: \"") || code.starts_with("(\"") {
+                    literals(code).first().copied()
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    sites.push((format!("{file}:{}", n + 1), kind.to_string()));
+                }
+            }
+        }
+        assert!(
+            sites.len() >= 30,
+            "read {} kind sites, too few to have read the push sites: {sites:?}",
+            sites.len()
+        );
+        for (site, kind) in &sites {
+            assert!(
+                LAYOUT.iter().any(|(k, _)| k == kind),
+                "{site}: kind {kind:?} has no place in LAYOUT"
+            );
+        }
     }
 }
