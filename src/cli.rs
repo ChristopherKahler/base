@@ -1100,7 +1100,7 @@ pub enum ReminderAction {
 
 #[derive(Subcommand)]
 pub enum HandoffAction {
-    /// Register a handoff doc (archives any prior open handoff for the project in this tier)
+    /// Register a handoff doc (archives the project's prior open or deferred handoff in every tier)
     Create {
         #[arg(long)]
         project: String,
@@ -2050,13 +2050,16 @@ pub fn run() {
 
         // ─── Handoff ─────────────────────────────────────
         Some(Commands::Handoff { global, action }) => {
-            let cwd = tier_cwd(&cwd, global);
+            // Where the operator stands, before `-g` routes the write: `create` finds every tier from here (rank 08).
+            let standing_cwd = &cwd;
+            let cwd = tier_cwd(standing_cwd, global);
             match action {
                 HandoffAction::Create { project, doc, slug } => {
                     let gbl = base::home::home_root();
                     match crud::handoff::create(
                         gbl.as_deref(),
                         &cwd,
+                        standing_cwd,
                         &config.namespace,
                         &project,
                         &doc,
@@ -2068,25 +2071,13 @@ pub fn run() {
                                 "Handoff for '{project}' registered (slug: {})",
                                 out.slug
                             );
-                            // 0.14.1 archived the prior handoff silently, so four
-                            // builders inside twelve seconds each closed the one
-                            // before it with nothing on screen (#71).
-                            match out.archived_prior {
-                                Some(prior) => println!(
-                                    "archived prior open handoff: {prior} ({})",
-                                    out.tier
-                                ),
-                                None => println!("no prior open handoff in this tier"),
+                            // Every archive, in every tier, on its own line with its tier (`auk`'s Q2 ruling).
+                            // 0.14.1 archived silently (#71); 0.15.2 archived one tier and only named the other.
+                            if out.archived.is_empty() {
+                                println!("no prior open or deferred handoff for '{project}' in any tier");
                             }
-                            // Named, never touched: a write acts on the tier you
-                            // stand in (#61), so the other tier's handoff is the
-                            // operator's call, with the command to make it.
-                            if let Some((other, tier)) = out.other_tier_open {
-                                let flag = if tier == "global tier" { " -g" } else { "" };
-                                println!(
-                                    "{tier} also holds an open handoff for '{project}': {other} \
-                                     — archive it with: base handoff{flag} archive {other}"
-                                );
+                            for (prior, tier) in &out.archived {
+                                println!("archived prior handoff: {prior} ({tier})");
                             }
                         }
                         Err(e) => die("Failed", e),

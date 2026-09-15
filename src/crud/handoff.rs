@@ -156,63 +156,70 @@ fn resolve_doc_slug(slug: Option<&str>, doc_path: &str) -> Result<String> {
     }
 }
 
-/// Register a handoff pointing at a resume document. Archives any prior OPEN
-/// continuity handoff for the same project (one open handoff per project), then
-/// inserts the new one with `resurfaceAt = now` so it surfaces next session start.
-/// Slug defaults to the doc basename (doc==slug protocol); pass `slug` to override.
-/// Re-registering the same slug re-points it idempotently (no duplicate triples).
 /// What a `handoff create` actually did, so the CLI can say it.
 ///
 /// 0.14.1 archived the prior handoff silently and only in the tier it wrote to,
 /// while the help promised a project-wide archive. Four builders registering
 /// inside twelve seconds each archived the one before it with no output, and an
 /// open handoff in the other tier sat there untouched and unmentioned (#71).
+/// 0.15.2 named an open handoff in the other tier and left it open, and under
+/// `-g` could not see the workspace at all (lane 2, rank 08).
 #[derive(Debug)]
 pub struct CreateOutcome {
     pub slug: String,
     /// The tier this create wrote to: "workspace tier" or "global tier".
     pub tier: String,
-    /// The handoff this create archived in its own tier, if any.
-    pub archived_prior: Option<String>,
-    /// An open handoff for the same project in the OTHER tier. Never touched —
-    /// a write acts on the tier you stand in (the 0.14.1 tier ruling, #61) — but
-    /// named, with the command that would archive it.
-    pub other_tier_open: Option<(String, String)>,
+    /// Every prior handoff this create archived, as (slug, tier), across every
+    /// tier (`auk`'s Q2 ruling). Empty when the project had no prior open or
+    /// deferred continuity handoff anywhere.
+    pub archived: Vec<(String, String)>,
 }
 
-/// The open, non-fork handoff for `project` in one graph file, if there is one.
+/// The prior continuity handoffs for `project` in one graph file: status `open`
+/// or `deferred` (E4), never a fork.
 ///
 /// Forks share the Handoff type and the project but are additive side-work, so
-/// they are excluded here exactly as they are in `create`'s archive step.
-fn open_handoff_in(file: &Path, ns: &NamespaceConfig, project: &str) -> Option<String> {
-    let store = crate::store::load_or_empty(file).ok()?;
+/// they are excluded here exactly as they are in `create`'s archive step. A file
+/// that cannot be read is an error, never an empty answer: `create` prints "in any
+/// tier", and decides what an unreadable tier costs.
+fn prior_handoffs_in(file: &Path, ns: &NamespaceConfig, project: &str) -> Result<Vec<String>> {
+    let store = crate::store::load_or_empty(file)?;
     let p = &ns.prefix;
     let esc = crud::escape_sparql_literal(project);
     let q = format!(
-        "{}\nSELECT ?h WHERE {{ GRAPH ?g {{ ?h a {p}:Handoff ; {p}:project \"{esc}\" ; {p}:status \"open\" .\n\
+        "{}\nSELECT ?h WHERE {{ GRAPH ?g {{ ?h a {p}:Handoff ; {p}:project \"{esc}\" ; {p}:status ?s .\n\
+           FILTER(?s IN (\"open\", \"deferred\"))\n\
            OPTIONAL {{ ?h {p}:kind ?kind }}\n\
-           FILTER(!BOUND(?kind) || ?kind != \"fork\") }} }} LIMIT 1",
+           FILTER(!BOUND(?kind) || ?kind != \"fork\") }} }}",
         crud::prefixes(ns)
     );
-    let QueryResults::Solutions(mut sols) = store.query(&q).ok()? else {
-        return None;
+    let QueryResults::Solutions(solutions) = crate::store::query(&store, &q)? else {
+        return Ok(Vec::new());
     };
-    let sol = sols.next()?.ok()?;
-    let term = sol.get("h")?;
-    let iri = crud::term_display(term.as_ref());
-    Some(iri.rsplit('/').next().unwrap_or(&iri).to_string())
+    let mut out: Vec<String> = solutions
+        .filter_map(|sol| sol.ok())
+        .filter_map(|sol| sol.get("h").map(|term| crud::term_display(term.as_ref())))
+        .map(|iri| iri.rsplit('/').next().unwrap_or(&iri).to_string())
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
-/// The tier file that is NOT `target`, when one exists.
-fn other_tier_file(gbl_root: Option<&Path>, cwd: &Path, target: &Path) -> Option<PathBuf> {
-    let key = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let t = key(target);
-    all_tier_files(gbl_root, cwd).into_iter().find(|f| key(f) != t)
-}
-
+/// Register a handoff pointing at a resume document. Archives the project's prior
+/// open or deferred continuity handoff in every tier (one open handoff per
+/// project, E4), then inserts the new one with `resurfaceAt = now` so it surfaces
+/// next session start. Slug defaults to the doc basename (doc==slug protocol);
+/// pass `slug` to override. Re-registering the same slug re-points it
+/// idempotently (no duplicate triples).
+///
+/// `cwd` picks the tier to write. `standing_cwd` is where the operator stands,
+/// and every tier is found from there: under `-g` the CLI routes `cwd` to the
+/// global tier, and discovery from it could never see the workspace (rank 08, R3).
 pub fn create(
     gbl_root: Option<&Path>,
     cwd: &Path,
+    standing_cwd: &Path,
     ns: &NamespaceConfig,
     project: &str,
     doc_path: &str,
@@ -225,19 +232,32 @@ pub fn create(
     let p = &ns.prefix;
     // The project this handoff names, as the IRI its domain hangs off (kite F7b).
     let project_iri = crud::build_iri(ns, "project", &crud::slugify(project));
+    // `prior_handoffs_in` escapes the name itself. Handed the escaped copy, it
+    // searched for a different literal whenever the name held a quote or a backslash.
+    let project_name = project;
     let project = crud::escape_sparql_literal(project);
     let doc = crud::escape_sparql_literal(doc_path);
 
-    // 1. Archive any existing open *continuity* handoff for this project in the
-    //    target tier. Forks (kind = "fork") share the Handoff type + project but
-    //    are additive side-work — never archive them here.
-    let archive_prior_sparql = format!(
-        "DELETE {{ GRAPH <{graph}> {{ ?h {p}:status \"open\" }} }}\n\
-         INSERT {{ GRAPH <{graph}> {{ ?h {p}:status \"archived\" }} }}\n\
-         WHERE  {{ GRAPH <{graph}> {{ ?h a {p}:Handoff ; {p}:project \"{project}\" ; {p}:status \"open\" .\n\
-           OPTIONAL {{ ?h {p}:kind ?kind }}\n\
-           FILTER(!BOUND(?kind) || ?kind != \"fork\") }} }}"
-    );
+    // 1. Archive the project's prior open or deferred *continuity* handoff (E4), in
+    //    every tier that holds one. `GRAPH ?g`: a tier file can hold another
+    //    workspace's named graph, and the read that names what was archived
+    //    matches any graph too, so the list and the write agree. Forks
+    //    (kind = "fork") share the Handoff type + project but are additive
+    //    side-work — never archived, in any tier. In the tier being written the new
+    //    slug is left out, because step 2 re-points it there; in another tier it
+    //    is an older copy and is archived (`auk`'s ruling D1).
+    let archive_prior = |exclude: &str| {
+        format!(
+            "DELETE {{ GRAPH ?g {{ ?h {p}:status ?s }} }}\n\
+             INSERT {{ GRAPH ?g {{ ?h {p}:status \"archived\" }} }}\n\
+             WHERE  {{ GRAPH ?g {{ ?h a {p}:Handoff ; {p}:project \"{project}\" ; {p}:status ?s .\n\
+               FILTER(?s IN (\"open\", \"deferred\"))\n\
+               OPTIONAL {{ ?h {p}:kind ?kind }}\n\
+               FILTER(!BOUND(?kind) || ?kind != \"fork\"){exclude} }} }}"
+        )
+    };
+    let archive_prior_here = archive_prior(&format!("\n           FILTER(?h != <{iri}>)"));
+    let archive_prior_elsewhere = archive_prior("");
 
     // 2. Clean any existing node at this exact slug so re-registration re-points
     //    it instead of layering duplicate status/timestamp triples.
@@ -263,27 +283,74 @@ pub fn create(
     // 4. The handoff takes the domain of the project it names, in the same write.
     let inherit = crate::domain::link::inherit_update(ns, &graph, &iri, &project_iri);
 
-    // Ask before writing: the archive step is a bulk UPDATE that leaves no trace
-    // of WHICH handoff it closed, so the name has to be read while it is still
-    // open. A re-register of the same slug is not a prior handoff.
-    let archived_prior = open_handoff_in(&path, ns, &project).filter(|s| s != &slug);
+    // Ask before writing, in every tier: the archive step is a bulk UPDATE that
+    // leaves no trace of WHICH handoff it closed, so the names are read while they
+    // are still open or deferred. A re-register of the same slug is not a prior
+    // handoff in the tier it re-points. A tier being written that cannot be read
+    // is a plain error, and nothing is written.
+    let tier = tier_label(&path, gbl_root);
+    let mut archived: Vec<(String, String)> = prior_handoffs_in(&path, ns, project_name)?
+        .into_iter()
+        .filter(|prior| *prior != slug)
+        .map(|prior| (prior, tier.to_string()))
+        .collect();
+    // What an error after the write says first: the handoff is registered, and
+    // what it archived in its own tier, so no archive goes unmentioned (#71).
+    let registered = if archived.is_empty() {
+        format!("registered '{slug}' in the {tier}")
+    } else {
+        let names: Vec<String> = archived.iter().map(|(prior, t)| format!("{prior} ({t})")).collect();
+        format!("registered '{slug}' in the {tier} and archived {}", names.join(", "))
+    };
+    // Every other tier, found from where the operator stands. Only a tier that
+    // holds a prior handoff is written: the global graph is shared by every live
+    // session. A tier that cannot be read must not stop the handoff being
+    // registered (`auk`'s ruling D5): it is skipped, and named after the write.
+    let key = |f: &Path| f.canonicalize().unwrap_or_else(|_| f.to_path_buf());
+    let written = key(&path);
+    let mut elsewhere: Vec<PathBuf> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
+    for file in all_tier_files(gbl_root, standing_cwd) {
+        if key(&file) == written {
+            continue;
+        }
+        let label = tier_label(&file, gbl_root);
+        match prior_handoffs_in(&file, ns, project_name) {
+            Ok(priors) if priors.is_empty() => {}
+            Ok(priors) => {
+                archived.extend(priors.into_iter().map(|prior| (prior, label.to_string())));
+                elsewhere.push(file);
+            }
+            Err(e) => unreadable.push(format!(
+                "could not read the {label} at {} to look for a prior handoff there: {e:#}",
+                file.display()
+            )),
+        }
+    }
 
-    // The other tier is READ only. `create` acts on the tier it writes to (#61);
-    // naming what it did not touch is the honest half of that ruling.
-    let other_tier_open = other_tier_file(gbl_root, cwd, &path).and_then(|other| {
-        open_handoff_in(&other, ns, &project).map(|s| (s, tier_label(&other, gbl_root).to_string()))
-    });
-
+    // The tier being written goes first, in one write with the new node, so a
+    // failure in another tier leaves one extra open handoff and says so, never an
+    // archived handoff with nothing registered in its place.
     mutate_file(
         &path,
         ns,
-        &format!("{archive_prior_sparql};\n{clean_target};\n{insert};\n{inherit}"),
+        &format!("{archive_prior_here};\n{clean_target};\n{insert};\n{inherit}"),
     )?;
+    for file in &elsewhere {
+        mutate_file(file, ns, &archive_prior_elsewhere).with_context(|| {
+            format!(
+                "{registered}, but archiving the prior handoff in the {} failed",
+                tier_label(file, gbl_root)
+            )
+        })?;
+    }
+    if !unreadable.is_empty() {
+        anyhow::bail!("{registered}, but {}", unreadable.join("; and "));
+    }
     Ok(CreateOutcome {
         slug,
-        tier: tier_label(&path, gbl_root).to_string(),
-        archived_prior,
-        other_tier_open,
+        tier: tier.to_string(),
+        archived,
     })
 }
 
