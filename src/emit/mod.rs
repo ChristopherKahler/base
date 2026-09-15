@@ -24,8 +24,10 @@ pub fn u16_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
 
-/// Trim order, and output order. `Pinned` is never degraded. `DueNow` is never degraded to
-/// meet the budget, only to keep the first screen (A5). The rest degrade from `Tail` upward.
+/// Trim order, and output order. `Pinned` and `DueNow` are never degraded. DUE NOW shows in full
+/// and first even when that pushes the first screen over: the overflow is reported in
+/// [`Rendered::first_screen_ok`], never resolved by collapsing what is due. The rest degrade from
+/// `Tail` upward.
 ///
 /// It is a total order on purpose: a trimmer that picks the biggest block produces a different
 /// layout run to run, so nobody can learn where to look and no test can assert a position.
@@ -311,7 +313,9 @@ pub struct Rendered {
     /// Every block is at its floor and the output is still over budget. Reported, never
     /// resolved by truncating: silent truncation is the defect this module replaces.
     pub over_budget: bool,
-    /// The header, the `Pinned` blocks and the `DueNow` blocks fit the first screen.
+    /// The header, the `Pinned` blocks and the `DueNow` blocks fit the first screen. Reported,
+    /// never resolved: those blocks are the whole first screen and none of them may degrade, so
+    /// trimming anything else cannot make them fit.
     pub first_screen_ok: bool,
     pub withheld: Vec<Withheld>,
     pub blocks: Vec<Block>,
@@ -414,11 +418,11 @@ impl Emission {
             let prefix = u16_len(&self.compose(&head, Some(Rank::DueNow)));
             let text = self.compose(&head, None);
             let total = u16_len(&text);
-            if prefix > self.first_screen_u16 && self.degrade_bottom(|r| r == Rank::DueNow) {
-                continue;
-            }
-            // `Pinned` is not excluded here: `next_level` already refuses it, and a second
-            // guard would leave a mutation of the first one unable to fail any test.
+            // There is no first-screen pass. The header, `Pinned` and `DueNow` are the whole first
+            // screen and none of them may degrade, so a first screen they overflow is reported in
+            // `first_screen_ok`, never trimmed. `Pinned` is not excluded here: `next_level` already
+            // refuses it, and a second guard would leave a mutation of the first one unable to fail
+            // any test.
             if total > self.budget_u16 && self.degrade_bottom(|r| r != Rank::DueNow) {
                 continue;
             }
@@ -637,11 +641,6 @@ mod tests {
             .expect("block present")
     }
 
-    fn first_units(s: &str, n: usize) -> String {
-        let units: Vec<u16> = s.encode_utf16().take(n).collect();
-        String::from_utf16_lossy(&units)
-    }
-
     fn count_header(f: &Facts<'_>) -> String {
         let full = f.full.written_path().unwrap_or("none");
         format!("[TEST · withheld {} · full: {full}]", f.withheld_total())
@@ -712,24 +711,48 @@ mod tests {
         assert_eq!(
             level_of(&r, "due"),
             Level::Full,
-            "the first screen holds, so DUE NOW stays"
+            "DUE NOW is never trimmed to meet the budget"
         );
         assert!(r.over_budget, "reported, not fixed by cutting what is due");
         assert!(r.first_screen_ok);
     }
 
     #[test]
-    fn due_now_collapses_only_to_keep_the_first_screen() {
-        let mut e = Emission::new(10_000, 100);
+    fn due_now_never_collapses_and_a_first_screen_it_overflows_is_reported() {
+        // DUE NOW shows in full, never collapsed, always first (auk's cross-lane ruling, lane doc
+        // B24). 41 units of instructions and 201 of DUE NOW overflow a 100-unit first screen, and
+        // nothing inside that prefix may shrink, so the overflow is reported. The budget pass still
+        // takes what comes after: 343 units against 300 collapse `tasks`, and only `tasks`.
+        let mut e = Emission::new(300, 100);
         assert!(e.push(blk("instructions", Rank::Pinned, &"I".repeat(40), 0)));
         assert!(e.push(blk("due", Rank::DueNow, &"D".repeat(200), 2)));
+        assert!(e.push(blk("tasks", Rank::Tail, &"T".repeat(100), 5)));
         let r = e.render(&FullOutput::off(), None);
+        assert_eq!(level_of(&r, "due"), Level::Full, "DUE NOW never collapses");
+        assert!(
+            !r.first_screen_ok,
+            "the overflow is reported, not trimmed away"
+        );
+        assert_eq!(level_of(&r, "tasks"), Level::Collapsed);
+        let rows: Vec<(&str, Reason, usize)> = r
+            .withheld
+            .iter()
+            .map(|w| (w.block.as_str(), w.reason, w.items))
+            .collect();
+        assert_eq!(
+            rows,
+            [("tasks", Reason::Collapsed, 5)],
+            "the ledger counts only what fell after DUE NOW"
+        );
         assert!(!r.over_budget);
-        assert_eq!(level_of(&r, "due"), Level::Collapsed);
-        assert!(r.first_screen_ok);
-        let screen = first_units(&r.text, 100);
-        assert!(screen.contains(&"I".repeat(40)));
-        assert!(screen.contains("due 2 · all: base due list"));
+        assert_eq!(
+            r.text,
+            format!(
+                "{}\n{}\ntasks 5 · all: base tasks list\n",
+                "I".repeat(40),
+                "D".repeat(200)
+            )
+        );
     }
 
     #[test]

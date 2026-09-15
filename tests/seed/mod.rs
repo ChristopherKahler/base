@@ -8,9 +8,12 @@
 //! reminders, and the legacy `[signal] max_chars = 2000`. Every value is fixed, so the same seed
 //! is written on every run and every machine; the live graphs change while a round runs.
 //!
-//! One exception, on purpose: the first [`Sizes::recent_projects`] projects are touched an hour or
+//! Two exceptions, on purpose. The first [`Sizes::recent_projects`] projects are touched an hour or
 //! a few hours before the seed is written, because "touched in the last 7 days" (spec B6) is
-//! measured from the moment session start runs, and no fixed date stays inside that window.
+//! measured from the moment session start runs, and no fixed date stays inside that window. And
+//! every due reminder falls due one day before the seed is written: lane 3's reminder clock warns
+//! on a DUE NOW line from day 8 past due and archives at day 10, so a fixed date would stop
+//! rendering as a plain due reminder as the calendar moves.
 //!
 //! Commit C adds what the B layout reads (lane doc B16): every task and milestone is linked to its
 //! project, and two open handoffs share a project from different tiers, the S/W case of spec E1,
@@ -272,11 +275,16 @@ pub fn write(root: &Path, sizes: &Sizes, global_toml: &str) -> Seed {
             &s,
         );
     }
+    // One day past due, a second apart, oldest first: whole days past due stay at 0 for any size
+    // under 86,400, inside lane 3's window for a plain DUE NOW line.
+    let due_from = chrono::Local::now() - chrono::Duration::days(1);
     for i in 0..sizes.due_reminders {
         let s = format!("reminder/seed-reminder-{i}");
         local.typ(&s, "Reminder");
         local.lit(&s, "name", &format!("Seed reminder {i} is due"));
-        local.date(&s, "resurfaceAt", &at(i * 7));
+        let due = (due_from + chrono::Duration::seconds(i as i64))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        local.date(&s, "resurfaceAt", &due);
     }
 
     for i in 0..sizes.notes {
