@@ -279,25 +279,13 @@ pub fn write(root: &Path, sizes: &Sizes, global_toml: &str) -> Seed {
         local.date(&s, "resurfaceAt", &at(i * 7));
     }
 
-    // Notes: the longest first, the rest sharing what remains as evenly as whole characters allow.
-    let rest = sizes.notes.saturating_sub(1);
-    let remaining = sizes.note_chars.saturating_sub(sizes.longest_note);
     for i in 0..sizes.notes {
-        let chars = if i == 0 {
-            sizes.longest_note
-        } else {
-            remaining / rest + usize::from(i <= remaining % rest)
-        };
         let s = format!("note/seed-note-{i:03}");
         local.typ(&s, "Note");
-        local.lit(&s, "noteText", &text_of(chars, i));
-        local.lit(
-            &s,
-            "noteType",
-            if i % 4 == 0 { "correction" } else { "insight" },
-        );
+        local.lit(&s, "noteText", &note_text(sizes, i));
+        local.lit(&s, "noteType", note_type(i));
         local.lit(&s, "status", "active");
-        local.date(&s, "createdAt", &at(i * 11));
+        local.date(&s, "createdAt", &note_created(i));
     }
 
     std::fs::write(gbl.join(".base").join("graph.nq"), global.out).expect("global graph");
@@ -324,18 +312,37 @@ pub fn write(root: &Path, sizes: &Sizes, global_toml: &str) -> Seed {
 /// Characters in every seeded note's text, as written. The generator's own control: the
 /// distribution must land exactly on the measured total.
 pub fn note_chars_written(sizes: &Sizes) -> usize {
+    (0..sizes.notes)
+        .map(|i| note_text(sizes, i).chars().count())
+        .sum()
+}
+
+/// The text of note `i`, as written: the longest first, the rest sharing what remains as evenly
+/// as whole characters allow.
+pub fn note_text(sizes: &Sizes, i: usize) -> String {
     let rest = sizes.notes.saturating_sub(1);
     let remaining = sizes.note_chars.saturating_sub(sizes.longest_note);
-    (0..sizes.notes)
-        .map(|i| {
-            let chars = if i == 0 {
-                sizes.longest_note
-            } else {
-                remaining / rest + usize::from(i <= remaining % rest)
-            };
-            text_of(chars, i).chars().count()
-        })
-        .sum()
+    let chars = if i == 0 {
+        sizes.longest_note
+    } else {
+        remaining / rest + usize::from(i <= remaining % rest)
+    };
+    text_of(chars, i)
+}
+
+/// The type of note `i`, as written: every fourth a correction.
+pub fn note_type(i: usize) -> &'static str {
+    if i.is_multiple_of(4) {
+        "correction"
+    } else {
+        "insight"
+    }
+}
+
+/// The creation time of note `i`, as written. Values repeat (minute 0 and minute 720 print the
+/// same time), so any order over notes needs a tie-break.
+pub fn note_created(i: usize) -> String {
+    at(i * 11)
 }
 
 const BIN: &str = env!("CARGO_BIN_EXE_base");

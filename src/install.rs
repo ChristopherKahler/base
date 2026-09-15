@@ -550,6 +550,7 @@ enabled = true            # master switch for all session-start injection
 # [signal] max_chars is read by nothing.
 [budget]
 session_start_chars = 9000   # everything session start prints
+memory_chars = 4000          # the memory block inside it, in whole notes
 write_full_output = true     # the untrimmed session start also goes to .base/last-session-start.md
 
 # ─── [sync] — graph extraction globs ─────────────────────────

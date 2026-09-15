@@ -337,7 +337,12 @@ const DATA_BLOCKS: [&str; 6] = ["reminders", "handoffs", "forks", "projects", "t
 /// Blocks whose producer marks them shown while producing them: a welcome stamped, an update
 /// marked noticed, relay messages marked delivered, a task marked announced, a wake nudge
 /// stamped. Collapsed, their text would never be seen, so their floor names the full-output
-/// file, which is written before anything prints.
+/// file, which is written before anything prints, and never a command: no command prints a
+/// delivered message again. `a_block_marked_shown_while_produced_never_collapses_to_a_command`
+/// reads this list and fails the build if one of them is given a command. Notices produced once by
+/// their own trigger (migrate, hooks-wired, contract, automap) are not here: a failing map build
+/// or a duplicate contract repeats every session, and with no command their floor already names
+/// the file.
 pub const SHOWN_ONCE: [&str; 5] = [
     "first-run",
     "update-applied",
@@ -359,6 +364,7 @@ pub fn command_for(kind: &str) -> Option<&'static str> {
         "tasks" => Some("base task list"),
         "milestones" => Some("base milestone list"),
         "extensions" => Some("base extension list"),
+        "memory" => Some(crate::signal::memory::LIST_COMMAND),
         _ => None,
     }
 }
@@ -1161,5 +1167,55 @@ mod tests {
                 "{site}: kind {kind:?} has no place in LAYOUT"
             );
         }
+    }
+
+    /// Flag 7 (lane doc B16): the relay wake contract outlasts the operator profile and extension
+    /// status. The trimmer collapses the last block that can still shrink, and `finish` places
+    /// blocks in LAYOUT order, so this holds while `relay-wake` sits above `operator` and
+    /// `extensions` in the table. They arrive here in the reverse order, so the order checked is the
+    /// table's. No full-output file and no signals, so `finish` writes nothing. It holds at commit
+    /// C's head, so it is proven by mutation: swap the `relay-wake` and `operator` rows.
+    #[test]
+    fn the_wake_contract_outlasts_the_operator_profile_and_extension_status() {
+        let mut config = BaseConfig::default();
+        config.budget.write_full_output = false;
+        config.budget.session_start_chars = 1000;
+        let mut out = SessionOutput::new();
+        out.push("extensions", &"e".repeat(600), 1);
+        out.push("relay-wake", &"w".repeat(600), 1);
+        out.push("operator", &"o".repeat(600), 1);
+        let rendered = out.finish(&config, Path::new("/nonexistent-session-start-cwd"));
+        let level = |id: &str| rendered.blocks.iter().find(|b| b.id() == id).map(Block::level);
+        assert_eq!(level("relay-wake"), Some(Level::Full), "{}", rendered.text);
+        assert_eq!(level("operator"), Some(Level::Collapsed), "{}", rendered.text);
+        assert_eq!(level("extensions"), Some(Level::Collapsed), "{}", rendered.text);
+    }
+
+    /// Every block in [`SHOWN_ONCE`] floors to the full-output file and never to a command: its
+    /// producer marked it shown, so a command could not print it again. Control: a block that has a
+    /// command floors to it, so the assertion can tell the two apart. It holds at commit C's head,
+    /// so it is proven by mutation: give `relay-tasks`, which T16 does not name, a command.
+    #[test]
+    fn a_block_marked_shown_while_produced_never_collapses_to_a_command() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let full = emit::write_full_output(&tmp.path().join("last-session-start.md"), "untrimmed\n");
+        let path = full.written_path().expect("the full-output file was written").to_string();
+        assert_eq!(
+            floor_line("reminders", 3, &full),
+            "reminders 3 · all: base reminder list",
+            "control: a block with a command floors to it"
+        );
+        let checked: Vec<&str> = SHOWN_ONCE
+            .into_iter()
+            .inspect(|kind| {
+                assert_eq!(command_for(kind), None, "{kind} is marked shown while produced");
+                assert_eq!(
+                    floor_line(kind, 3, &full),
+                    format!("{kind} 3 · full text: {path}"),
+                    "{kind} is marked shown while produced"
+                );
+            })
+            .collect();
+        assert!(checked.len() >= 5, "checked {checked:?}");
     }
 }

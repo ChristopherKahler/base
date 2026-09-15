@@ -856,8 +856,8 @@ impl Default for SignalConfig {
 /// preview of it, so base measures and trims before it prints. Measured on Claude Code 2.1.269.
 ///
 /// Read today by session start: `session_start_chars`, `first_screen_chars` and
-/// `write_full_output`. `prompt_chars`, `pre_tool_chars` and `post_tool_chars` are read by
-/// nothing yet; the prompt and tool hooks take them in their own commits.
+/// `write_full_output`; by the memory signal: `memory_chars`. `prompt_chars`, `pre_tool_chars` and
+/// `post_tool_chars` are read by nothing yet; the prompt and tool hooks take them in their own commits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetConfig {
     #[serde(default = "default_session_start_chars")]
@@ -871,6 +871,11 @@ pub struct BudgetConfig {
     /// The header, the instructions and due-now items must fit inside this many units (spec A5).
     #[serde(default = "default_first_screen_chars")]
     pub first_screen_chars: usize,
+    /// The memory block's own budget (board ruling R6), inside session start's: whole notes,
+    /// corrections first and newest first, then one line counting the rest and naming
+    /// `base learn --list`.
+    #[serde(default = "default_memory_chars")]
+    pub memory_chars: usize,
     /// The Claude Code version the defaults were measured on. The limit is the host's and can move.
     #[serde(default = "default_measured_on")]
     pub measured_on: String,
@@ -884,6 +889,7 @@ fn default_prompt_chars() -> usize { 4000 }
 fn default_pre_tool_chars() -> usize { 2500 }
 fn default_post_tool_chars() -> usize { 1000 }
 fn default_first_screen_chars() -> usize { 2000 }
+fn default_memory_chars() -> usize { 4000 }
 fn default_measured_on() -> String { "claude-code 2.1.269".into() }
 
 impl Default for BudgetConfig {
@@ -894,6 +900,7 @@ impl Default for BudgetConfig {
             pre_tool_chars: default_pre_tool_chars(),
             post_tool_chars: default_post_tool_chars(),
             first_screen_chars: default_first_screen_chars(),
+            memory_chars: default_memory_chars(),
             measured_on: default_measured_on(),
             write_full_output: default_true(),
         }
@@ -1302,6 +1309,12 @@ mod tests {
             toml::from_str("[budget]\nsession_start_chars = 1234\n").expect("a budget section parses");
         assert_eq!(cfg.budget.session_start_chars, 1234);
         assert_eq!(cfg.budget.prompt_chars, 4000, "an unset key keeps its default");
+        // Rank 04 adds the memory block's own key; the assertions above are unchanged.
+        assert_eq!(default_value("budget", "memory_chars"), Some(toml::Value::Integer(4000)));
+        let cfg: BaseConfig =
+            toml::from_str("[budget]\nmemory_chars = 321\n").expect("a budget section parses");
+        assert_eq!(cfg.budget.memory_chars, 321);
+        assert_eq!(cfg.budget.session_start_chars, 9000, "an unset key keeps its default");
     }
 
     #[test]

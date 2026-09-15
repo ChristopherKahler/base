@@ -289,12 +289,17 @@ pub fn load_and_mutate(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result
     })
 }
 
-/// Load workspace graph and run a SPARQL SELECT query.
-pub fn load_and_query(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<QueryResults> {
+/// Load the workspace graph [`load_and_query`] reads, for a caller that runs more than one query
+/// over one load.
+pub fn load_workspace_graph(cwd: &Path) -> Result<Store> {
     let base_dir = crate::config::find_workspace_base(cwd)
         .context("no .base/ directory found. Use --global for global rules, or run `base scaffold` to create a workspace.")?;
-    let trig_path = base_dir.join("graph.nq");
-    let store = crate::store::load_graph(&trig_path)?;
+    crate::store::load_graph(&base_dir.join("graph.nq"))
+}
+
+/// Load workspace graph and run a SPARQL SELECT query.
+pub fn load_and_query(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<QueryResults> {
+    let store = load_workspace_graph(cwd)?;
     let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
     crate::store::query(&store, &full_sparql)
 }
