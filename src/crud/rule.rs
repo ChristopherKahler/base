@@ -29,6 +29,19 @@ pub fn add_with(
     rationale: Option<&str>,
     supersedes: Option<&str>,
 ) -> Result<u32> {
+    add_with_matchers(cwd, ns, domain_name, rule_text, rationale, supersedes, &[])
+}
+
+/// [`add_with`], plus the rule's own matchers (spec F11): flat literals on the CLI rule, which sync never touches.
+pub fn add_with_matchers(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    domain_name: &str,
+    rule_text: &str,
+    rationale: Option<&str>,
+    supersedes: Option<&str>,
+    matchers: &[crate::domain::rules::Matcher],
+) -> Result<u32> {
     let p = &ns.prefix;
     let domain_slug = crud::slugify(domain_name);
     let domain_iri = crud::build_iri(ns, "domain", &domain_slug);
@@ -71,6 +84,10 @@ pub fn add_with(
         Some(r) => format!("               {p}:rationale \"{}\" ;\n", crud::escape_sparql_literal(r)),
         None => String::new(),
     };
+    let matcher_triples: String = crate::domain::rules::matcher_literals(matchers)
+        .iter()
+        .map(|(pred, v)| format!("               {p}:{pred} \"{}\" ;\n", crud::escape_sparql_literal(v)))
+        .collect();
 
     // Insert rule with edge to domain. {p}:index is what next_rule_index
     // MAXes over — without it every CLI rule would compute index 0 (the
@@ -82,6 +99,7 @@ pub fn add_with(
                {p}:ruleText \"{escaped}\" ;\n\
                {p}:index \"{next_index}\" ;\n\
          {rationale_triple}\
+         {matcher_triples}\
                {p}:priority \"{next_index}\" .\n\
              <{domain_iri}> {p}:hasRule <{rule_iri}> .\n\
            }}\n\
@@ -183,11 +201,17 @@ pub fn list(
     }
 
     println!("[{domain_name}] {} rules:", rules.len());
+    let matchers = matchers_by_text(cwd, ns, domain_name);
     for (pri, text, superseded) in &rules {
         // The marker appears only under `--include-superseded`, so the default output
         // of a store that never superseded a rule stays byte-identical.
         let mark = if *superseded { "  [superseded]" } else { "" };
         println!("  {pri}. {text}{mark}");
+        // F11: the listing shows each rule's kinds and matchers, and only for a rule that has some, so a store
+        // with no converted rule prints exactly what it printed before.
+        if let Some(m) = matchers.get(text) {
+            println!("      match: {}", crate::domain::rules::describe_matchers(m));
+        }
     }
     Ok(())
 }
@@ -227,6 +251,8 @@ pub fn list_all_tiers(
     }
 
     println!("[{domain_name}] {total} rules across both tiers:");
+    let mut matchers = matchers_by_text(&ws_cwd, ns, domain_name);
+    matchers.extend(matchers_by_text(&gbl_cwd, ns, domain_name));
     for (label, rules) in &shown {
         if rules.is_empty() {
             println!("  ({label}: none)");
@@ -235,6 +261,9 @@ pub fn list_all_tiers(
         for (pri, text, superseded) in rules {
             let mark = if *superseded { "  [superseded]" } else { "" };
             println!("  {label:<9} {pri}. {text}{mark}");
+            if let Some(m) = matchers.get(text) {
+                println!("              match: {}", crate::domain::rules::describe_matchers(m));
+            }
         }
     }
     println!("\nIndices are per tier; `rule remove` takes the index shown beside its own tier.");
@@ -386,4 +415,43 @@ fn next_rule_index(cwd: &Path, ns: &NamespaceConfig, domain_iri: &str) -> Result
         }
     }
     Ok(0)
+}
+
+/// Each rule's matchers in THIS tier, by its text (F11: `rule list` shows each rule's kinds and matchers).
+/// Keyed on text because the text is a rule's identity (`domain::rules::rule_id`); a rule with none is absent.
+pub fn matchers_by_text(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    domain_name: &str,
+) -> std::collections::HashMap<String, Vec<crate::domain::rules::Matcher>> {
+    let p = &ns.prefix;
+    let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(domain_name));
+    let sparql = format!(
+        "SELECT ?text ?mp ?mv WHERE {{\n\
+           GRAPH ?g {{\n\
+             <{domain_iri}> {p}:hasRule ?rule .\n\
+             ?rule {p}:ruleText ?text ; ?mp ?mv .\n\
+             FILTER(?mp IN ({p}:matchKind, {p}:matchPlace, {p}:matchTool, {p}:matchCommand, {p}:matchWord))\n\
+           }}\n\
+         }}"
+    );
+    let mut pairs: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
+    if let Ok(QueryResults::Solutions(rows)) = crud::load_and_query(cwd, ns, &sparql) {
+        for row in rows.filter_map(|r| r.ok()) {
+            let (Some(t), Some(mp), Some(mv)) = (row.get("text"), row.get("mp"), row.get("mv")) else {
+                continue;
+            };
+            let pred_full = crud::term_display(mp.into());
+            let pred = pred_full.trim_end_matches('>').rsplit(['#', '/']).next().unwrap_or_default().to_string();
+            pairs.entry(crud::term_display(t.into())).or_default().push((pred, crud::term_display(mv.into())));
+        }
+    }
+    pairs
+        .into_iter()
+        .map(|(text, ps)| {
+            let m = crate::domain::rules::matchers_from_literals(ps.iter().map(|(p, v)| (p.as_str(), v.as_str())));
+            (text, m)
+        })
+        .filter(|(_, m)| !m.is_empty())
+        .collect()
 }

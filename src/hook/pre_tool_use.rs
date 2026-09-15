@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -72,17 +73,75 @@ pub fn handle(
         crate::hook::automap::delegate_wsl_contact(&crate::hook::automap::linux_paths(cmd));
     }
 
-    // ─── Domain rule injection (file path match) ─────────────
     let file_paths = extract_file_paths(event);
+    // Single SessionState lifecycle for the whole hook — rule marks, domain dedup
+    // marks and AST-injected marks share one instance, saved once at the end (Q3).
+    let base_dir = crate::config::find_workspace_base(cwd);
+    let mut session = base_dir
+        .as_deref()
+        .map(SessionState::load)
+        .unwrap_or_default();
+    let mut session_dirty = false;
+    let domains = domain::load_domains(cwd);
+    // Sync BEFORE the single graph load so the store sees fresh rules. Marker-gated,
+    // a no-op when fresh; it ran only for a matched domain until F29, and the match
+    // now needs the store (the registered projects decide which triggers are live).
+    crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
+
+    // Single graph load per invocation — rule serving, domain injection and PAUL
+    // context all read from this store (Q2).
+    let graph_store = crate::store::load_merged(cwd);
+
+    // The bracket tier this hook is serving at, READ and never incremented: the
+    // prompt hook owns the counter, and a tool call must not advance a session's
+    // depth. A tier change re-serves the rules now in force, once, so the record
+    // has to know which tier it was told them at.
+    //
+    // And it is the tier the PROMPT hook last computed (`petrel` FINDING 1), never one this hook derives
+    // on its own. The prompt hook reads the transcript's percentage; this event carries none, and a tier
+    // taken from the prompt count disagreed with it in percent mode, so every switch between the two hooks
+    // served the same rules again.
+    let tier = session.served_tier(
+        &config.bracket,
+        event.get("session_id").and_then(|v| v.as_str()),
+    );
+
+    // ─── Rules with matchers of their own (F4, F5; A2, A3) ──
+    // Every tool call reaches this, not only one that names a file: a Bash, PowerShell or MCP call carries no
+    // `file_path`, and that is where action rules fire (A3). Place rules match the tool's file path and every
+    // path its command names (F4). A rule with matchers of its own is served here and never through its domain's
+    // trigger (F1); a rule with none stays on the domain path below, exactly as before (K4, `auk`'s HARD RULE).
+    let converted = domain::rules::rules_with_matchers(graph_store.as_ref(), config, &domains);
+    let converted_ids: HashSet<&str> = converted.iter().map(|c| c.rule.id.as_str()).collect();
+    if !converted.is_empty() {
+        let tool = event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+        let command = tool_command(event);
+        let home = crate::home::home_root();
+        let home_str = home.as_ref().map(|h| h.display().to_string());
+        let mut paths: Vec<String> = file_paths.iter().filter_map(|p| p.to_str().map(String::from)).collect();
+        if let Some(cmd) = command {
+            let named = crate::hook::automap::bash_paths(cmd, cwd, home.as_deref());
+            paths.extend(named.iter().filter_map(|p| p.to_str().map(String::from)));
+        }
+        let keywords = HashMap::new();
+        let cx = domain::rules::SelectContext {
+            bracket: tier,
+            now: SessionState::now_secs(),
+            home: home_str.as_deref(),
+            keywords: &keywords,
+            rules: &config.rules,
+        };
+        let rule_event = domain::rules::Event::PreTool { tool, paths: &paths, command };
+        let selection = domain::rules::select(&converted, &rule_event, &mut session, &cx);
+        if !selection.served.is_empty() {
+            output.push_str(&domain::rules::render_selection(&selection));
+            data.rules_injected += selection.served.len();
+            session_dirty = true;
+        }
+    }
+
+    // ─── Domain rule injection (file path match) ─────────────
     if !file_paths.is_empty() {
-        // Single SessionState lifecycle for the whole branch — domain dedup
-        // marks and AST-injected marks share one instance, saved once (Q3).
-        let base_dir = crate::config::find_workspace_base(cwd);
-        let mut session = base_dir
-            .as_deref()
-            .map(SessionState::load)
-            .unwrap_or_default();
-        let mut session_dirty = false;
 
         // Track apps whose files are being edited this turn so the Stop hook can
         // refresh exactly those code maps — not just the session-cwd app. This is
@@ -113,19 +172,10 @@ pub fn handle(
             }
         }
 
-        let domains = domain::load_domains(cwd);
         let file_path_strings: Vec<String> = file_paths
             .iter()
             .filter_map(|p| p.to_str().map(String::from))
             .collect();
-        // Sync BEFORE the single graph load so the store sees fresh rules. Marker-gated,
-        // a no-op when fresh; it ran only for a matched domain until F29, and the match
-        // now needs the store (the registered projects decide which triggers are live).
-        crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
-
-        // Single graph load per invocation — domain injection and PAUL
-        // context both read from this store (Q2).
-        let graph_store = crate::store::load_merged(cwd);
         let trigger_ctx = domain::matcher::TriggerContext {
             home: crate::home::home_root().map(|h| h.display().to_string()),
             registered: graph_store
@@ -136,18 +186,56 @@ pub fn handle(
         let matched = match_by_file(&domains, &file_path_strings, &trigger_ctx);
 
         for domain_def in &matched {
-            // Session dedup: skip if this domain's rules were already injected.
-            // Hash the rendered rules (text + rationale) so a rationale edit re-injects.
-            let rules_hash = domain::session::rules_hash(&domain_def.rendered_rules());
-            if session.is_injected(&domain_def.name, rules_hash) {
+            // Read the rules FIRST, then key the dedup on what came back.
+            //
+            // Until 0.16.0 this was the other way round: the key was
+            // `rules_hash(&domain_def.rendered_rules())`, which renders the TOML,
+            // and the payload was `query_rules_from_graph`, which reads the graph.
+            // A domain whose rules live only in the graph — which is every domain
+            // whose rules were added with `base rule add` — has an EMPTY
+            // `rendered_rules()`, so its key was a constant. The first tool call
+            // injected and marked it; every later call in that session computed the
+            // same constant and was suppressed, however the rules had changed. The
+            // reverse cost the other way: a domains.toml edit changed the key and
+            // re-injected text the reader had already seen.
+            //
+            // Reading before deciding costs one query on a domain that turns out to
+            // be deduped. That is the price of a key that describes the payload, and
+            // the defect it removes is a rule the operator added never arriving.
+            // A rule with matchers of its own left this path in 4d: it was served on them above (F1).
+            let rules: Vec<domain::rules::ServedRule> =
+                domain::rules::rules_for_domain(graph_store.as_ref(), config, domain_def)
+                    .into_iter()
+                    .filter(|r| !converted_ids.contains(r.id.as_str()))
+                    .collect();
+
+            // Dedup per RULE, not per domain block (F9). Before this the whole block
+            // was one unit, so adding a single rule to a seventeen-rule domain handed
+            // the reader all seventeen again, sixteen of which it had already been
+            // told this session. Measured live 2026-09-14: editing BASE-WORK-ORDER.md
+            // served all thirteen basemode rules, for an edit to a base work order.
+            //
+            // Scope is `None`, which means once per session and again on a tier
+            // change. Every rule left on this path has no matchers of its own, so it is
+            // serving through its domain's trigger, and K4 says an unconverted rule keeps
+            // exactly the behaviour it has today until an operator approves a conversion.
+            //
+            // `claim_rule` records as it decides, so this loop cannot claim a rule it
+            // then fails to render: everything that survives the filter is rendered.
+            let fresh: Vec<(usize, &domain::rules::ServedRule)> = rules
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| session.claim_rule(&r.id, r.content_hash, tier, None))
+                .collect();
+            if fresh.is_empty() && !rules.is_empty() {
                 data.suppressed += 1;
                 continue;
             }
-
-            let rules_text = match &graph_store {
-                Some(store) => query_rules_from_graph(store, config, domain_def),
-                None => format_toml_rules(domain_def),
-            };
+            if !fresh.is_empty() {
+                session_dirty = true;
+            }
+            let rules_text =
+                domain::rules::render_block("FILE MATCH", &fresh, rules.len(), &domain_def.name);
 
             // Query-triggered injection for filepath-matched domains
             let query_text = match (&graph_store, &domain_def.query) {
@@ -170,8 +258,7 @@ pub fn handle(
                     output.push('\n');
                 }
                 data.domains_matched.push(domain_def.name.clone());
-                data.rules_injected += rules_text.lines().filter(|l| l.starts_with("  ")).count();
-                session.mark_injected(&domain_def.name, rules_hash);
+                data.rules_injected += fresh.len();
                 session_dirty = true;
             }
         }
@@ -292,12 +379,13 @@ pub fn handle(
             }
         }
 
-        // Single save for the whole branch — only when something changed.
-        if session_dirty
-            && let Some(bd) = base_dir.as_deref() {
-                let _ = session.save(bd);
-            }
     }
+
+    // Single save for the whole hook — only when something changed.
+    if session_dirty
+        && let Some(bd) = base_dir.as_deref() {
+            let _ = session.save(bd);
+        }
 
     let context = output.trim_end().to_string();
     Ok((data, context))
@@ -554,78 +642,6 @@ fn match_by_file<'a>(
         .collect()
 }
 
-/// Query rules for a domain from the graph. Returns formatted text.
-fn query_rules_from_graph(
-    store: &oxigraph::store::Store,
-    config: &BaseConfig,
-    domain_def: &domain::DomainDef,
-) -> String {
-    let ns = &config.namespace;
-    let p = &ns.prefix;
-    let domain_slug = crud::slugify(&domain_def.name);
-    let domain_iri = crud::build_iri(ns, "domain", &domain_slug);
-    let pfx = crud::prefixes(ns);
-
-    let sparql = format!(
-        "{pfx}\n\
-         SELECT ?text ?rationale WHERE {{\n\
-           GRAPH ?g {{\n\
-             <{domain_iri}> {p}:hasRule ?rule .\n\
-             ?rule {p}:ruleText ?text .\n\
-             OPTIONAL {{ ?rule {p}:priority ?pri }}\n\
-             OPTIONAL {{ ?rule {p}:rationale ?rationale }}\n\
-           }}\n\
-         }}\n\
-         ORDER BY ?pri"
-    );
-
-    match crate::store::query(store, &sparql) {
-        Ok(oxigraph::sparql::QueryResults::Solutions(solutions)) => {
-            let rules: Vec<String> = solutions
-                .filter_map(|r| r.ok())
-                .filter_map(|row| {
-                    let text = match row.get("text")?.into() {
-                        TermRef::Literal(l) => l.value().to_string(),
-                        _ => return None,
-                    };
-                    if text.is_empty() {
-                        return None;
-                    }
-                    let rationale = row.get("rationale").and_then(|t| match t.into() {
-                        TermRef::Literal(l) => {
-                            let v = l.value().to_string();
-                            (!v.is_empty()).then_some(v)
-                        }
-                        _ => None,
-                    });
-                    Some(domain::render_rule(&text, rationale.as_deref()))
-                })
-                .collect();
-
-            if rules.is_empty() {
-                format_toml_rules(domain_def)
-            } else {
-                let mut out = format!("[FILE MATCH: {}]\n", domain_def.name);
-                for (i, rule) in rules.iter().enumerate() {
-                    out.push_str(&format!("  {i}. {rule}\n"));
-                }
-                out
-            }
-        }
-        _ => format_toml_rules(domain_def),
-    }
-}
-
-fn format_toml_rules(domain_def: &domain::DomainDef) -> String {
-    if domain_def.rules.is_empty() {
-        return String::new();
-    }
-    let mut out = format!("[FILE MATCH: {}]\n", domain_def.name);
-    for (i, rule) in domain_def.rules.iter().enumerate() {
-        out.push_str(&format!("  {i}. {}\n", rule.render()));
-    }
-    out
-}
 
 /// Query PAUL FileChange and Decision entities linked to a file path.
 /// Returns formatted context string for hook injection.
@@ -744,6 +760,15 @@ BODY PATTERNS (extracted as graph edges — use intentionally):
   Tags become individual graph edges — be specific, not generic
   relatedTo links to real entity slugs — check existing entities
 </mop-markdown>";
+
+/// The command a shell tool is about to run: Bash's, and PowerShell's too (A2). On the operator's machine the
+/// PowerShell tool is the primary shell, and every relay ping sent on 2026-09-14 went through it.
+fn tool_command(event: &serde_json::Value) -> Option<&str> {
+    match event.get("tool_name").and_then(|v| v.as_str()) {
+        Some("Bash" | "PowerShell") => event.get("tool_input")?.get("command")?.as_str(),
+        _ => None,
+    }
+}
 
 fn extract_file_paths(event: &serde_json::Value) -> Vec<PathBuf> {
     let mut paths = Vec::new();

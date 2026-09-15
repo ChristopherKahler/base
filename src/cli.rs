@@ -1100,7 +1100,7 @@ pub enum ReminderAction {
 
 #[derive(Subcommand)]
 pub enum HandoffAction {
-    /// Register a handoff doc (archives any prior open handoff for the project in this tier)
+    /// Register a handoff doc (archives the project's prior open or deferred handoff in every tier)
     Create {
         #[arg(long)]
         project: String,
@@ -1153,6 +1153,22 @@ pub enum RuleAction {
         /// pair in the same write, so serving surfaces stop returning the old one
         #[arg(long)]
         supersedes: Option<String>,
+        /// When the rule matters: always, place, action or topic (repeatable). A kind that
+        /// --place, --tool, --command or --words already implies need not be given
+        #[arg(long)]
+        kind: Vec<String>,
+        /// A folder, or a file the rule names (repeatable). Makes it a place rule
+        #[arg(long)]
+        place: Vec<String>,
+        /// A tool name, MCP tools included (repeatable). Makes it an action rule
+        #[arg(long)]
+        tool: Vec<String>,
+        /// A command, e.g. "base relay ping --to chris" (repeatable). Makes it an action rule
+        #[arg(long)]
+        command: Vec<String>,
+        /// Topic words and phrases, comma-separated: "ping chris, relay ping". Makes it a topic rule
+        #[arg(long)]
+        words: Option<String>,
     },
     /// List rules for a domain from the graph
     List {
@@ -2034,13 +2050,16 @@ pub fn run() {
 
         // ─── Handoff ─────────────────────────────────────
         Some(Commands::Handoff { global, action }) => {
-            let cwd = tier_cwd(&cwd, global);
+            // Where the operator stands, before `-g` routes the write: `create` finds every tier from here (rank 08).
+            let standing_cwd = &cwd;
+            let cwd = tier_cwd(standing_cwd, global);
             match action {
                 HandoffAction::Create { project, doc, slug } => {
                     let gbl = base::home::home_root();
                     match crud::handoff::create(
                         gbl.as_deref(),
                         &cwd,
+                        standing_cwd,
                         &config.namespace,
                         &project,
                         &doc,
@@ -2052,25 +2071,13 @@ pub fn run() {
                                 "Handoff for '{project}' registered (slug: {})",
                                 out.slug
                             );
-                            // 0.14.1 archived the prior handoff silently, so four
-                            // builders inside twelve seconds each closed the one
-                            // before it with nothing on screen (#71).
-                            match out.archived_prior {
-                                Some(prior) => println!(
-                                    "archived prior open handoff: {prior} ({})",
-                                    out.tier
-                                ),
-                                None => println!("no prior open handoff in this tier"),
+                            // Every archive, in every tier, on its own line with its tier (`auk`'s Q2 ruling).
+                            // 0.14.1 archived silently (#71); 0.15.2 archived one tier and only named the other.
+                            if out.archived.is_empty() {
+                                println!("no prior open or deferred handoff for '{project}' in any tier");
                             }
-                            // Named, never touched: a write acts on the tier you
-                            // stand in (#61), so the other tier's handoff is the
-                            // operator's call, with the command to make it.
-                            if let Some((other, tier)) = out.other_tier_open {
-                                let flag = if tier == "global tier" { " -g" } else { "" };
-                                println!(
-                                    "{tier} also holds an open handoff for '{project}': {other} \
-                                     — archive it with: base handoff{flag} archive {other}"
-                                );
+                            for (prior, tier) in &out.archived {
+                                println!("archived prior handoff: {prior} ({tier})");
                             }
                         }
                         Err(e) => die("Failed", e),
@@ -2913,9 +2920,20 @@ pub fn run() {
         Some(Commands::Rule { global, action }) => {
             let rule_cwd = tier_cwd(&cwd, global);
             match action {
-                RuleAction::Add { domain: name, text, rationale, supersedes } => {
-                    match crud::rule::add_with(&rule_cwd, &config.namespace, &name, &text, rationale.as_deref(), supersedes.as_deref()) {
-                        Ok(index) => println!("Rule {index} added to domain '{name}'"),
+                RuleAction::Add { domain: name, text, rationale, supersedes, kind, place, tool, command, words } => {
+                    // F11: matchers are captured when the rule is created. A kind that needs a value it was not
+                    // given is refused here, never stored as a matcher that cannot fire.
+                    let matchers = match domain::rules::matchers_from_flags(&kind, &place, &tool, &command, words.as_deref()) {
+                        Ok(m) => m,
+                        Err(msg) => die("Failed", msg),
+                    };
+                    match crud::rule::add_with_matchers(&rule_cwd, &config.namespace, &name, &text, rationale.as_deref(), supersedes.as_deref(), &matchers) {
+                        Ok(index) => {
+                            println!("Rule {index} added to domain '{name}'");
+                            if !matchers.is_empty() {
+                                println!("  match: {}", domain::rules::describe_matchers(&matchers));
+                            }
+                        }
                         Err(e) => die("Failed", e),
                     }
                 }

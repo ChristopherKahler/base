@@ -19,6 +19,22 @@ fn walk_key(term: TermRef<'_>) -> Option<String> {
     }
 }
 
+/// A domain's 1-hop neighbourhood, without its rules.
+///
+/// The prompt hook needs these two halves separately: it filters the rules per rule
+/// (F9) and renders only what this session has not been told, while the neighbourhood
+/// is still a block. [`query_domain_from_graph`] stays as the both-halves reader for
+/// every other caller, and both go through `domain::rules` for the rules half, so
+/// there is still exactly one place that knows what a rule is.
+pub fn query_domain_neighborhood(
+    store: &oxigraph::store::Store,
+    config: &BaseConfig,
+    domain_def: &domain::DomainDef,
+) -> (String, Vec<String>) {
+    let (_rules, neighborhood, served) = query_domain_from_graph(store, config, domain_def);
+    (neighborhood, served)
+}
+
 /// Query a domain's rules and 1-hop neighborhood from the graph.
 /// Returns (rules_text, neighborhood_text, served). Falls back to TOML if graph query fails.
 pub fn query_domain_from_graph(
@@ -39,77 +55,22 @@ pub fn query_domain_from_graph(
     let domain_iri = crud::build_iri(ns, "domain", &domain_slug);
     let pfx = crud::prefixes(ns);
 
-    // Query 1: Get rules ordered by priority, with optional rationale (Phase 26)
-    let rules_sparql = format!(
-        "{pfx}\n\
-         SELECT ?rule ?text ?rationale WHERE {{\n\
-           GRAPH ?g {{\n\
-             <{domain_iri}> {p}:hasRule ?rule .\n\
-             ?rule {p}:ruleText ?text .\n\
-             OPTIONAL {{ ?rule {p}:priority ?pri }}\n\
-             OPTIONAL {{ ?rule {p}:rationale ?rationale }}\n\
-           }}\n\
-         }}\n\
-         ORDER BY xsd:integer(?pri)"
-    );
-
-    let rules_text = match crate::store::query(store, &rules_sparql) {
-        Ok(oxigraph::sparql::QueryResults::Solutions(solutions)) => {
-            let rules: Vec<String> = solutions
-                .filter_map(|r| r.ok())
-                .filter_map(|row| {
-                    let text = match row.get("text")?.into() {
-                        TermRef::Literal(l) => l.value().to_string(),
-                        _ => return None,
-                    };
-                    if text.is_empty() {
-                        return None;
-                    }
-                    let rationale = row.get("rationale").and_then(|t| match t.into() {
-                        TermRef::Literal(l) => {
-                            let v = l.value().to_string();
-                            (!v.is_empty()).then_some(v)
-                        }
-                        _ => None,
-                    });
-                    if let Some(key) = row.get("rule").and_then(|t| walk_key(t.into())) {
-                        served.push(key);
-                    }
-                    Some(domain::render_rule(&text, rationale.as_deref()))
-                })
-                .collect();
-
-            // Dedupe identical rules, preserving priority order.
-            //
-            // The SPARQL above matches inside an UNBOUND `GRAPH ?g`, and the store
-            // is a MERGE of the global and workspace tiers. A domain declared once
-            // in the global domains.toml gets synced into both tiers' graphs (under
-            // ws/base-gbl and ws/<workspace> respectively), so the same rule is a
-            // distinct QUAD in each and matches twice — rendering every rule double.
-            //
-            // Deduping here rather than with SPARQL DISTINCT on purpose: DISTINCT
-            // would have to project ?pri to keep ORDER BY legal, and differing
-            // priorities across tiers would then defeat it. Identical rendered text
-            // is the thing that must appear once, whatever the graph topology.
-            let rules = {
-                let mut seen = std::collections::HashSet::new();
-                rules
-                    .into_iter()
-                    .filter(|r| seen.insert(r.clone()))
-                    .collect::<Vec<String>>()
-            };
-
-            if rules.is_empty() {
-                format_toml_rules(domain_def)
-            } else {
-                let mut out = format!("[DOMAIN: {}]\n", domain_def.name);
-                for (i, rule) in rules.iter().enumerate() {
-                    out.push_str(&format!("  {i}. {rule}\n"));
-                }
-                out
-            }
+    // The query, the superseded filter, the integer sort and the cross-tier
+    // dedupe now live once, in `domain::rules`. This surface renders; it does not
+    // also decide what a rule is. The copy that used to sit here and the copy in
+    // `pre_tool_use.rs` had already drifted apart on the sort.
+    let rules = crate::domain::rules::rules_for_domain(Some(store), config, domain_def);
+    // Every rule IRI this block served, so the prompt-time walk does not list the
+    // same record again under its own heading (#65).
+    served.extend(rules.iter().filter_map(|r| r.iri.clone()));
+    let rules_text = if rules.is_empty() {
+        String::new()
+    } else {
+        let mut out = format!("[DOMAIN: {}]\n", domain_def.name);
+        for (i, rule) in rules.iter().enumerate() {
+            out.push_str(&format!("  {i}. {}\n", rule.rendered));
         }
-        _ => format_toml_rules(domain_def),
+        out
     };
 
     // Query 2: 1-hop neighborhood (decisions linked to this domain, projects with hasDomain).

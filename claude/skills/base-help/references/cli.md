@@ -1209,7 +1209,7 @@ Manage session handoffs (resume docs surfaced at session start)
 Usage: base handoff [OPTIONS] <COMMAND>
 
 Commands:
-  create   Register a handoff doc (archives any prior open handoff for the project in this tier)
+  create   Register a handoff doc (archives the project's prior open or deferred handoff in every tier)
   list     List handoffs across global + workspace tiers
   snooze   Snooze a handoff for N days (hide until then)
   archive  Archive a handoff (stop resurfacing)
@@ -1226,7 +1226,7 @@ Options:
 ## base handoff create
 
 ```text
-Register a handoff doc (archives any prior open handoff for the project in this tier)
+Register a handoff doc (archives the project's prior open or deferred handoff in every tier)
 
 Usage: base handoff create [OPTIONS] --project <PROJECT> --doc <DOC>
 
@@ -2157,6 +2157,21 @@ Options:
 
       --supersedes <SUPERSEDES>
           Slug of the record this one replaces: writes the supersession edge pair in the same write, so serving surfaces stop returning the old one
+
+      --kind <KIND>
+          When the rule matters: always, place, action or topic (repeatable). A kind that --place, --tool, --command or --words already implies need not be given
+
+      --place <PLACE>
+          A folder, or a file the rule names (repeatable). Makes it a place rule
+
+      --tool <TOOL>
+          A tool name, MCP tools included (repeatable). Makes it an action rule
+
+      --command <COMMAND>
+          A command, e.g. "base relay ping --to chris" (repeatable). Makes it an action rule
+
+      --words <WORDS>
+          Topic words and phrases, comma-separated: "ping chris, relay ping". Makes it a topic rule
 
   -h, --help
           Print help (see a summary with '-h')

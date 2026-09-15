@@ -51,13 +51,14 @@ fn status_is(path: &Path, slug: &str, want: &str) -> bool {
 #[test]
 fn create_reports_the_handoff_it_archived() {
     let tmp = workspace();
-    crud::handoff::create(None, tmp.path(), &ns(), "pj", "/d/HANDOFF-A.md", None).unwrap();
+    crud::handoff::create(None, tmp.path(), tmp.path(), &ns(), "pj", "/d/HANDOFF-A.md", None).unwrap();
     let out =
-        crud::handoff::create(None, tmp.path(), &ns(), "pj", "/d/HANDOFF-B.md", None).unwrap();
+        crud::handoff::create(None, tmp.path(), tmp.path(), &ns(), "pj", "/d/HANDOFF-B.md", None).unwrap();
 
     // 0.14.1 archived the prior handoff and said nothing, so four builders
     // registering inside twelve seconds each closed the one before it silently.
-    assert_eq!(out.archived_prior.as_deref(), Some("HANDOFF-A"));
+    // A list since rank 08, one entry per archived handoff with its tier.
+    assert_eq!(out.archived, [("HANDOFF-A".to_string(), "workspace tier".to_string())]);
     assert_eq!(out.tier, "workspace tier");
     assert!(status_is(&graph_of(tmp.path()), "HANDOFF-A", "archived"));
 }
@@ -66,31 +67,35 @@ fn create_reports_the_handoff_it_archived() {
 fn create_reports_no_prior_when_there_was_none() {
     let tmp = workspace();
     let out =
-        crud::handoff::create(None, tmp.path(), &ns(), "pj", "/d/HANDOFF-ONLY.md", None).unwrap();
-    assert_eq!(out.archived_prior, None);
+        crud::handoff::create(None, tmp.path(), tmp.path(), &ns(), "pj", "/d/HANDOFF-ONLY.md", None).unwrap();
+    assert!(out.archived.is_empty(), "nothing to archive, yet create reported {:?}", out.archived);
 }
 
 #[test]
 fn re_registering_the_same_slug_is_not_a_prior_handoff() {
     let tmp = workspace();
-    crud::handoff::create(None, tmp.path(), &ns(), "pj", "/d/RESUME.md", None).unwrap();
-    let out = crud::handoff::create(None, tmp.path(), &ns(), "pj", "/d/RESUME.md", None).unwrap();
+    crud::handoff::create(None, tmp.path(), tmp.path(), &ns(), "pj", "/d/RESUME.md", None).unwrap();
+    let out = crud::handoff::create(None, tmp.path(), tmp.path(), &ns(), "pj", "/d/RESUME.md", None).unwrap();
     // Idempotent re-register: it re-points its own row, it does not "archive" it.
-    assert_eq!(out.archived_prior, None, "a re-register reported itself as a prior handoff");
+    assert!(out.archived.is_empty(), "a re-register reported itself as a prior handoff: {:?}", out.archived);
 }
 
 #[test]
-fn create_does_not_touch_the_other_tier() {
-    // A write acts on the tier you stand in (#61). The other tier is named by
-    // the CLI, never mutated here.
+fn create_archives_the_other_tiers_open_handoff_and_names_it() {
+    // Rewritten for rank 08 (law 43). This test pinned #61's per-tier rule for
+    // `create`: the other tier's open handoff was named and never touched. `auk`'s
+    // Q2 ruling replaced that rule for handoff registration, so a project no longer
+    // keeps one open handoff per tier. The new claims can still fail: the global
+    // handoff left open, or archived without its name and its tier, turns this red.
     let home = tempfile::tempdir().unwrap();
     let gbl = home.path().join(".base-gbl");
     std::fs::create_dir_all(gbl.join(".base")).unwrap();
-    crud::handoff::create(None, &gbl, &ns(), "pj", "/d/HANDOFF-G.md", None).unwrap();
+    crud::handoff::create(None, &gbl, &gbl, &ns(), "pj", "/d/HANDOFF-G.md", None).unwrap();
 
     let tmp = workspace();
     let out = crud::handoff::create(
         Some(home.path()),
+        tmp.path(),
         tmp.path(),
         &ns(),
         "pj",
@@ -100,13 +105,13 @@ fn create_does_not_touch_the_other_tier() {
     .unwrap();
 
     assert_eq!(
-        out.other_tier_open.as_ref().map(|(s, t)| (s.as_str(), t.as_str())),
-        Some(("HANDOFF-G", "global tier")),
-        "the other tier's open handoff was not reported"
+        out.archived,
+        [("HANDOFF-G".to_string(), "global tier".to_string())],
+        "the other tier's open handoff was not reported with its tier"
     );
     assert!(
-        status_is(&gbl.join(".base").join("graph.nq"), "HANDOFF-G", "open"),
-        "create mutated the other tier"
+        status_is(&gbl.join(".base").join("graph.nq"), "HANDOFF-G", "archived"),
+        "create left the other tier's handoff open"
     );
 }
 
