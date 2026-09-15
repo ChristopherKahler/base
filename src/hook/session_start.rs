@@ -792,6 +792,14 @@ fn check_and_banner(out: &mut SessionOutput) {
 /// error leaves graph state as-is and never blocks session start. Silent unless a
 /// status actually flipped (suppression principle — lastActive refreshes are noiseless).
 fn reconcile_active_state(config: &BaseConfig, cwd: &Path) {
+    // R3: reminders 10+ days past due archive themselves, in every tier. Not folded into
+    // `protocol::reconcile` — that pass is gated on `[protocol] enabled` and is workspace-only,
+    // and reminders are neither. Fail-open like the reconcile it sits beside.
+    let _ = crate::crud::reminder::auto_archive_pass(
+        crate::home::home_root().as_deref(),
+        cwd,
+        &config.namespace,
+    );
     match crate::protocol::reconcile(cwd, config) {
         Ok(stats) if stats.changed() => {
             eprintln!(

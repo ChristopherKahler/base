@@ -267,12 +267,13 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)
     let now_str = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
     let p = &ns.prefix;
     let sparql = format!(
-        "{pfx}\nSELECT ?r ?name WHERE {{\n\
+        "{pfx}\nSELECT ?r ?name ?when WHERE {{\n\
            GRAPH ?g {{\n\
              ?r a {p}:Reminder ;\n\
                {p}:name ?name ;\n\
                {p}:resurfaceAt ?when .\n\
              FILTER(?when <= \"{now_str}\"^^xsd:dateTime)\n\
+             FILTER NOT EXISTS {{ ?r {p}:status \"archived\" }}\n\
            }}\n\
          }}\n\
          ORDER BY ?when",
@@ -283,7 +284,7 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)
         return Ok((String::new(), 0));
     };
 
-    let rows: Vec<(String, String)> = solutions
+    let rows: Vec<(String, String, String)> = solutions
         .filter_map(|r| r.ok())
         .map(|row| {
             let get = |k: &str| {
@@ -293,7 +294,7 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)
             };
             let r = get("r");
             let slug = r.rsplit('/').next().unwrap_or(&r).to_string();
-            (slug, get("name"))
+            (slug, get("name"), get("when"))
         })
         .collect();
 
@@ -302,11 +303,25 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)
     }
 
     let mut out = format!("DUE NOW ({}) · all: base reminder list\n", rows.len());
-    for (i, (slug, name)) in rows.iter().enumerate() {
+    for (i, (slug, name, when)) in rows.iter().enumerate() {
+        // Flag 6: a handled reminder is kept, not destroyed, so the clear command archives.
+        // `base reminder remove` is still there and still deletes; it is just not what a
+        // session-start line tells you to reach for.
         out.push_str(&format!(
-            "  {} {name} · clear: base reminder remove {slug}\n",
+            "  {} {name} · clear: base reminder archive {slug}",
             i + 1
         ));
+        // R3/D4: from day 8 the line says when it goes and how to keep it.
+        if crud::reminder::days_past(when)
+            .is_some_and(|d| d >= crud::reminder::WARN_FROM_DAYS)
+        {
+            if let Some(on) = crud::reminder::archives_on(when) {
+                out.push_str(&format!(
+                    " · archives {on} unless reset: base reminder snooze {slug} <duration>"
+                ));
+            }
+        }
+        out.push('\n');
     }
     Ok((out.trim_end().to_string(), rows.len()))
 }

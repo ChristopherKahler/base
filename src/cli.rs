@@ -2255,17 +2255,74 @@ pub fn run() {
                 }
             }
             ReminderAction::List { archived } => {
-                if let Err(e) = crud::reminder::list(&cwd, &config.namespace, archived) { die("Error", e); }
+                if let Err(e) = crud::reminder::list(
+                    base::home::home_root().as_deref(),
+                    &cwd,
+                    &config.namespace,
+                    archived,
+                ) {
+                    die("Error", e);
+                }
             }
             ReminderAction::Snooze { slug, duration } => {
-                match crud::reminder::snooze(&cwd, &config.namespace, &slug, &duration) {
-                    Ok(tiers) => println!("Reminder '{slug}' snoozed in {} tier(s)", tiers.len()),
+                let d = match parse_duration(&duration) {
+                    Ok(d) => d,
+                    Err(e) => die("Invalid duration", e),
+                };
+                let at = chrono::Local::now() + d;
+                match crud::reminder::snooze(
+                    base::home::home_root().as_deref(),
+                    &cwd,
+                    &config.namespace,
+                    &slug,
+                    &at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+                    &at.format("%Y-%m-%d").to_string(),
+                ) {
+                    // An empty vec means no tier held the slug. Printing success here is
+                    // #72's observable: a no-op and a real snooze look identical outside.
+                    Ok(changed) if changed.is_empty() => die(
+                        "Failed",
+                        format!(
+                            "no reminder '{slug}' in any tier — nothing was snoozed. Searched:\n  {}",
+                            crud::reminder::searched_tiers(
+                                base::home::home_root().as_deref(),
+                                &cwd
+                            )
+                            .join("\n  ")
+                        ),
+                    ),
+                    Ok(changed) => {
+                        for tier in changed {
+                            println!("Reminder '{slug}' snoozed ({tier})");
+                        }
+                    }
                     Err(e) => die("Failed", e),
                 }
             }
             ReminderAction::Archive { slug } => {
-                match crud::reminder::archive(&cwd, &config.namespace, &slug) {
-                    Ok(tiers) => println!("Reminder '{slug}' archived in {} tier(s)", tiers.len()),
+                match crud::reminder::archive(
+                    base::home::home_root().as_deref(),
+                    &cwd,
+                    &config.namespace,
+                    &slug,
+                    None,
+                ) {
+                    Ok(changed) if changed.is_empty() => die(
+                        "Failed",
+                        format!(
+                            "no reminder '{slug}' in any tier — nothing was archived. Searched:\n  {}",
+                            crud::reminder::searched_tiers(
+                                base::home::home_root().as_deref(),
+                                &cwd
+                            )
+                            .join("\n  ")
+                        ),
+                    ),
+                    Ok(changed) => {
+                        for tier in changed {
+                            println!("Reminder '{slug}' archived ({tier})");
+                        }
+                    }
                     Err(e) => die("Failed", e),
                 }
             }
