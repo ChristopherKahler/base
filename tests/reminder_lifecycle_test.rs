@@ -434,3 +434,39 @@ fn the_global_graph_is_where_these_fixtures_write_it() {
         path.display()
     );
 }
+
+// ── R8 (rank 06 follow-up, flag 6) ──────────────────────────────────────────
+/// The instruction block tells Claude what to run for a handled reminder, and it must be the command DUE NOW's
+/// own line prints: `base reminder archive <slug>`. Before this follow-up, line 3 still said `remove`, the hard
+/// delete R4 keeps separate, while DUE NOW said `archive` two blocks below it.
+///
+/// Read off the hook's stdout, the channel Claude receives. Controls: the instruction block and DUE NOW both
+/// rendered, so an absent line cannot pass for a correct one. Mutation: put `remove` back in
+/// `hook::session_start::instruction_block`, and this goes red.
+#[test]
+fn the_instruction_block_names_archive_for_a_handled_reminder_as_due_now_does() {
+    let seed = workspace("r8");
+    let due = add_due(&seed, "Renew the domain", &days_ago(1));
+    let (code, stdout, stderr) = run_session_start(&seed, None);
+    assert_nonempty("session start", &stdout, &stderr);
+    assert_eq!(code, 0, "hooks fail open. stderr: {stderr}");
+    assert!(
+        stdout.contains("DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:"),
+        "control: the instruction block did not render:{NL_MARK}{stdout}",
+    );
+    assert!(
+        stdout.contains(&format!("clear: base reminder archive {}", due.slug)),
+        "control: DUE NOW did not print its clear command:{NL_MARK}{stdout}",
+    );
+    assert!(
+        stdout.contains("a handled reminder → `base reminder archive <slug>`."),
+        "the instruction block does not name archive for a handled reminder:{NL_MARK}{stdout}",
+    );
+    assert!(
+        !stdout.contains("base reminder remove"),
+        "session start still tells Claude to hard-delete a handled reminder:{NL_MARK}{stdout}",
+    );
+}
+
+/// A line break for the failure messages above, spelled once.
+const NL_MARK: &str = "\n";

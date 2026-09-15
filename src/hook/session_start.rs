@@ -586,7 +586,7 @@ pub fn instruction_block(letters: &[(char, String)], deferred: usize) -> String 
         "DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:\n\
          1. Show DUE NOW, then HANDOFFS, exactly as lettered. Nothing prepended. No \"is this stale?\" questions.\n\
          2. The user names a handoff by letter, project or a few words: run `base handoff show <what they said>` and read the doc it prints. Several matches: list them and ask.\n\
-         3. \"snooze <letter> <N>d\" → `base handoff snooze <slug> <N>` · \"archive <letter>\" → `base handoff archive <slug>` · a handled reminder → `base reminder remove <slug>`.\n\
+         3. \"snooze <letter> <N>d\" → `base handoff snooze <slug> <N>` · \"archive <letter>\" → `base handoff archive <slug>` · a handled reminder → `base reminder archive <slug>`.\n\
          4. FORKS are open side-work, not a lettered choice; several stay open. `base fork snooze <title> <N>` · `base fork archive <title>`.\n\
          5. Every block below is a summary. Its full list is the command on its line, and the whole untrimmed output is the file on line 1. Never guess; run it.",
     );

@@ -127,6 +127,8 @@ base entity update <slug> [--status ...] [--description ...]
 base goal add --name "..." --target "..."
 base goal update <slug> [--status ...] [--target ...]
 base reminder add --name "..." [--due YYYY-MM-DD] [--at <ISO-8601>] [--in 30s|3m|2h|1d]
+base reminder snooze <slug> <duration>   # moves its due time and resets the archive clock
+base reminder archive <slug>             # handled: kept, never shown again (remove deletes)
 base reminder remove <slug>
 ```
 

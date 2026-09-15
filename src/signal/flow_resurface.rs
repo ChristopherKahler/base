@@ -330,12 +330,11 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<(String, usize)
         // R3/D4: from day 8 the line says when it goes and how to keep it.
         if crud::reminder::days_past(when)
             .is_some_and(|d| d >= crud::reminder::WARN_FROM_DAYS)
+            && let Some(on) = crud::reminder::archives_on(when)
         {
-            if let Some(on) = crud::reminder::archives_on(when) {
-                out.push_str(&format!(
-                    " · archives {on} unless reset: base reminder snooze {slug} <duration>"
-                ));
-            }
+            out.push_str(&format!(
+                " · archives {on} unless reset: base reminder snooze {slug} <duration>"
+            ));
         }
         out.push('\n');
     }
