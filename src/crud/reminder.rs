@@ -46,7 +46,10 @@ pub fn add(
     Ok(slug)
 }
 
-pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
+pub fn list(cwd: &Path, ns: &NamespaceConfig, archived: bool) -> Result<()> {
+    // Law-11 commit 1: the flag parses and is not read yet. R5 fails on its
+    // assertion, never on the build.
+    let _ = archived;
     let p = &ns.prefix;
     let sparql = format!(
         "SELECT ?name ?resurfaceAt WHERE {{\n\
@@ -94,4 +97,30 @@ pub fn remove(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<()> {
     );
 
     crud::load_and_mutate(cwd, ns, &sparql)
+}
+
+/// Move a reminder's surface time to `now + duration`, in every tier that holds
+/// the slug. Returns the tiers it changed.
+///
+/// Law-11 commit 1: **no behaviour.** The signature and the subcommand land here
+/// so R3 and R6 compile and fail on their assertions. The write arrives in the
+/// behaviour commit.
+pub fn snooze(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    slug: &str,
+    duration: &str,
+) -> Result<Vec<String>> {
+    let _ = (cwd, ns, slug, duration);
+    Ok(Vec::new())
+}
+
+/// Mark a reminder archived in every tier that holds the slug: it stops
+/// surfacing and is kept. `remove` is still the hard delete. Returns the tiers
+/// it changed.
+///
+/// Law-11 commit 1: **no behaviour.** R1, R2 and R4 fail on their assertions.
+pub fn archive(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<Vec<String>> {
+    let _ = (cwd, ns, slug);
+    Ok(Vec::new())
 }

@@ -1092,8 +1092,16 @@ pub enum ReminderAction {
         #[arg(long = "in")]
         in_dur: Option<String>,
     },
-    /// List all reminders
-    List,
+    /// List reminders
+    List {
+        /// List archived reminders instead of the live ones
+        #[arg(long)]
+        archived: bool,
+    },
+    /// Move a reminder's surface time forward from now: 30s, 3m, 2h, 1d
+    Snooze { slug: String, duration: String },
+    /// Archive a reminder: it stops surfacing and is kept. `remove` deletes.
+    Archive { slug: String },
     /// Remove a reminder (hard delete)
     Remove { slug: String },
 }
@@ -2246,7 +2254,21 @@ pub fn run() {
                     Err(e) => die("Invalid time", e),
                 }
             }
-            ReminderAction::List => { if let Err(e) = crud::reminder::list(&cwd, &config.namespace) { die("Error", e); } }
+            ReminderAction::List { archived } => {
+                if let Err(e) = crud::reminder::list(&cwd, &config.namespace, archived) { die("Error", e); }
+            }
+            ReminderAction::Snooze { slug, duration } => {
+                match crud::reminder::snooze(&cwd, &config.namespace, &slug, &duration) {
+                    Ok(tiers) => println!("Reminder '{slug}' snoozed in {} tier(s)", tiers.len()),
+                    Err(e) => die("Failed", e),
+                }
+            }
+            ReminderAction::Archive { slug } => {
+                match crud::reminder::archive(&cwd, &config.namespace, &slug) {
+                    Ok(tiers) => println!("Reminder '{slug}' archived in {} tier(s)", tiers.len()),
+                    Err(e) => die("Failed", e),
+                }
+            }
             ReminderAction::Remove { slug } => {
                 match crud::reminder::remove(&cwd, &config.namespace, &slug) {
                     Ok(()) => println!("Reminder '{slug}' removed"),
