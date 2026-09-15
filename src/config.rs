@@ -261,6 +261,8 @@ pub struct BaseConfig {
     #[serde(default)]
     pub protocol: ProtocolConfig,
     #[serde(default)]
+    pub defer: DeferConfig,
+    #[serde(default)]
     pub standards: StandardsConfig,
     #[serde(default)]
     pub relay: RelayConfig,
@@ -690,6 +692,68 @@ pub struct StageDef {
     /// Optional context-doc filename created in the folder on project creation.
     #[serde(default)]
     pub context_doc: Option<String>,
+}
+
+// ─── Defer Config (spec Part C, Part H) ─────────────────────
+
+/// Deferred state for handoffs, forks, tasks and milestones (spec Part C). Deferred means open but
+/// paused: not listed at session start, one command away, and counted on the block it left.
+///
+/// `enabled` is FALSE in code. That is the interim default ruled on 2026-09-15 (lane 3 verdicts,
+/// AMENDMENTS B): an existing install and every test seed keep today's behaviour until they opt in.
+/// Whether any install writes it true is flag 3, which is Chris's. Projects keep `[protocol] enabled`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeferConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `"global"`: every type uses `global_days`. `"asset"`, unset, or any other value: each type
+    /// uses its own `[defer.days]` value, then `global_days`, then 10 (spec Part H, LOCKED).
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub global_days: Option<i64>,
+    #[serde(default)]
+    pub days: DeferDays,
+}
+
+/// One duration per type (spec Part H). The graph has no Fork type: a fork is an `ops:Handoff` whose
+/// `kind` literal is `"fork"`, and it reads `fork`; every other handoff reads `handoff`. That is the
+/// test `handoff_show::open_handoffs` already uses, so the key follows what the operator sees.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeferDays {
+    #[serde(default)]
+    pub handoff: Option<i64>,
+    #[serde(default)]
+    pub fork: Option<i64>,
+    #[serde(default)]
+    pub task: Option<i64>,
+    #[serde(default)]
+    pub milestone: Option<i64>,
+    /// Absent: `[protocol] stale_days`, which the project engine has always read (spec G6).
+    #[serde(default)]
+    pub project: Option<i64>,
+}
+
+/// The record types deferral resolves a duration for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferKind {
+    Handoff,
+    Fork,
+    Task,
+    Milestone,
+    Project,
+}
+
+/// The days used when neither the type nor `global_days` says (spec Part H).
+pub const DEFER_DAYS_FALLBACK: i64 = 10;
+
+impl BaseConfig {
+    /// Whole days before an untouched record of `kind` is deferred, in spec Part H's order.
+    pub fn defer_days(&self, kind: DeferKind) -> i64 {
+        // Law 11 commit 1: the surface, no behaviour.
+        let _ = kind;
+        DEFER_DAYS_FALLBACK
+    }
 }
 
 // ─── Signal Config ───────────────────────────────────────────

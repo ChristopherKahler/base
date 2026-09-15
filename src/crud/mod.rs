@@ -1,6 +1,7 @@
 pub mod ast_map;
 pub mod ast_query;
 pub mod decision;
+pub mod deferred;
 pub mod semantic;
 pub mod supersede;
 pub mod entity;

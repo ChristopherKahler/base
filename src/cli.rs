@@ -719,6 +719,8 @@ pub enum ProjectAction {
         #[arg(long)]
         stage: Option<String>,
     },
+    /// List deferred projects: open but paused, not listed at session start
+    Deferred,
     /// List projects (defaults to the current workspace; cross-awareness via flags)
     #[command(visible_alias = "l")]
     List {
@@ -815,6 +817,8 @@ pub enum MilestoneAction {
         #[arg(short, long)]
         description: Option<String>,
     },
+    /// List deferred milestones: open but paused, not listed at session start
+    Deferred,
     /// List milestones (optionally filtered by project)
     #[command(visible_alias = "l")]
     List {
@@ -870,6 +874,8 @@ pub enum TaskAction {
         #[arg(short, long)]
         milestone: Option<String>,
     },
+    /// List deferred tasks: open but paused, not listed at session start
+    Deferred,
     /// List tasks (filter by project, milestone, or label)
     #[command(visible_alias = "l")]
     List {
@@ -1128,6 +1134,9 @@ pub enum HandoffAction {
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
     },
+    /// List deferred handoffs: open but paused, so session start does not list them. Each line
+    /// carries a key (D1, D2, ...) that `base handoff show` takes, and the command that brings it back.
+    Deferred,
     /// Snooze a handoff for N days (hide until then)
     Snooze { slug: String, days: i64 },
     /// Archive a handoff (stop resurfacing)
@@ -1148,6 +1157,16 @@ pub enum ForkAction {
     },
     /// List forks across global + workspace tiers
     List,
+    /// Find one fork by its title, project or a few words and print its doc path. A deferred fork
+    /// it finds comes back to open. Several matches are listed and none is picked (exit 2); no match
+    /// exits 1.
+    Show {
+        /// A key from `base fork deferred`, a title, a project name, or loose words
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+    },
+    /// List deferred forks: open but paused. Each line carries a key `base fork show` takes.
+    Deferred,
     /// Snooze a fork for N days (hide until then)
     Snooze { slug: String, days: i64 },
     /// Archive a fork (stop resurfacing)
@@ -1674,6 +1693,9 @@ pub fn run() {
                     None => die("Failed", anyhow::anyhow!("--path is required, or enable [protocol] with a stage in base.toml")),
                 }
             }
+            ProjectAction::Deferred => {
+                if let Err(e) = crud::deferred::list(base::home::home_root().as_deref(), &cwd, &config, base::config::DeferKind::Project) { die("Error", e); }
+            }
             ProjectAction::List { all, workspace, unscoped, json } => {
                 if !json {
                     outside_workspace_note(&cwd);
@@ -1793,6 +1815,9 @@ pub fn run() {
                     Err(e) => die("Failed", e),
                 }
             }
+            MilestoneAction::Deferred => {
+                if let Err(e) = crud::deferred::list(base::home::home_root().as_deref(), &cwd, &config, base::config::DeferKind::Milestone) { die("Error", e); }
+            }
             MilestoneAction::List { project, json } => {
                 let ps = match project.as_deref() {
                     Some(p) => match resolve(&cwd, &config.namespace, "project", p) {
@@ -1864,6 +1889,9 @@ pub fn run() {
                     Ok(slug) => println!("Task '{name}' created (slug: {slug})"),
                     Err(e) => die("Failed", e),
                 }
+            }
+            TaskAction::Deferred => {
+                if let Err(e) = crud::deferred::list(base::home::home_root().as_deref(), &cwd, &config, base::config::DeferKind::Task) { die("Error", e); }
             }
             TaskAction::List { project, milestone, label, json } => {
                 let ps = match project.as_deref() {
@@ -2113,6 +2141,9 @@ pub fn run() {
                         Err(e) => die("Failed", e),
                     }
                 }
+                HandoffAction::Deferred => {
+                    if let Err(e) = crud::deferred::list(base::home::home_root().as_deref(), &cwd, &config, base::config::DeferKind::Handoff) { die("Error", e); }
+                }
                 HandoffAction::Snooze { slug, days } => {
                     match crud::handoff::snooze(
                         base::home::home_root().as_deref(),
@@ -2184,6 +2215,13 @@ pub fn run() {
                     }
                 }
                 ForkAction::List => { if let Err(e) = crud::handoff::list_forks(&cwd, &config.namespace) { die("Error", e); } }
+                ForkAction::Show { query } => {
+                    // Law 11 commit 1: the surface, no behaviour.
+                    let _ = query;
+                }
+                ForkAction::Deferred => {
+                    if let Err(e) = crud::deferred::list(base::home::home_root().as_deref(), &cwd, &config, base::config::DeferKind::Fork) { die("Error", e); }
+                }
                 ForkAction::Snooze { slug, days } => {
                     match crud::handoff::snooze(
                         base::home::home_root().as_deref(),
