@@ -239,6 +239,8 @@ pub struct BaseConfig {
     #[serde(default)]
     pub budget: BudgetConfig,
     #[serde(default)]
+    pub session_start: SessionStartConfig,
+    #[serde(default)]
     pub bracket: BracketConfig,
     #[serde(default)]
     pub devmode: DevmodeConfig,
@@ -820,6 +822,48 @@ impl Default for BudgetConfig {
     }
 }
 
+// ─── Session Start Config ────────────────────────────────────
+
+/// What session start lists (spec Part H, B4-B6). Counts of lines, not a size: the size is `[budget]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStartConfig {
+    /// Handoffs listed, newest created first. Never more than 10: spec B4 letters them A to J.
+    #[serde(default = "default_handoffs_shown")]
+    pub handoffs_shown: usize,
+    /// The only order built is `created_desc`, newest created first (spec B4). Any other value is
+    /// named on stderr and the list is still newest first.
+    #[serde(default = "default_handoffs_sort")]
+    pub handoffs_sort: String,
+    /// One handoff per project, the newest, with the older open ones counted on its line (spec B5).
+    #[serde(default = "default_true")]
+    pub one_per_project: bool,
+    /// Forks listed under the fork count, newest first (spec B6).
+    #[serde(default = "default_forks_shown")]
+    pub forks_shown: usize,
+    /// A project whose `lastActive` falls inside this many days is recent: PROJECTS lists it, and
+    /// TASKS and MILESTONES list the working items linked to it, which is what session start calls
+    /// in progress (spec B6, board ruling R4).
+    #[serde(default = "default_recent_project_days")]
+    pub recent_project_days: i64,
+}
+
+fn default_handoffs_shown() -> usize { 10 }
+fn default_handoffs_sort() -> String { "created_desc".into() }
+fn default_forks_shown() -> usize { 3 }
+fn default_recent_project_days() -> i64 { 7 }
+
+impl Default for SessionStartConfig {
+    fn default() -> Self {
+        Self {
+            handoffs_shown: default_handoffs_shown(),
+            handoffs_sort: default_handoffs_sort(),
+            one_per_project: default_true(),
+            forks_shown: default_forks_shown(),
+            recent_project_days: default_recent_project_days(),
+        }
+    }
+}
+
 // ─── Sync Config ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1180,6 +1224,22 @@ mod tests {
             toml::from_str("[budget]\nsession_start_chars = 1234\n").expect("a budget section parses");
         assert_eq!(cfg.budget.session_start_chars, 1234);
         assert_eq!(cfg.budget.prompt_chars, 4000, "an unset key keeps its default");
+    }
+
+    #[test]
+    fn the_session_start_keys_default_to_spec_part_h_and_read_back_when_set() {
+        assert_eq!(default_value("session_start", "handoffs_shown"), Some(toml::Value::Integer(10)));
+        assert_eq!(
+            default_value("session_start", "handoffs_sort"),
+            Some(toml::Value::String("created_desc".into()))
+        );
+        assert_eq!(default_value("session_start", "one_per_project"), Some(toml::Value::Boolean(true)));
+        assert_eq!(default_value("session_start", "forks_shown"), Some(toml::Value::Integer(3)));
+        assert_eq!(default_value("session_start", "recent_project_days"), Some(toml::Value::Integer(7)));
+        let cfg: BaseConfig = toml::from_str("[session_start]\nforks_shown = 5\n")
+            .expect("a session_start section parses");
+        assert_eq!(cfg.session_start.forks_shown, 5);
+        assert_eq!(cfg.session_start.handoffs_shown, 10, "an unset key keeps its default");
     }
 
     #[test]

@@ -527,11 +527,11 @@ refresh_interval = 5      # re-survey window pressure every N prompts
 
 # ─── [signal] — session-start injection engine ───────────────
 # The block you see when a session opens. Runs:
-#   active_awareness → [Active Projects] / [Active Tasks]  (your working set)
+#   active_awareness → PROJECTS / TASKS / MILESTONES / BLOCKED  (your working set)
 #   pulse            → <base-pulse> workspace-grooming health
 #   flow_resurface   → see [flow]
-#   handoff_scan     → [Pick up where you left off]
-#   reminder_scan    → [Reminders]
+#   handoff_scan     → HANDOFFS, lettered A-J (base handoff show <letter>)
+#   reminder_scan    → DUE NOW
 [signal]
 enabled = true            # master switch for all session-start injection
 
@@ -574,7 +574,7 @@ mode = "base"
 # ─── [protocol] — active⇄deferred reconcile ──────────────────
 # At session-start, sets each project's lastActive from its folder's newest file,
 # then auto-defers working projects gone cold (and revives touched ones). This is
-# what keeps [Active Projects] honest — your true working set.
+# what keeps PROJECTS honest — your true working set.
 [protocol]
 enabled = true
 stale_days = 7            # a working project untouched this many days → auto-deferred

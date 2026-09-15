@@ -21,6 +21,9 @@ pub struct SignalBlock {
     pub text: String,
     /// How many items the text lists.
     pub items: usize,
+    /// How many items exist. More than `items` when the block lists some of them, as HANDOFFS lists
+    /// ten of the open handoffs and FORKS the newest three (spec B4, B6).
+    pub total: usize,
 }
 
 /// One signal's output. Its blocks' texts joined are exactly what the signal rendered, and the
@@ -38,8 +41,22 @@ impl Signal {
         Signal { name, blocks, hash }
     }
 
-    fn single(name: &'static str, kind: &'static str, text: String, items: usize) -> Self {
-        Self::new(name, vec![SignalBlock { kind, text, items }])
+    fn single(
+        name: &'static str,
+        kind: &'static str,
+        text: String,
+        total: usize,
+        items: usize,
+    ) -> Self {
+        Self::new(
+            name,
+            vec![SignalBlock {
+                kind,
+                text,
+                items,
+                total,
+            }],
+        )
     }
 }
 
@@ -56,6 +73,9 @@ pub struct SignalOutput {
     /// No-match tags: `<hook-query:no-match>` for each query that ran but found nothing.
     /// Always emitted — bypass suppression so operator can verify queries executed.
     pub diagnostics: Vec<String>,
+    /// The letter and slug of every handoff HANDOFFS lists, for the instruction block and the
+    /// letters file `base handoff show` reads.
+    pub letters: Vec<(char, String)>,
     state: Option<(PathBuf, suppression::SignalState)>,
 }
 
@@ -107,10 +127,25 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     // (priority, signal): lower priority first, push order kept within a priority.
     let mut results: Vec<(u32, Signal)> = Vec::new();
     let mut diagnostics: Vec<String> = Vec::new();
+    let mut letters: Vec<(char, String)> = Vec::new();
+    let layout = &config.session_start;
+    if layout.handoffs_shown > crate::crud::handoff_show::MAX_SHOWN {
+        eprintln!(
+            "base: [session_start] handoffs_shown = {} lists {} at most: spec B4 letters them A to J",
+            layout.handoffs_shown,
+            crate::crud::handoff_show::MAX_SHOWN
+        );
+    }
+    if layout.handoffs_sort != "created_desc" {
+        eprintln!(
+            "base: [session_start] handoffs_sort = {:?} is not built; handoffs are listed newest created first",
+            layout.handoffs_sort
+        );
+    }
 
     match memory::run(cwd, config) {
         Ok(output) if !output.is_empty() => {
-            results.push((0, Signal::single("memory", "memory", output, 1)));
+            results.push((0, Signal::single("memory", "memory", output, 1, 1)));
         }
         Ok(_) => {}
         Err(e) => eprintln!("base: signal 'memory' failed: {e}"),
@@ -123,7 +158,8 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
                 .map(|s| SignalBlock {
                     kind: s.kind,
                     text: s.text,
-                    items: s.items,
+                    items: s.shown,
+                    total: s.total,
                 })
                 .collect();
             results.push((1, Signal::new("active-awareness", blocks)));
@@ -133,7 +169,7 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     }
     match pulse::run(cwd, ns, sig) {
         Ok(output) if !output.is_empty() => {
-            results.push((2, Signal::single("pulse", "pulse", output, 1)));
+            results.push((2, Signal::single("pulse", "pulse", output, 1, 1)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-pulse:no-match>")),
         Err(e) => eprintln!("base: signal 'pulse' failed: {e}"),
@@ -146,7 +182,10 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         match flow_resurface::run(cwd, ns, &config.flow, hook) {
             Ok((output, flow_diags)) => {
                 if !output.is_empty() {
-                    results.push((2, Signal::single("flow-resurface", "flow-resurface", output, 1)));
+                    results.push((
+                        2,
+                        Signal::single("flow-resurface", "flow-resurface", output, 1, 1),
+                    ));
                 }
                 diagnostics.extend(flow_diags);
             }
@@ -156,16 +195,20 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
 
     // Handoff + reminder resurface — persistent until dismissed. Their own signals so they
     // are never skipped as unchanged: they must surface EVERY session until acted on.
-    match flow_resurface::handoff_scan(cwd, ns) {
-        Ok((output, n)) if !output.is_empty() => {
-            results.push((0, Signal::single("handoff", "handoffs", output, n)));
+    match flow_resurface::handoff_scan(cwd, ns, layout) {
+        Ok((output, list)) if !output.is_empty() => {
+            letters = list.letters();
+            results.push((
+                0,
+                Signal::single("handoff", "handoffs", output, list.open, list.shown.len()),
+            ));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-handoff-scan:no-match>")),
         Err(e) => eprintln!("base: signal 'handoff' failed: {e}"),
     }
     match flow_resurface::reminder_scan(cwd, ns) {
         Ok((output, n)) if !output.is_empty() => {
-            results.push((0, Signal::single("reminder", "reminders", output, n)));
+            results.push((0, Signal::single("reminder", "reminders", output, n, n)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-reminder-scan:no-match>")),
         Err(e) => eprintln!("base: signal 'reminder' failed: {e}"),
@@ -173,9 +216,9 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     // Forks — parallel side-work build-specs. Persistent like handoffs: their own
     // signal so they are never skipped as unchanged and surface every session until
     // picked up, snoozed, or archived. Additive (multiple open).
-    match flow_resurface::fork_scan(cwd, ns) {
-        Ok((output, n)) if !output.is_empty() => {
-            results.push((0, Signal::single("fork", "forks", output, n)));
+    match flow_resurface::fork_scan(cwd, ns, layout) {
+        Ok((output, open, shown)) if !output.is_empty() => {
+            results.push((0, Signal::single("fork", "forks", output, open, shown)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-fork-scan:no-match>")),
         Err(e) => eprintln!("base: signal 'fork' failed: {e}"),
@@ -212,6 +255,7 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         signals,
         unchanged,
         diagnostics,
+        letters,
         state,
     })
 }

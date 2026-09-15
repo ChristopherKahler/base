@@ -58,6 +58,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base handoff`
 - `base handoff create`
 - `base handoff list`
+- `base handoff show`
 - `base handoff snooze`
 - `base handoff archive`
 - `base fork`
@@ -1211,6 +1212,7 @@ Usage: base handoff [OPTIONS] <COMMAND>
 Commands:
   create   Register a handoff doc (archives the project's prior open or deferred handoff in every tier)
   list     List handoffs across global + workspace tiers
+  show     Find one open handoff and print its doc path. Takes a letter from the last session start (A-J), a slug, a project name, or a few words. Several matches are listed and none is picked (exit 2); no match exits 1. Writes nothing
   snooze   Snooze a handoff for N days (hide until then)
   archive  Archive a handoff (stop resurfacing)
   help     Print this message or the help of the given subcommand(s)
@@ -1250,6 +1252,22 @@ Options:
 List handoffs across global + workspace tiers
 
 Usage: base handoff list
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base handoff show
+
+```text
+Find one open handoff and print its doc path. Takes a letter from the last session start (A-J), a slug, a project name, or a few words. Several matches are listed and none is picked (exit 2); no match exits 1. Writes nothing
+
+Usage: base handoff show <QUERY>...
+
+Arguments:
+  <QUERY>...
+          A letter, a slug, a project name, or loose words
 
 Options:
   -h, --help

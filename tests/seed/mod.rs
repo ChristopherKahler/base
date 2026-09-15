@@ -8,12 +8,22 @@
 //! reminders, and the legacy `[signal] max_chars = 2000`. Every value is fixed, so the same seed
 //! is written on every run and every machine; the live graphs change while a round runs.
 //!
+//! One exception, on purpose: the first [`Sizes::recent_projects`] projects are touched an hour or
+//! a few hours before the seed is written, because "touched in the last 7 days" (spec B6) is
+//! measured from the moment session start runs, and no fixed date stays inside that window.
+//!
+//! Commit C adds what the B layout reads (lane doc B16): every task and milestone is linked to its
+//! project, and two open handoffs share a project from different tiers, the S/W case of spec E1,
+//! so one-per-project folding has something to fold.
+//!
 //! Not generated: rules. Session start renders none, and the prompt-hook tests that need them
 //! add their own.
 #![allow(dead_code)]
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 pub const NS: &str = "http://ops-sys.local/ontology#";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -32,7 +42,14 @@ pub struct Sizes {
     pub longest_note: usize,
     pub domains: usize,
     pub due_reminders: usize,
+    /// Projects touched within the hours before the seed is written.
+    pub recent_projects: usize,
 }
+
+/// The S/W pair (spec E1): the open handoff at the second index takes the first one's project. The
+/// first sits in the global tier (index divisible by 5) and is created earlier; the second sits
+/// in the workspace tier and is newer, so it is listed and the first folds under it.
+pub const SW_PAIR: (usize, usize) = (15, 16);
 
 pub const REAL: Sizes = Sizes {
     open_handoffs: 24,
@@ -47,6 +64,7 @@ pub const REAL: Sizes = Sizes {
     longest_note: 30_221,
     domains: 32,
     due_reminders: 2,
+    recent_projects: 5,
 };
 
 /// One of everything, for tests that need a block to exist rather than a size.
@@ -63,6 +81,7 @@ pub const TINY: Sizes = Sizes {
     longest_note: 48,
     domains: 1,
     due_reminders: 1,
+    recent_projects: 1,
 };
 
 pub struct Seed {
@@ -133,16 +152,36 @@ fn text_of(chars: usize, seed: usize) -> String {
     s
 }
 
-fn handoff(q: &mut Quads, i: usize, kind: &str, status: &str, root: &Path) {
-    let slug = format!(
+/// The creation time of handoff or fork `i`, as written.
+pub fn handoff_created(i: usize) -> String {
+    at(i * 97)
+}
+
+/// The slug of handoff or fork `i`, as written.
+pub fn handoff_slug(i: usize, kind: &str) -> String {
+    format!(
         "2026-08-{:02}-{:04}-seed-{kind}-{i}",
         1 + i % 28,
         1000 + i % 60
-    );
+    )
+}
+
+/// The project of open handoff `i`, as written: its own, except the newer half of the S/W pair.
+pub fn handoff_project(i: usize, sizes: &Sizes) -> String {
+    let n = if i == SW_PAIR.1 && SW_PAIR.1 < sizes.open_handoffs {
+        SW_PAIR.0
+    } else {
+        i % 24
+    };
+    format!("project-{n:02}")
+}
+
+fn handoff(q: &mut Quads, i: usize, kind: &str, status: &str, project: &str, root: &Path) {
+    let slug = handoff_slug(i, kind);
     let s = format!("handoff/{slug}");
     q.typ(&s, "Handoff");
     q.lit(&s, "status", status);
-    q.lit(&s, "project", &format!("project-{:02}", i % 24));
+    q.lit(&s, "project", project);
     q.lit(&s, "kind", kind);
     let doc = root.join("handoffs").join(format!("{slug}.md"));
     q.lit(
@@ -150,7 +189,7 @@ fn handoff(q: &mut Quads, i: usize, kind: &str, status: &str, root: &Path) {
         "handoffDoc",
         &doc.display().to_string().replace('\\', "/"),
     );
-    let created = at(i * 97);
+    let created = handoff_created(i);
     q.date(&s, "createdAt", &created);
     q.date(&s, "lastActive", &created);
     q.date(&s, "resurfaceAt", &created);
@@ -176,7 +215,7 @@ pub fn write(root: &Path, sizes: &Sizes, global_toml: &str) -> Seed {
             "archived"
         };
         let q = if i % 5 == 0 { &mut global } else { &mut local };
-        handoff(q, i, "handoff", status, root);
+        handoff(q, i, "handoff", status, &handoff_project(i, sizes), root);
     }
     for i in 0..sizes.open_forks + sizes.archived_forks {
         let status = if i < sizes.open_forks {
@@ -185,7 +224,8 @@ pub fn write(root: &Path, sizes: &Sizes, global_toml: &str) -> Seed {
             "archived"
         };
         let q = if i % 5 == 0 { &mut global } else { &mut local };
-        handoff(q, 10_000 + i, "fork", status, root);
+        let project = format!("project-{:02}", (10_000 + i) % 24);
+        handoff(q, 10_000 + i, "fork", status, &project, root);
     }
 
     for i in 0..sizes.projects {
@@ -194,18 +234,23 @@ pub fn write(root: &Path, sizes: &Sizes, global_toml: &str) -> Seed {
         local.lit(&s, "name", &format!("Project {i:02}"));
         local.lit(&s, "status", "active");
         local.lit(&s, "nextAction", &format!("ship slice {i}"));
-        local.date(&s, "lastActive", &at(i * 131));
+        let touched = if i < sizes.recent_projects {
+            (chrono::Local::now() - chrono::Duration::hours(i as i64 + 1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+        } else {
+            at(i * 131)
+        };
+        local.date(&s, "lastActive", &touched);
     }
     for i in 0..sizes.milestones {
         let s = format!("milestone/milestone-{i:02}");
         local.typ(&s, "Milestone");
         local.lit(&s, "name", &format!("Milestone {i:02}"));
         local.lit(&s, "status", "active");
-        local.iri(
-            &format!("project/project-{:02}", i % sizes.projects.max(1)),
-            "hasMilestone",
-            &s,
-        );
+        local.date(&s, "lastActive", &at(i * 67));
+        let project = format!("project/project-{:02}", i % sizes.projects.max(1));
+        local.iri(&project, "hasMilestone", &s);
+        local.iri(&s, "belongsTo", &project);
     }
     for i in 0..sizes.tasks {
         let s = format!("task/task-{i:03}");
@@ -221,6 +266,11 @@ pub fn write(root: &Path, sizes: &Sizes, global_toml: &str) -> Seed {
             if i % 3 == 0 { "in_progress" } else { "active" },
         );
         local.date(&s, "lastActive", &at(i * 53));
+        local.iri(
+            &format!("project/project-{:02}", i % sizes.projects.max(1)),
+            "hasTask",
+            &s,
+        );
     }
     for i in 0..sizes.due_reminders {
         let s = format!("reminder/seed-reminder-{i}");
@@ -286,4 +336,84 @@ pub fn note_chars_written(sizes: &Sizes) -> usize {
             text_of(chars, i).chars().count()
         })
         .sum()
+}
+
+const BIN: &str = env!("CARGO_BIN_EXE_base");
+
+/// `base` from the binary `cargo test` builds, isolated the way Claude Code's hooks are driven in
+/// these tests: `BASE_HOME` at the seeded home so base's write tripwire stays armed, no auto-update,
+/// no detached map build, and none of the relay variables a caller's shell might carry. Exit code,
+/// stdout, stderr.
+fn run(
+    seed: &Seed,
+    args: &[&str],
+    stdin: Option<&str>,
+    relay_as: Option<&str>,
+) -> (i32, String, String) {
+    let mut cmd = Command::new(BIN);
+    cmd.args(args)
+        .current_dir(&seed.ws)
+        .env("BASE_HOME", &seed.home)
+        .env("BASE_NO_AUTO_UPDATE", "1")
+        .env("BASE_AST_NO_SPAWN", "1")
+        .env_remove("BASE_NO_WAKE_NUDGE")
+        .env_remove("BASE_NO_AUTONAME")
+        .env_remove("BASE_RELAY_AS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(title) = relay_as {
+        cmd.env("BASE_RELAY_AS", title);
+    }
+    let mut child = cmd.spawn().expect("the base binary runs");
+    let mut pipe = child.stdin.take().expect("stdin");
+    if let Some(text) = stdin {
+        pipe.write_all(text.as_bytes()).expect("stdin written");
+    }
+    drop(pipe);
+    let out = child.wait_with_output().expect("base finishes");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The session-start hook, driven as Claude Code drives it: JSON on stdin. With a session id the
+/// relay title is fixed, so the wake contract is part of the output and reads the same every run.
+pub fn run_session_start(seed: &Seed, session: Option<&str>) -> (i32, String, String) {
+    let payload = serde_json::json!({
+        "cwd": seed.ws.display().to_string(),
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "session_id": session,
+    })
+    .to_string();
+    run(
+        seed,
+        &["hook", "session-start"],
+        Some(&payload),
+        session.map(|_| "seed-kite"),
+    )
+}
+
+/// Any other `base` command, from the seeded workspace.
+pub fn run_base(seed: &Seed, args: &[&str]) -> (i32, String, String) {
+    run(seed, args, None, None)
+}
+
+/// The unit Claude Code's limit counts, and the budget's.
+pub fn units(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// Bytes, characters, UTF-16 units and lines, printed beside anything asserted about a size.
+pub fn measured(s: &str) -> String {
+    format!(
+        "bytes={} chars={} utf16={} lines={}",
+        s.len(),
+        s.chars().count(),
+        units(s),
+        s.lines().count()
+    )
 }
