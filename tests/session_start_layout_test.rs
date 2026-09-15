@@ -393,11 +393,13 @@ fn the_withheld_total_on_line_one_is_the_ledgers() {
     );
 }
 
-/// T7, the first-screen pass (lane doc B14 had NO ROW for it: unreachable without a DUE NOW block).
-/// Eighty due reminders overflow the first screen, so DUE NOW collapses to its floor there, never
-/// for the budget, and the header's withheld total includes the eighty. Red before commit C.
+/// T7, replaced by commit E. DUE NOW shows in full, never collapsed, always first (the four-lane
+/// table Chris accepted; `auk`'s cross-lane ruling, lane doc B24). Eighty due reminders push the
+/// header, the instruction block and DUE NOW past the 2,000-unit first screen. Nothing inside that
+/// prefix may shrink, so the overflow is reported on stderr and what the budget takes comes after
+/// DUE NOW. Red before commit E: DUE NOW collapsed to `reminders 80 · all: base reminder list`.
 #[test]
-fn due_now_collapses_only_to_keep_the_first_screen_and_the_header_counts_it() {
+fn due_now_stays_whole_and_first_when_it_overflows_the_first_screen() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let crowded = seed::Sizes {
         due_reminders: 80,
@@ -419,27 +421,85 @@ fn due_now_collapses_only_to_keep_the_first_screen_and_the_header_counts_it() {
         line1.starts_with("[BASE START · 80 due · "),
         "line 1: {line1}"
     );
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    // Whole: the block's first line, then all eighty reminders, oldest due first, one per line.
+    // Matched on the line's start, so the `clear:` needle lane 3 rewrites is not pinned here twice.
+    let head = lines
+        .iter()
+        .position(|l| *l == "DUE NOW (80) · all: base reminder list")
+        .unwrap_or_else(|| panic!("DUE NOW is not whole:\n{stdout}"));
+    for i in 0..80 {
+        let want = format!("  {} Seed reminder {i} is due · ", i + 1);
+        let got = lines.get(head + 1 + i).copied().unwrap_or_default();
+        assert!(
+            got.starts_with(&want),
+            "DUE NOW line {} is {got:?}, wanted it to start {want:?}",
+            i + 1
+        );
+    }
     assert!(
-        stdout
-            .lines()
-            .any(|l| l == "reminders 80 · all: base reminder list"),
-        "DUE NOW did not collapse to its floor:\n{stdout}"
+        !lines.contains(&"reminders 80 · all: base reminder list"),
+        "DUE NOW collapsed to its floor:\n{stdout}"
     );
-    let floor_end =
-        end_of_line_with(&stdout, "reminders 80 · all: base reminder list").unwrap_or(usize::MAX);
+
+    // The overflow is real. A seed that fits the first screen would pass every line above on a
+    // tree that still collapses DUE NOW, which is the vacuity this assertion exists to rule out.
+    let due_end = end_of_line_with(&stdout, "  80 Seed reminder 79 is due")
+        .expect("the eightieth reminder is present");
     assert!(
-        floor_end <= 2000,
-        "the DUE NOW floor ends at unit {floor_end}"
+        due_end > 2000,
+        "control: DUE NOW ends at unit {due_end}, inside the first screen, so nothing overflowed"
+    );
+
+    // First: only the header and the instruction block come before it.
+    let letters = lines
+        .iter()
+        .position(|l| l.starts_with("Letters: "))
+        .expect("the instruction block carries the letters");
+    assert!(
+        letters < head,
+        "DUE NOW starts before the instruction block ends"
+    );
+    assert!(
+        lines[letters + 1..head].iter().all(|l| l.trim().is_empty()),
+        "something sits between the instruction block and DUE NOW: {:?}",
+        &lines[letters + 1..head]
+    );
+
+    // Reported, not resolved: stderr is the only signal of an overflow nothing can trim away.
+    assert!(
+        stderr.contains(
+            "base: session start's header, instructions and DUE NOW take more than the first 2000 units"
+        ),
+        "the overflow is not reported. stderr: {stderr}"
+    );
+
+    // What fell came after it: the budget still trimmed, and every floor sits below DUE NOW.
+    let floors: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| is_floor(l))
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        !floors.is_empty(),
+        "control: 9,000 units cannot hold eighty reminders and the real-size seed whole"
+    );
+    assert!(
+        floors.iter().all(|n| *n > head + 80),
+        "a floor sits above DUE NOW's last line: floors at {floors:?}, DUE NOW ends at line {}",
+        head + 80
     );
     let withheld: usize = line1
         .split(" · withheld ")
         .nth(1)
         .and_then(|rest| rest.split(' ').next())
         .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
+        .unwrap_or_else(|| panic!("no withheld total on line 1: {line1}"));
     assert!(
-        withheld >= 80,
-        "the header's withheld {withheld} leaves out the 80 reminders: {line1}"
+        withheld > 0,
+        "floors were printed and line 1 says nothing was withheld: {line1}"
     );
     assert!(
         stdout.contains("DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:"),
