@@ -25,7 +25,7 @@
 //! Gated on `[protocol] enabled` for the *apply* path. The read-only [`plan`] is
 //! ungated so `base reconcile --dry-run` can preview before the protocol is enabled.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -379,6 +379,13 @@ impl RecordStats {
 /// when the pass deferred them (`deferredReason` starting `auto:`): `task update --status deferred`
 /// stamps `lastActive` itself, so reviving an operator's own deferral would undo it next session start.
 ///
+/// Decided on EVERY value a record carries, never on the order the store returns rows (F1): a subject holding two
+/// values for one field comes back as one row per combination. A terminal status wins over any other; two statuses,
+/// or two record types, are ambiguous and held, never written; a future value of `resurfaceAt` pins; the clock is the
+/// newest `lastActive` and the newest passed `resurfaceAt`; and revival needs every `deferredReason` to start `auto:`.
+/// A handoff carrying `kind "fork"` is a fork, whatever other `kind` it carries, which is how `base fork deferred`
+/// and `base handoff deferred` list it (`crud::deferred::kind_filter`).
+///
 /// Never deferred: a terminal status, `blocked` (someone is waiting on it), a record carrying a due date
 /// (rank 07 moves it to DUE), a snoozed one (C7), and one with no clock at all, which is never deferred
 /// blind.
@@ -411,49 +418,59 @@ pub fn plan_records(store: &Store, config: &BaseConfig, now: DateTime<Local>) ->
             other => other.to_string(),
         })
     };
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out = Vec::new();
+    // F1: every value of every field is gathered before anything is decided, so no single row decides.
+    let mut subjects: BTreeMap<String, Values> = BTreeMap::new();
     for sol in solutions.filter_map(|r| r.ok()) {
-        let (Some(iri), Some(ty), Some(status)) =
-            (full(sol.get("e")), full(sol.get("type")), full(sol.get("status")))
-        else {
+        let Some(iri) = full(sol.get("e")) else {
             continue;
         };
-        // A subject holding two values for one field comes back as two rows; the first stands.
-        if !seen.insert(iri.clone()) {
-            continue;
-        }
-        let kind = if ty.ends_with("#Handoff") {
-            if full(sol.get("kind")).as_deref() == Some("fork") {
+        let v = subjects.entry(iri).or_default();
+        v.types.extend(full(sol.get("type")));
+        v.statuses.extend(full(sol.get("status")));
+        v.kinds.extend(full(sol.get("kind")));
+        v.last_active.extend(full(sol.get("lastActive")));
+        v.resurface_at.extend(full(sol.get("resurfaceAt")));
+        v.reasons.extend(full(sol.get("why")));
+        v.dues.extend(full(sol.get("due")));
+    }
+    let mut out = Vec::new();
+    for (iri, v) in subjects {
+        let kind = if v.types.iter().any(|t| t.ends_with("#Handoff")) {
+            if v.kinds.contains("fork") {
                 DeferKind::Fork
             } else {
                 DeferKind::Handoff
             }
-        } else if ty.ends_with("#Task") {
+        } else if v.types.iter().any(|t| t.ends_with("#Task")) {
             DeferKind::Task
         } else {
             DeferKind::Milestone
         };
-        let last_active = full(sol.get("lastActive"));
-        let resurface_at = full(sol.get("resurfaceAt"));
-        let reason = full(sol.get("why"));
-        let dated = full(sol.get("due")).is_some_and(|d| !d.trim().is_empty());
+        let status = v.statuses.iter().cloned().collect::<Vec<_>>().join(" + ");
         let window = config.defer_days(kind);
-        let days = deferred::clock(last_active.as_deref(), resurface_at.as_deref(), now)
-            .map(|t| deferred::days_since(t, now));
+        let days = deferred::clock_of(
+            v.last_active.iter().map(String::as_str),
+            v.resurface_at.iter().map(String::as_str),
+            now,
+        )
+        .map(|t| deferred::days_since(t, now));
         let handoff_like = matches!(kind, DeferKind::Handoff | DeferKind::Fork);
+        let dated = v.dues.iter().any(|d| !d.trim().is_empty());
 
-        let action = if RECORD_TERMINAL.contains(&status.as_str()) {
+        let action = if v.statuses.iter().any(|s| RECORD_TERMINAL.contains(&s.as_str())) {
             Action::Terminal
+        } else if v.statuses.len() != 1 || v.types.len() != 1 {
+            // Two working statuses, or two record types: ambiguous, and an ambiguous record is never written.
+            Action::Hold
         } else if status == "blocked" || dated {
             Action::Hold
-        } else if deferred::is_snoozed(resurface_at.as_deref(), now) {
+        } else if v.resurface_at.iter().any(|r| deferred::is_snoozed(Some(r.as_str()), now)) {
             Action::Pinned
         } else {
             match days {
                 None => Action::Hold,
                 Some(d) if status == deferred::DEFERRED => {
-                    let auto = reason.as_deref().is_some_and(|r| r.starts_with(deferred::AUTO));
+                    let auto = !v.reasons.is_empty() && v.reasons.iter().all(|r| r.starts_with(deferred::AUTO));
                     if !handoff_like && auto && d < window {
                         Action::Revive
                     } else {
@@ -474,6 +491,18 @@ pub fn plan_records(store: &Store, config: &BaseConfig, now: DateTime<Local>) ->
         out.push(RecordDecision { iri, slug, kind, status, days, window, action });
     }
     Ok(out)
+}
+
+/// Every value one subject carries for each field [`plan_records`] reads, gathered from all of its rows (F1).
+#[derive(Default)]
+struct Values {
+    types: BTreeSet<String>,
+    statuses: BTreeSet<String>,
+    kinds: BTreeSet<String>,
+    last_active: BTreeSet<String>,
+    resurface_at: BTreeSet<String>,
+    reasons: BTreeSet<String>,
+    dues: BTreeSet<String>,
 }
 
 /// Apply one tier file's record plan to `store` and write the file once. The caller holds the file's

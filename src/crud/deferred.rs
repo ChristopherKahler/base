@@ -66,8 +66,18 @@ fn parse(s: &str) -> Option<DateTime<Local>> {
 /// `resurfaceAt` still in the future is a snooze running, which [`is_snoozed`] answers, and never a
 /// clock value. `None` when neither gives a time.
 pub fn clock(last_active: Option<&str>, resurface_at: Option<&str>, now: DateTime<Local>) -> Option<DateTime<Local>> {
-    let touched = last_active.and_then(parse);
-    let ended = resurface_at.and_then(parse).filter(|r| *r <= now);
+    clock_of(last_active, resurface_at, now)
+}
+
+/// [`clock`] over every value a record carries (F1): the newest `lastActive` and the newest `resurfaceAt` that has
+/// passed. A record holding two values for one field is decided on all of them, never on whichever came first.
+pub fn clock_of<'a>(
+    last_active: impl IntoIterator<Item = &'a str>,
+    resurface_at: impl IntoIterator<Item = &'a str>,
+    now: DateTime<Local>,
+) -> Option<DateTime<Local>> {
+    let touched = last_active.into_iter().filter_map(parse).max();
+    let ended = resurface_at.into_iter().filter_map(parse).filter(|r| *r <= now).max();
     match (touched, ended) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
@@ -87,8 +97,9 @@ pub fn days_since(then: DateTime<Local>, now: DateTime<Local>) -> i64 {
 /// The `rdf:type` filter and the kind test that select one kind's records in a SPARQL group.
 fn kind_filter(kind: DeferKind, p: &str) -> String {
     match kind {
+        // A record carrying `kind "fork"` is a fork, whatever else it carries: the answer `plan_records` gives (F1).
         DeferKind::Handoff => format!(
-            "?e a {p}:Handoff .\n             OPTIONAL {{ ?e {p}:kind ?kind }}\n             FILTER(!BOUND(?kind) || ?kind != \"fork\")"
+            "?e a {p}:Handoff .\n             FILTER NOT EXISTS {{ ?e {p}:kind \"fork\" }}"
         ),
         DeferKind::Fork => format!("?e a {p}:Handoff ; {p}:kind \"fork\" ."),
         DeferKind::Task => format!("?e a {p}:Task ."),

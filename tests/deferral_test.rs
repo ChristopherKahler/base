@@ -1270,3 +1270,275 @@ fn first_screen_holds_with_real_length_slugs_and_lane_3_lines() {
         assert!(due_last <= BAR, "{tag}: DUE NOW's last item ends at unit {due_last}, past the {BAR}-unit bar");
     }
 }
+
+// ── D19-D24: F1, a record carrying several values is decided on all of them ─────
+// F1 (lane 3 verdicts, 2026-09-15): the planner kept the FIRST solution row per subject, so a record holding two
+// values for one field was decided by the store's index order, and the Defer write deletes every status value. The
+// live instance is `task/rebuild-auth-guard` in the global tier: `status "active"` AND `status "completed"`, three
+// `lastActive` values. One test per rule the planner now follows. Each has a single-valued twin whose outcome proves
+// the pass ran, so a pass that never runs cannot pass any of them. Mutation MD14 (the first row stands again) must
+// redden them.
+
+/// The values of `subject`'s `pred`, sorted, so a comparison never depends on the order the store wrote them in.
+fn sorted_values(seed: &seed::Seed, tier: Tier, subject: &str, pred: &str) -> Vec<String> {
+    let mut v = values(seed, tier, subject, pred);
+    v.sort();
+    v
+}
+
+/// A second `lastActive` on a workspace task, typed as the store writes it (`add_task` types only `…At` extras).
+fn add_last_active(seed: &seed::Seed, slug: &str, days: i64) {
+    let at = stamp(days);
+    let q = Q::new(Tier::Workspace, &format!("task/{slug}")).date("lastActive", &at);
+    let marker = format!("<{}task/{slug}> <{}lastActive> \"{at}\"", seed::NS, seed::NS);
+    append(seed, Tier::Workspace, &q.out, &marker);
+}
+
+// ── D19 ──────────────────────────────────────────────────────────────────────
+/// F1 rule 1: any terminal status wins, WHATEVER ORDER the store returns a subject's values in.
+/// DISCRIMINATING, and deliberately order-independent (auk, 2026-09-18). Two cold tasks that mean the same
+/// thing - each carries one working status and `completed` - with their working values chosen to encode on
+/// opposite sides of `completed`: `open` sorts above it, `active` sorts below it. Both must reach the SAME
+/// decision, because both carry a terminal status. On commit 4 `plan_records` keeps the first row per
+/// subject, so whichever way the store iterates, exactly one of the pair reads its working status and is
+/// deferred while the other reads `completed` and is not - the decisions DIFFER and this arm is red under
+/// either ordering rule. It cannot go green if oxigraph changes its index, because no assertion below names
+/// an order. Its single-status cold twin is the control that proves the pass ran at all.
+#[test]
+fn a_record_carrying_a_terminal_status_is_never_deferred_whatever_else_it_carries() {
+    let seed = workspace("d19", ON);
+    add_task(&seed, "task-open-and-completed", "open", 30, &[("status", "completed")]);
+    add_task(&seed, "task-active-and-completed", "active", 30, &[("status", "completed")]);
+    add_task(&seed, "task-cold-twin", "active", 30, &[]);
+    let ws = Tier::Workspace;
+    let (a, b) = ("task/task-open-and-completed", "task/task-active-and-completed");
+    assert_eq!(sorted_values(&seed, ws, a, "status"), ["completed", "open"], "control: pair member A carries both");
+    assert_eq!(sorted_values(&seed, ws, b, "status"), ["active", "completed"], "control: pair member B carries both");
+
+    session_start(&seed);
+    assert_eq!(status(&seed, ws, "task/task-cold-twin"), "deferred", "control: the cold twin was not deferred, so the pass never ran");
+    let (after_a, after_b) = (sorted_values(&seed, ws, a, "status"), sorted_values(&seed, ws, b, "status"));
+    let (deferred_a, deferred_b) = (
+        after_a.iter().any(|s| s == "deferred"),
+        after_b.iter().any(|s| s == "deferred"),
+    );
+    assert_eq!(
+        deferred_a, deferred_b,
+        "two records carrying a terminal status got DIFFERENT decisions, so the status was picked by row order: A={after_a:?} B={after_b:?}"
+    );
+    for (label, after) in [("A", &after_a), ("B", &after_b)] {
+        assert!(after.iter().any(|s| s == "completed"), "{label}: a completed task lost `completed` to the deferral pass: {after:?}");
+        assert!(!after.iter().any(|s| s == "deferred"), "{label}: a completed task was deferred: {after:?}");
+    }
+}
+
+// ── D20 ──────────────────────────────────────────────────────────────────────
+/// F1 rule 6: the clock reads the NEWEST `lastActive`. A task carrying one 30 days old and one 1 day old was touched
+/// yesterday and is not deferred. Its twin, carrying only the 30-day clock, is.
+/// NON-DISCRIMINATING on commit 4, and structurally so (auk, 2026-09-18). It passed at commit 4 without the fix.
+/// Exposing the row-order defect needs the store to return the OLDER `lastActive` first, and with ISO date
+/// literals older always sorts lower, so no value choice reaches that case. There is no second lever: this
+/// arm's only assertion is the clock, and a record whose values are both cold defers either way, so nothing
+/// separates the two. It is kept as a REGRESSION GUARD under law 45, not as a red arm, and it was not bent
+/// until it reddened. Grade any mutation against it as INERT, never PROVEN.
+#[test]
+fn the_clock_reads_the_newest_last_active_a_record_carries() {
+    let seed = workspace("d20", ON);
+    add_task(&seed, "task-two-clocks", "active", 30, &[]);
+    add_last_active(&seed, "task-two-clocks", 1);
+    add_task(&seed, "task-cold-twin", "active", 30, &[]);
+    let ws = Tier::Workspace;
+    assert_eq!(values(&seed, ws, "task/task-two-clocks", "lastActive").len(), 2, "control: the fixture carries two clocks");
+
+    session_start(&seed);
+    assert_eq!(status(&seed, ws, "task/task-cold-twin"), "deferred", "control: the cold twin was not deferred, so the pass never ran");
+    assert_eq!(status(&seed, ws, "task/task-two-clocks"), "active", "a task touched yesterday was deferred on its older clock");
+}
+
+// ── D21 ──────────────────────────────────────────────────────────────────────
+/// F1 rule 2: two working statuses are ambiguous, and an ambiguous record is never written. A cold task carrying
+/// `active` and `in_progress` keeps both. Its single-status cold twin is deferred.
+#[test]
+fn a_record_carrying_two_working_statuses_is_held_and_keeps_both() {
+    let seed = workspace("d21", ON);
+    add_task(&seed, "task-two-statuses", "active", 30, &[("status", "in_progress")]);
+    add_task(&seed, "task-cold-twin", "active", 30, &[]);
+    let (ws, dual) = (Tier::Workspace, "task/task-two-statuses");
+    assert_eq!(sorted_values(&seed, ws, dual, "status"), ["active", "in_progress"], "control: the fixture carries both");
+
+    session_start(&seed);
+    assert_eq!(status(&seed, ws, "task/task-cold-twin"), "deferred", "control: the cold twin was not deferred, so the pass never ran");
+    assert_eq!(sorted_values(&seed, ws, dual, "status"), ["active", "in_progress"], "an ambiguous record was written");
+}
+
+// ── D22 ──────────────────────────────────────────────────────────────────────
+/// F1 rule 5: a snooze running in ANY `resurfaceAt` value pins the record. A cold task carrying one `resurfaceAt`
+/// 20 days past and one 5 days ahead is not deferred. Its twin, carrying only the passed one, is.
+/// NON-DISCRIMINATING on commit 4, and structurally so (auk, 2026-09-18). It passed at commit 4 without the fix.
+/// Exposing the defect needs the store to return the PAST `resurfaceAt` first while a future one is also
+/// carried, and a future ISO date always sorts above a past one, so that case is unreachable. A record whose
+/// `resurfaceAt` values are all past is not pinned either way, so it separates nothing. Kept as a REGRESSION
+/// GUARD under law 45. Grade any mutation against it as INERT, never PROVEN.
+#[test]
+fn a_snooze_running_in_any_resurface_value_pins_the_record() {
+    let seed = workspace("d22", ON);
+    let (passed, ahead) = (stamp(20), stamp(-5));
+    add_task(&seed, "task-snoozed", "active", 30, &[("resurfaceAt", passed.as_str()), ("resurfaceAt", ahead.as_str())]);
+    add_task(&seed, "task-cold-twin", "active", 30, &[("resurfaceAt", passed.as_str())]);
+    let ws = Tier::Workspace;
+    assert_eq!(values(&seed, ws, "task/task-snoozed", "resurfaceAt").len(), 2, "control: the fixture carries both");
+
+    session_start(&seed);
+    assert_eq!(status(&seed, ws, "task/task-cold-twin"), "deferred", "control: the cold twin was not deferred, so the pass never ran");
+    assert_eq!(status(&seed, ws, "task/task-snoozed"), "active", "a task snoozed into the future was deferred");
+}
+
+// ── D23 ──────────────────────────────────────────────────────────────────────
+/// F1 rule 7: the clock revives a task only when EVERY `deferredReason` it carries starts `auto:`.
+/// DISCRIMINATING, and deliberately order-independent (auk, 2026-09-18). Two tasks that mean the same thing
+/// (each deferred by the pass AND by the operator, so neither may be revived) with their operator reasons
+/// chosen to encode on opposite sides of `auto:`: `until Q4` sorts above it, `Q4 hold` sorts below it
+/// (uppercase `Q` is 0x51, lowercase `a` is 0x61). Both must reach the SAME decision. On commit 4 the clock
+/// reads the first `deferredReason` row, so whichever way the store iterates, exactly one of the pair reads
+/// the operator's reason and stays deferred while the other reads the `auto:` one and is revived - the
+/// decisions DIFFER and this arm is red under either ordering rule, with no assertion naming an order.
+/// The all-automatic twin is the control that proves the pass ran at all.
+#[test]
+fn the_clock_revives_only_when_every_deferred_reason_is_automatic() {
+    let seed = workspace("d23", ON);
+    let at5 = stamp(5);
+    for (slug, operator_reason) in [("task-auto-and-until", "until Q4"), ("task-auto-and-qhold", "Q4 hold")] {
+        add_task(
+            &seed,
+            slug,
+            "deferred",
+            1,
+            &[("deferredReason", "auto: cold 12d"), ("deferredReason", operator_reason), ("deferredAt", at5.as_str())],
+        );
+    }
+    add_task(&seed, "task-auto-twin", "deferred", 1, &[("deferredReason", "auto: cold 12d"), ("deferredAt", at5.as_str())]);
+    let ws = Tier::Workspace;
+    let (a, b) = ("task/task-auto-and-until", "task/task-auto-and-qhold");
+    assert_eq!(sorted_values(&seed, ws, a, "deferredReason"), ["auto: cold 12d", "until Q4"], "control: pair member A carries both reasons");
+    assert_eq!(sorted_values(&seed, ws, b, "deferredReason"), ["Q4 hold", "auto: cold 12d"], "control: pair member B carries both reasons");
+
+    session_start(&seed);
+    assert_eq!(status(&seed, ws, "task/task-auto-twin"), "active", "control: the automatic twin was not revived, so the pass never ran");
+    let (after_a, after_b) = (status(&seed, ws, a), status(&seed, ws, b));
+    assert_eq!(
+        after_a, after_b,
+        "two records an operator also deferred got DIFFERENT decisions, so the reason was picked by row order: A={after_a} B={after_b}"
+    );
+    assert_eq!(after_a, "deferred", "the clock revived a task an operator also deferred");
+}
+
+// ── D24 ──────────────────────────────────────────────────────────────────────
+/// F1 rule 1's note on `kind`: a record carrying `kind "fork"` is a fork, whatever other `kind` it carries, to the
+/// planner AND to both listings, so they never disagree. Windows: handoff 30 days, fork 10. A record carrying `fork`
+/// and `handoff`, untouched 11 days, is deferred on the fork window, listed by `base fork deferred` and not by
+/// `base handoff deferred`. Its single-kind fork twin, also 11 days cold, is deferred too.
+#[test]
+fn a_record_carrying_the_fork_kind_is_a_fork_to_the_planner_and_to_both_listings() {
+    let seed = workspace("d24", "[defer]\nenabled = true\n[defer.days]\nhandoff = 30\nfork = 10\n");
+    let dual = "2026-09-04-0900-lark-two-kinds-of-record";
+    let twin = "2026-09-04-0900-lark-fork-twin-record";
+    for slug in [dual, twin] {
+        add_handoff(
+            &seed,
+            Tier::Workspace,
+            &H { slug, kind: "fork", project: "two-kinds", status: "open", touched: 11, resurface: 11, deferred: None },
+        );
+    }
+    let second = Q::new(Tier::Workspace, &format!("handoff/{dual}")).lit("kind", "handoff");
+    let marker = format!("<{}handoff/{dual}> <{}kind> \"handoff\"", seed::NS, seed::NS);
+    append(&seed, Tier::Workspace, &second.out, &marker);
+    let ws = Tier::Workspace;
+    assert_eq!(sorted_values(&seed, ws, &format!("handoff/{dual}"), "kind"), ["fork", "handoff"], "control: both kinds");
+
+    session_start(&seed);
+    assert_eq!(status(&seed, ws, &format!("handoff/{twin}")), "deferred", "control: the fork twin was not deferred, so the pass never ran");
+    assert_eq!(status(&seed, ws, &format!("handoff/{dual}")), "deferred", "the record carrying `fork` was not deferred on the fork window");
+    let (_, forks) = base(&seed, &["fork", "deferred"]);
+    assert!(forks.contains(dual), "`base fork deferred` does not list the record carrying `fork`:\n{forks}");
+    let (_, handoffs) = base(&seed, &["handoff", "deferred"]);
+    assert!(!handoffs.contains(dual), "`base handoff deferred` lists a record the planner treats as a fork:\n{handoffs}");
+}
+
+// ── D19b ─────────────────────────────────────────────────────────────────────
+/// F1 rule 1, the INSERTION-POSITION complement of D19 (auk, 2026-09-18). D19 varies the VALUE SET and
+/// holds write position fixed, so a lexical row rule makes its two members differ and reddens it, while an
+/// insertion rule makes them agree and greens it. This arm pulls the other lever: the SAME two values,
+/// `completed` and `open`, with only their WRITE ORDER swapped. A lexical rule greens this one; an
+/// insertion rule reddens it. Whichever rule the store follows, exactly one of D19 and D19b is red on
+/// commit 4, and neither assertion names a rule - so they are independent detectors in the law 39 sense,
+/// and the one that greens is the control telling you which rule is in play. `add_task` writes its primary
+/// status first and its extras after; that is the only thing that differs between A and B.
+/// Note `handoff_like` is false for a Task (`reconcile.rs:461`), so `open` is a working status here.
+#[test]
+fn a_terminal_status_wins_whichever_position_it_was_written_in() {
+    let seed = workspace("d19b", ON);
+    add_task(&seed, "task-completed-then-open", "completed", 30, &[("status", "open")]);
+    add_task(&seed, "task-open-then-completed", "open", 30, &[("status", "completed")]);
+    add_task(&seed, "task-cold-twin", "active", 30, &[]);
+    let ws = Tier::Workspace;
+    let (a, b) = ("task/task-completed-then-open", "task/task-open-then-completed");
+    assert_eq!(sorted_values(&seed, ws, a, "status"), ["completed", "open"], "control: A carries both, `completed` written first");
+    assert_eq!(sorted_values(&seed, ws, b, "status"), ["completed", "open"], "control: B carries both, `open` written first");
+
+    session_start(&seed);
+    assert_eq!(status(&seed, ws, "task/task-cold-twin"), "deferred", "control: the cold twin was not deferred, so the pass never ran");
+    let (after_a, after_b) = (sorted_values(&seed, ws, a, "status"), sorted_values(&seed, ws, b, "status"));
+    let (deferred_a, deferred_b) = (
+        after_a.iter().any(|s| s == "deferred"),
+        after_b.iter().any(|s| s == "deferred"),
+    );
+    assert_eq!(
+        deferred_a, deferred_b,
+        "two records carrying the SAME two statuses got different decisions, so the WRITE ORDER decided it: A={after_a:?} B={after_b:?}"
+    );
+    for (label, after) in [("A", &after_a), ("B", &after_b)] {
+        assert!(after.iter().any(|s| s == "completed"), "{label}: a completed task lost `completed` to the deferral pass: {after:?}");
+        assert!(!after.iter().any(|s| s == "deferred"), "{label}: a completed task was deferred: {after:?}");
+    }
+}
+
+// ── D23b ─────────────────────────────────────────────────────────────────────
+/// F1 rule 7, the INSERTION-POSITION complement of D23. Same construction as D19b and the same reason:
+/// D23 varies the VALUE SET with `auto:` held in the same write slot in both members, so an insertion rule
+/// greens it. Here both members carry the SAME two reasons, `auto: cold 12d` and `until Q4`, with only
+/// their write order swapped. A lexical rule greens this arm; an insertion rule reddens it. Both records
+/// were deferred by the operator as well as by the pass, so neither may be revived, whichever reason the
+/// clock happens to read first.
+#[test]
+fn the_clock_reads_every_deferred_reason_whichever_position_it_was_written_in() {
+    let seed = workspace("d23b", ON);
+    let at5 = stamp(5);
+    add_task(
+        &seed,
+        "task-auto-written-first",
+        "deferred",
+        1,
+        &[("deferredReason", "auto: cold 12d"), ("deferredReason", "until Q4"), ("deferredAt", at5.as_str())],
+    );
+    add_task(
+        &seed,
+        "task-operator-written-first",
+        "deferred",
+        1,
+        &[("deferredReason", "until Q4"), ("deferredReason", "auto: cold 12d"), ("deferredAt", at5.as_str())],
+    );
+    add_task(&seed, "task-auto-twin", "deferred", 1, &[("deferredReason", "auto: cold 12d"), ("deferredAt", at5.as_str())]);
+    let ws = Tier::Workspace;
+    let (a, b) = ("task/task-auto-written-first", "task/task-operator-written-first");
+    assert_eq!(sorted_values(&seed, ws, a, "deferredReason"), ["auto: cold 12d", "until Q4"], "control: A carries both, the automatic reason written first");
+    assert_eq!(sorted_values(&seed, ws, b, "deferredReason"), ["auto: cold 12d", "until Q4"], "control: B carries both, the operator reason written first");
+
+    session_start(&seed);
+    assert_eq!(status(&seed, ws, "task/task-auto-twin"), "active", "control: the automatic twin was not revived, so the pass never ran");
+    let (after_a, after_b) = (status(&seed, ws, a), status(&seed, ws, b));
+    assert_eq!(
+        after_a, after_b,
+        "two records carrying the SAME two reasons got different decisions, so the WRITE ORDER decided it: A={after_a} B={after_b}"
+    );
+    assert_eq!(after_a, "deferred", "the clock revived a task an operator also deferred");
+}
