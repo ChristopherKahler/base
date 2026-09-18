@@ -19,6 +19,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod record;
+
 /// The length the host measures: UTF-16 code units. Nothing in this module measures any other way.
 pub fn u16_len(s: &str) -> usize {
     s.encode_utf16().count()
@@ -72,6 +74,15 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// Every reason, so [`Reason::parse`] can invert [`Reason::as_str`].
+    pub(crate) const ALL: [Reason; 5] = [
+        Reason::Collapsed,
+        Reason::ListCut,
+        Reason::TextShortened,
+        Reason::SignalSuppressed,
+        Reason::HashUnchanged,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Reason::Collapsed => "collapsed",
@@ -80,6 +91,20 @@ impl Reason {
             Reason::SignalSuppressed => "suppressed",
             Reason::HashUnchanged => "unchanged",
         }
+    }
+
+    /// The reason [`Reason::as_str`] wrote, read back: `None` for a string this build does not know.
+    pub fn parse(s: &str) -> Option<Reason> {
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+
+    /// The trimmer degraded the block. One definition for [`Rendered::trimmed`] and for what `base doctor` names as
+    /// trimmed.
+    pub fn is_trim(self) -> bool {
+        matches!(
+            self,
+            Reason::Collapsed | Reason::ListCut | Reason::TextShortened
+        )
     }
 }
 
@@ -328,12 +353,7 @@ impl Rendered {
 
     /// True when the trimmer degraded anything in this run.
     pub fn trimmed(&self) -> bool {
-        self.withheld.iter().any(|w| {
-            matches!(
-                w.reason,
-                Reason::Collapsed | Reason::ListCut | Reason::TextShortened
-            )
-        })
+        self.withheld.iter().any(|w| w.reason.is_trim())
     }
 }
 

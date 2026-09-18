@@ -1093,6 +1093,36 @@ fn report_config_faults(faults: &[ConfigFault], latch: &std::sync::Once) -> bool
     spoke
 }
 
+/// A key base still parses and no longer reads, found in one `base.toml`, with what replaced it (spec A8, G6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyKey {
+    pub file: PathBuf,
+    pub section: &'static str,
+    pub key: &'static str,
+    pub replacement: &'static str,
+}
+
+impl LegacyKey {
+    /// The advisory `base doctor` prints.
+    pub fn sentence(&self) -> String {
+        format!(
+            "legacy: [{}] {} in {} is read by nothing; {}",
+            self.section,
+            self.key,
+            self.file.display(),
+            self.replacement
+        )
+    }
+}
+
+/// Every legacy key this build knows: section, key, and what replaced it. One table, so the migration (rank 09) adds
+/// its rows here rather than keeping a second list.
+const LEGACY_KEYS: &[(&str, &str, &str)] = &[(
+    "signal",
+    "max_chars",
+    "session start's budget is [budget] session_start_chars and the memory block's is [budget] memory_chars",
+)];
+
 impl BaseConfig {
     /// Load config: global `~/.base-gbl/base.toml` as base, workspace `.base/base.toml` overlaid on top.
     /// Workspace sections override global at the key level; missing sections inherit from global.
@@ -1118,12 +1148,10 @@ impl BaseConfig {
     pub fn load_reporting(cwd: &Path) -> (Self, Vec<ConfigFault>) {
         let mut faults = Vec::new();
 
-        let Some(home) = crate::home::home_root() else {
+        let Some([global_path, ws_path]) = Self::base_toml_paths(cwd) else {
             faults.push(ConfigFault::HomeUnresolvable);
             return (Self::default(), faults);
         };
-        let global_path = home.join(".base-gbl").join("base.toml");
-        let ws_path = cwd.join(".base").join("base.toml");
 
         let global = Self::read_table(&global_path, &mut faults);
         let workspace = Self::read_table(&ws_path, &mut faults);
@@ -1187,6 +1215,46 @@ impl BaseConfig {
                 None
             }
         }
+    }
+
+    /// The two `base.toml` files [`BaseConfig::load_reporting`] reads, global first, so every reader of them resolves
+    /// the same two paths. `None` without a home.
+    fn base_toml_paths(cwd: &Path) -> Option<[PathBuf; 2]> {
+        let home = crate::home::home_root()?;
+        Some([
+            home.join(".base-gbl").join("base.toml"),
+            cwd.join(".base").join("base.toml"),
+        ])
+    }
+
+    /// Every legacy key present in either `base.toml` (spec A8, G6), once per file that carries it. A file that
+    /// cannot be read or parsed yields nothing here: [`BaseConfig::load_reporting`] is what reports it.
+    pub fn legacy_keys(cwd: &Path) -> Vec<LegacyKey> {
+        let Some(paths) = Self::base_toml_paths(cwd) else {
+            return Vec::new();
+        };
+        let mut reported_by_load = Vec::new();
+        let mut out = Vec::new();
+        for path in paths {
+            let Some(table) = Self::read_table(&path, &mut reported_by_load) else {
+                continue;
+            };
+            for &(section, key, replacement) in LEGACY_KEYS {
+                let present = table
+                    .get(section)
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|t| t.contains_key(key));
+                if present {
+                    out.push(LegacyKey {
+                        file: path.clone(),
+                        section,
+                        key,
+                        replacement,
+                    });
+                }
+            }
+        }
+        out
     }
 }
 

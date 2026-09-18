@@ -121,6 +121,11 @@ pub struct DoctorReport {
     /// Counts against `healthy`: an inert trigger is a domain that silently stopped
     /// loading, and the fix is one line in domains.toml.
     pub trigger_faults: Vec<String>,
+    /// What each hook emitted, per tier doctor can read (spec A7): the last run and the largest of the last
+    /// [`crate::emit::record::WINDOW`] on record, against the budget each ran under, with what each trimmed.
+    /// **Advisory, never counted against `healthy`:** a first screen DUE NOW overflows is a reported state by ruling,
+    /// and over budget is a report, not a defect (`auk`'s rank 10 G0 verdict, question 2).
+    pub hook_output: Vec<crate::emit::record::TierSizes>,
     /// The write seam this binary was built with, [`store::LOCK_SEAM_MARKER`].
     ///
     /// Not diagnostic information for an operator — it is here so a verification
@@ -419,6 +424,18 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
             }
         }
     }
+    // Spec A8: a key base still parses and no longer reads is named, with the file and what replaced it.
+    for legacy in crate::config::BaseConfig::legacy_keys(cwd) {
+        warnings.push(legacy.sentence());
+    }
+    // Spec A7: what each hook emitted, from the tier dirs the failure trail reads, each dir once (the workspace and the
+    // global dir are one path when cwd is the global tier root).
+    let mut dirs_read = std::collections::HashSet::new();
+    let hook_output: Vec<crate::emit::record::TierSizes> = crate::hook::hook_log_dirs(cwd)
+        .into_iter()
+        .filter(|(_, dir)| dirs_read.insert(dir.clone()))
+        .map(|(tier, dir)| crate::emit::record::read(tier, &dir, crate::emit::record::WINDOW))
+        .collect();
     let config_errors = crate::command::check_command_files(cwd);
     let trigger_faults = trigger_faults(cwd);
     // FIVE conjuncts. Keep the doc comment on `DoctorReport::healthy` in step
@@ -458,6 +475,7 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         warnings,
         config_errors,
         trigger_faults,
+        hook_output,
         seam: store::LOCK_SEAM_MARKER,
     }
 }
@@ -530,6 +548,7 @@ pub fn format_human(report: &DoctorReport) -> String {
         for w in &report.warnings {
             out.push_str(&format!("   ⚠ {w}\n"));
         }
+        push_hook_output(&mut out, &report.hook_output);
         return out;
     }
 
@@ -701,6 +720,8 @@ pub fn format_human(report: &DoctorReport) -> String {
         }
     }
 
+    push_hook_output(&mut out, &report.hook_output);
+
     if !report.config_errors.is_empty() {
         out.push_str("\n─── config faults ────────────────────\n");
         for e in &report.config_errors {
@@ -729,6 +750,99 @@ pub fn format_human(report: &DoctorReport) -> String {
     };
     out.push_str(&format!("\n{verdict}\n"));
     out
+}
+
+/// The hook output section (spec A7): per tier, each hook's last run and the largest of the last runs on record,
+/// against the budget each ran under, with what each trimmed and the two rank 00 flags. A tier where session start
+/// never ran says so in words, never as a run of zero (C25). Advisory: nothing here touches `healthy`.
+fn push_hook_output(out: &mut String, tiers: &[crate::emit::record::TierSizes]) {
+    use crate::emit::record::{FILE, FileState};
+    if tiers.is_empty() {
+        return;
+    }
+    out.push_str("\n─── hook output (UTF-16 units, measured before printing) ───\n");
+    for t in tiers {
+        if let FileState::Present {
+            unreadable_lines,
+            unreadable_files,
+        } = t.file
+            && unreadable_lines + unreadable_files > 0
+        {
+            out.push_str(&format!(
+                "   ⚠ {} tier · {}: {unreadable_lines} unreadable line(s) and {unreadable_files} unreadable file(s) skipped\n",
+                t.tier, t.dir
+            ));
+        }
+        if t.event("session-start").is_none() {
+            let file = Path::new(&t.dir).join(FILE);
+            let why = match t.file {
+                FileState::Absent => format!("{} absent", file.display()),
+                FileState::Present { .. } => {
+                    format!("{} holds no session-start run", file.display())
+                }
+            };
+            out.push_str(&format!(
+                "   {} tier · session-start: no run on record ({why})\n",
+                t.tier
+            ));
+        }
+        for e in &t.events {
+            out.push_str(&format!(
+                "   {} tier · {}: last run {} of {} units at {}{}\n",
+                t.tier,
+                e.hook,
+                e.last.emitted_u16,
+                e.last.budget_u16,
+                e.last.ts,
+                trim_clause(&e.last)
+            ));
+            out.push_str(&format!(
+                "   {} tier · {}: largest of the last {} run(s) on record: {} of {} units at {}{}\n",
+                t.tier,
+                e.hook,
+                e.runs,
+                e.largest.emitted_u16,
+                e.largest.budget_u16,
+                e.largest.ts,
+                trim_clause(&e.largest)
+            ));
+            if let Some(ts) = &e.latest_over_budget {
+                out.push_str(&format!(
+                    "   ⚠ {} tier · {}: over budget in {} of the last {} run(s), latest at {ts}\n",
+                    t.tier, e.hook, e.over_budget_runs, e.runs
+                ));
+            }
+            if let Some(ts) = &e.latest_first_screen_overflow {
+                out.push_str(&format!(
+                    "   ⚠ {} tier · {}: header, instructions and DUE NOW passed the first {} units in {} of the last {} run(s), latest at {ts}\n",
+                    t.tier, e.hook, e.last.first_screen_u16, e.first_screen_overflow_runs, e.runs
+                ));
+            }
+        }
+    }
+}
+
+/// ` · trimmed: <block> <items> <reason>, ...` in ledger order, or ` · nothing trimmed`; then any row whose reason this
+/// build does not know, named, so a newer binary's trim is never read as nothing trimmed.
+fn trim_clause(run: &crate::emit::record::Run) -> String {
+    let list = |rows: &[crate::emit::record::Row]| {
+        rows.iter()
+            .map(|(block, items, reason)| format!("{block} {items} {reason}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut s = if run.trimmed.is_empty() {
+        " · nothing trimmed".to_string()
+    } else {
+        format!(" · trimmed: {}", list(&run.trimmed))
+    };
+    if !run.unrecognised.is_empty() {
+        s.push_str(&format!(
+            " · withheld for a reason this build does not know: {}",
+            list(&run.unrecognised)
+        ));
+    }
+    s
 }
 
 /// Count lines via a streaming reader (never loads the whole file at once).
@@ -1518,6 +1632,7 @@ mod tests {
             warnings: Vec::new(),
             config_errors: Vec::new(),
             trigger_faults: Vec::new(),
+            hook_output: Vec::new(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human = format_human(&report);
@@ -1535,6 +1650,7 @@ mod tests {
             warnings: Vec::new(),
             config_errors: Vec::new(),
             trigger_faults: Vec::new(),
+            hook_output: Vec::new(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human2 = format_human(&report2);
@@ -1737,11 +1853,117 @@ mod coach_drift_tests {
             warnings: vec![skill_drift_warning(Some("0.12.3"), "0.13.2", true).unwrap()],
             config_errors: vec![],
             trigger_faults: vec![],
+            hook_output: vec![],
             seam: store::LOCK_SEAM_MARKER,
         };
         assert!(report.healthy, "an advisory must not flip the verdict");
         // Reaches the reader even with no graph tiers present — a lagging coach
         // is true regardless of whether a graph exists in this directory.
         assert!(format_human(&report).contains("0.12.3"), "advisory must be rendered");
+    }
+}
+
+/// Rank 10's hook output section, in its own module. `coach_drift_tests` above is about a stale
+/// coach; a test's registered path is read as a statement of what the test covers, and this one
+/// covers neither drift nor health (`auk`, 2026-09-15 16:18, after the matrix registered this test
+/// under a module it does not belong to).
+#[cfg(test)]
+mod hook_output_tests {
+    use super::*;
+
+    /// Spec A7: the hook output section prints the last run and the largest against the budget each ran under, what
+    /// each trimmed, both rank 00 flags, unreadable lines, and a tier with no session start as exactly that. The
+    /// report has no graph tier, so this also proves the section reaches the reader on that early return.
+    #[test]
+    fn the_hook_output_section_prints_last_largest_trims_and_both_flags() {
+        use crate::emit::record::{EventSizes, FileState, Run, TierSizes};
+        fn run(
+            ts: &str,
+            emitted: usize,
+            budget: usize,
+            over: bool,
+            screen_ok: bool,
+            trimmed: &[(&str, usize, &str)],
+        ) -> Run {
+            Run {
+                ts: ts.to_string(),
+                emitted_u16: emitted,
+                budget_u16: budget,
+                full_u16: emitted * 3,
+                first_screen_u16: 2000,
+                over_budget: over,
+                first_screen_ok: screen_ok,
+                trimmed: trimmed
+                    .iter()
+                    .map(|(b, n, r)| (b.to_string(), *n, r.to_string()))
+                    .collect(),
+                other_withheld: Vec::new(),
+                unrecognised: Vec::new(),
+            }
+        }
+        let session = EventSizes {
+            hook: "session-start".to_string(),
+            runs: 2,
+            last: run(
+                "t2",
+                4100,
+                4000,
+                true,
+                false,
+                &[("forks", 157, "collapsed")],
+            ),
+            largest: run("t1", 8998, 9000, false, true, &[]),
+            over_budget_runs: 1,
+            latest_over_budget: Some("t2".to_string()),
+            first_screen_overflow_runs: 1,
+            latest_first_screen_overflow: Some("t2".to_string()),
+        };
+        let global_dir = "/home/.base-gbl/.base";
+        let report = DoctorReport {
+            tiers: vec![],
+            healthy: true,
+            warnings: vec![],
+            config_errors: vec![],
+            trigger_faults: vec![],
+            hook_output: vec![
+                TierSizes {
+                    tier: "workspace".to_string(),
+                    dir: "/ws/.base".to_string(),
+                    file: FileState::Present {
+                        unreadable_lines: 1,
+                        unreadable_files: 0,
+                    },
+                    events: vec![session],
+                },
+                TierSizes {
+                    tier: "global".to_string(),
+                    dir: global_dir.to_string(),
+                    file: FileState::Absent,
+                    events: vec![],
+                },
+            ],
+            seam: store::LOCK_SEAM_MARKER,
+        };
+        let human = format_human(&report);
+        let absent = format!(
+            "   global tier · session-start: no run on record ({} absent)\n",
+            Path::new(global_dir)
+                .join(crate::emit::record::FILE)
+                .display()
+        );
+        for want in [
+            "   workspace tier · session-start: last run 4100 of 4000 units at t2 · trimmed: forks 157 collapsed\n",
+            "   workspace tier · session-start: largest of the last 2 run(s) on record: 8998 of 9000 units at t1 · nothing trimmed\n",
+            "   ⚠ workspace tier · session-start: over budget in 1 of the last 2 run(s), latest at t2\n",
+            "   ⚠ workspace tier · session-start: header, instructions and DUE NOW passed the first 2000 units in 1 of the last 2 run(s), latest at t2\n",
+            "   ⚠ workspace tier · /ws/.base: 1 unreadable line(s) and 0 unreadable file(s) skipped\n",
+            absent.as_str(),
+        ] {
+            assert!(human.contains(want), "missing {want:?} in:\n{human}");
+        }
+        assert!(
+            !human.contains("workspace tier · session-start: no run on record"),
+            "a tier with runs on record is not absent:\n{human}"
+        );
     }
 }
