@@ -179,6 +179,18 @@ fn run_event(
             // A handler error still prints what it collected first: those sites had printed
             // before the error, and the unhealthy-graph warning is exactly what precedes one.
             let rendered = out.finish(&config, &cwd);
+            // Rank 10 (spec A7): what is about to print is kept for `base doctor`, beside the full-output file, before
+            // the print and before `handled?`, so a session start whose handler failed is still on record.
+            if let Some(dir) = crate::crud::handoff_show::session_start_dir(&cwd) {
+                let record = crate::emit::record::record_of(
+                    &rendered,
+                    "session-start",
+                    session_id.as_deref(),
+                );
+                if let Err(why) = crate::emit::record::keep(&dir, &record) {
+                    eprintln!("base: session start could not keep its output record: {why}");
+                }
+            }
             print!("{}", rendered.text);
             handled?;
             Ok(HookEventData { session_id, ..Default::default() })
