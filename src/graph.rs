@@ -409,7 +409,13 @@ mod tests {
         // (b) attached: old + unread but linked → spared
         body += &note_quads(&ns.uri, &g, "attached", "2020-01-01T00:00:00Z", None, true);
         // (c) recently read: unattached but read recently → spared
-        body += &note_quads(&ns.uri, &g, "fresh", "2020-01-01T00:00:00Z", Some("2026-06-18T00:00:00Z"), false);
+        // Seeded RELATIVE to now, never absolute. As an absolute 2026-06-18 this aged past the 90-day
+        // cutoff on 2026-09-16 and reddened both purge tests on every machine, having passed inside a
+        // one-day-wide window (plover, 2026-09-18). A fixture compared against a now()-derived cutoff
+        // must move with it.
+        let fresh_read = (chrono::Utc::now() - chrono::Duration::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        body += &note_quads(&ns.uri, &g, "fresh", "2020-01-01T00:00:00Z", Some(&fresh_read), false);
         let p = write_file(dir, "graph.nq", &body);
         (p, ns)
     }
