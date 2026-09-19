@@ -220,6 +220,7 @@ pub fn plan(
 pub fn apply(store: &Store, ns: &NamespaceConfig, trig_path: &Path, decisions: &[Decision]) -> Result<ReconcileStats> {
     let mut stats = ReconcileStats { scanned: decisions.len(), ..Default::default() };
     let p = &ns.prefix;
+    let now = crud::now_iso();
     let pfx = crud::prefixes(ns);
     let mut ops: Vec<String> = Vec::new();
 
@@ -237,6 +238,11 @@ pub fn apply(store: &Store, ns: &NamespaceConfig, trig_path: &Path, decisions: &
                 ops.push(crud::field_update(&d.g, &d.iri, &format!("{p}:status"), "\"deferred\""));
                 ops.push(crud::field_update(&d.g, &d.iri, &format!("{p}:deferredReason"),
                     &format!("\"auto: cold {days}d\"")));
+                // THE PAIR, copied from `apply_records`, which writes this on Defer and deletes it
+                // on Revive. Without it every row of `base project deferred` renders "date deferred
+                // not recorded" permanently — honest, and therefore never chased.
+                ops.push(crud::field_update(&d.g, &d.iri, &format!("{p}:deferredAt"),
+                    &format!("\"{now}\"^^xsd:dateTime")));
                 stats.deferred += 1;
             }
             Action::Revive => {
@@ -244,6 +250,17 @@ pub fn apply(store: &Store, ns: &NamespaceConfig, trig_path: &Path, decisions: &
                 ops.push(format!(
                     "DELETE {{ GRAPH <{g}> {{ <{s}> {p}:deferredReason ?r }} }}\n\
                      WHERE {{ GRAPH <{g}> {{ <{s}> {p}:deferredReason ?r }} }}",
+                    g = d.g, s = d.iri
+                ));
+                // THE OTHER HALF OF THE PAIR. Adding the Defer write without this leaves a revived
+                // project carrying a stale `deferredAt` that says deferred while `status` says
+                // active — one field reading the same in two states, arriving through the fix.
+                // A SEPARATE statement, not a second triple in the pattern above: a two-triple
+                // DELETE matches only when BOTH are present, and a project deferred before this
+                // change carries a reason and no date.
+                ops.push(format!(
+                    "DELETE {{ GRAPH <{g}> {{ <{s}> {p}:deferredAt ?a }} }}\n\
+                     WHERE {{ GRAPH <{g}> {{ <{s}> {p}:deferredAt ?a }} }}",
                     g = d.g, s = d.iri
                 ));
                 stats.revived += 1;

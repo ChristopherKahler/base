@@ -36,6 +36,16 @@ const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
 /// Deferral on. Appended to the seed's global `base.toml`.
 const ON: &str = "[defer]\nenabled = true\n";
 
+/// `ON` plus the PROJECT engine. Projects run behind `[protocol] enabled`, which the shared seed
+/// leaves OFF (this file's own header says so), so a project test seeded with `ON` alone
+/// reconciles nothing and every assertion after it is vacuous.
+const ON_PROTO: &str = "[defer]
+enabled = true
+
+[protocol]
+enabled = true
+";
+
 /// The seed with nothing that carries a clock: no handoffs, forks, tasks, milestones or reminders.
 /// Its one project was touched an hour before the seed is written, and projects keep their own
 /// engine behind `[protocol] enabled`, which the seed leaves off. Every record asserted on below is a
@@ -286,6 +296,52 @@ fn add_milestone(seed: &seed::Seed, slug: &str, status: &str, touched: i64, extr
     let link =
         Q::new(Tier::Workspace, "project/project-00").iri("hasMilestone", &format!("milestone/{slug}"));
     append(seed, Tier::Workspace, &format!("{}{}", q.out, link.out), slug);
+}
+
+/// A project in the workspace tier, with a REAL folder on disk.
+///
+/// Projects are dated by `protocol::touch::folder_last_touch` — the newest FILE mtime under the
+/// project folder — and NOT by the graph's `lastActive`. A fixture that only seeds `lastActive`
+/// reconciles to `Hold`, which is exactly how the first draft of these two tests failed on their
+/// own controls rather than on their subject.
+fn add_project(seed: &seed::Seed, slug: &str, status: &str, folder_days: u64, extra: &[(&str, &str)]) {
+    let dir = seed.ws.join(slug);
+    std::fs::create_dir_all(&dir).expect("project folder");
+    let file = dir.join("README.md");
+    std::fs::write(&file, "fixture\n").expect("project file");
+
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(folder_days * 86_400);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .expect("open to date")
+        .set_modified(when)
+        .expect("set mtime");
+
+    // THE MTIME WRITE CAN SILENTLY NOT LAND (filesystem granularity, a mount ignoring utimes), and
+    // every assertion after it would then measure a FRESH folder while claiming to measure an old
+    // one. Assert it rather than let the absence be silent.
+    let got = std::fs::metadata(&file).expect("stat").modified().expect("mtime");
+    let drift = got
+        .duration_since(when)
+        .or_else(|_| when.duration_since(got))
+        .expect("compare mtimes");
+    assert!(
+        drift.as_secs() < 120,
+        "the fixture mtime did not land for {slug}: asked for {folder_days}d old, drift {}s",
+        drift.as_secs()
+    );
+
+    let mut q = Q::new(Tier::Workspace, &format!("project/{slug}"))
+        .typ("Project")
+        .lit("name", &format!("Fixture {slug}"))
+        .lit("status", status)
+        .lit("path", slug)
+        .date("lastActive", &stamp(folder_days as i64));
+    for (p, v) in extra {
+        q = if p.ends_with("At") { q.date(p, v) } else { q.lit(p, v) };
+    }
+    append(seed, Tier::Workspace, &q.out, slug);
 }
 
 /// Every literal value of `<subject> <pred>` in one tier file, as written.
@@ -1739,5 +1795,84 @@ fn a_pending_migration_writes_no_deferral_at_all() {
     assert!(
         values(&seed, Tier::Workspace, "task/cold-three", "deferredAt").is_empty(),
         "a deferral date was written while the migration was pending:\n{out}"
+    );
+}
+
+/// ITEM 2, ARM A — a deferred project must record WHEN.
+///
+/// `apply_records` writes `deferredAt` on Defer; the PROJECT path had no such write, so every row
+/// of `base project deferred` rendered "date deferred not recorded" permanently. Honest, which is
+/// exactly why nobody chased it.
+///
+/// SPLIT FROM ARM B DELIBERATELY. In one test the first failing assertion hides the second, and the
+/// revive half is the one a single-line fix leaves broken — so it must be able to go red on its own.
+#[test]
+fn a_deferred_project_records_when_it_was_deferred() {
+    let seed = workspace("d-projat-a", ON_PROTO);
+    add_project(&seed, "cold-proj", "active", 40, &[]);
+    assert_eq!(
+        status(&seed, Tier::Workspace, "project/cold-proj"),
+        "active",
+        "control: the project must start working, or deferring it proves nothing"
+    );
+
+    let (code, out) = base(&seed, &["reconcile"]);
+    assert_eq!(code, 0, "{out}");
+
+    assert_eq!(
+        status(&seed, Tier::Workspace, "project/cold-proj"),
+        "deferred",
+        "control: the cold project did not defer, so this test never reached its subject:
+{out}"
+    );
+    assert_eq!(
+        values(&seed, Tier::Workspace, "project/cold-proj", "deferredAt").len(),
+        1,
+        "a deferred project must record when it was deferred, exactly once:
+{out}"
+    );
+}
+
+/// ITEM 2, ARM B — a revived project must CLEAR it. This is the half a one-line fix leaves broken.
+///
+/// It seeds `deferredAt` DIRECTLY rather than deferring first, and that is the whole design: on the
+/// unfixed tree the Defer half never writes the field, so an arm that deferred first would find it
+/// absent afterwards for the WRONG REASON and pass while proving nothing. Seeding the field is the
+/// only way this arm discriminates the revive path independently of the defer path.
+#[test]
+fn a_revived_project_clears_the_date_it_was_deferred() {
+    let seed = workspace("d-projat-b", ON_PROTO);
+    let at4 = stamp(4);
+    add_project(
+        &seed,
+        "back-proj",
+        "deferred",
+        1,
+        &[("deferredReason", "auto: cold 10d"), ("deferredAt", at4.as_str())],
+    );
+    assert_eq!(
+        status(&seed, Tier::Workspace, "project/back-proj"),
+        "deferred",
+        "control: must start deferred"
+    );
+    assert_eq!(
+        values(&seed, Tier::Workspace, "project/back-proj", "deferredAt").len(),
+        1,
+        "control: must start WITH the field, or its absence afterwards proves nothing"
+    );
+
+    let (code, out) = base(&seed, &["reconcile"]);
+    assert_eq!(code, 0, "{out}");
+
+    assert_eq!(
+        status(&seed, Tier::Workspace, "project/back-proj"),
+        "active",
+        "control: the warm project did not revive, so this test never reached its subject:
+{out}"
+    );
+    assert!(
+        values(&seed, Tier::Workspace, "project/back-proj", "deferredAt").is_empty(),
+        "a revived project still carries deferredAt, so the field says deferred while status says active:
+{out}"
     );
 }
