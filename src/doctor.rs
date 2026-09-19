@@ -424,27 +424,25 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         // `unrecognised` stay advisory — those are graphs base writes on purpose.
         && tiers.iter().all(|t| t.foreign_graphs.is_empty());
 
-    // G4 step 8 (rank 09): report the deferral migration's status. It goes in `warnings`, which is
-    // reported but is NOT one of the five conjuncts of `healthy` above — a pending migration is a
-    // thing to do, not a broken install, and conflating the two would make `base doctor` red for a
-    // state that is working exactly as designed.
+    // BOTH DEFERRAL-MIGRATION WARNINGS WERE REMOVED HERE, 2026-09-19, and NOTHING REPLACES THE
+    // "a migration ran" SIGNAL. That loss is stated out loud rather than left to be discovered,
+    // because the Applied branch was the only place base ever told an operator the migration had
+    // run. After this change no operator-visible surface states it at all.
     //
-    // This is a place to CONFIRM a suspicion, not a way to discover one: the operator has to run
-    // doctor to see it. Discovery is the session-start stderr line (`hook::session_start`), which is
-    // outside the output budget and speaks to the operator.
-    if let Some(root) = crate::protocol::migrate::marker_root(cwd) {
-        match crate::protocol::migrate::state(&root) {
-            crate::protocol::migrate::State::Pending => warnings.push(
-                "deferral upgrade migration PENDING — nothing has been written. \
-                 Preview it with `base defer migrate`."
-                    .to_string(),
-            ),
-            crate::protocol::migrate::State::Applied(when) => warnings.push(format!(
-                "deferral upgrade migration applied {}. Roll back with `base defer migrate --rollback`.",
-                when.format("%Y-%m-%d %H:%M")
-            )),
-        }
-    }
+    // The PENDING branch could not survive the removal of `mark_fresh_install`. With nothing writing
+    // the marker at install, an absent marker no longer separates "upgraded, not migrated" from
+    // "installed yesterday, nothing to migrate" — so this branch would have told every new 0.16.0
+    // user, forever, that a migration was pending. That is precisely the machine-wide false claim
+    // the removal exists to end, arriving through the line meant to preserve a signal.
+    //
+    // The APPLIED branch went on its own merits too. Its text advertised
+    // `base defer migrate --rollback` as the undo, and that promise is false at any distance from
+    // the run: `doctor::restore_tier` replaces whole tier files, so an undo on day 11 silently
+    // discards every unrelated write made since the sweep. It was struck from the G0 design as
+    // item 3 of this work order; it does not get to survive in code.
+    //
+    // The marker is now WRITE-ONLY in production. `base defer migrate --apply` still records it and
+    // `--rollback` still clears it; nothing outside the tests reads it.
 
     DoctorReport {
         tiers,

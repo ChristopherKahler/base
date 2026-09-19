@@ -61,70 +61,34 @@ const BARE: seed::Sizes = seed::Sizes {
     ..seed::TINY
 };
 
-/// The seed every test here stands on, with the rank 09 deferral migration already APPLIED.
+/// The seed every test here stands on.
 ///
-/// WHY THE MARK IS HERE, and why it is a FIDELITY fix rather than a fixture bent until the tests
-/// go green (`auk`, ruled 2026-09-18). Before rank 09 there was no marker, so a seed that created
-/// the tier directories WAS a faithful model of an installed machine. Rank 09 added a precondition
-/// to what "installed" means: `install::run` calls `migrate::mark_fresh_install`. The seed
-/// reproduces the DIRECTORIES of an install without reproducing the ACT of installing, so every
-/// test in this file was silently running against a machine that had never been installed, and the
-/// rank 09 write block engaged for a reason none of these tests is about.
+/// IT NO LONGER MARKS ANY MIGRATION. Until 2026-09-19 this was two functions: `workspace()`, which
+/// called `mark_migrated()` so the rank 09 write gate would not engage, and `workspace_pending()`,
+/// which left the marker absent to model a legacy machine. The gate is gone and `mark_fresh_install`
+/// with it, so there is no state to mark and no second fixture that needs one. Both collapsed here.
 ///
-/// THE CHECK THAT KEEPS THIS HONEST IS MG7. It restores the unconditional write block and must
-/// still redden all thirteen names with this marker in place. If it reddens fewer, the marker
-/// disabled the tests and this was a bend — and the count gets reported, not patched.
+/// WHY THE RETIRED ASSERT IS FINISHED RATHER THAN LOST. `mark_migrated` ended by asserting that the
+/// marker landed, and that assert guarded ORDER rather than success: `mark_fresh_install` marked
+/// only when the plan was EMPTY, so the fixture was correct only while `workspace()` ran BEFORE any
+/// record was seeded. Delete the function and the hazard cannot occur — the order it protected no
+/// longer exists to get wrong.
 ///
-/// Tests that need the legacy machine call [`workspace_pending`] instead.
+/// WHAT REPLACES IT, because the seed path still has one silent step. `remove_dir_all` is the only
+/// call here that ignores its result; everything inside `seed::write` carries an `.expect` with a
+/// named reason. On Windows a root can survive the clean while the call reports nothing, and a stale
+/// root feeds another run's records into every assertion after it — the same shape as the fixture
+/// that silently did not land, read from the other end. So the clean is ASSERTED.
 fn workspace(tag: &str, global_toml: &str) -> seed::Seed {
-    let seed = workspace_pending(tag, global_toml);
-    mark_migrated(&seed);
-    seed
-}
-
-/// The same seed with the migration LEFT PENDING: upgraded from a version predating the feature and
-/// not yet migrated. This is the population the 0.16.0 release gate is about.
-fn workspace_pending(tag: &str, global_toml: &str) -> seed::Seed {
     let root = std::env::temp_dir().join(format!("base-r05-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    seed::write(&root, &BARE, global_toml)
-}
-
-/// Record the deferral migration as applied, by calling the SAME function a real install calls, at
-/// the same point a real install calls it: before any record exists, when the plan is still empty.
-///
-/// Writing the marker by hand would duplicate both its file name and its format into the tests, and
-/// a duplicated constant is the thing that drifts.
-///
-/// The directory is spelled out rather than taken from `migrate::marker_root`, for the same reason
-/// [`graph_file`] spells the tier paths out: `marker_root` resolves the marker for THIS process,
-/// and every assertion below is about the CHILD process, which resolves its home from `BASE_HOME`.
-///
-/// IT ASSERTS THE MARKER LANDED, AND THAT ASSERT GUARDS ORDER RATHER THAN SUCCESS (`auk`,
-/// 2026-09-18). DO NOT REMOVE IT AS NOISE. `mark_fresh_install` marks only when the plan is EMPTY,
-/// so this fixture is correct only while `workspace()` runs BEFORE any record is seeded. Get that
-/// order wrong in some future test and it sees a non-empty plan, declines to mark, the machine
-/// stays Pending, and that test fails FOR THE OLD REASON while looking like the fix did not work —
-/// a wrong fixture whose failure points at production. This assert is the only thing separating
-/// those two readings.
-///
-/// It is the same principle [`append`] is built on: a fixture that silently did not land reads as
-/// the feature under test being absent.
-fn mark_migrated(seed: &seed::Seed) {
-    let dir = seed.home.join(".base-gbl").join(".base");
-    std::fs::create_dir_all(&dir).expect("global tier directory");
-    let cfg = BaseConfig::load(&seed.home.join(".base-gbl"));
-    base::protocol::migrate::mark_fresh_install(&dir, Some(&seed.home), &seed.ws, &cfg)
-        .expect("mark_fresh_install must succeed on a seed that holds no records");
     assert!(
-        matches!(
-            base::protocol::migrate::state(&dir),
-            base::protocol::migrate::State::Applied(_)
-        ),
-        "the fixture marker did not land in {} — every test in this file would then be measuring \
-         the rank 09 write block instead of the thing its name says",
-        dir.display()
+        !root.exists(),
+        "the seed root {} survived its clean, so this test would run against a previous run's \
+         records and every assertion below would be measuring the wrong tree",
+        root.display()
     );
+    seed::write(&root, &BARE, global_toml)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1659,84 +1623,41 @@ fn the_clock_reads_every_deferred_reason_whichever_position_it_was_written_in() 
     assert_eq!(after_a, "deferred", "the clock revived a task an operator also deferred");
 }
 
-// ── Rank 09: the pending-migration guard ─────────────────────────────────────
+// ── The rank 09 pending-migration guard was tested here. REMOVED 2026-09-19 ────────────
 //
-// `auk`'s ruling, `verdicts/2026-09-18-auk-lane3-reconcile-skip-vs-filter.md`: while the upgrade
-// migration is pending, `reconcile_records` must FILTER the plan, never SKIP the tier. Two earlier
-// versions skipped — the first returned from the whole pass, the second `continue`d a tier on its
-// first `Defer` — and each took that tier's REVIVES with it.
+// Three tests stood here. TWO ARE GONE BY NAME, because what they asserted is gone:
 //
-// Predictions for these three were registered BEFORE the code was written, in
-// `r09/prediction-reconcile-revive-filter.md`, as P1, P2, P3 and the MG-R1 / MG-R2 mutations.
+//   a_pending_migration_withholds_the_defer_and_still_revives_in_the_same_tier
+//   a_pending_migration_writes_no_deferral_at_all
+//
+// Both seeded `workspace_pending` — a machine with the marker absent — and asserted that a cold
+// record was NOT deferred. After the removal a cold record IS deferred, whatever any marker says.
+// Their required answer did not weaken, it INVERTED, and a test whose required answer flipped
+// cannot be carried forward. Bending either one until it went green is the bend `auk` ruled against
+// on 2026-09-18, and it would have deleted the coverage while making the file look healthier.
+//
+// THE THIRD SURVIVES, RENAMED, BODY UNCHANGED, because its required answer did not change. It
+// asserted the post-removal behaviour verbatim while the gate still stood. Its own doc named it a
+// guard against the FIX rather than the defect: a filter that dropped `Defer` unconditionally — the
+// guard stuck ON rather than removed — would redden this AND NOTHING ELSE in the file, which is the
+// single most likely way this removal goes wrong. It is shown red against exactly that mutation.
 
-/// THE PAIRED TEST. One cold record and one revivable record in the SAME tier, migration pending:
-/// the revive must fire and the defer must not.
+/// A cold record defers and a revivable record revives, IN THE SAME TIER, on one pass.
 ///
-/// NEITHER HALF ALONE PROVES IT, which is the whole reason they are one test. Asserting only that
-/// the defer is withheld passes on the broken tier-skip code. Asserting only that the revive fires
-/// passes on code carrying no guard at all. Only the pair pins the condition.
+/// RENAMED 2026-09-19 from `with_the_migration_applied_the_same_tier_defers_and_revives`. The old
+/// name described the seed's migration state and there is no migration state left to be in. The
+/// behaviour asserted is unchanged, so this is a rename and not a rewrite.
+///
+/// WHAT IT IS FOR, carried forward word for word: it is a guard against the FIX, not the defect. A
+/// filter that dropped `Defer` unconditionally would redden this and nothing else in this file. That
+/// is why it had to survive the removal that deleted its two siblings, and why it was renamed rather
+/// than replaced by something new.
 ///
 /// THE REVIVABLE HALF MUST BE A TASK. `plan_records` only ever produces `Revive` for a task or a
-/// milestone: handoffs and forks never revive on the clock (R7). Built with a handoff, the revive
-/// could not have fired, this test would have passed on broken code, and it would have looked like
-/// proof.
-///
-/// Mutation MG-R1 (restore the tier `continue`) and MG-R2 (restore the whole-pass early return)
-/// must both redden this on its revive assertion. If neither does, it is INERT and carried as a
-/// regression guard — never PROVEN, and never bent until it reddens.
+/// milestone: handoffs and forks never revive on the clock (R7). Built with a handoff the revive
+/// could not fire, this test would pass on broken code, and it would look like proof.
 #[test]
-fn a_pending_migration_withholds_the_defer_and_still_revives_in_the_same_tier() {
-    let seed = workspace_pending("r09-pair", ON);
-    add_task(&seed, "cold-one", "active", 40, &[]);
-    add_task(
-        &seed,
-        "back-one",
-        "deferred",
-        1,
-        &[("deferredReason", "auto: cold 40d"), ("deferredAt", &stamp(30))],
-    );
-
-    // Controls: the fixture must actually hold the two opposite records it claims to, or the
-    // assertions below could pass because nothing was ever there to act on.
-    assert_eq!(
-        status(&seed, Tier::Workspace, "task/cold-one"),
-        "active",
-        "control: the cold record must start working, or there is no defer to withhold"
-    );
-    assert_eq!(
-        status(&seed, Tier::Workspace, "task/back-one"),
-        "deferred",
-        "control: the revivable record must start deferred, or there is no revive to fire"
-    );
-
-    let out = session_start(&seed);
-
-    assert_eq!(
-        status(&seed, Tier::Workspace, "task/cold-one"),
-        "active",
-        "a deferral was written while the migration was pending, before any preview:\n{out}"
-    );
-    assert_eq!(
-        status(&seed, Tier::Workspace, "task/back-one"),
-        "active",
-        "THE REVIVE DID NOT FIRE. One unrelated cold record in the same tier disabled revival for \
-         the whole tier — records refusing to come back, which is the opposite direction from the \
-         one the guard exists to protect:\n{out}"
-    );
-    assert!(
-        values(&seed, Tier::Workspace, "task/back-one", "deferredReason").is_empty(),
-        "the revived record kept its deferral reason:\n{out}"
-    );
-}
-
-/// The guard LIFTS. Same fixture with the migration applied: the cold record defers and the
-/// revivable one revives.
-///
-/// This proves nothing about the defect and is not claimed to. It is a guard against the FIX: a
-/// filter that dropped `Defer` unconditionally — the guard stuck on rather than stuck off — would
-/// redden this and nothing else.
-#[test]
-fn with_the_migration_applied_the_same_tier_defers_and_revives() {
+fn a_cold_record_defers_and_a_revivable_one_revives_in_the_same_tier() {
     let seed = workspace("r09-lift", ON);
     add_task(&seed, "cold-two", "active", 40, &[]);
     add_task(
@@ -1752,49 +1673,14 @@ fn with_the_migration_applied_the_same_tier_defers_and_revives() {
     assert_eq!(
         status(&seed, Tier::Workspace, "task/cold-two"),
         "deferred",
-        "the migration is applied, so a cold record must defer normally:\n{out}"
+        "a cold record did not defer. Nothing gates the defer pass any more, so the only way this \
+         fails is a filter that drops `Defer`:\n{out}"
     );
     assert_eq!(
         status(&seed, Tier::Workspace, "task/back-two"),
         "active",
-        "the migration is applied, so a revivable record must revive normally:\n{out}"
-    );
-}
-
-/// `auk`'s condition 2. The pending state keeps its coverage IN THIS FILE.
-///
-/// Once `workspace()` marks the migration applied, every other test here models an installed and
-/// migrated machine — so nothing in the file would notice if the write block stopped engaging. This
-/// test keeps the marker ABSENT and asserts the block still holds: a cold record is not deferred,
-/// and no deferral fields are written.
-///
-/// Without it, option A would quietly delete the guard from the suite while making everything
-/// green, which reads exactly like success.
-#[test]
-fn a_pending_migration_writes_no_deferral_at_all() {
-    let seed = workspace_pending("r09-block", ON);
-    add_task(&seed, "cold-three", "active", 40, &[]);
-    assert_eq!(
-        status(&seed, Tier::Workspace, "task/cold-three"),
-        "active",
-        "control: the record must start working"
-    );
-
-    let out = session_start(&seed);
-
-    assert_eq!(
-        status(&seed, Tier::Workspace, "task/cold-three"),
-        "active",
-        "the write block did not engage: a deferral was written before the operator previewed \
-         it:\n{out}"
-    );
-    assert!(
-        values(&seed, Tier::Workspace, "task/cold-three", "deferredReason").is_empty(),
-        "a deferral reason was written while the migration was pending:\n{out}"
-    );
-    assert!(
-        values(&seed, Tier::Workspace, "task/cold-three", "deferredAt").is_empty(),
-        "a deferral date was written while the migration was pending:\n{out}"
+        "a revivable record did not revive, in a tier that also held a cold record — the failure \
+         direction where records refuse to come back:\n{out}"
     );
 }
 

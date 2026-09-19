@@ -815,43 +815,22 @@ fn reconcile_active_state(config: &BaseConfig, cwd: &Path) {
     // Spec C5: handoffs, forks, tasks and milestones that went cold are deferred, in every tier, before
     // signals render, so session start already shows the truth. Gated on `[defer] enabled`, false in code
     // (lane 3 verdicts, AMENDMENTS B). Fail-open like the passes beside it.
-    // Rank 09 discoverability. This line is the ONLY thing that tells an operator the upgrade
-    // migration is waiting, and it is an EXISTING line widened rather than new surface.
+    // THE PENDING-MIGRATION FORM OF THIS LINE WAS REMOVED, 2026-09-19, with the gate it reported.
+    // It said "NOTHING HAS BEEN WRITTEN. N records are waiting on the upgrade migration", and that
+    // stops being true the moment nothing withholds the write. A line announcing a block that no
+    // longer exists is worse than no line: it is confidently wrong.
     //
-    // Why widening it is free: stderr is outside every output budget BY CONSTRUCTION, because Claude
-    // Code feeds only a hook stdout to the model (the `emit` module header says so). So this costs
-    // nothing against the 1,990-unit bar and session start grows no block.
-    //
-    // THE LIMIT, named here and not only in the design doc: stderr reaches the OPERATOR and NOT the
-    // model, by that same sentence. This line can never make the model act on a pending migration.
-    // If that is ever wanted it needs the stdout side, which IS inside the bar and would have to win
-    // space against every other block. Nobody should have to discover that by trying it.
-    //
-    // THE TWO FORMS MUST NOT BE CONFUSABLE (auk, hard condition, 2026-09-18). An operator who sees a
-    // number and cannot tell whether it HAPPENED or is WAITING is worse off than with silence,
-    // because silence prompts a question and a misread number does not. That is the tree_after defect
-    // exactly: a field that reads the same in two states and gets believed. So the pending form does
-    // not lead with a count at all. It leads with the state, in words, and names the command.
-    let migration_pending = crate::protocol::migrate::blocks_automatic_defer_for(cwd);
+    // WHAT SURVIVES, and why the stderr reasoning still holds for it: stderr is outside every output
+    // budget BY CONSTRUCTION, because Claude Code feeds only a hook stdout to the model (the `emit`
+    // module header says so). So the counts below cost nothing against the 1,990-unit bar. THE LIMIT
+    // is the same one that applied to the removed line: stderr reaches the OPERATOR and NOT the
+    // model, so nothing printed here can make the model act.
     match crate::protocol::reconcile::reconcile_records(crate::home::home_root().as_deref(), cwd, config) {
         Ok(stats) if stats.changed() => {
             eprintln!(
                 "base: defer — {} deferred, {} revived ({} records scanned)",
                 stats.deferred, stats.revived, stats.scanned
             );
-        }
-        // Reached only when [defer] enabled is ON: the pass returns above when it is off, and a
-        // feature that is off has nothing waiting. So the operator who just turned it on is exactly
-        // the one who gets told, on their first run.
-        Ok(_) if migration_pending => {
-            match crate::protocol::migrate::plan(crate::home::home_root().as_deref(), cwd, config) {
-                Ok(plan) if !plan.is_empty() => eprintln!(
-                    "base: defer — NOTHING HAS BEEN WRITTEN. {} records are waiting on the upgrade migration. Run `base defer migrate` to see the plan.",
-                    plan.total()
-                ),
-                Ok(_) => {}
-                Err(e) => eprintln!("base: defer migration plan failed: {e}"),
-            }
         }
         Ok(_) => {}
         Err(e) => eprintln!("base: defer failed: {e}"),

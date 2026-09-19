@@ -238,15 +238,11 @@ pub fn state(base_dir: &Path) -> State {
     State::Pending
 }
 
-/// Whether the automatic deferral pass must refuse to WRITE.
-///
-/// `auk` made this a hard condition and he is right that it must not be left to the caller: if the
-/// pass writes and the operator then previews, the preview is not decoration, it is a PREVIEW OF
-/// SOMETHING ALREADY DONE, which is a screen that lies. `reconcile_records` calls this and returns
-/// before its write, so the refusal lives on the write path itself.
-pub fn blocks_automatic_defer(base_dir: &Path) -> bool {
-    state(base_dir) == State::Pending
-}
+// `blocks_automatic_defer` WAS HERE and was removed with the gate, 2026-09-19. It answered "must
+// the automatic deferral pass refuse to WRITE" — a question with no caller once deferring is
+// understood as recoverable rather than destructive. Its one consumer, `reconcile_records`, carries
+// the reasoning at the site the guard used to occupy. The predicate is GONE, not relocated
+// somewhere quieter.
 
 /// Every record that would otherwise defer, per tier. Reads without a lock and writes nothing.
 ///
@@ -488,55 +484,16 @@ pub fn format_plan(plan: &Plan) -> String {
 const GATING_TRAP: &str = "\n    Note: record deferral is gated by [defer] enabled, NOT by [protocol] enabled.\n    They are separate gates and they are not layered. If you set [protocol] enabled = false\n    expecting this to stop, it does not — these records still move. Set [defer] enabled = false.\n";
 
 
-/// Record the migration as ALREADY APPLIED on a fresh install, with nothing to do.
-///
-/// THIS IS THE FIX FOR THE DEFECT THE SUITE FOUND (13 red `deferral_test` names, `auk` ruling
-/// 2026-09-18), and it is worth reading before anyone "simplifies" it away.
-///
-/// An absent marker was doing DOUBLE DUTY. It meant both "a fresh install where nothing was ever
-/// pending" AND "a legacy install where a migration is genuinely waiting". Those are different
-/// facts and they read identically, so the write block engaged for people who had nothing to
-/// migrate — the deferral feature was simply off until they ran a command they had no reason to run.
-///
-/// The obvious patch is to block only when the plan is non-empty. THAT FIX PASSES TODAY AND FAILS ON
-/// DAY ELEVEN: a fresh install eventually HAS cold records, the plan becomes non-empty, the block
-/// engages, and it asks the operator to migrate records that were created AFTER the upgrade by the
-/// new code and never needed a reset. It hides the conflation instead of removing it.
-///
-/// Writing the marker at install removes it. Afterwards an absent marker means exactly ONE thing:
-/// upgraded from a version that predates this feature — which is precisely the population the
-/// migration exists for. No caller can read it two ways, because it only says one.
-pub fn mark_fresh_install(
-    base_dir: &Path,
-    gbl_root: Option<&Path>,
-    cwd: &Path,
-    config: &BaseConfig,
-) -> Result<()> {
-    if base_dir.join(MARKER).exists() {
-        // Redundant under the condition below rather than load-bearing, and kept only because
-        // re-reading an existing marker is wasted work. It must NEVER be the thing that decides.
-        return Ok(());
-    }
-    // THE CONDITION IS EMPTY PLAN, NOT ABSENT MARKER (`auk`, 2026-09-18, catching a hole I wrote).
-    //
-    // My first version marked APPLIED whenever the marker was absent. A LEGACY user has no marker —
-    // that is the entire definition of the population. So a legacy user running `base install` after
-    // upgrading, which people do routinely to rewire hooks, would have had their migration recorded
-    // as done having never run: the block lifts, their records still carry `lastActive ==
-    // createdAt`, and the next session start mass-defers all of them. That is the data-loss panic
-    // the 0.16.0 release is gated on, arriving through the fix for the defect.
-    //
-    // An absent marker was a PROXY for "nothing to migrate". The empty plan IS that fact. A proxy
-    // is what fails at the edge, and this edge is the one population that matters.
-    //
-    // A genuinely fresh install has no records at all, so the plan is empty. A legacy install has
-    // records that would defer, so it is not, and it stays PENDING until the operator previews.
-    let plan = plan(gbl_root, cwd, config)?;
-    if !plan.is_empty() {
-        return Ok(());
-    }
-    mark_applied(base_dir, &Outcome::default())
-}
+// `mark_fresh_install` WAS HERE and was DELETED on 2026-09-19, function and doc comment together.
+//
+// It recorded the deferral migration as already applied at install time, so that an absent marker
+// would mean exactly one thing: upgraded from a version predating the feature. That distinction had
+// one consumer, the write gate in `reconcile::reconcile_records`, and the gate is gone. With nothing
+// to gate, a machine-wide claim about migration state has nothing left to decide, so it is not
+// preserved in a quieter form — it is removed.
+//
+// `base install` no longer touches migration state at all (see `install::run`). A 0.16.0 install
+// carries no marker until an operator runs `base defer migrate --apply` themselves.
 
 /// Where the marker lives: the GLOBAL `.base/` when there is one, because this migration spans every
 /// tier and one run covers the install. Falls back to the workspace `.base/` when base was never
@@ -545,16 +502,6 @@ pub fn marker_root(cwd: &Path) -> Option<PathBuf> {
     crate::config::global_base_dir().or_else(|| crate::config::find_workspace_base(cwd))
 }
 
-/// [`blocks_automatic_defer`] for a caller that has a cwd rather than a base dir.
-///
-/// Failure direction, stated (law 41): NO base dir at all means base is not installed here, so there
-/// is no install to migrate and nothing to block — `false`. That is the opposite of an unreadable
-/// MARKER, which is [`State::Pending`] and DOES block. Absent install and absent proof-of-migration
-/// are different facts and they get different answers.
-///
-/// This answers only "is a migration pending". Whether that should stop a given tier's write is the
-/// CALLER's question, and `reconcile_records` answers it from the plan it has already computed
-/// rather than walking a second one — see its comment. One walk, exact condition.
-pub fn blocks_automatic_defer_for(cwd: &Path) -> bool {
-    marker_root(cwd).is_some_and(|d| blocks_automatic_defer(&d))
-}
+// `blocks_automatic_defer_for` WAS HERE, the cwd-taking form of the predicate above, and went with
+// it on 2026-09-19. Both of its call sites — `reconcile::reconcile_records` and
+// `hook::session_start` — were removed in the same change.

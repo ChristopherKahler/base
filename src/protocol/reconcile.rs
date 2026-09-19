@@ -611,32 +611,23 @@ pub fn reconcile_records(gbl_root: Option<&Path>, cwd: &Path, config: &BaseConfi
     if !config.defer.enabled {
         return Ok(stats);
     }
-    // Rank 09 / D1: while the upgrade migration is PENDING, this pass must not WRITE a deferral the
-    // operator has not previewed. If the pass writes first, the preview becomes a preview of
-    // something already done, which is a screen that lies.
+    // THE RANK 09 MIGRATION GATE WAS REMOVED HERE, 2026-09-19. This comment is its headstone and
+    // not its deletion: a reader who remembers `migration_pending` has to find out that it went and
+    // why, rather than find a file that never had it.
     //
-    // THE GUARD FILTERS THE PLAN. IT NEVER SKIPS THE TIER (`auk`, ruled 2026-09-18, after two
-    // earlier versions of this guard did exactly that). A guard that skips a container in order to
-    // block ONE action blocks EVERY other action in that container, and the difference is silent.
+    // The gate withheld `Defer` while the upgrade migration read PENDING, so that a legacy install
+    // could not mass-defer before its operator had previewed. Chris supplied the design intent that
+    // removes the premise: DEFERRING IS NOT DELETION. A deferred record stops surfacing, stays
+    // listable and queryable, and every listed row prints its own revive command
+    // (`crud::deferred::list`, wired for all five kinds). So the day-one sweep the gate existed to
+    // prevent is the feature working correctly, and the gate was blocking a correct outcome.
     //
-    // Both earlier versions failed that way. The first returned from the whole pass the moment a
-    // migration was pending; the second `continue`d a tier on its first `Defer`. Each took that
-    // tier's REVIVES with it, and the consequence landed on the exact population the 0.16.0 release
-    // gate is about: a legacy user with a migration pending who opens a deferred handoff to bring it
-    // back got NOTHING, silently, because some unrelated cold record elsewhere in the same tier
-    // would have deferred. That is the OPPOSITE direction from the one this guard exists to protect
-    // — not records vanishing, but records refusing to come back.
+    // The machine-wide claim it read went with it. An absent marker could not tell a fresh install
+    // from a legacy one without `mark_fresh_install`, which is also gone. `base defer migrate`
+    // survives as an OPT-IN way to reset `lastActive`; nothing gates on it any more.
     //
-    // Only `Defer` is withheld. Revives are not what the migration touches.
-    let migration_pending = crate::protocol::migrate::blocks_automatic_defer_for(cwd);
-    // The verbs this pass may still write. With a migration pending the set is `Revive` alone, so a
-    // tier holding nothing but deferrals is skipped by the cheap pre-check below because it has no
-    // work LEFT — never because its work was suppressed wholesale.
-    let writable = |a: Action| match a {
-        Action::Revive => true,
-        Action::Defer => !migration_pending,
-        _ => false,
-    };
+    // The verbs this pass may write. Both of them, unconditionally.
+    let writable = |a: Action| matches!(a, Action::Revive | Action::Defer);
     let now = Local::now();
     for file in crud::all_tier_files(gbl_root, cwd) {
         let first = plan_records(&store::load_graph(&file)?, config, now)?;

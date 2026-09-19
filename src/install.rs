@@ -55,21 +55,12 @@ pub fn run(
     let global_dir = home.join(".base-gbl");
     create_global_tier(&global_dir)?;
 
-    // Rank 09: a fresh install has nothing to migrate, so it records the deferral migration as
-    // already applied. Without this an absent marker means BOTH "fresh, nothing was ever pending"
-    // and "upgraded, a migration is waiting", and the write block engages for people with nothing to
-    // migrate. With it, absent means exactly one thing: upgraded from a version predating the
-    // feature. Non-fatal: a marker we could not write leaves the state Pending, which is the safe
-    // direction — it over-protects rather than under-protects.
-    if let Some(gbl_base) = crate::config::global_base_dir() {
-        let cfg = BaseConfig::load(&global_dir);
-        let here = std::env::current_dir().unwrap_or_else(|_| global_dir.clone());
-        if let Err(e) =
-            crate::protocol::migrate::mark_fresh_install(&gbl_base, Some(&home), &here, &cfg)
-        {
-            eprintln!("base: could not record the deferral migration as applied: {e}");
-        }
-    }
+    // INSTALL NO LONGER TOUCHES THE DEFERRAL MIGRATION, 2026-09-19. It used to call
+    // `migrate::mark_fresh_install` here so a fresh install could be told apart from a legacy one by
+    // the marker. That distinction existed only to feed the write gate in
+    // `reconcile::reconcile_records`, and the gate is gone: deferral is recoverable per record, so a
+    // first-run sweep is the feature rather than the hazard. Nothing about an install now depends on
+    // migration state, which is why the function this called no longer exists.
 
     // Step 3: Wire hooks in ~/.claude/settings.json
     let settings_path = home.join(".claude").join("settings.json");

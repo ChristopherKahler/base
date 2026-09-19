@@ -38,17 +38,9 @@ const SPREAD: seed::Sizes = seed::Sizes {
     ..seed::TINY
 };
 
-/// Nothing that carries a clock: the shape of a genuinely fresh install.
-const EMPTY: seed::Sizes = seed::Sizes {
-    open_handoffs: 0,
-    archived_handoffs: 0,
-    open_forks: 0,
-    archived_forks: 0,
-    tasks: 0,
-    milestones: 0,
-    due_reminders: 0,
-    ..seed::TINY
-};
+// `EMPTY` WAS HERE — a fixture holding nothing that carries a clock, the shape of a genuinely fresh
+// install. Its only user was `a_fresh_install_with_no_records_is_marked_applied`, deleted with
+// `mark_fresh_install` at the bottom of this file, so it went with it rather than sit unused.
 
 fn workspace(tag: &str) -> seed::Seed {
     let root = std::env::temp_dir().join(format!("base-r09-{tag}-{}", std::process::id()));
@@ -68,10 +60,33 @@ fn waiting(s: &seed::Seed) -> usize {
         .unwrap_or_else(|| panic!("the preview named no count:\n{out}"))
 }
 
-/// Whether the migration is still pending, read the way the operator would read it.
+/// Whether the migration is still pending.
+///
+/// IT NO LONGER READS THIS FROM AN OPERATOR-VISIBLE SURFACE, BECAUSE THERE ISN'T ONE. Until
+/// 2026-09-19 this scraped `base doctor` for the string "deferral upgrade migration PENDING". Item 1
+/// removed both of doctor's migration warnings, so after that change no command anywhere states
+/// whether the migration ran. That loss is deliberate and recorded at the removal site in
+/// `doctor.rs`; this helper reads the marker directly because nothing else is left to read.
+///
+/// WHY THIS REWRITE IS THE DANGEROUS PART OF ITEM 1, stated where the next reader will find it.
+/// Leaving the old body in place would NOT have failed loudly. `out.contains(..)` on output that can
+/// no longer contain it returns `false` forever, so `pending()` becomes a constant. The five
+/// `assert!(pending(..))` sites then go red and get noticed; the three `assert!(!pending(..))` sites
+/// PASS NO MATTER WHAT THE COMMAND DID. Three assertions about whether `base defer migrate` marked
+/// the migration would have stopped testing anything, silently, inside the change that removed the
+/// display they depended on. This is the same shape as the `tree_after` defect: a value that reads
+/// the same in two different states and gets believed.
+///
+/// THE MARKER ROOT COMES FROM THIS SEED, never from `migrate::marker_root`. `marker_root` resolves
+/// through `home_root()`, which under the `isolation-guard` feature returns a path belonging to the
+/// TEST PROCESS rather than to the seed — the order-dependence measured in this file on 2026-09-18,
+/// where a pair read GREEN in a full-suite run and RED in a targeted run on the same commit.
 fn pending(s: &seed::Seed) -> bool {
-    let (_, out, _) = run_base(s, &["doctor"]);
-    out.contains("deferral upgrade migration PENDING")
+    let root = s.home.join(".base-gbl").join(".base");
+    matches!(
+        base::protocol::migrate::state(&root),
+        base::protocol::migrate::State::Pending
+    )
 }
 
 /// How many records a session start deferred. This is the number every test here is really about.
@@ -91,57 +106,52 @@ fn deferred_by_session_start(s: &seed::Seed) -> usize {
 // Everything below asserts records were NOT deferred. This proves that is a result and not the
 // silence of a pass that never fires.
 
-/// POSITIVE CONTROL for this whole file. Once the migration is complete the deferral pass DOES run
-/// on this fixture and DOES defer. If this goes red, every "was not deferred" assertion below is
-/// worthless and must be read as VOID, not as a pass.
+/// POSITIVE CONTROL for this whole file: the deferral pass DOES fire on this fixture and DOES
+/// defer. If this goes red, every "was not deferred" assertion below is worthless and must be read
+/// as VOID rather than as a pass.
+///
+/// REWRITTEN 2026-09-19, and the old version is why this comment is long. It used to run
+/// `--apply` first and then assert that session-start stderr did NOT contain "NOTHING HAS BEEN
+/// WRITTEN" — that is, that the write block had lifted. Item 1 deleted the line carrying that
+/// string, so the assertion could never fail again: a control that cannot go red is not a control
+/// (lane rule 63). Carrying it would have left this file's "was not deferred" assertions resting on
+/// an instrument that had quietly stopped measuring.
+///
+/// It now asserts the thing directly, with no migration run at all: cold records exist, and a
+/// session start defers them. That is also the headline behaviour change of item 1 — before the
+/// removal this fixture deferred NOTHING until an operator previewed, and the count here was zero.
 #[test]
-fn control_the_deferral_pass_fires_on_this_fixture_once_the_migration_is_complete() {
+fn control_the_deferral_pass_fires_on_this_fixture_and_defers() {
     let s = workspace("control");
     let full = waiting(&s);
     assert!(full > 0, "the fixture holds no records that would defer, so nothing here is testable");
-    let (rc, out, err) = run_base(&s, &["defer", "migrate", "--apply"]);
-    assert_eq!(rc, 0, "a complete apply should succeed:\nstdout:\n{out}\nstderr:\n{err}");
-    assert!(!pending(&s), "the migration should be complete after an unstaged --apply");
-    // The clocks were just reset to now, so nothing defers TODAY. The control is that the pass is
-    // no longer blocked: it runs and reports, rather than returning early.
-    let (_, _, err) = run_session_start(&s, None);
     assert!(
-        !err.contains("NOTHING HAS BEEN WRITTEN"),
-        "the write block should be lifted after a complete migration:\n{err}"
+        pending(&s),
+        "control: this fixture must start un-migrated, or the count below proves nothing about a \
+         machine that never ran the migration"
+    );
+    let deferred = deferred_by_session_start(&s);
+    assert!(
+        deferred > 0,
+        "session start deferred NOTHING on a fixture holding {full} cold records with no migration \
+         run. Either the defer pass is not firing, in which case every 'was not deferred' assertion \
+         in this file is VOID, or something still gates it — which is the gate item 1 removed"
     );
 }
 
 // ── DEFECT 1: the blocking one ──────────────────────────────────────────────────
 
-/// THE HEADLINE DEFECT. Staging must not mark the whole migration applied.
-///
-/// PRE-FIX BEHAVIOUR this is red against: `cli.rs` discarded the full plan, `apply` called
-/// `mark_applied` unconditionally, the write block lifted, and every record the operator did NOT
-/// stage deferred on the next session start — the mass defer K13 exists to prevent, reached through
-/// the staging feature that exists to make the operator safe.
-#[test]
-fn a_staged_apply_leaves_the_migration_pending_so_the_rest_cannot_defer() {
-    let s = workspace("staged");
-    let full = waiting(&s);
-    assert!(full >= 2, "need at least two waiting records to stage a partial run, got {full}");
-
-    let (rc, out, err) = run_base(&s, &["defer", "migrate", "--apply", "--limit", "1"]);
-    assert_eq!(rc, 0, "a partial apply is not an error:\nstdout:\n{out}\nstderr:\n{err}");
-
-    assert!(
-        pending(&s),
-        "a PARTIAL apply must leave the migration PENDING, or the records the operator did not \
-         take lose their protection. doctor said:\n{}",
-        run_base(&s, &["doctor"]).1
-    );
-    assert_eq!(
-        deferred_by_session_start(&s),
-        0,
-        "session start deferred records after a partial migration: this is the mass defer K13 \
-         exists to prevent, reached through the staging feature"
-    );
-}
-
+// `a_staged_apply_leaves_the_migration_pending_so_the_rest_cannot_defer` WAS HERE and DIED WITH
+// THE GATE, 2026-09-19.
+//
+// It was the headline test of the blocking defect: a staged `--apply` must not mark the whole
+// migration applied, because the records the operator did not stage would then defer on the next
+// session start. Its first assertion — that a partial apply leaves the state PENDING — is still
+// true and is still covered, by `rollback_works_after_a_partial_run_even_though_the_state_is_still_pending`
+// below. Its second assertion required that session start defer NOTHING afterwards, and that is
+// exactly what item 1 removed: cold records now defer whether or not a migration ran.
+//
+// So this test did not weaken, it INVERTED, and the surviving half is not lost.
 /// The sharper form, which writes nothing at all and is therefore not even recoverable.
 ///
 /// PRE-FIX BEHAVIOUR: the staged plan was empty, `apply` took the `is_empty` branch, marked Applied
@@ -157,14 +167,15 @@ fn a_filter_that_matches_nothing_refuses_and_does_not_mark_the_migration_applied
     assert_ne!(rc, 0, "a filter that matched nothing must REFUSE, not succeed:\nstdout:\n{out}");
     assert!(
         pending(&s),
-        "refusing must leave the migration PENDING; marking it here would lift the write block \
-         having written nothing. stderr was:\n{err}"
+        "refusing must leave the migration PENDING; marking it here would record a migration as \
+         done having written nothing. stderr was:\n{err}"
     );
-    assert_eq!(
-        deferred_by_session_start(&s),
-        0,
-        "session start deferred records after a refused migration"
-    );
+    // THE SESSION-START ASSERTION THAT USED TO CLOSE THIS TEST WAS REMOVED 2026-09-19. It required
+    // `deferred_by_session_start(&s) == 0` after a refused migration — true only while the gate
+    // withheld `Defer` on an un-migrated machine. Item 1 removed the gate, so cold records now defer
+    // regardless, and that assertion INVERTED rather than weakened. What this test is actually about
+    // — that a filter matching nothing refuses and records nothing — is asserted above, and is
+    // unaffected.
 }
 
 /// The one empty case that MAY mark: there is genuinely nothing to reset. Same count as the test
@@ -183,9 +194,12 @@ fn an_empty_plan_marks_applied_because_there_is_genuinely_nothing_to_reset() {
     assert!(!pending(&s), "an empty plan may mark the migration applied");
 }
 
-/// A complete run marks, and the block lifts. The other half of the pair above.
+/// A complete run marks, and leaves nothing waiting. The other half of the pair above.
+///
+/// RENAMED 2026-09-19 from `a_complete_apply_marks_applied_and_lifts_the_write_block`. There is no
+/// write block left to lift; both assertions in the body are unchanged and both still hold.
 #[test]
-fn a_complete_apply_marks_applied_and_lifts_the_write_block() {
+fn a_complete_apply_marks_applied_and_leaves_nothing_waiting() {
     let s = workspace("complete");
     let full = waiting(&s);
     assert!(full > 0);
@@ -233,102 +247,26 @@ fn apply_and_rollback_together_refuse_rather_than_guessing() {
     assert!(pending(&s), "the refused command must not have changed the migration state");
 }
 
-// ── THE LEGACY-INSTALL PAIR ─────────────────────────────────────────────────────
-// Added on auk's condition after he found a hole in my first fix. These two are a COMPLEMENT: same
-// call, same absent marker, opposite record populations, opposite required answers. Neither is worth
-// much alone — the first could pass because the function never marks anything, and the second could
-// pass because it marks everything. Only the pair pins the condition.
-
-/// A LEGACY install must NOT be marked applied. This is the one Chris gated the release on.
-///
-/// The hole this pins: my first `mark_fresh_install` marked APPLIED whenever the marker was ABSENT.
-/// A legacy user has no marker — that IS the population — so running `base install` after upgrading
-/// (routine, to rewire hooks) would have recorded their migration as done having never run. The
-/// block lifts, their records still carry `lastActive == createdAt`, and the next session start
-/// mass-defers all of them. An absent marker was a PROXY for "nothing to migrate"; the empty plan is
-/// that fact.
-#[test]
-fn a_legacy_install_with_records_and_no_marker_is_not_marked_applied() {
-    let s = workspace("legacy-install");
-    let full = waiting(&s);
-    assert!(full > 0, "control: the fixture must hold records that would defer, got {full}");
-
-    // THE MARKER ROOT COMES FROM THIS SEED, never from `migrate::marker_root`.
-    //
-    // `marker_root` resolves through `home_root()`, which under the `isolation-guard` feature
-    // returns a path belonging to the TEST PROCESS rather than to the seed. Both tests in this pair
-    // then shared ONE marker root: whichever ran first left a marker, and the second one's
-    // `mark_fresh_install` returned early at its `if base_dir.join(MARKER).exists()` line and read
-    // the other test's state as its own.
-    //
-    // Measured 2026-09-18: this pair read GREEN in a full-suite run and RED in a targeted run on the
-    // SAME commit. A test whose result depends on execution order was never evidence in either
-    // direction, and this is the test guarding the data-loss scenario 0.16.0 is gated on.
-    //
-    // It is the same defect as the production one this file exists to check: A VALUE WHOSE SCOPE IS
-    // WIDER THAN THE THING IT IS MEANT TO DESCRIBE. There, a machine-wide marker written from
-    // one-directory evidence. Here, a process-wide marker root standing in for a per-test seed.
-    //
-    // Every other test file in this tree already derives it from its own root — 26 places across 20
-    // files, including `deferral_test::mark_migrated` written by the same hand for this same hazard.
-    // This file was the only outlier.
-    let root = s.home.join(".base-gbl").join(".base");
-    std::fs::create_dir_all(&root).expect("the seed's global tier must exist");
-    assert!(
-        matches!(base::protocol::migrate::state(&root), base::protocol::migrate::State::Pending),
-        "control: a fixture that has never migrated must start Pending"
-    );
-
-    let cfg = base::config::BaseConfig::load(&s.home.join(".base-gbl"));
-    base::protocol::migrate::mark_fresh_install(&root, Some(&s.home), &s.ws, &cfg)
-        .expect("mark_fresh_install must not error on a legacy install");
-
-    assert!(
-        matches!(base::protocol::migrate::state(&root), base::protocol::migrate::State::Pending),
-        "a legacy install was marked APPLIED having never migrated: the write block would lift and \
-         {full} records would defer on the next session start"
-    );
-    assert!(pending(&s), "and doctor must still report it pending");
-}
-
-/// The twin, and it is what stops the test above passing for the wrong reason. A GENUINELY fresh
-/// install — no records at all, so an empty plan — MUST be marked applied, or deferral stays off
-/// forever for someone who has nothing to migrate.
-#[test]
-fn a_fresh_install_with_no_records_is_marked_applied() {
-    let root_dir = std::env::temp_dir().join(format!("base-r09-fresh-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root_dir);
-    let s = seed::write(&root_dir, &EMPTY, DEFER_ON);
-    assert_eq!(waiting(&s), 0, "control: this fixture must hold nothing that would defer");
-
-    // THE MARKER ROOT COMES FROM THIS SEED, never from `migrate::marker_root`.
-    //
-    // `marker_root` resolves through `home_root()`, which under the `isolation-guard` feature
-    // returns a path belonging to the TEST PROCESS rather than to the seed. Both tests in this pair
-    // then shared ONE marker root: whichever ran first left a marker, and the second one's
-    // `mark_fresh_install` returned early at its `if base_dir.join(MARKER).exists()` line and read
-    // the other test's state as its own.
-    //
-    // Measured 2026-09-18: this pair read GREEN in a full-suite run and RED in a targeted run on the
-    // SAME commit. A test whose result depends on execution order was never evidence in either
-    // direction, and this is the test guarding the data-loss scenario 0.16.0 is gated on.
-    //
-    // It is the same defect as the production one this file exists to check: A VALUE WHOSE SCOPE IS
-    // WIDER THAN THE THING IT IS MEANT TO DESCRIBE. There, a machine-wide marker written from
-    // one-directory evidence. Here, a process-wide marker root standing in for a per-test seed.
-    //
-    // Every other test file in this tree already derives it from its own root — 26 places across 20
-    // files, including `deferral_test::mark_migrated` written by the same hand for this same hazard.
-    // This file was the only outlier.
-    let root = s.home.join(".base-gbl").join(".base");
-    std::fs::create_dir_all(&root).expect("the seed's global tier must exist");
-    let cfg = base::config::BaseConfig::load(&s.home.join(".base-gbl"));
-    base::protocol::migrate::mark_fresh_install(&root, Some(&s.home), &s.ws, &cfg)
-        .expect("mark_fresh_install must succeed on a fresh install");
-
-    assert!(
-        matches!(base::protocol::migrate::state(&root), base::protocol::migrate::State::Applied(_)),
-        "a fresh install with nothing to migrate was left Pending, so deferral would stay blocked \
-         forever for someone who has nothing to migrate"
-    );
-}
+// ── THE LEGACY-INSTALL PAIR WAS HERE. BOTH TESTS DIED WITH `mark_fresh_install`, 2026-09-19 ──
+//
+//   a_legacy_install_with_records_and_no_marker_is_not_marked_applied
+//   a_fresh_install_with_no_records_is_marked_applied
+//
+// They were a COMPLEMENT and only worked as a pair: same call, same absent marker, opposite record
+// populations, opposite required answers. Both called `base::protocol::migrate::mark_fresh_install`
+// directly, and item 1 deleted that function. They cannot be adapted, because the condition they
+// pinned — mark APPLIED on an empty plan, stay PENDING on a non-empty one — exists nowhere now:
+// `base install` no longer touches migration state at all.
+//
+// WHAT THE PAIR WAS GUARDING, and why losing it costs nothing HERE: it stopped a legacy install
+// being recorded as migrated having never migrated, because that lifted the write gate and let the
+// next session start mass-defer every record. There is no write gate to lift. The mass defer it
+// feared is now the designed behaviour, recoverable per record, and `deferral_test`'s renamed
+// survivor is the test that pins it.
+//
+// THE ORDER-DEPENDENCE LESSON THEY CARRIED IS NOT LOST. Both spelled their marker root out of the
+// seed rather than calling `migrate::marker_root`, because `marker_root` resolves through
+// `home_root()` and under `isolation-guard` that is the TEST PROCESS's path, not the seed's — so the
+// pair shared one marker root and read GREEN in a full-suite run and RED in a targeted run on the
+// same commit. That reasoning now lives on `pending()` above, which is the only thing in this file
+// still reading a marker.
