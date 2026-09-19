@@ -187,6 +187,12 @@ fn sync_domain_list(
                 ),
                 None => String::new(),
             };
+            // The rule's matchers as flat literals on the rule (G0 2.2). The collector above deletes every
+            // triple on a synced rule, these included, so they cannot outlive the line that declares them.
+            let matcher_triples: String = crate::domain::rules::matcher_literals(rule.matchers())
+                .iter()
+                .map(|(pred, v)| format!("                       {p}:{pred} \"{}\" ;\n", crud::escape_sparql_literal(v)))
+                .collect();
             let rule_insert = format!(
                 "{pfx}\n\
                  INSERT DATA {{\n\
@@ -195,6 +201,7 @@ fn sync_domain_list(
                        {p}:ruleText \"{}\" ;\n\
                        {p}:priority \"{i}\" ;\n\
                  {rationale_triple}\
+                 {matcher_triples}\
                        {p}:source \"{}\" .\n\
                      <{domain_iri}> {p}:hasRule <{rule_iri}> .\n\
                    }}\n\

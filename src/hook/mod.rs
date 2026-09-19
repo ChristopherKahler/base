@@ -43,6 +43,10 @@ pub struct HookEventData {
     pub nudged: bool,
     /// Pre-tool-use: number of standards injected for this mutation
     pub standards_injected: usize,
+    /// User-prompt-submit: the bracket-rules block went out on this prompt.
+    /// Under K1 that is true once per tier per session, so a log showing it true
+    /// on consecutive prompts at one tier is the defect returning.
+    pub bracket_rules_injected: bool,
 }
 
 /// Extract tool name and file path from hook event JSON.

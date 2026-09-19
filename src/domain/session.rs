@@ -29,6 +29,17 @@ impl fmt::Display for Bracket {
 }
 
 impl Bracket {
+    /// The tier a label names, exactly as `Display` writes it. `None` for anything else.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "FRESH" => Some(Self::Fresh),
+            "MODERATE" => Some(Self::Moderate),
+            "DEPLETED" => Some(Self::Depleted),
+            "CRITICAL" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+
     /// Rules to inject at this tier: `always` first, then the tier's own bucket.
     ///
     /// Additive rather than exclusive — a DEPLETED prompt gets `always` + `depleted`.
@@ -101,6 +112,30 @@ fn process_session() -> Option<&'static str> {
     PROCESS_SESSION.get().map(String::as_str)
 }
 
+/// What one session was told about one rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShownRule {
+    /// Unix seconds. The action throttle (F5, at most once per 10 minutes per rule) compares against it.
+    pub at: u64,
+    /// The bracket tier in force when it was shown. A tier change re-serves the rules
+    /// now in force, once (F8).
+    pub tier: String,
+    /// A hash of what was actually rendered. A text or rationale edit changes it, so
+    /// an edited rule is shown again (F8's last line).
+    pub content: u64,
+}
+
+/// How a rule's record decides that it is due again (spec F8's table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReShow {
+    /// Always, place and topic, and every rule with no matcher: once per session per scope, again when the
+    /// bracket changes tier (when `on_tier_change`), and again when its text or rationale changes.
+    PerSession { on_tier_change: bool },
+    /// Action: every time its action runs, at most once per `secs`, and again when its content changes. A tier
+    /// change does not re-fire it, because it fires on its action and not on a tier.
+    Throttle { secs: u64 },
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SessionState {
     /// Session this instance is acting for. Not persisted — it is set at load and
@@ -143,6 +178,37 @@ pub struct SessionState {
     /// long sessions get a top-of-awareness restore.
     #[serde(default)]
     pub standards_injected: HashMap<String, u64>,
+    /// Scoped key → what this session was told about one rule, and when.
+    ///
+    /// F9: dedup per RULE, not per domain block. Before this the unit was the block,
+    /// so adding one rule to a seventeen-rule domain handed the reader all seventeen
+    /// again, sixteen of which it had already been told this session.
+    ///
+    /// The key carries the SCOPE, which is what lets one map serve all four kinds
+    /// without a second one: a topic or always rule is keyed on its id alone and is
+    /// therefore once per session, while a place or action rule is keyed on its id
+    /// AND the place or action that matched, and is therefore once per place and once
+    /// per action.
+    #[serde(default)]
+    pub rules_shown: HashMap<String, ShownRule>,
+    /// Scoped key → the bracket tier whose rules block this session has been shown.
+    ///
+    /// Deliberately NOT cleared by [`SessionState::clear_dedup`]. The DEPLETED and
+    /// CRITICAL force-refresh exists to restore domain rules that erode as context
+    /// fills; K1 says the bracket block is served once per tier and nothing else,
+    /// so a force-refresh that re-sent it would put the old every-prompt behaviour
+    /// back on exactly the long sessions the ruling was written for.
+    #[serde(default)]
+    pub bracket_shown: HashMap<String, String>,
+    /// Scoped key → the bracket tier the PROMPT hook most recently computed for this session.
+    ///
+    /// `petrel`'s FINDING 1 on `5c099d1`. The prompt hook reads its tier from the transcript's real
+    /// percentage. The tool hook's event carries no such reading, so it fell back to the prompt count. Both
+    /// write one per-rule record that re-opens whenever its stored tier differs, so in percent mode every
+    /// switch between a prompt and a tool call served the same rules again. The prompt hook owns the counter
+    /// and the reading, so it records the tier here, and every tool-hook branch reads this one value.
+    #[serde(default)]
+    pub bracket_tier: HashMap<String, String>,
 }
 
 impl SessionState {
@@ -216,7 +282,7 @@ impl SessionState {
             .is_some_and(|(scope, _)| scope == self.active_scope())
     }
 
-    fn now_secs() -> u64 {
+    pub fn now_secs() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs())
@@ -256,6 +322,9 @@ impl SessionState {
         self.injected.retain(|k, _| !k.starts_with(&prefix));
         self.ast_injected.retain(|k, _| !k.starts_with(&prefix));
         self.standards_injected.retain(|k, _| !k.starts_with(&prefix));
+        self.bracket_shown.retain(|k, _| !k.starts_with(&prefix));
+        self.bracket_tier.retain(|k, _| !k.starts_with(&prefix));
+        self.rules_shown.retain(|k, _| !k.starts_with(&prefix));
         self.dirty_apps.retain(|k| !k.starts_with(&prefix));
         self.prompt_counts.remove(session_id);
         self.last_seen.remove(session_id);
@@ -350,6 +419,22 @@ impl SessionState {
         }
     }
 
+    /// Record the tier the prompt hook computed, for the tool hook to serve at (`petrel` FINDING 1).
+    pub fn record_tier(&mut self, tier: Bracket) {
+        let key = self.scoped("tier");
+        self.bracket_tier.insert(key, tier.to_string());
+    }
+
+    /// The tier a tool call serves at: the one the prompt hook last computed for this session, so the two
+    /// hooks agree about what was served. Before the session's first prompt there is none, and the prompt
+    /// count decides, which is what the tool hook always did.
+    pub fn served_tier(&self, config: &BracketConfig, session_id: Option<&str>) -> Bracket {
+        self.bracket_tier
+            .get(&self.scoped("tier"))
+            .and_then(|t| Bracket::from_label(t))
+            .unwrap_or_else(|| self.bracket_for(config, session_id, None))
+    }
+
     /// Whether to force-refresh dedup (re-inject all domains) this prompt.
     /// True when DEPLETED or CRITICAL AND prompt lands on the refresh interval.
     pub fn should_force_refresh(&self, config: &BracketConfig) -> bool {
@@ -399,6 +484,94 @@ impl SessionState {
         let prefix = format!("{}{SCOPE_SEP}", self.active_scope());
         self.injected.retain(|k, _| !k.starts_with(&prefix));
         self.standards_injected.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    /// Claim one rule for this session: true when it should be served now, false
+    /// when this session has already been told it.
+    ///
+    /// F9. The unit of dedup is the rule, not the domain block. `scope` is the place
+    /// or the action that matched, and `None` for a rule serving on its topic, on
+    /// always, or through its domain's trigger — so a place rule is claimed once per
+    /// place and an action rule once per action, out of the same map.
+    ///
+    /// Three things re-open a claim, and they are F8's table:
+    ///   - the bracket changed tier, so the rules now in force are served once more;
+    ///   - the rule's own text or rationale changed, so it is a different rule to read;
+    ///   - a new Claude session, which has its own scope and has been told nothing.
+    ///
+    /// It DECIDES and RECORDS in one call, the way `claim_bracket_block` does, so two
+    /// call sites cannot drift into disagreeing about what was served.
+    pub fn claim_rule(
+        &mut self,
+        rule_id: &str,
+        content: u64,
+        tier: Bracket,
+        scope: Option<&str>,
+    ) -> bool {
+        let now = Self::now_secs();
+        if !self.rule_due(rule_id, content, tier, scope, ReShow::PerSession { on_tier_change: true }, now) {
+            return false;
+        }
+        self.mark_rule_shown(rule_id, content, tier, scope, now);
+        true
+    }
+
+    fn rule_key(&self, rule_id: &str, scope: Option<&str>) -> String {
+        match scope {
+            Some(s) => self.scoped(&format!("r{SCOPE_SEP}{rule_id}{SCOPE_SEP}{s}")),
+            None => self.scoped(&format!("r{SCOPE_SEP}{rule_id}")),
+        }
+    }
+
+    /// Whether a rule is due to be shown, recording NOTHING (F8). `domain::rules::select` asks this first and
+    /// records only what it returns, so a rule the topic cap cut is never marked as shown.
+    pub fn rule_due(&self, rule_id: &str, content: u64, tier: Bracket, scope: Option<&str>, reshow: ReShow, now: u64) -> bool {
+        let Some(prev) = self.rules_shown.get(&self.rule_key(rule_id, scope)) else {
+            return true;
+        };
+        if prev.content != content {
+            return true;
+        }
+        match reshow {
+            ReShow::PerSession { on_tier_change } => on_tier_change && prev.tier != tier.to_string(),
+            ReShow::Throttle { secs } => now.saturating_sub(prev.at) >= secs,
+        }
+    }
+
+    /// Record that a rule was shown at `now`, at this tier.
+    pub fn mark_rule_shown(&mut self, rule_id: &str, content: u64, tier: Bracket, scope: Option<&str>, now: u64) {
+        let key = self.rule_key(rule_id, scope);
+        self.rules_shown.insert(key, ShownRule { at: now, tier: tier.to_string(), content });
+    }
+
+    /// Claim the bracket-rules block for `tier`: true the first time this session
+    /// is served that tier's block, false afterwards, and true again the first time
+    /// a DIFFERENT tier is in force.
+    ///
+    /// K1, ruled by Chris 2026-09-12: "no, inject one time, then no more, inject only
+    /// when bracket changes the rules for that bracket." Before this, the block was
+    /// exempt from dedup by design and rode every prompt — 2,931 bytes per prompt at
+    /// FRESH and 1,878 at MODERATE on the operator's machine, measured 2026-09-12,
+    /// while the same text also sat in `~/.claude/CLAUDE.md`.
+    ///
+    /// It DECIDES and RECORDS in one call, so the four return sites in the prompt
+    /// hook cannot drift apart: a gate applied at three of them is a gate a user
+    /// routes around by having no domains configured. Call it only once the block
+    /// has actually rendered to something — claiming a tier for a block that was
+    /// never printed would silence the first real one after an operator configures
+    /// bracket rules mid-session.
+    ///
+    /// A change BACK to an earlier tier serves that tier's block again. The rules
+    /// now in force have not been served since they came into force, which is what
+    /// the ruling is about.
+    pub fn claim_bracket_block(&mut self, tier: Bracket) -> bool {
+        let key = self.scoped("bracket");
+        let tier = tier.to_string();
+        if self.bracket_shown.get(&key).is_some_and(|shown| *shown == tier) {
+            return false;
+        }
+        self.bracket_shown.insert(key, tier);
+        true
     }
 
     /// Whether this standard was already injected this session with the same

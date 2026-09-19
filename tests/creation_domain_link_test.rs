@@ -122,7 +122,7 @@ fn a_handoff_and_a_fork_take_the_domain_of_the_project_they_name() {
     let cwd = tmp.path();
     plant_project(cwd, "kit", Some("probe"));
 
-    let h = crud::handoff::create(None, cwd, &ns(), "kit", "docs/2026-09-06-kit-handoff.md", None)
+    let h = crud::handoff::create(None, cwd, cwd, &ns(), "kit", "docs/2026-09-06-kit-handoff.md", None)
         .unwrap()
         .slug;
     let f = crud::handoff::create_fork(cwd, &ns(), "kit", "docs/kit-side-quest.md", None).unwrap();

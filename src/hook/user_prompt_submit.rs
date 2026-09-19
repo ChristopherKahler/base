@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
@@ -5,7 +6,7 @@ use anyhow::Result;
 use crate::config::BaseConfig;
 use crate::domain;
 use crate::domain::matcher::{match_domains_auto, TriggerContext};
-use crate::domain::query::{query_domain_from_graph, resolve_and_run_query, format_toml_rules};
+use crate::domain::query::resolve_and_run_query;
 use crate::domain::session::{rules_hash, Bracket, SessionState};
 
 pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Result<super::HookEventData> {
@@ -43,27 +44,55 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // Track prompt count and derive bracket
     session.increment_prompt_for(session_id);
     let bracket = session.bracket_for(&config.bracket, session_id, context_pct);
+    // The tool hook serves at this same tier (`petrel` FINDING 1). Its event carries no transcript reading,
+    // and a tier it computed from the prompt count instead re-opened every rule record in percent mode.
+    session.record_tier(bracket);
 
-    // Force-refresh dedup in DEPLETED/CRITICAL on interval
+    // Force-refresh in DEPLETED and CRITICAL, on an interval. `clear_dedup` clears this session's domain-block
+    // hashes (`injected`) and standards hashes, so a matched domain's neighbourhood, query and steering lines
+    // are served again. It does NOT clear the per-rule record (`rules_shown`) or the bracket block: since F9
+    // a rule is shown again on a tier change, not on an interval, which is spec F8's table (`petrel` F2).
     if session.should_force_refresh_for(&config.bracket, session_id, context_pct) {
         session.clear_dedup();
     }
 
-    // Bracket rules — tier-gated, never deduped. Re-injecting every prompt IS the
-    // feature: these are the rules that must not erode as context fills, which a
-    // once-per-session domain injection cannot guarantee. Built before the *command
-    // branch so a star command cannot bypass them.
+    // Bracket rules — tier-gated, and served ONCE per tier (F7, ruled by Chris as K1
+    // on 2026-09-12: "no, inject one time, then no more, inject only when bracket
+    // changes the rules for that bracket"). Built before the *command branch so a
+    // star command cannot bypass them.
+    //
+    // This variable is the gate for all four return sites below. Each of them prints
+    // `{bracket_rules}`, so gating the string rather than the printers means a new
+    // return site added later cannot forget the rule.
+    //
+    // The short-circuit order matters: `claim_bracket_block` is not called when the
+    // render is empty. base ships no bracket rules, so a default install renders
+    // nothing at every tier, and claiming a tier for a block that was never printed
+    // would silence the first real one after an operator configures some.
     let bracket_rules = crate::domain::session::format_bracket_rules(bracket, &config.bracket.rules);
+    let bracket_rules = if bracket_rules.is_empty() || !session.claim_bracket_block(bracket) {
+        String::new()
+    } else {
+        bracket_rules
+    };
+    let bracket_injected = !bracket_rules.is_empty();
 
-    // Deferred from above: nothing else to do without domains, but the bracket
-    // block still goes out.
+    // Deferred from above: no domains to match, but the bracket block still goes
+    // out, and so do rules that carry matchers of their own: a rule added with
+    // `base rule add --kind` needs no domains.toml entry to fire (4d).
     if domains.is_empty() {
+        let store = crate::store::load_merged(cwd);
+        let converted = crate::domain::rules::rules_with_matchers(store.as_ref(), config, &domains);
+        let (matcher_block, matcher_served) =
+            serve_matcher_rules(config, &prompt, &mut session, bracket, &converted, &domains);
         if let Some(ref base_dir) = base_dir {
             let _ = session.save(base_dir);
         }
-        print!("{bracket_rules}");
+        print!("{bracket_rules}{matcher_block}");
         return Ok(super::HookEventData {
             prompt_num: Some(session.prompt_count_for(session_id)),
+            rules_injected: matcher_served,
+            bracket_rules_injected: bracket_injected,
             ..Default::default()
         });
     }
@@ -88,6 +117,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             print!("{bracket_rules}{cmd_output}");
             return Ok(super::HookEventData {
                 prompt_num: Some(session.prompt_count_for(session_id)),
+                bracket_rules_injected: bracket_injected,
                 ..Default::default()
             });
         }
@@ -100,6 +130,11 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // Single graph load per invocation (merged: global + workspace); the
     // injection loop and the walk share this store.
     let graph_store = crate::store::load_merged(cwd);
+
+    // Rules with matchers of their own (4d): read once, served on this prompt whether or not a domain matches, and
+    // kept out of every domain block below (F1).
+    let converted = crate::domain::rules::rules_with_matchers(graph_store.as_ref(), config, &domains);
+    let converted_ids: HashSet<&str> = converted.iter().map(|c| c.rule.id.as_str()).collect();
 
     // The paths this session touched (tool-hook log), never the store.
     let active_paths = gather_active_paths(cwd, base_dir.as_deref(), session_id);
@@ -123,12 +158,15 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         //
         // AND N-BRACKET-DEAD-WITHOUT-A-MATCHED-DOMAIN, the same early return
         // costing the same users a second feature. The bracket line and its
-        // rules are tier-gated, never domain-gated: they are re-sent every
-        // prompt precisely because they are the layer that must not erode as
-        // context fills, which a once-per-session injection cannot guarantee.
-        // Skipping them here made them erode fastest for the user with the
-        // fewest domains -- and on an install whose domains are all
-        // `mode = "triggered"`, erode to nothing.
+        // rules are tier-gated, never domain-gated, so withholding them because
+        // an unrelated domain trigger did not fire left the user with the fewest
+        // domains getting nothing at all -- and on an install whose domains are
+        // all `mode = "triggered"`, nothing ever.
+        //
+        // Under K1 the block itself is now served once per tier rather than every
+        // prompt; that gate lives where `bracket_rules` is built, above, so this
+        // return prints whatever the gate already decided. The reason this return
+        // must not skip it is unchanged: it is not domain-gated.
         //
         // `prompt_count_for(session_id)`, NOT the raw `session.prompt_count`.
         // Of the four return sites in this function this was the only one
@@ -158,6 +196,9 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             "<context-bracket>[{bracket}] (prompt {nomatch_prompt_num})</context-bracket>\n\n"
         );
         out.push_str(&bracket_rules);
+        let (matcher_block, matcher_served) =
+            serve_matcher_rules(config, &prompt, &mut session, bracket, &converted, &domains);
+        out.push_str(&matcher_block);
         if let Some(ref store) = graph_store {
             let nothing_served = std::collections::HashSet::new();
             let walked =
@@ -175,6 +216,8 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         }
         return Ok(super::HookEventData {
             prompt_num: Some(session.prompt_count),
+            rules_injected: matcher_served,
+            bracket_rules_injected: bracket_injected,
             ..Default::default()
         });
     }
@@ -188,6 +231,9 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         "<context-bracket>[{bracket}] (prompt {prompt_num})</context-bracket>\n\n"
     );
     output.push_str(&bracket_rules);
+    let (matcher_block, matcher_served) =
+        serve_matcher_rules(config, &prompt, &mut session, bracket, &converted, &domains);
+    output.push_str(&matcher_block);
 
     // Determine if we're in lean mode (FRESH, first 2 prompts — rules only, skip neighborhood)
     let lean_mode = bracket == Bracket::Fresh && prompt_num <= 2;
@@ -198,7 +244,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     // Steering layer (v0.4): dedup domain-linked command injection across domains,
     // and remember whether any fresh content was injected (gates the grounding block).
     let mut injected_commands: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut injected_any = false;
+    let mut injected_any = matcher_served > 0;
     // Every record IRI the domain blocks serve this prompt. The walk below dedups
     // against it, so a record cannot arrive twice under two headings.
     let mut domain_served: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -207,18 +253,33 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     for dm in &matched {
         let domain_def = dm.domain;
 
-        // Try graph-backed injection first, fall back to TOML rules
-        let (rules_text, neighborhood_text) = match &graph_store {
-            Some(store) => {
-                let (r, n, served) = query_domain_from_graph(store, config, domain_def);
+        // The rules and the neighbourhood are read separately now, because they are
+        // deduped differently: the rules per RULE (F9), the neighbourhood as a block.
+        // A rule with matchers of its own left this block in 4d: it was served on them above (F1).
+        let rules: Vec<crate::domain::rules::ServedRule> =
+            crate::domain::rules::rules_for_domain(graph_store.as_ref(), config, domain_def)
+                .into_iter()
+                .filter(|r| !converted_ids.contains(r.id.as_str()))
+                .collect();
+        let fresh: Vec<(usize, &crate::domain::rules::ServedRule)> = rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| session.claim_rule(&r.id, r.content_hash, bracket, None))
+            .collect();
+        // Only what the reader is actually handed is marked as served, so the walk
+        // still resolves a rule this block held back.
+        domain_served.extend(fresh.iter().filter_map(|(_, r)| r.iri.clone()));
+        let rules_text =
+            crate::domain::rules::render_block("DOMAIN", &fresh, rules.len(), &domain_def.name);
+
+        let neighborhood_text = match (&graph_store, lean_mode) {
+            (Some(store), false) => {
+                let (n, served) =
+                    crate::domain::query::query_domain_neighborhood(store, config, domain_def);
                 domain_served.extend(served);
-                if lean_mode {
-                    (r, String::new()) // skip neighborhood in lean mode
-                } else {
-                    (r, n)
-                }
+                n
             }
-            None => (format_toml_rules(domain_def), String::new()),
+            _ => String::new(),
         };
 
         // ─── Steering layer (v0.4): role / linked commands / output-mode / format ───
@@ -262,6 +323,28 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             && output_mode_line.is_none()
             && format_line.is_none()
         {
+            // A domain that HAS rules and had every one of them already served this
+            // session is not "contributes nothing". It is a dedup, and it has to be
+            // COUNTED as one.
+            //
+            // Since F9 dedups one rule at a time, a fully served domain arrives here
+            // with an empty `rules_text`, and a domain carrying nothing else used to
+            // `continue` before the dedup branch below ever ran. The injection was
+            // right and the report was not: the domain dropped out of
+            // `HookEventData::suppressed`, which feeds the JSONL log, and out of the
+            // devmode dedup list. A domain that silently vanishes from the count reads
+            // as a domain that never matched — a false clean bill in the telemetry.
+            // `graph_injection_test::dedup_skips_unchanged_graph_injection` caught it
+            // on the first full-suite run after F9 landed.
+            if !rules.is_empty() {
+                deduped_count += 1;
+                let dedup_reason = if config.devmode.enabled {
+                    format!("dedup [{}]", dm.reason)
+                } else {
+                    "dedup".into()
+                };
+                loaded_domains.push((domain_def.name.clone(), dedup_reason, 0));
+            }
             continue;
         }
 
@@ -302,19 +385,27 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         }
         let domain_output = sections.join("\n");
 
-        // Dedup: hash combined output (rules + neighborhood), skip if unchanged.
-        // Hash over SORTED lines — SPARQL result order shifts when the graph
-        // file is rewritten (post-tool-use fires on every edit), and an
-        // order-sensitive hash would re-inject unchanged content every prompt.
+        // The rules have already been deduped one at a time above. What is hashed
+        // here is everything ELSE the block carries — the neighbourhood, the query,
+        // the steering lines — which is still a block and still deduped as one.
+        //
+        // Hash over SORTED lines: SPARQL result order shifts when the graph file is
+        // rewritten (post-tool-use fires on every edit), and an order-sensitive hash
+        // would re-inject unchanged content every prompt.
         let combined_hash = {
-            let mut lines: Vec<String> = domain_output.lines().map(String::from).collect();
+            let mut lines: Vec<String> = domain_output
+                .lines()
+                .filter(|l| !rules_text.contains(*l))
+                .map(String::from)
+                .collect();
             lines.sort();
             rules_hash(&lines)
         };
-        // Count actual injected rules (from graph, not TOML)
-        let injected_rule_count = rules_text.lines().filter(|l| l.starts_with("  ")).count();
+        let injected_rule_count = fresh.len();
 
-        if session.is_injected(&domain_def.name, combined_hash) {
+        // A fresh rule is served even when nothing else about the block changed. The
+        // block hash can only suppress the block when it carries no new rule.
+        if rules_text.is_empty() && session.is_injected(&domain_def.name, combined_hash) {
             deduped_count += 1;
             let dedup_reason = if config.devmode.enabled {
                 format!("dedup [{}]", dm.reason)
@@ -493,15 +584,48 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
 
     Ok(super::HookEventData {
         domains_matched,
-        rules_injected: total_rules,
+        rules_injected: total_rules + matcher_served,
         suppressed: deduped_count,
         prompt_num: Some(session.prompt_count),
         prompt_text: prompt_preview,
         tool_name: None,
         file_path: None,
         session_id: None, // populated by run() after handle returns
+        bracket_rules_injected: bracket_injected,
         ..Default::default()
     })
+}
+
+/// Rules that carry matchers of their own, for one prompt (4d): always rules on the session's first prompt and on
+/// each tier change, and topic rules ranked against the prompt and capped at `topic_max`, with F6's pointer line
+/// for what the cap withheld (F6, F7, F8). `select` records only what it returns, so this renders exactly that.
+///
+/// Three callers in `handle`, one per return site that is not a star command: no domains at all, no domain matched,
+/// and the main path. A star command is an explicit invocation and passes rules by, as it passes domains by.
+fn serve_matcher_rules(
+    config: &BaseConfig,
+    prompt: &str,
+    session: &mut SessionState,
+    bracket: Bracket,
+    converted: &[crate::domain::rules::Converted],
+    domains: &[domain::DomainDef],
+) -> (String, usize) {
+    if converted.is_empty() {
+        return (String::new(), 0);
+    }
+    let keywords: HashMap<String, Vec<String>> =
+        domains.iter().map(|d| (d.name.clone(), d.prompt_keywords.clone())).collect();
+    let home = crate::home::home_root().map(|h| h.display().to_string());
+    let cx = crate::domain::rules::SelectContext {
+        bracket,
+        now: SessionState::now_secs(),
+        home: home.as_deref(),
+        keywords: &keywords,
+        rules: &config.rules,
+    };
+    let event = crate::domain::rules::Event::Prompt { text: prompt };
+    let selection = crate::domain::rules::select(converted, &event, session, &cx);
+    (crate::domain::rules::render_selection(&selection), selection.served.len())
 }
 
 /// The walk's three steps as one unit: dedup against what this session already
