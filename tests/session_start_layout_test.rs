@@ -107,7 +107,11 @@ fn the_header_instructions_and_due_now_fit_the_first_screen() {
         ),
         (
             "DUE NOW's last item",
-            "  2 Seed reminder 1 is due · clear: base reminder remove seed-reminder-1",
+            // `archive`, not `remove`, since lane 3 rank 06: a handled reminder is archived
+            // and kept, and `remove` is a hard delete. Both commands exist; session start
+            // changed which one it RECOMMENDS. The assertion below is unchanged - this
+            // still pins DUE NOW's last item inside the first 2,000 UTF-16 units.
+            "  2 Seed reminder 1 is due · clear: base reminder archive seed-reminder-1",
         ),
     ] {
         let end = end_of_line_with(stdout, needle)
