@@ -831,6 +831,27 @@ fn reconcile_active_state(config: &BaseConfig, cwd: &Path) {
                 "base: defer — {} deferred, {} revived ({} records scanned)",
                 stats.deferred, stats.revived, stats.scanned
             );
+            // THE POINTER FOR RECORDS. It names the four commands instead of breaking the count
+            // down by kind, because `RecordStats` holds no per-kind counts and adding them would
+            // make this a feature. The capability is already complete: `crud::deferred::list` is
+            // wired for every kind and each row already prints its own revive command. This only
+            // has to get the operator there.
+            //
+            // THE LAST LINE IS THE ONE THAT CANNOT BE LEFT OUT. Reading a deferred handoff moves
+            // its clock but does NOT revive it (R7, mutation-proven). So opening the file looks
+            // like it should work and does not, and this is the only place an operator is ever
+            // told otherwise.
+            //
+            // Gated on `deferred > 0`, not on `changed()`: a pass that only revived would
+            // otherwise explain how to find what was deferred having deferred nothing.
+            if stats.deferred > 0 {
+                eprintln!("  Deferred records are not deleted. They stop showing up, and they stay listed.");
+                eprintln!("  That count covers four kinds, and each one lists separately:");
+                eprintln!("    base handoff deferred     base task deferred");
+                eprintln!("    base fork deferred        base milestone deferred");
+                eprintln!("  Every row prints the command that brings that record back.");
+                eprintln!("  Opening the file does NOT bring one back. Only that command does.");
+            }
         }
         Ok(_) => {}
         Err(e) => eprintln!("base: defer failed: {e}"),
@@ -841,6 +862,34 @@ fn reconcile_active_state(config: &BaseConfig, cwd: &Path) {
                 "base: reconcile — {} deferred, {} revived ({} projects scanned)",
                 stats.deferred, stats.revived, stats.scanned
             );
+            // THE POINTER FOR PROJECTS, AND ITS WORDING IS DELIBERATELY NOT THE ONE ABOVE.
+            //
+            // A RECORD defers because nothing EDITED it. A PROJECT defers because no FILE under its
+            // folder changed. `protocol::touch::folder_last_touch` reads the newest modification
+            // time of any non-ignored file under the project's path, and `IGNORE_DIRS` skips
+            // `.base` BY NAME - because `graph.nq` is rewritten every session and counting it would
+            // re-introduce the freshness-faking that module exists to kill.
+            //
+            // So an operator who edited the project record inside base has written into a directory
+            // this walk refuses to look at. If this line said "untouched" without naming the
+            // folder, they would go looking in exactly the wrong place, and the line would be true
+            // for records and false here.
+            //
+            // The "untouched Nd" the listing prints is the same filesystem reading: `apply`
+            // overwrites `lastActive` from `touch_iso` on every non-terminal decision, so it is a
+            // cache of the folder's mtime rather than a record of activity in base.
+            //
+            // This line needs no extra condition to avoid an empty list. `[protocol] enabled`
+            // defaults off, `reconcile()` returns early when it is, and stats never change - so the
+            // line carrying this pointer only appears when something actually moved.
+            if stats.deferred > 0 {
+                eprintln!("  Deferred projects are not deleted. List them with: base project deferred");
+                eprintln!("  Every row prints the command that brings that project back.");
+                eprintln!("  A PROJECT defers on its FOLDER, not on its record. base reads the newest");
+                eprintln!("  file modification time under the project's path, skipping .base, .git,");
+                eprintln!("  node_modules, target and the like. Working on the project inside base does");
+                eprintln!("  not count here. Changing a file under the folder does.");
+            }
         }
         Ok(_) => {}
         Err(e) => eprintln!("base: reconcile failed: {e}"),
