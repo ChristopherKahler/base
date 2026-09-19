@@ -55,6 +55,22 @@ pub fn run(
     let global_dir = home.join(".base-gbl");
     create_global_tier(&global_dir)?;
 
+    // Rank 09: a fresh install has nothing to migrate, so it records the deferral migration as
+    // already applied. Without this an absent marker means BOTH "fresh, nothing was ever pending"
+    // and "upgraded, a migration is waiting", and the write block engages for people with nothing to
+    // migrate. With it, absent means exactly one thing: upgraded from a version predating the
+    // feature. Non-fatal: a marker we could not write leaves the state Pending, which is the safe
+    // direction — it over-protects rather than under-protects.
+    if let Some(gbl_base) = crate::config::global_base_dir() {
+        let cfg = BaseConfig::load(&global_dir);
+        let here = std::env::current_dir().unwrap_or_else(|_| global_dir.clone());
+        if let Err(e) =
+            crate::protocol::migrate::mark_fresh_install(&gbl_base, Some(&home), &here, &cfg)
+        {
+            eprintln!("base: could not record the deferral migration as applied: {e}");
+        }
+    }
+
     // Step 3: Wire hooks in ~/.claude/settings.json
     let settings_path = home.join(".claude").join("settings.json");
     let hooks_deferred = if !skip_hooks {

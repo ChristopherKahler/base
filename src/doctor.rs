@@ -423,6 +423,29 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         // perfectly, so nothing above can see it. Only `unscoped` and
         // `unrecognised` stay advisory — those are graphs base writes on purpose.
         && tiers.iter().all(|t| t.foreign_graphs.is_empty());
+
+    // G4 step 8 (rank 09): report the deferral migration's status. It goes in `warnings`, which is
+    // reported but is NOT one of the five conjuncts of `healthy` above — a pending migration is a
+    // thing to do, not a broken install, and conflating the two would make `base doctor` red for a
+    // state that is working exactly as designed.
+    //
+    // This is a place to CONFIRM a suspicion, not a way to discover one: the operator has to run
+    // doctor to see it. Discovery is the session-start stderr line (`hook::session_start`), which is
+    // outside the output budget and speaks to the operator.
+    if let Some(root) = crate::protocol::migrate::marker_root(cwd) {
+        match crate::protocol::migrate::state(&root) {
+            crate::protocol::migrate::State::Pending => warnings.push(
+                "deferral upgrade migration PENDING — nothing has been written. \
+                 Preview it with `base defer migrate`."
+                    .to_string(),
+            ),
+            crate::protocol::migrate::State::Applied(when) => warnings.push(format!(
+                "deferral upgrade migration applied {}. Roll back with `base defer migrate --rollback`.",
+                when.format("%Y-%m-%d %H:%M")
+            )),
+        }
+    }
+
     DoctorReport {
         tiers,
         healthy,

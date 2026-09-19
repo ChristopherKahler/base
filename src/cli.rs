@@ -287,6 +287,11 @@ pub enum Commands {
         /// Target directory (defaults to cwd)
         path: Option<String>,
     },
+    /// Deferral upgrade migration (rank 09): preview, apply, or roll back
+    Defer {
+        #[command(subcommand)]
+        action: DeferAction,
+    },
     /// Reconcile project active/deferred state from real folder last-touch
     Reconcile {
         /// Preview what would change — no graph writes. Bypasses the [protocol] enabled gate.
@@ -514,6 +519,29 @@ pub enum SecretAction {
     Rm {
         /// The key name to remove
         key: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DeferAction {
+    /// Reset the activity clock on records that would otherwise defer on upgrade.
+    ///
+    /// With no flag this PREVIEWS and writes nothing. That is D1, and it survives K13: Part G holds
+    /// two migrations and the rule migration next door already writes nothing until the operator
+    /// approves (G4 step 3). K13 changed what this migration does, not whether it asks.
+    Migrate {
+        /// Perform the reset. Without this nothing is written.
+        #[arg(long)]
+        apply: bool,
+        /// Restore every tier this migration wrote, from the snapshot taken before it wrote.
+        #[arg(long)]
+        rollback: bool,
+        /// Stage it: touch at most N records.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Stage it: only records at least D days cold.
+        #[arg(long)]
+        older_than: Option<i64>,
     },
 }
 
@@ -3349,6 +3377,69 @@ pub fn run() {
                 die("Scaffold failed", e);
             }
         }
+
+        // ─── Deferral upgrade migration (rank 09) ─────────────
+        Some(Commands::Defer { action }) => match action {
+            DeferAction::Migrate { apply, rollback, limit, older_than } => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let Some(root) = base::protocol::migrate::marker_root(&cwd) else {
+                    eprintln!(
+                        "base: no base directory here, so there is no install to migrate. \
+                         Run `base scaffold` first."
+                    );
+                    return;
+                };
+                // Two writes in opposite directions in one command is never what was meant, and
+                // guessing which one wins is how an operator loses a tier. Refuse and name both.
+                if apply && rollback {
+                    eprintln!("base: --apply and --rollback do the opposite of each other; pass one.");
+                    return;
+                }
+                if rollback {
+                    match base::protocol::migrate::rollback(&root) {
+                        Ok(n) => println!("base: defer migrate — rolled back {n} tier(s) from the pre-migration snapshot."),
+                        Err(e) => eprintln!("base: defer migrate --rollback failed: {e}"),
+                    }
+                    return;
+                }
+                let home = base::home::home_root();
+                let plan = match base::protocol::migrate::plan(home.as_deref(), &cwd, &config) {
+                    Ok(p) => p.stage(limit, older_than),
+                    Err(e) => {
+                        eprintln!("base: defer migrate plan failed: {e}");
+                        return;
+                    }
+                };
+                if !apply {
+                    print!("{}", base::protocol::migrate::format_plan(&plan));
+                    return;
+                }
+                // The four cases are reported as four DIFFERENT sentences. Two of them write
+                // nothing and they must never read alike: one means there was nothing to do, the
+                // other means the filter excluded everything and the migration is still waiting.
+                match base::protocol::migrate::apply(&root, &plan, &config) {
+                    Ok(base::protocol::migrate::Applied::NothingToDo) => println!(
+                        "base: defer migrate — nothing to reset. Every clock already reads a real touch."
+                    ),
+                    Ok(base::protocol::migrate::Applied::Complete(out)) => println!(
+                        "base: defer migrate — COMPLETE. Reset the activity clock on {} record(s) across \
+                         {} tier(s). Roll back with `base defer migrate --rollback`.",
+                        out.reset,
+                        out.snapshots.len()
+                    ),
+                    Ok(base::protocol::migrate::Applied::Partial { done, full, .. }) => println!(
+                        "base: defer migrate — PARTIAL: {done} of {full} record(s) reset. The migration is \
+                         STILL PENDING and automatic deferral stays blocked, so the {} you did not take \
+                         will NOT defer. Run it again to continue, or `base defer migrate --rollback`.",
+                        full - done
+                    ),
+                    Err(e) => {
+                        eprintln!("base: defer migrate --apply refused: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
 
         // ─── Reconcile ────────────────────────────────────────
         Some(Commands::Reconcile { dry_run }) => {

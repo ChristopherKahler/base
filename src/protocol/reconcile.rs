@@ -594,16 +594,50 @@ pub fn reconcile_records(gbl_root: Option<&Path>, cwd: &Path, config: &BaseConfi
     if !config.defer.enabled {
         return Ok(stats);
     }
+    // Rank 09 / D1: while the upgrade migration is PENDING, this pass must not WRITE a deferral the
+    // operator has not previewed. If the pass writes first, the preview becomes a preview of
+    // something already done, which is a screen that lies.
+    //
+    // THE GUARD FILTERS THE PLAN. IT NEVER SKIPS THE TIER (`auk`, ruled 2026-09-18, after two
+    // earlier versions of this guard did exactly that). A guard that skips a container in order to
+    // block ONE action blocks EVERY other action in that container, and the difference is silent.
+    //
+    // Both earlier versions failed that way. The first returned from the whole pass the moment a
+    // migration was pending; the second `continue`d a tier on its first `Defer`. Each took that
+    // tier's REVIVES with it, and the consequence landed on the exact population the 0.16.0 release
+    // gate is about: a legacy user with a migration pending who opens a deferred handoff to bring it
+    // back got NOTHING, silently, because some unrelated cold record elsewhere in the same tier
+    // would have deferred. That is the OPPOSITE direction from the one this guard exists to protect
+    // — not records vanishing, but records refusing to come back.
+    //
+    // Only `Defer` is withheld. Revives are not what the migration touches.
+    let migration_pending = crate::protocol::migrate::blocks_automatic_defer_for(cwd);
+    // The verbs this pass may still write. With a migration pending the set is `Revive` alone, so a
+    // tier holding nothing but deferrals is skipped by the cheap pre-check below because it has no
+    // work LEFT — never because its work was suppressed wholesale.
+    let writable = |a: Action| match a {
+        Action::Revive => true,
+        Action::Defer => !migration_pending,
+        _ => false,
+    };
     let now = Local::now();
     for file in crud::all_tier_files(gbl_root, cwd) {
         let first = plan_records(&store::load_graph(&file)?, config, now)?;
+        // `scanned` counts every record this pass PLANNED, including the ones it then declines to
+        // write. It is not a count of records acted on — `deferred` and `revived` are that count.
         stats.scanned += first.len();
-        if !first.iter().any(|d| matches!(d.action, Action::Defer | Action::Revive)) {
+        if !first.iter().any(|d| writable(d.action)) {
             continue;
         }
         let (d, r) = store::with_graph_lock(&file, || {
             let store = store::load_graph(&file)?;
-            let plan = plan_records(&store, config, now)?;
+            // THE FILTER GOES ON THE PLAN RECOMPUTED INSIDE THE LOCK, never on `first` (`auk`, same
+            // ruling). The outer read is only a cheap pre-check; the two can disagree, and that
+            // disagreement is the whole reason this recompute exists.
+            let plan: Vec<RecordDecision> = plan_records(&store, config, now)?
+                .into_iter()
+                .filter(|d| writable(d.action))
+                .collect();
             apply_records(&store, &config.namespace, &file, &plan)
         })?;
         stats.deferred += d;

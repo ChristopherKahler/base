@@ -211,6 +211,23 @@ base extension run <name> [args...]      # collision-proof explicit plugin invoc
 base extension remove <name>
 ```
 
+Deferral upgrade migration (rank 09):
+
+```bash
+base defer                               # a NAMESPACE, not a command: its subcommands do the work
+base defer migrate                       # PREVIEWS and writes nothing -- this is the default
+base defer migrate --apply               # THE FLAG THAT WRITES: resets the activity clock on records
+                                         # that would otherwise go deferred the moment you upgrade
+base defer migrate --apply --limit <N>   # stage it: touch at most N records
+base defer migrate --apply --older-than <D>      # stage it: only records at least D days cold
+base defer migrate --rollback            # restore every tier it wrote, from the snapshot it took first
+```
+
+Listed here rather than under read-only even though it previews by default: a list grouped by risk
+classifies a command by the worst thing it can do, never by its default. Someone scanning this list
+is asking what can change their data, and `--apply` can. It is not in the destructive list because
+`--rollback` restores every tier from a snapshot taken before the write, so it is reversible.
+
 ## Destructive: warn first, never run to demonstrate
 
 ```bash

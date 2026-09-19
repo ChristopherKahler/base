@@ -118,6 +118,8 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base uninstall`
 - `base dashboard` (alias: dash)
 - `base scaffold`
+- `base defer`
+- `base defer migrate`
 - `base reconcile`
 - `base workspace`
 - `base workspace sync`
@@ -200,6 +202,7 @@ Commands:
   uninstall        Uninstall base: remove hooks from settings.json, remove binary, remove CLAUDE.md section
   dashboard        Launch the Command Center Dashboard (local web UI) [aliases: dash]
   scaffold         Scaffold a new workspace: create .base/, write configs, register globally
+  defer            Deferral upgrade migration (rank 09): preview, apply, or roll back
   reconcile        Reconcile project active/deferred state from real folder last-touch
   workspace        Registered-workspace registry (sync CLAUDE.md from base.toml)
   operator         Operator identity profile (init, show)
@@ -2506,6 +2509,48 @@ Arguments:
 Options:
   -h, --help
           Print help
+```
+
+## base defer
+
+```text
+Deferral upgrade migration (rank 09): preview, apply, or roll back
+
+Usage: base defer <COMMAND>
+
+Commands:
+  migrate  Reset the activity clock on records that would otherwise defer on upgrade
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base defer migrate
+
+```text
+Reset the activity clock on records that would otherwise defer on upgrade.
+
+With no flag this PREVIEWS and writes nothing. That is D1, and it survives K13: Part G holds two migrations and the rule migration next door already writes nothing until the operator approves (G4 step 3). K13 changed what this migration does, not whether it asks.
+
+Usage: base defer migrate [OPTIONS]
+
+Options:
+      --apply
+          Perform the reset. Without this nothing is written
+
+      --rollback
+          Restore every tier this migration wrote, from the snapshot taken before it wrote
+
+      --limit <LIMIT>
+          Stage it: touch at most N records
+
+      --older-than <OLDER_THAN>
+          Stage it: only records at least D days cold
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## base reconcile

@@ -779,6 +779,11 @@ Forks are additive, registering a new one never archives existing forks or the p
 **A:** `~/.base-gbl/manifest.toml` tracks, per component (base, and optionally PAUL/SEED/SKILLSMITH with `--full`), the installed version, install path, and install timestamp under `[components.<name>]`, plus an `[update_check]` section holding `last_checked`, `ttl_seconds` (default 7 days between checks), `pending_update` (the pending update string, if any), and `dismissed_until` (the `--snooze` expiry timestamp). It's the single source of truth the update banner reads from, which is exactly why a manual binary swap that doesn't touch this file causes the stale-manifest bug described under Known bugs.
 <!-- v0.12.3 | verified: source -->
 
+### Q: I upgraded base and now it wants to defer a pile of my old handoffs and tasks. What is `base defer migrate` and do I have to run it?
+
+**A:** Record deferral decides what is cold from a record's activity clock. On a version that predates the feature, that clock was never maintained, so on upgrade a lot of perfectly live records look untouched and would go `deferred` at the next session start. That is not data loss -- nothing is deleted and `base handoff show` or a new registration brings a record straight back -- but a screenful of your work going quiet at once is alarming, so the migration exists to stop it happening by surprise. Run `base defer migrate` to PREVIEW: it prints exactly which records would be touched and writes nothing. That is the default and there is no flag you need in order to look. When you are happy, `base defer migrate --apply` performs the reset. `base defer migrate --apply --limit <N>` touches at most N records and `base defer migrate --apply --older-than <D>` restricts it to records at least D days cold, so you can stage it rather than doing everything at once. If you do not like the result, `base defer migrate --rollback` restores every tier it wrote from the snapshot it took before writing. `base defer` on its own is just the namespace: `migrate` is the command that does the work.
+<!-- v0.15.2 | verified: cli-help -->
+
 ---
 
 ## Known bugs (status as of v0.12.3)
