@@ -253,8 +253,27 @@ fn a_legacy_install_with_records_and_no_marker_is_not_marked_applied() {
     let full = waiting(&s);
     assert!(full > 0, "control: the fixture must hold records that would defer, got {full}");
 
-    let root = base::protocol::migrate::marker_root(&s.ws)
-        .expect("the seed must resolve a marker root");
+    // THE MARKER ROOT COMES FROM THIS SEED, never from `migrate::marker_root`.
+    //
+    // `marker_root` resolves through `home_root()`, which under the `isolation-guard` feature
+    // returns a path belonging to the TEST PROCESS rather than to the seed. Both tests in this pair
+    // then shared ONE marker root: whichever ran first left a marker, and the second one's
+    // `mark_fresh_install` returned early at its `if base_dir.join(MARKER).exists()` line and read
+    // the other test's state as its own.
+    //
+    // Measured 2026-09-18: this pair read GREEN in a full-suite run and RED in a targeted run on the
+    // SAME commit. A test whose result depends on execution order was never evidence in either
+    // direction, and this is the test guarding the data-loss scenario 0.16.0 is gated on.
+    //
+    // It is the same defect as the production one this file exists to check: A VALUE WHOSE SCOPE IS
+    // WIDER THAN THE THING IT IS MEANT TO DESCRIBE. There, a machine-wide marker written from
+    // one-directory evidence. Here, a process-wide marker root standing in for a per-test seed.
+    //
+    // Every other test file in this tree already derives it from its own root — 26 places across 20
+    // files, including `deferral_test::mark_migrated` written by the same hand for this same hazard.
+    // This file was the only outlier.
+    let root = s.home.join(".base-gbl").join(".base");
+    std::fs::create_dir_all(&root).expect("the seed's global tier must exist");
     assert!(
         matches!(base::protocol::migrate::state(&root), base::protocol::migrate::State::Pending),
         "control: a fixture that has never migrated must start Pending"
@@ -282,8 +301,27 @@ fn a_fresh_install_with_no_records_is_marked_applied() {
     let s = seed::write(&root_dir, &EMPTY, DEFER_ON);
     assert_eq!(waiting(&s), 0, "control: this fixture must hold nothing that would defer");
 
-    let root = base::protocol::migrate::marker_root(&s.ws)
-        .expect("the seed must resolve a marker root");
+    // THE MARKER ROOT COMES FROM THIS SEED, never from `migrate::marker_root`.
+    //
+    // `marker_root` resolves through `home_root()`, which under the `isolation-guard` feature
+    // returns a path belonging to the TEST PROCESS rather than to the seed. Both tests in this pair
+    // then shared ONE marker root: whichever ran first left a marker, and the second one's
+    // `mark_fresh_install` returned early at its `if base_dir.join(MARKER).exists()` line and read
+    // the other test's state as its own.
+    //
+    // Measured 2026-09-18: this pair read GREEN in a full-suite run and RED in a targeted run on the
+    // SAME commit. A test whose result depends on execution order was never evidence in either
+    // direction, and this is the test guarding the data-loss scenario 0.16.0 is gated on.
+    //
+    // It is the same defect as the production one this file exists to check: A VALUE WHOSE SCOPE IS
+    // WIDER THAN THE THING IT IS MEANT TO DESCRIBE. There, a machine-wide marker written from
+    // one-directory evidence. Here, a process-wide marker root standing in for a per-test seed.
+    //
+    // Every other test file in this tree already derives it from its own root — 26 places across 20
+    // files, including `deferral_test::mark_migrated` written by the same hand for this same hazard.
+    // This file was the only outlier.
+    let root = s.home.join(".base-gbl").join(".base");
+    std::fs::create_dir_all(&root).expect("the seed's global tier must exist");
     let cfg = base::config::BaseConfig::load(&s.home.join(".base-gbl"));
     base::protocol::migrate::mark_fresh_install(&root, Some(&s.home), &s.ws, &cfg)
         .expect("mark_fresh_install must succeed on a fresh install");
