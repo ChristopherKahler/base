@@ -106,24 +106,38 @@ fn watch_script(title: &str) -> Option<String> {
 /// Truncation is now marked and names the file, so a clipped ping cannot be
 /// mistaken for a short one. The scan is narrowed to `ping-*.json`, and
 /// dotfiles (`.watching`, `.status`) stay invisible to it.
+///
+/// TWO CORRECTIONS FROM auk's GRADING OF THE FIRST VERSION OF THIS FIX, both
+/// of them the round's own defects committed inside the commit that fixes one.
+///
+/// UNITS. It cut with `cut -c` (characters) and reported with `wc -c` (bytes),
+/// labelled "bytes". On multibyte content the cut passed up to 2,100 bytes
+/// while the label claimed 700. `cut -c` is kept because it cannot split a
+/// character mid-sequence; BOTH units are now named, each as what it is.
+///
+/// DELIMITER. `seen` matched `*"$b|"*`, a trailing pipe only, so a filename
+/// ending with another entry's name would false-match and that ping would be
+/// SILENTLY SKIPPED — the exact failure this function exists to remove.
+/// `seen` now opens with `|` and the match is anchored on both sides.
 pub fn watch_script_for(inbox: &std::path::Path) -> Option<String> {
     let inbox = inbox.to_string_lossy().replace('\\', "/");
     Some(format!(
         r#"INBOX="{inbox}"
 mkdir -p "$INBOX"
-seen=""
+seen="|"
 while true; do
   touch "$INBOX/.watching" 2>/dev/null
   for f in $(ls -1t "$INBOX"/ping-*.json 2>/dev/null); do
     b=$(basename "$f")
-    case "$seen" in *"$b|"*) continue;; esac
+    case "$seen" in *"|$b|"*) continue;; esac
     from=$(grep -o '"from": *"[^"]*"' "$f" 2>/dev/null | head -1 | cut -d'"' -f4)
     msg=$(tr -d '\n' < "$f" 2>/dev/null | sed -n 's/.*"summary": *"\(.*\)", *"doc".*/\1/p')
     [ -z "$msg" ] && msg=$(tr -d '\n' < "$f" 2>/dev/null)
-    full=$(printf '%s' "$msg" | wc -c)
+    chars=$(printf '%s' "$msg" | wc -m)
+    bytes=$(printf '%s' "$msg" | wc -c)
     out=$(printf '%s' "$msg" | cut -c1-700)
-    if [ "$full" -gt 700 ]; then
-      out="$out  [TRUNCATED at 700 of $full bytes - full file: $f]"
+    if [ "$chars" -gt 700 ]; then
+      out="$out  [TRUNCATED at 700 of $chars chars ($bytes bytes) - full file: $f]"
     fi
     echo "RELAY PING from ${{from:-unknown}}: $out"
     seen="$seen$b|"

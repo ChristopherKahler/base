@@ -1017,9 +1017,16 @@ mod tests {
     #[test]
     fn the_idle_threshold_clears_the_wake_rearm_cycle() {
         const WAKE_REARM_SECS: i64 = 30 * 60;
-        assert!(
+
+        // A const block, not a plain assert!: both sides are constants, so a
+        // runtime assertion here is folded away and clippy is right to call it
+        // out (assertions_on_constants). In a const block the same invariant
+        // fails the BUILD rather than a test run, which is strictly stronger —
+        // the threshold cannot be lowered under the re-arm cycle at all.
+        const _: () = assert!(
             IDLE_AFTER_SECS > WAKE_REARM_SECS,
-            "IDLE_AFTER_SECS is {IDLE_AFTER_SECS}s and must exceed the {WAKE_REARM_SECS}s wake re-arm cycle"
+            "IDLE_AFTER_SECS must exceed the 30-minute wake re-arm cycle, or a \
+             correctly parked seat reads idle for most of every cycle"
         );
 
         // A seat that acted one full re-arm cycle ago is still live.

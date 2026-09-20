@@ -28,8 +28,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn bash() -> Option<&'static str> {
-    for candidate in ["bash", "/usr/bin/bash", "/bin/bash"] {
-        if Command::new(candidate)
+    ["bash", "/usr/bin/bash", "/bin/bash"].into_iter().find(|candidate| {
+        Command::new(candidate)
             .arg("-c")
             .arg("exit 0")
             .stdout(Stdio::null())
@@ -37,11 +37,7 @@ fn bash() -> Option<&'static str> {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
-        {
-            return Some(candidate);
-        }
-    }
-    None
+    })
 }
 
 /// Seed `n` pings, run the script for a couple of poll cycles, return stdout.
