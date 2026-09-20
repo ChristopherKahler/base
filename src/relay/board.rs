@@ -49,7 +49,15 @@ fn print_store_board(store: &RelayStore) {
         println!("\n| Session | Phase | Worktree | Bound | Last seen | Watching | Pending |");
         println!("|---------|-------|----------|-------|-----------|----------|---------|");
         for entry in reg.sessions.values() {
-            let liveness = super::liveness_label(&entry.last_heartbeat);
+            // Which session holds this title RIGHT NOW. A store row is keyed
+            // on the title, so a retired seat leaves its row behind and the next
+            // heartbeat on that title refreshes it.
+            let live = super::session_registry::resolve(&entry.title).map(|e| e.session_id);
+            let liveness = super::row_liveness(
+                entry.session_id.as_deref(),
+                live.as_deref(),
+                &entry.last_heartbeat,
+            );
             println!(
                 "| {} | {} | {} | {} | {} | {} | {} |",
                 entry.title,

@@ -143,9 +143,12 @@ fn arm_block_for(title: &str, operator: &str) -> Option<String> {
          {inbox_disp}/.status (e.g. `echo \"building X\" > .../.status`). It is a local file \
          the operator's ping hub shows on this session's card, so {operator} sees live work \
          state at a glance.\n\
-         PROJECT TAG: the moment you know which project this session serves (and again whenever \
-         it changes), run `base relay register --as {title} --project <project-name>` — every \
-         project ever named stays on the session's hub card as a filter keyword; nothing is removed.\n"
+         PROJECT TAG: register with NO --project first — `base relay register --as {title}` — \
+         which joins this workspace's relay store and puts you on `base relay board`, the \
+         operator's hub view. Then read your own row back before anything else; a registration \
+         you did not read back did not happen. Passing --project names a DIFFERENT store, and if \
+         no store by that name exists you are registered globally only and never appear on the \
+         board. Add the project keyword afterwards, once you are on it.\n"
     ))
 }
 

@@ -2759,6 +2759,21 @@ pub fn run() {
                                 Err(e) => die("Register failed", e),
                             }
                         }
+                        // `resolve_store` already fails LOUD on a missing store,
+                        // naming it and listing the ones that exist. A catch-all
+                        // arm used to eat that error and print the cheerful line
+                        // below, so three seats registered against a store that
+                        // did not exist and were told only that they had
+                        // succeeded at something else. Surface it, and name the
+                        // consequence the error itself cannot know.
+                        Err(e) if project.is_some() => {
+                            eprintln!("{e:#}");
+                            eprintln!(
+                                "'{title}' is registered globally ONLY — it is NOT on `base relay board`, \
+                                 the operator's hub view. To join this workspace's store, run it with no \
+                                 --project: base relay register --as {title}"
+                            );
+                        }
                         _ => println!(
                             "Registered '{title}' globally{}. Other sessions can now relay to you: *task {title} …",
                             sid.as_deref()

@@ -684,6 +684,36 @@ pub fn liveness_label(last_heartbeat: &str) -> String {
     }
 }
 
+/// The "Last seen" cell for a BOARD row, which needs one fact `liveness_label`
+/// does not have: which session actually holds this title right now.
+///
+/// A store row is keyed on the TITLE, not the session. When a seat retires its
+/// row stays behind, and the next seat to take that title refreshes the
+/// heartbeat without rewriting the binding. The row then reads fresh while
+/// pointing at a session that ended weeks ago.
+pub fn row_liveness(
+    row_session: Option<&str>,
+    live_session: Option<&str>,
+    last_heartbeat: &str,
+) -> String {
+    match (row_session, live_session) {
+        // The row was written by a session that no longer holds this title.
+        // Its age is true about THAT session, and a reader will take it for
+        // this one, so the age is not reported at all. Report the observable,
+        // refuse the inference.
+        (Some(row), Some(live)) if row != live => {
+            format!("row from another session ({})", short_id(row))
+        }
+        _ => liveness_label(last_heartbeat),
+    }
+}
+
+/// First segment of a session uuid — enough to recognise, short enough for a
+/// table cell.
+fn short_id(session: &str) -> &str {
+    session.split('-').next().unwrap_or(session)
+}
+
 
 fn escape_nq(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
@@ -998,5 +1028,57 @@ mod tests {
             .format("%Y-%m-%dT%H:%M:%S%z")
             .to_string();
         assert_eq!(liveness_word(&one_cycle_ago), "live");
+    }
+
+    /// RANK B. A board row is keyed on the TITLE. When a seat retires its row
+    /// stays behind, and the next seat to claim that title refreshes the
+    /// heartbeat without rewriting the session binding.
+    ///
+    /// Measured 2026-09-20: the `auk` row in
+    /// `.base/relay/skyrim-companion/registry.json` carried session
+    /// `8ae4d5d3-6838-47e1-a519-350605f76907` and rendered "last seen 7s,
+    /// Watching yes", while the live `auk` was `ffe5735e-...`. Chris reads a
+    /// healthy row and learns nothing is wrong. ABSENT IS VISIBLE;
+    /// PRESENT-AND-WRONG IS NOT.
+    ///
+    /// Inherits the ruled principle rather than inventing one: report the
+    /// observable, refuse the inference. The age is true about a DIFFERENT
+    /// session, so it is not reported as this one's.
+    #[test]
+    fn a_row_bound_to_a_dead_session_does_not_report_that_sessions_age() {
+        let fresh = now_iso();
+
+        let stale = row_liveness(Some("8ae4d5d3"), Some("ffe5735e"), &fresh);
+        assert!(
+            !stale.contains("live"),
+            "a row from another session must not read as live: {stale}"
+        );
+        assert!(
+            stale.contains("8ae4d5d3") || stale.to_lowercase().contains("other session"),
+            "the mismatch must be stated, not papered over: {stale}"
+        );
+        assert_ne!(
+            stale,
+            liveness_label(&fresh),
+            "a mismatched row must not render the same cell as a matching one"
+        );
+
+        // A row that DOES hold the title renders exactly as before. The fix
+        // must not disturb the ordinary case.
+        assert_eq!(
+            row_liveness(Some("ffe5735e"), Some("ffe5735e"), &fresh),
+            liveness_label(&fresh)
+        );
+    }
+
+    /// Negative control for RANK B: with nothing to compare against there is no
+    /// mismatch to report, so the ordinary cell stands. A reader that flagged
+    /// every row would be as useless as one that flagged none.
+    #[test]
+    fn a_row_with_nothing_to_compare_against_is_not_flagged() {
+        let fresh = now_iso();
+        assert_eq!(row_liveness(Some("abc"), None, &fresh), liveness_label(&fresh));
+        assert_eq!(row_liveness(None, Some("abc"), &fresh), liveness_label(&fresh));
+        assert_eq!(row_liveness(None, None, &fresh), liveness_label(&fresh));
     }
 }
