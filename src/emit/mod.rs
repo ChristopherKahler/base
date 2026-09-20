@@ -26,6 +26,93 @@ pub fn u16_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
 
+/// What a hook actually emitted, so the caller can report it and rank 10 can record it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Measured {
+    /// What the hook wanted to say, in UTF-16 units.
+    pub wanted_u16: usize,
+    /// What it printed, notice included.
+    pub emitted_u16: usize,
+    /// What the budget withheld. Zero when everything fitted.
+    pub withheld_u16: usize,
+}
+
+impl Measured {
+    pub fn lost(&self) -> bool {
+        self.withheld_u16 > 0
+    }
+}
+
+/// Print `text` for `hook` under `budget_u16`, measured in the unit the host counts, and say what
+/// was withheld INSIDE the part that survives.
+///
+/// WHY THE NOTICE IS RESERVED BEFORE THE TRIM AND NOT APPENDED AFTER IT. That is rank 00's exact
+/// failure mode: base measured its own session-start loss correctly and put the report at byte
+/// 23,815 of 26,310 - eleven thousand bytes inside the region the host never delivers. The report
+/// of the loss was destroyed by the loss it reported. A writer that cuts at the boundary and then
+/// appends its notice rebuilds that defect in the fix for it, which is why the reserve comes first
+/// and why a test asserts the notice lands inside `budget_u16`.
+///
+/// THE RESERVE NEEDS NO ITERATION. The notice's length depends on the withheld figure, the figure
+/// depends on the cut, and the cut depends on the reserve. The circle is cut by formatting the
+/// reserve with `wanted` - the whole text - standing in for the withheld figure. The real withheld
+/// is always at most `wanted`, so the reserved notice is never shorter than the final one.
+///
+/// WHAT THIS IS NOT. It does not degrade per block to a floor and it has no ranked trim order, as
+/// `Emission` does for session start. The tail is withheld and named. The two hooks are NOT
+/// equivalent afterwards and should not be read as though they were.
+///
+/// Trimming is on whole lines: half a rule is worse than no rule, because a truncated instruction
+/// still reads as an instruction.
+pub fn print_measured(hook: &str, key: &str, text: &str, budget_u16: usize) -> Measured {
+    let wanted = u16_len(text);
+    if wanted <= budget_u16 {
+        print!("{text}");
+        return Measured { wanted_u16: wanted, emitted_u16: wanted, withheld_u16: 0 };
+    }
+
+    let reserve = u16_len(&withheld_notice(hook, key, wanted, budget_u16));
+    let room = budget_u16.saturating_sub(reserve);
+
+    let mut kept = String::new();
+    let mut kept_u16 = 0usize;
+    for line in text.split_inclusive('\n') {
+        let n = u16_len(line);
+        if kept_u16 + n > room {
+            break;
+        }
+        kept.push_str(line);
+        kept_u16 += n;
+    }
+
+    let withheld = wanted.saturating_sub(kept_u16);
+    let notice = withheld_notice(hook, key, withheld, budget_u16);
+    if !kept.is_empty() && !kept.ends_with('\n') {
+        kept.push('\n');
+    }
+    let out = format!("{kept}{notice}");
+    print!("{out}");
+    Measured { wanted_u16: wanted, emitted_u16: u16_len(&out), withheld_u16: withheld }
+}
+
+/// The one line that survives. It names the hook, the loss and the key that governs it, because an
+/// operator who sees a truncation and cannot find the setting has been told nothing useful.
+/// WHY `key` IS A PARAMETER AND NOT THE LITERAL `prompt_chars` IT USED TO BE. Every key in
+/// `[budget]` governs a different hook, and this line's whole job is to send the operator to the one
+/// that caused the trim. Hard-coding one key made the notice correct only for as long as exactly one
+/// hook called this function - correct conditional on a neighbouring defect, which is the shape that
+/// survives review and breaks the day somebody repairs the neighbour. The person who wires
+/// `pre_tool_chars` is reading `pre_tool_use.rs`, not this function, so they would never see it
+/// coming: their overflow notice would name `prompt_chars` and send them to edit a setting that
+/// governs a different hook. That is the inert-field defect pointed at the operator, and it is worse
+/// than silence, because silence does not give directions.
+fn withheld_notice(hook: &str, key: &str, withheld_u16: usize, budget_u16: usize) -> String {
+    format!(
+        "\n[base: {hook} withheld {withheld_u16} of its units against [budget] {key} = {budget_u16}. \
+Raise it in base.toml, or run `base doctor` to see what each hook emitted.]\n"
+    )
+}
+
 /// Trim order, and output order. `Pinned` and `DueNow` are never degraded. DUE NOW shows in full
 /// and first even when that pushes the first screen over: the overflow is reported in
 /// [`Rendered::first_screen_ok`], never resolved by collapsing what is due. The rest degrade from

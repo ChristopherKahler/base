@@ -52,7 +52,7 @@ fn user_prompt_submit_injects_matched_rules() {
     });
 
     // First call should succeed and inject rules
-    let result = user_prompt_submit::handle(&config, tmp.path(), &event);
+    let result = user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new());
     assert!(result.is_ok(), "Should succeed: {result:?}");
 }
 
@@ -63,7 +63,7 @@ fn user_prompt_submit_silent_without_domains() {
     let config = BaseConfig::default();
     let event = serde_json::json!({ "prompt": "hello" });
 
-    let result = user_prompt_submit::handle(&config, tmp.path(), &event);
+    let result = user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new());
     assert!(result.is_ok(), "Should succeed silently");
 }
 
@@ -76,12 +76,12 @@ fn user_prompt_submit_dedup_across_calls() {
     let event = serde_json::json!({ "prompt": "fix bug please" });
 
     // First call — injects
-    user_prompt_submit::handle(&config, tmp.path(), &event).unwrap();
+    user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new()).unwrap();
 
     // Second call — should dedup (session state persisted)
     // Dedup detail covered by graph_injection_test.rs — the hook-layer
     // rendered-output hash is the single dedup gate
-    let result = user_prompt_submit::handle(&config, tmp.path(), &event);
+    let result = user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new());
     assert!(result.is_ok());
 }
 
@@ -93,7 +93,7 @@ fn user_prompt_submit_empty_prompt_silent() {
     let config = BaseConfig::default();
     let event = serde_json::json!({ "prompt": "" });
 
-    let result = user_prompt_submit::handle(&config, tmp.path(), &event);
+    let result = user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new());
     assert!(result.is_ok(), "Empty prompt should be silent");
 }
 
@@ -105,7 +105,7 @@ fn user_prompt_submit_no_prompt_field_silent() {
     let config = BaseConfig::default();
     let event = serde_json::json!({ "tool_name": "something" });
 
-    let result = user_prompt_submit::handle(&config, tmp.path(), &event);
+    let result = user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new());
     assert!(result.is_ok(), "Missing prompt field should be silent");
 }
 
@@ -120,6 +120,6 @@ fn user_prompt_submit_malformed_domains_failopen() {
     let event = serde_json::json!({ "prompt": "fix bug" });
 
     // Malformed TOML should result in empty domains (graceful), not a crash
-    let result = user_prompt_submit::handle(&config, tmp.path(), &event);
+    let result = user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new());
     assert!(result.is_ok(), "Malformed domains.toml should not crash");
 }

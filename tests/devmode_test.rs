@@ -46,7 +46,7 @@ fn devmode_disabled_no_block() {
     let config = base::config::BaseConfig::load(tmp.path());
 
     // Run the hook — devmode disabled
-    base::hook::user_prompt_submit::handle(&config, tmp.path(), &event).unwrap();
+    base::hook::user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new()).unwrap();
 
     // We can't capture stdout directly, but verify the config is correct
     assert!(!config.devmode.enabled);
@@ -175,7 +175,7 @@ fn bracket_tag_emitted_in_output() {
 
     // Run hook — bracket should be tracked in session
     let event = serde_json::json!({ "prompt": "hello" });
-    base::hook::user_prompt_submit::handle(&config, tmp.path(), &event).unwrap();
+    base::hook::user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new()).unwrap();
 
     // Load session to verify prompt count incremented
     let base_dir = base::config::find_workspace_base(tmp.path()).unwrap();
@@ -193,7 +193,7 @@ fn bracket_increments_across_multiple_prompts() {
 
     // Fire 5 prompts
     for _ in 0..5 {
-        base::hook::user_prompt_submit::handle(&config, tmp.path(), &event).unwrap();
+        base::hook::user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new()).unwrap();
     }
 
     let base_dir = base::config::find_workspace_base(tmp.path()).unwrap();

@@ -255,20 +255,45 @@ fn run_event(
             Ok(data)
         }
         "user-prompt-submit" => {
-            let mut data = user_prompt_submit::handle(&config, &cwd, stdin_json)?;
-            // Relay inbox push for messages that arrived mid-session. Runs in
-            // the dispatcher (not the handler) so star-command and empty-prompt
-            // early returns can't swallow a pending delivery. Silent when
-            // unregistered — the session-start notice already ran.
-            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), false, false) {
-                print!("{block}");
+            // Everything this event says is collected here and printed ONCE, measured against
+            // `[budget] prompt_chars` (rank 00), exactly as session start does above.
+            //
+            // WHAT WAS WRONG, AND WHY MEASURING ONE EMITTER WOULD HAVE BEEN WORSE THAN MEASURING
+            // NONE. This arm used to hold THREE SEQUENTIAL EMITTERS, each blind to the others'
+            // spend: `handle` printed at its four return sites, then the relay inbox push printed,
+            // then the task tick printed. A budget cannot be enforced by any one of them, because
+            // none knows what the next two are about to add — and `Measured::withheld_u16 == 0` from
+            // a writer that saw a third of the output is a POSITIVE CLAIM THAT NOTHING WAS LOST,
+            // made over output that overflows anyway. That reassurance is what stops anyone looking.
+            //
+            // Measured on Chris's install: 13.3 KB emitted here and 2 KB delivered, the whole relay
+            // wake contract and every global domain rule past the second lost inline, with no notice
+            // of any kind. The same session later emitted 26 KB — the overflow GROWS as a session
+            // does, so the trim is the mechanism and not a backstop.
+            let mut out = String::new();
+            let handled = user_prompt_submit::handle(&config, &cwd, stdin_json, &mut out);
+            // Both relay blocks stay gated on the handler succeeding, exactly as the `?` used to
+            // gate them: on an error neither used to run, and this is not the change that alters it.
+            if handled.is_ok() {
+                // Relay inbox push for messages that arrived mid-session. Runs in
+                // the dispatcher (not the handler) so star-command and empty-prompt
+                // early returns can't swallow a pending delivery. Silent when
+                // unregistered — the session-start notice already ran.
+                if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), false, false) {
+                    out.push_str(&block);
+                }
+                // Session-targeted task relay: refresh liveness + deliver assigned tasks.
+                if let Some(sid) = session_id.as_deref()
+                    && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Prompt, true)
+                {
+                    out.push_str(&block);
+                }
             }
-            // Session-targeted task relay: refresh liveness + deliver assigned tasks.
-            if let Some(sid) = session_id.as_deref()
-                && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Prompt, true)
-            {
-                print!("{block}");
-            }
+            // THE SINGLE EXIT. It runs before `handled?` for the same reason session start's does:
+            // the sites this replaced had already printed by the time an error could be seen, so
+            // dropping their text on an error would be a regression dressed as a refactor.
+            crate::emit::print_measured("user-prompt-submit", "prompt_chars", &out, config.budget.prompt_chars);
+            let mut data = handled?;
             data.session_id = session_id;
             Ok(data)
         }

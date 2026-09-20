@@ -9,7 +9,25 @@ use crate::domain::matcher::{match_domains_auto, TriggerContext};
 use crate::domain::query::resolve_and_run_query;
 use crate::domain::session::{rules_hash, Bracket, SessionState};
 
-pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Result<super::HookEventData> {
+/// Collect everything this hook says into `sink`; never print.
+///
+/// THE CONTRACT CHANGED HERE AND THE REASON IS THE WHOLE POINT OF RANK 00. This function used to
+/// `print!` at each of its four return sites, and the dispatcher printed twice more after it
+/// returned - the relay inbox push and the task tick. THREE SEQUENTIAL EMITTERS, EACH BLIND TO THE
+/// OTHERS' SPEND. No one of them can enforce a budget, because none of them knows what the other two
+/// are about to add. Measuring any one of them and reporting it under budget is a POSITIVE CLAIM
+/// THAT NOTHING WAS LOST, made over output that overflows anyway - worse than not measuring, because
+/// a wrong reassurance stops anyone looking. A first attempt wired only this function's four sites,
+/// measured 2,826 units of a 6,160-unit emission, and was reverted rather than shipped.
+///
+/// So the text is collected and the dispatcher owns the single measured write, mirroring
+/// `session_start`, which builds `rendered.text` and prints once at its own exit.
+pub fn handle(
+    config: &BaseConfig,
+    cwd: &Path,
+    event: &serde_json::Value,
+    sink: &mut String,
+) -> Result<super::HookEventData> {
     let prompt = extract_prompt(event);
     if prompt.is_empty() {
         return Ok(super::HookEventData::default());
@@ -88,7 +106,8 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         if let Some(ref base_dir) = base_dir {
             let _ = session.save(base_dir);
         }
-        print!("{bracket_rules}{matcher_block}");
+        sink.push_str(&bracket_rules);
+        sink.push_str(&matcher_block);
         return Ok(super::HookEventData {
             prompt_num: Some(session.prompt_count_for(session_id)),
             rules_injected: matcher_served,
@@ -114,7 +133,8 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             }
             // Bracket rules ride along with star commands too — a mode changes
             // stance, it does not suspend the always-on layer.
-            print!("{bracket_rules}{cmd_output}");
+            sink.push_str(&bracket_rules);
+            sink.push_str(&cmd_output);
             return Ok(super::HookEventData {
                 prompt_num: Some(session.prompt_count_for(session_id)),
                 bracket_rules_injected: bracket_injected,
@@ -180,9 +200,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
         // carried that number here, and whether it should is a separate
         // question from what the reader sees.
         //
-        // Built as one string and printed once, like the main path below. Two
-        // `print!` calls would do the same thing, but a literal ending in a
-        // newline trips clippy's `print_with_newline` under `-D warnings`.
+        // Built as one string and pushed once, like the main path below.
         //
         // Nothing to dedup against: `domain_served` is filled by the domain
         // loop below, which an empty `matched` makes a no-op.
@@ -207,7 +225,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
             let w = render_walk_block(&mut session, walked, config.injection.walk_budget);
             out.push_str(&w.block);
         }
-        print!("{out}");
+        sink.push_str(&out);
         // Still save session state (prompt_count) even if nothing matched.
         // AFTER the walk, so the marks it just wrote are in what gets saved --
         // otherwise dedup resets every prompt and the walk re-serves forever.
@@ -556,7 +574,7 @@ pub fn handle(config: &BaseConfig, cwd: &Path, event: &serde_json::Value) -> Res
     }
 
     if !output.is_empty() {
-        print!("{}", output.trim_end());
+        sink.push_str(output.trim_end());
     }
 
     // Build event data for JSONL logging
