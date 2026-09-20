@@ -292,7 +292,7 @@ fn run_event(
             // THE SINGLE EXIT. It runs before `handled?` for the same reason session start's does:
             // the sites this replaced had already printed by the time an error could be seen, so
             // dropping their text on an error would be a regression dressed as a refactor.
-            crate::emit::print_measured("user-prompt-submit", "prompt_chars", &out, config.budget.prompt_chars);
+            crate::emit::print_measured("user-prompt-submit", "prompt_chars", &out, config.budget.prompt_bytes);
             let mut data = handled?;
             data.session_id = session_id;
             Ok(data)

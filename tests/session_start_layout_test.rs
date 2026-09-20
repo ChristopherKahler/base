@@ -374,7 +374,7 @@ fn the_withheld_total_on_line_one_is_the_ledgers() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(tmp.path().join(".base")).expect(".base");
     let mut config = BaseConfig::default();
-    config.budget.session_start_chars = 300;
+    config.budget.session_start_bytes = 300;
     let mut out = SessionOutput::new();
     out.push("pulse", &format!("[Pulse]\n{}", "p".repeat(2000)), 1);
     out.push(

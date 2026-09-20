@@ -788,21 +788,26 @@ fn push_hook_output(out: &mut String, tiers: &[crate::emit::record::TierSizes]) 
         }
         for e in &t.events {
             out.push_str(&format!(
-                "   {} tier · {}: last run {} of {} units at {}{}\n",
+                "   {} tier · {}: last run {} of {} {} at {}{}\n",
                 t.tier,
                 e.hook,
-                e.last.emitted_u16,
-                e.last.budget_u16,
+                e.last.emitted.value,
+                e.last.budget.value,
+                // The unit is PRINTED rather than assumed. Rows written before 2026-09-20 hold
+                // UTF-16 units and rows since hold bytes; a bare "units" read the same either way
+                // and invited two different quantities to be compared as though they were one.
+                e.last.emitted.unit.label(),
                 e.last.ts,
                 trim_clause(&e.last)
             ));
             out.push_str(&format!(
-                "   {} tier · {}: largest of the last {} run(s) on record: {} of {} units at {}{}\n",
+                "   {} tier · {}: largest of the last {} run(s) on record: {} of {} {} at {}{}\n",
                 t.tier,
                 e.hook,
                 e.runs,
-                e.largest.emitted_u16,
-                e.largest.budget_u16,
+                e.largest.emitted.value,
+                e.largest.budget.value,
+                e.largest.emitted.unit.label(),
                 e.largest.ts,
                 trim_clause(&e.largest)
             ));
@@ -1876,7 +1881,7 @@ mod hook_output_tests {
     /// report has no graph tier, so this also proves the section reaches the reader on that early return.
     #[test]
     fn the_hook_output_section_prints_last_largest_trims_and_both_flags() {
-        use crate::emit::record::{EventSizes, FileState, Run, TierSizes};
+        use crate::emit::record::{EventSizes, FileState, Run, Size, TierSizes};
         fn run(
             ts: &str,
             emitted: usize,
@@ -1887,9 +1892,9 @@ mod hook_output_tests {
         ) -> Run {
             Run {
                 ts: ts.to_string(),
-                emitted_u16: emitted,
-                budget_u16: budget,
-                full_u16: emitted * 3,
+                emitted: Size::bytes(emitted),
+                budget: Size::bytes(budget),
+                full: Size::bytes(emitted * 3),
                 first_screen_u16: 2000,
                 over_budget: over,
                 first_screen_ok: screen_ok,
@@ -1952,8 +1957,8 @@ mod hook_output_tests {
                 .display()
         );
         for want in [
-            "   workspace tier · session-start: last run 4100 of 4000 units at t2 · trimmed: forks 157 collapsed\n",
-            "   workspace tier · session-start: largest of the last 2 run(s) on record: 8998 of 9000 units at t1 · nothing trimmed\n",
+            "   workspace tier · session-start: last run 4100 of 4000 bytes at t2 · trimmed: forks 157 collapsed\n",
+            "   workspace tier · session-start: largest of the last 2 run(s) on record: 8998 of 9000 bytes at t1 · nothing trimmed\n",
             "   ⚠ workspace tier · session-start: over budget in 1 of the last 2 run(s), latest at t2\n",
             "   ⚠ workspace tier · session-start: header, instructions and DUE NOW passed the first 2000 units in 1 of the last 2 run(s), latest at t2\n",
             "   ⚠ workspace tier · /ws/.base: 1 unreadable line(s) and 0 unreadable file(s) skipped\n",
