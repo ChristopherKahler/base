@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use super::{now_iso, parse_ts, write_json_atomic, read_json, DEAD_AFTER_SECS};
+use super::{now_iso, parse_ts, write_json_atomic, read_json, IDLE_AFTER_SECS};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionEntry {
@@ -53,7 +53,7 @@ pub struct SessionEntry {
 impl SessionEntry {
     pub fn alive(&self) -> bool {
         parse_ts(&self.last_heartbeat)
-            .map(|t| (chrono::Local::now() - t).num_seconds() < DEAD_AFTER_SECS)
+            .map(|t| (chrono::Local::now() - t).num_seconds() < IDLE_AFTER_SECS)
             .unwrap_or(false)
     }
 }
