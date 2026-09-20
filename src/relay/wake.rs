@@ -135,6 +135,28 @@ fn watch_script(title: &str) -> Option<String> {
 /// simply does not list it and nothing was lost; if the read failed
 /// transiently, the next poll retries it.
 ///
+/// AND IT SAYS SO, WHICH RANK E DID NOT (2026-09-20, raised by `plover`, who read
+/// the emitted script off its own re-arm hook). Rank E shipped the read-once fix
+/// and nothing else: an empty read printed NOTHING and continued. That removed a
+/// mislabelled ping and put silence in its place, which is the same shape one turn
+/// on — THE INSTRUMENT HAD NO WAY TO SAY "I COULD NOT SEE", and a quiet inbox and a
+/// ping that vanished under the read reached the reader identically.
+///
+/// The two cases above are also not all of them. A file that is PRESENT AND EMPTY is
+/// neither cleared nor transient: it stays on the `ls`, so it is re-read every poll
+/// forever. A drained file self-limits by disappearing; this one does not. Before
+/// this line it did that unboundedly AND silently, so the only case with an unbounded
+/// retry was also the only case with no output at all.
+///
+/// So the empty branch prints ONE line naming both states it cannot separate, with the
+/// path, tracked in `reported` rather than `seen`. `reported` IS A SEPARATE LIST ON
+/// PURPOSE: marking `seen` would bound the retry by consuming a file a later poll might
+/// read successfully, which reverses the paragraph above rather than completing it.
+///
+/// KNOWN AND LEFT: the retry is still unbounded. Bounding it is rank E's decision to
+/// revisit, not a line to slip in beside a logging fix. `plover`'s sentence is why the
+/// line came first — A BOUNDED SILENCE LOOKS DELIBERATE.
+///
 /// There is deliberately NO separate existence test. auk proposed read-once
 /// plus a guard; the guard only ever existed to bridge the gap between listing
 /// and reading, and reading once removes the gap rather than narrowing it. A
@@ -146,13 +168,20 @@ pub fn watch_script_for(inbox: &std::path::Path) -> Option<String> {
         r#"INBOX="{inbox}"
 mkdir -p "$INBOX"
 seen="|"
+reported="|"
 while true; do
   touch "$INBOX/.watching" 2>/dev/null
   for f in $(ls -1t "$INBOX"/ping-*.json 2>/dev/null); do
     b=$(basename "$f")
     case "$seen" in *"|$b|"*) continue;; esac
     raw=$(cat "$f" 2>/dev/null | tr -d '\n')
-    [ -z "$raw" ] && continue
+    if [ -z "$raw" ]; then
+      case "$reported" in *"|$b|"*) ;; *)
+        echo "RELAY EMPTY READ: $b gave nothing on one read - a reply drained it, or it is on disk and empty, and this cannot tell which. Not consumed, so a later read still announces it. This line prints once. Path: $f"
+        reported="$reported$b|" ;;
+      esac
+      continue
+    fi
     from=$(printf '%s' "$raw" | grep -o '"from": *"[^"]*"' | head -1 | cut -d'"' -f4)
     msg=$(printf '%s' "$raw" | sed -n 's/.*"summary": *"\(.*\)", *"doc".*/\1/p')
     [ -z "$msg" ] && msg="$raw"

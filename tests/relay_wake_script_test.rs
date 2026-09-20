@@ -187,9 +187,15 @@ fn a_file_that_reads_empty_is_not_consumed() {
     );
 }
 
-/// Negative control for RANK E: an empty file announces NOTHING while it is
-/// empty. Skipping without consuming must not become announcing a blank line —
-/// the defect it replaces was a header with no body.
+/// Negative control for RANK E: an empty file never announces a PING. Skipping
+/// without consuming must not become announcing a blank line — the defect it
+/// replaces was a header with no body.
+///
+/// NARROWED 2026-09-20, because the old wording would now be false. It read
+/// "announces NOTHING while it is empty", true when an empty read was silent. The
+/// empty branch now prints one `RELAY EMPTY READ:` line. This test guards what it
+/// always actually guarded — that no `RELAY PING from` header is emitted with no
+/// body — and the assertion is unchanged because it was already keyed on that string.
 #[test]
 fn an_empty_file_announces_nothing_while_it_is_empty() {
     let Some(sh) = bash() else {
@@ -211,5 +217,49 @@ fn an_empty_file_announces_nothing_while_it_is_empty() {
         stdout.matches("RELAY PING from").count(),
         0,
         "an empty file must announce nothing, not an empty header:\n{stdout}"
+    );
+}
+
+/// The honest half of RANK E (2026-09-20, raised by `plover`). An empty read used to
+/// print nothing at all, so a ping that vanished under the read and an inbox that was
+/// simply quiet reached the reader identically.
+///
+/// TWO ASSERTIONS, AND THE SECOND HAS THE TEETH. That the line appears is the easy
+/// half. That it appears EXACTLY ONCE over a run spanning several polls is what proves
+/// `reported` works — without it the line repeats every five seconds for as long as the
+/// file sits there, which is its own kind of unreadable.
+#[test]
+fn an_empty_file_says_it_could_not_be_read_exactly_once() {
+    let Some(sh) = bash() else {
+        eprintln!("SKIPPED: bash not on PATH — this test cannot run here, and is not passing.");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::File::create(inbox.join("ping-empty.json")).unwrap();
+
+    let script = base::relay::wake::watch_script_for(&inbox).unwrap();
+    // 13s spans at least two 5s polls, so a line repeating per poll would show up twice.
+    let wrapped =
+        format!("( {script} ) & pid=$!; sleep 13; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0");
+    let out = Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert_eq!(
+        stdout.matches("RELAY EMPTY READ:").count(),
+        1,
+        "an unreadable ping must say so exactly once over several polls:
+{stdout}"
+    );
+    assert!(
+        stdout.contains("cannot tell which"),
+        "the line must name both states it cannot separate:
+{stdout}"
+    );
+    assert!(
+        stdout.contains("ping-empty.json"),
+        "the line must name the file, or nobody can go and look:
+{stdout}"
     );
 }
