@@ -860,10 +860,19 @@ impl Default for SignalConfig {
 /// `post_tool_chars` are read by nothing yet; the prompt and tool hooks take them in their own commits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetConfig {
-    #[serde(default = "default_session_start_chars")]
-    pub session_start_chars: usize,
-    #[serde(default = "default_prompt_chars")]
-    pub prompt_chars: usize,
+    /// Session start's budget, in BYTES.
+    ///
+    /// RENAMED WITH ITS UNIT, IN THE SAME COMMIT. It was `session_start_chars` and it measured
+    /// UTF-16 code units; the host was measured counting bytes on 2026-09-20. A key renamed before
+    /// its unit changes, or after, is a lie for the window in between — so the two move together.
+    /// The old spelling keeps working as an alias, because an operator who tuned it must not be
+    /// silently returned to the default; `legacy_budget_keys` says so once per run.
+    #[serde(default = "default_session_start_bytes", alias = "session_start_chars")]
+    pub session_start_bytes: usize,
+    /// The prompt hook's budget, in BYTES. Same rename, same reason — its unit changed earlier the
+    /// same day and the key went on saying `chars` until now.
+    #[serde(default = "default_prompt_bytes", alias = "prompt_chars")]
+    pub prompt_bytes: usize,
     #[serde(default = "default_pre_tool_chars")]
     pub pre_tool_chars: usize,
     #[serde(default = "default_post_tool_chars")]
@@ -884,8 +893,8 @@ pub struct BudgetConfig {
     pub write_full_output: bool,
 }
 
-fn default_session_start_chars() -> usize { 9000 }
-fn default_prompt_chars() -> usize { 4000 }
+fn default_session_start_bytes() -> usize { 9000 }
+fn default_prompt_bytes() -> usize { 4000 }
 fn default_pre_tool_chars() -> usize { 2500 }
 fn default_post_tool_chars() -> usize { 1000 }
 fn default_first_screen_chars() -> usize { 2000 }
@@ -895,8 +904,8 @@ fn default_measured_on() -> String { "claude-code 2.1.269".into() }
 impl Default for BudgetConfig {
     fn default() -> Self {
         Self {
-            session_start_chars: default_session_start_chars(),
-            prompt_chars: default_prompt_chars(),
+            session_start_bytes: default_session_start_bytes(),
+            prompt_bytes: default_prompt_bytes(),
             pre_tool_chars: default_pre_tool_chars(),
             post_tool_chars: default_post_tool_chars(),
             first_screen_chars: default_first_screen_chars(),
@@ -1052,6 +1061,72 @@ impl std::fmt::Display for ConfigFault {
 /// `post_tool_use.rs` records that "stderr stays stderr -- those lines are
 /// operator diagnostics, not model context". A config warning must never be
 /// able to change one byte of hook stdout, and a test asserts exactly that.
+/// A `[budget]` key whose UNIT changed and which was therefore renamed. The old spelling still
+/// parses and its value is still used — this only tells the operator to move on.
+///
+/// DELIBERATELY NOT A [`ConfigFault`]. That type already had the once-per-process latch and was the
+/// obvious host, but its `Display` appends "base is running on DEFAULT settings, not yours", which
+/// is FALSE here: the legacy value IS being honoured. Reusing it would have shipped a message that
+/// lies in order to save writing a second path, which is the defect class this change is part of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyBudgetKey {
+    pub old: &'static str,
+    pub new: &'static str,
+}
+
+impl std::fmt::Display for LegacyBudgetKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "base: [budget] {} was renamed to {} when its unit changed from UTF-16 units to bytes. \
+Your value is still being used. Rename the key in base.toml to stop seeing this.",
+            self.old, self.new
+        )
+    }
+}
+
+/// Every `[budget]` key that was renamed with its unit: old spelling, new spelling.
+const RENAMED_BUDGET_KEYS: &[LegacyBudgetKey] = &[
+    LegacyBudgetKey { old: "session_start_chars", new: "session_start_bytes" },
+    LegacyBudgetKey { old: "prompt_chars", new: "prompt_bytes" },
+];
+
+/// Which renamed keys the merged config actually spells the old way.
+///
+/// Read off the RAW table rather than the deserialized struct on purpose: `serde(alias)` makes both
+/// spellings land in one field and then cannot say which one it saw, so the struct is exactly the
+/// wrong place to ask.
+fn legacy_budget_keys(merged: &toml::value::Table) -> Vec<LegacyBudgetKey> {
+    let Some(toml::Value::Table(budget)) = merged.get("budget") else {
+        return Vec::new();
+    };
+    RENAMED_BUDGET_KEYS
+        .iter()
+        .filter(|k| budget.contains_key(k.old))
+        .cloned()
+        .collect()
+}
+
+/// The one advisory this process gets, with its own latch.
+static LEGACY_KEYS_REPORTED: std::sync::Once = std::sync::Once::new();
+
+fn report_legacy_budget_keys(keys: &[LegacyBudgetKey], latch: &std::sync::Once) -> bool {
+    if keys.is_empty() {
+        return false;
+    }
+    let mut spoke = false;
+    latch.call_once(|| {
+        for k in keys {
+            // stderr, because stdout is what the budget governs: an advisory about the budget must
+            // not be charged against it, and `emit` states that stderr is outside every budget by
+            // construction.
+            eprintln!("{k}");
+        }
+        spoke = true;
+    });
+    spoke
+}
+
 fn report_config_faults_once(faults: &[ConfigFault]) {
     report_config_faults(faults, &FAULTS_REPORTED);
 }
@@ -1173,6 +1248,11 @@ impl BaseConfig {
             (None, Some(w)) => w,
             (None, None) => return (Self::default(), faults),
         };
+
+        // Before `try_into` consumes the table: after deserialization the alias has erased which
+        // spelling was used.
+        let legacy = legacy_budget_keys(&merged);
+        report_legacy_budget_keys(&legacy, &LEGACY_KEYS_REPORTED);
 
         match toml::Value::Table(merged).try_into() {
             Ok(config) => (config, faults),
@@ -1370,19 +1450,35 @@ mod tests {
     /// nothing until you have overridden it.
     #[test]
     fn the_budget_keys_default_to_spec_part_h_and_read_back_when_set() {
-        assert_eq!(default_value("budget", "session_start_chars"), Some(toml::Value::Integer(9000)));
+        assert_eq!(default_value("budget", "session_start_bytes"), Some(toml::Value::Integer(9000)));
         assert_eq!(default_value("budget", "first_screen_chars"), Some(toml::Value::Integer(2000)));
         assert_eq!(default_value("budget", "write_full_output"), Some(toml::Value::Boolean(true)));
         let cfg: BaseConfig =
-            toml::from_str("[budget]\nsession_start_chars = 1234\n").expect("a budget section parses");
-        assert_eq!(cfg.budget.session_start_chars, 1234);
-        assert_eq!(cfg.budget.prompt_chars, 4000, "an unset key keeps its default");
+            toml::from_str("[budget]\nsession_start_bytes = 1234\n").expect("a budget section parses");
+        assert_eq!(cfg.budget.session_start_bytes, 1234);
+        assert_eq!(cfg.budget.prompt_bytes, 4000, "an unset key keeps its default");
+
+        // THE LEGACY SPELLING MUST STILL SET THE VALUE. Renaming a key an operator may have tuned
+        // is only honest if the old name keeps working; retiring it silently would return them to
+        // the default without saying so.
+        let cfg: BaseConfig =
+            toml::from_str("[budget]\nsession_start_chars = 1234\n").expect("the legacy key parses");
+        assert_eq!(cfg.budget.session_start_bytes, 1234, "the legacy alias still sets the value");
+        let cfg: BaseConfig =
+            toml::from_str("[budget]\nprompt_chars = 777\n").expect("the legacy key parses");
+        assert_eq!(cfg.budget.prompt_bytes, 777, "the legacy alias still sets the value");
+
+        // And the raw-table scan names exactly the keys spelled the old way.
+        let table: toml::value::Table =
+            toml::from_str("[budget]\nsession_start_chars = 1\nprompt_bytes = 2\n").expect("table");
+        let found: Vec<&str> = legacy_budget_keys(&table).iter().map(|k| k.old).collect();
+        assert_eq!(found, vec!["session_start_chars"], "only the old spelling is reported");
         // Rank 04 adds the memory block's own key; the assertions above are unchanged.
         assert_eq!(default_value("budget", "memory_chars"), Some(toml::Value::Integer(4000)));
         let cfg: BaseConfig =
             toml::from_str("[budget]\nmemory_chars = 321\n").expect("a budget section parses");
         assert_eq!(cfg.budget.memory_chars, 321);
-        assert_eq!(cfg.budget.session_start_chars, 9000, "an unset key keeps its default");
+        assert_eq!(cfg.budget.session_start_bytes, 9000, "an unset key keeps its default");
     }
 
     #[test]

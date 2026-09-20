@@ -39,9 +39,12 @@ pub fn record_of(r: &Rendered, hook: &str, session_id: Option<&str>) -> serde_js
         "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
         "hook": hook,
         "session_id": session_id,
-        "emitted_u16": r.emitted_u16,
-        "budget_u16": r.budget_u16,
-        "full_u16": r.full_u16,
+        // `_bytes` names say what these now are. The old `_u16` names are still READ (see `parse`)
+        // so existing history keeps working, but nothing writes them any more.
+        "emitted_bytes": r.emitted_bytes,
+        "budget_bytes": r.budget_bytes,
+        "full_bytes": r.full_bytes,
+        // Still UTF-16: the first screen is a readability limit, not a delivery one.
         "first_screen_u16": r.first_screen_u16,
         "over_budget": r.over_budget,
         "first_screen_ok": r.first_screen_ok,
@@ -75,13 +78,76 @@ fn keep_capped(dir: &Path, record: &serde_json::Value, cap: u64) -> Result<(), S
 /// A withheld row read back: block, items, reason.
 pub type Row = (String, usize, String);
 
+/// What a recorded size is measured in.
+///
+/// RECORDS WRITTEN BEFORE 2026-09-20 HOLD UTF-16 UNITS; EVERYTHING SINCE HOLDS BYTES. The host was
+/// measured counting bytes that day, and the emitters were converted.
+///
+/// The obvious cheap move was to read old rows as though they were bytes. UTF-16 units are never
+/// larger than bytes, so historical figures would only ever have been UNDERSTATED — about 5% on
+/// real output — and understating errs in the safe direction.
+///
+/// **That reasoning was rejected, and the rejection is the point.** "Safe because the error happens
+/// to point the right way" is the same sentence as "it does not bite because the output happens to
+/// be ASCII", and a coerced row cannot be un-coerced by a later reader: someone opening
+/// `hook-output.jsonl` in six months would see every row looking like bytes with nothing saying
+/// three of them are not. **A gap the reader can see beats a number quietly 5% wrong.**
+///
+/// So a row keeps the unit it was written in, and anything comparing sizes must check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Unit {
+    /// Bytes: what the host counts, and what every record since 2026-09-20 holds.
+    Bytes,
+    /// UTF-16 code units: what records written before 2026-09-20 hold.
+    Utf16,
+}
+
+impl Unit {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::Utf16 => "UTF-16 units",
+        }
+    }
+}
+
+/// A recorded size and the unit it was measured in, kept together so the two cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Size {
+    pub value: usize,
+    pub unit: Unit,
+}
+
+impl Size {
+    pub fn bytes(value: usize) -> Self {
+        Self { value, unit: Unit::Bytes }
+    }
+
+    /// True when `self` and `other` are in the same unit and can be ordered meaningfully.
+    ///
+    /// A caller that wants the larger of two sizes MUST ask this first. Comparing a UTF-16 row
+    /// against a byte row silently compares two different quantities, which is the defect this type
+    /// exists to prevent.
+    pub fn comparable_with(self, other: Self) -> bool {
+        self.unit == other.unit
+    }
+}
+
+impl std::fmt::Display for Size {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.value, self.unit.label())
+    }
+}
+
 /// One run, as doctor prints it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Run {
     pub ts: String,
-    pub emitted_u16: usize,
-    pub budget_u16: usize,
-    pub full_u16: usize,
+    /// Sizes carry their unit: a row written before 2026-09-20 is in UTF-16 units and says so.
+    pub emitted: Size,
+    pub budget: Size,
+    pub full: Size,
+    /// Always UTF-16: a readability limit, unchanged by the byte conversion.
     pub first_screen_u16: usize,
     pub over_budget: bool,
     pub first_screen_ok: bool,
@@ -199,9 +265,14 @@ pub fn read(tier: &str, dir: &Path, window: usize) -> TierSizes {
 
 fn summarise(hook: String, recent: &[&Run]) -> Option<EventSizes> {
     let last = (*recent.last()?).clone();
+    // LARGEST IS ONLY MEANINGFUL WITHIN ONE UNIT. Rows written before 2026-09-20 hold UTF-16 units
+    // and rows since hold bytes; picking the biggest number across both would compare two different
+    // quantities and report the winner as a fact. Skipping a row that cannot be compared leaves a
+    // gap the reader can see, which is the trade ruled for this record.
     let mut largest = recent[0];
     for &run in recent {
-        if run.emitted_u16 >= largest.emitted_u16 {
+        if run.emitted.comparable_with(largest.emitted) && run.emitted.value >= largest.emitted.value
+        {
             largest = run;
         }
     }
@@ -224,11 +295,21 @@ fn parse(line: &str) -> Option<(String, Run)> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let number = |k: &str| v.get(k)?.as_u64().and_then(|n| usize::try_from(n).ok());
     let flag = |k: &str| v.get(k)?.as_bool();
+    // A row is in ONE unit throughout, so the unit is decided once from whichever spelling the
+    // emitted size uses, and the other fields follow it. Mixing spellings within a row is not a
+    // shape base has ever written.
+    let sized = |bytes_key: &str, u16_key: &str| -> Option<Size> {
+        if let Some(value) = number(bytes_key) {
+            Some(Size { value, unit: Unit::Bytes })
+        } else {
+            number(u16_key).map(|value| Size { value, unit: Unit::Utf16 })
+        }
+    };
     let mut run = Run {
         ts: v.get("ts")?.as_str()?.to_string(),
-        emitted_u16: number("emitted_u16")?,
-        budget_u16: number("budget_u16")?,
-        full_u16: number("full_u16")?,
+        emitted: sized("emitted_bytes", "emitted_u16")?,
+        budget: sized("budget_bytes", "budget_u16")?,
+        full: sized("full_bytes", "full_u16")?,
         first_screen_u16: number("first_screen_u16")?,
         over_budget: flag("over_budget")?,
         first_screen_ok: flag("first_screen_ok")?,
@@ -296,7 +377,7 @@ mod tests {
             "a file holding another hook's run has no session-start run"
         );
         let run = z.event("session-start").expect("a run of zero is a run");
-        assert_eq!((run.runs, run.last.emitted_u16), (1, 0));
+        assert_eq!((run.runs, run.last.emitted.value), (1, 0));
     }
 
     #[test]
@@ -315,9 +396,9 @@ mod tests {
             .cloned()
             .expect("runs on record");
         assert_eq!(e.runs, 20, "the window");
-        assert_eq!(e.last.emitted_u16, 200, "the last run");
+        assert_eq!(e.last.emitted.value, 200, "the last run");
         assert_eq!(
-            e.largest.emitted_u16, 700,
+            e.largest.emitted.value, 700,
             "the largest inside the window, not 9999 before it and not the first in it"
         );
     }
@@ -350,7 +431,7 @@ mod tests {
             "every record written across the rename is read back"
         );
         assert_eq!(
-            (e.last.emitted_u16, e.largest.emitted_u16),
+            (e.last.emitted.value, e.largest.emitted.value),
             (6, 6),
             "in order"
         );

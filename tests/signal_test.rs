@@ -148,7 +148,7 @@ fn an_over_budget_signal_collapses_to_a_floor_with_a_ledger_row() {
 
     let mut config = test_config();
     config.signal.max_chars = 50; // the legacy key: read by nothing now
-    config.budget.session_start_chars = 60;
+    config.budget.session_start_bytes = 60;
     config.budget.write_full_output = false;
 
     let output = signal::run_signals(tmp.path(), &config, "test").unwrap();

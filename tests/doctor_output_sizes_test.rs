@@ -7,12 +7,13 @@
 //! runs red there first. Each test asserts its controls before its claim, and a control that fails says `control:`,
 //! so a run that could not measure is never read as a red.
 //!
-//! The size doctor prints is checked against `units(stdout)` of the session start itself, the channel Claude Code
+//! The size doctor prints is checked against `stdout.len()` of the session start itself -- BYTES, the unit the
+//! host counts and the unit doctor reports since 2026-09-20. The channel Claude Code
 //! reads (law 42), not against the record doctor read it from.
 
 mod seed;
 
-use seed::{measured, run_base, run_session_start, units};
+use seed::{measured, run_base, run_session_start};
 
 /// Session start over `seed`, with its controls: hooks fail open, so it exits 0, and it printed something.
 fn start(seed: &seed::Seed, session: &str) -> String {
@@ -45,20 +46,35 @@ fn size_line<'a>(report: &'a str, what: &str) -> Option<&'a str> {
     report.lines().find(|line| line.contains(&key))
 }
 
-/// `N` and `B` from a line reading `... N of B units ...`.
+/// `N` and `B` from a line reading `... N of B <unit> at ...`, and the unit must be NAMED.
+///
+/// It used to split on the literal `" units"`, which worked only while every recorded size was in
+/// the same unit and the word carried no information. Since 2026-09-20 a record is in bytes or, if
+/// it was written earlier, in UTF-16 units — so doctor prints which, and a reader can no longer be
+/// shown two different quantities under one word. This parser asserts the unit is one it knows
+/// rather than skipping over it: an unrecognised unit is a doctor line nobody can interpret.
 fn of_units(line: &str) -> (usize, usize) {
-    let head = line.split(" units").next().unwrap_or("");
+    let head = line.split(" at ").next().unwrap_or("");
     let words: Vec<&str> = head.split_whitespace().collect();
-    let n = words.len();
+    let of = words
+        .iter()
+        .rposition(|w| *w == "of")
+        .unwrap_or_else(|| panic!("not an `N of B <unit>` line: {line}"));
     assert!(
-        n >= 3 && words[n - 2] == "of",
-        "not an `N of B units` line: {line}"
+        of >= 1 && of + 2 <= words.len(),
+        "not an `N of B <unit>` line: {line}"
     );
     let number = |w: &str| {
         w.parse::<usize>()
             .unwrap_or_else(|_| panic!("`{w}` is not a number in: {line}"))
     };
-    (number(words[n - 3]), number(words[n - 1]))
+    let unit = words[of + 2..].join(" ");
+    assert!(
+        unit == "bytes" || unit == "UTF-16 units",
+        "doctor named the unit `{unit}`, which is neither `bytes` nor `UTF-16 units`, so a reader \
+         cannot tell what quantity this line reports: {line}"
+    );
+    (number(words[of - 1]), number(words[of + 1]))
 }
 
 /// D1. On the real-size seed the size doctor reports for the last session start is the size Claude Code received,
@@ -81,7 +97,7 @@ fn doctor_reports_the_last_session_start_at_the_size_claude_code_received() {
         measured(&full)
     );
     assert!(
-        units(&full) > units(&stdout),
+        full.len() > stdout.len(),
         "control: the untrimmed file is not larger than stdout, so this run trimmed nothing"
     );
 
@@ -102,7 +118,7 @@ fn doctor_reports_the_last_session_start_at_the_size_claude_code_received() {
     let (n, budget) = of_units(line);
     assert_eq!(
         n,
-        units(&stdout),
+        stdout.len(),
         "doctor's last run is not the size session start printed: {line}"
     );
     assert_eq!(
@@ -169,11 +185,11 @@ session_start_chars = 300
     .expect("the global base.toml rewritten");
     let second = start(&seed, "d2-second");
 
-    let (u1, u2) = (units(&first), units(&second));
+    let (u1, u2) = (first.len(), second.len());
     println!("run 1 {} · run 2 {}", measured(&first), measured(&second));
     assert_ne!(
         u1, u2,
-        "control: both runs printed {u1} units, so the last run and the largest cannot be told apart"
+        "control: both runs printed {u1} bytes, so the last run and the largest cannot be told apart"
     );
 
     let report = doctor(&seed);
