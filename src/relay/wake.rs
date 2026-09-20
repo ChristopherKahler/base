@@ -430,32 +430,43 @@ pub fn arm_blocks_for(session_id: &str, force: bool) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// The five gate states, driven through the pure half so none of them needs a home
-    /// on disk or a sentinel aged in real time.
-    ///
-    /// LEG 2 IS THE ONE THAT DECIDES WHETHER THIS FIX REACHES ANYBODY. Every monitor
-    /// alive on this machine only touches the sentinel, so it writes NOTHING. If empty
-    /// read as "no data, assume fine", every running session would stay silent forever
-    /// and the fix would never reach a seat — the defect reproduced by its own fix.
+    /// THE MIGRATION LEG, and the one that decides whether this fix reaches anybody.
+    /// Every monitor alive on this machine only touches the sentinel, so it writes
+    /// NOTHING. If empty read as "no data, assume fine", every running session would
+    /// stay silent forever and the fix would never reach a seat — the defect reproduced
+    /// by its own fix. auk asked for this case to be named on its own, and it is.
     #[test]
-    fn the_gate_separates_current_outdated_and_not_watching() {
+    fn an_empty_sentinel_is_outdated_never_a_pass() {
+        assert_eq!(armed_from("", "finch", true), Armed::Outdated);
+    }
+
+    /// A monitor running today's template under its own title is the only Current case.
+    #[test]
+    fn a_matching_fingerprint_and_title_is_current() {
         let fp = template_fingerprint();
-
-        // 1. fresh, right fingerprint, right title
         assert_eq!(armed_from(&format!("{fp} finch"), "finch", true), Armed::Current);
+    }
 
-        // 2. THE MIGRATION: an empty sentinel is Outdated, never a pass
-        assert_eq!(armed_from("", "finch", true), Armed::Outdated,
-            "an EMPTY sentinel must be Outdated - every monitor running today writes nothing");
-
-        // 3. a monitor armed from an older template
+    /// The control that stops every leg above passing on a function that calls
+    /// everything Outdated.
+    #[test]
+    fn an_older_template_is_outdated() {
         assert_eq!(armed_from("0000000000000000 finch", "finch", true), Armed::Outdated);
+    }
 
-        // 4. right fingerprint, WRONG title - a retitle, which the template hash alone
-        //    cannot see, which is why the title is stored beside it
+    /// The template hash alone cannot see a retitle, which is why the title is stored
+    /// beside it. Right fingerprint, wrong title, still Outdated.
+    #[test]
+    fn the_right_fingerprint_under_the_wrong_title_is_outdated() {
+        let fp = template_fingerprint();
         assert_eq!(armed_from(&format!("{fp} plover"), "finch", true), Armed::Outdated);
+    }
 
-        // 5. no live monitor at all beats every other reading
+    /// No live monitor beats every other reading: a perfect sentinel that has gone stale
+    /// is NotWatching, not Current.
+    #[test]
+    fn a_stale_sentinel_is_not_watching_whatever_it_says() {
+        let fp = template_fingerprint();
         assert_eq!(armed_from(&format!("{fp} finch"), "finch", false), Armed::NotWatching);
     }
 
