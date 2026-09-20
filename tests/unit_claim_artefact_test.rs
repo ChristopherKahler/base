@@ -155,6 +155,29 @@ fn control(leg: &str, name: &str, present: bool) {
     );
 }
 
+/// The budget notice line alone — NOT the whole capture.
+///
+/// SCOPING THIS WAS NOT OPTIONAL, AND THE FIRST VERSION DID NOT. The resolved-key arm asserted
+/// `text.contains("prompt_chars")` over stdout AND stderr combined. The legacy deprecation warning
+/// lives on stderr and ALSO contains `prompt_chars`:
+///
+///   base: [budget] prompt_chars was renamed to prompt_bytes when its unit changed ...
+///
+/// So the assertion passed by matching a DIFFERENT LINE than the one it is about, every single run,
+/// including on a tree where the notice named something else entirely.
+///
+/// FOUND BY auk's COMPLEMENTARITY DISCRIMINATOR. That mutation replaced the resolved key with
+/// `prompt_octets` — neither legacy nor resolved — and the test stayed GREEN. It was built to ask
+/// whether two legs were duplicates and instead showed that one of them did not assert what its
+/// name claimed. A probe aimed at one question answering a different one is worth more than the
+/// answer it was sent for.
+///
+/// This is law 40 in this file's own tests: an assertion keyed on a substring matched a different,
+/// legitimate line.
+fn notice_line(text: &str) -> Option<&str> {
+    text.lines().find(|l| l.contains("withheld") && l.contains("[budget]"))
+}
+
 /// Everything the three matchers found, formatted for one assertion.
 fn scan(leg: &str, artefact: &str, text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -618,9 +641,15 @@ fn the_overflow_notice_names_the_key_that_resolved() {
     let (_, out, err) = seed::run_prompt_submit(&s, "a prompt", Some("artefact-resolved-2"));
     let text = format!("{out}\n{err}");
     control("resolved/legacy", "the notice fired", text.contains("withheld"));
+
+    // ON THE NOTICE LINE, NOT THE WHOLE CAPTURE. See `notice_line`: the deprecation warning on
+    // stderr carries the same key, so asserting over both streams passes for the wrong reason.
+    let notice = notice_line(&text)
+        .unwrap_or_else(|| panic!("no budget notice line in the capture:\n{text}"));
     assert!(
-        text.contains(legacy),
+        notice.contains(legacy),
         "the operator set `{legacy}`, so that is the key in their file and the one the notice must \
-         send them to; naming the new spelling points at a key they do not have:\n{text}"
+         send them to; naming anything else points at a key they do not have. The notice line:\n\
+         {notice}"
     );
 }
