@@ -10,9 +10,35 @@
 //! character 40,159: the report of the loss was destroyed by the loss it reported.
 //!
 //! Every hook event's output is assembled here as ranked blocks, trimmed to its budget, and
-//! only then emitted. The unit is UTF-16 code units, because the host is JavaScript and its
-//! limit is a JS string length. On the reference output bytes over-count by 871 and `char`s
-//! under-count by 2, so neither is the number the host applies.
+//! only then emitted.
+//!
+//! THE UNIT IS BYTES, AND THIS MODULE SAID OTHERWISE UNTIL 2026-09-20. It read: "the unit is
+//! UTF-16 code units, because the host is JavaScript and its limit is a JS string length." That
+//! was an inference from the 2026-09-14 reading below, where bytes over-counted by 871 and `char`s
+//! under-counted by 2 against the UTF-16 figure. **Comparing three counts OF ONE FILE against each
+//! other cannot determine a THRESHOLD's unit** — it can only say which count a chosen number
+//! happens to sit near.
+//!
+//! MEASURED, 2026-09-20, Claude Code 2.1.278, with a probe built so the candidate units predict
+//! OPPOSITE outcomes: 13,000 box-drawing characters — 39,000 bytes but only 13,000 `char`s and
+//! 13,000 UTF-16 units. A UTF-16 or `char` limit predicts it ARRIVES WHOLE, because 13,703 ASCII
+//! bytes had already been proven to arrive whole. A byte limit predicts it PERSISTS, because
+//! 30,038 ASCII bytes had already been proven to persist. **IT PERSISTED. The host counts bytes.**
+//! An all-ASCII probe can never settle this, because for ASCII bytes, `char`s and UTF-16 units are
+//! the same number.
+//!
+//! WHY IT MATTERED: UTF-8 allows up to 3 bytes per UTF-16 unit, so a 4,000-unit budget permitted up
+//! to 12,000 BYTES against a hook threshold at or below 10,957. base would have trimmed correctly,
+//! reported its withheld figure truthfully, and the host would have cut the survivor anyway — **a
+//! loss notice that is itself lost, with every number in it accurate.** It never bit only because
+//! base's output is near-pure ASCII, which is the content saving it rather than the budget.
+//!
+//! ⚠️ [`Emission`] AND [`Rendered`] STILL MEASURE IN UTF-16 AND STILL CARRY THIS DEFECT. Session
+//! start's `session_start_chars = 9000` is enforced in UTF-16 units against the same byte
+//! threshold, so the same arithmetic permits up to 27,000 bytes. It does not bite today for the
+//! same reason — its measured 8,552-unit arrival was near-ASCII. NOT FIXED HERE: that hook is
+//! another lane's, it has live arrival evidence behind it, and re-unitising the first thing the
+//! operator sees is not a change to make as a side effect of this one.
 //!
 //! Output written to stderr is outside every budget by construction: Claude Code feeds only a
 //! hook's stdout to the model.
@@ -21,7 +47,16 @@ use std::path::{Path, PathBuf};
 
 pub mod record;
 
-/// The length the host measures: UTF-16 code units. Nothing in this module measures any other way.
+/// UTF-16 code units. **NOT the length the host measures** — this doc comment used to say it was,
+/// and that sentence is what misled three separate sessions into building on it as settled fact.
+///
+/// The host counts BYTES. Measured 2026-09-20 on Claude Code 2.1.278 with a probe built so the
+/// candidate units predict opposite outcomes: 13,000 box-drawing characters — 39,000 bytes, 13,000
+/// `char`s, 13,000 UTF-16 units — PERSISTED, where a UTF-16 or `char` limit predicts it arrives
+/// whole. See the module header for the full reasoning.
+///
+/// Still used by [`Emission`] and [`Rendered`], **knowingly and against the measured unit**. Use
+/// `str::len()` for anything that has to bound what the host will actually deliver.
 pub fn u16_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
@@ -29,22 +64,23 @@ pub fn u16_len(s: &str) -> usize {
 /// What a hook actually emitted, so the caller can report it and rank 10 can record it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Measured {
-    /// What the hook wanted to say, in UTF-16 units.
-    pub wanted_u16: usize,
+    /// What the hook wanted to say, in BYTES — the unit the host counts.
+    pub wanted_bytes: usize,
     /// What it printed, notice included.
-    pub emitted_u16: usize,
+    pub emitted_bytes: usize,
     /// What the budget withheld. Zero when everything fitted.
-    pub withheld_u16: usize,
+    pub withheld_bytes: usize,
 }
 
 impl Measured {
     pub fn lost(&self) -> bool {
-        self.withheld_u16 > 0
+        self.withheld_bytes > 0
     }
 }
 
-/// Print `text` for `hook` under `budget_u16`, measured in the unit the host counts, and say what
-/// was withheld INSIDE the part that survives.
+/// Print `text` for `hook` under `budget_bytes`, measured in BYTES — the unit the host counts,
+/// established by probe on 2026-09-20 (see the module header) — and say what was withheld INSIDE
+/// the part that survives.
 ///
 /// WHY THE NOTICE IS RESERVED BEFORE THE TRIM AND NOT APPENDED AFTER IT. That is rank 00's exact
 /// failure mode: base measured its own session-start loss correctly and put the report at byte
@@ -60,39 +96,42 @@ impl Measured {
 ///
 /// WHAT THIS IS NOT. It does not degrade per block to a floor and it has no ranked trim order, as
 /// `Emission` does for session start. The tail is withheld and named. The two hooks are NOT
-/// equivalent afterwards and should not be read as though they were.
+/// equivalent afterwards and should not be read as though they were — and since 2026-09-20 they do
+/// not even measure in the same unit: this caps BYTES, `Emission` still caps UTF-16 units.
 ///
 /// Trimming is on whole lines: half a rule is worse than no rule, because a truncated instruction
 /// still reads as an instruction.
-pub fn print_measured(hook: &str, key: &str, text: &str, budget_u16: usize) -> Measured {
-    let wanted = u16_len(text);
-    if wanted <= budget_u16 {
+pub fn print_measured(hook: &str, key: &str, text: &str, budget_bytes: usize) -> Measured {
+    let wanted = text.len();
+    if wanted <= budget_bytes {
         print!("{text}");
-        return Measured { wanted_u16: wanted, emitted_u16: wanted, withheld_u16: 0 };
+        return Measured { wanted_bytes: wanted, emitted_bytes: wanted, withheld_bytes: 0 };
     }
 
-    let reserve = u16_len(&withheld_notice(hook, key, wanted, budget_u16));
-    let room = budget_u16.saturating_sub(reserve);
+    let reserve = withheld_notice(hook, key, wanted, budget_bytes).len();
+    let room = budget_bytes.saturating_sub(reserve);
 
+    // Whole lines, so the cut never lands mid-character: every line is valid UTF-8 on its own, and
+    // counting its bytes cannot split one. Byte-slicing arbitrary text could.
     let mut kept = String::new();
-    let mut kept_u16 = 0usize;
+    let mut kept_bytes = 0usize;
     for line in text.split_inclusive('\n') {
-        let n = u16_len(line);
-        if kept_u16 + n > room {
+        let n = line.len();
+        if kept_bytes + n > room {
             break;
         }
         kept.push_str(line);
-        kept_u16 += n;
+        kept_bytes += n;
     }
 
-    let withheld = wanted.saturating_sub(kept_u16);
-    let notice = withheld_notice(hook, key, withheld, budget_u16);
+    let withheld = wanted.saturating_sub(kept_bytes);
+    let notice = withheld_notice(hook, key, withheld, budget_bytes);
     if !kept.is_empty() && !kept.ends_with('\n') {
         kept.push('\n');
     }
     let out = format!("{kept}{notice}");
     print!("{out}");
-    Measured { wanted_u16: wanted, emitted_u16: u16_len(&out), withheld_u16: withheld }
+    Measured { wanted_bytes: wanted, emitted_bytes: out.len(), withheld_bytes: withheld }
 }
 
 /// The one line that survives. It names the hook, the loss and the key that governs it, because an
@@ -106,9 +145,9 @@ pub fn print_measured(hook: &str, key: &str, text: &str, budget_u16: usize) -> M
 /// coming: their overflow notice would name `prompt_chars` and send them to edit a setting that
 /// governs a different hook. That is the inert-field defect pointed at the operator, and it is worse
 /// than silence, because silence does not give directions.
-fn withheld_notice(hook: &str, key: &str, withheld_u16: usize, budget_u16: usize) -> String {
+fn withheld_notice(hook: &str, key: &str, withheld_bytes: usize, budget_bytes: usize) -> String {
     format!(
-        "\n[base: {hook} withheld {withheld_u16} of its units against [budget] {key} = {budget_u16}. \
+        "\n[base: {hook} withheld {withheld_bytes} bytes against [budget] {key} = {budget_bytes}. \
 Raise it in base.toml, or run `base doctor` to see what each hook emitted.]\n"
     )
 }
@@ -519,6 +558,26 @@ impl Emission {
     /// measured is the header that is printed. Each pass either degrades one block or stops,
     /// and every block can degrade at most twice, so the loop ends.
     pub fn render(mut self, full: &FullOutput, header: Option<Header<'_>>) -> Rendered {
+        // ⚠️ THIS MEASURES IN UTF-16 UNITS AND THAT IS KNOWINGLY THE WRONG UNIT. The host was
+        // measured counting BYTES on 2026-09-20 (Claude Code 2.1.278; see the module header for
+        // the probe). UTF-8 allows up to 3 bytes per UTF-16 unit, so `session_start_chars = 9000`
+        // permits up to 27,000 bytes against a threshold at or below 10,957. It does not bite
+        // today only because this hook's output is near-pure ASCII — its measured 8,552-unit
+        // arrival was — so CONTENT is what keeps it inside, not the budget.
+        //
+        // LEFT DELIBERATELY, NOT OVERLOOKED. `print_measured` was converted to bytes in the same
+        // change; this path was not, because session start is another lane's, it has live arrival
+        // evidence attached to its current behaviour, and re-unitising the first thing the operator
+        // sees is not a change to make as a side effect of another one.
+        //
+        // OWNED BY `auk`, filed 2026-09-20, including the question this raises: whether
+        // `session_start_chars` keeps its name when its unit changes, since silently redefining a
+        // setting an operator may already have tuned is its own defect.
+        //
+        // This note is here rather than only in the commit because the thing that misled everyone
+        // was a comment in this very module asserting the UTF-16 unit as settled fact. A deliberate
+        // divergence with nothing beside it reads as the considered choice, and the next reader
+        // builds on it exactly as we did.
         let full_u16 = u16_len(&self.full_text());
         let (text, prefix) = loop {
             let head = self.header_line(full, header);

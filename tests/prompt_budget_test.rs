@@ -14,28 +14,47 @@
 //!
 //! WHY A TEST AND NOT A MEASUREMENT. 13.3-KB-in-2-KB-out is one machine at one moment, and a
 //! reading that cannot be re-run is not a guard.
+//!
+//! THE BUDGET IS IN BYTES, AND IT WAS IN UTF-16 UNITS UNTIL 2026-09-20. The host was measured
+//! counting bytes, with a probe built so the candidate units predict opposite outcomes: 13,000
+//! box-drawing characters — 39,000 bytes but only 13,000 UTF-16 units — PERSISTED, where a UTF-16
+//! limit predicts it arrives whole. A UTF-16 budget cannot bound a byte limit: UTF-8 allows 3
+//! bytes per unit, so 4,000 units permitted up to 12,000 bytes against a threshold at or below
+//! 10,957. base would have trimmed correctly, reported its withheld figure truthfully, and the
+//! host would have cut the survivor anyway — a loss notice that is itself lost with every number
+//! in it accurate. **So this file asserts on `str::len()`, never on `units()`.**
 
 mod seed;
 
-use seed::{run_prompt_submit, units};
+use seed::run_prompt_submit;
 
 /// `[budget] prompt_chars`'s built-in default, which is what an operator with no `[budget]` section
 /// gets. Spelled here rather than imported so the test states the number it is asserting.
+///
+/// **BYTES.** The name predates the measurement that settled the unit; see the file header.
 const PROMPT_CHARS: usize = 4000;
 
 /// The opening of the withheld notice. Both arms key off it, so it is spelled once.
 const NOTICE: &str = "[base: user-prompt-submit withheld ";
+
+/// Bytes, because that is what the host counts and therefore what the budget must bound.
+fn emitted_bytes(s: &str) -> usize {
+    s.len()
+}
 
 /// The LARGEST emission measured from this hook on a real machine: `finch`, 2026-09-20, prompt 10
 /// of a single session, 26,016 bytes, of which 2,048 arrived. Prompt 1 of that same session emitted
 /// 13,678 — SO THE EMISSION NEARLY DOUBLED AS THE SESSION GREW, which is why the fixture is keyed
 /// to the observed maximum and not to a typical figure. A trim validated at 13 KB passes and still
 /// loses everything at 26 KB.
+///
+/// **It was measured in BYTES**, which is now the unit the budget uses too — so this floor and the
+/// budget are finally the same kind of number. They were not before 2026-09-20.
 const HIGH_WATER: usize = 26_016;
 
 /// The withheld figure the notice states, which is the only number in `stdout` that reports on text
 /// that is NOT in `stdout`.
-fn withheld_units(stdout: &str) -> Option<usize> {
+fn withheld_bytes(stdout: &str) -> Option<usize> {
     let at = stdout.find(NOTICE)?;
     stdout[at + NOTICE.len()..]
         .split_whitespace()
@@ -108,7 +127,7 @@ fn the_prompt_hook_fits_its_budget() {
         run_prompt_submit(&s, "write code to fix a bug in src/", Some("prompt-budget"));
     assert_eq!(code, 0, "the hook should not fail:\nstdout:\n{stdout}\nstderr:\n{stderr}");
 
-    let emitted = units(&stdout);
+    let emitted = emitted_bytes(&stdout);
 
     // THE CONTROL, AND IT IS KEYED ON WHAT THE HOOK WANTED TO SAY, NOT ON WHAT IT SAID.
     //
@@ -123,10 +142,10 @@ fn the_prompt_hook_fits_its_budget() {
     // only one that can prove a trim happened. `wanted == withheld + kept` and `kept >= 0`, so
     // `withheld >= HIGH_WATER` implies `wanted >= HIGH_WATER`: the fixture really did reproduce the
     // largest emission measured on a real machine.
-    let withheld = withheld_units(&stdout).unwrap_or_else(|| {
+    let withheld = withheld_bytes(&stdout).unwrap_or_else(|| {
         panic!(
             "control: no withheld notice, so NOTHING WAS TRIMMED and the budget assertion below \
-             would be vacuous. The hook emitted {emitted} units against a {PROMPT_CHARS} unit \
+             would be vacuous. The hook emitted {emitted} bytes against a {PROMPT_CHARS} byte \
              budget. TWO CAUSES LOOK IDENTICAL FROM HERE and the figure tells them apart: at or \
              under {PROMPT_CHARS} the fixture is too quiet to overflow and needs more rules; well \
              over it, nothing is measuring the output at all, which is the defect itself. \
@@ -135,17 +154,17 @@ fn the_prompt_hook_fits_its_budget() {
     });
     assert!(
         withheld >= HIGH_WATER,
-        "control: the trim withheld {withheld} units, short of the {HIGH_WATER} measured on a real \
+        "control: the trim withheld {withheld} bytes, short of the {HIGH_WATER} measured on a real \
          machine, so this fixture is quieter than the failure it stands for. A budget validated \
          against a small overflow is not evidence about a large one — finch watched this hook go \
-         from 13,678 to 26,016 units inside ONE session. Raise the fixture's rule count."
+         from 13,678 to 26,016 bytes inside ONE session. Raise the fixture's rule count."
     );
 
     assert!(
         emitted <= PROMPT_CHARS,
-        "the prompt hook emitted {emitted} UTF-16 units against [budget] prompt_chars = \
+        "the prompt hook emitted {emitted} BYTES against [budget] prompt_chars = \
          {PROMPT_CHARS}. Nothing measures it, so whatever the host drops is lost silently — which \
-         is the defect. First 400 units:\n{}",
+         is the defect. First 400 chars:\n{}",
         stdout.chars().take(400).collect::<String>()
     );
 
@@ -182,18 +201,22 @@ fn the_withheld_notice_survives_the_trim_that_caused_it() {
         // No notice is only acceptable if nothing was withheld. Over budget with no notice is the
         // silent loss this change exists to end.
         assert!(
-            units(&stdout) <= PROMPT_CHARS,
-            "the output is {} units, over the {PROMPT_CHARS} budget, and carries NO withheld \
+            emitted_bytes(&stdout) <= PROMPT_CHARS,
+            "the output is {} bytes, over the {PROMPT_CHARS} budget, and carries NO withheld \
              notice: the loss is silent, which is the defect itself",
-            units(&stdout)
+            emitted_bytes(&stdout)
         );
         return;
     };
 
-    let notice_ends = units(&stdout[..at]) + units(NOTICE);
+    // `str::find` returns a BYTE offset, which is now the unit the budget is in — so the position
+    // of the notice needs no conversion at all. Under the old UTF-16 budget this line had to
+    // re-measure the prefix, and a byte offset compared against a UTF-16 budget would have read as
+    // correct while comparing two different quantities.
+    let notice_ends = at + NOTICE.len();
     assert!(
         notice_ends <= PROMPT_CHARS,
-        "the withheld notice ends at UTF-16 unit {notice_ends}, past the {PROMPT_CHARS} the host \
+        "the withheld notice ends at byte {notice_ends}, past the {PROMPT_CHARS} the host \
          delivers. The report of the loss died inside the loss — the exact defect this fixes."
     );
 }
