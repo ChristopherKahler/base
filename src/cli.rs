@@ -3106,7 +3106,7 @@ pub fn run() {
                     } else {
                         println!("Titled sessions ({}):", sessions.len());
                         for e in &sessions {
-                            let live = if e.alive() { "live" } else { "DEAD" };
+                            let live = relay::liveness_word(&e.last_heartbeat);
                             let ws = if e.workspace.is_empty() { "-" } else { e.workspace.as_str() };
                             println!(
                                 "  {title}  [{live} · {age}]  ws:{ws}  session:{sid}",

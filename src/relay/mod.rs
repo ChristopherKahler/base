@@ -41,8 +41,12 @@ pub const MESSAGE_TYPES: &[&str] = &[
     "answer",
 ];
 
-/// Heartbeats older than this render as DEAD on the board.
-pub const DEAD_AFTER_SECS: i64 = 15 * 60;
+/// A seat that has made no tool call for longer than this renders as idle.
+///
+/// MUST stay above the wake-monitor re-arm cycle (30 min). At 15 min a
+/// correctly parked seat sat past the threshold for most of every cycle, so
+/// the label fired during normal operation rather than on a fault.
+pub const IDLE_AFTER_SECS: i64 = 45 * 60;
 /// Default advisory-claim TTL.
 pub const DEFAULT_CLAIM_TTL_SECS: i64 = 60 * 60;
 
@@ -657,6 +661,30 @@ pub fn age_str(ts: &str) -> String {
     }
 }
 
+/// The one word the operator's surfaces use for a session row's liveness, and
+/// the single place the threshold is applied. Extracted verbatim from
+/// `board.rs`'s inline derivation so both surfaces stop deriving it separately
+/// and a row cannot contradict itself between two columns.
+pub fn liveness_word(last_heartbeat: &str) -> &'static str {
+    match parse_ts(last_heartbeat) {
+        Some(t) if (chrono::Local::now() - t).num_seconds() < IDLE_AFTER_SECS => "live",
+        // A stale heartbeat means the seat has not acted recently. It never
+        // means the seat is gone: nothing in this module removes a session row.
+        Some(_) => "idle",
+        // A heartbeat we cannot read is not evidence of anything.
+        None => "unknown",
+    }
+}
+
+/// The "Last seen" cell. A live seat shows the bare age, as it always has.
+pub fn liveness_label(last_heartbeat: &str) -> String {
+    match liveness_word(last_heartbeat) {
+        "live" => age_str(last_heartbeat),
+        w => format!("{w} ({})", age_str(last_heartbeat)),
+    }
+}
+
+
 fn escape_nq(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
@@ -909,5 +937,66 @@ mod tests {
 
         let root = relay_root(&wt).expect("worktree should resolve main relay root");
         assert_eq!(root, main.join(".base").join("relay"));
+    }
+
+    /// Chris, 2026-09-20, verbatim: "I dont care about retired sessions, I dont
+    /// want idles being labeled dead. period."
+    ///
+    /// A stale heartbeat means the seat has not made a tool call recently. It
+    /// does NOT mean the session is gone: there is no code path in `src/relay`
+    /// that removes a session row (the only `.remove(` is `claims.remove`), so
+    /// a row that exists was never dead. Measured 2026-09-20: the board printed
+    /// `DEAD (16h)` for `auk` beside `Watching OK` while its wake sentinel was
+    /// 0s old, and a ping sent to it landed seconds later.
+    #[test]
+    fn an_idle_seat_is_never_labelled_dead() {
+        let fresh = now_iso();
+        let stale = (chrono::Local::now() - chrono::Duration::hours(16))
+            .format("%Y-%m-%dT%H:%M:%S%z")
+            .to_string();
+
+        assert_eq!(liveness_word(&fresh), "live", "a fresh heartbeat is live");
+        assert_eq!(
+            liveness_word(&stale), "idle",
+            "a stale heartbeat is IDLE, never dead"
+        );
+
+        let label = liveness_label(&stale);
+        assert!(
+            !label.to_uppercase().contains("DEAD"),
+            "an idle seat was labelled dead: {label}"
+        );
+        assert!(
+            label.starts_with("idle ("),
+            "expected `idle (<age>)`, got `{label}`"
+        );
+
+        // A live seat keeps the bare age it has always shown.
+        assert_eq!(liveness_label(&fresh), age_str(&fresh));
+
+        // An unreadable heartbeat is UNKNOWN. A reader that cannot see must say
+        // so, never report a death it did not measure.
+        assert_eq!(liveness_word("not-a-timestamp"), "unknown");
+        assert!(!liveness_label("not-a-timestamp").to_uppercase().contains("DEAD"));
+    }
+
+    /// The threshold must sit ABOVE the wake-monitor re-arm cycle, or a
+    /// correctly parked seat reads idle for most of every cycle and the label
+    /// fires during normal operation rather than on a fault. Measured
+    /// 2026-09-20: the threshold was 15 min against a 30 min cycle.
+    #[test]
+    fn the_idle_threshold_clears_the_wake_rearm_cycle() {
+        const WAKE_REARM_SECS: i64 = 30 * 60;
+        assert!(
+            IDLE_AFTER_SECS > WAKE_REARM_SECS,
+            "IDLE_AFTER_SECS is {IDLE_AFTER_SECS}s and must exceed the {WAKE_REARM_SECS}s wake re-arm cycle"
+        );
+
+        // A seat that acted one full re-arm cycle ago is still live.
+        let one_cycle_ago = (chrono::Local::now()
+            - chrono::Duration::seconds(WAKE_REARM_SECS + 60))
+            .format("%Y-%m-%dT%H:%M:%S%z")
+            .to_string();
+        assert_eq!(liveness_word(&one_cycle_ago), "live");
     }
 }
