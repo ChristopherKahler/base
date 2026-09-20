@@ -1,3 +1,20 @@
+/// What `base --version` prints: the package version plus the commit it was
+/// built from.
+///
+/// `CARGO_PKG_VERSION` alone cannot tell two binaries apart that were built
+/// from different branches at the same version. On 2026-09-20 that is exactly
+/// what happened: one install silently reverted another's fix and nothing on
+/// the machine could say which was running.
+///
+/// The updater still compares `CARGO_PKG_VERSION` (see `update::run_quiet`).
+/// This const changes only what a human is shown, never what is compared.
+pub const BUILD_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (build ",
+    env!("BASE_BUILD_SHA_RESOLVED"),
+    ")"
+);
+
 pub mod ast_repo;
 pub mod graph_analyze;
 pub mod graph_extract;

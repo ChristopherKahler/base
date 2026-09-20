@@ -11,7 +11,7 @@ use base::scope;
 #[derive(Parser)]
 #[command(
     name = "base",
-    version,
+    version = base::BUILD_VERSION,
     about = "BASE — Proactive context-injection engine for Claude Code",
     after_help = "Drop-in plugin commands (from extensions): run `base ext list`\n\n\
                   Docs: https://docs.basemode.ai\n\
