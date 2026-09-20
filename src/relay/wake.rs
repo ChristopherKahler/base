@@ -75,14 +75,26 @@ pub fn is_watching(title: &str) -> bool {
 /// stamp that could not move inside a release let a coach sit eight days behind while
 /// the check said nothing. **A freshness check is not a truth check.**
 ///
-/// A compile-time constant has neither problem. The title is stored beside the hash so
-/// a retitle is caught too, since the template itself carries no title.
+/// A compile-time constant has neither problem.
+///
+/// NO TITLE IS STORED BESIDE IT (auk added one, then withdrew it on 2026-09-20). The
+/// worry was that a template-only hash leaves a RETITLED session reading Current while
+/// its monitor watches the wrong inbox. THE PATH ALREADY CLOSES THAT: the sentinel lives
+/// at `relay-inbox/<title>/.watching`, so base builds a DIFFERENT path for a retitled
+/// session, finds no file, and reads `NotWatching`. A missing file is already a mismatch,
+/// and the field caught nothing the path did not — at a measured cost of 11 characters in
+/// a block that renders on every session start.
+///
+/// ⚑ RESIDUAL, NAMED RATHER THAN HIDDEN (auk): `title_dir` SANITIZES, so two distinct
+/// titles can map to one directory — `auk-1` and `auk_1` both become `auk-1`. That is a
+/// real collision and a title field would not have fixed it well. It is a defect in the
+/// sanitizer, recorded here so the next reader does not re-derive it.
 const WATCH_TEMPLATE: &str = r#"INBOX="{inbox}"
 mkdir -p "$INBOX"
 seen="|"
 reported="|"
 while true; do
-  printf '%s %s' "{fp}" "{title}" > "$INBOX/.watching" 2>/dev/null
+  printf '%s' "{fp}" > "$INBOX/.watching" 2>/dev/null
   for f in $(ls -1t "$INBOX"/ping-*.json 2>/dev/null); do
     b=$(basename "$f")
     case "$seen" in *"|$b|"*) continue;; esac
@@ -153,26 +165,23 @@ pub fn armed_state(title: &str) -> Armed {
         return Armed::NotWatching;
     };
     let body = std::fs::read_to_string(&p).unwrap_or_default();
-    armed_from(&body, title, fresh(&p))
+    armed_from(&body, fresh(&p))
 }
 
 /// The pure half, so every state is reachable in a test without a home on disk and
 /// without waiting for a sentinel to age. `is_fresh` is the caller's reading of the
-/// file's mtime; this function never touches the filesystem.
-fn armed_from(body: &str, title: &str, is_fresh: bool) -> Armed {
+/// file's mtime; this function never touches the filesystem. It takes no title: the
+/// sentinel's PATH carries that, and a retitle is a different path.
+fn armed_from(body: &str, is_fresh: bool) -> Armed {
     if !is_fresh {
         return Armed::NotWatching;
     }
-    let mut parts = body.split_whitespace();
-    let (Some(fp), Some(t)) = (parts.next(), parts.next()) else {
-        // Missing either field. An EMPTY sentinel lands here, and it must be Outdated:
-        // see the doc above, this is the case every live monitor is in today.
-        return Armed::Outdated;
-    };
-    if fp == template_fingerprint() && t == title {
-        Armed::Current
-    } else {
-        Armed::Outdated
+    // An EMPTY sentinel yields no token and falls through to Outdated, which is the
+    // case every live monitor on this machine is in today. See the doc above: if empty
+    // read as fine, this fix would never reach a single seat.
+    match body.split_whitespace().next() {
+        Some(fp) if fp == template_fingerprint() => Armed::Current,
+        _ => Armed::Outdated,
     }
 }
 
@@ -294,19 +303,13 @@ fn watch_script(title: &str) -> Option<String> {
 /// test between `ls` and `cat` can always be overtaken by the delete it is
 /// checking for.
 pub fn watch_script_for(inbox: &std::path::Path) -> Option<String> {
-    // The title is the inbox's own last component, so the name the monitor STAMPS is
-    // always the name of the folder it WATCHES. Deriving it here rather than taking it
-    // as an argument keeps those two from ever disagreeing, and keeps every existing
-    // caller working.
-    let title = inbox.file_name()?.to_string_lossy().into_owned();
     let inbox = inbox.to_string_lossy().replace('\\', "/");
     // Substitution happens AFTER the hash is taken, and `replace` is used rather than
     // `format!` because the template is a plain const whose braces are literal shell.
     Some(
         WATCH_TEMPLATE
             .replace("{inbox}", &inbox)
-            .replace("{fp}", &template_fingerprint())
-            .replace("{title}", &title),
+            .replace("{fp}", &template_fingerprint()),
     )
 }
 
@@ -437,29 +440,33 @@ mod tests {
     /// by its own fix. auk asked for this case to be named on its own, and it is.
     #[test]
     fn an_empty_sentinel_is_outdated_never_a_pass() {
-        assert_eq!(armed_from("", "finch", true), Armed::Outdated);
+        assert_eq!(armed_from("", true), Armed::Outdated);
     }
 
     /// A monitor running today's template under its own title is the only Current case.
     #[test]
-    fn a_matching_fingerprint_and_title_is_current() {
+    fn a_matching_fingerprint_is_current() {
         let fp = template_fingerprint();
-        assert_eq!(armed_from(&format!("{fp} finch"), "finch", true), Armed::Current);
+        assert_eq!(armed_from(&format!("{fp} finch"), true), Armed::Current);
     }
 
     /// The control that stops every leg above passing on a function that calls
     /// everything Outdated.
     #[test]
     fn an_older_template_is_outdated() {
-        assert_eq!(armed_from("0000000000000000 finch", "finch", true), Armed::Outdated);
+        assert_eq!(armed_from("0000000000000000 finch", true), Armed::Outdated);
     }
 
-    /// The template hash alone cannot see a retitle, which is why the title is stored
-    /// beside it. Right fingerprint, wrong title, still Outdated.
+    /// A retitle needs no field of its own: the sentinel for a new title is a new PATH
+    /// with no file behind it, and `armed_state` returns `NotWatching` for a missing
+    /// sentinel. This leg pins the piece that lives in this function — anything after
+    /// the fingerprint is ignored, so a stale second field cannot make a stale monitor
+    /// read Current.
     #[test]
-    fn the_right_fingerprint_under_the_wrong_title_is_outdated() {
+    fn anything_after_the_fingerprint_is_ignored() {
         let fp = template_fingerprint();
-        assert_eq!(armed_from(&format!("{fp} plover"), "finch", true), Armed::Outdated);
+        assert_eq!(armed_from(&format!("{fp} plover"), true), Armed::Current);
+        assert_eq!(armed_from("0000000000000000 finch", true), Armed::Outdated);
     }
 
     /// No live monitor beats every other reading: a perfect sentinel that has gone stale
@@ -467,16 +474,16 @@ mod tests {
     #[test]
     fn a_stale_sentinel_is_not_watching_whatever_it_says() {
         let fp = template_fingerprint();
-        assert_eq!(armed_from(&format!("{fp} finch"), "finch", false), Armed::NotWatching);
+        assert_eq!(armed_from(&format!("{fp} finch"), false), Armed::NotWatching);
     }
 
-    /// A half-written sentinel — fingerprint present, title missing — is Outdated, not
-    /// Current. Without this, a torn write would read as compliant.
+    /// Whitespace-only is not a fingerprint. A torn or blanked write must read Outdated,
+    /// not Current.
     #[test]
-    fn a_sentinel_missing_its_second_field_is_outdated() {
-        let fp = template_fingerprint();
-        assert_eq!(armed_from(&fp, "finch", true), Armed::Outdated);
-        assert_eq!(armed_from("   ", "finch", true), Armed::Outdated);
+    fn a_whitespace_only_sentinel_is_outdated() {
+        assert_eq!(armed_from("   ", true), Armed::Outdated);
+        assert_eq!(armed_from("
+", true), Armed::Outdated);
     }
 
     /// Whitespace and a trailing newline must not change the reading. The script writes
@@ -486,8 +493,8 @@ mod tests {
     #[test]
     fn the_gate_tolerates_surrounding_whitespace() {
         let fp = template_fingerprint();
-        assert_eq!(armed_from(&format!("  {fp}  finch 
-"), "finch", true), Armed::Current);
+        assert_eq!(armed_from(&format!("  {fp}  
+"), true), Armed::Current);
     }
 
     #[test]

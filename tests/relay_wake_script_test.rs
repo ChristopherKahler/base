@@ -294,16 +294,10 @@ fn the_emitted_script_writes_the_fingerprint_and_title_into_the_sentinel() {
 
     let body = std::fs::read_to_string(inbox.join(".watching"))
         .expect("the loop must create the sentinel");
-    let mut parts = body.split_whitespace();
     assert_eq!(
-        parts.next(),
-        Some(base::relay::wake::template_fingerprint().as_str()),
-        "field 1 must be the template fingerprint, got: {body:?}"
-    );
-    assert_eq!(
-        parts.next(),
-        Some("kestrel"),
-        "field 2 must be the title, which is the inbox's own folder name, got: {body:?}"
+        body.trim(),
+        base::relay::wake::template_fingerprint(),
+        "the sentinel must hold the template fingerprint and nothing else, got: {body:?}"
     );
 }
 
