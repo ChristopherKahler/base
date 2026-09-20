@@ -73,6 +73,7 @@ fn an_unmigrated_tier_says_so_and_counts_its_orphans() {
     );
 
     let report = base::doctor::DoctorReport {
+        measured_on: base::doctor::MeasuredOn::Matches { version: "2.1.278".to_string() },
         tiers: vec![r],
         healthy: true,
         warnings: vec![],
@@ -101,6 +102,7 @@ fn a_migrated_tier_reports_its_schema_version_and_no_orphans() {
     assert!(r.domain_orphans.is_empty(), "{:?}", r.domain_orphans);
 
     let report = base::doctor::DoctorReport {
+        measured_on: base::doctor::MeasuredOn::Matches { version: "2.1.278".to_string() },
         tiers: vec![r],
         healthy: true,
         warnings: vec![],
