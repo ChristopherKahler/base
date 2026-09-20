@@ -1077,8 +1077,19 @@ mod tests {
     #[test]
     fn a_row_with_nothing_to_compare_against_is_not_flagged() {
         let fresh = now_iso();
+
+        // No live binding for the title: nothing to disagree with.
         assert_eq!(row_liveness(Some("abc"), None, &fresh), liveness_label(&fresh));
-        assert_eq!(row_liveness(None, Some("abc"), &fresh), liveness_label(&fresh));
+
+        // Neither side is bound: nothing to disagree with.
         assert_eq!(row_liveness(None, None, &fresh), liveness_label(&fresh));
+
+        // DIFFERENT CASE FROM THE OTHER TWO, and deliberately so (auk, 2026-09-20).
+        // A live session DOES hold this title; only the row cannot be tied to
+        // it. The age is reported because it is true about the TITLE being
+        // active, which is what the column claims. It is not a statement about
+        // which session wrote the row, and no mismatch has been observed —
+        // an unbound row is not evidence of a stale one.
+        assert_eq!(row_liveness(None, Some("abc"), &fresh), liveness_label(&fresh));
     }
 }
