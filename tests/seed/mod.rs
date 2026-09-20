@@ -394,6 +394,26 @@ fn run(
     )
 }
 
+/// The user-prompt-submit hook, driven as Claude Code drives it: JSON on stdin with the prompt.
+///
+/// The field name is `prompt`, which is what `extract_prompt` reads first (it also accepts
+/// `tool_input.prompt`). Mirrors [`run_session_start`] so the two hooks are measured the same way.
+pub fn run_prompt_submit(seed: &Seed, prompt: &str, session: Option<&str>) -> (i32, String, String) {
+    let payload = serde_json::json!({
+        "cwd": seed.ws.display().to_string(),
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": prompt,
+        "session_id": session,
+    })
+    .to_string();
+    run(
+        seed,
+        &["hook", "user-prompt-submit"],
+        Some(&payload),
+        session.map(|_| "seed-kite"),
+    )
+}
+
 /// The session-start hook, driven as Claude Code drives it: JSON on stdin. With a session id the
 /// relay title is fixed, so the wake contract is part of the output and reads the same every run.
 pub fn run_session_start(seed: &Seed, session: Option<&str>) -> (i32, String, String) {
