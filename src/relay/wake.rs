@@ -119,6 +119,27 @@ fn watch_script(title: &str) -> Option<String> {
 /// ending with another entry's name would false-match and that ping would be
 /// SILENTLY SKIPPED — the exact failure this function exists to remove.
 /// `seen` now opens with `|` and the match is anchored on both sides.
+///
+/// RANK E — ONE READ, AND NEVER CONSUME ON AN EMPTY ONE. Found by auk
+/// EXPERIENCING it: its waker printed `RELAY PING from grebe:` with no body.
+///
+/// The loop took ONE `ls` snapshot and then read each file THREE times — once
+/// for `from`, once for the summary, once for the raw fallback. **A reply
+/// clears inbound pings**, so a file later in the snapshot can be deleted
+/// before it is read. All three reads then return empty, the header prints
+/// with nothing after it, and the next line marks the file consumed. Silent
+/// loss again, by a different mechanism than `head -5`, in the same script.
+///
+/// The body is now read ONCE into `raw`, and an empty read is `continue`
+/// WITHOUT marking `seen`. If a reply really did clear the file, the next `ls`
+/// simply does not list it and nothing was lost; if the read failed
+/// transiently, the next poll retries it.
+///
+/// There is deliberately NO separate existence test. auk proposed read-once
+/// plus a guard; the guard only ever existed to bridge the gap between listing
+/// and reading, and reading once removes the gap rather than narrowing it. A
+/// test between `ls` and `cat` can always be overtaken by the delete it is
+/// checking for.
 pub fn watch_script_for(inbox: &std::path::Path) -> Option<String> {
     let inbox = inbox.to_string_lossy().replace('\\', "/");
     Some(format!(
@@ -130,9 +151,11 @@ while true; do
   for f in $(ls -1t "$INBOX"/ping-*.json 2>/dev/null); do
     b=$(basename "$f")
     case "$seen" in *"|$b|"*) continue;; esac
-    from=$(grep -o '"from": *"[^"]*"' "$f" 2>/dev/null | head -1 | cut -d'"' -f4)
-    msg=$(tr -d '\n' < "$f" 2>/dev/null | sed -n 's/.*"summary": *"\(.*\)", *"doc".*/\1/p')
-    [ -z "$msg" ] && msg=$(tr -d '\n' < "$f" 2>/dev/null)
+    raw=$(cat "$f" 2>/dev/null | tr -d '\n')
+    [ -z "$raw" ] && continue
+    from=$(printf '%s' "$raw" | grep -o '"from": *"[^"]*"' | head -1 | cut -d'"' -f4)
+    msg=$(printf '%s' "$raw" | sed -n 's/.*"summary": *"\(.*\)", *"doc".*/\1/p')
+    [ -z "$msg" ] && msg="$raw"
     chars=$(printf '%s' "$msg" | wc -m)
     bytes=$(printf '%s' "$msg" | wc -c)
     out=$(printf '%s' "$msg" | cut -c1-700)

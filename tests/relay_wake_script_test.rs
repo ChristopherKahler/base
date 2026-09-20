@@ -131,3 +131,85 @@ fn the_script_never_marks_unannounced_files_as_seen() {
         "the scan must be narrowed to ping files.\n{script}"
     );
 }
+
+/// RANK E: a file that reads empty must NOT be marked consumed.
+///
+/// Found by auk experiencing it, not by reading for it: its waker printed
+/// `RELAY PING from grebe:` with no body. The loop took one `ls` snapshot and
+/// then read each file three times, and a REPLY CLEARS INBOUND PINGS — so a
+/// file later in the snapshot can be deleted before it is read. Every read
+/// returns empty, the header prints with nothing after it, and the file is
+/// marked consumed.
+///
+/// THIS TEST DOES NOT CHASE THE RACE, because a test that has to win a race to
+/// fail is a test that passes for the wrong reason. It uses the same code path
+/// deterministically: an empty file IS an empty read. It seeds one good ping
+/// and one empty file, lets a poll pass over both, then writes content into
+/// the empty one and lets another poll run.
+///
+/// On the old behaviour the empty file is consumed on the first pass and its
+/// content is NEVER announced. On the fix it is skipped without being marked,
+/// and announced once it has something in it.
+#[test]
+fn a_file_that_reads_empty_is_not_consumed() {
+    let Some(sh) = bash() else {
+        eprintln!("SKIPPED: bash not on PATH — this test cannot run here, and is not passing.");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+
+    // One real ping, and one file that is present but empty.
+    let mut f = std::fs::File::create(inbox.join("ping-aaa.json")).unwrap();
+    write!(f, r#"{{"from": "sender", "summary": "the good one", "doc": null}}"#).unwrap();
+    std::fs::File::create(inbox.join("ping-bbb.json")).unwrap();
+
+    let script = base::relay::wake::watch_script_for(&inbox).unwrap();
+    let late = inbox.join("ping-bbb.json");
+    let late_disp = late.to_string_lossy().replace('\\', "/");
+
+    // Poll once over both, THEN fill the empty file, then poll again.
+    let wrapped = format!(
+        "( {script} ) & pid=$!; sleep 8;          printf '%s' '{{\"from\": \"sender\", \"summary\": \"the late one\", \"doc\": null}}' > '{late_disp}';          sleep 8; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0"
+    );
+    let out = Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout.contains("the good one"),
+        "the readable ping never announced at all:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("the late one"),
+        "a file that read EMPTY was marked consumed, so its content was never \
+         announced once it arrived. That is the rank E loss.\n{stdout}"
+    );
+}
+
+/// Negative control for RANK E: an empty file announces NOTHING while it is
+/// empty. Skipping without consuming must not become announcing a blank line —
+/// the defect it replaces was a header with no body.
+#[test]
+fn an_empty_file_announces_nothing_while_it_is_empty() {
+    let Some(sh) = bash() else {
+        eprintln!("SKIPPED: bash not on PATH — this test cannot run here, and is not passing.");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::File::create(inbox.join("ping-empty.json")).unwrap();
+
+    let script = base::relay::wake::watch_script_for(&inbox).unwrap();
+    let wrapped =
+        format!("( {script} ) & pid=$!; sleep 8; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0");
+    let out = Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert_eq!(
+        stdout.matches("RELAY PING from").count(),
+        0,
+        "an empty file must announce nothing, not an empty header:\n{stdout}"
+    );
+}
