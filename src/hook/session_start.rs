@@ -505,7 +505,7 @@ impl SessionOutput {
             };
         }
 
-        let mut untrimmed = Emission::new(budget.session_start_chars, budget.first_screen_chars);
+        let mut untrimmed = Emission::new(budget.session_start_bytes, budget.first_screen_chars);
         for p in &placed {
             let block = Block::new(p.id.clone(), place(&p.kind).0, p.text.clone(), "", "")
                 .items(p.total, p.shown);
@@ -532,7 +532,7 @@ impl SessionOutput {
             }
         }
 
-        let mut emission = Emission::new(budget.session_start_chars, budget.first_screen_chars);
+        let mut emission = Emission::new(budget.session_start_bytes, budget.first_screen_chars);
         for p in placed {
             let floor = floor_line(&p.kind, p.total, &full);
             let command = command_for(&p.kind)
@@ -557,8 +557,8 @@ impl SessionOutput {
         }
         if rendered.over_budget {
             eprintln!(
-                "base: session start printed {} units against [budget] session_start_chars = {}, with every block that can shrink already at its floor",
-                rendered.emitted_u16, rendered.budget_u16
+                "base: session start printed {} bytes against [budget] session_start_bytes = {}, with every block that can shrink already at its floor",
+                rendered.emitted_bytes, rendered.budget_bytes
             );
         }
 
@@ -1179,7 +1179,7 @@ mod tests {
     fn the_wake_contract_outlasts_the_operator_profile_and_extension_status() {
         let mut config = BaseConfig::default();
         config.budget.write_full_output = false;
-        config.budget.session_start_chars = 1000;
+        config.budget.session_start_bytes = 1000;
         let mut out = SessionOutput::new();
         out.push("extensions", &"e".repeat(600), 1);
         out.push("relay-wake", &"w".repeat(600), 1);

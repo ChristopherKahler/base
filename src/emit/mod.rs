@@ -10,9 +10,35 @@
 //! character 40,159: the report of the loss was destroyed by the loss it reported.
 //!
 //! Every hook event's output is assembled here as ranked blocks, trimmed to its budget, and
-//! only then emitted. The unit is UTF-16 code units, because the host is JavaScript and its
-//! limit is a JS string length. On the reference output bytes over-count by 871 and `char`s
-//! under-count by 2, so neither is the number the host applies.
+//! only then emitted.
+//!
+//! THE UNIT IS BYTES, AND THIS MODULE SAID OTHERWISE UNTIL 2026-09-20. It read: "the unit is
+//! UTF-16 code units, because the host is JavaScript and its limit is a JS string length." That
+//! was an inference from the 2026-09-14 reading below, where bytes over-counted by 871 and `char`s
+//! under-counted by 2 against the UTF-16 figure. **Comparing three counts OF ONE FILE against each
+//! other cannot determine a THRESHOLD's unit** — it can only say which count a chosen number
+//! happens to sit near.
+//!
+//! MEASURED, 2026-09-20, Claude Code 2.1.278, with a probe built so the candidate units predict
+//! OPPOSITE outcomes: 13,000 box-drawing characters — 39,000 bytes but only 13,000 `char`s and
+//! 13,000 UTF-16 units. A UTF-16 or `char` limit predicts it ARRIVES WHOLE, because 13,703 ASCII
+//! bytes had already been proven to arrive whole. A byte limit predicts it PERSISTS, because
+//! 30,038 ASCII bytes had already been proven to persist. **IT PERSISTED. The host counts bytes.**
+//! An all-ASCII probe can never settle this, because for ASCII bytes, `char`s and UTF-16 units are
+//! the same number.
+//!
+//! WHY IT MATTERED: UTF-8 allows up to 3 bytes per UTF-16 unit, so a 4,000-unit budget permitted up
+//! to 12,000 BYTES against a hook threshold at or below 10,957. base would have trimmed correctly,
+//! reported its withheld figure truthfully, and the host would have cut the survivor anyway — **a
+//! loss notice that is itself lost, with every number in it accurate.** It never bit only because
+//! base's output is near-pure ASCII, which is the content saving it rather than the budget.
+//!
+//! ⚠️ [`Emission`] AND [`Rendered`] STILL MEASURE IN UTF-16 AND STILL CARRY THIS DEFECT. Session
+//! start's `session_start_chars = 9000` is enforced in UTF-16 units against the same byte
+//! threshold, so the same arithmetic permits up to 27,000 bytes. It does not bite today for the
+//! same reason — its measured 8,552-unit arrival was near-ASCII. NOT FIXED HERE: that hook is
+//! another lane's, it has live arrival evidence behind it, and re-unitising the first thing the
+//! operator sees is not a change to make as a side effect of this one.
 //!
 //! Output written to stderr is outside every budget by construction: Claude Code feeds only a
 //! hook's stdout to the model.
@@ -21,7 +47,18 @@ use std::path::{Path, PathBuf};
 
 pub mod record;
 
-/// The length the host measures: UTF-16 code units. Nothing in this module measures any other way.
+/// UTF-16 code units. **NOT the length the host measures** — this doc comment used to say it was,
+/// and that sentence is what misled three separate sessions into building on it as settled fact.
+///
+/// The host counts BYTES. Measured 2026-09-20 on Claude Code 2.1.278 with a probe built so the
+/// candidate units predict opposite outcomes: 13,000 box-drawing characters — 39,000 bytes, 13,000
+/// `char`s, 13,000 UTF-16 units — PERSISTED, where a UTF-16 or `char` limit predicts it arrives
+/// whole. See the module header.
+///
+/// NOTHING THAT BOUNDS DELIVERY USES THIS ANY MORE. Both output budgets measure `str::len()`. What
+/// remains is [`Emission::first_screen_u16`], governed by `[budget] first_screen_chars` — a
+/// readability limit about how much text a reader sees before scrolling, not a claim about what the
+/// host will deliver. Its key still says `chars`, and that name is honest for what it measures.
 pub fn u16_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
@@ -29,29 +66,30 @@ pub fn u16_len(s: &str) -> usize {
 /// What a hook actually emitted, so the caller can report it and rank 10 can record it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Measured {
-    /// What the hook wanted to say, in UTF-16 units.
-    pub wanted_u16: usize,
+    /// What the hook wanted to say, in BYTES — the unit the host counts.
+    pub wanted_bytes: usize,
     /// What it printed, notice included.
-    pub emitted_u16: usize,
+    pub emitted_bytes: usize,
     /// What the budget withheld. Zero when everything fitted.
-    pub withheld_u16: usize,
+    pub withheld_bytes: usize,
 }
 
 impl Measured {
     pub fn lost(&self) -> bool {
-        self.withheld_u16 > 0
+        self.withheld_bytes > 0
     }
 }
 
-/// Print `text` for `hook` under `budget_u16`, measured in the unit the host counts, and say what
-/// was withheld INSIDE the part that survives.
+/// Print `text` for `hook` under `budget_bytes`, measured in BYTES — the unit the host counts,
+/// established by probe on 2026-09-20 (see the module header) — and say what was withheld INSIDE
+/// the part that survives.
 ///
 /// WHY THE NOTICE IS RESERVED BEFORE THE TRIM AND NOT APPENDED AFTER IT. That is rank 00's exact
 /// failure mode: base measured its own session-start loss correctly and put the report at byte
 /// 23,815 of 26,310 - eleven thousand bytes inside the region the host never delivers. The report
 /// of the loss was destroyed by the loss it reported. A writer that cuts at the boundary and then
 /// appends its notice rebuilds that defect in the fix for it, which is why the reserve comes first
-/// and why a test asserts the notice lands inside `budget_u16`.
+/// and why a test asserts the notice lands inside `budget_bytes`.
 ///
 /// THE RESERVE NEEDS NO ITERATION. The notice's length depends on the withheld figure, the figure
 /// depends on the cut, and the cut depends on the reserve. The circle is cut by formatting the
@@ -60,39 +98,42 @@ impl Measured {
 ///
 /// WHAT THIS IS NOT. It does not degrade per block to a floor and it has no ranked trim order, as
 /// `Emission` does for session start. The tail is withheld and named. The two hooks are NOT
-/// equivalent afterwards and should not be read as though they were.
+/// equivalent afterwards and should not be read as though they were — and since 2026-09-20 they do
+/// not even measure in the same unit: this caps BYTES, `Emission` still caps UTF-16 units.
 ///
 /// Trimming is on whole lines: half a rule is worse than no rule, because a truncated instruction
 /// still reads as an instruction.
-pub fn print_measured(hook: &str, key: &str, text: &str, budget_u16: usize) -> Measured {
-    let wanted = u16_len(text);
-    if wanted <= budget_u16 {
+pub fn print_measured(hook: &str, key: &str, text: &str, budget_bytes: usize) -> Measured {
+    let wanted = text.len();
+    if wanted <= budget_bytes {
         print!("{text}");
-        return Measured { wanted_u16: wanted, emitted_u16: wanted, withheld_u16: 0 };
+        return Measured { wanted_bytes: wanted, emitted_bytes: wanted, withheld_bytes: 0 };
     }
 
-    let reserve = u16_len(&withheld_notice(hook, key, wanted, budget_u16));
-    let room = budget_u16.saturating_sub(reserve);
+    let reserve = withheld_notice(hook, key, wanted, budget_bytes).len();
+    let room = budget_bytes.saturating_sub(reserve);
 
+    // Whole lines, so the cut never lands mid-character: every line is valid UTF-8 on its own, and
+    // counting its bytes cannot split one. Byte-slicing arbitrary text could.
     let mut kept = String::new();
-    let mut kept_u16 = 0usize;
+    let mut kept_bytes = 0usize;
     for line in text.split_inclusive('\n') {
-        let n = u16_len(line);
-        if kept_u16 + n > room {
+        let n = line.len();
+        if kept_bytes + n > room {
             break;
         }
         kept.push_str(line);
-        kept_u16 += n;
+        kept_bytes += n;
     }
 
-    let withheld = wanted.saturating_sub(kept_u16);
-    let notice = withheld_notice(hook, key, withheld, budget_u16);
+    let withheld = wanted.saturating_sub(kept_bytes);
+    let notice = withheld_notice(hook, key, withheld, budget_bytes);
     if !kept.is_empty() && !kept.ends_with('\n') {
         kept.push('\n');
     }
     let out = format!("{kept}{notice}");
     print!("{out}");
-    Measured { wanted_u16: wanted, emitted_u16: u16_len(&out), withheld_u16: withheld }
+    Measured { wanted_bytes: wanted, emitted_bytes: out.len(), withheld_bytes: withheld }
 }
 
 /// The one line that survives. It names the hook, the loss and the key that governs it, because an
@@ -106,9 +147,9 @@ pub fn print_measured(hook: &str, key: &str, text: &str, budget_u16: usize) -> M
 /// coming: their overflow notice would name `prompt_chars` and send them to edit a setting that
 /// governs a different hook. That is the inert-field defect pointed at the operator, and it is worse
 /// than silence, because silence does not give directions.
-fn withheld_notice(hook: &str, key: &str, withheld_u16: usize, budget_u16: usize) -> String {
+fn withheld_notice(hook: &str, key: &str, withheld_bytes: usize, budget_bytes: usize) -> String {
     format!(
-        "\n[base: {hook} withheld {withheld_u16} of its units against [budget] {key} = {budget_u16}. \
+        "\n[base: {hook} withheld {withheld_bytes} bytes against [budget] {key} = {budget_bytes}. \
 Raise it in base.toml, or run `base doctor` to see what each hook emitted.]\n"
     )
 }
@@ -417,10 +458,12 @@ pub type Header<'h> = &'h dyn Fn(&Facts<'_>) -> String;
 pub struct Rendered {
     /// Exactly what to print.
     pub text: String,
-    pub emitted_u16: usize,
-    /// The untrimmed blocks, in UTF-16 code units, without the header line.
-    pub full_u16: usize,
-    pub budget_u16: usize,
+    /// What was printed, in BYTES — the unit the host counts.
+    pub emitted_bytes: usize,
+    /// The untrimmed blocks, in BYTES, without the header line.
+    pub full_bytes: usize,
+    pub budget_bytes: usize,
+    /// The first screen, in UTF-16 units. A readability measure, not a delivery one.
     pub first_screen_u16: usize,
     /// Every block is at its floor and the output is still over budget. Reported, never
     /// resolved by truncating: silent truncation is the defect this module replaces.
@@ -448,16 +491,21 @@ impl Rendered {
 pub struct Emission {
     blocks: Vec<Block>,
     withheld: Vec<Withheld>,
-    budget_u16: usize,
+    /// What the host will deliver, in BYTES.
+    budget_bytes: usize,
+    /// How much a reader sees before scrolling, in UTF-16 units. **Deliberately a different unit
+    /// from `budget_bytes`, and that is not an oversight:** this one is about readability, not
+    /// delivery, so it is not measured against the host's limit. The `[budget] first_screen_chars`
+    /// key keeps its name because the name matches what it measures.
     first_screen_u16: usize,
 }
 
 impl Emission {
-    pub fn new(budget_u16: usize, first_screen_u16: usize) -> Self {
+    pub fn new(budget_bytes: usize, first_screen_u16: usize) -> Self {
         Emission {
             blocks: Vec::new(),
             withheld: Vec::new(),
-            budget_u16,
+            budget_bytes,
             first_screen_u16,
         }
     }
@@ -519,30 +567,33 @@ impl Emission {
     /// measured is the header that is printed. Each pass either degrades one block or stops,
     /// and every block can degrade at most twice, so the loop ends.
     pub fn render(mut self, full: &FullOutput, header: Option<Header<'_>>) -> Rendered {
-        let full_u16 = u16_len(&self.full_text());
+        let full_bytes = self.full_text().len();
         let (text, prefix) = loop {
             let head = self.header_line(full, header);
+            // The first screen is a READABILITY limit and stays in UTF-16 units; the budget below
+            // is a DELIVERY limit and is in bytes. Two units in one loop, each matching what it
+            // governs.
             let prefix = u16_len(&self.compose(&head, Some(Rank::DueNow)));
             let text = self.compose(&head, None);
-            let total = u16_len(&text);
+            let total = text.len();
             // There is no first-screen pass. The header, `Pinned` and `DueNow` are the whole first
             // screen and none of them may degrade, so a first screen they overflow is reported in
             // `first_screen_ok`, never trimmed. `Pinned` is not excluded here: `next_level` already
             // refuses it, and a second guard would leave a mutation of the first one unable to fail
             // any test.
-            if total > self.budget_u16 && self.degrade_bottom(|r| r != Rank::DueNow) {
+            if total > self.budget_bytes && self.degrade_bottom(|r| r != Rank::DueNow) {
                 continue;
             }
             break (text, prefix);
         };
-        let emitted_u16 = u16_len(&text);
+        let emitted_bytes = text.len();
         Rendered {
-            over_budget: emitted_u16 > self.budget_u16,
+            over_budget: emitted_bytes > self.budget_bytes,
             first_screen_ok: prefix <= self.first_screen_u16,
             text,
-            emitted_u16,
-            full_u16,
-            budget_u16: self.budget_u16,
+            emitted_bytes,
+            full_bytes,
+            budget_bytes: self.budget_bytes,
             first_screen_u16: self.first_screen_u16,
             withheld: self.withheld,
             blocks: self.blocks,
@@ -769,8 +820,20 @@ mod tests {
         assert_eq!(astral.len(), 4);
     }
 
+    /// THIS TEST USED TO ASSERT THE OPPOSITE, AND IT IS KEPT RATHER THAN DELETED.
+    ///
+    /// It was `the_budget_is_counted_in_utf16_units_not_bytes`, and it passed for two weeks while
+    /// encoding a belief that was never measured: that the host counts UTF-16 units because it is
+    /// JavaScript. On 2026-09-20 a probe built so the candidate units predict OPPOSITE outcomes
+    /// settled it — 13,000 box-drawing characters, 39,000 bytes but 13,000 UTF-16 units, PERSISTED
+    /// where a UTF-16 limit predicts it arrives whole. **The host counts bytes.**
+    ///
+    /// The fixture is unchanged because it is the sharpest unit discriminator in the tree: 600
+    /// middle dots are 600 UTF-16 units and 1,200 bytes, and the budget of 700 sits between them.
+    /// Only the expected outcome moved. A test that cannot tell the two units apart could never
+    /// have caught this either way.
     #[test]
-    fn the_budget_is_counted_in_utf16_units_not_bytes() {
+    fn the_budget_is_counted_in_bytes_not_utf16_units() {
         let dots = "·".repeat(600);
         // Control: the input discriminates only because the two units fall either side of 700.
         assert_eq!(u16_len(&dots), 600);
@@ -779,17 +842,18 @@ mod tests {
         assert!(e.push(blk("dots", Rank::Tail, &dots, 1)));
         let r = e.render(&FullOutput::off(), None);
         assert!(!r.text.is_empty());
-        assert!(
-            r.text.len() > 700,
-            "in bytes this output is over the budget"
-        );
-        assert_eq!(r.emitted_u16, 601);
+
         assert_eq!(
+            r.emitted_bytes,
+            r.text.len(),
+            "the reported size must be the byte length of what was printed"
+        );
+        assert_ne!(
             level_of(&r, "dots"),
             Level::Full,
-            "601 units fit 700; bytes would trim it"
+            "1,200 bytes cannot fit a 700-byte budget. Left Full, this block is under budget in \
+             UTF-16 and over it in bytes — base would believe it fitted and the host would cut it."
         );
-        assert!(r.withheld.is_empty());
     }
 
     #[test]
@@ -916,7 +980,7 @@ mod tests {
             "and the cut stops once it fits"
         );
         assert!(!r.over_budget);
-        assert!(r.emitted_u16 <= 140);
+        assert!(r.emitted_bytes <= 140);
     }
 
     #[test]
@@ -950,7 +1014,7 @@ mod tests {
             r.text, "a 5 · all: base a list\n",
             "the floor is whole, not cut to 5 units"
         );
-        assert_eq!(r.emitted_u16, u16_len(&r.text));
+        assert_eq!(r.emitted_bytes, r.text.len());
     }
 
     #[test]
@@ -1003,11 +1067,11 @@ mod tests {
         let h: Header<'_> = &short_header;
         let r = e.render(&FullOutput::off(), Some(h));
         assert_eq!(r.text.lines().next(), Some("[W 1000]"));
-        assert_eq!(r.emitted_u16, u16_len(&r.text));
+        assert_eq!(r.emitted_bytes, r.text.len());
         assert!(
-            r.emitted_u16 <= 74,
-            "emitted {} units against a 74-unit budget",
-            r.emitted_u16
+            r.emitted_bytes <= 74,
+            "emitted {} bytes against a 74-byte budget",
+            r.emitted_bytes
         );
         assert!(!r.over_budget);
         assert_eq!(level_of(&r, "s"), Level::Collapsed);
