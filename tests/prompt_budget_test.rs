@@ -32,7 +32,7 @@ use seed::run_prompt_submit;
 /// gets. Spelled here rather than imported so the test states the number it is asserting.
 ///
 /// **BYTES.** The name predates the measurement that settled the unit; see the file header.
-const PROMPT_CHARS: usize = 4000;
+const PROMPT_BYTES: usize = 4000;
 
 /// The opening of the withheld notice. Both arms key off it, so it is spelled once.
 const NOTICE: &str = "[base: user-prompt-submit withheld ";
@@ -133,7 +133,7 @@ fn the_prompt_hook_fits_its_budget() {
     //
     // The first version of this control read `emitted > 1000`, which was right for the tree it was
     // written against and is WRONG FOR THE FIXED ONE. Once the writer caps the output, `emitted` is
-    // bounded by `PROMPT_CHARS` by construction and can never again be evidence that anything was
+    // bounded by `PROMPT_BYTES` by construction and can never again be evidence that anything was
     // driven through the trim: a fixture emitting 1,500 units with no overflow at all would satisfy
     // both `> 1000` and `<= 4000` and the file would go green having tested nothing. That is the
     // same inert guard this test already caught once, rebuilt by the fix that made it pass.
@@ -145,9 +145,9 @@ fn the_prompt_hook_fits_its_budget() {
     let withheld = withheld_bytes(&stdout).unwrap_or_else(|| {
         panic!(
             "control: no withheld notice, so NOTHING WAS TRIMMED and the budget assertion below \
-             would be vacuous. The hook emitted {emitted} bytes against a {PROMPT_CHARS} byte \
+             would be vacuous. The hook emitted {emitted} bytes against a {PROMPT_BYTES} byte \
              budget. TWO CAUSES LOOK IDENTICAL FROM HERE and the figure tells them apart: at or \
-             under {PROMPT_CHARS} the fixture is too quiet to overflow and needs more rules; well \
+             under {PROMPT_BYTES} the fixture is too quiet to overflow and needs more rules; well \
              over it, nothing is measuring the output at all, which is the defect itself. \
              stdout:\n{stdout}"
         )
@@ -161,9 +161,9 @@ fn the_prompt_hook_fits_its_budget() {
     );
 
     assert!(
-        emitted <= PROMPT_CHARS,
+        emitted <= PROMPT_BYTES,
         "the prompt hook emitted {emitted} BYTES against [budget] prompt_chars = \
-         {PROMPT_CHARS}. Nothing measures it, so whatever the host drops is lost silently — which \
+         {PROMPT_BYTES}. Nothing measures it, so whatever the host drops is lost silently — which \
          is the defect. First 400 chars:\n{}",
         stdout.chars().take(400).collect::<String>()
     );
@@ -173,13 +173,35 @@ fn the_prompt_hook_fits_its_budget() {
     // while exactly one hook called it. An overflow notice that names the wrong setting is worse
     // than no notice: it sends the operator to edit a key that governs a different hook, with every
     // appearance of having been told what to do.
-    let key = format!("[budget] prompt_chars = {PROMPT_CHARS}");
+    //
+    // AND THIS ASSERTION USED TO HARD-CODE `prompt_chars` ITSELF. The paragraph above states the
+    // rule correctly and the line below it pinned the old spelling, so the test went green over the
+    // defect for its whole life and could only ever have gone RED if somebody fixed the code. A
+    // test written to stop a hard-coded key, holding a hard-coded key.
+    //
+    // `prompt_chars` was renamed to `prompt_bytes` on 2026-09-20 when its unit changed. The notice
+    // told every operator to raise the LEGACY key - which `BaseConfig::load` then warns them to
+    // rename. Base directed the operator into the exact state it scolds them for, as advice, on
+    // every over-budget prompt.
+    let key = format!("[budget] prompt_bytes = {PROMPT_BYTES}");
     assert!(
         stdout.contains(&key),
         "the withheld notice does not name `{key}`, so it cannot tell the operator which setting \
          caused the trim. Notice as emitted:\n{}",
         stdout.rsplit_once(NOTICE).map(|(_, tail)| tail).unwrap_or("<none>")
     );
+
+    // AND IT NAMES NO RETIRED SPELLING, read off the table the production code reads rather than a
+    // list typed here. A list typed here is correct today and blind at the next rename, which is
+    // the same failure as the line above.
+    for k in base::config::RENAMED_BUDGET_KEYS {
+        assert!(
+            !stdout.contains(&format!("[budget] {} =", k.old)),
+            "the notice names the retired spelling `{}`, sending the operator to set a key base \
+             will then warn them to rename",
+            k.old
+        );
+    }
 }
 
 /// THE ARM THAT MATTERS MOST: when the budget withholds anything, the notice saying so lands
@@ -201,8 +223,8 @@ fn the_withheld_notice_survives_the_trim_that_caused_it() {
         // No notice is only acceptable if nothing was withheld. Over budget with no notice is the
         // silent loss this change exists to end.
         assert!(
-            emitted_bytes(&stdout) <= PROMPT_CHARS,
-            "the output is {} bytes, over the {PROMPT_CHARS} budget, and carries NO withheld \
+            emitted_bytes(&stdout) <= PROMPT_BYTES,
+            "the output is {} bytes, over the {PROMPT_BYTES} budget, and carries NO withheld \
              notice: the loss is silent, which is the defect itself",
             emitted_bytes(&stdout)
         );
@@ -215,8 +237,8 @@ fn the_withheld_notice_survives_the_trim_that_caused_it() {
     // correct while comparing two different quantities.
     let notice_ends = at + NOTICE.len();
     assert!(
-        notice_ends <= PROMPT_CHARS,
-        "the withheld notice ends at byte {notice_ends}, past the {PROMPT_CHARS} the host \
+        notice_ends <= PROMPT_BYTES,
+        "the withheld notice ends at byte {notice_ends}, past the {PROMPT_BYTES} the host \
          delivers. The report of the loss died inside the loss — the exact defect this fixes."
     );
 }

@@ -71,9 +71,9 @@ pub fn run(target: &Path) -> Result<()> {
 # [signal]             # session-start injection (active set, handoffs, reminders)
 # enabled = true
 
-# [budget]             # what a hook may print, in UTF-16 units (Claude Code's unit)
-# session_start_chars = 9000
-# memory_chars = 4000
+# [budget]             # what a hook may print, in bytes (the unit the host counts)
+# session_start_bytes = 9000
+# memory_chars = 4000  # the memory block inside it, in UTF-16: a readability limit
 
 # [flow]               # resurface scans: unblocked, deferred-due, recurring ideas
 # enabled = true

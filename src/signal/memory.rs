@@ -3,7 +3,16 @@
 //! It used to select every active note with no limit, format all of them, and cut the result at
 //! 4,000 bytes. Measured on the operator machine, 2026-09-15: 943 active notes holding 982,525
 //! UTF-16 units of text, read to print 6. Board ruling R6 gives the block its own budget,
-//! `[budget] memory_chars`, counted in the UTF-16 units Claude Code counts.
+//! `[budget] memory_chars`, counted in UTF-16 units.
+//!
+//! THE UNIT HERE IS DELIBERATE AND IT IS NOT THE HOST'S. `memory_chars` counts UTF-16 because it
+//! is a READABILITY limit - how much of a block a reader takes in - and not a delivery one. The
+//! host counts BYTES, measured 2026-09-20, and the delivery budgets were renamed to `_bytes` that
+//! same day. This one keeps its name because its name is honest.
+//!
+//! DO NOT SWEEP THIS IN WITH THOSE. The sentence above used to end "the UTF-16 units Claude Code
+//! counts", which is right about base and wrong about the host - and that exact confusion is what
+//! cost a full round. Deleting it would erase the one place the distinction is visible.
 
 use std::path::Path;
 
