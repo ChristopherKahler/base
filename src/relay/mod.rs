@@ -42,7 +42,11 @@ pub const MESSAGE_TYPES: &[&str] = &[
 ];
 
 /// A seat that has made no tool call for longer than this renders as idle.
-pub const IDLE_AFTER_SECS: i64 = 15 * 60;
+///
+/// MUST stay above the wake-monitor re-arm cycle (30 min). At 15 min a
+/// correctly parked seat sat past the threshold for most of every cycle, so
+/// the label fired during normal operation rather than on a fault.
+pub const IDLE_AFTER_SECS: i64 = 45 * 60;
 /// Default advisory-claim TTL.
 pub const DEFAULT_CLAIM_TTL_SECS: i64 = 60 * 60;
 
@@ -664,7 +668,11 @@ pub fn age_str(ts: &str) -> String {
 pub fn liveness_word(last_heartbeat: &str) -> &'static str {
     match parse_ts(last_heartbeat) {
         Some(t) if (chrono::Local::now() - t).num_seconds() < IDLE_AFTER_SECS => "live",
-        _ => "DEAD",
+        // A stale heartbeat means the seat has not acted recently. It never
+        // means the seat is gone: nothing in this module removes a session row.
+        Some(_) => "idle",
+        // A heartbeat we cannot read is not evidence of anything.
+        None => "unknown",
     }
 }
 
