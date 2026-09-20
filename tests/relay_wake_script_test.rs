@@ -263,3 +263,76 @@ fn an_empty_file_says_it_could_not_be_read_exactly_once() {
 {stdout}"
     );
 }
+
+// ─── The sentinel fingerprint: does a wake fix REACH a running session? ──────
+//
+// The defect (grebe, verified by auk): the arming block is re-emitted only when the
+// sentinel goes STALE, and a live monitor touches it every 5s. So a session already
+// running the OLD script never went stale and was never shown the NEW one. Every wake
+// fix was undeliverable to exactly the sessions that needed it.
+//
+// Legs 1-5 test the GATE. Leg 6 tests the SCRIPT, and it is the one with teeth: a gate
+// that reads a field nothing writes is green forever.
+
+/// LEG 6 FIRST, because the others are worthless without it. Run the emitted script
+/// under real bash and read the sentinel file back off disk. This is the only leg that
+/// proves the script holds up its half of the contract.
+#[test]
+fn the_emitted_script_writes_the_fingerprint_and_title_into_the_sentinel() {
+    let Some(sh) = bash() else {
+        eprintln!("SKIPPED: bash not on PATH — this test cannot run here, and is not passing.");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("kestrel");
+    std::fs::create_dir_all(&inbox).unwrap();
+
+    let script = base::relay::wake::watch_script_for(&inbox).unwrap();
+    let wrapped =
+        format!("( {script} ) & pid=$!; sleep 3; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0");
+    Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
+
+    let body = std::fs::read_to_string(inbox.join(".watching"))
+        .expect("the loop must create the sentinel");
+    let mut parts = body.split_whitespace();
+    assert_eq!(
+        parts.next(),
+        Some(base::relay::wake::template_fingerprint().as_str()),
+        "field 1 must be the template fingerprint, got: {body:?}"
+    );
+    assert_eq!(
+        parts.next(),
+        Some("kestrel"),
+        "field 2 must be the title, which is the inbox's own folder name, got: {body:?}"
+    );
+}
+
+/// The fingerprint is a property of the TEMPLATE, not of the rendered text. Two
+/// different inboxes must stamp the SAME fingerprint — if it moved with the path, the
+/// check would depend on path spelling and could go permanently red.
+#[test]
+fn the_fingerprint_does_not_move_with_the_inbox_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("aaa");
+    let b = tmp.path().join("bbb");
+    let sa = base::relay::wake::watch_script_for(&a).unwrap();
+    let sb = base::relay::wake::watch_script_for(&b).unwrap();
+    let fp = base::relay::wake::template_fingerprint();
+
+    assert!(sa.contains(&fp) && sb.contains(&fp), "both scripts carry the same fingerprint");
+    assert_ne!(sa, sb, "but the scripts differ, so this is not comparing a constant to itself");
+    assert!(sa.contains("aaa") && sb.contains("bbb"), "each carries its own title");
+}
+
+/// The fingerprint must be 16 hex characters and stable across calls. Without the
+/// stability half, a function returning a fresh value each call would make every
+/// sentinel read as Outdated forever — permanently red, which is the failure auk ruled
+/// against.
+#[test]
+fn the_fingerprint_is_stable_across_calls() {
+    let a = base::relay::wake::template_fingerprint();
+    let b = base::relay::wake::template_fingerprint();
+    assert_eq!(a, b, "the same template must hash the same way twice");
+    assert_eq!(a.len(), 16, "expected 16 hex characters, got {a:?}");
+    assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "not hex: {a:?}");
+}

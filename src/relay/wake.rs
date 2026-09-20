@@ -53,12 +53,143 @@ fn fresh(path: &std::path::Path) -> bool {
 }
 
 /// Is a wake monitor for this title provably alive right now?
+///
+/// ALIVE, NOT CURRENT. This answers "can a ping reach them", which is what a sender
+/// warning and a liveness sweep want. Whether the running monitor is the script base
+/// would print TODAY is a different question — see [`is_current`].
 pub fn is_watching(title: &str) -> bool {
     sentinel_path(title).is_some_and(|p| fresh(&p))
 }
 
+/// The template the watch loop is rendered from, hashed as the version of the
+/// contract. **Hashed BEFORE substitution, deliberately** (auk's ruling, 2026-09-20,
+/// after grebe pushed back on hashing the rendered script).
+///
+/// A RENDERED hash would have to be reproduced identically on both sides, and it
+/// depends on the inbox path rendering the same way each time — `title_dir`
+/// resolution, backslash replacement, trailing separators. Three ways the two sides
+/// drift apart for reasons that have nothing to do with the thing being checked, and
+/// the failure mode is a check that is PERMANENTLY red for every session, which gets
+/// ignored within a day and is worse than no check at all. The precedent is in this
+/// repo: `doctor::skill_drift_warning` returns `None` whenever two stamps match, and a
+/// stamp that could not move inside a release let a coach sit eight days behind while
+/// the check said nothing. **A freshness check is not a truth check.**
+///
+/// A compile-time constant has neither problem. The title is stored beside the hash so
+/// a retitle is caught too, since the template itself carries no title.
+const WATCH_TEMPLATE: &str = r#"INBOX="{inbox}"
+mkdir -p "$INBOX"
+seen="|"
+reported="|"
+while true; do
+  printf '%s %s' "{fp}" "{title}" > "$INBOX/.watching" 2>/dev/null
+  for f in $(ls -1t "$INBOX"/ping-*.json 2>/dev/null); do
+    b=$(basename "$f")
+    case "$seen" in *"|$b|"*) continue;; esac
+    raw=$(cat "$f" 2>/dev/null | tr -d '\n')
+    if [ -z "$raw" ]; then
+      case "$reported" in *"|$b|"*) ;; *)
+        echo "RELAY EMPTY READ: $b gave nothing on one read - a reply drained it, or it is on disk and empty, and this cannot tell which. Not consumed, so a later read still announces it. This line prints once. Path: $f"
+        reported="$reported$b|" ;;
+      esac
+      continue
+    fi
+    from=$(printf '%s' "$raw" | grep -o '"from": *"[^"]*"' | head -1 | cut -d'"' -f4)
+    msg=$(printf '%s' "$raw" | sed -n 's/.*"summary": *"\(.*\)", *"doc".*/\1/p')
+    [ -z "$msg" ] && msg="$raw"
+    chars=$(printf '%s' "$msg" | wc -m)
+    bytes=$(printf '%s' "$msg" | wc -c)
+    out=$(printf '%s' "$msg" | cut -c1-700)
+    if [ "$chars" -gt 700 ]; then
+      out="$out  [TRUNCATED at 700 of $chars chars ($bytes bytes) - full file: $f]"
+    fi
+    echo "RELAY PING from ${from:-unknown}: $out"
+    seen="$seen$b|"
+  done
+  sleep 5
+done"#;
+
+/// FNV-1a over the template, 16 hex characters. Hand-rolled because a hash crate is a
+/// new dependency and those go past Chris first; this value is never a security claim,
+/// only "is this the same text".
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The current contract version. Changes the moment [`WATCH_TEMPLATE`] is edited,
+/// which is exactly when every armed monitor becomes out of date.
+pub fn template_fingerprint() -> String {
+    format!("{:016x}", fnv1a(WATCH_TEMPLATE))
+}
+
+/// What a sentinel says about the monitor that wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Armed {
+    /// Fresh, and the monitor runs the script base would print now.
+    Current,
+    /// Fresh, but armed from a DIFFERENT template or under a different title. The
+    /// session is reachable and is running an out-of-date contract, so it must be
+    /// re-prompted — the state that had no representation before this existed.
+    Outdated,
+    /// No live monitor at all.
+    NotWatching,
+}
+
+/// Read the sentinel and say which of the three states it is in.
+///
+/// AN EMPTY SENTINEL IS `Outdated`, AND THAT IS THE WHOLE MIGRATION. Every monitor
+/// alive on this machine right now only `touch`es the sentinel, so it writes NOTHING.
+/// If empty were read as "no data, assume fine", every running session would stay
+/// silent forever and this fix would never reach a single seat — the defect it exists
+/// to fix, reproduced by its own fix. So absence of evidence is a mismatch here, not a
+/// pass.
+pub fn armed_state(title: &str) -> Armed {
+    let Some(p) = sentinel_path(title) else {
+        return Armed::NotWatching;
+    };
+    let body = std::fs::read_to_string(&p).unwrap_or_default();
+    armed_from(&body, title, fresh(&p))
+}
+
+/// The pure half, so every state is reachable in a test without a home on disk and
+/// without waiting for a sentinel to age. `is_fresh` is the caller's reading of the
+/// file's mtime; this function never touches the filesystem.
+fn armed_from(body: &str, title: &str, is_fresh: bool) -> Armed {
+    if !is_fresh {
+        return Armed::NotWatching;
+    }
+    let mut parts = body.split_whitespace();
+    let (Some(fp), Some(t)) = (parts.next(), parts.next()) else {
+        // Missing either field. An EMPTY sentinel lands here, and it must be Outdated:
+        // see the doc above, this is the case every live monitor is in today.
+        return Armed::Outdated;
+    };
+    if fp == template_fingerprint() && t == title {
+        Armed::Current
+    } else {
+        Armed::Outdated
+    }
+}
+
+/// Is this title's monitor both alive AND running today's script?
+pub fn is_current(title: &str) -> bool {
+    armed_state(title) == Armed::Current
+}
+
 /// Board cell: watching state with evidence.
+///
+/// A fresh sentinel from an OUT-OF-DATE script reads `✓ old script`, not a bare tick.
+/// Those two used to render identically — same fresh sentinel, same silence — and that
+/// is the whole reason a stale monitor could sit there being counted as compliant.
 pub fn watch_cell(title: &str) -> String {
+    if armed_state(title) == Armed::Outdated {
+        return "✓ old script".into();
+    }
     match sentinel_path(title).and_then(|p| age_secs(&p)) {
         Some(a) if a < WATCH_STALE_SECS => "✓".into(),
         Some(a) => format!("✗ stale {}", human(a)),
@@ -163,40 +294,20 @@ fn watch_script(title: &str) -> Option<String> {
 /// test between `ls` and `cat` can always be overtaken by the delete it is
 /// checking for.
 pub fn watch_script_for(inbox: &std::path::Path) -> Option<String> {
+    // The title is the inbox's own last component, so the name the monitor STAMPS is
+    // always the name of the folder it WATCHES. Deriving it here rather than taking it
+    // as an argument keeps those two from ever disagreeing, and keeps every existing
+    // caller working.
+    let title = inbox.file_name()?.to_string_lossy().into_owned();
     let inbox = inbox.to_string_lossy().replace('\\', "/");
-    Some(format!(
-        r#"INBOX="{inbox}"
-mkdir -p "$INBOX"
-seen="|"
-reported="|"
-while true; do
-  touch "$INBOX/.watching" 2>/dev/null
-  for f in $(ls -1t "$INBOX"/ping-*.json 2>/dev/null); do
-    b=$(basename "$f")
-    case "$seen" in *"|$b|"*) continue;; esac
-    raw=$(cat "$f" 2>/dev/null | tr -d '\n')
-    if [ -z "$raw" ]; then
-      case "$reported" in *"|$b|"*) ;; *)
-        echo "RELAY EMPTY READ: $b gave nothing on one read - a reply drained it, or it is on disk and empty, and this cannot tell which. Not consumed, so a later read still announces it. This line prints once. Path: $f"
-        reported="$reported$b|" ;;
-      esac
-      continue
-    fi
-    from=$(printf '%s' "$raw" | grep -o '"from": *"[^"]*"' | head -1 | cut -d'"' -f4)
-    msg=$(printf '%s' "$raw" | sed -n 's/.*"summary": *"\(.*\)", *"doc".*/\1/p')
-    [ -z "$msg" ] && msg="$raw"
-    chars=$(printf '%s' "$msg" | wc -m)
-    bytes=$(printf '%s' "$msg" | wc -c)
-    out=$(printf '%s' "$msg" | cut -c1-700)
-    if [ "$chars" -gt 700 ]; then
-      out="$out  [TRUNCATED at 700 of $chars chars ($bytes bytes) - full file: $f]"
-    fi
-    echo "RELAY PING from ${{from:-unknown}}: $out"
-    seen="$seen$b|"
-  done
-  sleep 5
-done"#
-    ))
+    // Substitution happens AFTER the hash is taken, and `replace` is used rather than
+    // `format!` because the template is a plain const whose braces are literal shell.
+    Some(
+        WATCH_TEMPLATE
+            .replace("{inbox}", &inbox)
+            .replace("{fp}", &template_fingerprint())
+            .replace("{title}", &title),
+    )
 }
 
 /// The arming block injected into hook context (and printed by `relay
@@ -288,7 +399,13 @@ pub fn arm_blocks_for(session_id: &str, force: bool) -> Option<String> {
     }
     let mut out = String::new();
     for title in super::session_registry::titles_for(session_id) {
-        if is_watching(&title) {
+        // is_current, NOT is_watching. This gate used to ask whether a monitor EXISTS
+        // when the question is whether the running one MATCHES what base prints now. A
+        // live monitor touches its sentinel every 5s, so a session running an OLD
+        // script never went stale and was never shown the new one — every wake fix was
+        // undeliverable to exactly the sessions already running. Found by grebe,
+        // verified by auk in this file's own doc at lines 9-12.
+        if is_current(&title) {
             continue;
         }
         let due = force
@@ -313,6 +430,55 @@ pub fn arm_blocks_for(session_id: &str, force: bool) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The five gate states, driven through the pure half so none of them needs a home
+    /// on disk or a sentinel aged in real time.
+    ///
+    /// LEG 2 IS THE ONE THAT DECIDES WHETHER THIS FIX REACHES ANYBODY. Every monitor
+    /// alive on this machine only touches the sentinel, so it writes NOTHING. If empty
+    /// read as "no data, assume fine", every running session would stay silent forever
+    /// and the fix would never reach a seat — the defect reproduced by its own fix.
+    #[test]
+    fn the_gate_separates_current_outdated_and_not_watching() {
+        let fp = template_fingerprint();
+
+        // 1. fresh, right fingerprint, right title
+        assert_eq!(armed_from(&format!("{fp} finch"), "finch", true), Armed::Current);
+
+        // 2. THE MIGRATION: an empty sentinel is Outdated, never a pass
+        assert_eq!(armed_from("", "finch", true), Armed::Outdated,
+            "an EMPTY sentinel must be Outdated - every monitor running today writes nothing");
+
+        // 3. a monitor armed from an older template
+        assert_eq!(armed_from("0000000000000000 finch", "finch", true), Armed::Outdated);
+
+        // 4. right fingerprint, WRONG title - a retitle, which the template hash alone
+        //    cannot see, which is why the title is stored beside it
+        assert_eq!(armed_from(&format!("{fp} plover"), "finch", true), Armed::Outdated);
+
+        // 5. no live monitor at all beats every other reading
+        assert_eq!(armed_from(&format!("{fp} finch"), "finch", false), Armed::NotWatching);
+    }
+
+    /// A half-written sentinel — fingerprint present, title missing — is Outdated, not
+    /// Current. Without this, a torn write would read as compliant.
+    #[test]
+    fn a_sentinel_missing_its_second_field_is_outdated() {
+        let fp = template_fingerprint();
+        assert_eq!(armed_from(&fp, "finch", true), Armed::Outdated);
+        assert_eq!(armed_from("   ", "finch", true), Armed::Outdated);
+    }
+
+    /// Whitespace and a trailing newline must not change the reading. The script writes
+    /// with `printf` and no newline today, but a future shell or editor adding one must
+    /// not make every session read as Outdated - that is the permanently-red failure
+    /// auk ruled against.
+    #[test]
+    fn the_gate_tolerates_surrounding_whitespace() {
+        let fp = template_fingerprint();
+        assert_eq!(armed_from(&format!("  {fp}  finch 
+"), "finch", true), Armed::Current);
+    }
+
     #[test]
     fn fresh_sentinel_within_threshold_stale_after_missing_never() {
         let tmp = tempfile::tempdir().unwrap();
@@ -328,10 +494,24 @@ mod tests {
     }
 
     #[test]
-    fn arm_block_carries_sentinel_touch_and_persistent_flag() {
+    fn arm_block_carries_the_sentinel_write_and_persistent_flag() {
         // title_dir needs a home dir; any real home works — content only.
         if let Some(block) = arm_block_for("wake-test-title", "Pat") {
-            assert!(block.contains("touch \"$INBOX/.watching\""));
+            // CHANGED 2026-09-20 WITH THE CONTRACT IT PINS. This asserted the loop
+            // ran `touch "$INBOX/.watching"`. The loop now WRITES the sentinel instead,
+            // with the template fingerprint and the title, so the old string is gone by
+            // design. The replacement has more teeth than the original, not less: it
+            // pins that both FIELDS reach the emitted block, which is what the gate
+            // reads. A test asserting only that some line mentions the path would pass
+            // over a loop that wrote nothing into it.
+            assert!(
+                block.contains("> \"$INBOX/.watching\""),
+                "the loop must WRITE the sentinel, not touch it"
+            );
+            assert!(
+                block.contains(&template_fingerprint()),
+                "the emitted block must carry the template fingerprint"
+            );
             assert!(block.contains("persistent: true"));
             assert!(block.contains("relay-inbox"));
             assert!(block.contains("never arm a duplicate"));
