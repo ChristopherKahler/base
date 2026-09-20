@@ -2766,12 +2766,22 @@ pub fn run() {
                         // did not exist and were told only that they had
                         // succeeded at something else. Surface it, and name the
                         // consequence the error itself cannot know.
+                        //
+                        // THE MESSAGE DESCRIBES WHAT THIS COMMAND DID, NOT WHAT
+                        // THE BOARD CONTAINS. An earlier version asserted the
+                        // caller "is NOT on `base relay board`" — which is FALSE
+                        // for anyone already in the store from an earlier bare
+                        // register, exactly the operator who is already fine
+                        // (grebe hit this on 2026-09-20). The command knows what
+                        // it did; it has not read the board and must not claim
+                        // to have.
                         Err(e) if project.is_some() => {
                             eprintln!("{e:#}");
                             eprintln!(
-                                "'{title}' is registered globally ONLY — it is NOT on `base relay board`, \
-                                 the operator's hub view. To join this workspace's store, run it with no \
-                                 --project: base relay register --as {title}"
+                                "This command did NOT join '{title}' to this workspace's relay store, so \
+                                 it added nothing to `base relay board`, the operator's hub view. It \
+                                 registered globally only. To join the store, run it with no --project: \
+                                 base relay register --as {title}"
                             );
                         }
                         _ => println!(
