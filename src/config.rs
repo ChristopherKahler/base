@@ -851,13 +851,24 @@ impl Default for SignalConfig {
 
 // ─── Budget Config ───────────────────────────────────────────
 
-/// How much each hook event may print, in UTF-16 code units: the unit Claude Code's limit
-/// counts. Output over the host's limit is saved to a file and Claude sees a 2,000-character
-/// preview of it, so base measures and trims before it prints. Measured on Claude Code 2.1.269.
+/// How much each hook event may print, in BYTES: the unit the host counts. Output over the
+/// host's limit is saved to a file and Claude sees a 2,000-character preview of it, so base
+/// measures and trims before it prints. Measured on Claude Code 2.1.278, 2026-09-20.
 ///
-/// Read today by session start: `session_start_chars`, `first_screen_chars` and
-/// `write_full_output`; by the memory signal: `memory_chars`. `prompt_chars`, `pre_tool_chars` and
-/// `post_tool_chars` are read by nothing yet; the prompt and tool hooks take them in their own commits.
+/// THE UNIT IN THIS PARAGRAPH WAS FALSE UNTIL 2026-09-20 AND IT MISLED THREE SESSIONS. It read
+/// "UTF-16 code units: the unit Claude Code's limit counts", on the belief that the host is
+/// JavaScript and its limit is a JS string length. Nobody had measured it. A probe of 13,000
+/// box-drawing characters - 39,000 bytes but only 13,000 UTF-16 units - PERSISTED, where a UTF-16
+/// limit predicts it arrives whole. The host counts bytes.
+///
+/// Read today by session start: `session_start_bytes`, `first_screen_chars` and
+/// `write_full_output`; by the memory signal: `memory_chars`; by the prompt hook: `prompt_bytes`.
+/// `pre_tool_chars` and `post_tool_chars` are read by nothing yet; the tool hooks take them in
+/// their own commits.
+///
+/// `first_screen_chars` and `memory_chars` ARE GENUINELY UTF-16 AND KEEP THEIR NAMES. They are
+/// READABILITY limits - how much a reader takes in - not delivery ones, so the host's unit does
+/// not apply to them. Mixed and honest beats uniform and lying.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetConfig {
     /// Session start's budget, in BYTES.
@@ -873,6 +884,17 @@ pub struct BudgetConfig {
     /// same day and the key went on saying `chars` until now.
     #[serde(default = "default_prompt_bytes", alias = "prompt_chars")]
     pub prompt_bytes: usize,
+    /// Which renamed keys THIS config was actually written with, in the operator's own spelling.
+    ///
+    /// NOT DESERIALIZED, AND IT CANNOT BE. `serde(alias)` lands both spellings in one field and
+    /// then cannot say which one it saw, so the struct is exactly the wrong place to ask. `load`
+    /// fills this from the RAW merged table, before `try_into` erases the distinction.
+    ///
+    /// WHAT IT IS FOR: an overflow notice must send the operator to the key that is in THEIR file.
+    /// Naming the current spelling to someone who legitimately still has the old one points them
+    /// at a key they do not have.
+    #[serde(skip)]
+    pub legacy_spellings: Vec<String>,
     #[serde(default = "default_pre_tool_chars")]
     pub pre_tool_chars: usize,
     #[serde(default = "default_post_tool_chars")]
@@ -899,13 +921,14 @@ fn default_pre_tool_chars() -> usize { 2500 }
 fn default_post_tool_chars() -> usize { 1000 }
 fn default_first_screen_chars() -> usize { 2000 }
 fn default_memory_chars() -> usize { 4000 }
-fn default_measured_on() -> String { "claude-code 2.1.269".into() }
+fn default_measured_on() -> String { "claude-code 2.1.278".into() }
 
 impl Default for BudgetConfig {
     fn default() -> Self {
         Self {
             session_start_bytes: default_session_start_bytes(),
             prompt_bytes: default_prompt_bytes(),
+            legacy_spellings: Vec::new(),
             pre_tool_chars: default_pre_tool_chars(),
             post_tool_chars: default_post_tool_chars(),
             first_screen_chars: default_first_screen_chars(),
@@ -1085,8 +1108,23 @@ Your value is still being used. Rename the key in base.toml to stop seeing this.
     }
 }
 
+impl BudgetConfig {
+    /// The spelling of `new` that the operator will actually find in their own `base.toml`.
+    ///
+    /// WHY NOT SIMPLY `new`, WHICH IS THE OBVIOUS FIX AND IS WRONG IN THE OTHER DIRECTION. An
+    /// operator who legitimately still has the old spelling set would be sent to edit a key that
+    /// is not in their file. The correct behaviour depends on what is actually there, not on what
+    /// we assume - the same principle the unit itself had to learn.
+    pub fn key_as_written<'a>(&self, new: &'a str) -> &'a str {
+        RENAMED_BUDGET_KEYS
+            .iter()
+            .find(|k| k.new == new && self.legacy_spellings.iter().any(|s| s == k.old))
+            .map_or(new, |k| k.old)
+    }
+}
+
 /// Every `[budget]` key that was renamed with its unit: old spelling, new spelling.
-const RENAMED_BUDGET_KEYS: &[LegacyBudgetKey] = &[
+pub const RENAMED_BUDGET_KEYS: &[LegacyBudgetKey] = &[
     LegacyBudgetKey { old: "session_start_chars", new: "session_start_bytes" },
     LegacyBudgetKey { old: "prompt_chars", new: "prompt_bytes" },
 ];
@@ -1195,7 +1233,7 @@ impl LegacyKey {
 const LEGACY_KEYS: &[(&str, &str, &str)] = &[(
     "signal",
     "max_chars",
-    "session start's budget is [budget] session_start_chars and the memory block's is [budget] memory_chars",
+    "session start's budget is [budget] session_start_bytes and the memory block's is [budget] memory_chars",
 )];
 
 impl BaseConfig {
@@ -1255,7 +1293,15 @@ impl BaseConfig {
         report_legacy_budget_keys(&legacy, &LEGACY_KEYS_REPORTED);
 
         match toml::Value::Table(merged).try_into() {
-            Ok(config) => (config, faults),
+            Ok(config) => {
+                // Carry the operator's own spellings past the point where `serde(alias)` erases
+                // them, so a notice can name the key that is in their file rather than the one we
+                // would prefer they had.
+                let mut config: Self = config;
+                config.budget.legacy_spellings =
+                    legacy.iter().map(|k| k.old.to_string()).collect();
+                (config, faults)
+            }
             Err(e) => {
                 faults.push(ConfigFault::Mismatched {
                     paths: sources,

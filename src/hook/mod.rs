@@ -153,7 +153,7 @@ fn run_event(
     match event {
         "session-start" => {
             // Everything session start says is collected, measured against
-            // `[budget] session_start_chars`, and printed ONCE (rank 00). The untrimmed text
+            // `[budget] session_start_bytes`, and printed ONCE (rank 00). The untrimmed text
             // goes to `.base/last-session-start.md` before anything prints.
             let mut out = session_start::SessionOutput::new();
             let handled = session_start::handle(&config, &cwd, session_id.as_deref(), &mut out);
@@ -256,7 +256,7 @@ fn run_event(
         }
         "user-prompt-submit" => {
             // Everything this event says is collected here and printed ONCE, measured against
-            // `[budget] prompt_chars` (rank 00), exactly as session start does above.
+            // `[budget] prompt_bytes` (rank 00), exactly as session start does above.
             //
             // WHAT WAS WRONG, AND WHY MEASURING ONE EMITTER WOULD HAVE BEEN WORSE THAN MEASURING
             // NONE. This arm used to hold THREE SEQUENTIAL EMITTERS, each blind to the others'
@@ -292,7 +292,17 @@ fn run_event(
             // THE SINGLE EXIT. It runs before `handled?` for the same reason session start's does:
             // the sites this replaced had already printed by the time an error could be seen, so
             // dropping their text on an error would be a regression dressed as a refactor.
-            crate::emit::print_measured("user-prompt-submit", "prompt_chars", &out, config.budget.prompt_bytes);
+            // THE KEY IS THE ONE THAT RESOLVED, NOT A LITERAL. This call used to pass
+            // "prompt_chars" - the LEGACY spelling - so every over-budget prompt told the operator
+            // to raise a key base would then warn them to rename. Base directed the operator into
+            // the exact state it scolds them for, on advice, every single prompt.
+            //
+            // `key` was made a parameter precisely to stop this, and the rationale sits nine lines
+            // above `withheld_notice` in emit/mod.rs predicting it in words. The refactor landed
+            // and the one call site kept the constant: a parameter every caller passes the same
+            // literal to has not removed the literal, it has moved it somewhere nobody greps.
+            let key = config.budget.key_as_written("prompt_bytes");
+            crate::emit::print_measured("user-prompt-submit", key, &out, config.budget.prompt_bytes);
             let mut data = handled?;
             data.session_id = session_id;
             Ok(data)

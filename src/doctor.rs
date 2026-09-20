@@ -760,7 +760,17 @@ fn push_hook_output(out: &mut String, tiers: &[crate::emit::record::TierSizes]) 
     if tiers.is_empty() {
         return;
     }
-    out.push_str("\n─── hook output (UTF-16 units, measured before printing) ───\n");
+    // THE HEADER NAMES NO UNIT, DELIBERATELY. It used to read "(UTF-16 units, measured before
+    // printing)" while the row directly beneath it read "6868 of 9000 bytes" - a heading
+    // contradicting its own rows on adjacent lines, on the one screen whose entire job is
+    // reporting what was measured.
+    //
+    // Every row carries the unit it was RECORDED in, because records written before 2026-09-20
+    // hold UTF-16 units and everything since holds bytes. A single unit in the heading cannot be
+    // true of both, and a reader's eye passes the heading first - so correct per-row labels get
+    // read through a false frame. A correct measurement under a wrong heading is not a correct
+    // report. `Unit::label` is the only thing that names a unit in this section.
+    out.push_str("\n─── hook output, measured before printing ───\n");
     for t in tiers {
         if let FileState::Present {
             unreadable_lines,

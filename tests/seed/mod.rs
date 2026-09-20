@@ -437,7 +437,15 @@ pub fn run_base(seed: &Seed, args: &[&str]) -> (i32, String, String) {
     run(seed, args, None, None)
 }
 
-/// The unit Claude Code's limit counts, and the budget's.
+/// UTF-16 units.
+///
+/// NOT what the host counts AND NOT what the delivery budgets count - both are BYTES, measured
+/// 2026-09-20. This doc used to claim it was both, which was two false claims in nine words on the
+/// helper every size assertion in this suite calls.
+///
+/// It stays because a test that wants to show three units disagreeing needs all three: `measured`
+/// below prints bytes, chars and UTF-16 side by side for exactly that reason. An assertion that
+/// wants the host's unit wants `str::len`.
 pub fn units(s: &str) -> usize {
     s.encode_utf16().count()
 }
