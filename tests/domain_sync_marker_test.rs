@@ -191,7 +191,7 @@ fn editing_domains_toml_reopens_the_guard_and_the_new_rule_reaches_the_graph() {
 
         // The next prompt: the hook syncs before it loads the graph it injects from.
         let event = serde_json::json!({ "prompt": "markertest please" });
-        user_prompt_submit::handle(&config, &ws, &event).unwrap();
+        user_prompt_submit::handle(&config, &ws, &event, &mut String::new()).unwrap();
 
         assert!(
             rule_texts(&ws, &config).iter().any(|t| t == NEW_RULE),

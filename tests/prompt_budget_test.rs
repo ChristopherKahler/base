@@ -23,6 +23,27 @@ use seed::{run_prompt_submit, units};
 /// gets. Spelled here rather than imported so the test states the number it is asserting.
 const PROMPT_CHARS: usize = 4000;
 
+/// The opening of the withheld notice. Both arms key off it, so it is spelled once.
+const NOTICE: &str = "[base: user-prompt-submit withheld ";
+
+/// The LARGEST emission measured from this hook on a real machine: `finch`, 2026-09-20, prompt 10
+/// of a single session, 26,016 bytes, of which 2,048 arrived. Prompt 1 of that same session emitted
+/// 13,678 — SO THE EMISSION NEARLY DOUBLED AS THE SESSION GREW, which is why the fixture is keyed
+/// to the observed maximum and not to a typical figure. A trim validated at 13 KB passes and still
+/// loses everything at 26 KB.
+const HIGH_WATER: usize = 26_016;
+
+/// The withheld figure the notice states, which is the only number in `stdout` that reports on text
+/// that is NOT in `stdout`.
+fn withheld_units(stdout: &str) -> Option<usize> {
+    let at = stdout.find(NOTICE)?;
+    stdout[at + NOTICE.len()..]
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// A fixture LOUD ENOUGH TO OVERFLOW, which the bare seed is not.
 ///
 /// THE FIRST VERSION OF THIS TEST PASSED ON THE UNFIXED TREE, AND THAT WAS A VOID READING, NOT A
@@ -43,7 +64,7 @@ const PROMPT_CHARS: usize = 4000;
 /// That is the same defect this round already measured in `migrate_test`, where a pair sharing one
 /// marker root read GREEN in a full-suite run and RED in a targeted run on the same commit. A test
 /// whose result depends on what another test is doing was never evidence in either direction.
-fn loud(tag: &str) -> seed::Seed {
+fn loud(tag: &str, rules: usize) -> seed::Seed {
     let root = std::env::temp_dir()
         .join(format!("base-prompt-budget-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -61,11 +82,14 @@ fn loud(tag: &str) -> seed::Seed {
     let ws_base = s.ws.join(".base");
     std::fs::create_dir_all(&ws_base).expect("workspace .base");
     let mut toml = String::from("[[domain]]\nname = \"global\"\nmode = \"always\"\nrules = [\n");
-    for i in 0..15 {
+    for i in 0..rules {
         toml.push_str(&format!(
             "  \"Global rule {i}: this rule is deliberately long enough to matter against a four \
              thousand unit budget, because a budget test whose fixture fits inside the budget \
-             proves nothing at all about what happens when it does not.\",\n"
+             proves nothing at all about what happens when it does not. It is repeated many times \
+             over so the fixture reproduces the LARGEST emission anyone has measured on a real \
+             machine rather than the smallest one that happens to overflow, because a trim \
+             validated at the small figure is not evidence about the large one.\",\n"
         ));
     }
     toml.push_str("]\n");
@@ -79,20 +103,42 @@ fn loud(tag: &str) -> seed::Seed {
 /// stdout with nothing measuring it, so the output is whatever the graph happens to produce.
 #[test]
 fn the_prompt_hook_fits_its_budget() {
-    let s = loud("budget");
+    let s = loud("budget", 70);
     let (code, stdout, stderr) =
         run_prompt_submit(&s, "write code to fix a bug in src/", Some("prompt-budget"));
     assert_eq!(code, 0, "the hook should not fail:\nstdout:\n{stdout}\nstderr:\n{stderr}");
 
     let emitted = units(&stdout);
-    // THE CONTROL. A hook that emitted nothing, or emitted only the context bracket, makes the
-    // budget assertion vacuous — which is exactly how the first version of this test passed on a
-    // tree with no budget at all.
+
+    // THE CONTROL, AND IT IS KEYED ON WHAT THE HOOK WANTED TO SAY, NOT ON WHAT IT SAID.
+    //
+    // The first version of this control read `emitted > 1000`, which was right for the tree it was
+    // written against and is WRONG FOR THE FIXED ONE. Once the writer caps the output, `emitted` is
+    // bounded by `PROMPT_CHARS` by construction and can never again be evidence that anything was
+    // driven through the trim: a fixture emitting 1,500 units with no overflow at all would satisfy
+    // both `> 1000` and `<= 4000` and the file would go green having tested nothing. That is the
+    // same inert guard this test already caught once, rebuilt by the fix that made it pass.
+    //
+    // `withheld` is the only figure in `stdout` that reports on text NOT in `stdout`, so it is the
+    // only one that can prove a trim happened. `wanted == withheld + kept` and `kept >= 0`, so
+    // `withheld >= HIGH_WATER` implies `wanted >= HIGH_WATER`: the fixture really did reproduce the
+    // largest emission measured on a real machine.
+    let withheld = withheld_units(&stdout).unwrap_or_else(|| {
+        panic!(
+            "control: no withheld notice, so NOTHING WAS TRIMMED and the budget assertion below \
+             would be vacuous. The hook emitted {emitted} units against a {PROMPT_CHARS} unit \
+             budget. TWO CAUSES LOOK IDENTICAL FROM HERE and the figure tells them apart: at or \
+             under {PROMPT_CHARS} the fixture is too quiet to overflow and needs more rules; well \
+             over it, nothing is measuring the output at all, which is the defect itself. \
+             stdout:\n{stdout}"
+        )
+    });
     assert!(
-        emitted > 1000,
-        "control: the hook emitted only {emitted} units, so it never approached the {PROMPT_CHARS} \
-         unit budget and a passing assertion below would prove nothing. The fixture is not loud \
-         enough. stdout:\n{stdout}"
+        withheld >= HIGH_WATER,
+        "control: the trim withheld {withheld} units, short of the {HIGH_WATER} measured on a real \
+         machine, so this fixture is quieter than the failure it stands for. A budget validated \
+         against a small overflow is not evidence about a large one — finch watched this hook go \
+         from 13,678 to 26,016 units inside ONE session. Raise the fixture's rule count."
     );
 
     assert!(
@@ -101,6 +147,19 @@ fn the_prompt_hook_fits_its_budget() {
          {PROMPT_CHARS}. Nothing measures it, so whatever the host drops is lost silently — which \
          is the defect. First 400 units:\n{}",
         stdout.chars().take(400).collect::<String>()
+    );
+
+    // THE NOTICE MUST NAME THE KEY THAT ACTUALLY GOVERNED THE TRIM. `withheld_notice` used to
+    // hard-code `prompt_chars` while taking the hook name as a parameter, so it was correct only
+    // while exactly one hook called it. An overflow notice that names the wrong setting is worse
+    // than no notice: it sends the operator to edit a key that governs a different hook, with every
+    // appearance of having been told what to do.
+    let key = format!("[budget] prompt_chars = {PROMPT_CHARS}");
+    assert!(
+        stdout.contains(&key),
+        "the withheld notice does not name `{key}`, so it cannot tell the operator which setting \
+         caused the trim. Notice as emitted:\n{}",
+        stdout.rsplit_once(NOTICE).map(|(_, tail)| tail).unwrap_or("<none>")
     );
 }
 
@@ -114,13 +173,12 @@ fn the_prompt_hook_fits_its_budget() {
 /// appends its notice reproduces that precisely, and it would look like a fix.
 #[test]
 fn the_withheld_notice_survives_the_trim_that_caused_it() {
-    let s = loud("notice");
+    let s = loud("notice", 70);
     let (code, stdout, _) =
         run_prompt_submit(&s, "write code to fix a bug in src/", Some("prompt-budget"));
     assert_eq!(code, 0);
 
-    const NEEDLE: &str = "[base: user-prompt-submit withheld ";
-    let Some(at) = stdout.find(NEEDLE) else {
+    let Some(at) = stdout.find(NOTICE) else {
         // No notice is only acceptable if nothing was withheld. Over budget with no notice is the
         // silent loss this change exists to end.
         assert!(
@@ -132,7 +190,7 @@ fn the_withheld_notice_survives_the_trim_that_caused_it() {
         return;
     };
 
-    let notice_ends = units(&stdout[..at]) + units(NEEDLE);
+    let notice_ends = units(&stdout[..at]) + units(NOTICE);
     assert!(
         notice_ends <= PROMPT_CHARS,
         "the withheld notice ends at UTF-16 unit {notice_ends}, past the {PROMPT_CHARS} the host \

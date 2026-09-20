@@ -187,8 +187,27 @@ fn the_events_that_deliver_plain_stdout_still_use_it() {
     let session_start = arm_of("\"session-start\" =>");
     assert!(session_start.contains("print!("), "session-start must keep plain stdout — the host delivers it there");
     assert!(!session_start.contains("hookSpecificOutput"), "session-start must not use the envelope");
+    // Rank 00 widened: user-prompt-submit collects its three contributions — the handler, the relay
+    // inbox push and the task tick — and prints the measured emission ONCE, so the literal
+    // `print!("{block}")` left this arm exactly as it left session start above. The property under
+    // test is unchanged and is now asserted more strictly than before: plain stdout, no envelope,
+    // and through THE single measured writer rather than any `print!` that happens to be in scope.
+    // Three sequential emitters is what this arm used to be, and it is what must not come back.
     let prompt = arm_of("\"user-prompt-submit\" =>");
-    assert!(prompt.contains("print!(\"{block}\")"), "user-prompt-submit must keep plain stdout — the host delivers it there");
+    assert!(
+        prompt.contains("emit::print_measured("),
+        "user-prompt-submit must keep plain stdout, through the one measured writer — the host \
+         delivers plain stdout on this event"
+    );
+    assert!(
+        !prompt.contains("hookSpecificOutput"),
+        "user-prompt-submit must not use the envelope"
+    );
+    assert!(
+        !prompt.contains("print!("),
+        "user-prompt-submit must have exactly ONE writer: a bare `print!` beside the measured one \
+         is a second emitter blind to the first's spend, which is the defect rank 00 removed here"
+    );
     for arm in ["\"pre-tool-use\" =>", "\"post-tool-use\" =>"] {
         let body = arm_of(arm);
         assert!(body.contains("hookSpecificOutput"), "{arm} must use the envelope");

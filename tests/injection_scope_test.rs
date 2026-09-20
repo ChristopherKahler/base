@@ -113,7 +113,7 @@ fn register_operator_projects(root: &Path) {
 /// One prompt in session `sid`; the domains whose block was injected.
 fn prompt(config: &BaseConfig, root: &Path, sid: &str, text: &str) -> Vec<String> {
     let event = serde_json::json!({ "prompt": text, "session_id": sid });
-    user_prompt_submit::handle(config, root, &event).unwrap().domains_matched
+    user_prompt_submit::handle(config, root, &event, &mut String::new()).unwrap().domains_matched
 }
 
 /// A fresh session: the per-workspace dedup state is cleared so every prompt below is

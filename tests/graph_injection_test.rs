@@ -84,7 +84,7 @@ fn graph_injection_returns_rules_from_graph() {
 
     // Capture stdout
     let result = std::panic::catch_unwind(|| {
-        base::hook::user_prompt_submit::handle(&config, tmp.path(), &event).unwrap();
+        base::hook::user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new()).unwrap();
     });
     assert!(result.is_ok());
 
@@ -186,7 +186,7 @@ rules = ["Fallback rule"]
     // The hook should still work (fail-open, use TOML rules directly)
     let event = serde_json::json!({ "prompt": "test" });
     let config = base::config::BaseConfig::load(tmp.path());
-    let result = base::hook::user_prompt_submit::handle(&config, tmp.path(), &event);
+    let result = base::hook::user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new());
     assert!(result.is_ok(), "Should not error even without graph");
 }
 
@@ -199,7 +199,7 @@ fn dedup_skips_unchanged_graph_injection() {
     let config = base::config::BaseConfig::load(tmp.path());
 
     // First call — should inject
-    base::hook::user_prompt_submit::handle(&config, tmp.path(), &event).unwrap();
+    base::hook::user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new()).unwrap();
 
     // Load session state to verify something was marked
     let base_dir = base::config::find_workspace_base(tmp.path()).unwrap();
@@ -218,7 +218,7 @@ fn dedup_skips_unchanged_graph_injection() {
 
     // Second call with same prompt — GLOBAL should be deduped at the hook
     // layer (single dedup gate: rendered-output hash)
-    let result = base::hook::user_prompt_submit::handle(&config, tmp.path(), &event).unwrap();
+    let result = base::hook::user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new()).unwrap();
     assert!(
         result.suppressed >= 1,
         "Second identical call should report suppressed domains, got: {}",
@@ -235,7 +235,7 @@ fn rule_change_reinjects_after_dedup() {
     let config = base::config::BaseConfig::load(tmp.path());
 
     // First call — injects GLOBAL, marks it in session state
-    let first = base::hook::user_prompt_submit::handle(&config, tmp.path(), &event).unwrap();
+    let first = base::hook::user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new()).unwrap();
     assert!(
         first.domains_matched.iter().any(|d| d == "GLOBAL"),
         "First call should inject GLOBAL, got: {:?}",
@@ -258,7 +258,7 @@ rules = ["Never lie", "Always verify", "NEW RULE added later"]
     base::domain::sync::sync_domains_to_graph(&config, tmp.path(), None).unwrap();
 
     // Second call — changed content must RE-inject, not dedup
-    let second = base::hook::user_prompt_submit::handle(&config, tmp.path(), &event).unwrap();
+    let second = base::hook::user_prompt_submit::handle(&config, tmp.path(), &event, &mut String::new()).unwrap();
     assert!(
         second.domains_matched.iter().any(|d| d == "GLOBAL"),
         "Changed rules should re-inject GLOBAL, got: {:?} (suppressed: {})",

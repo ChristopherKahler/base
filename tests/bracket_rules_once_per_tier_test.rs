@@ -65,7 +65,7 @@ fn config() -> BaseConfig {
 /// One prompt in session `sid`; whether the bracket block was emitted.
 fn prompt(config: &BaseConfig, root: &Path, sid: &str, text: &str) -> bool {
     let event = serde_json::json!({ "prompt": text, "session_id": sid });
-    user_prompt_submit::handle(config, root, &event)
+    user_prompt_submit::handle(config, root, &event, &mut String::new())
         .unwrap()
         .bracket_rules_injected
 }

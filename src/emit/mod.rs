@@ -64,14 +64,14 @@ impl Measured {
 ///
 /// Trimming is on whole lines: half a rule is worse than no rule, because a truncated instruction
 /// still reads as an instruction.
-pub fn print_measured(hook: &str, text: &str, budget_u16: usize) -> Measured {
+pub fn print_measured(hook: &str, key: &str, text: &str, budget_u16: usize) -> Measured {
     let wanted = u16_len(text);
     if wanted <= budget_u16 {
         print!("{text}");
         return Measured { wanted_u16: wanted, emitted_u16: wanted, withheld_u16: 0 };
     }
 
-    let reserve = u16_len(&withheld_notice(hook, wanted, budget_u16));
+    let reserve = u16_len(&withheld_notice(hook, key, wanted, budget_u16));
     let room = budget_u16.saturating_sub(reserve);
 
     let mut kept = String::new();
@@ -86,7 +86,7 @@ pub fn print_measured(hook: &str, text: &str, budget_u16: usize) -> Measured {
     }
 
     let withheld = wanted.saturating_sub(kept_u16);
-    let notice = withheld_notice(hook, withheld, budget_u16);
+    let notice = withheld_notice(hook, key, withheld, budget_u16);
     if !kept.is_empty() && !kept.ends_with('\n') {
         kept.push('\n');
     }
@@ -97,9 +97,18 @@ pub fn print_measured(hook: &str, text: &str, budget_u16: usize) -> Measured {
 
 /// The one line that survives. It names the hook, the loss and the key that governs it, because an
 /// operator who sees a truncation and cannot find the setting has been told nothing useful.
-fn withheld_notice(hook: &str, withheld_u16: usize, budget_u16: usize) -> String {
+/// WHY `key` IS A PARAMETER AND NOT THE LITERAL `prompt_chars` IT USED TO BE. Every key in
+/// `[budget]` governs a different hook, and this line's whole job is to send the operator to the one
+/// that caused the trim. Hard-coding one key made the notice correct only for as long as exactly one
+/// hook called this function - correct conditional on a neighbouring defect, which is the shape that
+/// survives review and breaks the day somebody repairs the neighbour. The person who wires
+/// `pre_tool_chars` is reading `pre_tool_use.rs`, not this function, so they would never see it
+/// coming: their overflow notice would name `prompt_chars` and send them to edit a setting that
+/// governs a different hook. That is the inert-field defect pointed at the operator, and it is worse
+/// than silence, because silence does not give directions.
+fn withheld_notice(hook: &str, key: &str, withheld_u16: usize, budget_u16: usize) -> String {
     format!(
-        "\n[base: {hook} withheld {withheld_u16} of its units against [budget] prompt_chars = {budget_u16}. \
+        "\n[base: {hook} withheld {withheld_u16} of its units against [budget] {key} = {budget_u16}. \
 Raise it in base.toml, or run `base doctor` to see what each hook emitted.]\n"
     )
 }
