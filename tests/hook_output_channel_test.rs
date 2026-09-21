@@ -174,7 +174,19 @@ fn stop_never_writes_a_bare_block_to_stdout() {
 /// injections that already worked would have stopped working.
 #[test]
 fn the_events_that_deliver_plain_stdout_still_use_it() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/hook/mod.rs")).unwrap();
+    // NORMALISE THE LINE ENDINGS BEFORE SEARCHING. The arm delimiter below is written with `\n`,
+    // and `.gitattributes` carries no rule for `*.rs`, so on Windows `core.autocrlf` checks this
+    // source out as CRLF and `\n        }\n` matches NOTHING. `find` then returns None, `unwrap_or`
+    // hands back the whole rest of the file, and the arm "contains" `hookSpecificOutput` from a
+    // completely different arm further down - 21,828 characters swallowed instead of 2,670.
+    //
+    // THE TEST FAILED WHILE THE PRODUCT WAS CORRECT, and it fails that way on every Windows
+    // checkout while passing on Linux CI, which is the exact shape `.gitattributes` warns about in
+    // its own header comment for `*.sh`. Measured 2026-09-21 on the four-lane merge: the delimiter
+    // occurs 0 times in its LF form and 8 times in its CRLF form.
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/hook/mod.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
     let arm_of = |needle: &str| -> String {
         let start = src.find(needle).unwrap_or_else(|| panic!("arm {needle} not found"));
         let rest = &src[start..];
