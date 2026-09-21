@@ -297,8 +297,43 @@ pub fn load_workspace_graph(cwd: &Path) -> Result<Store> {
 }
 
 /// Load workspace graph and run a SPARQL SELECT query.
+///
+/// Reads ONE tier: the workspace above `cwd`. A caller that must see records from
+/// either tier wants [`load_merged_and_query`]. All 30 remaining call sites of this
+/// function read a single tier, so all 30 carry that limit latent; they move across
+/// on their own evidence, one at a time, not in a sweep.
 pub fn load_and_query(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<QueryResults> {
     let store = load_workspace_graph(cwd)?;
+    let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
+    crate::store::query(&store, &full_sparql)
+}
+
+/// Load BOTH tiers into one store and run a SPARQL SELECT query.
+///
+/// The cross-tier sibling of [`load_and_query`]. `store::load_merged` already merges
+/// the global and workspace graphs, already fails open when one is missing, and
+/// already degrades to a lenient per-tier load when one tier will not parse, so a
+/// corrupt tier costs its own bad lines instead of the whole read. `flow_resurface`
+/// has called it for three of its scans all along; this is the seam, not a new one.
+///
+/// Errors when NEITHER tier has a graph, rather than returning zero rows. Absent and
+/// empty are different states, and a query that matches nothing because nothing was
+/// read is the one that reads as a confident "there is none".
+///
+/// Uses [`crate::store::query`], not `query_union`. base's own queries wrap their
+/// patterns in `GRAPH ?g {{ ... }}`, so they already match named graphs explicitly.
+/// `query_union` would return the very same rows here, because an explicit `GRAPH ?g`
+/// is unaffected by a union default graph — but it would tell every later reader that
+/// this query was written by a user, which is false. A correct result carrying a false
+/// signal is worth refusing.
+pub fn load_merged_and_query(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<QueryResults> {
+    let store = crate::store::load_merged(cwd).with_context(|| {
+        format!(
+            "no graph in either tier: neither the global tier's graph.nq nor a workspace \
+             .base/graph.nq at or above {} exists, so this query read nothing at all",
+            cwd.display()
+        )
+    })?;
     let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
     crate::store::query(&store, &full_sparql)
 }

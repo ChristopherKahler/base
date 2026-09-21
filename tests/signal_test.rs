@@ -243,3 +243,108 @@ fn disabled_signals_emit_nothing() {
     assert!(output.is_empty(), "Disabled signals should emit nothing");
     assert!(output.diagnostics.is_empty(), "Disabled signals should emit no diagnostics");
 }
+
+
+// --------------------------------------------------------------------------
+// Cross-lane item 2: the working set reads BOTH tiers.
+//
+// Every arm below gets its OWN fake home through `with_thread_home`, because
+// `load_merged` resolves the global tier through `home::home_root()`. The
+// process-wide test root is shared by every thread in this binary, and these
+// arms write a global tier -- so sharing it would let one arm's global task
+// appear in another's. A thread-local root cannot do that.
+//
+// Predictions registered before the run (B42 step 6):
+//   I1 RED before the fix, GREEN after -- the defect's own test
+//   I2 GREEN both sides -- the merge must not lose the workspace tier
+//   I4 GREEN both sides -- control: the common path is untouched
+//   I5 GREEN both sides -- pins behaviour that is currently right by accident
+// --------------------------------------------------------------------------
+
+/// Build a tier rooted at `dir` and return it, creating its `.base/` first.
+fn tier(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir.join(".base")).unwrap();
+    dir.to_path_buf()
+}
+
+/// I1. A task recorded only in the global tier must appear in the working set.
+/// Before the fix the query opened the workspace graph alone, so it could not match.
+#[test]
+fn a_global_tier_task_renders_in_the_working_set() {
+    let home = tempfile::tempdir().unwrap();
+    base::home::with_thread_home(home.path(), || {
+        let gbl = tier(&home.path().join(".base-gbl"));
+        crud::project::add(&gbl, &ns(), "Global Project", "active", None).unwrap();
+        crud::task::add(&gbl, &ns(), "global-project", "Global Only Task", Some("high"), None).unwrap();
+
+        let ws = tier(&home.path().join("ws"));
+        crud::project::add(&ws, &ns(), "Workspace Project", "active", None).unwrap();
+
+        let out = signal::active_awareness::run(&ws, &test_config()).unwrap();
+        assert!(
+            out.contains("Global Only Task"),
+            "a global-tier task must render in the working set; got:\n{out}"
+        );
+    });
+}
+
+/// I2. Reading both tiers must not lose the workspace tier.
+#[test]
+fn a_workspace_task_still_renders_when_both_tiers_exist() {
+    let home = tempfile::tempdir().unwrap();
+    base::home::with_thread_home(home.path(), || {
+        let gbl = tier(&home.path().join(".base-gbl"));
+        crud::project::add(&gbl, &ns(), "Global Project", "active", None).unwrap();
+        crud::task::add(&gbl, &ns(), "global-project", "Global Only Task", Some("high"), None).unwrap();
+
+        let ws = tier(&home.path().join("ws"));
+        crud::project::add(&ws, &ns(), "Workspace Project", "active", None).unwrap();
+        crud::task::add(&ws, &ns(), "workspace-project", "Workspace Only Task", Some("high"), None).unwrap();
+
+        let out = signal::active_awareness::run(&ws, &test_config()).unwrap();
+        assert!(out.contains("Workspace Only Task"), "workspace tier lost; got:\n{out}");
+        assert!(out.contains("Global Only Task"), "global tier lost; got:\n{out}");
+    });
+}
+
+/// I4. Control. A workspace with no global graph beside it behaves exactly as before.
+/// If this reddens, the change broke the ordinary path rather than widening it.
+#[test]
+fn a_workspace_only_task_is_unaffected() {
+    let home = tempfile::tempdir().unwrap();
+    base::home::with_thread_home(home.path(), || {
+        // deliberately no .base-gbl at all
+        let ws = tier(&home.path().join("ws"));
+        crud::project::add(&ws, &ns(), "Workspace Project", "active", None).unwrap();
+        crud::task::add(&ws, &ns(), "workspace-project", "Workspace Only Task", Some("high"), None).unwrap();
+
+        let out = signal::active_awareness::run(&ws, &test_config()).unwrap();
+        assert!(out.contains("Workspace Only Task"), "the common path broke; got:\n{out}");
+    });
+}
+
+/// I5. One entity recorded in BOTH tiers renders once, not twice.
+///
+/// This already holds, and it holds by accident: `run_sections` keys a `HashMap` on
+/// entity id for an entirely different reason -- gathering an entity's several owner
+/// links into one row. Merging the tiers is the first thing that makes two rows share
+/// an id, so the collapse now matters and nothing announces it if it breaks.
+/// Accidental correctness is the fragile kind. Keep this arm whatever else changes.
+#[test]
+fn an_entity_recorded_in_both_tiers_renders_once() {
+    let home = tempfile::tempdir().unwrap();
+    base::home::with_thread_home(home.path(), || {
+        let gbl = tier(&home.path().join(".base-gbl"));
+        crud::project::add(&gbl, &ns(), "Shared Project", "active", None).unwrap();
+
+        let ws = tier(&home.path().join("ws"));
+        crud::project::add(&ws, &ns(), "Shared Project", "active", None).unwrap();
+
+        let out = signal::active_awareness::run(&ws, &test_config()).unwrap();
+        assert_eq!(
+            out.matches("Shared Project").count(),
+            1,
+            "an entity in both tiers must render once, not once per tier; got:\n{out}"
+        );
+    });
+}
