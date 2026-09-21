@@ -348,3 +348,138 @@ fn an_entity_recorded_in_both_tiers_renders_once() {
         );
     });
 }
+
+
+// --------------------------------------------------------------------------
+// The honesty envelope. Absent, empty and zero are three states; two of them
+// used to produce the same screen.
+//
+// Predictions registered before the run:
+//   A1 RED before, GREEN after -- absent renders nothing today
+//   A2 RED before, GREEN after -- empty renders nothing today
+//   A3 GREEN both for the rows, RED before for the scope clause
+//   A4 RED before, GREEN after -- the DIFFERENTIAL arm, and the only one that
+//      can catch this. A1-A3 can all pass while the defect sits untouched.
+// --------------------------------------------------------------------------
+
+/// A1. Neither tier has a graph. The block must say so, not render empty.
+#[test]
+fn no_graph_in_either_tier_says_so_and_never_renders_an_empty_working_set() {
+    let home = tempfile::tempdir().unwrap();
+    base::home::with_thread_home(home.path(), || {
+        let ws = tier(&home.path().join("ws"));
+        let out = signal::active_awareness::run(&ws, &test_config()).unwrap();
+        assert!(
+            out.contains("no graph was read"),
+            "absent must say no graph was read; got:\n{out}"
+        );
+        assert!(
+            out.contains("NOT an empty working set"),
+            "absent must refuse the empty reading outright; got:\n{out}"
+        );
+    });
+}
+
+/// A2. A tier exists and holds no working rows. The empty rendering, with scope.
+#[test]
+fn an_empty_working_set_names_its_scope_so_it_cannot_read_as_absent() {
+    let home = tempfile::tempdir().unwrap();
+    base::home::with_thread_home(home.path(), || {
+        let ws = tier(&home.path().join("ws"));
+        // A graph that exists and holds nothing in a working state.
+        crud::project::add(&ws, &ns(), "Done Project", "complete", None).unwrap();
+
+        let out = signal::active_awareness::run(&ws, &test_config()).unwrap();
+        assert!(out.contains("SCOPE:"), "empty must still name its scope; got:\n{out}");
+        assert!(
+            out.contains("other workspaces were not read"),
+            "the scope clause must name the axis it does NOT cover; got:\n{out}"
+        );
+        assert!(
+            !out.contains("no graph was read"),
+            "a graph WAS read; this must not claim otherwise; got:\n{out}"
+        );
+    });
+}
+
+/// A3. The ordinary listing still lists, and now carries its scope too.
+#[test]
+fn a_populated_working_set_still_lists_and_names_its_scope() {
+    let home = tempfile::tempdir().unwrap();
+    base::home::with_thread_home(home.path(), || {
+        let ws = tier(&home.path().join("ws"));
+        crud::project::add(&ws, &ns(), "Live Project", "active", None).unwrap();
+
+        let out = signal::active_awareness::run(&ws, &test_config()).unwrap();
+        assert!(out.contains("Live Project"), "the rows must still render; got:\n{out}");
+        assert!(out.contains("SCOPE:"), "a populated block must name its scope too; got:\n{out}");
+    });
+}
+
+/// A4. THE DIFFERENTIAL ARM, and the only one of the four that can catch this.
+///
+/// It asserts nothing about whether either output is correct. It asserts the two
+/// are NOT THE SAME STRING. When the defect IS two states rendering identically,
+/// an assertion about either one on its own cannot see it -- A1, A2 and A3 can
+/// every one of them pass while absent and empty still produce the same screen.
+#[test]
+fn absent_and_empty_do_not_render_the_same_thing() {
+    let absent_home = tempfile::tempdir().unwrap();
+    let absent = base::home::with_thread_home(absent_home.path(), || {
+        let ws = tier(&absent_home.path().join("ws"));
+        signal::active_awareness::run(&ws, &test_config()).unwrap()
+    });
+
+    let empty_home = tempfile::tempdir().unwrap();
+    let empty = base::home::with_thread_home(empty_home.path(), || {
+        let ws = tier(&empty_home.path().join("ws"));
+        crud::project::add(&ws, &ns(), "Done Project", "complete", None).unwrap();
+        signal::active_awareness::run(&ws, &test_config()).unwrap()
+    });
+
+    assert_ne!(
+        absent, empty,
+        "absent and empty render identically, so the envelope does not exist \
+         whatever the code says.\nabsent:\n{absent}\nempty:\n{empty}"
+    );
+}
+
+
+/// A5. A tier that read badly is reported IN THE BLOCK, not only on stderr.
+///
+/// This is the state the whole prerequisite commit exists to make reachable.
+/// Before `load_merged_reporting` the count went to stderr and the caller could
+/// not see it, so no block could say this however much it wanted to.
+///
+/// HONEST NOTE ON ITS RED: this arm was written AFTER the fix, unlike the other
+/// four. Its red is asserted from the code path, not observed, because the
+/// function it needs did not exist to be called before. Weaker evidence than
+/// the arms that were watched failing, and recorded as such.
+#[test]
+fn a_damaged_tier_is_reported_in_the_block_not_only_on_stderr() {
+    let home = tempfile::tempdir().unwrap();
+    base::home::with_thread_home(home.path(), || {
+        let ws = tier(&home.path().join("ws"));
+        // A real project, so the block has rows to render, plus one line that
+        // will not parse -- the strict load fails and the lenient one skips it.
+        crud::project::add(&ws, &ns(), "Live Project", "active", None).unwrap();
+        let g = ws.join(".base").join("graph.nq");
+        let mut text = std::fs::read_to_string(&g).unwrap();
+        text.push_str("this line is not a quad\n");
+        std::fs::write(&g, text).unwrap();
+
+        let out = signal::active_awareness::run(&ws, &test_config()).unwrap();
+        assert!(
+            out.contains("THIS READ WAS INCOMPLETE"),
+            "a skipped line must be reported in the block; got:\n{out}"
+        );
+        assert!(
+            out.contains("skipped 1 malformed line"),
+            "the block must name what was skipped, not just that something was; got:\n{out}"
+        );
+        assert!(
+            out.contains("Live Project"),
+            "the rows it DID read must still render; a degraded read is not an empty one; got:\n{out}"
+        );
+    });
+}

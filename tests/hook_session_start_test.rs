@@ -90,18 +90,53 @@ fn session_start_failopen_on_malformed_trig() {
 
     let config = BaseConfig::default();
 
-    // Should return an error, but the dispatch wrapper catches it (fail-open)
-    // At the handler level, an error is expected here
     let mut out = session_start::SessionOutput::new();
     let result = session_start::handle(&config, tmp.path(), None, &mut out);
-    assert!(result.is_err(), "Malformed TriG should error at handler level");
-    // Rank 00 commit B: the handler collects instead of printing, and what it collected before
-    // the error must survive it, as it survived on stdout before. The unhealthy-graph warning
-    // is exactly what precedes this error.
+
+    // WHAT THIS TEST USED TO ASSERT, AND WHY IT DOES NOT ANY MORE.
+    //
+    // It asserted `result.is_err()`, with the comment "the dispatch wrapper catches
+    // it (fail-open)". That error never came from the signals. It came from
+    // `store::load_graphs(&paths)?` in the queries.toml FALLBACK, which sits below
+    // the `if any_signal { ... return Ok(()); }` early return. A malformed graph
+    // used to leave every signal silent, so the fallback ran and errored.
+    //
+    // The honesty envelope makes the working-set block always render at least a
+    // scope line, so `any_signal` is now always true and the handler returns before
+    // reaching that strict load. THE FALLBACK IS NOW UNREACHABLE -- filed as its own
+    // item, QTF-1, for the operator to rule on, NOT fixed or deleted by this lane.
+    // See findings/2026-09-21-plover-queries-toml-fallback-unreachable.md.
+    //
+    // THE ASSERTION IS REPLACED, NOT WEAKENED. The contract worth guarding was never
+    // "an internal Err the wrapper discards" -- nothing reached the operator from it.
+    // It is "a malformed graph does not pass silently", and that is now checked where
+    // the operator can actually see it: in the text this session start renders.
+    assert!(
+        result.is_ok(),
+        "the handler no longer reaches the fallback's strict load; see QTF-1: {result:?}"
+    );
+
+    // Unchanged from the original: the unhealthy-graph warning must still be collected.
     assert!(
         out.fragments().parts().iter().any(|p| p.kind == "graph-unhealthy"),
-        "the warning collected before the error is gone: {:?}",
+        "the unhealthy-graph warning is gone: {:?}",
         out.fragments().parts().iter().map(|p| p.kind.as_str()).collect::<Vec<_>>()
+    );
+
+    // NEW AND STRICTLY STRONGER than the Err it replaces: the damaged read has to be
+    // reported in rendered text, not merely signalled to a caller that drops it.
+    //
+    // It has to be read off `finish()`, NOT off `fragments().parts()`.
+    // `push_signals` parks the signals in their own field and only merges them in
+    // `finish`, so the fragments alone never contain the working-set block. A first
+    // draft of this assertion read the fragments, found no block, and would have
+    // been taken as proof the envelope does not fire -- when it was the READER that
+    // was wrong. Assert on what is actually printed.
+    let rendered = out.finish(&config, tmp.path()).text;
+    assert!(
+        rendered.contains("THIS READ WAS INCOMPLETE"),
+        "a malformed graph must be reported in what the operator sees, not only to a \
+         caller that discards it; rendered:\n{rendered}"
     );
 }
 
