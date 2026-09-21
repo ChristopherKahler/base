@@ -623,18 +623,29 @@ struct Placed {
 
 /// Spec B3, with B7's BEHAVIOR lines merged in: what Claude does first, written before any data
 /// so no trim can remove it. It names only commands that exist. The deferred line (B3) prints when
-/// anything is deferred, so a session with nothing deferred keeps today's block byte for byte.
+/// anything is deferred, so a session with nothing deferred keeps the block it had without it.
+///
+/// THE WORDING IS BUDGETED. The header, this block (Letters line included) and DUE NOW must end
+/// inside the first 2,000 UTF-16 units; `tests/deferral_test.rs` FS1 holds them to a 1,990 bar on
+/// the worst case (ten 50-character slugs, the two longest DUE NOW lines, line 6 printing). At
+/// 566c753 that case ended at 2011 units, 21 past the bar and 11 past the screen. Three phrases
+/// were shed (flint, 2026-09-21), each already said elsewhere on the same screen: line 4's
+/// "; several stay open" (line 4 already says forks are not a lettered choice), line 5's "and the
+/// whole untrimmed" → "; the untrimmed", and line 6's "; each block counts them. Bring one back:"
+/// → ". Revive one:" (every block prints its own deferred notice). Measured after: fs1-before
+/// 1831 (was 1861), fs1-after 1953 (was 2011). Every word added here is paid for on that screen,
+/// and FS1 is the receipt.
 pub fn instruction_block(letters: &[(char, String)], deferred: usize) -> String {
     let mut s = String::from(
         "DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:\n\
          1. Show DUE NOW, then HANDOFFS, exactly as lettered. Nothing prepended. No \"is this stale?\" questions.\n\
          2. The user names a handoff by letter, project or a few words: run `base handoff show <what they said>` and read the doc it prints. Several matches: list them and ask.\n\
          3. \"snooze <letter> <N>d\" → `base handoff snooze <slug> <N>` · \"archive <letter>\" → `base handoff archive <slug>` · a handled reminder → `base reminder archive <slug>`.\n\
-         4. FORKS are open side-work, not a lettered choice; several stay open. `base fork snooze <title> <N>` · `base fork archive <title>`.\n\
-         5. Every block below is a summary. Its full list is the command on its line, and the whole untrimmed output is the file on line 1. Never guess; run it.",
+         4. FORKS are open side-work, not a lettered choice. `base fork snooze <title> <N>` · `base fork archive <title>`.\n\
+         5. Every block below is a summary. Its full list is the command on its line; the untrimmed output is the file on line 1. Never guess; run it.",
     );
     if deferred > 0 {
-        s.push_str("\n6. Deferred = open but paused, not listed; each block counts them. Bring one back: `base handoff show <words>` (forks: `base fork show`).");
+        s.push_str("\n6. Deferred = open but paused, not listed. Revive one: `base handoff show <words>` (forks: `base fork show`).");
     }
     if !letters.is_empty() {
         let map: Vec<String> = letters

@@ -1083,7 +1083,7 @@ fn each_block_ends_with_its_notice_and_a_block_with_zero_open_still_renders() {
     let line1 = out.lines().next().unwrap_or_default();
     assert!(line1.contains(" · deferred 7 · "), "line 1 lacks the deferred total: {line1}");
     assert!(
-        out.contains("Deferred = open but paused, not listed; each block counts them. Bring one back: `base handoff show <words>` (forks: `base fork show`)."),
+        out.contains("Deferred = open but paused, not listed. Revive one: `base handoff show <words>` (forks: `base fork show`)."),
         "the instruction block lacks the deferred line:\n{out}"
     );
 }
@@ -1282,18 +1282,16 @@ fn nothing_defers_unless_defer_is_enabled() {
 /// header's `· deferred N` both print. The header, the whole instruction block and the whole DUE NOW
 /// block must end inside the first 2,000 UTF-16 units, before lane 3's lines and after them. Both
 /// readings are printed whatever the outcome: the numbers are the deliverable.
+///
+/// RED, THEN FIXED IN THE OUTPUT, NEVER IN THE BAR. At 566c753 the with-deferred case measured
+/// 2011 units (fs1-before 1861) - 21 past this bar and 11 past the screen itself - and this test
+/// sat under `#[ignore]` so the suite would run to completion. An ignore is not a pass, and
+/// Chris's ruling on it was that it should never have been one. The fix (flint, 2026-09-21) shed
+/// prose from `instruction_block` in src/hook/session_start.rs, where the phrases and the
+/// before/after numbers are recorded at the text. The fixture, both assertions and the 1,990 bar
+/// are exactly what they were: the ten slugs are still 50 characters, DUE NOW still carries the
+/// day-8 line, and line 6 still prints.
 #[test]
-#[ignore = "KNOWN DEFECT, NOT A FLAKE: the first screen measures 2011 UTF-16 units against a \
-            1990-unit bar - and past the real 2,000-unit limit too, by 11. Ignored ONLY so the \
-            suite runs to completion: it halted here, leaving ~69 of ~99 targets UNMEASURED, and \
-            an unknown is worse than a known red. AN IGNORE IS NOT A PASS AND MUST NEVER BE READ \
-            AS ONE. The measurement is real and reproduced on every lane that carries this file \
-            (grebe, auk, finch), at a61117b with none of today's work in the tree, and again on \
-            the 4-lane merge. The assertion is CORRECT - auk ruled 1990 the readability bar and \
-            the only thing this test was ever entitled to assert - so the OUTPUT is what is \
-            wrong, not the bar. Raising the bar to make this pass is moving the goalposts. OWNER: \
-            the emit/session-start surface, to shed the overflow in the with-deferred case. \
-            Remove this attribute the moment it does. finch, 2026-09-21."]
 fn first_screen_holds_with_real_length_slugs_and_lane_3_lines() {
     fn units_to_end_of_line(s: &str, needle: &str) -> usize {
         let at = s.find(needle).unwrap_or_else(|| panic!("{needle:?} is not in the output:\n{s}"));
