@@ -758,9 +758,112 @@ pub(crate) fn scrub_shell_env() {
     });
 }
 
+/// The prefix a ping carries when its sender holds no relay title.
+///
+/// A literal, because the CLI matches on it to decide whether to warn, and a
+/// typo in either copy would silence the warning without failing anything.
+pub const UNREGISTERED: &str = "unregistered";
+
+/// The sender title a ping is recorded under. **NEVER EMPTY, and that is the
+/// whole point of this function existing.**
+///
+/// It used to be empty in three separate cases: `--from ""`, a session holding
+/// no title, and a session whose id resolved to no title. The hub files a ping
+/// under a thread named after its sender, so an empty sender produced a thread
+/// file called `.jsonl` — a **dotfile**. Both `ls` and a `*.jsonl` glob skip
+/// leading-dot names, so every routine listing of that directory read clean
+/// while **492 nameless pings to `chris` accumulated in it between 2026-08-20
+/// and 2026-09-18** (62 on the win side, 430 on the wsl side, measured
+/// 2026-09-21). They stayed readable only because every session writes its own
+/// codename into the message text by convention. The field meant to carry it
+/// was empty every time.
+///
+/// **Delivery is preserved deliberately.** Refusing the send would break a child
+/// that pings before it registers, which is a real boot sequence. The ping goes
+/// through; it just carries something that identifies the sender instead of
+/// nothing. An unattributable ping that arrives is worse than a named one that
+/// arrives, and better than a refused one that does not.
+///
+/// An explicit `--from` that is empty or whitespace falls through rather than
+/// short-circuiting, because `--from ""` was one of the three ways in.
+pub fn resolve_origin(
+    explicit: Option<&str>,
+    titles: &[String],
+    session_id: Option<&str>,
+) -> String {
+    if let Some(f) = explicit.map(str::trim).filter(|f| !f.is_empty()) {
+        return f.to_string();
+    }
+    if let Some(t) = titles.iter().map(|t| t.trim()).find(|t| !t.is_empty()) {
+        return t.to_string();
+    }
+    match session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        // Eight characters is what the registry prints and what a reader
+        // recognises; `chars()` rather than a byte slice so a non-ASCII id
+        // cannot panic on a split boundary.
+        Some(sid) => format!("{UNREGISTERED}-{}", sid.chars().take(8).collect::<String>()),
+        None => UNREGISTERED.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── resolve_origin: one named leg per way an empty sender used to get in ──
+
+    #[test]
+    fn an_explicit_sender_wins_when_it_is_a_real_name() {
+        let t = vec!["registered".to_string()];
+        assert_eq!(resolve_origin(Some("typed"), &t, Some("sess-1")), "typed");
+    }
+
+    #[test]
+    fn an_empty_explicit_sender_falls_through_to_the_registered_title() {
+        // `--from ""` was one of the three ways in: it used to short-circuit as
+        // vec![""] and be taken as the sender verbatim.
+        let t = vec!["registered".to_string()];
+        assert_eq!(resolve_origin(Some(""), &t, Some("sess-1")), "registered");
+        assert_eq!(resolve_origin(Some("   "), &t, Some("sess-1")), "registered");
+    }
+
+    #[test]
+    fn a_blank_title_in_the_registry_is_skipped_not_used() {
+        let t = vec![String::new(), "real".to_string()];
+        assert_eq!(resolve_origin(None, &t, Some("sess-1")), "real");
+    }
+
+    #[test]
+    fn no_title_at_all_is_attributed_to_the_session_not_to_nothing() {
+        assert_eq!(
+            resolve_origin(None, &[], Some("44f77c06-799f-43c2")),
+            "unregistered-44f77c06"
+        );
+    }
+
+    #[test]
+    fn no_title_and_no_session_id_still_names_itself() {
+        assert_eq!(resolve_origin(None, &[], None), "unregistered");
+        assert_eq!(resolve_origin(None, &[], Some("  ")), "unregistered");
+    }
+
+    #[test]
+    fn the_property_that_matters_is_that_it_is_never_empty() {
+        // The 492 records came from an empty string reaching the hub. No input
+        // combination may produce one.
+        let blank = [String::new(), "  ".to_string()];
+        for explicit in [None, Some(""), Some("  ")] {
+            for titles in [&[][..], &blank[..]] {
+                for sid in [None, Some(""), Some("sess")] {
+                    let got = resolve_origin(explicit, titles, sid);
+                    assert!(
+                        !got.trim().is_empty(),
+                        "empty sender from explicit={explicit:?} titles={titles:?} sid={sid:?}"
+                    );
+                }
+            }
+        }
+    }
 
     fn store(dir: &Path) -> RelayStore {
         let s = RelayStore {

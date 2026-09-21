@@ -3021,11 +3021,16 @@ pub fn run() {
                             .map(|sid| relay::session_registry::titles_for(&sid))
                             .unwrap_or_default(),
                     };
-                    let origin = my_titles.first().cloned().unwrap_or_default();
-                    if origin.is_empty() {
+                    let origin = relay::resolve_origin(
+                        from.as_deref(),
+                        &my_titles,
+                        relay::env_session_id().as_deref(),
+                    );
+                    if origin.starts_with(relay::UNREGISTERED) {
                         eprintln!(
-                            "Warning: this session has no relay title — the receiver cannot ping back. \
-                             Register one: base relay register --as <title>"
+                            "Warning: this session has no relay title, so the ping is attributed to \
+                             {origin} and the receiver cannot ping back. Register one: \
+                             base relay register --as <title>"
                         );
                     }
                     // Chris's output-style contract applies to his pipe
