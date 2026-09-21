@@ -77,27 +77,94 @@ fn human(secs: u64) -> String {
 
 /// The canonical watch loop for a title — the single source of truth every
 /// session arms verbatim (bash: Git Bash on Windows, bash in WSL). Touching
-/// the sentinel each poll IS the compliance proof. Dotfiles stay invisible
-/// to both the loop's `ls -1` and base's *.json inbox scan.
+/// the sentinel each poll IS the compliance proof.
 fn watch_script(title: &str) -> Option<String> {
-    let inbox = title_dir(title)?.to_string_lossy().replace('\\', "/");
+    watch_script_for(&title_dir(title)?)
+}
+
+/// `watch_script` for an explicit inbox, so the loop can be executed in a test
+/// rather than only eyeballed.
+///
+/// WHAT THE PREVIOUS VERSION GOT WRONG, recorded here because the fix looks
+/// like a tidy-up and is not. It announced `ls -1t | head -5` and then ran
+/// `seen=$cur`, where `cur` was the FULL listing. With six or more waiting
+/// pings it printed five and marked every one of them consumed; `cur` then
+/// stopped changing, so the remainder were never printed and never would be.
+/// Measured 2026-09-20: 6 of 8 lost. Silent message loss, inside the
+/// message-delivery system, in the script every session is told to arm
+/// verbatim.
+///
+/// `seen` is now marked ONLY after a ping has actually been echoed.
+///
+/// AND IT DELIBERATELY DOES NOT PRIME `seen` FROM THE INBOX AT START-UP. Doing
+/// so would stop a re-arm re-announcing pings already read, which is tempting,
+/// but it would also silence pings that arrived while no monitor was running —
+/// trading a visible duplicate for an invisible drop. A duplicate is noise the
+/// reader can see. A drop is not. Replies delete their ping file, so the inbox
+/// is normally near-empty and the duplicate is bounded.
+///
+/// Truncation is now marked and names the file, so a clipped ping cannot be
+/// mistaken for a short one. The scan is narrowed to `ping-*.json`, and
+/// dotfiles (`.watching`, `.status`) stay invisible to it.
+///
+/// TWO CORRECTIONS FROM auk's GRADING OF THE FIRST VERSION OF THIS FIX, both
+/// of them the round's own defects committed inside the commit that fixes one.
+///
+/// UNITS. It cut with `cut -c` (characters) and reported with `wc -c` (bytes),
+/// labelled "bytes". On multibyte content the cut passed up to 2,100 bytes
+/// while the label claimed 700. `cut -c` is kept because it cannot split a
+/// character mid-sequence; BOTH units are now named, each as what it is.
+///
+/// DELIMITER. `seen` matched `*"$b|"*`, a trailing pipe only, so a filename
+/// ending with another entry's name would false-match and that ping would be
+/// SILENTLY SKIPPED — the exact failure this function exists to remove.
+/// `seen` now opens with `|` and the match is anchored on both sides.
+///
+/// RANK E — ONE READ, AND NEVER CONSUME ON AN EMPTY ONE. Found by auk
+/// EXPERIENCING it: its waker printed `RELAY PING from grebe:` with no body.
+///
+/// The loop took ONE `ls` snapshot and then read each file THREE times — once
+/// for `from`, once for the summary, once for the raw fallback. **A reply
+/// clears inbound pings**, so a file later in the snapshot can be deleted
+/// before it is read. All three reads then return empty, the header prints
+/// with nothing after it, and the next line marks the file consumed. Silent
+/// loss again, by a different mechanism than `head -5`, in the same script.
+///
+/// The body is now read ONCE into `raw`, and an empty read is `continue`
+/// WITHOUT marking `seen`. If a reply really did clear the file, the next `ls`
+/// simply does not list it and nothing was lost; if the read failed
+/// transiently, the next poll retries it.
+///
+/// There is deliberately NO separate existence test. auk proposed read-once
+/// plus a guard; the guard only ever existed to bridge the gap between listing
+/// and reading, and reading once removes the gap rather than narrowing it. A
+/// test between `ls` and `cat` can always be overtaken by the delete it is
+/// checking for.
+pub fn watch_script_for(inbox: &std::path::Path) -> Option<String> {
+    let inbox = inbox.to_string_lossy().replace('\\', "/");
     Some(format!(
         r#"INBOX="{inbox}"
 mkdir -p "$INBOX"
-seen=""
+seen="|"
 while true; do
   touch "$INBOX/.watching" 2>/dev/null
-  cur=$(ls -1 "$INBOX" 2>/dev/null | sort | tr '\n' '|')
-  if [ "$cur" != "$seen" ]; then
-    for f in $(ls -1t "$INBOX" 2>/dev/null | head -5); do
-      case "$seen" in *"$f|"*) continue;; esac
-      from=$(grep -o '"from": *"[^"]*"' "$INBOX/$f" 2>/dev/null | head -1 | cut -d'"' -f4)
-      msg=$(tr -d '\n' < "$INBOX/$f" 2>/dev/null | sed -n 's/.*"summary": *"\(.*\)", *"doc".*/\1/p' | cut -c1-700)
-      [ -z "$msg" ] && msg=$(tr -d '\n' < "$INBOX/$f" 2>/dev/null | cut -c1-400)
-      echo "RELAY PING from ${{from:-unknown}}: $msg"
-    done
-    seen=$cur
-  fi
+  for f in $(ls -1t "$INBOX"/ping-*.json 2>/dev/null); do
+    b=$(basename "$f")
+    case "$seen" in *"|$b|"*) continue;; esac
+    raw=$(cat "$f" 2>/dev/null | tr -d '\n')
+    [ -z "$raw" ] && continue
+    from=$(printf '%s' "$raw" | grep -o '"from": *"[^"]*"' | head -1 | cut -d'"' -f4)
+    msg=$(printf '%s' "$raw" | sed -n 's/.*"summary": *"\(.*\)", *"doc".*/\1/p')
+    [ -z "$msg" ] && msg="$raw"
+    chars=$(printf '%s' "$msg" | wc -m)
+    bytes=$(printf '%s' "$msg" | wc -c)
+    out=$(printf '%s' "$msg" | cut -c1-700)
+    if [ "$chars" -gt 700 ]; then
+      out="$out  [TRUNCATED at 700 of $chars chars ($bytes bytes) - full file: $f]"
+    fi
+    echo "RELAY PING from ${{from:-unknown}}: $out"
+    seen="$seen$b|"
+  done
   sleep 5
 done"#
     ))
@@ -143,9 +210,12 @@ fn arm_block_for(title: &str, operator: &str) -> Option<String> {
          {inbox_disp}/.status (e.g. `echo \"building X\" > .../.status`). It is a local file \
          the operator's ping hub shows on this session's card, so {operator} sees live work \
          state at a glance.\n\
-         PROJECT TAG: the moment you know which project this session serves (and again whenever \
-         it changes), run `base relay register --as {title} --project <project-name>` — every \
-         project ever named stays on the session's hub card as a filter keyword; nothing is removed.\n"
+         PROJECT TAG: register with NO --project first — `base relay register --as {title}` — \
+         which joins this workspace's relay store and puts you on `base relay board`, the \
+         operator's hub view. Then read your own row back before anything else; a registration \
+         you did not read back did not happen. Passing --project names a DIFFERENT store, and if \
+         no store by that name exists you are registered globally only and never appear on the \
+         board. Add the project keyword afterwards, once you are on it.\n"
     ))
 }
 

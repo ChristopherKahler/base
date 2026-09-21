@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::{age_str, claim_expired, list_projects, parse_ts, relay_root, RelayStore, DEAD_AFTER_SECS};
+use super::{age_str, claim_expired, list_projects, relay_root, RelayStore};
 
 // ─── Operator board ──────────────────────────────────────────
 //
@@ -49,14 +49,15 @@ fn print_store_board(store: &RelayStore) {
         println!("\n| Session | Phase | Worktree | Bound | Last seen | Watching | Pending |");
         println!("|---------|-------|----------|-------|-----------|----------|---------|");
         for entry in reg.sessions.values() {
-            let alive = parse_ts(&entry.last_heartbeat)
-                .map(|t| (chrono::Local::now() - t).num_seconds() < DEAD_AFTER_SECS)
-                .unwrap_or(false);
-            let liveness = if alive {
-                age_str(&entry.last_heartbeat)
-            } else {
-                format!("DEAD ({})", age_str(&entry.last_heartbeat))
-            };
+            // Which session holds this title RIGHT NOW. A store row is keyed
+            // on the title, so a retired seat leaves its row behind and the next
+            // heartbeat on that title refreshes it.
+            let live = super::session_registry::resolve(&entry.title).map(|e| e.session_id);
+            let liveness = super::row_liveness(
+                entry.session_id.as_deref(),
+                live.as_deref(),
+                &entry.last_heartbeat,
+            );
             println!(
                 "| {} | {} | {} | {} | {} | {} | {} |",
                 entry.title,

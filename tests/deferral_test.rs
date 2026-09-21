@@ -1348,6 +1348,36 @@ fn first_screen_holds_with_real_length_slugs_and_lane_3_lines() {
         const BAR: usize = 1990;
         assert!(letters <= BAR, "{tag}: the letters line ends at unit {letters}, past the {BAR}-unit bar");
         assert!(due_last <= BAR, "{tag}: DUE NOW's last item ends at unit {due_last}, past the {BAR}-unit bar");
+
+        // THE BYTE ARM IS RETIRED. THE READING THAT DID IT IS src/emit/mod.rs:496-500 - NOT a
+        // preview measurement. The note that stood here asked for exactly that: "retire one arm
+        // when the preview is measured, and say which reading did it." This is the other way it
+        // could land. (NOT :495 - that line is budget_bytes, the HOST field, which is the exact
+        //  opposite of what this argument rests on. The citation was wrong here once already.)
+        //
+        // THE ARM WAS NOT THE WRONG UNIT. IT WAS AIMED AT THE WRONG TARGET. It borrowed the host's
+        // byte limit and applied it to base's own first screen - and the first screen is declared,
+        // at src/emit/mod.rs:496-500, to be "deliberately a different unit from budget_bytes, and
+        // that is not an oversight: this one is about readability, not delivery, so it is not
+        // measured against the host's limit." src/config.rs:869 says the same of the key that sets
+        // it: first_screen_chars and memory_chars "ARE GENUINELY UTF-16 AND KEEP THEIR NAMES ...
+        // the host's unit does not apply to them."
+        //
+        // So no preview measurement could ever have governed this bar, in either unit. The ratchet
+        // held a line nothing needed held, and waiting on the preview probe to retire it was
+        // waiting on evidence that could not bear on the question.
+        //
+        // DELIVERY IS STILL GUARDED, BY A DIFFERENT MECHANISM, AND THAT IS WHY REMOVING THIS IS
+        // SAFE: base trims to budget_bytes BEFORE printing, so the host's byte limit is enforced
+        // there and never reaches this screen. Removing the arm leaves nothing unguarded.
+        //
+        // The UTF-16 assertions above keep BAR at its original 1,990 - the readability bar, and
+        // the only thing this test was ever entitled to assert.
+        //
+        // The helper bytes_to_end_of_line went with it: this arm was its only caller.
+        // (auk, 2026-09-20. The byte arm's own measurement - unit 1984, BYTE 2006 on fs1-after -
+        //  is preserved in ~/.base-gbl/forks/2026-09-20-auk-ruling-preview-unit-before-shedding.md,
+        //  so retiring the assertion does not erase the number it found.)
     }
 }
 

@@ -37,10 +37,21 @@ fn real(budget: usize) -> &'static (seed::Seed, i32, String, String) {
     })
 }
 
-/// The first `n` UTF-16 units of `s`, the preview Claude Code hands over when it cuts an output.
+/// The first `n` UTF-16 units of `s`.
+///
+/// THE PREVIEW'S UNIT IS UNKNOWN AND THIS DOC USED TO ASSERT IT. It read "the preview Claude Code
+/// hands over when it cuts an output", which claims the host measures that preview in UTF-16. The
+/// host's LIMIT was measured as bytes on 2026-09-20. THE PREVIEW LENGTH HAS NEVER BEEN MEASURED,
+/// in either unit - it is a separate quantity and that round did not touch it.
 fn first_units(s: &str, n: usize) -> String {
     let units: Vec<u16> = s.encode_utf16().take(n).collect();
     String::from_utf16_lossy(&units)
+}
+
+/// The BYTE offset just past the end of the line holding `needle`, or `None` when it is absent.
+fn end_of_line_bytes(s: &str, needle: &str) -> Option<usize> {
+    let at = s.find(needle)?;
+    Some(s[at..].find('\n').map_or(s.len(), |i| at + i + 1))
 }
 
 /// The UTF-16 offset just past the end of the line holding `needle`, or `None` when it is absent.
@@ -116,9 +127,31 @@ fn the_header_instructions_and_due_now_fit_the_first_screen() {
     ] {
         let end = end_of_line_with(stdout, needle)
             .unwrap_or_else(|| panic!("{what} is not in the output:\n{stdout}"));
+        let end_bytes = end_of_line_bytes(stdout, needle)
+            .unwrap_or_else(|| panic!("{what} is not in the output:\n{stdout}"));
+
+        // BOTH UNITS, AND THIS IS A HEDGE AGAINST AN OPEN QUESTION RATHER THAN BELT AND BRACES.
+        // DO NOT SIMPLIFY IT AWAY AS REDUNDANT.
+        //
+        // The host's LIMIT was measured as bytes on 2026-09-20. THE PREVIEW'S LENGTH WAS NEVER
+        // MEASURED, in either unit. This assertion used to check UTF-16 alone, which is too weak in
+        // exactly the direction that hides a real cut: 2,000 UTF-16 units of the box-drawing text
+        // session start actually emits is up to 6,000 BYTES, so a byte-counted preview would cut
+        // the map and the commands while this test stayed green.
+        //
+        // Asserting bytes INSTEAD would repeat the original error with the sign flipped. The defect
+        // was never that anyone picked UTF-16 - it was that nobody measured and the code asserted
+        // anyway. Both units is the only form that is true under either answer, and it needs no
+        // measurement to justify. When the preview is finally measured, drop the other arm and say
+        // which reading retired it.
         assert!(
             end <= 2000,
             "{what} ends at UTF-16 unit {end}, past the 2,000-unit preview. The preview:\n{screen}"
+        );
+        assert!(
+            end_bytes <= 2000,
+            "{what} ends at BYTE {end_bytes}, past a 2,000-BYTE preview. The preview unit is \
+             unmeasured, so this arm holds if the host counts bytes. The preview:\n{screen}"
         );
     }
 }

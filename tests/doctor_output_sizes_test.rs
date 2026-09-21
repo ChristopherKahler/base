@@ -278,7 +278,12 @@ fn doctor_names_the_legacy_max_chars_with_its_replacement() {
         .lines()
         .find(|l| l.contains(&head))
         .unwrap_or_else(|| panic!("no legacy line naming {head}:\n{report}"));
-    for key in ["[budget] session_start_chars", "[budget] memory_chars"] {
+    // THE EXPECTED KEY CHANGED BECAUSE THE REPLACEMENT DID, NOT TO MAKE THIS PASS. The advisory
+    // used to send an operator off the dead `[signal] max_chars` onto `[budget] session_start_chars`
+    // - which had itself been renamed, so base pointed at one deprecated key from another. The
+    // assertion keeps its teeth: it still fails if the line names no replacement, or names the
+    // wrong one. What changed is which key is correct, not whether the line has to name one.
+    for key in ["[budget] session_start_bytes", "[budget] memory_chars"] {
         assert!(
             line.contains(key),
             "the legacy line does not name its replacement {key}: {line}"

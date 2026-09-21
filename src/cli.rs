@@ -11,7 +11,7 @@ use base::scope;
 #[derive(Parser)]
 #[command(
     name = "base",
-    version,
+    version = base::BUILD_VERSION,
     about = "BASE — Proactive context-injection engine for Claude Code",
     after_help = "Drop-in plugin commands (from extensions): run `base ext list`\n\n\
                   Docs: https://docs.basemode.ai\n\
@@ -2759,6 +2759,31 @@ pub fn run() {
                                 Err(e) => die("Register failed", e),
                             }
                         }
+                        // `resolve_store` already fails LOUD on a missing store,
+                        // naming it and listing the ones that exist. A catch-all
+                        // arm used to eat that error and print the cheerful line
+                        // below, so three seats registered against a store that
+                        // did not exist and were told only that they had
+                        // succeeded at something else. Surface it, and name the
+                        // consequence the error itself cannot know.
+                        //
+                        // THE MESSAGE DESCRIBES WHAT THIS COMMAND DID, NOT WHAT
+                        // THE BOARD CONTAINS. An earlier version asserted the
+                        // caller "is NOT on `base relay board`" — which is FALSE
+                        // for anyone already in the store from an earlier bare
+                        // register, exactly the operator who is already fine
+                        // (grebe hit this on 2026-09-20). The command knows what
+                        // it did; it has not read the board and must not claim
+                        // to have.
+                        Err(e) if project.is_some() => {
+                            eprintln!("{e:#}");
+                            eprintln!(
+                                "This command did NOT join '{title}' to this workspace's relay store, so \
+                                 it added nothing to `base relay board`, the operator's hub view. It \
+                                 registered globally only. To join the store, run it with no --project: \
+                                 base relay register --as {title}"
+                            );
+                        }
                         _ => println!(
                             "Registered '{title}' globally{}. Other sessions can now relay to you: *task {title} …",
                             sid.as_deref()
@@ -3106,7 +3131,7 @@ pub fn run() {
                     } else {
                         println!("Titled sessions ({}):", sessions.len());
                         for e in &sessions {
-                            let live = if e.alive() { "live" } else { "DEAD" };
+                            let live = relay::liveness_word(&e.last_heartbeat);
                             let ws = if e.workspace.is_empty() { "-" } else { e.workspace.as_str() };
                             println!(
                                 "  {title}  [{live} · {age}]  ws:{ws}  session:{sid}",

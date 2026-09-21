@@ -41,8 +41,12 @@ pub const MESSAGE_TYPES: &[&str] = &[
     "answer",
 ];
 
-/// Heartbeats older than this render as DEAD on the board.
-pub const DEAD_AFTER_SECS: i64 = 15 * 60;
+/// A seat that has made no tool call for longer than this renders as idle.
+///
+/// MUST stay above the wake-monitor re-arm cycle (30 min). At 15 min a
+/// correctly parked seat sat past the threshold for most of every cycle, so
+/// the label fired during normal operation rather than on a fault.
+pub const IDLE_AFTER_SECS: i64 = 45 * 60;
 /// Default advisory-claim TTL.
 pub const DEFAULT_CLAIM_TTL_SECS: i64 = 60 * 60;
 
@@ -657,6 +661,60 @@ pub fn age_str(ts: &str) -> String {
     }
 }
 
+/// The one word the operator's surfaces use for a session row's liveness, and
+/// the single place the threshold is applied. Extracted verbatim from
+/// `board.rs`'s inline derivation so both surfaces stop deriving it separately
+/// and a row cannot contradict itself between two columns.
+pub fn liveness_word(last_heartbeat: &str) -> &'static str {
+    match parse_ts(last_heartbeat) {
+        Some(t) if (chrono::Local::now() - t).num_seconds() < IDLE_AFTER_SECS => "live",
+        // A stale heartbeat means the seat has not acted recently. It never
+        // means the seat is gone: nothing in this module removes a session row.
+        Some(_) => "idle",
+        // A heartbeat we cannot read is not evidence of anything.
+        None => "unknown",
+    }
+}
+
+/// The "Last seen" cell. A live seat shows the bare age, as it always has.
+pub fn liveness_label(last_heartbeat: &str) -> String {
+    match liveness_word(last_heartbeat) {
+        "live" => age_str(last_heartbeat),
+        w => format!("{w} ({})", age_str(last_heartbeat)),
+    }
+}
+
+/// The "Last seen" cell for a BOARD row, which needs one fact `liveness_label`
+/// does not have: which session actually holds this title right now.
+///
+/// A store row is keyed on the TITLE, not the session. When a seat retires its
+/// row stays behind, and the next seat to take that title refreshes the
+/// heartbeat without rewriting the binding. The row then reads fresh while
+/// pointing at a session that ended weeks ago.
+pub fn row_liveness(
+    row_session: Option<&str>,
+    live_session: Option<&str>,
+    last_heartbeat: &str,
+) -> String {
+    match (row_session, live_session) {
+        // The row was written by a session that no longer holds this title.
+        // Its age is true about THAT session, and a reader will take it for
+        // this one, so the age is not reported at all. Report the observable,
+        // refuse the inference.
+        (Some(row), Some(live)) if row != live => {
+            format!("row from another session ({})", short_id(row))
+        }
+        _ => liveness_label(last_heartbeat),
+    }
+}
+
+/// First segment of a session uuid — enough to recognise, short enough for a
+/// table cell.
+fn short_id(session: &str) -> &str {
+    session.split('-').next().unwrap_or(session)
+}
+
+
 fn escape_nq(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
@@ -909,5 +967,136 @@ mod tests {
 
         let root = relay_root(&wt).expect("worktree should resolve main relay root");
         assert_eq!(root, main.join(".base").join("relay"));
+    }
+
+    /// Chris, 2026-09-20, verbatim: "I dont care about retired sessions, I dont
+    /// want idles being labeled dead. period."
+    ///
+    /// A stale heartbeat means the seat has not made a tool call recently. It
+    /// does NOT mean the session is gone: there is no code path in `src/relay`
+    /// that removes a session row (the only `.remove(` is `claims.remove`), so
+    /// a row that exists was never dead. Measured 2026-09-20: the board printed
+    /// `DEAD (16h)` for `auk` beside `Watching OK` while its wake sentinel was
+    /// 0s old, and a ping sent to it landed seconds later.
+    #[test]
+    fn an_idle_seat_is_never_labelled_dead() {
+        let fresh = now_iso();
+        let stale = (chrono::Local::now() - chrono::Duration::hours(16))
+            .format("%Y-%m-%dT%H:%M:%S%z")
+            .to_string();
+
+        assert_eq!(liveness_word(&fresh), "live", "a fresh heartbeat is live");
+        assert_eq!(
+            liveness_word(&stale), "idle",
+            "a stale heartbeat is IDLE, never dead"
+        );
+
+        let label = liveness_label(&stale);
+        assert!(
+            !label.to_uppercase().contains("DEAD"),
+            "an idle seat was labelled dead: {label}"
+        );
+        assert!(
+            label.starts_with("idle ("),
+            "expected `idle (<age>)`, got `{label}`"
+        );
+
+        // A live seat keeps the bare age it has always shown.
+        assert_eq!(liveness_label(&fresh), age_str(&fresh));
+
+        // An unreadable heartbeat is UNKNOWN. A reader that cannot see must say
+        // so, never report a death it did not measure.
+        assert_eq!(liveness_word("not-a-timestamp"), "unknown");
+        assert!(!liveness_label("not-a-timestamp").to_uppercase().contains("DEAD"));
+    }
+
+    /// The threshold must sit ABOVE the wake-monitor re-arm cycle, or a
+    /// correctly parked seat reads idle for most of every cycle and the label
+    /// fires during normal operation rather than on a fault. Measured
+    /// 2026-09-20: the threshold was 15 min against a 30 min cycle.
+    #[test]
+    fn the_idle_threshold_clears_the_wake_rearm_cycle() {
+        const WAKE_REARM_SECS: i64 = 30 * 60;
+
+        // A const block, not a plain assert!: both sides are constants, so a
+        // runtime assertion here is folded away and clippy is right to call it
+        // out (assertions_on_constants). In a const block the same invariant
+        // fails the BUILD rather than a test run, which is strictly stronger —
+        // the threshold cannot be lowered under the re-arm cycle at all.
+        const _: () = assert!(
+            IDLE_AFTER_SECS > WAKE_REARM_SECS,
+            "IDLE_AFTER_SECS must exceed the 30-minute wake re-arm cycle, or a \
+             correctly parked seat reads idle for most of every cycle"
+        );
+
+        // A seat that acted one full re-arm cycle ago is still live.
+        let one_cycle_ago = (chrono::Local::now()
+            - chrono::Duration::seconds(WAKE_REARM_SECS + 60))
+            .format("%Y-%m-%dT%H:%M:%S%z")
+            .to_string();
+        assert_eq!(liveness_word(&one_cycle_ago), "live");
+    }
+
+    /// RANK B. A board row is keyed on the TITLE. When a seat retires its row
+    /// stays behind, and the next seat to claim that title refreshes the
+    /// heartbeat without rewriting the session binding.
+    ///
+    /// Measured 2026-09-20: the `auk` row in
+    /// `.base/relay/skyrim-companion/registry.json` carried session
+    /// `8ae4d5d3-6838-47e1-a519-350605f76907` and rendered "last seen 7s,
+    /// Watching yes", while the live `auk` was `ffe5735e-...`. Chris reads a
+    /// healthy row and learns nothing is wrong. ABSENT IS VISIBLE;
+    /// PRESENT-AND-WRONG IS NOT.
+    ///
+    /// Inherits the ruled principle rather than inventing one: report the
+    /// observable, refuse the inference. The age is true about a DIFFERENT
+    /// session, so it is not reported as this one's.
+    #[test]
+    fn a_row_bound_to_a_dead_session_does_not_report_that_sessions_age() {
+        let fresh = now_iso();
+
+        let stale = row_liveness(Some("8ae4d5d3"), Some("ffe5735e"), &fresh);
+        assert!(
+            !stale.contains("live"),
+            "a row from another session must not read as live: {stale}"
+        );
+        assert!(
+            stale.contains("8ae4d5d3") || stale.to_lowercase().contains("other session"),
+            "the mismatch must be stated, not papered over: {stale}"
+        );
+        assert_ne!(
+            stale,
+            liveness_label(&fresh),
+            "a mismatched row must not render the same cell as a matching one"
+        );
+
+        // A row that DOES hold the title renders exactly as before. The fix
+        // must not disturb the ordinary case.
+        assert_eq!(
+            row_liveness(Some("ffe5735e"), Some("ffe5735e"), &fresh),
+            liveness_label(&fresh)
+        );
+    }
+
+    /// Negative control for RANK B: with nothing to compare against there is no
+    /// mismatch to report, so the ordinary cell stands. A reader that flagged
+    /// every row would be as useless as one that flagged none.
+    #[test]
+    fn a_row_with_nothing_to_compare_against_is_not_flagged() {
+        let fresh = now_iso();
+
+        // No live binding for the title: nothing to disagree with.
+        assert_eq!(row_liveness(Some("abc"), None, &fresh), liveness_label(&fresh));
+
+        // Neither side is bound: nothing to disagree with.
+        assert_eq!(row_liveness(None, None, &fresh), liveness_label(&fresh));
+
+        // DIFFERENT CASE FROM THE OTHER TWO, and deliberately so (auk, 2026-09-20).
+        // A live session DOES hold this title; only the row cannot be tied to
+        // it. The age is reported because it is true about the TITLE being
+        // active, which is what the column claims. It is not a statement about
+        // which session wrote the row, and no mismatch has been observed —
+        // an unbound row is not evidence of a stale one.
+        assert_eq!(row_liveness(None, Some("abc"), &fresh), liveness_label(&fresh));
     }
 }
