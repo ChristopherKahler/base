@@ -771,9 +771,12 @@ fn several_matches_or_none_revive_nothing() {
 /// `open` or `deferred`), merged to `main` in PR #165 and absent from this branch's base `65718ae`,
 /// whose `create` archives `open` only. Lane 3 owes the test, never the behaviour.
 ///
-/// Parked: RED on this branch, predicted GREEN at the integration base. It runs there, first.
+/// Was parked RED on the lane branch with GREEN predicted at the integration base. **That
+/// prediction was correct and the park is now spent:** run at merged `main`
+/// `2d3803babcc5db38e5517d205a03c62ecf31e835` it passes, so the `#[ignore]` came off here rather
+/// than being carried as a permanent exclusion. A park that outlives its own condition is an
+/// exclusion nobody re-examines (finch, 2026-09-21).
 #[test]
-#[ignore = "needs lane 2 rank 08 create (main f433a9a): runs at the integration base only"]
 fn a_new_handoff_archives_the_older_deferred_one() {
     let seed = workspace("d7", "");
     let old = "2026-08-30-1000-auk-base-0160";
