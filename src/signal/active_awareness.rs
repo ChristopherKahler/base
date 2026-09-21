@@ -74,7 +74,10 @@ pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<Vec<Section>> {
          ORDER BY DESC(?lastActive)"
     );
 
-    let results = crud::load_and_query(cwd, ns, &sparql)?;
+    // BOTH tiers. A task or milestone recorded globally lives in a file the
+    // workspace-only read never opens, so it rendered as though it did not exist --
+    // a shorter list, with nothing saying a tier went unread.
+    let results = crud::load_merged_and_query(cwd, ns, &sparql)?;
     let QueryResults::Solutions(solutions) = results else {
         return Ok(Vec::new());
     };
