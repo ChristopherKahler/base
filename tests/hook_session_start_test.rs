@@ -193,3 +193,48 @@ SELECT ?name WHERE {
         "session-start with custom namespace should succeed: {result:?}"
     );
 }
+
+
+/// QTF-1, option 2. An operator's `queries.toml` must render even when signals speak.
+///
+/// Before this, the ad-hoc query step sat below `if any_signal { ... return Ok(()); }`,
+/// so it ran only when EVERY signal was silent. On a workspace with real data a signal
+/// always speaks, so the block never rendered: the file parsed, the config loaded it,
+/// `LAYOUT` reserved it a place, and the operator got nothing and was told nothing.
+///
+/// The workspace below holds a project, so active-awareness WILL speak. That is the
+/// whole point of the arm -- a fixture with no signals would pass before the fix and
+/// prove nothing.
+#[test]
+fn an_operator_queries_toml_renders_beside_the_signals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base_dir = tmp.path().join(".base");
+    std::fs::create_dir_all(&base_dir).unwrap();
+
+    let ns = base::config::NamespaceConfig::default();
+    base::crud::project::add(tmp.path(), &ns, "Qtf Project", "active", None).unwrap();
+
+    std::fs::write(
+        base_dir.join("queries.toml"),
+        "[[query]]\nname = \"qtf_probe\"\ndescription = \"QTF PROBE BLOCK\"\nformat = \"list\"\nsparql = \"\"\"\nSELECT ?name WHERE { GRAPH ?g { ?e {{prefix}}:name ?name } } LIMIT 5\n\"\"\"\n",
+    )
+    .unwrap();
+
+    let config = BaseConfig::default();
+    let mut out = session_start::SessionOutput::new();
+    let result = session_start::handle(&config, tmp.path(), None, &mut out);
+    assert!(result.is_ok(), "session start must not fail: {result:?}");
+
+    let rendered = out.finish(&config, tmp.path()).text;
+
+    // The signal speaks -- if it did not, this arm would pass before the fix too.
+    assert!(
+        rendered.contains("Qtf Project"),
+        "the fixture must produce a signal, or this arm proves nothing; got:\n{rendered}"
+    );
+    // ...and the operator's own query renders BESIDE it.
+    assert!(
+        rendered.contains("QTF PROBE BLOCK"),
+        "a queries.toml must render even when signals speak (QTF-1); got:\n{rendered}"
+    );
+}
