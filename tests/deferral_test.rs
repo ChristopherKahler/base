@@ -1286,12 +1286,6 @@ fn first_screen_holds_with_real_length_slugs_and_lane_3_lines() {
         let end = s[at..].find('\n').map_or(s.len(), |i| at + i + 1);
         s[..end].encode_utf16().count()
     }
-    /// The same offset in BYTES. See the both-units note at the assertions below: the preview's
-    /// unit has never been measured, so the screen must fit under either reading.
-    fn bytes_to_end_of_line(s: &str, needle: &str) -> usize {
-        let at = s.find(needle).unwrap_or_else(|| panic!("{needle:?} is not in the output:\n{s}"));
-        s[at..].find('\n').map_or(s.len(), |i| at + i + 1)
-    }
     for (tag, with_deferred) in [("fs1-before", false), ("fs1-after", true)] {
         let seed = workspace(tag, "");
         for i in 0..10 {
@@ -1355,45 +1349,35 @@ fn first_screen_holds_with_real_length_slugs_and_lane_3_lines() {
         assert!(letters <= BAR, "{tag}: the letters line ends at unit {letters}, past the {BAR}-unit bar");
         assert!(due_last <= BAR, "{tag}: DUE NOW's last item ends at unit {due_last}, past the {BAR}-unit bar");
 
-        // AND THE SAME BAR IN BYTES. NOT REDUNDANT - do not remove it as duplication.
+        // THE BYTE ARM IS RETIRED. THE READING THAT DID IT IS src/emit/mod.rs:496-500 - NOT a
+        // preview measurement. The note that stood here asked for exactly that: "retire one arm
+        // when the preview is measured, and say which reading did it." This is the other way it
+        // could land. (NOT :495 - that line is budget_bytes, the HOST field, which is the exact
+        //  opposite of what this argument rests on. The citation was wrong here once already.)
         //
-        // The host's LIMIT is bytes, measured 2026-09-20. THE PREVIEW'S LENGTH IS UNMEASURED in
-        // either unit. A UTF-16-only bar is too weak in the direction that hides a real cut, since
-        // 1,990 UTF-16 units of this output is up to three times that many bytes. Asserting bytes
-        // instead would repeat the original error with the sign flipped: the defect was never the
-        // unit chosen, it was asserting without measuring. Retire one arm when the preview is
-        // measured, and say which reading did it.
-        let letters_b = bytes_to_end_of_line(&out, "Letters: A=");
-        let due_last_b = bytes_to_end_of_line(&out, "Renew the wildcard certificate");
-        assert!(letters_b <= BAR, "{tag}: the letters line ends at BYTE {letters_b}, past the {BAR}-byte bar");
-
-        // THE BYTE ARM IS OVER THE BAR TODAY AND THAT IS A REAL FINDING, NOT A TEST PROBLEM.
+        // THE ARM WAS NOT THE WRONG UNIT. IT WAS AIMED AT THE WRONG TARGET. It borrowed the host's
+        // byte limit and applied it to base's own first screen - and the first screen is declared,
+        // at src/emit/mod.rs:496-500, to be "deliberately a different unit from budget_bytes, and
+        // that is not an oversight: this one is about readability, not delivery, so it is not
+        // measured against the host's limit." src/config.rs:869 says the same of the key that sets
+        // it: first_screen_chars and memory_chars "ARE GENUINELY UTF-16 AND KEEP THEIR NAMES ...
+        // the host's unit does not apply to them."
         //
-        // Measured 2026-09-20, on the first run this arm ever had: fs1-after ends at UTF-16 unit
-        // 1984 and at BYTE 2006. So on the worst-case fixture the last DUE NOW item is INSIDE the
-        // screen counted in UTF-16 and OUTSIDE it counted in bytes - past the 1990 bar and past the
-        // real 2,000 preview. The UTF-16-only assertion that stood here passed the entire time.
+        // So no preview measurement could ever have governed this bar, in either unit. The ratchet
+        // held a line nothing needed held, and waiting on the preview probe to retire it was
+        // waiting on evidence that could not bear on the question.
         //
-        // The excess is the multi-byte characters session start actually emits: box drawing, middle
-        // dots, arrows. About 1% on this fixture, and 1% is enough when the margin is 16 units.
+        // DELIVERY IS STILL GUARDED, BY A DIFFERENT MECHANISM, AND THAT IS WHY REMOVING THIS IS
+        // SAFE: base trims to budget_bytes BEFORE printing, so the host's byte limit is enforced
+        // there and never reaches this screen. Removing the arm leaves nothing unguarded.
         //
-        // PARKED AS A RATCHET, NOT WAIVED, AND THE DISTINCTION IS THE WHOLE POINT. Lowering the bar
-        // so today passes is moving the goalposts. Deleting the arm erases the measurement. So the
-        // ceiling sits at the value MEASURED the day it was found: nothing may make it worse, and
-        // both numbers print on every run.
+        // The UTF-16 assertions above keep BAR at its original 1,990 - the readability bar, and
+        // the only thing this test was ever entitled to assert.
         //
-        // OWNER: auk, to rule whether the first screen sheds the bytes or the preview unit gets
-        // measured first. Retire this and restore BAR the moment either lands.
-        const BYTE_CEILING: usize = 2006;
-        assert!(
-            due_last_b <= BYTE_CEILING,
-            "{tag}: DUE NOW last item ends at BYTE {due_last_b}, WORSE than the {BYTE_CEILING} \
-             measured on 2026-09-20 - the first screen is growing in bytes. This is a ratchet on a \
-             known overflow, not a passing bar. See the note above."
-        );
-        println!(
-            "FS1 {tag}: BYTES - letters {letters_b}, DUE NOW last {due_last_b} (bar {BAR}, parked ceiling {BYTE_CEILING})"
-        );
+        // The helper bytes_to_end_of_line went with it: this arm was its only caller.
+        // (auk, 2026-09-20. The byte arm's own measurement - unit 1984, BYTE 2006 on fs1-after -
+        //  is preserved in ~/.base-gbl/forks/2026-09-20-auk-ruling-preview-unit-before-shedding.md,
+        //  so retiring the assertion does not erase the number it found.)
     }
 }
 
