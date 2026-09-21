@@ -187,9 +187,15 @@ fn a_file_that_reads_empty_is_not_consumed() {
     );
 }
 
-/// Negative control for RANK E: an empty file announces NOTHING while it is
-/// empty. Skipping without consuming must not become announcing a blank line —
-/// the defect it replaces was a header with no body.
+/// Negative control for RANK E: an empty file never announces a PING. Skipping
+/// without consuming must not become announcing a blank line — the defect it
+/// replaces was a header with no body.
+///
+/// NARROWED 2026-09-20, because the old wording would now be false. It read
+/// "announces NOTHING while it is empty", true when an empty read was silent. The
+/// empty branch now prints one `RELAY EMPTY READ:` line. This test guards what it
+/// always actually guarded — that no `RELAY PING from` header is emitted with no
+/// body — and the assertion is unchanged because it was already keyed on that string.
 #[test]
 fn an_empty_file_announces_nothing_while_it_is_empty() {
     let Some(sh) = bash() else {
@@ -212,4 +218,115 @@ fn an_empty_file_announces_nothing_while_it_is_empty() {
         0,
         "an empty file must announce nothing, not an empty header:\n{stdout}"
     );
+}
+
+/// The honest half of RANK E (2026-09-20, raised by `plover`). An empty read used to
+/// print nothing at all, so a ping that vanished under the read and an inbox that was
+/// simply quiet reached the reader identically.
+///
+/// TWO ASSERTIONS, AND THE SECOND HAS THE TEETH. That the line appears is the easy
+/// half. That it appears EXACTLY ONCE over a run spanning several polls is what proves
+/// `reported` works — without it the line repeats every five seconds for as long as the
+/// file sits there, which is its own kind of unreadable.
+#[test]
+fn an_empty_file_says_it_could_not_be_read_exactly_once() {
+    let Some(sh) = bash() else {
+        eprintln!("SKIPPED: bash not on PATH — this test cannot run here, and is not passing.");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::File::create(inbox.join("ping-empty.json")).unwrap();
+
+    let script = base::relay::wake::watch_script_for(&inbox).unwrap();
+    // 13s spans at least two 5s polls, so a line repeating per poll would show up twice.
+    let wrapped =
+        format!("( {script} ) & pid=$!; sleep 13; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0");
+    let out = Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert_eq!(
+        stdout.matches("RELAY EMPTY READ:").count(),
+        1,
+        "an unreadable ping must say so exactly once over several polls:
+{stdout}"
+    );
+    assert!(
+        stdout.contains("cannot tell which"),
+        "the line must name both states it cannot separate:
+{stdout}"
+    );
+    assert!(
+        stdout.contains("ping-empty.json"),
+        "the line must name the file, or nobody can go and look:
+{stdout}"
+    );
+}
+
+// ─── The sentinel fingerprint: does a wake fix REACH a running session? ──────
+//
+// The defect (grebe, verified by auk): the arming block is re-emitted only when the
+// sentinel goes STALE, and a live monitor touches it every 5s. So a session already
+// running the OLD script never went stale and was never shown the NEW one. Every wake
+// fix was undeliverable to exactly the sessions that needed it.
+//
+// Legs 1-5 test the GATE. Leg 6 tests the SCRIPT, and it is the one with teeth: a gate
+// that reads a field nothing writes is green forever.
+
+/// LEG 6 FIRST, because the others are worthless without it. Run the emitted script
+/// under real bash and read the sentinel file back off disk. This is the only leg that
+/// proves the script holds up its half of the contract.
+#[test]
+fn the_emitted_script_writes_the_fingerprint_and_title_into_the_sentinel() {
+    let Some(sh) = bash() else {
+        eprintln!("SKIPPED: bash not on PATH — this test cannot run here, and is not passing.");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("kestrel");
+    std::fs::create_dir_all(&inbox).unwrap();
+
+    let script = base::relay::wake::watch_script_for(&inbox).unwrap();
+    let wrapped =
+        format!("( {script} ) & pid=$!; sleep 3; kill $pid 2>/dev/null; wait $pid 2>/dev/null; exit 0");
+    Command::new(sh).arg("-c").arg(&wrapped).output().unwrap();
+
+    let body = std::fs::read_to_string(inbox.join(".watching"))
+        .expect("the loop must create the sentinel");
+    assert_eq!(
+        body.trim(),
+        base::relay::wake::template_fingerprint(),
+        "the sentinel must hold the template fingerprint and nothing else, got: {body:?}"
+    );
+}
+
+/// The fingerprint is a property of the TEMPLATE, not of the rendered text. Two
+/// different inboxes must stamp the SAME fingerprint — if it moved with the path, the
+/// check would depend on path spelling and could go permanently red.
+#[test]
+fn the_fingerprint_does_not_move_with_the_inbox_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("aaa");
+    let b = tmp.path().join("bbb");
+    let sa = base::relay::wake::watch_script_for(&a).unwrap();
+    let sb = base::relay::wake::watch_script_for(&b).unwrap();
+    let fp = base::relay::wake::template_fingerprint();
+
+    assert!(sa.contains(&fp) && sb.contains(&fp), "both scripts carry the same fingerprint");
+    assert_ne!(sa, sb, "but the scripts differ, so this is not comparing a constant to itself");
+    assert!(sa.contains("aaa") && sb.contains("bbb"), "each carries its own title");
+}
+
+/// The fingerprint must be 16 hex characters and stable across calls. Without the
+/// stability half, a function returning a fresh value each call would make every
+/// sentinel read as Outdated forever — permanently red, which is the failure auk ruled
+/// against.
+#[test]
+fn the_fingerprint_is_stable_across_calls() {
+    let a = base::relay::wake::template_fingerprint();
+    let b = base::relay::wake::template_fingerprint();
+    assert_eq!(a, b, "the same template must hash the same way twice");
+    assert_eq!(a.len(), 16, "expected 16 hex characters, got {a:?}");
+    assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "not hex: {a:?}");
 }

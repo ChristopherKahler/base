@@ -656,7 +656,26 @@ pub fn reconcile_records(gbl_root: Option<&Path>, cwd: &Path, config: &BaseConfi
 
 /// The record half of `base reconcile --dry-run`: every WOULD DEFER and WOULD REVIVE line, by tier and
 /// type, and a count of everything else.
+///
+/// **A ZERO-VISITED RUN MUST NOT RENDER AS A COMPLETED PLAN.** With no tier file to read, this used to
+/// print the same header, the same `(nothing would change)` and the same `Summary: 0 defer · 0 revive ·
+/// 0 stay` that a real pass over a real graph prints. Run from outside a workspace the caller correctly
+/// warns `no workspace graph found` and then **the very next line states a finished plan over nothing**
+/// — and the confident zero is the sentence a reader takes away, not the warning above it.
+///
+/// Found by `plover` as scope row W4, 2026-09-21, and reproduced here on `finch/measured-on-drift`, so
+/// it is not confined to one branch. **The warning is correct and stays; only the summary was the
+/// defect.** Silencing the warning to make the total honest would fix the wrong half.
+///
+/// The summary also names **how many tiers it actually read**, because a count that hides its
+/// denominator is the same defect one level down.
 pub fn format_records_report(config: &BaseConfig, plans: &[(&'static str, Vec<RecordDecision>)]) -> String {
+    if plans.is_empty() {
+        return "\nDeferral dry-run — NO TIER FILE WAS READ, so nothing was planned. This is not a \
+                result: it is the absence of one. Run from inside a base workspace, or check that the \
+                home tier exists.\n"
+            .to_string();
+    }
     let mut s = format!(
         "\nDeferral dry-run — handoffs, forks, tasks, milestones ([defer] enabled = {}; a dry run plans either way)\n",
         config.defer.enabled
@@ -689,7 +708,8 @@ pub fn format_records_report(config: &BaseConfig, plans: &[(&'static str, Vec<Re
         s.push_str("  (nothing would change)\n");
     }
     s.push_str(&format!(
-        "Summary: {defer} defer · {revive} revive · {other} stay (no graph writes)\n"
+        "Summary: {defer} defer · {revive} revive · {other} stay, across {} tier(s) read (no graph writes)\n",
+        plans.len()
     ));
     s
 }
@@ -805,6 +825,44 @@ fn collect_rows(store: &Store, sparql: &str) -> Result<Vec<Row>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── W4: a run that read nothing must not render as a completed plan ──
+    //
+    // The pair is the point. Leg one is the defect; leg two is the case it must
+    // stay distinguishable from. One without the other proves nothing: suppress
+    // the summary unconditionally and leg one passes while base goes silent on a
+    // real empty graph, which is the same defect wearing the other sign.
+
+    #[test]
+    fn a_dry_run_that_read_no_tier_says_so_instead_of_counting_to_zero() {
+        let out = format_records_report(&BaseConfig::default(), &[]);
+        assert!(
+            out.contains("NO TIER FILE WAS READ"),
+            "a zero-visited run must name itself. Got:\n{out}"
+        );
+        assert!(
+            !out.contains("Summary:"),
+            "a run that read nothing must not print a summary at all. Got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_that_read_a_tier_and_found_nothing_still_summarises() {
+        let plans = vec![("home", Vec::new())];
+        let out = format_records_report(&BaseConfig::default(), &plans);
+        assert!(
+            out.contains("Summary:"),
+            "a real pass over a real tier still reports, even at zero. Got:\n{out}"
+        );
+        assert!(
+            out.contains("1 tier(s) read"),
+            "the summary names the size of the set it visited. Got:\n{out}"
+        );
+        assert!(
+            !out.contains("NO TIER FILE WAS READ"),
+            "a tier that was read is not an absent one. Got:\n{out}"
+        );
+    }
 
     #[test]
     fn project_root_strips_paul_state_path() {

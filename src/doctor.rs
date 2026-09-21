@@ -121,6 +121,9 @@ pub struct DoctorReport {
     /// Counts against `healthy`: an inert trigger is a domain that silently stopped
     /// loading, and the fix is one line in domains.toml.
     pub trigger_faults: Vec<String>,
+    /// Which Claude Code version `[budget]` was measured on, against the host running now.
+    /// ADVISORY: read by the hook output section only, and it is not one of the five conjuncts.
+    pub measured_on: MeasuredOn,
     /// What each hook emitted, per tier doctor can read (spec A7): the last run and the largest of the last
     /// [`crate::emit::record::WINDOW`] on record, against the budget each ran under, with what each trimmed.
     /// **Advisory, never counted against `healthy`:** a first screen DUE NOW overflows is a reported state by ruling,
@@ -475,6 +478,8 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         warnings,
         config_errors,
         trigger_faults,
+        // One subprocess per `diagnose`, not one per render: both call sites below read this.
+        measured_on: check_measured_on(&crate::config::BaseConfig::load(cwd).budget.measured_on),
         hook_output,
         seam: store::LOCK_SEAM_MARKER,
     }
@@ -548,7 +553,7 @@ pub fn format_human(report: &DoctorReport) -> String {
         for w in &report.warnings {
             out.push_str(&format!("   ⚠ {w}\n"));
         }
-        push_hook_output(&mut out, &report.hook_output);
+        push_hook_output(&mut out, &report.hook_output, &report.measured_on);
         return out;
     }
 
@@ -720,7 +725,7 @@ pub fn format_human(report: &DoctorReport) -> String {
         }
     }
 
-    push_hook_output(&mut out, &report.hook_output);
+    push_hook_output(&mut out, &report.hook_output, &report.measured_on);
 
     if !report.config_errors.is_empty() {
         out.push_str("\n─── config faults ────────────────────\n");
@@ -752,10 +757,143 @@ pub fn format_human(report: &DoctorReport) -> String {
     out
 }
 
+/// Which Claude Code version the `[budget]` defaults were measured on, against the host running now.
+///
+/// WHY THIS EXISTS. `budget.measured_on` had FOUR references in the tree and every one was its own
+/// definition or default — `config.rs:911`, `:912`, `:924`, `:936`. Nothing compared it to anything.
+/// It was hand-corrected to `claude-code 2.1.278` on 2026-09-20 and would have drifted again in
+/// silence. A field that records a measurement nothing ever checks is a claim with no reader, and
+/// the fix is to make the drift VISIBLE rather than to assert it away.
+///
+/// ADVISORY, AND DELIBERATELY NOT A SIXTH CONJUNCT. `healthy` is five conjuncts (see `diagnose`,
+/// and the comment there demanding the doc comment stay in step). A host that has moved past the
+/// measurement is a REPORT, not a defect — the same ruling that keeps over budget advisory. An
+/// operator who upgraded Claude Code this morning does not have a broken machine; they have budget
+/// numbers worth re-measuring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MeasuredOn {
+    /// The host runs the version the defaults were measured on.
+    Matches { version: String },
+    /// The host has moved. BOTH versions are named and neither is called the right one: base cannot
+    /// know whether the numbers were re-measured and the field forgotten, or the reverse.
+    Differs { measured: String, host: String },
+    /// The check could not run. THIS IS NOT "THEY AGREE" and it never prints as reassurance.
+    Unknown { configured: String, why: String },
+}
+
+/// The first `N.N.N` in a string, so each side may carry whatever label it likes: `claude --version`
+/// prints `2.1.278 (Claude Code)` while `measured_on` holds `claude-code 2.1.278`. Comparing the raw
+/// strings would report a difference on every machine forever — a check that cannot pass is not a
+/// check, and it would have been indistinguishable from real drift.
+fn version_in(s: &str) -> Option<String> {
+    let c: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < c.len() {
+        if !c[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut dots = 0;
+        let mut j = i;
+        while j < c.len()
+            && (c[j].is_ascii_digit()
+                || (c[j] == '.' && dots < 2 && j + 1 < c.len() && c[j + 1].is_ascii_digit()))
+        {
+            if c[j] == '.' {
+                dots += 1;
+            }
+            j += 1;
+        }
+        if dots == 2 {
+            return Some(c[start..j].iter().collect());
+        }
+        i = (start + 1).max(j);
+    }
+    None
+}
+
+/// The comparison, kept pure so all three states are reachable in a test without a subprocess.
+/// `host` is `None` when `claude --version` could not be run or said nothing.
+fn compare_measured_on(configured: &str, host: Option<&str>) -> MeasuredOn {
+    let Some(host_raw) = host else {
+        return MeasuredOn::Unknown {
+            configured: configured.to_string(),
+            why: "`claude --version` did not run — is claude on PATH?".to_string(),
+        };
+    };
+    let Some(host_v) = version_in(host_raw) else {
+        return MeasuredOn::Unknown {
+            configured: configured.to_string(),
+            why: format!("no version in `claude --version` output: {}", host_raw.trim()),
+        };
+    };
+    let Some(measured_v) = version_in(configured) else {
+        return MeasuredOn::Unknown {
+            configured: configured.to_string(),
+            why: "no version in [budget] measured_on".to_string(),
+        };
+    };
+    if host_v == measured_v {
+        MeasuredOn::Matches { version: host_v }
+    } else {
+        MeasuredOn::Differs {
+            measured: measured_v,
+            host: host_v,
+        }
+    }
+}
+
+/// Asks the host what version it is. Every failure returns `None`, which becomes `Unknown` — a
+/// check that could not run must never reach the reader as a check that passed.
+fn host_version() -> Option<String> {
+    let out = std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Read `[budget] measured_on` against the live host. Runs a subprocess, so `diagnose` calls it once.
+pub fn check_measured_on(configured: &str) -> MeasuredOn {
+    compare_measured_on(configured, host_version().as_deref())
+}
+
+/// The one line that frames every budget number under it.
+fn push_measured_on(out: &mut String, m: &MeasuredOn) {
+    match m {
+        MeasuredOn::Matches { version } => out.push_str(&format!(
+            "   budget defaults were measured on claude-code {version}, which is what this host runs.\n"
+        )),
+        MeasuredOn::Differs { measured, host } => out.push_str(&format!(
+            "   ⚠ budget defaults were measured on claude-code {measured}; this host runs {host}. \
+             The numbers below were measured against a host that has since moved — re-measure them, \
+             then set [budget] measured_on to what you measured on.\n"
+        )),
+        MeasuredOn::Unknown { configured, why } => out.push_str(&format!(
+            "   budget defaults say \"{configured}\" — NOT CHECKED against this host: {why}\n"
+        )),
+    }
+}
+
 /// The hook output section (spec A7): per tier, each hook's last run and the largest of the last runs on record,
 /// against the budget each ran under, with what each trimmed and the two rank 00 flags. A tier where session start
 /// never ran says so in words, never as a run of zero (C25). Advisory: nothing here touches `healthy`.
-fn push_hook_output(out: &mut String, tiers: &[crate::emit::record::TierSizes]) {
+///
+/// The `measured_on` line rides here because this is the section the budget numbers live in and it is
+/// what those numbers were calibrated against. KNOWN BOUNDARY: when no tier holds a hook record this
+/// section returns before printing anything, so the line is not shown — there are no budget numbers
+/// on that screen for it to frame.
+fn push_hook_output(
+    out: &mut String,
+    tiers: &[crate::emit::record::TierSizes],
+    measured_on: &MeasuredOn,
+) {
     use crate::emit::record::{FILE, FileState};
     if tiers.is_empty() {
         return;
@@ -771,6 +909,7 @@ fn push_hook_output(out: &mut String, tiers: &[crate::emit::record::TierSizes]) 
     // read through a false frame. A correct measurement under a wrong heading is not a correct
     // report. `Unit::label` is the only thing that names a unit in this section.
     out.push_str("\n─── hook output, measured before printing ───\n");
+    push_measured_on(out, measured_on);
     for t in tiers {
         if let FileState::Present {
             unreadable_lines,
@@ -1642,6 +1781,7 @@ mod tests {
         let r = diagnose_tier("workspace", &p);
         assert_eq!(r.foreign_graphs, vec![(old, 3)]);
         let report = DoctorReport {
+            measured_on: MeasuredOn::Matches { version: "2.1.278".to_string() },
             tiers: vec![r],
             healthy: false,
             warnings: Vec::new(),
@@ -1660,6 +1800,7 @@ mod tests {
         let body2 = quad_in("a", &ws_graph(&own2)) + &quad_in("b", &ws_graph("theirs"));
         write_file(p2.parent().unwrap(), "graph.nq", &body2);
         let report2 = DoctorReport {
+            measured_on: MeasuredOn::Matches { version: "2.1.278".to_string() },
             tiers: vec![diagnose_tier("workspace", &p2)],
             healthy: false,
             warnings: Vec::new(),
@@ -1863,6 +2004,7 @@ mod coach_drift_tests {
     #[test]
     fn coach_drift_never_counts_against_health() {
         let report = DoctorReport {
+            measured_on: MeasuredOn::Matches { version: "2.1.278".to_string() },
             tiers: vec![],
             healthy: true,
             warnings: vec![skill_drift_warning(Some("0.12.3"), "0.13.2", true).unwrap()],
@@ -1882,6 +2024,91 @@ mod coach_drift_tests {
 /// coach; a test's registered path is read as a statement of what the test covers, and this one
 /// covers neither drift nor health (`auk`, 2026-09-15 16:18, after the matrix registered this test
 /// under a module it does not belong to).
+#[cfg(test)]
+mod measured_on_tests {
+    use super::*;
+
+    /// Each side labels its version differently and both labels are real: `claude --version` prints
+    /// `2.1.278 (Claude Code)`, `measured_on` holds `claude-code 2.1.278`. A raw string compare
+    /// would report drift on every machine forever.
+    #[test]
+    fn a_version_is_found_whatever_label_surrounds_it() {
+        assert_eq!(version_in("2.1.278 (Claude Code)").as_deref(), Some("2.1.278"));
+        assert_eq!(version_in("claude-code 2.1.278").as_deref(), Some("2.1.278"));
+        assert_eq!(version_in("0.15.2").as_deref(), Some("0.15.2"));
+        assert_eq!(version_in("base 0.15.2 (build a61117b)").as_deref(), Some("0.15.2"));
+    }
+
+    /// The negative half. Without it, a `version_in` that returned `Some("")` for everything would
+    /// pass the test above and make every comparison agree.
+    #[test]
+    fn a_string_with_no_version_yields_none() {
+        assert_eq!(version_in(""), None);
+        assert_eq!(version_in("claude-code"), None);
+        assert_eq!(version_in("2.1"), None);
+        assert_eq!(version_in("v2"), None);
+    }
+
+    #[test]
+    fn the_same_version_either_side_matches() {
+        assert_eq!(
+            compare_measured_on("claude-code 2.1.278", Some("2.1.278 (Claude Code)")),
+            MeasuredOn::Matches { version: "2.1.278".to_string() }
+        );
+    }
+
+    /// The drift this whole change exists to surface.
+    #[test]
+    fn a_moved_host_differs_and_names_both_versions() {
+        let m = compare_measured_on("claude-code 2.1.269", Some("2.1.278 (Claude Code)"));
+        assert_eq!(
+            m,
+            MeasuredOn::Differs {
+                measured: "2.1.269".to_string(),
+                host: "2.1.278".to_string()
+            }
+        );
+        let mut out = String::new();
+        push_measured_on(&mut out, &m);
+        assert!(out.contains("2.1.269"), "the measured version is not in the line: {out}");
+        assert!(out.contains("2.1.278"), "the host version is not in the line: {out}");
+        assert!(out.contains('⚠'), "drift is not flagged: {out}");
+    }
+
+    /// A CHECK THAT COULD NOT RUN IS NOT A CHECK THAT PASSED. Three ways the check fails to run,
+    /// none of which may reach the reader as agreement.
+    #[test]
+    fn a_check_that_could_not_run_says_so_and_never_reads_as_agreement() {
+        let cases = [
+            compare_measured_on("claude-code 2.1.278", None),
+            compare_measured_on("claude-code 2.1.278", Some("command not found")),
+            compare_measured_on("whenever", Some("2.1.278 (Claude Code)")),
+        ];
+        for m in cases {
+            assert!(
+                matches!(m, MeasuredOn::Unknown { .. }),
+                "expected Unknown, got {m:?}"
+            );
+            let mut out = String::new();
+            push_measured_on(&mut out, &m);
+            assert!(out.contains("NOT CHECKED"), "does not say it was not checked: {out}");
+            assert!(
+                !out.contains("which is what this host runs"),
+                "an unrunnable check printed the agreement line: {out}"
+            );
+        }
+    }
+
+    /// The match line is quiet: no warning mark, so a reader skimming for problems does not find one.
+    #[test]
+    fn the_match_line_carries_no_warning() {
+        let mut out = String::new();
+        push_measured_on(&mut out, &MeasuredOn::Matches { version: "2.1.278".to_string() });
+        assert!(out.contains("2.1.278"), "{out}");
+        assert!(!out.contains('⚠'), "a match should not warn: {out}");
+    }
+}
+
 #[cfg(test)]
 mod hook_output_tests {
     use super::*;
@@ -1935,6 +2162,7 @@ mod hook_output_tests {
         };
         let global_dir = "/home/.base-gbl/.base";
         let report = DoctorReport {
+            measured_on: MeasuredOn::Matches { version: "2.1.278".to_string() },
             tiers: vec![],
             healthy: true,
             warnings: vec![],
