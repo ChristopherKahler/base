@@ -86,6 +86,12 @@ pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<Vec<Section>> {
             text: ABSENT_LINE.to_string(),
             shown: 0,
             total: 0,
+            // ZERO BECAUSE THERE IS NOTHING TO COUNT, not because the count was
+            // skipped. `deferred` counts records of a listing block's own kind;
+            // this section lists nothing, it states the scope of what was read.
+            // On this arm no graph was read at all, so any other value would be
+            // a claim about records that were never seen.
+            deferred: 0,
         }]);
     };
     let QueryResults::Solutions(solutions) = results else {
@@ -149,6 +155,10 @@ pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<Vec<Section>> {
         text: scope_line(current.as_deref(), &tiers),
         shown: 0,
         total: 0,
+        // Zero for the same reason as the ABSENT arm above: this section states
+        // what was read, it does not list records, so it has no deferred ones of
+        // its own. The listing sections each carry their own count.
+        deferred: 0,
     });
     Ok(sections)
 }
