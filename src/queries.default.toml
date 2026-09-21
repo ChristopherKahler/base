@@ -30,6 +30,8 @@ SELECT ?name ?blocker WHERE {
   GRAPH ?g {
     ?entity {{prefix}}:name ?name ;
             {{prefix}}:blockedBy ?blocker .
+    FILTER NOT EXISTS { ?entity {{prefix}}:status ?_hidden
+                        FILTER(?_hidden IN ("deferred", "archived")) }
   }
 }
 """
@@ -44,6 +46,8 @@ SELECT ?name ?lastActive WHERE {
   GRAPH ?g {
     ?entity {{prefix}}:name ?name ;
             {{prefix}}:lastActive ?lastActive .
+    FILTER NOT EXISTS { ?entity {{prefix}}:status ?_hidden
+                        FILTER(?_hidden IN ("deferred", "archived")) }
   }
 }
 ORDER BY DESC(?lastActive)
