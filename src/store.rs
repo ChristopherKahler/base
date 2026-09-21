@@ -531,10 +531,113 @@ pub fn load_graphs(paths: &[&Path]) -> Result<Store> {
     Ok(store)
 }
 
+/// One tier that did not read cleanly.
+#[derive(Debug, Clone)]
+pub struct TierFault {
+    /// The graph file this fault is about.
+    pub path: std::path::PathBuf,
+    /// `Some(n)`: the tier loaded and `n` malformed lines were skipped.
+    /// `None`: the tier could not be opened at all and contributed NOTHING.
+    ///
+    /// The two are different states and keeping them apart is the point of this
+    /// type. The warning this replaced was gated on the line count, so a tier
+    /// that failed to OPEN contributed zero lines — and when every tier failed
+    /// that way the count was zero, the gate stayed shut, and a graph nothing
+    /// could read came back as an empty one in silence. Branch on the variant,
+    /// never on a summed count.
+    pub skipped_lines: Option<usize>,
+}
+
+/// What a merged read actually managed to read, handed back as a VALUE.
+///
+/// [`load_merged`] reports a damaged tier by printing to stderr and returns the
+/// same `Some(store)` either way, so a caller cannot tell a clean read from a
+/// degraded one and cannot say so in what it renders. **Evidence that leaves as
+/// a side effect is invisible to the code that has to decide what to tell the
+/// operator.** This type is that evidence, returned.
+///
+/// Modelled on `crud::handoff::searched_tiers`, which hands back the list of
+/// what it looked at so the caller can name it in a not-found sentence — and
+/// carrying the correction that pattern needs. This names TIERS. It says nothing
+/// about OTHER WORKSPACES, which were never opened at all. A caller may conclude
+/// "workspace X and the global tier". It may never conclude "everything on this
+/// machine".
+#[derive(Debug, Clone, Default)]
+pub struct TierRead {
+    /// Every tier file that was opened and contributed. A tier with skipped
+    /// lines still contributed, so it appears here AND in `degraded`.
+    pub read: Vec<std::path::PathBuf>,
+    /// Every tier that did not read cleanly.
+    pub degraded: Vec<TierFault>,
+}
+
+impl TierRead {
+    /// True when every tier in scope read cleanly.
+    ///
+    /// This is the health question. Ask it here, never by comparing a line count
+    /// against zero.
+    pub fn is_clean(&self) -> bool {
+        self.degraded.is_empty()
+    }
+
+    /// Malformed lines skipped across the tiers that still loaded.
+    ///
+    /// NOT a health check. This is 0 both when nothing was wrong and when a tier
+    /// could not be opened at all, which is exactly the confusion that made the
+    /// old warning miss its worst case. Use [`TierRead::is_clean`].
+    pub fn skipped_lines(&self) -> usize {
+        self.degraded.iter().filter_map(|f| f.skipped_lines).sum()
+    }
+
+    /// Tiers that contributed nothing because they could not be opened.
+    pub fn unreadable(&self) -> usize {
+        self.degraded.iter().filter(|f| f.skipped_lines.is_none()).count()
+    }
+
+    /// One operator-facing sentence naming what went wrong, or that nothing did.
+    pub fn summary(&self) -> String {
+        let lines = self.skipped_lines();
+        let unreadable = self.unreadable();
+        match (lines, unreadable) {
+            (0, 0) => "every tier read cleanly".to_string(),
+            (0, u) => format!("{u} tier(s) could not be read at all and contributed nothing"),
+            (l, 0) => format!("skipped {l} malformed line(s) across {} tier(s)", self.degraded.len()),
+            (l, u) => format!(
+                "skipped {l} malformed line(s), and {u} tier(s) could not be read at all and contributed nothing"
+            ),
+        }
+    }
+}
+
 /// Load a merged graph from global (~/.base-gbl/.base/graph.nq) and workspace tiers
 /// into one store so SPARQL queries span all tiers. Returns None only if neither
 /// graph exists (fail-open). Call ONCE per hook invocation and share the store.
+///
+/// Prints to stderr when a tier read badly, because its callers cannot see a
+/// value. A caller that must ACT on a damaged tier — render it, or decide
+/// differently because of it — wants [`load_merged_reporting`] instead.
 pub fn load_merged(cwd: &Path) -> Option<Store> {
+    let (store, report) = load_merged_reporting(cwd)?;
+    if !report.is_clean() {
+        // Gated on the FAULT, not on the line count. The gate this replaced was
+        // `if total_bad > 0`: a tier that could not be OPENED contributed no
+        // lines, so when every tier failed that way the count was zero and this
+        // printed nothing at all, while returning a store nothing had been read
+        // into. A graph the process could not read rendered as a graph with
+        // nothing in it.
+        eprintln!("graph: {} — run `base doctor --repair`", report.summary());
+    }
+    Some(store)
+}
+
+/// [`load_merged`], with what it managed to read handed back beside the store.
+///
+/// Same resolution, same fail-open rule, same lenient fallback. The only
+/// difference is that the degraded-read fact comes back as a [`TierRead`]
+/// instead of going to stderr, so a caller can put it in what it renders.
+/// This one prints nothing; reporting is the caller's to do, which is the
+/// whole point.
+pub fn load_merged_reporting(cwd: &Path) -> Option<(Store, TierRead)> {
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
 
     if let Some(home) = crate::home::home_root() {
@@ -557,9 +660,10 @@ pub fn load_merged(cwd: &Path) -> Option<Store> {
 
     let path_refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
 
-    // Fast path: strict multi-tier load.
+    // Fast path: strict multi-tier load. It is all-or-nothing, so its success is
+    // proof every tier read cleanly and the report is empty by construction.
     if let Ok(store) = load_graphs(&path_refs) {
-        return Some(store);
+        return Some((store, TierRead { read: paths, degraded: Vec::new() }));
     }
 
     // Strict parse failed in some tier. READS degrade rather than die: fall back to
@@ -570,25 +674,28 @@ pub fn load_merged(cwd: &Path) -> Option<Store> {
     // away. Counted, because it happened.
     GRAPH_LOADS.fetch_add(1, Ordering::Relaxed);
     let store = Store::new().ok()?;
-    let mut total_bad = 0usize;
-    let mut bad_tiers = 0usize;
+    let mut report = TierRead::default();
     for path in &paths {
         match load_lenient_into(&store, path) {
             Ok(bad) if !bad.is_empty() => {
-                total_bad += bad.len();
-                bad_tiers += 1;
+                report.read.push(path.clone());
+                report.degraded.push(TierFault {
+                    path: path.clone(),
+                    skipped_lines: Some(bad.len()),
+                });
             }
-            Ok(_) => {}
-            Err(_) => bad_tiers += 1,
+            Ok(_) => report.read.push(path.clone()),
+            // Unrecoverable IO: the file could not be opened, so this tier
+            // contributed NOTHING. Recorded as its own state rather than as
+            // zero bad lines, which is indistinguishable from a clean read.
+            Err(_) => report.degraded.push(TierFault {
+                path: path.clone(),
+                skipped_lines: None,
+            }),
         }
     }
-    if total_bad > 0 {
-        eprintln!(
-            "graph: skipped {total_bad} malformed line(s) across {bad_tiers} tier(s) — run `base doctor --repair`"
-        );
-    }
     strip_ledger(&store);
-    Some(store)
+    Some((store, report))
 }
 
 /// Load a Turtle file (e.g. ast.ttl) into an existing store's default graph.
@@ -1495,6 +1602,126 @@ pub fn load_or_empty(path: &Path) -> Result<Store> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----------------------------------------------------------------------
+    // The envelope's prerequisite: a merged read hands back what it read.
+    //
+    // Predictions registered before the run:
+    //   P1 RED before, GREEN after -- load_merged_reporting does not exist yet
+    //   P2 RED before, GREEN after -- same
+    //   P3 RED before, GREEN after -- same, and it is the gate defect's own test
+    //   P4 GREEN both sides -- control, load_merged's fail-open rule is untouched
+    // ----------------------------------------------------------------------
+
+    /// Build a workspace at `root/ws` and a global tier at `root/.base-gbl`,
+    /// each with the graph text given, and return the workspace path.
+    fn two_tiers(root: &std::path::Path, global: Option<&str>, workspace: Option<&str>) -> std::path::PathBuf {
+        if let Some(text) = global {
+            let d = root.join(".base-gbl").join(".base");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("graph.nq"), text).unwrap();
+        }
+        let ws = root.join("ws");
+        if let Some(text) = workspace {
+            let d = ws.join(".base");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("graph.nq"), text).unwrap();
+        }
+        ws
+    }
+
+    const GOOD: &str = "<http://t.local/s> <http://t.local/p> \"v\" <http://t.local/g> .\n";
+
+    /// P1. A clean read reports itself clean, and names the tiers it opened.
+    #[test]
+    fn a_clean_merged_read_reports_every_tier_and_no_fault() {
+        let root = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(root.path(), || {
+            let ws = two_tiers(root.path(), Some(GOOD), Some(GOOD));
+            let (_store, report) = load_merged_reporting(&ws).expect("both tiers exist");
+            assert!(report.is_clean(), "a clean read must report clean: {report:?}");
+            assert_eq!(report.read.len(), 2, "both tiers must be named as read: {report:?}");
+            assert_eq!(report.skipped_lines(), 0);
+            assert_eq!(report.unreadable(), 0);
+            assert_eq!(report.summary(), "every tier read cleanly");
+        });
+    }
+
+    /// P2. A malformed line comes back as a VALUE, not only on stderr.
+    /// This is the whole prerequisite: without it no caller can render the fact.
+    #[test]
+    fn a_malformed_line_comes_back_as_a_value() {
+        let root = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(root.path(), || {
+            let broken = format!("{GOOD}this line is not a quad\n");
+            let ws = two_tiers(root.path(), Some(GOOD), Some(&broken));
+            let (_store, report) = load_merged_reporting(&ws).expect("both tiers exist");
+            assert!(!report.is_clean(), "a skipped line must not read as clean: {report:?}");
+            assert_eq!(report.skipped_lines(), 1, "the count must reach the caller: {report:?}");
+            assert_eq!(report.unreadable(), 0, "the tier loaded, it was not unreadable: {report:?}");
+            assert!(
+                report.summary().contains("skipped 1 malformed line"),
+                "summary must name the count; got {:?}",
+                report.summary()
+            );
+        });
+    }
+
+    /// P3. A tier that cannot be OPENED is its own state, not zero bad lines.
+    ///
+    /// This is the defect's own test. The old warning was gated on the line
+    /// count, and an unopenable tier contributes no lines -- so a read that
+    /// recovered NOTHING reported exactly what a clean read reports.
+    #[cfg(unix)]
+    #[test]
+    fn a_tier_that_cannot_be_opened_is_a_fault_even_though_it_skipped_no_lines() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(root.path(), || {
+            // Workspace tier is malformed, so the strict load fails and the
+            // lenient fallback runs. Global tier is then made unreadable.
+            let ws = two_tiers(root.path(), Some(GOOD), Some("not a quad\n"));
+            let gbl = root.path().join(".base-gbl").join(".base").join("graph.nq");
+            std::fs::set_permissions(&gbl, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            let opened = std::fs::File::open(&gbl).is_err();
+            std::fs::set_permissions(&gbl, std::fs::Permissions::from_mode(0o644)).ok();
+            if !opened {
+                // Running as root, or a filesystem that ignores the mode. The
+                // arm cannot observe what it exists to observe, so it must not
+                // report a pass. VOID, stated, rather than a silent green.
+                eprintln!("VOID: this environment can open a 0o000 file; the arm proves nothing");
+                return;
+            }
+            std::fs::set_permissions(&gbl, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            let (_store, report) = load_merged_reporting(&ws).expect("both tiers exist");
+            std::fs::set_permissions(&gbl, std::fs::Permissions::from_mode(0o644)).ok();
+
+            assert_eq!(report.unreadable(), 1, "an unopenable tier must be its own state: {report:?}");
+            assert!(!report.is_clean(), "an unopenable tier must not read as clean: {report:?}");
+            assert!(
+                report.summary().contains("could not be read at all"),
+                "summary must say the tier contributed nothing; got {:?}",
+                report.summary()
+            );
+        });
+    }
+
+    /// P4. Control. `load_merged`'s fail-open rule is unchanged: None only when
+    /// neither tier has a graph, Some otherwise.
+    #[test]
+    fn load_merged_still_returns_none_only_when_neither_tier_exists() {
+        let root = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(root.path(), || {
+            let empty = two_tiers(root.path(), None, None);
+            std::fs::create_dir_all(empty.join(".base")).unwrap();
+            assert!(load_merged(&empty).is_none(), "no graph in either tier must be None");
+
+            let ws = two_tiers(root.path(), Some(GOOD), None);
+            assert!(load_merged(&ws).is_some(), "a global tier alone must still load");
+        });
+    }
 
     /// The claim `tests/write_back_test.rs` can no longer make: the two entry
     /// points into the seam produce identical bytes.
