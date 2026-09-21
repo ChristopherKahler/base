@@ -288,13 +288,18 @@ pub fn handle(
 /// pulse last, and the relay wake contract outlasts the operator profile and the notices. A kind
 /// missing from this table sorts after all of it, and `every_pushed_kind_has_a_place_in_the_layout`
 /// fails the build when one does.
-pub const LAYOUT: [(&str, Rank); 30] = [
+pub const LAYOUT: [(&str, Rank); 31] = [
     ("instructions", Rank::Pinned),
     ("graph-unhealthy", Rank::DueNow),
     ("reminders", Rank::DueNow),
     ("relay-inbox", Rank::DueNow),
     ("handoffs", Rank::Primary),
     ("forks", Rank::Secondary),
+    // BEFORE the working-set blocks it qualifies, deliberately. The trimmer takes the
+    // bottom of a rank first, so a scope clause placed after the rows would be trimmed
+    // while the rows survived -- and rows with no scope is the exact defect the clause
+    // exists to close. An honesty clause has to outlive the thing it qualifies.
+    ("working-set-scope", Rank::Secondary),
     ("projects", Rank::Secondary),
     ("tasks", Rank::Secondary),
     ("milestones", Rank::Secondary),

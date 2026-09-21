@@ -326,16 +326,21 @@ pub fn load_and_query(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<
 /// is unaffected by a union default graph — but it would tell every later reader that
 /// this query was written by a user, which is false. A correct result carrying a false
 /// signal is worth refusing.
-pub fn load_merged_and_query(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<QueryResults> {
-    let store = crate::store::load_merged(cwd).with_context(|| {
-        format!(
-            "no graph in either tier: neither the global tier's graph.nq nor a workspace \
-             .base/graph.nq at or above {} exists, so this query read nothing at all",
-            cwd.display()
-        )
-    })?;
+pub fn load_merged_and_query(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    sparql: &str,
+) -> Result<Option<(QueryResults, crate::store::TierRead)>> {
+    let Some((store, tiers)) = crate::store::load_merged_reporting(cwd) else {
+        // ABSENT is a state, not an error. The first version of this function
+        // returned Err here, which was the right placeholder while nothing could
+        // render the difference: an Err at least refused to answer, where zero
+        // rows would have answered wrongly. Now that a caller CAN render it,
+        // a state the caller can act on beats an error string it cannot.
+        return Ok(None);
+    };
     let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
-    crate::store::query(&store, &full_sparql)
+    Ok(Some((crate::store::query(&store, &full_sparql)?, tiers)))
 }
 
 

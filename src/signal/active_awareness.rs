@@ -75,7 +75,17 @@ pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<Vec<Section>> {
     // BOTH tiers. A task or milestone recorded globally lives in a file the
     // workspace-only read never opens, so it rendered as though it did not exist --
     // a shorter list, with nothing saying a tier went unread.
-    let results = crud::load_merged_and_query(cwd, ns, &sparql)?;
+    let Some((results, tiers)) = crud::load_merged_and_query(cwd, ns, &sparql)? else {
+        // ABSENT. No graph in either tier. This must NOT fall through to the
+        // ordinary empty rendering: "no graph was read" and "you have no work"
+        // are opposite claims, and before this they produced the same screen.
+        return Ok(vec![Section {
+            kind: "working-set-scope",
+            text: ABSENT_LINE.to_string(),
+            shown: 0,
+            total: 0,
+        }]);
+    };
     let QueryResults::Solutions(solutions) = results else {
         return Ok(Vec::new());
     };
@@ -125,7 +135,49 @@ pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<Vec<Section>> {
     let days = config.session_start.recent_project_days;
     let since = chrono::Utc::now() - chrono::Duration::days(days);
 
-    Ok(render_sections(&rows, current.as_deref(), &registry, days, since))
+    let mut sections = render_sections(&rows, current.as_deref(), &registry, days, since);
+    // The scope clause, on EVERY render and not only on not-found. Without it an
+    // empty working set says "nothing exists" when it can only honestly say
+    // "nothing in scope" -- and that is the sentence that makes EMPTY safe to
+    // show at all. It is a line of its own because session_start_layout_test
+    // matches the section headers with an exact `l == whole` comparison, so
+    // widening a header would break the layout contract to fix the honesty one.
+    sections.push(Section {
+        kind: "working-set-scope",
+        text: scope_line(current.as_deref(), &tiers),
+        shown: 0,
+        total: 0,
+    });
+    Ok(sections)
+}
+
+/// What the block says when NEITHER tier has a graph.
+///
+/// It does not recompute the paths `load_merged_reporting` looked for. Restating
+/// that resolution here would be a second copy of it, free to drift from the
+/// real one and to name a file the loader never opened.
+const ABSENT_LINE: &str = "WORKING SET: no graph was read \u{2014} no graph.nq in the global tier or in any workspace at or above this directory. This is NOT an empty working set.";
+
+/// One line naming what was in scope, and what was not.
+///
+/// The axes it covers AND the axes it does not, because naming only what it
+/// covers is what lets a half-blind envelope read as a handled case. It names
+/// the workspace and the tiers. It says other workspaces were not read. It
+/// claims the tier read was clean only when the loader said so.
+fn scope_line(current: Option<&str>, tiers: &crate::store::TierRead) -> String {
+    let where_ = match current {
+        Some(ws) => format!("workspace '{ws}' and the global tier"),
+        // No registered workspace under cwd, or `[signal] scope = "global"`.
+        None => "every tier that was readable, unscoped".to_string(),
+    };
+    if tiers.is_clean() {
+        format!("SCOPE: {where_}; other workspaces were not read")
+    } else {
+        format!(
+            "SCOPE: {where_}; other workspaces were not read \u{2014} AND THIS READ WAS INCOMPLETE: {}",
+            tiers.summary()
+        )
+    }
 }
 
 const PROJECT_TYPES: [&str; 4] = ["Project", "App", "Framework", "TrackingProject"];
