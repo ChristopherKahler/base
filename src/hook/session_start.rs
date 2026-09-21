@@ -178,6 +178,18 @@ pub fn handle(
     // Try signals first (Phase 5) — primary injection source
     let mut diagnostics: Vec<String> = Vec::new();
 
+    // QTF-1, option 2. The ad-hoc `queries.toml` block used to sit BELOW the
+    // `if any_signal { ... return Ok(()); }` further down, so it rendered only when
+    // EVERY signal was silent -- "fallback" in the strict sense of instead-of. On
+    // any workspace with real data a signal always speaks, so an operator who wrote
+    // a `queries.toml` got nothing and was told nothing: the file parsed, the config
+    // loaded it, `LAYOUT` reserved it a place, and the code never ran.
+    //
+    // It now runs ONCE, here, for both paths. Queries render BESIDE the signals,
+    // which is what `docs/settings-hook-config.md` has always promised. Where the
+    // block lands in the output is decided by `LAYOUT`, not by when it is pushed.
+    let queries_shown = render_adhoc_queries(cwd, config, out);
+
     if let Ok(signal_result) = crate::signal::run_signals(cwd, config, "session-start") {
         diagnostics.extend(signal_result.diagnostics.iter().cloned());
         let any_signal = !signal_result.is_empty();
@@ -215,7 +227,8 @@ pub fn handle(
         }
     }
 
-    // Fallback: ad-hoc queries from queries.toml (Phase 1 behavior)
+    // No signal produced anything. The queries block, if there was one, is already
+    // pushed above -- this path now carries only the tail it always carried.
     let trig_files = discover_trig_files(cwd);
 
     if trig_files.is_empty() {
@@ -226,15 +239,56 @@ pub fn handle(
         return Ok(());
     }
 
-    let paths: Vec<&Path> = trig_files.iter().map(|p| p.as_path()).collect();
-    let graph = store::load_graphs(&paths)?;
+    // Flow protocol injection — also in fallback path
+    if config.flow.enabled && config.flow.protocol {
+        if queries_shown > 0 {
+            out.newline();
+        }
+        out.push("flow-protocol", crate::hook::flow::protocol_block(), 1);
+    }
 
-    ontology::load_vocabulary(&graph, &config.namespace)?;
+    // Diagnostics: always emitted at end of output
+    if !diagnostics.is_empty() {
+        if queries_shown > 0 || (config.flow.enabled && config.flow.protocol) {
+            out.newline();
+        }
+        out.push("diagnostics", &diagnostics.join("\n"), diagnostics.len());
+    }
+
+    // Extension status injection (Phase 23)
+    inject_extension_status(config, cwd, out);
+
+    Ok(())
+}
+
+/// Run the operator's `queries.toml` and push the `queries` block. Returns how many
+/// queries rendered something.
+///
+/// FAIL-OPEN, deliberately. A graph that will not parse strictly costs the queries
+/// block and nothing else; it does not abort session start. The unhealthy-graph
+/// warning has already been collected by the time this runs, so the operator hears
+/// about a bad graph from the block that exists to say so, never from the silent
+/// absence of an unrelated one.
+///
+/// This is QTF-1's fix, ruled option 2. Called ONCE, before the signal early-return,
+/// so ad-hoc queries render BESIDE the signals instead of only when every signal is
+/// silent -- which, on any workspace with real data, was never.
+fn render_adhoc_queries(cwd: &Path, config: &BaseConfig, out: &mut SessionOutput) -> usize {
+    let trig_files = discover_trig_files(cwd);
+    if trig_files.is_empty() {
+        return 0;
+    }
+    let paths: Vec<&Path> = trig_files.iter().map(|p| p.as_path()).collect();
+    let Ok(graph) = store::load_graphs(&paths) else {
+        return 0;
+    };
+    if ontology::load_vocabulary(&graph, &config.namespace).is_err() {
+        return 0;
+    }
 
     let queries = load_queries(cwd, config);
     let mut output = String::new();
-    let mut queries_shown = 0usize;
-
+    let mut shown = 0usize;
     for qdef in &queries {
         let sparql = format!(
             "PREFIX {p}: <{u}>\n\
@@ -246,41 +300,19 @@ pub fn handle(
             u = config.namespace.uri,
             body = qdef.sparql,
         );
-
         if let Ok(results) = store::query(&graph, &sparql) {
             let section = format_results(results, &qdef.format, &qdef.description);
             if !section.is_empty() {
                 output.push_str(&section);
                 output.push('\n');
-                queries_shown += 1;
+                shown += 1;
             }
         }
     }
-
     if !output.is_empty() {
-        out.push("queries", output.trim_end(), queries_shown);
+        out.push("queries", output.trim_end(), shown);
     }
-
-    // Flow protocol injection — also in fallback path
-    if config.flow.enabled && config.flow.protocol {
-        if !output.is_empty() {
-            out.newline();
-        }
-        out.push("flow-protocol", crate::hook::flow::protocol_block(), 1);
-    }
-
-    // Diagnostics: always emitted at end of output
-    if !diagnostics.is_empty() {
-        if !output.is_empty() || (config.flow.enabled && config.flow.protocol) {
-            out.newline();
-        }
-        out.push("diagnostics", &diagnostics.join("\n"), diagnostics.len());
-    }
-
-    // Extension status injection (Phase 23)
-    inject_extension_status(config, cwd, out);
-
-    Ok(())
+    shown
 }
 
 /// Spec B1: every block's rank, and inside its rank its place. The trimmer takes the bottom of the
