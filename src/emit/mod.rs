@@ -103,14 +103,17 @@ impl Measured {
 ///
 /// Trimming is on whole lines: half a rule is worse than no rule, because a truncated instruction
 /// still reads as an instruction.
-pub fn print_measured(hook: &str, key: &str, text: &str, budget_bytes: usize) -> Measured {
+///
+/// `full_text` names the file holding the untrimmed text, when the caller wrote one. The notice then says where
+/// it is, so a session that sees the cut can read what was cut instead of only being told it happened.
+pub fn print_measured(hook: &str, key: &str, text: &str, budget_bytes: usize, full_text: Option<&str>) -> Measured {
     let wanted = text.len();
     if wanted <= budget_bytes {
         print!("{text}");
         return Measured { wanted_bytes: wanted, emitted_bytes: wanted, withheld_bytes: 0 };
     }
 
-    let reserve = withheld_notice(hook, key, wanted, budget_bytes).len();
+    let reserve = withheld_notice(hook, key, wanted, budget_bytes, full_text).len();
     let room = budget_bytes.saturating_sub(reserve);
 
     // Whole lines, so the cut never lands mid-character: every line is valid UTF-8 on its own, and
@@ -127,7 +130,7 @@ pub fn print_measured(hook: &str, key: &str, text: &str, budget_bytes: usize) ->
     }
 
     let withheld = wanted.saturating_sub(kept_bytes);
-    let notice = withheld_notice(hook, key, withheld, budget_bytes);
+    let notice = withheld_notice(hook, key, withheld, budget_bytes, full_text);
     if !kept.is_empty() && !kept.ends_with('\n') {
         kept.push('\n');
     }
@@ -147,9 +150,10 @@ pub fn print_measured(hook: &str, key: &str, text: &str, budget_bytes: usize) ->
 /// coming: their overflow notice would name `prompt_chars` and send them to edit a setting that
 /// governs a different hook. That is the inert-field defect pointed at the operator, and it is worse
 /// than silence, because silence does not give directions.
-fn withheld_notice(hook: &str, key: &str, withheld_bytes: usize, budget_bytes: usize) -> String {
+fn withheld_notice(hook: &str, key: &str, withheld_bytes: usize, budget_bytes: usize, full_text: Option<&str>) -> String {
+    let full = full_text.map(|p| format!("The full text is in {p}. ")).unwrap_or_default();
     format!(
-        "\n[base: {hook} withheld {withheld_bytes} bytes against [budget] {key} = {budget_bytes}. \
+        "\n[base: {hook} withheld {withheld_bytes} bytes against [budget] {key} = {budget_bytes}. {full}\
 Raise it in base.toml, or run `base doctor` to see what each hook emitted.]\n"
     )
 }

@@ -972,6 +972,16 @@ fn push_hook_output(
                     t.tier, e.hook, e.last.first_screen_u16, e.first_screen_overflow_runs, e.runs
                 ));
             }
+            // Where to read what the prompt hook's cut withheld, named only when the file is there.
+            let full = Path::new(&t.dir).join(crate::emit::record::PROMPT_FULL_FILE);
+            if e.hook == "user-prompt-submit" && full.is_file() {
+                out.push_str(&format!(
+                    "   {} tier · {}: full text of the last prompt's output: {}\n",
+                    t.tier,
+                    e.hook,
+                    full.display()
+                ));
+            }
         }
     }
 }
@@ -985,7 +995,11 @@ fn trim_clause(run: &crate::emit::record::Run) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let mut s = if run.trimmed.is_empty() {
+    // The prompt hook cuts whole lines from the end and has no per-block rows, so without this its cut runs
+    // would read as "nothing trimmed".
+    let mut s = if run.withheld_bytes > 0 {
+        format!(" · withheld {} bytes from the end", run.withheld_bytes)
+    } else if run.trimmed.is_empty() {
         " · nothing trimmed".to_string()
     } else {
         format!(" · trimmed: {}", list(&run.trimmed))
@@ -2141,6 +2155,7 @@ mod hook_output_tests {
                     .collect(),
                 other_withheld: Vec::new(),
                 unrecognised: Vec::new(),
+                withheld_bytes: 0,
             }
         }
         let session = EventSizes {
