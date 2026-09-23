@@ -428,6 +428,15 @@ fn is_source_file(path: &str) -> bool {
     exts.iter().any(|ext| path.ends_with(ext))
 }
 
+/// The hint for a folder no code map covers. It used to tell the session to run `base sync --ast`
+/// itself, against the 0.13.9 ruling that base maps an app automatically on first contact and a map is
+/// never built by hand. It also fired in folders that are not apps at all, such as the home folder,
+/// where no map will ever exist, so it now says that plainly instead of giving an instruction.
+const NO_MAP_HINT: &str = "<ast-hint>\n\
+No code map covers this folder. base maps an app automatically the first time a session works in it, \
+so there is nothing to run. A folder that is not an app is never mapped: search its files directly.\n\
+</ast-hint>";
+
 /// Check if AST data has been extracted for the current workspace.
 /// ast.ttl IS the AST store (never merged into graph.nq — AUDIT C10),
 /// so its existence is the correct populated check.
@@ -478,16 +487,7 @@ fn grep_intercept(event: &serde_json::Value, cwd: &Path) -> Option<String> {
 
     // Check if AST graph is populated — different message if not
     if !ast_graph_populated(cwd) {
-        return Some(
-            "<ast-hint>\n\
-             AST graph not yet populated for this workspace.\n\
-             Would you like to index the codebase? Run:\n\
-               base sync --ast\n\
-             This takes ~10 seconds and indexes 35+ languages.\n\
-             Then use `base ast query` for code navigation instead of grep/find.\n\
-             </ast-hint>"
-                .to_string(),
-        );
+        return Some(NO_MAP_HINT.to_string());
     }
 
     let suggestion = if let Some(term) = search_term {
@@ -577,16 +577,7 @@ fn context_mode_intercept(event: &serde_json::Value, cwd: &Path) -> Option<Strin
     }
 
     if !ast_graph_populated(cwd) {
-        return Some(
-            "<ast-hint>\n\
-             AST graph not yet populated for this workspace.\n\
-             Would you like to index the codebase? Run:\n\
-               base sync --ast\n\
-             This takes ~10 seconds and indexes 35+ languages.\n\
-             Then use `base ast query` for code navigation instead of scanning files.\n\
-             </ast-hint>"
-                .to_string(),
-        );
+        return Some(NO_MAP_HINT.to_string());
     }
 
     Some(
