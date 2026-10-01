@@ -158,10 +158,12 @@ fn run_event(
             let mut out = session_start::SessionOutput::new();
             let handled = session_start::handle(&config, &cwd, session_id.as_deref(), &mut out);
             if handled.is_ok() {
-                // Relay inbox push: pending messages addressed to this session
-                // (unregistered sessions get a one-line notice that a relay is live).
+                // Relay inbox push: pending messages addressed to this session, due now
+                // (unregistered sessions get a one-line notice that a relay is live, which
+                // ranks in the tail: an invitation to join is not due now).
                 if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true, false) {
-                    out.push("relay-inbox", &block, 1);
+                    let kind = if crate::relay::deliver::is_notice(&block) { "relay-notice" } else { "relay-inbox" };
+                    out.push(kind, &block, 1);
                 }
                 // Session-targeted task relay: refresh liveness + announce any tasks
                 // assigned to this session (loud, re-announced on each new session), as two blocks

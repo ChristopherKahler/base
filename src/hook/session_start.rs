@@ -320,7 +320,7 @@ fn render_adhoc_queries(cwd: &Path, config: &BaseConfig, out: &mut SessionOutput
 /// pulse last, and the relay wake contract outlasts the operator profile and the notices. A kind
 /// missing from this table sorts after all of it, and `every_pushed_kind_has_a_place_in_the_layout`
 /// fails the build when one does.
-pub const LAYOUT: [(&str, Rank); 31] = [
+pub const LAYOUT: [(&str, Rank); 32] = [
     ("instructions", Rank::Pinned),
     ("graph-unhealthy", Rank::DueNow),
     ("reminders", Rank::DueNow),
@@ -342,6 +342,9 @@ pub const LAYOUT: [(&str, Rank); 31] = [
     ("triggers", Rank::Tail),
     ("relay-tasks", Rank::Tail),
     ("relay-wake", Rank::Tail),
+    // The unregistered session's invitation to join a relay store. Until BO-00 B4 it rode
+    // `relay-inbox` at DueNow and took 165 units of the first screen on Chris's store.
+    ("relay-notice", Rank::Tail),
     ("operator", Rank::Tail),
     ("extensions", Rank::Tail),
     ("queries", Rank::Tail),
@@ -496,6 +499,7 @@ impl SessionOutput {
                 text: part.text,
                 total: part.items,
                 shown: part.items,
+                fits: Vec::new(),
             })
             .collect();
         let letters = self
@@ -507,12 +511,19 @@ impl SessionOutput {
         if let Some(signals) = &self.signals {
             for signal in signals.signals() {
                 for block in &signal.blocks {
+                    // DUE NOW's shorter renderings, for the first-screen pass in `Emission::render`.
+                    let fits = if block.kind == "reminders" {
+                        signals.reminder_fits.clone()
+                    } else {
+                        Vec::new()
+                    };
                     placed.push(Placed {
                         id: block.kind.to_string(),
                         kind: block.kind.to_string(),
                         text: block.text.clone(),
                         total: block.total,
                         shown: block.items,
+                        fits,
                     });
                 }
             }
@@ -527,6 +538,7 @@ impl SessionOutput {
                 text: instruction_block(&letters, deferred),
                 total: 0,
                 shown: 0,
+                fits: Vec::new(),
             });
         }
         // Stable: blocks of one place keep the order they arrived in.
@@ -534,12 +546,19 @@ impl SessionOutput {
         for (i, p) in placed.iter_mut().enumerate() {
             // The sites' own leading and trailing newlines belonged to the old print order. In
             // B1's order every block is one paragraph, a blank line before each but the first.
-            let body = p.text.trim_matches('\n');
-            p.text = if i == 0 {
-                body.to_string()
-            } else {
-                format!("\n{body}")
+            // A block's fits are the same paragraph listing less, so they are spaced the same way.
+            let paragraph = |text: &str| {
+                let body = text.trim_matches('\n');
+                if i == 0 {
+                    body.to_string()
+                } else {
+                    format!("\n{body}")
+                }
             };
+            p.text = paragraph(&p.text);
+            for fit in &mut p.fits {
+                fit.0 = paragraph(&fit.0);
+            }
         }
 
         let mut untrimmed = Emission::new(budget.session_start_bytes, budget.first_screen_chars);
@@ -563,7 +582,12 @@ impl SessionOutput {
         if self.signals.is_some()
             && let Some(dir) = crate::crud::handoff_show::session_start_dir(cwd)
         {
-            let kept = crate::crud::handoff_show::write_letters(&dir, &letters);
+            let reminders = self
+                .signals
+                .as_ref()
+                .map(|s| s.reminders.as_slice())
+                .unwrap_or_default();
+            let kept = crate::crud::handoff_show::write_letters(&dir, &letters, reminders);
             if let Some(why) = kept.failure() {
                 eprintln!("base: session start could not keep its handoff letters: {why}");
             }
@@ -577,7 +601,8 @@ impl SessionOutput {
                 .unwrap_or("")
                 .to_string();
             let block = Block::new(p.id, place(&p.kind).0, p.text, floor, command)
-                .items(p.total, p.shown);
+                .items(p.total, p.shown)
+                .with_fits(p.fits);
             let pushed = emission.push(block);
             debug_assert!(pushed, "block ids are unique by construction");
         }
@@ -588,8 +613,8 @@ impl SessionOutput {
         let rendered = emission.render(&full, Some(&header));
         if !rendered.first_screen_ok {
             eprintln!(
-                "base: session start's header, instructions and DUE NOW take more than the first {} units",
-                rendered.first_screen_u16
+                "base: session start's header, instructions and DUE NOW take {} units, more than the first {}",
+                rendered.first_screen_len_u16, rendered.first_screen_u16
             );
         }
         if rendered.over_budget {
@@ -619,6 +644,8 @@ struct Placed {
     text: String,
     total: usize,
     shown: usize,
+    /// Renderings listing fewer items, for the first-screen pass. Only DUE NOW has any.
+    fits: Vec<(String, usize)>,
 }
 
 /// Spec B3, with B7's BEHAVIOR lines merged in: what Claude does first, written before any data
@@ -635,12 +662,15 @@ struct Placed {
 /// → ". Revive one:" (every block prints its own deferred notice). Measured after: fs1-before
 /// 1831 (was 1861), fs1-after 1953 (was 2011). Every word added here is paid for on that screen,
 /// and FS1 is the receipt.
+///
+/// Line 3 names a reminder by its DUE NOW number since BO-00 B4 (2026-10-01): DUE NOW's lines no
+/// longer print the slug, and `base reminder archive|snooze <number>` read it from the letters file.
 pub fn instruction_block(letters: &[(char, String)], deferred: usize) -> String {
     let mut s = String::from(
         "DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:\n\
          1. Show DUE NOW, then HANDOFFS, exactly as lettered. Nothing prepended. No \"is this stale?\" questions.\n\
          2. The user names a handoff by letter, project or a few words: run `base handoff show <what they said>` and read the doc it prints. Several matches: list them and ask.\n\
-         3. \"snooze <letter> <N>d\" → `base handoff snooze <slug> <N>` · \"archive <letter>\" → `base handoff archive <slug>` · a handled reminder → `base reminder archive <slug>`.\n\
+         3. \"snooze <letter> <N>d\" → `base handoff snooze <slug> <N>` · \"archive <letter>\" → `base handoff archive <slug>` · a handled reminder → `base reminder archive <number>`.\n\
          4. FORKS are open side-work, not a lettered choice. `base fork snooze <title> <N>` · `base fork archive <title>`.\n\
          5. Every block below is a summary. Its full list is the command on its line; the untrimmed output is the file on line 1. Never guess; run it.",
     );

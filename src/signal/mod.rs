@@ -76,6 +76,11 @@ pub struct SignalOutput {
     /// The letter and slug of every handoff HANDOFFS lists, for the instruction block and the
     /// letters file `base handoff show` reads.
     pub letters: Vec<(char, String)>,
+    /// The slug of every reminder DUE NOW numbers, number 1 first, for the letters file
+    /// `base reminder archive|snooze <number>` reads.
+    pub reminders: Vec<String>,
+    /// DUE NOW listing fewer reminders, for the first-screen pass (see `flow_resurface::DueNow`).
+    pub reminder_fits: Vec<(String, usize)>,
     /// Records marked deferred across HANDOFFS, FORKS, PROJECTS, TASKS and MILESTONES, for line 1 (B2).
     pub deferred: usize,
     state: Option<(PathBuf, suppression::SignalState)>,
@@ -130,6 +135,8 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     let mut results: Vec<(u32, Signal)> = Vec::new();
     let mut diagnostics: Vec<String> = Vec::new();
     let mut letters: Vec<(char, String)> = Vec::new();
+    let mut reminders: Vec<String> = Vec::new();
+    let mut reminder_fits: Vec<(String, usize)> = Vec::new();
     let mut deferred = 0usize;
     let layout = &config.session_start;
     if layout.handoffs_shown > crate::crud::handoff_show::MAX_SHOWN {
@@ -212,8 +219,11 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         Err(e) => eprintln!("base: signal 'handoff' failed: {e}"),
     }
     match flow_resurface::reminder_scan(cwd, ns) {
-        Ok((output, n)) if !output.is_empty() => {
-            results.push((0, Signal::single("reminder", "reminders", output, n, n)));
+        Ok(due) if !due.text.is_empty() => {
+            let n = due.slugs.len();
+            reminders = due.slugs;
+            reminder_fits = due.fits;
+            results.push((0, Signal::single("reminder", "reminders", due.text, n, n)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-reminder-scan:no-match>")),
         Err(e) => eprintln!("base: signal 'reminder' failed: {e}"),
@@ -262,6 +272,8 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         unchanged,
         diagnostics,
         letters,
+        reminders,
+        reminder_fits,
         deferred,
         state,
     })

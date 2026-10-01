@@ -152,9 +152,10 @@ fn day_8_shows_the_archive_date_and_the_reset_command() {
         warned_line.contains(&format!("archives {archives_on}")),
         "no archive date on the day-8 line: {warned_line}"
     );
+    // By its DUE NOW number since BO-00 B4: DUE NOW sorts oldest due first, so the 8-day reminder is 1.
     assert!(
-        warned_line.contains(&format!("base reminder snooze {}", warned.slug)),
-        "no reset command on the day-8 line: {warned_line}"
+        warned_line.starts_with("  1 ") && warned_line.contains("base reminder snooze 1 <duration>"),
+        "no reset command naming the line's own number on the day-8 line: {warned_line}"
     );
 
     let quiet_line = line_with(&stdout, &quiet.name)
@@ -436,9 +437,10 @@ fn the_global_graph_is_where_these_fixtures_write_it() {
 }
 
 // ── R8 (rank 06 follow-up, flag 6) ──────────────────────────────────────────
-/// The instruction block tells Claude what to run for a handled reminder, and it must be the command DUE NOW's
-/// own line prints: `base reminder archive <slug>`. Before this follow-up, line 3 still said `remove`, the hard
-/// delete R4 keeps separate, while DUE NOW said `archive` two blocks below it.
+/// The instruction block tells Claude what to run for a handled reminder: `base reminder archive <number>`, the
+/// number DUE NOW prints on the reminder's line. Before rank 06's follow-up, line 3 still said `remove`, the hard
+/// delete R4 keeps separate, while DUE NOW said `archive` two blocks below it. Since BO-00 B4 DUE NOW's lines
+/// carry the number and no command, so line 3 is the only place the command is named.
 ///
 /// Read off the hook's stdout, the channel Claude receives. Controls: the instruction block and DUE NOW both
 /// rendered, so an absent line cannot pass for a correct one. Mutation: put `remove` back in
@@ -455,16 +457,70 @@ fn the_instruction_block_names_archive_for_a_handled_reminder_as_due_now_does() 
         "control: the instruction block did not render:{NL_MARK}{stdout}",
     );
     assert!(
-        stdout.contains(&format!("clear: base reminder archive {}", due.slug)),
-        "control: DUE NOW did not print its clear command:{NL_MARK}{stdout}",
+        stdout.lines().any(|l| l == format!("  1 {}", due.name)),
+        "control: DUE NOW did not print the reminder as number 1:{NL_MARK}{stdout}",
     );
     assert!(
-        stdout.contains("a handled reminder → `base reminder archive <slug>`."),
+        !stdout.contains(&due.slug),
+        "DUE NOW still spends the first screen on the reminder's slug:{NL_MARK}{stdout}",
+    );
+    assert!(
+        stdout.contains("a handled reminder → `base reminder archive <number>`."),
         "the instruction block does not name archive for a handled reminder:{NL_MARK}{stdout}",
     );
     assert!(
         !stdout.contains("base reminder remove"),
         "session start still tells Claude to hard-delete a handled reminder:{NL_MARK}{stdout}",
+    );
+}
+
+// ── R9 (BO-00 B4) ─────────────────────────────────────────────────────────────
+/// `base reminder archive <number>` and `snooze <number>` act on the reminder the last session start printed under
+/// that number, and say which. A number session start did not print is read as a slug, so it finds nothing and
+/// says so rather than acting on a guess.
+///
+/// Controls: each number is checked against the reminder it must reach AND the one it must not, so a resolver that
+/// ignored the number and took the first reminder fails on 2.
+#[test]
+fn a_due_now_number_archives_and_snoozes_the_reminder_printed_under_it() {
+    let seed = workspace("r9");
+    let first = add_due(&seed, "Pay the invoice", &days_ago(3));
+    let second = add_due(&seed, "Call the bank", &days_ago(2));
+    let (code, stdout, stderr) = run_session_start(&seed, None);
+    assert_eq!(code, 0, "session start failed: {stderr}");
+    assert!(
+        stdout.lines().any(|l| l == format!("  1 {}", first.name))
+            && stdout.lines().any(|l| l == format!("  2 {}", second.name)),
+        "control: DUE NOW did not number the two reminders oldest first:{NL_MARK}{stdout}",
+    );
+
+    let (acode, aout, aerr) = run_base(&seed, &["reminder", "archive", "2"]);
+    assert_nonempty("reminder archive 2", &aout, &aerr);
+    assert_eq!(acode, 0, "archive by number failed: {aout}{aerr}");
+    assert!(
+        aout.contains(&format!("DUE NOW 2 is '{}'", second.slug)),
+        "archive by number did not say which reminder it reached: {aout}"
+    );
+    let (_, live, _) = run_base(&seed, &["reminder", "list"]);
+    assert!(!live.contains(&second.name), "number 2 was not archived:\n{live}");
+    assert!(live.contains(&first.name), "number 2 reached number 1 as well:\n{live}");
+
+    let (scode, sout, serr) = run_base(&seed, &["reminder", "snooze", "1", "2d"]);
+    assert_nonempty("reminder snooze 1", &sout, &serr);
+    assert_eq!(scode, 0, "snooze by number failed: {sout}{serr}");
+    assert!(
+        sout.contains(&format!("DUE NOW 1 is '{}'", first.slug)),
+        "snooze by number did not say which reminder it reached: {sout}"
+    );
+    let (_, live, _) = run_base(&seed, &["reminder", "list"]);
+    let moved = line_with(&live, &first.name).unwrap_or_else(|| panic!("number 1 vanished:\n{live}"));
+    assert!(moved.contains(&days_ahead(2)), "number 1 was not snoozed: {moved}");
+
+    let (ncode, nout, nerr) = run_base(&seed, &["reminder", "archive", "7"]);
+    assert_ne!(ncode, 0, "a number session start never printed must not succeed: {nout}{nerr}");
+    assert!(
+        format!("{nout}{nerr}").contains("no reminder '7'"),
+        "an unprinted number is not reported as not found: {nout}{nerr}"
     );
 }
 

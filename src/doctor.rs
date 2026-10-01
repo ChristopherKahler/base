@@ -2147,6 +2147,7 @@ mod hook_output_tests {
                 budget: Size::bytes(budget),
                 full: Size::bytes(emitted * 3),
                 first_screen_u16: 2000,
+                first_screen_len_u16: None,
                 over_budget: over,
                 first_screen_ok: screen_ok,
                 trimmed: trimmed

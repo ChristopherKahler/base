@@ -203,20 +203,59 @@ pub fn session_start_dir(cwd: &Path) -> Option<PathBuf> {
 struct LettersFile {
     written_at: String,
     letters: BTreeMap<String, String>,
+    /// DUE NOW's numbers, "1" first, each to its reminder's slug. Absent from a file written before
+    /// 2026-10-01, which reads as no numbers.
+    #[serde(default)]
+    reminders: BTreeMap<String, String>,
 }
 
-/// Keep the letters session start printed, so `show <letter>` names the handoff that session saw.
-/// Written through a temp file and a rename; a failure comes back as a value, never a panic.
-pub fn write_letters(dir: &Path, letters: &[(char, String)]) -> crate::emit::FullOutput {
+/// Keep the letters and DUE NOW numbers session start printed, so `show <letter>` names the handoff
+/// that session saw and `reminder archive|snooze <number>` the reminder. Written through a temp file
+/// and a rename; a failure comes back as a value, never a panic.
+pub fn write_letters(
+    dir: &Path,
+    letters: &[(char, String)],
+    reminders: &[String],
+) -> crate::emit::FullOutput {
     let file = LettersFile {
         written_at: crud::now_iso(),
         letters: letters
             .iter()
             .map(|(l, slug)| (l.to_string(), slug.clone()))
             .collect(),
+        reminders: reminders
+            .iter()
+            .enumerate()
+            .map(|(i, slug)| ((i + 1).to_string(), slug.clone()))
+            .collect(),
     };
     let text = serde_json::to_string_pretty(&file).unwrap_or_default();
     crate::emit::write_full_output(&dir.join(LETTERS_FILE), &text)
+}
+
+/// A DUE NOW number read back: the slug the last session start printed under it, and when that
+/// session start ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumberedReminder {
+    pub slug: String,
+    pub written_at: String,
+}
+
+/// The reminder the last session start in `cwd` numbered `arg`, or `None` when `arg` is not a
+/// number that session start printed. `None` leaves `arg` to be read as a slug, so a reminder whose
+/// slug is all digits stays reachable whenever its slug is not also a DUE NOW number.
+pub fn reminder_number(cwd: &Path, arg: &str) -> Option<NumberedReminder> {
+    if arg.is_empty() || !arg.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let dir = session_start_dir(cwd)?;
+    let text = std::fs::read_to_string(dir.join(LETTERS_FILE)).ok()?;
+    let file: LettersFile = serde_json::from_str(&text).ok()?;
+    let n: usize = arg.parse().ok()?;
+    file.reminders.get(&n.to_string()).map(|slug| NumberedReminder {
+        slug: slug.clone(),
+        written_at: file.written_at.clone(),
+    })
 }
 
 enum Letters {

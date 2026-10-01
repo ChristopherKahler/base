@@ -47,8 +47,10 @@ pub fn record_of(r: &Rendered, hook: &str, session_id: Option<&str>) -> serde_js
         "emitted_bytes": r.emitted_bytes,
         "budget_bytes": r.budget_bytes,
         "full_bytes": r.full_bytes,
-        // Still UTF-16: the first screen is a readability limit, not a delivery one.
+        // Still UTF-16: the first screen is a readability limit, not a delivery one. `first_screen_u16`
+        // is the LIMIT (it read 2000 in every row); `first_screen_len_u16` is the measured length.
         "first_screen_u16": r.first_screen_u16,
+        "first_screen_len_u16": r.first_screen_len_u16,
         "over_budget": r.over_budget,
         "first_screen_ok": r.first_screen_ok,
         "withheld": withheld,
@@ -171,6 +173,9 @@ pub struct Run {
     pub full: Size,
     /// Always UTF-16: a readability limit, unchanged by the byte conversion.
     pub first_screen_u16: usize,
+    /// The measured first screen, UTF-16. `None` on a row written before 2026-10-01, when only the
+    /// limit was recorded, and on a prompt-hook row, which has no first screen.
+    pub first_screen_len_u16: Option<usize>,
     pub over_budget: bool,
     pub first_screen_ok: bool,
     /// Rows the trimmer degraded, in ledger order.
@@ -337,6 +342,7 @@ fn parse(line: &str) -> Option<(String, Run)> {
         full: sized("full_bytes", "full_u16")?,
         // A prompt-hook record has no first screen and writes no first-screen fields (see `record_of_prompt`).
         first_screen_u16: number("first_screen_u16").unwrap_or(0),
+        first_screen_len_u16: number("first_screen_len_u16"),
         over_budget: flag("over_budget")?,
         first_screen_ok: flag("first_screen_ok").unwrap_or(true),
         trimmed: Vec::new(),
@@ -382,6 +388,31 @@ mod tests {
         let (_, run) = parse(&record_of_prompt(&fit, 4000, "user-prompt-submit", None).to_string()).unwrap();
         assert_eq!(run.withheld_bytes, 0);
         assert!(!run.over_budget);
+    }
+
+    /// The record carries the measured first screen beside its limit, and a row written before the field existed
+    /// reads back as unmeasured, never as a length of zero. The `Rendered` comes from `Emission::render`, so the
+    /// census of construction sites is unchanged.
+    #[test]
+    fn the_first_screen_length_is_recorded_beside_its_limit() {
+        use super::super::{Block, Emission, FullOutput, Rank};
+        let tail = "y".repeat(500);
+        let mut e = Emission::new(9000, 2000);
+        assert!(e.push(Block::new("instructions", Rank::Pinned, "x".repeat(30), "", "")));
+        assert!(e.push(Block::new("reminders", Rank::DueNow, "z".repeat(40), "", "")));
+        assert!(e.push(Block::new("pulse", Rank::Tail, tail.clone(), "", "")));
+        let r = e.render(&FullOutput::off(), None);
+        let first_screen = &r.text[..r.text.find(&tail).expect("the tail block is printed")];
+        assert_eq!(
+            r.first_screen_len_u16,
+            first_screen.encode_utf16().count(),
+            "the length is everything printed before the first block below DueNow"
+        );
+        assert!(r.first_screen_len_u16 >= 70, "control: both first-screen blocks are counted");
+        let (_, run) = parse(&record_of(&r, "session-start", None).to_string()).expect("the record parses");
+        assert_eq!((run.first_screen_u16, run.first_screen_len_u16), (2000, Some(r.first_screen_len_u16)));
+        let (_, old) = parse(&line("session-start", 5, &[]).to_string()).expect("an old row parses");
+        assert_eq!(old.first_screen_len_u16, None, "an old row has no measured length");
     }
 
     /// A record as a JSON line, the shape `record_of` writes. Built by hand so no test here constructs a `Rendered`:

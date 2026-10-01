@@ -158,10 +158,15 @@ Raise it in base.toml, or run `base doctor` to see what each hook emitted.]\n"
     )
 }
 
-/// Trim order, and output order. `Pinned` and `DueNow` are never degraded. DUE NOW shows in full
-/// and first even when that pushes the first screen over: the overflow is reported in
-/// [`Rendered::first_screen_ok`], never resolved by collapsing what is due. The rest degrade from
-/// `Tail` upward.
+/// Trim order, and output order. `Pinned` is never degraded and `DueNow` is never collapsed or
+/// trimmed for the byte budget. The rest degrade from `Tail` upward.
+///
+/// The first screen (spec A5, locked) is the one thing that can shorten `DueNow`: a `DueNow` block
+/// that carries fits (see [`Block::with_fits`]) lists fewer items, one at a time, until the first
+/// screen fits or its last fit is reached, and its line says how many it shows and the command for
+/// the rest (A4's rule for a trimmed item). Before BO-00 B4 (2026-10-01) DUE NOW always showed in
+/// full and an overflow was only reported; on Chris's store five due reminders took a first screen
+/// of 2,871 units against 2,000. What still overflows is reported in [`Rendered::first_screen_ok`].
 ///
 /// It is a total order on purpose: a trimmer that picks the biggest block produces a different
 /// layout run to run, so nobody can learn where to look and no test can assert a position.
@@ -262,6 +267,11 @@ pub struct Block {
     items_total: usize,
     command: String,
     level: Level,
+    /// Renderings listing fewer items, most first, for the first-screen pass. Empty for every block
+    /// but DUE NOW.
+    fits: Vec<(String, usize)>,
+    /// How many of `fits` the first-screen pass has stepped down. 0 is none.
+    fitted: usize,
 }
 
 impl Block {
@@ -287,9 +297,20 @@ impl Block {
             items_total: 0,
             command: command.into(),
             level: Level::Full,
+            fits: Vec::new(),
+            fitted: 0,
         };
         b.refresh_floor();
         b
+    }
+
+    /// Renderings that list fewer items, most first, each with how many it lists. Used only by the
+    /// first-screen pass, and only on a `DueNow` block: it steps down them one at a time while the
+    /// first screen is over its limit and never past the last, so the last decides what always
+    /// shows. Each one's text must say how many it shows and where the rest are.
+    pub fn with_fits(mut self, fits: Vec<(String, usize)>) -> Self {
+        self.fits = fits;
+        self
     }
 
     /// How many items exist, and how many the full rendering lists.
@@ -330,6 +351,9 @@ impl Block {
 
     /// Items listed at the current level.
     pub fn items_shown(&self) -> usize {
+        if let Some((_, shown)) = self.fit() {
+            return (*shown).min(self.full_shown);
+        }
         match (self.level, &self.shortened) {
             (Level::Full, _) | (Level::Shortened, None) => self.full_shown,
             (Level::Shortened, Some((_, shown))) => (*shown).min(self.full_shown),
@@ -339,11 +363,24 @@ impl Block {
 
     /// The text at the current level.
     pub fn text(&self) -> &str {
+        if let Some((text, _)) = self.fit() {
+            return text;
+        }
         match (self.level, &self.shortened) {
             (Level::Full, _) | (Level::Shortened, None) => &self.full,
             (Level::Shortened, Some((text, _))) => text,
             (Level::Collapsed, _) => &self.collapsed,
         }
+    }
+
+    /// The fit the first-screen pass stepped down to, if it stepped at all.
+    fn fit(&self) -> Option<&(String, usize)> {
+        self.fitted.checked_sub(1).and_then(|i| self.fits.get(i))
+    }
+
+    /// The first-screen pass may step this block down once more: a `DueNow` block with a fit left.
+    fn can_fit(&self) -> bool {
+        self.rank == Rank::DueNow && self.fitted < self.fits.len()
     }
 
     fn refresh_floor(&mut self) {
@@ -467,8 +504,13 @@ pub struct Rendered {
     /// The untrimmed blocks, in BYTES, without the header line.
     pub full_bytes: usize,
     pub budget_bytes: usize,
-    /// The first screen, in UTF-16 units. A readability measure, not a delivery one.
+    /// The first screen's LIMIT, in UTF-16 units: `[budget] first_screen_chars`. A readability
+    /// measure, not a delivery one.
     pub first_screen_u16: usize,
+    /// The first screen's measured LENGTH, in UTF-16 units: the header, the `Pinned` blocks and the
+    /// `DueNow` blocks as printed. Until 2026-10-01 only the limit was recorded, so 91 overflowing
+    /// session starts on a live store could not say by how much they overflowed.
+    pub first_screen_len_u16: usize,
     /// Every block is at its floor and the output is still over budget. Reported, never
     /// resolved by truncating: silent truncation is the defect this module replaces.
     pub over_budget: bool,
@@ -580,11 +622,14 @@ impl Emission {
             let prefix = u16_len(&self.compose(&head, Some(Rank::DueNow)));
             let text = self.compose(&head, None);
             let total = text.len();
-            // There is no first-screen pass. The header, `Pinned` and `DueNow` are the whole first
-            // screen and none of them may degrade, so a first screen they overflow is reported in
-            // `first_screen_ok`, never trimmed. `Pinned` is not excluded here: `next_level` already
-            // refuses it, and a second guard would leave a mutation of the first one unable to fail
-            // any test.
+            // The first-screen pass. The header, `Pinned` and `DueNow` are the whole first screen;
+            // only a `DueNow` block with fits can give anything back, one item per pass, and
+            // never past its last fit. What still overflows is reported in `first_screen_ok`.
+            if prefix > self.first_screen_u16 && self.fit_first_screen() {
+                continue;
+            }
+            // `Pinned` is not excluded here: `next_level` already refuses it, and a second guard
+            // would leave a mutation of the first one unable to fail any test.
             if total > self.budget_bytes && self.degrade_bottom(|r| r != Rank::DueNow) {
                 continue;
             }
@@ -599,6 +644,7 @@ impl Emission {
             full_bytes,
             budget_bytes: self.budget_bytes,
             first_screen_u16: self.first_screen_u16,
+            first_screen_len_u16: prefix,
             withheld: self.withheld,
             blocks: self.blocks,
         }
@@ -630,6 +676,35 @@ impl Emission {
             push_line(&mut s, b.text());
         }
         s
+    }
+
+    /// Step the bottom-most `DueNow` block that has a fit left down one, and ledger what it stops
+    /// listing. One row per block: a second step adds to the row the first one wrote. `false` when
+    /// no block can step.
+    fn fit_first_screen(&mut self) -> bool {
+        let Some(idx) = self.blocks.iter().rposition(Block::can_fit) else {
+            return false;
+        };
+        let b = &mut self.blocks[idx];
+        let before = b.items_shown();
+        b.fitted += 1;
+        b.level = Level::Shortened;
+        let cut = before.saturating_sub(b.items_shown());
+        let (id, command) = (b.id.clone(), b.command.clone());
+        match self
+            .withheld
+            .iter_mut()
+            .find(|w| w.block == id && w.reason == Reason::ListCut)
+        {
+            Some(row) => row.items += cut,
+            None => self.withheld.push(Withheld {
+                block: id,
+                items: cut,
+                reason: Reason::ListCut,
+                command,
+            }),
+        }
+        true
     }
 
     /// Degrade the bottom-most block whose rank passes `eligible` and write its ledger row.
@@ -790,6 +865,52 @@ impl Fragments {
 mod tests {
     use super::*;
 
+    /// BO-00 B4 (lynx, 2026-10-01: spec A5 is locked, A4's "never trimmed" is detail and allows a
+    /// trimmed item whose line says shown/total and the command). DUE NOW with fits steps down one
+    /// item at a time until the first screen fits, writes one ledger row however many steps it
+    /// took, and never goes past its last fit: an overflow that remains is reported. A `Pinned`
+    /// block handed fits is never stepped, so fitting cannot reach the instructions.
+    #[test]
+    fn due_now_with_fits_steps_down_to_fit_the_first_screen_and_never_past_its_last_fit() {
+        let line = |i: usize| format!("{i}{}", "d".repeat(49));
+        let due = |k: usize| (1..=k).map(line).collect::<Vec<_>>().join("\n");
+        // First screen at 3, 2 and 1 items: 41 + 152 + 1 = 194, 143, 92 units.
+        let render = |screen: usize| {
+            let mut e = Emission::new(10_000, screen);
+            let pinned = blk("instructions", Rank::Pinned, &"I".repeat(40), 0)
+                .with_fits(vec![("I".to_string(), 0)]);
+            assert!(e.push(pinned));
+            let fits = vec![(due(2), 2), (due(1), 1)];
+            assert!(e.push(blk("due", Rank::DueNow, &due(3), 3).with_fits(fits)));
+            assert!(e.push(blk("tasks", Rank::Tail, &"T".repeat(30), 5)));
+            e.render(&FullOutput::off(), None)
+        };
+        let shown = |r: &Rendered| r.blocks.iter().find(|b| b.id() == "due").map(Block::items_shown);
+        let due_rows = |r: &Rendered| -> Vec<(Reason, usize)> {
+            r.withheld.iter().filter(|w| w.block == "due").map(|w| (w.reason, w.items)).collect()
+        };
+
+        let roomy = render(1000);
+        assert_eq!((shown(&roomy), roomy.first_screen_len_u16), (Some(3), 194), "control: room for all three");
+        assert!(roomy.first_screen_ok && due_rows(&roomy).is_empty());
+
+        let one_step = render(150);
+        assert_eq!((shown(&one_step), one_step.first_screen_len_u16), (Some(2), 143));
+        assert!(one_step.first_screen_ok);
+        assert_eq!(due_rows(&one_step), [(Reason::ListCut, 1)]);
+        assert!(one_step.text.contains(&due(2)) && !one_step.text.contains(&line(3)));
+
+        let two_steps = render(100);
+        assert_eq!((shown(&two_steps), two_steps.first_screen_len_u16), (Some(1), 92));
+        assert_eq!(due_rows(&two_steps), [(Reason::ListCut, 2)], "one row for the block, however many steps");
+        assert!(two_steps.text.starts_with(&"I".repeat(40)), "the pinned block is never stepped");
+
+        let floor = render(50);
+        assert_eq!(shown(&floor), Some(1), "never past the last fit: the most overdue item always shows");
+        assert!(!floor.first_screen_ok, "what still overflows is reported");
+        assert_eq!(floor.first_screen_len_u16, 92);
+    }
+
     fn blk(id: &str, rank: Rank, full: &str, total: usize) -> Block {
         let floor = format!("{id} {total} · all: base {id} list");
         Block::new(id, rank, full, floor, format!("base {id} list")).items(total, total)
@@ -894,9 +1015,9 @@ mod tests {
 
     #[test]
     fn due_now_never_collapses_and_a_first_screen_it_overflows_is_reported() {
-        // DUE NOW shows in full, never collapsed, always first (auk's cross-lane ruling, lane doc
-        // B24). 41 units of instructions and 201 of DUE NOW overflow a 100-unit first screen, and
-        // nothing inside that prefix may shrink, so the overflow is reported. The budget pass still
+        // DUE NOW is never collapsed, always first (auk's cross-lane ruling, lane doc B24). A DUE NOW
+        // block with no fits cannot shrink at all: 41 units of instructions and 201 of DUE NOW
+        // overflow a 100-unit first screen, so the overflow is reported. The budget pass still
         // takes what comes after: 343 units against 300 collapse `tasks`, and only `tasks`.
         let mut e = Emission::new(300, 100);
         assert!(e.push(blk("instructions", Rank::Pinned, &"I".repeat(40), 0)));
