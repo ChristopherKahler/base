@@ -1,0 +1,35 @@
+# The replay corpus's prompts (tests/replay_test.rs). Synthetic, modeled on the shapes of real
+# prompts: short asks, long complaints about a hook, corrections that restate context, asks that
+# name a file, asks about the relay. This repository is public, so no line here carries a real
+# person's or client's name, a real path or a secret; `replay_corpus_has_no_real_names` checks it.
+# One prompt per line. Blank lines and lines starting with # are skipped.
+what reminders do i need
+we're having issues with the user prompt submit hook being cut off at a high rate; how are the injections doing
+the installed version is not the release, it's a dev build from the local tree; rephrase with that context
+i don't want broad path triggers, i want the exact path of the file being touched
+draft the morning update for Client A on ProjectV
+touch .../ProjectR/BRIEF.md and tell me what rules apply
+show me handoff C
+snooze B 3d
+archive the reminder about the invoice
+what's due now
+start the inventory crawl for ProjectV and normalize the dealer list
+how do I tell the client owner the export is late
+review the PR for the session start hook and check CI on both platforms
+why did the first screen overflow on session start
+make a doc for the funding notes in the owner's account
+run the full test suite on windows and linux and give me the counts
+what did the relay say since my last prompt
+ping the orchestrator that the build order is done
+rebuild the code map for apps/web and tell me which callers changed
+log a decision: path triggers are exact, never broad
+recall what we decided about the budget for the prompt hook
+the hook output log says first_screen_ok false; what length did it measure
+add a task to ProjectR: wire the brief intake form
+what's the status of the dealer registry cleanup
+open the latest fork for the release blockers
+write the end of day report from today's handoffs
+check the doctor output and tell me what is unhealthy
+compare the before and after numbers from the hook output log
+the reminder numbers changed after a new session start; which one is 2
+summarize the last three session starts and what they withheld
