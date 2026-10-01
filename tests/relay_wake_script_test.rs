@@ -45,7 +45,21 @@ use std::process::{Command, Stdio};
 /// `SystemRoot` (the WSL launcher) or `WindowsApps` (the Store alias stub), and hands back the
 /// absolute path so `Command` cannot re-resolve it. Elsewhere `bash` on `PATH` is the real
 /// thing. Which bash ran is printed by every leg, so a log always says what it measured.
+///
+/// ON CI A MISSING HOST BASH FAILS, IT DOES NOT SKIP. Every leg below prints SKIPPED and returns, which
+/// libtest counts as passed, and the test-count guard (scripts/ci_guards.py) cannot tell that apart from
+/// a pass. A runner without a host bash is a broken runner, so the skip is kept for a dev machine only
+/// (BO-00 code review, 2026-10-01).
 fn bash() -> Option<String> {
+    let found = find_bash();
+    assert!(
+        found.is_some() || std::env::var_os("CI").is_none(),
+        "no host bash on this CI runner: every relay wake test would skip and be counted as passed"
+    );
+    found
+}
+
+fn find_bash() -> Option<String> {
     let works = |candidate: &str| {
         Command::new(candidate)
             .arg("-c")

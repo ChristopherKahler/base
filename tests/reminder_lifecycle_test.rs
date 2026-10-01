@@ -24,7 +24,7 @@ mod seed;
 
 use std::path::Path;
 
-use seed::{run_base, run_session_start};
+use seed::{run_base, run_base_in_session, run_session_start};
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
@@ -522,6 +522,44 @@ fn a_due_now_number_archives_and_snoozes_the_reminder_printed_under_it() {
         format!("{nout}{nerr}").contains("no reminder '7'"),
         "an unprinted number is not reported as not found: {nout}{nerr}"
     );
+}
+
+// ── R10 (BO-00 code review) ───────────────────────────────────────────────────
+/// Inside a session a DUE NOW number reaches only the reminder THAT session's start printed under it. Another
+/// session's later start rewrites the workspace's letters file and must not move this session's numbers, and a
+/// session with no numbers on file resolves none, whatever the workspace file says.
+///
+/// The failure this closes: A sees 1 = pay, pay is archived, B starts and the workspace file says 1 = call, and
+/// A's `base reminder archive 1` archived call.
+#[test]
+fn a_due_now_number_belongs_to_the_session_that_printed_it() {
+    let seed = workspace("r10");
+    let pay = add_due(&seed, "Pay the invoice", &days_ago(3));
+    let call = add_due(&seed, "Call the bank", &days_ago(2));
+    let (code, stdout, stderr) = run_session_start(&seed, Some("r10-session-a"));
+    assert_eq!(code, 0, "session A's start failed: {stderr}");
+    assert!(stdout.lines().any(|l| l == format!("  1 {}", pay.name)), "control: A sees pay as 1:{NL_MARK}{stdout}");
+
+    let (code, out, err) = run_base(&seed, &["reminder", "archive", &pay.slug]);
+    assert_eq!(code, 0, "archive by slug failed: {out}{err}");
+    let (code, stdout, stderr) = run_session_start(&seed, Some("r10-session-b"));
+    assert_eq!(code, 0, "session B's start failed: {stderr}");
+    assert!(
+        stdout.lines().any(|l| l == format!("  1 {}", call.name)),
+        "control: B's start renumbered, so the workspace file now says 1 = call:{NL_MARK}{stdout}"
+    );
+
+    let (code, out, err) = run_base_in_session(&seed, &["reminder", "archive", "1"], "r10-session-a");
+    assert_eq!(code, 0, "A's archive 1 failed: {out}{err}");
+    assert!(out.contains(&format!("DUE NOW 1 is '{}'", pay.slug)), "A's 1 is not the reminder A saw: {out}");
+    let (_, live, _) = run_base(&seed, &["reminder", "list"]);
+    assert!(live.contains(&call.name), "A's number reached the reminder B numbered 1:\n{live}");
+
+    let (code, out, err) = run_base_in_session(&seed, &["reminder", "archive", "1"], "r10-never-started");
+    assert_ne!(code, 0, "a session with no numbers on file resolved one: {out}{err}");
+    assert!(format!("{out}{err}").contains("no reminder '1'"), "not reported as not found: {out}{err}");
+    let (_, live, _) = run_base(&seed, &["reminder", "list"]);
+    assert!(live.contains(&call.name), "a session with no numbers archived from the workspace file:\n{live}");
 }
 
 /// A line break for the failure messages above, spelled once.

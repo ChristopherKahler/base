@@ -233,25 +233,103 @@ pub fn write_letters(
     crate::emit::write_full_output(&dir.join(LETTERS_FILE), &text)
 }
 
-/// A DUE NOW number read back: the slug the last session start printed under it, and when that
-/// session start ran.
+/// Each session's DUE NOW numbers, one file per session id, beside the letters file.
+///
+/// WHY PER SESSION. The letters file is one per workspace and every session start rewrites it, so a
+/// number read from it can name a reminder another session's start numbered: session A sees
+/// 1 = pay-invoice, session B starts after pay-invoice was archived, the file now says 1 = call-bank,
+/// and A's `base reminder archive 1` archives call-bank (BO-00 code review, 2026-10-01). Inside a
+/// session `CLAUDE_CODE_SESSION_ID` names the session, so the number is read from that session's own
+/// file and nowhere else.
+pub const DUE_NOW_DIR: &str = "due-now";
+/// Days a session's numbers file is kept after it was last written.
+const DUE_NOW_KEEP_DAYS: u64 = 7;
+
+#[derive(Serialize, Deserialize)]
+struct DueNowFile {
+    written_at: String,
+    session_id: String,
+    reminders: BTreeMap<String, String>,
+}
+
+/// A session id usable as a file name, or `None`. Claude Code's ids are UUIDs; anything else that
+/// arrives on the hook's stdin is refused rather than joined into a path.
+fn session_file_name(session_id: &str) -> Option<String> {
+    let ok = !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    ok.then(|| format!("{session_id}.json"))
+}
+
+/// Keep the DUE NOW numbers `session_id`'s session start printed, and drop files of sessions not
+/// started for [`DUE_NOW_KEEP_DAYS`]. Written even when nothing is due, so an old number cannot
+/// outlive the list that printed it. A failure comes back as a value, never a panic.
+pub fn write_due_now(dir: &Path, session_id: &str, reminders: &[String]) -> crate::emit::FullOutput {
+    let Some(name) = session_file_name(session_id) else {
+        return crate::emit::FullOutput::not_written(format!("session id {session_id:?} is not a file name"));
+    };
+    let folder = dir.join(DUE_NOW_DIR);
+    if let Err(e) = std::fs::create_dir_all(&folder) {
+        return crate::emit::FullOutput::not_written(format!("{}: {e}", folder.display()));
+    }
+    if let Ok(entries) = std::fs::read_dir(&folder) {
+        let keep = std::time::Duration::from_secs(DUE_NOW_KEEP_DAYS * 24 * 60 * 60);
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > keep);
+            if old && entry.path().extension().is_some_and(|x| x == "json") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let file = DueNowFile {
+        written_at: crud::now_iso(),
+        session_id: session_id.to_string(),
+        reminders: reminders
+            .iter()
+            .enumerate()
+            .map(|(i, slug)| ((i + 1).to_string(), slug.clone()))
+            .collect(),
+    };
+    let text = serde_json::to_string_pretty(&file).unwrap_or_default();
+    crate::emit::write_full_output(&folder.join(name), &text)
+}
+
+/// A DUE NOW number read back: the slug a session start printed under it, and when it ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NumberedReminder {
     pub slug: String,
     pub written_at: String,
 }
 
-/// The reminder the last session start in `cwd` numbered `arg`, or `None` when `arg` is not a
-/// number that session start printed. `None` leaves `arg` to be read as a slug, so a reminder whose
-/// slug is all digits stays reachable whenever its slug is not also a DUE NOW number.
+/// What either numbers file holds, read the same way.
+#[derive(Deserialize)]
+struct Numbers {
+    written_at: String,
+    #[serde(default)]
+    reminders: BTreeMap<String, String>,
+}
+
+/// The reminder numbered `arg` in DUE NOW, or `None` when `arg` is not such a number. Inside a session
+/// (`CLAUDE_CODE_SESSION_ID` set) only that session's own numbers count, and a session with none on
+/// file resolves nothing; outside one, the last session start in `cwd` decides. `None` leaves `arg`
+/// to be read as a slug, so a reminder whose slug is all digits stays reachable whenever its slug is
+/// not also a DUE NOW number.
 pub fn reminder_number(cwd: &Path, arg: &str) -> Option<NumberedReminder> {
     if arg.is_empty() || !arg.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let dir = session_start_dir(cwd)?;
-    let text = std::fs::read_to_string(dir.join(LETTERS_FILE)).ok()?;
-    let file: LettersFile = serde_json::from_str(&text).ok()?;
     let n: usize = arg.parse().ok()?;
+    let dir = session_start_dir(cwd)?;
+    let path = match crate::relay::env_session_id() {
+        Some(session) => dir.join(DUE_NOW_DIR).join(session_file_name(&session)?),
+        None => dir.join(LETTERS_FILE),
+    };
+    let file: Numbers = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     file.reminders.get(&n.to_string()).map(|slug| NumberedReminder {
         slug: slug.clone(),
         written_at: file.written_at.clone(),

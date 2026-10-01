@@ -374,6 +374,9 @@ fn run(
         .env_remove("BASE_NO_WAKE_NUDGE")
         .env_remove("BASE_NO_AUTONAME")
         .env_remove("BASE_RELAY_AS")
+        // Claude Code puts the session id in every Bash tool's environment, so a test run from a
+        // session would otherwise hand that session to each command it spawns.
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -435,6 +438,26 @@ pub fn run_session_start(seed: &Seed, session: Option<&str>) -> (i32, String, St
 /// Any other `base` command, from the seeded workspace.
 pub fn run_base(seed: &Seed, args: &[&str]) -> (i32, String, String) {
     run(seed, args, None, None)
+}
+
+/// A `base` command run the way a session's Bash tool runs it: `CLAUDE_CODE_SESSION_ID` names the
+/// session, as Claude Code sets it.
+pub fn run_base_in_session(seed: &Seed, args: &[&str], session: &str) -> (i32, String, String) {
+    let mut cmd = Command::new(BIN);
+    cmd.args(args)
+        .current_dir(&seed.ws)
+        .env("BASE_HOME", &seed.home)
+        .env("BASE_NO_AUTO_UPDATE", "1")
+        .env("BASE_AST_NO_SPAWN", "1")
+        .env_remove("BASE_RELAY_AS")
+        .env("CLAUDE_CODE_SESSION_ID", session)
+        .stdin(Stdio::null());
+    let out = cmd.output().expect("the base binary runs");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// UTF-16 units.

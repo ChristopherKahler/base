@@ -163,8 +163,9 @@ Raise it in base.toml, or run `base doctor` to see what each hook emitted.]\n"
 ///
 /// The first screen (spec A5, locked) is the one thing that can shorten `DueNow`: a `DueNow` block
 /// that carries fits (see [`Block::with_fits`]) lists fewer items, one at a time, until the first
-/// screen fits or its last fit is reached, and its line says how many it shows and the command for
-/// the rest (A4's rule for a trimmed item). Before BO-00 B4 (2026-10-01) DUE NOW always showed in
+/// screen fits, and its line says how many it shows and the command for the rest (A4's rule for a
+/// trimmed item). It is shortened only when its last fit would make the screen fit; otherwise
+/// nothing is cut for an overflow it cannot cure. Before BO-00 B4 (2026-10-01) DUE NOW always showed in
 /// full and an overflow was only reported; on Chris's store five due reminders took a first screen
 /// of 2,871 units against 2,000. What still overflows is reported in [`Rendered::first_screen_ok`].
 ///
@@ -624,8 +625,13 @@ impl Emission {
             let total = text.len();
             // The first-screen pass. The header, `Pinned` and `DueNow` are the whole first screen;
             // only a `DueNow` block with fits can give anything back, one item per pass, and
-            // never past its last fit. What still overflows is reported in `first_screen_ok`.
-            if prefix > self.first_screen_u16 && self.fit_first_screen() {
+            // never past its last fit. It runs only when that would make the screen fit: an
+            // overflow from blocks that cannot shrink (a long relay message) would otherwise hide
+            // due reminders for nothing. What still overflows is reported in `first_screen_ok`.
+            if prefix > self.first_screen_u16
+                && self.first_screen_floor(&head) <= self.first_screen_u16
+                && self.fit_first_screen()
+            {
                 continue;
             }
             // `Pinned` is not excluded here: `next_level` already refuses it, and a second guard
@@ -676,6 +682,21 @@ impl Emission {
             push_line(&mut s, b.text());
         }
         s
+    }
+
+    /// The first screen with every block that can still fit at its last fit, under `head`: the
+    /// shortest the first-screen pass can make it.
+    fn first_screen_floor(&self, head: &str) -> usize {
+        let mut s = String::new();
+        push_line(&mut s, head);
+        for b in self.blocks.iter().take_while(|b| b.rank <= Rank::DueNow) {
+            let text = match b.fits.last() {
+                Some((last, _)) if b.can_fit() => last.as_str(),
+                _ => b.text(),
+            };
+            push_line(&mut s, text);
+        }
+        u16_len(&s)
     }
 
     /// Step the bottom-most `DueNow` block that has a fit left down one, and ledger what it stops
@@ -905,10 +926,42 @@ mod tests {
         assert_eq!(due_rows(&two_steps), [(Reason::ListCut, 2)], "one row for the block, however many steps");
         assert!(two_steps.text.starts_with(&"I".repeat(40)), "the pinned block is never stepped");
 
-        let floor = render(50);
-        assert_eq!(shown(&floor), Some(1), "never past the last fit: the most overdue item always shows");
-        assert!(!floor.first_screen_ok, "what still overflows is reported");
-        assert_eq!(floor.first_screen_len_u16, 92);
+        // 92 at the last fit is still past 50, so no step can make it fit: nothing is cut, and the
+        // overflow is reported. Stepping stops at the last fit at the latest, because it only starts
+        // when the last fit fits.
+        let unreachable = render(50);
+        assert_eq!(shown(&unreachable), Some(3), "cut although no cut could make the screen fit");
+        assert!(!unreachable.first_screen_ok, "what still overflows is reported");
+        assert!(due_rows(&unreachable).is_empty());
+        assert_eq!(unreachable.first_screen_len_u16, 194);
+    }
+
+    /// A first screen that stepping cannot fix is left alone (BO-00 code review): a `DueNow` block
+    /// with no fits (a relay message) that overflows on its own would otherwise cost every due
+    /// reminder but one for nothing. The control is the same layout with a short message, where
+    /// stepping does make it fit and does run.
+    #[test]
+    fn due_now_is_not_cut_when_cutting_cannot_make_the_first_screen_fit() {
+        let line = |i: usize| format!("{i}{}", "d".repeat(49));
+        let due = |k: usize| (1..=k).map(line).collect::<Vec<_>>().join("\n");
+        let render = |message: usize| {
+            let mut e = Emission::new(10_000, 150);
+            assert!(e.push(blk("instructions", Rank::Pinned, &"I".repeat(40), 0)));
+            assert!(e.push(blk("due", Rank::DueNow, &due(3), 3).with_fits(vec![(due(2), 2), (due(1), 1)])));
+            assert!(e.push(blk("relay-inbox", Rank::DueNow, &"R".repeat(message), 1)));
+            e.render(&FullOutput::off(), None)
+        };
+        let shown = |r: &Rendered| r.blocks.iter().find(|b| b.id() == "due").map(Block::items_shown);
+
+        // 41 + 152 + 201 whole; 41 + 51 + 201 = 293 at the last fit, still past 150.
+        let long = render(200);
+        assert_eq!(shown(&long), Some(3), "reminders cut although no cut could make the screen fit");
+        assert!(!long.first_screen_ok && long.withheld.is_empty());
+
+        // 41 + 51 + 21 = 113 at the last fit: stepping can fit, so it runs, down to one.
+        let short = render(20);
+        assert_eq!(shown(&short), Some(1), "control: with a short message the pass still fits the screen");
+        assert!(short.first_screen_ok);
     }
 
     fn blk(id: &str, rank: Rank, full: &str, total: usize) -> Block {

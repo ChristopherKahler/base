@@ -156,6 +156,7 @@ fn run_event(
             // `[budget] session_start_bytes`, and printed ONCE (rank 00). The untrimmed text
             // goes to `.base/last-session-start.md` before anything prints.
             let mut out = session_start::SessionOutput::new();
+            out.set_session(session_id.as_deref());
             let handled = session_start::handle(&config, &cwd, session_id.as_deref(), &mut out);
             if handled.is_ok() {
                 // Relay inbox push: pending messages addressed to this session, due now

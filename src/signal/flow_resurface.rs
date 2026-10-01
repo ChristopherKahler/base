@@ -375,9 +375,16 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<DueNow> {
     Ok(DueNow {
         text: block(total),
         slugs: rows.into_iter().map(|(slug, _, _)| slug).collect(),
-        fits: (1..total).rev().map(|k| (block(k), k)).collect(),
+        // Capped, so the renderings stay linear in the reminder count: with no cap, 1,000 due
+        // reminders would build 999 renderings of up to 1,000 lines each (BO-00 code review).
+        fits: (1..total.min(FIT_CAP + 1)).rev().map(|k| (block(k), k)).collect(),
     })
 }
+
+/// The most reminders a trimmed DUE NOW lists. A numbered line is at least about ten UTF-16 units and
+/// the default first screen is 2,000, so more than this never fits one; a DUE NOW longer than the cap
+/// steps from all of them straight to this many.
+const FIT_CAP: usize = 100;
 
 /// Find notes with mentionCount >= threshold — recurring ideas that should be promoted.
 fn mention_threshold_scan(cwd: &Path, ns: &NamespaceConfig, threshold: u32) -> Result<String> {

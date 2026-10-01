@@ -24,6 +24,9 @@ pub struct SignalBlock {
     /// How many items exist. More than `items` when the block lists some of them, as HANDOFFS lists
     /// ten of the open handoffs and FORKS the newest three (spec B4, B6).
     pub total: usize,
+    /// The block listing fewer items, most first, for session start's first-screen pass
+    /// (`emit::Block::with_fits`). Only DUE NOW has any.
+    pub fits: Vec<(String, usize)>,
 }
 
 /// One signal's output. Its blocks' texts joined are exactly what the signal rendered, and the
@@ -55,6 +58,7 @@ impl Signal {
                 text,
                 items,
                 total,
+                fits: Vec::new(),
             }],
         )
     }
@@ -79,8 +83,6 @@ pub struct SignalOutput {
     /// The slug of every reminder DUE NOW numbers, number 1 first, for the letters file
     /// `base reminder archive|snooze <number>` reads.
     pub reminders: Vec<String>,
-    /// DUE NOW listing fewer reminders, for the first-screen pass (see `flow_resurface::DueNow`).
-    pub reminder_fits: Vec<(String, usize)>,
     /// Records marked deferred across HANDOFFS, FORKS, PROJECTS, TASKS and MILESTONES, for line 1 (B2).
     pub deferred: usize,
     state: Option<(PathBuf, suppression::SignalState)>,
@@ -136,7 +138,6 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     let mut diagnostics: Vec<String> = Vec::new();
     let mut letters: Vec<(char, String)> = Vec::new();
     let mut reminders: Vec<String> = Vec::new();
-    let mut reminder_fits: Vec<(String, usize)> = Vec::new();
     let mut deferred = 0usize;
     let layout = &config.session_start;
     if layout.handoffs_shown > crate::crud::handoff_show::MAX_SHOWN {
@@ -171,6 +172,7 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
                     text: s.text,
                     items: s.shown,
                     total: s.total,
+                    fits: Vec::new(),
                 })
                 .collect();
             results.push((1, Signal::new("active-awareness", blocks)));
@@ -222,8 +224,14 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         Ok(due) if !due.text.is_empty() => {
             let n = due.slugs.len();
             reminders = due.slugs;
-            reminder_fits = due.fits;
-            results.push((0, Signal::single("reminder", "reminders", due.text, n, n)));
+            let block = SignalBlock {
+                kind: "reminders",
+                text: due.text,
+                items: n,
+                total: n,
+                fits: due.fits,
+            };
+            results.push((0, Signal::new("reminder", vec![block])));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-reminder-scan:no-match>")),
         Err(e) => eprintln!("base: signal 'reminder' failed: {e}"),
@@ -273,7 +281,6 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         diagnostics,
         letters,
         reminders,
-        reminder_fits,
         deferred,
         state,
     })

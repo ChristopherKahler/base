@@ -447,11 +447,19 @@ fn kind_of(id: &str) -> &str {
 pub struct SessionOutput {
     fragments: Fragments,
     signals: Option<SignalOutput>,
+    /// The session this start belongs to, when the host named one: DUE NOW's numbers are kept per
+    /// session so `base reminder archive <number>` cannot reach another session's list.
+    session_id: Option<String>,
 }
 
 impl SessionOutput {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Name the session this start belongs to.
+    pub fn set_session(&mut self, session_id: Option<&str>) {
+        self.session_id = session_id.map(str::to_string);
     }
 
     /// One print site's exact output, newlines included. `items` counts what it lists.
@@ -511,19 +519,14 @@ impl SessionOutput {
         if let Some(signals) = &self.signals {
             for signal in signals.signals() {
                 for block in &signal.blocks {
-                    // DUE NOW's shorter renderings, for the first-screen pass in `Emission::render`.
-                    let fits = if block.kind == "reminders" {
-                        signals.reminder_fits.clone()
-                    } else {
-                        Vec::new()
-                    };
                     placed.push(Placed {
                         id: block.kind.to_string(),
                         kind: block.kind.to_string(),
                         text: block.text.clone(),
                         total: block.total,
                         shown: block.items,
-                        fits,
+                        // DUE NOW's shorter renderings, for the first-screen pass in `Emission::render`.
+                        fits: block.fits.clone(),
                     });
                 }
             }
@@ -590,6 +593,12 @@ impl SessionOutput {
             let kept = crate::crud::handoff_show::write_letters(&dir, &letters, reminders);
             if let Some(why) = kept.failure() {
                 eprintln!("base: session start could not keep its handoff letters: {why}");
+            }
+            if let Some(session) = self.session_id.as_deref() {
+                let kept = crate::crud::handoff_show::write_due_now(&dir, session, reminders);
+                if let Some(why) = kept.failure() {
+                    eprintln!("base: session start could not keep this session's DUE NOW numbers: {why}");
+                }
             }
         }
 
