@@ -68,6 +68,15 @@ pub fn days_past(when: &str) -> Option<i64> {
     )
 }
 
+/// The one rule for a due reminder (BO-06, F10c): live, and its `resurfaceAt` has passed. DUE NOW lists exactly these
+/// and the header and the pulse count exactly these. Until BO-06 the pulse counted "overdue" its own way, a `dueDate`
+/// before today in the workspace tier, archived reminders included, so on 2026-10-01 it said 4 beside a DUE NOW of 5.
+/// A time that does not parse is never due, as the old `<= now` comparison on an `xsd:dateTime` was never true for it.
+pub fn is_due(resurface_at: &str, archived: bool, now: chrono::DateTime<chrono::Local>) -> bool {
+    !archived
+        && chrono::DateTime::parse_from_rfc3339(resurface_at).is_ok_and(|when| when <= now)
+}
+
 /// The date a reminder due at `when` archives itself, for the warning line.
 pub fn archives_on(when: &str) -> Option<String> {
     let parsed = chrono::DateTime::parse_from_rfc3339(when).ok()?;

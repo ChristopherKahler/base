@@ -8,8 +8,9 @@
 //! matches or none write nothing (lane 3 verdicts, AMENDMENTS C).
 //!
 //! One selection serves session start and the letter path of `show`. The letters a session start
-//! printed are kept in a file beside its full output, so a letter names the handoff that session
-//! was shown even after a newer handoff is registered, which in a respawning chain is minutes later.
+//! printed are kept in that session's own file beside its full output (BO-06, F11), so a letter names
+//! the handoff that session was shown even after a newer handoff is registered, which in a
+//! respawning chain is minutes later, and even after another session starts in the same workspace.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -26,7 +27,8 @@ use crate::crud;
 /// Spec B4: letters A to J, so never more than ten handoffs are listed.
 pub const MAX_SHOWN: usize = 10;
 
-/// The letters the last session start printed, kept beside its full output.
+/// The letters the last session start in the workspace printed, of any session (F11c): read only
+/// outside a session. Each session's own are in `hook-output/<session>/letters.json`.
 pub const LETTERS_FILE: &str = "last-session-start-letters.json";
 
 /// One open handoff. Forks share the record type and are never in this list.
@@ -210,10 +212,13 @@ struct LettersFile {
 }
 
 /// Keep the letters and DUE NOW numbers session start printed, so `show <letter>` names the handoff
-/// that session saw and `reminder archive|snooze <number>` the reminder. Written through a temp file
-/// and a rename; a failure comes back as a value, never a panic.
+/// that session saw and `reminder archive|snooze <number>` the reminder: in the session's own
+/// `hook-output/<session>/letters.json` (BO-06, F11a) and in the workspace's latest copy. Written even
+/// when nothing is lettered or due, so an old letter cannot outlive the list that printed it. Written
+/// through a temp file and a rename; a failure comes back as a value, never a panic.
 pub fn write_letters(
     dir: &Path,
+    session: Option<&str>,
     letters: &[(char, String)],
     reminders: &[String],
 ) -> crate::emit::FullOutput {
@@ -230,26 +235,28 @@ pub fn write_letters(
             .collect(),
     };
     let text = serde_json::to_string_pretty(&file).unwrap_or_default();
-    crate::emit::write_full_output(&dir.join(LETTERS_FILE), &text)
+    crate::emit::session_files::write(dir, session, crate::emit::session_files::LETTERS_FILE, LETTERS_FILE, &text)
 }
 
-/// Each session's DUE NOW numbers, one file per session id, beside the letters file.
+/// Where each session's DUE NOW numbers were kept from BO-00 until BO-06, one `<session>.json` per session.
 ///
 /// WHY PER SESSION. The letters file is one per workspace and every session start rewrites it, so a
 /// number read from it can name a reminder another session's start numbered: session A sees
 /// 1 = pay-invoice, session B starts after pay-invoice was archived, the file now says 1 = call-bank,
-/// and A's `base reminder archive 1` archives call-bank (BO-00 code review, 2026-10-01). Inside a
-/// session `CLAUDE_CODE_SESSION_ID` names the session, so the number is read from that session's own
-/// file and nowhere else.
+/// and A's `base reminder archive 1` archives call-bank (BO-00 code review, 2026-10-01). BO-06 (F11)
+/// moved the numbers into the session's own `letters.json` beside its letters, which had the same
+/// defect. Nothing writes this folder now; a session started under an earlier build still reads its
+/// numbers here, and session start clears the folder after seven days (`emit::session_files::prune`).
 pub const DUE_NOW_DIR: &str = "due-now";
-/// Days a session's numbers file is kept after it was last written.
-const DUE_NOW_KEEP_DAYS: u64 = 7;
 
-#[derive(Serialize, Deserialize)]
-struct DueNowFile {
-    written_at: String,
-    session_id: String,
-    reminders: BTreeMap<String, String>,
+/// The letters file for `session`, inside that session, or the workspace's latest copy outside every
+/// session: inside one, only its own file counts, and a session with none resolves nothing from it.
+fn letters_path(dir: &Path, session: Option<&str>) -> Option<PathBuf> {
+    match session {
+        Some(session) => crate::emit::session_files::session_dir(dir, session)
+            .map(|d| d.join(crate::emit::session_files::LETTERS_FILE)),
+        None => Some(dir.join(LETTERS_FILE)),
+    }
 }
 
 /// A session id usable as a file or folder name. Claude Code's ids are UUIDs; anything else that
@@ -259,49 +266,6 @@ pub(crate) fn is_file_safe_session_id(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.len() <= 128
         && session_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
-/// A session id usable as a file name, or `None`.
-fn session_file_name(session_id: &str) -> Option<String> {
-    is_file_safe_session_id(session_id).then(|| format!("{session_id}.json"))
-}
-
-/// Keep the DUE NOW numbers `session_id`'s session start printed, and drop files of sessions not
-/// started for [`DUE_NOW_KEEP_DAYS`]. Written even when nothing is due, so an old number cannot
-/// outlive the list that printed it. A failure comes back as a value, never a panic.
-pub fn write_due_now(dir: &Path, session_id: &str, reminders: &[String]) -> crate::emit::FullOutput {
-    let Some(name) = session_file_name(session_id) else {
-        return crate::emit::FullOutput::not_written(format!("session id {session_id:?} is not a file name"));
-    };
-    let folder = dir.join(DUE_NOW_DIR);
-    if let Err(e) = std::fs::create_dir_all(&folder) {
-        return crate::emit::FullOutput::not_written(format!("{}: {e}", folder.display()));
-    }
-    if let Ok(entries) = std::fs::read_dir(&folder) {
-        let keep = std::time::Duration::from_secs(DUE_NOW_KEEP_DAYS * 24 * 60 * 60);
-        for entry in entries.flatten() {
-            let old = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age > keep);
-            if old && entry.path().extension().is_some_and(|x| x == "json") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-    let file = DueNowFile {
-        written_at: crud::now_iso(),
-        session_id: session_id.to_string(),
-        reminders: reminders
-            .iter()
-            .enumerate()
-            .map(|(i, slug)| ((i + 1).to_string(), slug.clone()))
-            .collect(),
-    };
-    let text = serde_json::to_string_pretty(&file).unwrap_or_default();
-    crate::emit::write_full_output(&folder.join(name), &text)
 }
 
 /// A DUE NOW number read back: the slug a session start printed under it, and when it ran.
@@ -330,11 +294,14 @@ pub fn reminder_number(cwd: &Path, arg: &str) -> Option<NumberedReminder> {
     }
     let n: usize = arg.parse().ok()?;
     let dir = session_start_dir(cwd)?;
-    let path = match crate::relay::env_session_id() {
-        Some(session) => dir.join(DUE_NOW_DIR).join(session_file_name(&session)?),
-        None => dir.join(LETTERS_FILE),
-    };
-    let file: Numbers = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let session = crate::relay::env_session_id();
+    let path = letters_path(&dir, session.as_deref())?;
+    let text = std::fs::read_to_string(&path).ok().or_else(|| {
+        // A session started under an earlier build kept its numbers in `due-now/<session>.json`.
+        let session = session.as_deref().filter(|s| is_file_safe_session_id(s))?;
+        std::fs::read_to_string(dir.join(DUE_NOW_DIR).join(format!("{session}.json"))).ok()
+    })?;
+    let file: Numbers = serde_json::from_str(&text).ok()?;
     file.reminders.get(&n.to_string()).map(|slug| NumberedReminder {
         slug: slug.clone(),
         written_at: file.written_at.clone(),
@@ -350,11 +317,11 @@ enum Letters {
     },
 }
 
-fn read_letters(dir: Option<&Path>) -> Letters {
-    let Some(dir) = dir else {
+/// The letters `session`'s start printed (F11d), or the workspace's latest copy outside every session.
+fn read_letters(dir: Option<&Path>, session: Option<&str>) -> Letters {
+    let Some(path) = dir.and_then(|dir| letters_path(dir, session)) else {
         return Letters::Absent;
     };
-    let path = dir.join(LETTERS_FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Letters::Absent,
@@ -559,14 +526,18 @@ pub fn resolve(
 
     if !fork && let Some(letter) = as_letter(&query) {
         let dir = session_start_dir(cwd);
-        let (slug, written_at) = match read_letters(dir.as_deref()) {
+        // Inside a session, its own letters and no other session's (BO-06, F11d): the workspace copy holds whichever
+        // session started last, and its A is not this session's A.
+        let session = crate::relay::env_session_id();
+        let (slug, written_at) = match read_letters(dir.as_deref(), session.as_deref()) {
             Letters::Read { written_at, map } => {
                 (map.get(&letter.to_string()).cloned(), Some(written_at))
             }
             unusable => {
-                let why = match unusable {
-                    Letters::Unreadable(why) => format!("the letters file is unreadable ({why})"),
-                    _ => "no session start here left a letters file".to_string(),
+                let why = match (unusable, session.as_deref()) {
+                    (Letters::Unreadable(why), _) => format!("the letters file is unreadable ({why})"),
+                    (_, Some(s)) => format!("this session ({s}) has no letters file here"),
+                    (_, None) => "no session start here left a letters file".to_string(),
                 };
                 out.notes.push(format!(
                     "{why}, so the letters were rebuilt now and can differ from the ones a session start printed"
@@ -755,7 +726,7 @@ impl Resolution {
                 };
                 let _ = writeln!(
                     s,
-                    "{} {open_word}{noun}s match \"{}\"{parked_note} by {}. None was picked; run base {noun} show <slug> for one:",
+                    "{} {open_word}{noun}s match \"{}\"{parked_note} by {}. None was picked; list them to the user and ask which, then run base {noun} show <slug>:",
                     many.len(),
                     self.query,
                     self.rule_text()

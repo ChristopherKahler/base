@@ -154,7 +154,8 @@ fn run_event(
         "session-start" => {
             // Everything session start says is collected, measured against
             // `[budget] session_start_bytes`, and printed ONCE (rank 00). The untrimmed text
-            // goes to `.base/last-session-start.md` before anything prints.
+            // goes to `.base/hook-output/<session>/session-start.md` and `.base/last-session-start.md`
+            // before anything prints (BO-06, F11).
             let mut out = session_start::SessionOutput::new();
             out.set_session(session_id.as_deref());
             let handled = session_start::handle(&config, &cwd, session_id.as_deref(), &mut out);
@@ -337,8 +338,16 @@ fn run_event(
             // already print. An empty emission leaves the previous full-output file alone.
             let dir = crate::crud::handoff_show::session_start_dir(&cwd);
             if let Some(d) = dir.as_ref() {
-                if !fitted.full_text.is_empty() {
-                    let _ = crate::emit::write_full_output(&d.join(crate::emit::record::PROMPT_FULL_FILE), &fitted.full_text);
+                // The session's own `prompt-submit.md` and the workspace's latest copy (BO-06, F11), and neither when
+                // `[budget] write_full_output = false`: until BO-06 this wrote the workspace file whatever it said.
+                if config.budget.write_full_output && !fitted.full_text.is_empty() {
+                    let _ = crate::emit::session_files::write(
+                        d,
+                        session_id.as_deref(),
+                        crate::emit::session_files::PROMPT_FILE,
+                        crate::emit::record::PROMPT_FULL_FILE,
+                        &fitted.full_text,
+                    );
                 }
                 if let Some(sid) = session_id.as_deref()
                     && let Some(why) = crate::emit::prompt::write_blocks(d, sid, &fitted).failure()

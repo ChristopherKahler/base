@@ -7,6 +7,7 @@ use oxigraph::sparql::{QueryResults, QuerySolution};
 use crate::config::{BaseConfig, DeferKind, WorkspaceEntry};
 use crate::crud;
 use crate::scope::{self, Home};
+use crate::signal::counts::Work;
 
 /// One working-set entity from the graph: a project, task or milestone in a working state.
 struct Wrow {
@@ -30,6 +31,7 @@ struct Wrow {
 /// Priority 1.
 pub fn run(cwd: &Path, config: &BaseConfig) -> Result<String> {
     Ok(run_sections(cwd, config)?
+        .sections
         .into_iter()
         .map(|s| s.text)
         .collect::<Vec<_>>()
@@ -47,12 +49,26 @@ pub struct Section {
     pub deferred: usize,
 }
 
+/// The working set's sections and the counts their first lines print (BO-06, F10). Session start's header and pulse
+/// read the same counts, so a block skipped as unchanged still has its numbers.
+#[derive(Default)]
+pub struct WorkingSet {
+    pub sections: Vec<Section>,
+    pub projects: Work,
+    pub tasks: Work,
+    pub milestones: Work,
+}
+
+/// A status that closes a record: counted as completed, never as working. The pulse always read `done` this way; until
+/// BO-06 the working set read it as working.
+const COMPLETED: [&str; 3] = ["complete", "completed", "done"];
+
 /// The working set as its sections, in order: projects, tasks, milestones, blocked (spec B6, board
 /// ruling R4). Each starts with its count and the command that lists all of it. PROJECTS lists the
 /// projects touched within `[session_start] recent_project_days`; TASKS and MILESTONES list the
 /// working ones a `hasTask` or `hasMilestone` link ties to one of those projects, which is what
 /// "in progress on recently touched projects" means here: no task status says "in progress".
-pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<Vec<Section>> {
+pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<WorkingSet> {
     let ns = &config.namespace;
     let p = &ns.prefix;
     let sparql = format!(
@@ -66,7 +82,7 @@ pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<Vec<Section>> {
              OPTIONAL {{ ?entity {p}:blockedBy ?blockedBy }}\n\
              OPTIONAL {{ ?entity {p}:path ?path }}\n\
              FILTER(?type IN ({p}:Project, {p}:App, {p}:Framework, {p}:TrackingProject, {p}:Task, {p}:Milestone))\n\
-             FILTER(?status NOT IN (\"complete\", \"completed\", \"archived\"))\n\
+             FILTER(?status != \"archived\")\n\
            }}\n\
            OPTIONAL {{ GRAPH ?tg {{ ?taskOf {p}:hasTask ?entity }} }}\n\
            OPTIONAL {{ GRAPH ?mg {{ ?milestoneOf {p}:hasMilestone ?entity }} }}\n\
@@ -81,21 +97,24 @@ pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<Vec<Section>> {
         // ABSENT. No graph in either tier. This must NOT fall through to the
         // ordinary empty rendering: "no graph was read" and "you have no work"
         // are opposite claims, and before this they produced the same screen.
-        return Ok(vec![Section {
-            kind: "working-set-scope",
-            text: ABSENT_LINE.to_string(),
-            shown: 0,
-            total: 0,
-            // ZERO BECAUSE THERE IS NOTHING TO COUNT, not because the count was
-            // skipped. `deferred` counts records of a listing block's own kind;
-            // this section lists nothing, it states the scope of what was read.
-            // On this arm no graph was read at all, so any other value would be
-            // a claim about records that were never seen.
-            deferred: 0,
-        }]);
+        return Ok(WorkingSet {
+            sections: vec![Section {
+                kind: "working-set-scope",
+                text: ABSENT_LINE.to_string(),
+                shown: 0,
+                total: 0,
+                // ZERO BECAUSE THERE IS NOTHING TO COUNT, not because the count was
+                // skipped. `deferred` counts records of a listing block's own kind;
+                // this section lists nothing, it states the scope of what was read.
+                // On this arm no graph was read at all, so any other value would be
+                // a claim about records that were never seen.
+                deferred: 0,
+            }],
+            ..WorkingSet::default()
+        });
     };
     let QueryResults::Solutions(solutions) = results else {
-        return Ok(Vec::new());
+        return Ok(WorkingSet::default());
     };
 
     let cell = |row: &QuerySolution, k: &str| {
@@ -143,14 +162,14 @@ pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<Vec<Section>> {
     let days = config.session_start.recent_project_days;
     let since = chrono::Utc::now() - chrono::Duration::days(days);
 
-    let mut sections = render_sections(&rows, current.as_deref(), &registry, days, since);
+    let mut set = render_sections(&rows, current.as_deref(), &registry, days, since);
     // The scope clause, on EVERY render and not only on not-found. Without it an
     // empty working set says "nothing exists" when it can only honestly say
     // "nothing in scope" -- and that is the sentence that makes EMPTY safe to
     // show at all. It is a line of its own because session_start_layout_test
     // matches the section headers with an exact `l == whole` comparison, so
     // widening a header would break the layout contract to fix the honesty one.
-    sections.push(Section {
+    set.sections.push(Section {
         kind: "working-set-scope",
         text: scope_line(current.as_deref(), &tiers),
         shown: 0,
@@ -160,7 +179,7 @@ pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<Vec<Section>> {
         // its own. The listing sections each carry their own count.
         deferred: 0,
     });
-    Ok(sections)
+    Ok(set)
 }
 
 /// What the block says when NEITHER tier has a graph.
@@ -207,7 +226,7 @@ fn render_sections(
     registry: &[WorkspaceEntry],
     days: i64,
     since: chrono::DateTime<chrono::Utc>,
-) -> Vec<Section> {
+) -> WorkingSet {
     let home_of = |path: &str| -> Home {
         let canon = if path.is_empty() { None } else { Some(scope::canonical_str(path)) };
         scope::home(canon.as_deref(), registry)
@@ -227,29 +246,37 @@ fn render_sections(
             .is_ok_and(|dt| dt.with_timezone(&chrono::Utc) >= since)
     };
     // Deferred rows are read so each block can count them (C8). They are never listed and never counted
-    // as working: the notice line is the only place they appear.
-    let working = |r: &Wrow| r.status != "blocked" && r.status != crud::deferred::DEFERRED;
+    // as working: the notice line is the only place they appear. Completed rows are read so the pulse's
+    // completed count comes from the same rows as everything else (BO-06); nothing lists them.
+    let completed = |r: &Wrow| COMPLETED.contains(&r.status.as_str());
+    let working = |r: &Wrow| {
+        r.status != "blocked" && r.status != crud::deferred::DEFERRED && !completed(r)
+    };
     let parked = |r: &Wrow| r.status == crud::deferred::DEFERRED;
 
+    let mut set = WorkingSet::default();
     let mut sections: Vec<Section> = Vec::new();
 
     // PROJECTS — scoped to the current workspace + un-homed; the recent ones listed.
-    let projects: Vec<&Wrow> = rows
-        .iter()
-        .filter(|r| working(r) && is_project(&r.ty) && in_briefing(&r.path))
-        .collect();
-    let parked_projects = rows
-        .iter()
-        .filter(|r| parked(r) && is_project(&r.ty) && in_briefing(&r.path))
-        .count();
+    let scoped_project = |r: &Wrow| is_project(&r.ty) && in_briefing(&r.path);
+    let projects: Vec<&Wrow> = rows.iter().filter(|r| working(r) && scoped_project(r)).collect();
     let recent: Vec<&Wrow> = projects.iter().copied().filter(|r| touched(r)).collect();
     let recent_name: HashMap<&str, &str> =
         recent.iter().map(|r| (r.id.as_str(), r.name.as_str())).collect();
+    // What the block's first line, the header and the pulse print. Counted here and nowhere else (BO-06, F10).
+    set.projects = Work {
+        active: projects.len(),
+        listed: recent.len(),
+        blocked: rows.iter().filter(|r| r.status == "blocked" && scoped_project(r)).count(),
+        completed: rows.iter().filter(|r| completed(r) && scoped_project(r)).count(),
+        deferred: rows.iter().filter(|r| parked(r) && scoped_project(r)).count(),
+    };
+    let parked_projects = set.projects.deferred;
     if !projects.is_empty() || parked_projects > 0 {
         let mut output = format!(
             "PROJECTS ({} active, touched in {days} days: {}) · all: base project list --all\n",
-            projects.len(),
-            recent.len()
+            set.projects.active,
+            set.projects.listed
         );
         for r in &recent {
             if r.next.is_empty() {
@@ -280,8 +307,8 @@ fn render_sections(
         sections.push(Section {
             kind: "projects",
             text: output.trim_end().to_string(),
-            shown: recent.len(),
-            total: projects.len(),
+            shown: set.projects.listed,
+            total: set.projects.active,
             deferred: parked_projects,
         });
     }
@@ -292,10 +319,6 @@ fn render_sections(
         ("milestones", "Milestone", "MILESTONES", "base milestone list", DeferKind::Milestone),
     ] {
         let all: Vec<&Wrow> = rows.iter().filter(|r| r.ty == ty && working(r)).collect();
-        let parked_here = rows.iter().filter(|r| r.ty == ty && parked(r)).count();
-        if all.is_empty() && parked_here == 0 {
-            continue;
-        }
         let listed: Vec<(&Wrow, &str)> = all
             .iter()
             .filter_map(|r| {
@@ -305,23 +328,37 @@ fn render_sections(
                     .map(|project| (*r, *project))
             })
             .collect();
+        let work = Work {
+            active: all.len(),
+            listed: listed.len(),
+            blocked: rows.iter().filter(|r| r.ty == ty && r.status == "blocked").count(),
+            completed: rows.iter().filter(|r| r.ty == ty && completed(r)).count(),
+            deferred: rows.iter().filter(|r| r.ty == ty && parked(r)).count(),
+        };
+        if ty == "Task" {
+            set.tasks = work;
+        } else {
+            set.milestones = work;
+        }
+        if work.active == 0 && work.deferred == 0 {
+            continue;
+        }
         let mut output = format!(
             "{title} ({} active, on projects touched in {days} days: {}) · all: {command}\n",
-            all.len(),
-            listed.len()
+            work.active, work.listed
         );
         for (r, project) in &listed {
             output.push_str(&format!("  {} · {project}\n", r.name));
         }
-        if let Some(line) = crud::deferred::notice(defer_kind, parked_here) {
+        if let Some(line) = crud::deferred::notice(defer_kind, work.deferred) {
             output.push_str(&format!("  {line}\n"));
         }
         sections.push(Section {
             kind,
             text: output.trim_end().to_string(),
-            shown: listed.len(),
-            total: all.len(),
-            deferred: parked_here,
+            shown: work.listed,
+            total: work.active,
+            deferred: work.deferred,
         });
     }
 
@@ -345,7 +382,8 @@ fn render_sections(
         });
     }
 
-    sections
+    set.sections = sections;
+    set
 }
 
 #[cfg(test)]
@@ -362,6 +400,7 @@ mod tests {
 
     fn joined(rows: &[Wrow], current: Option<&str>, registry: &[WorkspaceEntry]) -> String {
         render_sections(rows, current, registry, 7, week())
+            .sections
             .into_iter()
             .map(|s| s.text)
             .collect::<Vec<_>>()
@@ -435,15 +474,26 @@ mod tests {
         m1.owners = vec![alpha.id.clone()];
         let mut m2 = row("Milestone", "M2", "");
         m2.owners = vec![old.id.clone()];
-        let rows = vec![alpha, old, stuck, t1, t2, t3, m1, m2];
+        let mut shipped = row("Project", "Shipped", "");
+        shipped.status = "completed".into();
+        let mut closed = row("Task", "Closed", "");
+        closed.status = "done".into();
+        closed.owners = vec![alpha.id.clone()];
+        let rows = vec![alpha, old, stuck, t1, t2, t3, m1, m2, shipped, closed];
 
-        let sections = render_sections(&rows, None, &registry, 7, week());
+        let set = render_sections(&rows, None, &registry, 7, week());
         let counts: Vec<(&str, usize, usize)> =
-            sections.iter().map(|s| (s.kind, s.shown, s.total)).collect();
+            set.sections.iter().map(|s| (s.kind, s.shown, s.total)).collect();
         assert_eq!(
             counts,
             [("projects", 1, 2), ("tasks", 1, 3), ("milestones", 1, 2), ("blocked", 1, 1)]
         );
+        // BO-06 (F10): the counts the header and the pulse print are the ones the blocks print. Completed records
+        // (`Shipped`, and `Closed` under the pulse's old synonym `done`) are counted as completed and listed nowhere.
+        let work = |active, listed, blocked, completed| Work { active, listed, blocked, completed, deferred: 0 };
+        assert_eq!(set.projects, work(2, 1, 1, 1));
+        assert_eq!(set.tasks, work(3, 1, 0, 1));
+        assert_eq!(set.milestones, work(2, 1, 0, 0));
         let text = joined(&rows, None, &registry);
         assert!(text.contains("PROJECTS (2 active, touched in 7 days: 1) · all: base project list --all"), "{text}");
         assert!(text.contains("  Alpha (active)") && !text.contains("  Old (active)"), "{text}");
@@ -452,5 +502,6 @@ mod tests {
         assert!(text.contains("MILESTONES (2 active, on projects touched in 7 days: 1) · all: base milestone list"), "{text}");
         assert!(text.contains("  M1 · Alpha") && !text.contains("M2 ·"), "{text}");
         assert!(text.contains("BLOCKED (1)\n  Stuck: API keys"), "{text}");
+        assert!(!text.contains("Shipped") && !text.contains("Closed"), "a completed record is listed: {text}");
     }
 }
