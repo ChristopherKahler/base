@@ -46,6 +46,9 @@ use std::process::{Command, Stdio};
 /// absolute path so `Command` cannot re-resolve it. Elsewhere `bash` on `PATH` is the real
 /// thing. Which bash ran is printed by every leg, so a log always says what it measured.
 ///
+/// The search is the product's own, `base::shell::host_bash` (BO-08, F19): the plugin build runs
+/// `prepare.sh` through it, and this file tests the same function rather than a copy of it.
+///
 /// ON CI A MISSING HOST BASH FAILS, IT DOES NOT SKIP. Every leg below prints SKIPPED and returns, which
 /// libtest counts as passed, and the test-count guard (scripts/ci_guards.py) cannot tell that apart from
 /// a pass. A runner without a host bash is a broken runner, so the skip is kept for a dev machine only
@@ -59,46 +62,26 @@ fn bash() -> Option<String> {
     found
 }
 
+/// The product's bash, kept only if it runs.
 fn find_bash() -> Option<String> {
-    let works = |candidate: &str| {
-        Command::new(candidate)
-            .arg("-c")
-            .arg("exit 0")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
-    if cfg!(windows) {
-        let system_root = std::env::var("SystemRoot")
-            .unwrap_or_else(|_| r"C:\Windows".to_string())
-            .to_lowercase();
-        let found = std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|dir| {
-                let d = dir.to_string_lossy().to_lowercase();
-                !d.starts_with(&system_root) && !d.contains("windowsapps")
-            })
-            .map(|dir| dir.join("bash.exe"))
-            .find(|p| p.is_file())?;
-        let path = found.to_string_lossy().into_owned();
-        return works(&path).then_some(path);
-    }
-    ["bash", "/usr/bin/bash", "/bin/bash"]
-        .into_iter()
-        .find(|candidate| works(candidate))
-        .map(str::to_owned)
+    let path = base::shell::host_bash().ok()?.to_string_lossy().into_owned();
+    let works = Command::new(&path)
+        .arg("-c")
+        .arg("exit 0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    works.then_some(path)
 }
 
 /// The resolver must never hand back the WSL launcher: that is the hang, not a bash. Two
 /// detectors on two channels - the path string, and what the child itself reports as its
 /// kernel - so a future resolver edit that lands in System32 fails on both, not on a string
-/// this test happens to share with the resolver.
+/// this test happens to share with the resolver. On Linux and macOS the resolver returns the bare
+/// `bash`, so after printing which bash it found this test returns early there by design.
 #[test]
-fn on_windows_the_resolved_bash_is_the_host_shell_not_the_wsl_launcher() {
+fn resolved_bash_is_not_the_wsl_launcher() {
     let Some(sh) = bash() else {
         eprintln!("SKIPPED: bash not on PATH — this test cannot run here, and is not passing.");
         return;
@@ -111,10 +94,13 @@ fn on_windows_the_resolved_bash_is_the_host_shell_not_the_wsl_launcher() {
         std::path::Path::new(&sh).is_absolute(),
         "on Windows the path must be absolute, or Command re-resolves it through System32: {sh}"
     );
+    let lower = sh.to_lowercase();
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()).to_lowercase();
     assert!(
-        !sh.to_lowercase().contains(r"\windows\system32\"),
+        !lower.starts_with(&format!("{}\\", system_root.trim_end_matches('\\'))) && !lower.contains(r"\windows\system32\"),
         "resolved the WSL launcher: {sh}"
     );
+    assert!(!lower.contains(r"\windowsapps\"), "resolved a Store alias stub: {sh}");
     let kernel = Command::new(&sh).arg("-c").arg("uname -s").output().unwrap();
     let kernel = String::from_utf8_lossy(&kernel.stdout).trim().to_string();
     assert!(

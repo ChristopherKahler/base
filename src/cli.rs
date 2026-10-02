@@ -1714,10 +1714,20 @@ pub fn run() {
             std::process::exit(1);
         }
     };
+
+    // A hook event goes to the dispatcher before the config load below. The dispatcher loads its own config from the
+    // cwd the host reports, so this load was never used by a hook; and inside one of base's own headless calls a hook
+    // must print nothing at all (F27, BO-08), while this load prints any config fault it finds.
+    if let Some(Commands::Hook { event }) = &cli.command {
+        hook::dispatch(event);
+        return;
+    }
     let config = BaseConfig::load(&cwd);
 
     match cli.command {
-        Some(Commands::Hook { event }) => hook::dispatch(&event),
+        // Dispatched above, before the config load. Reaching this arm means that early return moved, and every base hook
+        // would silently do nothing, so it fails loudly instead.
+        Some(Commands::Hook { .. }) => unreachable!("hook events are dispatched before the config load"),
 
         // ─── Hooks manifest ─────────────────────────────────
         // Machine-readable only: stdout is one JSON object, because the sole

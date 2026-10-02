@@ -70,7 +70,16 @@ fn extract_tool_context(event: &serde_json::Value) -> (Option<String>, Option<St
 }
 
 /// Entry point for all hook events. Fail-open: any error → stderr only, exit 0, empty stdout.
+///
+/// Inside one of base's own headless `claude -p` calls (`BASE_HEADLESS`, set by `llm`) every event returns here before
+/// anything is parsed, printed or written: no config, no log row, no session file, no relay title (F27, BO-08). The
+/// payload is still drained, unread, as every hook run drained it before: a prompt hook's payload carries the whole
+/// extraction prompt, and the host should never be left writing it into a pipe nobody reads.
 pub fn dispatch(event: &str) {
+    if crate::llm::headless() {
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+        return;
+    }
     let outcome = run(event);
     let (success, data, error) = match &outcome.result {
         Ok(d) => (true, Some(d), None),

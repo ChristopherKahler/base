@@ -11,13 +11,30 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-/// `claude -p <prompt> --output-format text [--model <model>]`: the one place every call here is built.
+/// The variable every headless call base makes carries, set to `1` (F27, BO-08).
+///
+/// Claude Code runs the user's hooks inside a `claude -p` session, base's own among them, so without it a
+/// `base graph extract` fired base's session start inside base's own call: the call took a relay codename (or, started
+/// from a Windows Terminal tab, the tab's title: BO-05), wrote hook log rows and session files, and added base's context
+/// to the extraction prompt. Every base hook returns at once, printing and writing nothing, when it is set
+/// ([`headless`], checked first in `hook::dispatch`).
+pub const HEADLESS_ENV: &str = "BASE_HEADLESS";
+
+/// True inside one of base's own headless calls: [`HEADLESS_ENV`] is `1`, the value [`claude`] sets. Only that value
+/// counts, so `BASE_HEADLESS=0` or an empty export meant as "off" never turns every base hook off unseen.
+pub fn headless() -> bool {
+    std::env::var_os(HEADLESS_ENV).is_some_and(|v| v == "1")
+}
+
+/// `claude -p <prompt> --output-format text [--model <model>]` with [`HEADLESS_ENV`] set: the one place every call here
+/// is built.
 fn claude(prompt: &str, model: Option<&str>) -> Command {
     let mut cmd = Command::new("claude");
     cmd.arg("-p").arg(prompt).arg("--output-format").arg("text");
     if let Some(m) = model {
         cmd.arg("--model").arg(m);
     }
+    cmd.env(HEADLESS_ENV, "1");
     cmd
 }
 
@@ -137,4 +154,22 @@ pub fn complete_with_image(prompt: &str, image_path: &Path, model: Option<&str>)
         .output()
         .context("failed to spawn `claude` for vision — is Claude Code on PATH?")?;
     answer(out.status.success(), &out.stdout, &out.stderr, "claude -p (vision)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F27a (BO-08): every headless call is built by [`claude`], and the command it builds carries the marker, so the
+    /// child's environment has `BASE_HEADLESS=1` and base's own hooks inside the call return at once.
+    #[test]
+    fn headless_calls_set_marker() {
+        for model in [None, Some("haiku")] {
+            let cmd = claude("a prompt", model);
+            let marker: Vec<_> = cmd.get_envs().filter(|(k, _)| *k == HEADLESS_ENV).collect();
+            assert_eq!(marker, [(std::ffi::OsStr::new(HEADLESS_ENV), Some(std::ffi::OsStr::new("1")))], "model {model:?}");
+            assert_eq!(cmd.get_program(), "claude");
+            assert_eq!(cmd.get_args().take(2).collect::<Vec<_>>(), ["-p", "a prompt"]);
+        }
+    }
 }

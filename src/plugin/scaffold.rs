@@ -133,15 +133,24 @@ pub fn scaffold_plugin(name: &str, parent: &Path, opts: &ScaffoldOpts) -> Result
     })
 }
 
-/// Build the freshly-scaffolded plugin via prepare.sh (best-effort: a missing Bun is
-/// a warning, not a failure — the files are already written).
+/// Build the freshly-scaffolded plugin via prepare.sh (best-effort: a missing Bun, or on
+/// Windows a missing Git Bash, is a warning, not a failure — the files are already written).
 fn run_prepare(dir: &Path) -> Result<bool> {
     let have_bun = Command::new("bun").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
     if !have_bun {
         eprintln!("base: bun not found — skipping build (run ./prepare.sh after installing Bun: https://bun.sh)");
         return Ok(false);
     }
-    let status = Command::new("bash").arg("prepare.sh").current_dir(dir).status().context("running prepare.sh")?;
+    // No usable bash (Windows without Git Bash) is a missing tool, like a missing Bun: the files are written, so warn
+    // with what to install and let the git and repo steps run.
+    let mut cmd = match super::prepare_command(dir) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            eprintln!("base: warning — {e} Build skipped; run ./prepare.sh once bash is available.");
+            return Ok(false);
+        }
+    };
+    let status = cmd.status().context("running prepare.sh")?;
     if !status.success() {
         eprintln!("base: warning — prepare.sh did not succeed; build skipped");
         return Ok(false);
