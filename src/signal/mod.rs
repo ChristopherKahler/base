@@ -183,7 +183,10 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
             results.push((1, Signal::new("active-awareness", blocks)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-active-awareness:no-match>")),
-        Err(e) => eprintln!("base: signal 'active-awareness' failed: {e}"),
+        Err(e) => {
+            eprintln!("base: signal 'active-awareness' failed: {e}");
+            counts.failed.extend(["projects", "tasks", "milestones"]);
+        }
     }
     // Staleness is now owned by [protocol]: reconcile decays cold projects to
     // "deferred" at session-start, so a separate stale-flag scan is redundant.
@@ -218,7 +221,10 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
             ));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-handoff-scan:no-match>")),
-        Err(e) => eprintln!("base: signal 'handoff' failed: {e}"),
+        Err(e) => {
+            eprintln!("base: signal 'handoff' failed: {e}");
+            counts.failed.push("handoffs");
+        }
     }
     match flow_resurface::reminder_scan(cwd, ns) {
         Ok(due) if !due.text.is_empty() => {
@@ -235,7 +241,10 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
             results.push((0, Signal::new("reminder", vec![block])));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-reminder-scan:no-match>")),
-        Err(e) => eprintln!("base: signal 'reminder' failed: {e}"),
+        Err(e) => {
+            eprintln!("base: signal 'reminder' failed: {e}");
+            counts.failed.push("due");
+        }
     }
     // Forks — parallel side-work build-specs. Persistent like handoffs: their own
     // signal so they are never skipped as unchanged and surface every session until
@@ -248,7 +257,10 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
             results.push((0, Signal::single("fork", "forks", output, open, shown)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-fork-scan:no-match>")),
-        Err(e) => eprintln!("base: signal 'fork' failed: {e}"),
+        Err(e) => {
+            eprintln!("base: signal 'fork' failed: {e}");
+            counts.failed.push("forks");
+        }
     }
 
     // The pulse, last: it prints the counts the scans above made, never its own (BO-06, F10). Its decisions count is

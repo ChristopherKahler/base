@@ -140,6 +140,36 @@ fn handoff_letters_per_session() {
     assert!(numbers.contains("\"reminders\""), "the session's DUE NOW numbers sit beside its letters:\n{numbers}");
 }
 
+/// BO-06 review findings 1 and 2. When a session's own letters file is missing (its write failed), the session reads
+/// the workspace copy only while that copy says this session wrote it; once another session's start has replaced it,
+/// the session gets no letters and is told so, never the other session's A.
+#[test]
+fn a_session_missing_its_own_letters_reads_only_its_own_workspace_copy() {
+    let s = store("own-copy", "");
+    let (code, out1, err) = run_session_start(&s, Some(S1));
+    assert_eq!(code, 0, "{err}");
+    let a1 = letters_line(&out1)
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("A="))
+        .expect("session 1 lettered A")
+        .to_string();
+    let own = session_dir(&s, S1).join("letters.json");
+    std::fs::remove_file(&own).expect("remove session 1's own letters");
+    let (code, shown, err) = run_base_in_session(&s, &["handoff", "show", "A"], S1);
+    assert_eq!(code, 0, "{err}");
+    assert!(shown.contains(&format!("handoff: {a1} ")), "the workspace copy is session 1's, so it is read:\n{shown}");
+
+    register_newer_handoff(&s);
+    let (code, _, err) = run_session_start(&s, Some(S2));
+    assert_eq!(code, 0, "{err}");
+    assert!(!own.exists(), "control: session 1's own letters are still missing");
+    let (_, shown, _) = run_base_in_session(&s, &["handoff", "show", "A"], S1);
+    assert!(
+        shown.contains(&format!("this session ({S1}) has no letters file here")),
+        "the workspace copy is session 2's now, so session 1 is told it has none:\n{shown}"
+    );
+}
+
 /// Set a file's modification time `days` ago.
 fn age(path: &Path, days: u64) {
     let file = std::fs::OpenOptions::new().write(true).open(path).expect("open to set its time");

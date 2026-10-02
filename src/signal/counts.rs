@@ -22,7 +22,8 @@ pub struct Work {
     /// How many of them the block lists (the ones on a project touched recently).
     pub listed: usize,
     pub blocked: usize,
-    /// Status `complete`, `completed` or `done`.
+    /// Status `complete`, `completed` or `done`. Counted for projects only, the pulse's one use: the working-set query
+    /// leaves completed tasks and milestones out, so a long history costs session start nothing (BO-06 review).
     pub completed: usize,
     /// Status `deferred`: open but paused, counted on the block's notice line, never listed.
     pub deferred: usize,
@@ -46,9 +47,27 @@ pub struct Counts {
     pub milestones: Work,
     /// Decisions logged in the last seven days, in both tiers.
     pub decisions_week: usize,
+    /// The labels whose scan failed this session start (`due`, `handoffs`, `forks`, `projects`, `tasks`,
+    /// `milestones`). Their numbers are unknown: line 1 prints `?` for them and the pulse leaves their line out, instead
+    /// of a 0 nobody counted (BO-06 review). The failure itself goes to stderr where the scan failed.
+    pub failed: Vec<&'static str>,
 }
 
 impl Counts {
+    /// `n` as line 1 prints it under `label`: `?` when that label's scan failed.
+    pub fn shown(&self, label: &str, n: usize) -> String {
+        if self.failed.contains(&label) {
+            "?".to_string()
+        } else {
+            n.to_string()
+        }
+    }
+
+    /// Whether `label`'s number was counted this session start.
+    pub fn known(&self, label: &str) -> bool {
+        !self.failed.contains(&label)
+    }
+
     /// Records marked deferred across handoffs, forks, projects, tasks and milestones (spec B2, line 1).
     pub fn deferred(&self) -> usize {
         self.handoffs_deferred

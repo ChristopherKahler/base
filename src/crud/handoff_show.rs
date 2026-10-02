@@ -29,7 +29,7 @@ pub const MAX_SHOWN: usize = 10;
 
 /// The letters the last session start in the workspace printed, of any session (F11c): read only
 /// outside a session. Each session's own are in `hook-output/<session>/letters.json`.
-pub const LETTERS_FILE: &str = "last-session-start-letters.json";
+pub const LATEST_LETTERS_FILE: &str = "last-session-start-letters.json";
 
 /// One open handoff. Forks share the record type and are never in this list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +204,9 @@ pub fn session_start_dir(cwd: &Path) -> Option<PathBuf> {
 #[derive(Serialize, Deserialize)]
 struct LettersFile {
     written_at: String,
+    /// The session whose start wrote it (BO-06), so the workspace copy can say whose letters it holds.
+    #[serde(default)]
+    session_id: Option<String>,
     letters: BTreeMap<String, String>,
     /// DUE NOW's numbers, "1" first, each to its reminder's slug. Absent from a file written before
     /// 2026-10-01, which reads as no numbers.
@@ -224,6 +227,7 @@ pub fn write_letters(
 ) -> crate::emit::FullOutput {
     let file = LettersFile {
         written_at: crud::now_iso(),
+        session_id: session.map(str::to_string),
         letters: letters
             .iter()
             .map(|(l, slug)| (l.to_string(), slug.clone()))
@@ -235,7 +239,7 @@ pub fn write_letters(
             .collect(),
     };
     let text = serde_json::to_string_pretty(&file).unwrap_or_default();
-    crate::emit::session_files::write(dir, session, crate::emit::session_files::LETTERS_FILE, LETTERS_FILE, &text)
+    crate::emit::session_files::write(dir, session, crate::emit::session_files::LETTERS_FILE, LATEST_LETTERS_FILE, &text)
 }
 
 /// Where each session's DUE NOW numbers were kept from BO-00 until BO-06, one `<session>.json` per session.
@@ -249,14 +253,31 @@ pub fn write_letters(
 /// numbers here, and session start clears the folder after seven days (`emit::session_files::prune`).
 pub const DUE_NOW_DIR: &str = "due-now";
 
-/// The letters file for `session`, inside that session, or the workspace's latest copy outside every
-/// session: inside one, only its own file counts, and a session with none resolves nothing from it.
-fn letters_path(dir: &Path, session: Option<&str>) -> Option<PathBuf> {
-    match session {
-        Some(session) => crate::emit::session_files::session_dir(dir, session)
-            .map(|d| d.join(crate::emit::session_files::LETTERS_FILE)),
-        None => Some(dir.join(LETTERS_FILE)),
+/// The letters file `session` reads (F11d), as text, or `Ok(None)` when there is none. Inside a session: its own
+/// `hook-output/<session>/letters.json`, else the workspace copy only when that copy says this session wrote it (the
+/// session's own file could not be written; BO-06 review). Never another session's: the workspace copy holds whichever
+/// session started last, and its A is not this session's A. Outside every session: the workspace copy.
+fn letters_text(dir: &Path, session: Option<&str>) -> Result<Option<String>, String> {
+    let read = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    };
+    let latest = dir.join(LATEST_LETTERS_FILE);
+    let Some(session) = session else {
+        return read(&latest);
+    };
+    if let Some(own) = crate::emit::session_files::session_dir(dir, session)
+        && let Some(text) = read(&own.join(crate::emit::session_files::LETTERS_FILE))?
+    {
+        return Ok(Some(text));
     }
+    let written_by = |text: &str| {
+        serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|v| v["session_id"].as_str().map(str::to_string))
+    };
+    Ok(read(&latest)?.filter(|text| written_by(text).as_deref() == Some(session)))
 }
 
 /// A session id usable as a file or folder name. Claude Code's ids are UUIDs; anything else that
@@ -295,8 +316,7 @@ pub fn reminder_number(cwd: &Path, arg: &str) -> Option<NumberedReminder> {
     let n: usize = arg.parse().ok()?;
     let dir = session_start_dir(cwd)?;
     let session = crate::relay::env_session_id();
-    let path = letters_path(&dir, session.as_deref())?;
-    let text = std::fs::read_to_string(&path).ok().or_else(|| {
+    let text = letters_text(&dir, session.as_deref()).ok().flatten().or_else(|| {
         // A session started under an earlier build kept its numbers in `due-now/<session>.json`.
         let session = session.as_deref().filter(|s| is_file_safe_session_id(s))?;
         std::fs::read_to_string(dir.join(DUE_NOW_DIR).join(format!("{session}.json"))).ok()
@@ -319,20 +339,20 @@ enum Letters {
 
 /// The letters `session`'s start printed (F11d), or the workspace's latest copy outside every session.
 fn read_letters(dir: Option<&Path>, session: Option<&str>) -> Letters {
-    let Some(path) = dir.and_then(|dir| letters_path(dir, session)) else {
+    let Some(dir) = dir else {
         return Letters::Absent;
     };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Letters::Absent,
-        Err(e) => return Letters::Unreadable(format!("{}: {e}", path.display())),
+    let text = match letters_text(dir, session) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Letters::Absent,
+        Err(why) => return Letters::Unreadable(why),
     };
     match serde_json::from_str::<LettersFile>(&text) {
         Ok(file) => Letters::Read {
             written_at: file.written_at,
             map: file.letters,
         },
-        Err(e) => Letters::Unreadable(format!("{}: {e}", path.display())),
+        Err(e) => Letters::Unreadable(format!("the letters file: {e}")),
     }
 }
 

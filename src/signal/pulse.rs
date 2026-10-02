@@ -19,21 +19,24 @@ pub fn render(counts: &Counts) -> String {
     if p.active + p.blocked + p.completed + counts.tasks.active + counts.reminders_due + counts.decisions_week == 0 {
         return String::new();
     }
-    let mut output = String::from("[Workspace Pulse]\n");
-    output.push_str(&format!(
-        "Projects: {} active, {} blocked, {} completed\n",
-        p.active, p.blocked, p.completed
-    ));
-    if counts.tasks.active > 0 {
-        output.push_str(&format!("Tasks: {} active\n", counts.tasks.active));
+    let mut lines = Vec::new();
+    // A number whose scan failed is left out, never printed as 0 (BO-06 review).
+    if counts.known("projects") {
+        lines.push(format!("Projects: {} active, {} blocked, {} completed", p.active, p.blocked, p.completed));
     }
-    if counts.reminders_due > 0 {
-        output.push_str(&format!("Reminders: {} due\n", counts.reminders_due));
+    if counts.known("tasks") && counts.tasks.active > 0 {
+        lines.push(format!("Tasks: {} active", counts.tasks.active));
+    }
+    if counts.known("due") && counts.reminders_due > 0 {
+        lines.push(format!("Reminders: {} due", counts.reminders_due));
     }
     if counts.decisions_week > 0 {
-        output.push_str(&format!("Decisions: {} this week\n", counts.decisions_week));
+        lines.push(format!("Decisions: {} this week", counts.decisions_week));
     }
-    output.trim_end().to_string()
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("[Workspace Pulse]\n{}", lines.join("\n"))
 }
 
 /// Decisions logged in the last seven days, in both tiers: the one count the pulse shows that no block lists. Until

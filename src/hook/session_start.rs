@@ -693,7 +693,8 @@ struct Placed {
 ///
 /// THE WORDING IS BUDGETED. The header, this block (Letters line included) and DUE NOW must end
 /// inside the first 2,000 UTF-16 units; `tests/deferral_test.rs` FS1 holds them to a 1,990 bar on
-/// the worst case (ten 50-character slugs, the two longest DUE NOW lines, then line 6 printing). At
+/// the worst case (ten 50-character slugs, the two longest DUE NOW lines, and, until BO-06 removed
+/// it, line 6 printing). At
 /// 566c753 that case ended at 2011 units, 21 past the bar and 11 past the screen. Three phrases
 /// were shed (flint, 2026-09-21), each already said elsewhere on the same screen: line 4's
 /// "; several stay open" (line 4 already says forks are not a lettered choice), line 5's "and the
@@ -767,12 +768,12 @@ pub fn header_line(facts: &Facts<'_>, counts: &crate::signal::counts::Counts) ->
     };
     format!(
         "[BASE START · {} due · handoffs {} open ({handoffs_shown} shown) · forks {} · projects {} · tasks {} · milestones {}{parked} · withheld {} · full: {full}]",
-        counts.reminders_due,
-        counts.handoffs_open,
-        counts.forks_open,
-        counts.projects.active,
-        counts.tasks.active,
-        counts.milestones.active,
+        counts.shown("due", counts.reminders_due),
+        counts.shown("handoffs", counts.handoffs_open),
+        counts.shown("forks", counts.forks_open),
+        counts.shown("projects", counts.projects.active),
+        counts.shown("tasks", counts.tasks.active),
+        counts.shown("milestones", counts.milestones.active),
         facts.withheld_total(),
     )
 }
@@ -1327,6 +1328,27 @@ mod tests {
         assert_eq!(level("relay-wake"), Some(Level::Full), "{}", rendered.text);
         assert_eq!(level("operator"), Some(Level::Collapsed), "{}", rendered.text);
         assert_eq!(level("extensions"), Some(Level::Collapsed), "{}", rendered.text);
+    }
+
+    /// BO-06 review: a count whose scan failed is printed `?` on line 1, never as a 0 nobody counted, and the pulse
+    /// leaves its line out. Control: the counts that were counted print as numbers.
+    #[test]
+    fn a_count_whose_scan_failed_prints_a_question_mark() {
+        let mut counts = crate::signal::counts::Counts {
+            reminders_due: 2,
+            forks_open: 4,
+            failed: vec!["projects", "tasks", "milestones"],
+            ..Default::default()
+        };
+        let full = FullOutput::off();
+        let facts = Facts { blocks: &[], withheld: &[], full: &full };
+        let line = header_line(&facts, &counts);
+        assert!(line.contains("· 2 due ·") && line.contains("· forks 4 ·"), "control: {line}");
+        assert!(line.contains("· projects ? · tasks ? · milestones ? ·"), "{line}");
+        counts.decisions_week = 3;
+        let pulse = crate::signal::pulse::render(&counts);
+        assert!(!pulse.contains("Projects:") && !pulse.contains("Tasks:"), "{pulse}");
+        assert!(pulse.contains("Reminders: 2 due") && pulse.contains("Decisions: 3 this week"), "control: {pulse}");
     }
 
     /// Every block in [`SHOWN_ONCE`] floors to the full-output file and never to a command: its

@@ -83,6 +83,7 @@ pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<WorkingSet> {
              OPTIONAL {{ ?entity {p}:path ?path }}\n\
              FILTER(?type IN ({p}:Project, {p}:App, {p}:Framework, {p}:TrackingProject, {p}:Task, {p}:Milestone))\n\
              FILTER(?status != \"archived\")\n\
+             FILTER(?type IN ({p}:Project, {p}:App, {p}:Framework, {p}:TrackingProject) || ?status NOT IN (\"complete\", \"completed\", \"done\"))\n\
            }}\n\
            OPTIONAL {{ GRAPH ?tg {{ ?taskOf {p}:hasTask ?entity }} }}\n\
            OPTIONAL {{ GRAPH ?mg {{ ?milestoneOf {p}:hasMilestone ?entity }} }}\n\

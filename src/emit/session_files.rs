@@ -41,7 +41,9 @@ pub fn session_dir(base: &Path, session_id: &str) -> Option<PathBuf> {
 
 /// Write `text` as this session's `name` and as the workspace's latest copy `latest`. The outcome is the one the hook
 /// names: the session's own file when the host named a session with a usable id and it was written, else the latest
-/// copy. Never panics; a failure comes back as a value carrying its reason.
+/// copy. When the session's own file fails and the latest copy is written, the failure goes to stderr, because the copy
+/// named instead is the one the next session overwrites (BO-06 review). Never panics; a failure comes back as a value
+/// carrying its reason.
 pub fn write(base: &Path, session: Option<&str>, name: &str, latest: &str, text: &str) -> FullOutput {
     let own = session
         .and_then(|s| session_dir(base, s))
@@ -49,7 +51,13 @@ pub fn write(base: &Path, session: Option<&str>, name: &str, latest: &str, text:
     let shared = super::write_full_output(&base.join(latest), text);
     match own {
         Some(own) if own.written_path().is_some() || shared.written_path().is_none() => own,
-        _ => shared,
+        Some(own) => {
+            if let Some(why) = own.failure() {
+                eprintln!("base: this session's own {name} was not written ({why}); naming the workspace copy instead");
+            }
+            shared
+        }
+        None => shared,
     }
 }
 

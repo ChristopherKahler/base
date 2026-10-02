@@ -71,10 +71,20 @@ pub fn days_past(when: &str) -> Option<i64> {
 /// The one rule for a due reminder (BO-06, F10c): live, and its `resurfaceAt` has passed. DUE NOW lists exactly these
 /// and the header and the pulse count exactly these. Until BO-06 the pulse counted "overdue" its own way, a `dueDate`
 /// before today in the workspace tier, archived reminders included, so on 2026-10-01 it said 4 beside a DUE NOW of 5.
-/// A time that does not parse is never due, as the old `<= now` comparison on an `xsd:dateTime` was never true for it.
+/// An `xsd:dateTime` with no timezone (`2026-09-30T09:00:00`; base writes an offset, another writer may not) is read as
+/// local time. A time that does not parse at all is never due.
 pub fn is_due(resurface_at: &str, archived: bool, now: chrono::DateTime<chrono::Local>) -> bool {
-    !archived
-        && chrono::DateTime::parse_from_rfc3339(resurface_at).is_ok_and(|when| when <= now)
+    !archived && surface_time(resurface_at).is_some_and(|when| when <= now)
+}
+
+/// A stored `resurfaceAt`: RFC 3339, or a timezone-less `xsd:dateTime` read as local time.
+fn surface_time(value: &str) -> Option<chrono::DateTime<chrono::Local>> {
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(t.with_timezone(&chrono::Local));
+    }
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
+        .ok()
+        .and_then(|t| t.and_local_timezone(chrono::Local).earliest())
 }
 
 /// The date a reminder due at `when` archives itself, for the warning line.
@@ -380,4 +390,28 @@ pub fn overdue_for_auto_archive(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BO-06 review finding 4: the due rule reads a `resurfaceAt` with no timezone as local time, as the old SPARQL
+    /// comparison ordered it, instead of never counting it. Controls: an RFC 3339 time, an archived reminder, garbage.
+    #[test]
+    fn is_due_reads_a_time_with_no_timezone_as_local() {
+        let now = chrono::Local::now();
+        let yesterday = (now - chrono::Duration::days(1)).naive_local();
+        let tomorrow = (now + chrono::Duration::days(1)).naive_local();
+        for (value, archived, due) in [
+            (yesterday.format("%Y-%m-%dT%H:%M:%S").to_string(), false, true),
+            (yesterday.format("%Y-%m-%dT%H:%M:%S%.3f").to_string(), false, true),
+            (tomorrow.format("%Y-%m-%dT%H:%M:%S").to_string(), false, false),
+            ((now - chrono::Duration::hours(1)).to_rfc3339(), false, true),
+            ((now - chrono::Duration::hours(1)).to_rfc3339(), true, false),
+            ("not a time".to_string(), false, false),
+        ] {
+            assert_eq!(is_due(&value, archived, now), due, "{value:?}, archived {archived}");
+        }
+    }
 }
