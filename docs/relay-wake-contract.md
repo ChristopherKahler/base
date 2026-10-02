@@ -44,14 +44,23 @@ watcher, and whether it does is observable from outside the session.
 - Relay text never claims priority over the user's prompt. A ping is
   information: who, when, the message on its own line, and the reply command.
 - Relay content appears at session start and on a prompt, never on a tool call.
+  The one exception: a run that sets `BASE_NO_WAKE_NUDGE` (it cannot keep a
+  watcher) gets each new item once on its next tool call, in the same plain
+  form, with no watcher line. `BASE_RELAY_AS` does not count: the operator's
+  launchers set it on interactive sessions.
+- A title taken over mid-session (or a successor) is shown, once, the open
+  task in full and the unanswered pings in one line on its next prompt.
 - A new ping is shown once. While it stays unanswered, session start lists it in
   one line; prompts do not repeat it.
 - Of one sender's unshown messages, only the newest is shown; the older ones are
   kept, marked `superseded`, and the shown one names the command that lists
   them (`base relay tasks --from <sender>`, or for the spool
-  `base relay poll --project <p> --peek --all --from <sender>`).
-- A reply to a sender clears that sender's pings and marks its earlier spool
-  messages seen, so nothing it sent before is shown again.
+  `base relay poll --project <p> --peek --all --from <sender>`). A hidden ping
+  is still listed as unanswered. A sender with no title is never one thread.
+- A reply to a sender (a ping to someone whose ping is waiting) clears that
+  sender's pings and hidden messages and marks seen what it sent up to its
+  newest ping, so nothing it sent before is shown again. A ping that answers
+  nothing marks nothing.
 - A `relay send` message is written to the spool and dropped as a wake notify;
   the notify shows it, and marks the spool copy seen, so it is shown once.
 
