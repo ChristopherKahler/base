@@ -232,12 +232,14 @@ pub fn update_with(
     if let Some(v) = status { field("status", v); }
 
     if let Some(list) = keywords {
-        // Every graph's old keywords go, as `field_update` removes a single value wherever it is stamped; the new
-        // ones go where the decision's own type triple is, so a decision in another tier is left untouched.
+        // The old keywords go from every graph, as `field_update` removes a single value wherever it is stamped,
+        // and the new ones go into this tier's graph. Both are conditioned on the decision's type triple being in
+        // that graph, as `field_update` is, and the write below refuses outright when it is not: an unconditional
+        // delete with a conditional insert would leave the decision with no keywords and print that it has some.
         let pred = format!("{p}:{}", crate::domain::global_decisions::PRED_KEYWORD);
         updates.push(format!(
             "DELETE {{ GRAPH ?gg {{ <{iri}> {pred} ?old }} }}\n\
-             WHERE {{ GRAPH ?gg {{ <{iri}> {pred} ?old }} }}"
+             WHERE {{ GRAPH <{graph}> {{ <{iri}> a ?type }} GRAPH ?gg {{ <{iri}> {pred} ?old }} }}"
         ));
         if !list.is_empty() {
             let values = list
@@ -256,7 +258,19 @@ pub fn update_with(
     updates.push(crud::field_update(&graph, &iri, &format!("{p}:lastActive"), &format!("\"{now}\"^^xsd:dateTime")));
 
     let sparql = updates.join(" ;\n");
-    crud::load_and_mutate(cwd, ns, &sparql)
+    if keywords.is_none() {
+        return crud::load_and_mutate(cwd, ns, &sparql);
+    }
+    crud::load_read_then_mutate(cwd, ns, |store| {
+        let ask = format!("{}\nASK {{ GRAPH <{graph}> {{ <{iri}> a ?type }} }}", crud::prefixes(ns));
+        match crate::store::query(store, &ask) {
+            Ok(QueryResults::Boolean(true)) => Ok(sparql),
+            _ => anyhow::bail!(
+                "decision '{slug}' is not in this tier's graph <{graph}>, so nothing was changed. Run the command from \
+                 the workspace that holds it, or with -g for the global tier."
+            ),
+        }
+    })
 }
 
 pub fn delete(cwd: &Path, ns: &NamespaceConfig, keyword: &str) -> Result<usize> {

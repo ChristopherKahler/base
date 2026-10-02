@@ -350,14 +350,15 @@ pub fn walk_filtered(
 /// A store that will not project returns NO names rather than an error: this is an
 /// injection layer, and a prompt that fails to gain context must still be a prompt.
 ///
-/// `global` is this prompt's global decisions (BO-03, F5): one the text does not name by keyword is not listed.
+/// `withheld` names records this text must not be served (BO-03, F5): a global decision the text does not name by
+/// keyword, or one this session was already given. See [`walk_filtered`].
 pub fn walk_from_text(
     store: &oxigraph::store::Store,
     cwd: &Path,
     config: &BaseConfig,
     text: &str,
     already_served: &HashSet<String>,
-    global: &crate::domain::global_decisions::GlobalDecisions,
+    withheld: &dyn Fn(&str) -> bool,
 ) -> Vec<(Resolved, Vec<Record>)> {
     let Ok(maps) = crate::graph_query::maps_from_store(store, cwd, &config.namespace, false) else {
         return Vec::new();
@@ -380,7 +381,7 @@ pub fn walk_from_text(
             (head != bare).then(|| format!("<{head}>"))
         },
         // F5. `graph_query` ids are `<iri>`, the form `GlobalDecisions` keys on.
-        &|id: &str| global.withheld_from(id, text),
+        withheld,
     )
 }
 

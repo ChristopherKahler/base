@@ -280,3 +280,79 @@ fn a_global_decision_in_the_global_tier_takes_keywords_with_global() {
     assert!(hit.contains(SECURITY), "{hit}");
     assert!(!prompt(&w, PROMPT_THREE, "s-gt2").contains(SECURITY), "and not without a keyword");
 }
+
+/// A quad in the workspace's own graph, `graph/ws/work` (the workspace folder is `work`).
+fn append_quad(w: &Ws, s: &str, p: &str, o: &str) {
+    const NS: &str = "http://ops-sys.local/ontology#";
+    let graph = w.ws.join(".base").join("graph.nq");
+    let mut text = std::fs::read_to_string(&graph).unwrap();
+    text.push_str(&format!("<{NS}{s}> <{NS}{p}> <{NS}{o}> <{NS}graph/ws/work> .\n"));
+    std::fs::write(&graph, text).unwrap();
+}
+
+#[test]
+fn a_global_decision_is_served_once_per_session() {
+    // Code review, 2026-10-02: the decisions a prompt names change with each prompt, so they are their own block,
+    // each decision recorded as shown when it prints, like a rule; the domain's CONTEXT never changes because of
+    // them, so it is never re-sent because of them either.
+    let w = workspace("");
+    example_two(&w);
+    assert!(prompt(&w, "grazer please", "s-once").contains(GRAZER), "the first time");
+    assert!(!prompt(&w, "grazer again", "s-once").contains(GRAZER), "not twice in a session");
+    let other = prompt(&w, "open Brave and set up a second account", "s-once");
+    assert!(!other.contains(GRAZER), "not on another of its keywords either:\n{other}");
+    assert!(other.contains(TWO_ACCOUNTS), "while a decision not yet shown still goes:\n{other}");
+    assert!(prompt(&w, "grazer please", "s-other").contains(GRAZER), "a new session has been shown nothing");
+}
+
+#[test]
+fn a_decision_filed_under_a_matched_domain_too_is_that_domains_as_well() {
+    // Code review, 2026-10-02: F5 governs an always-on domain's decisions. One also filed under a keyword domain is
+    // that domain's too: its CONTEXT keeps it when the domain matches, and it is not a session-start-only record.
+    let w = workspace("[[domain]]\nname = \"widgets\"\nmode = \"triggered\"\nprompt_keywords = [\"widgets\"]\n");
+    let slug = log(&w, "GLOBAL", MEMORY);
+    append_quad(&w, "domain/widgets", "hasDecision", &format!("decision/{slug}"));
+    let hit = prompt(&w, "how are the widgets doing", "s-widgets");
+    assert!(hit.contains("[widgets CONTEXT]") && hit.contains(MEMORY), "the matched domain keeps it:\n{hit}");
+    assert!(!prompt(&w, PROMPT_THREE, "s-none").contains(MEMORY), "and GLOBAL alone does not serve it");
+    let start = session_start(&w, "s-start");
+    assert!(!start.contains("decisions with no keywords"), "it reaches prompts, so it is not listed there:\n{start}");
+}
+
+#[test]
+fn a_decision_under_two_always_on_domains_is_listed_under_the_first_by_name() {
+    let w = workspace("[[domain]]\nname = \"ALSO\"\nmode = \"always\"\n");
+    let slug = log(&w, "GLOBAL", MEMORY);
+    append_quad(&w, "domain/also", "hasDecision", &format!("decision/{slug}"));
+    for i in 0..3 {
+        let start = session_start(&w, &format!("s-two-{i}"));
+        assert!(
+            start.contains(&format!("[ALSO CONTEXT · decisions with no keywords, shown at session start only]\n  - Decision: {MEMORY}")),
+            "run {i}: one heading, the same every time:\n{start}"
+        );
+        assert!(!start.contains("[GLOBAL CONTEXT · decisions with no keywords"), "listed once:\n{start}");
+    }
+}
+
+#[test]
+fn decision_update_refuses_keywords_outside_its_tier() {
+    // Code review, 2026-10-02: the keywords are written into this tier's graph. A decision whose record sits in
+    // another graph is refused by name, and its keywords are left as they were, not deleted and reported as set.
+    const NS: &str = "http://ops-sys.local/ontology#";
+    let w = workspace("");
+    let other = format!("<{NS}graph/ws/elsewhere>");
+    let d = format!("<{NS}decision/global.moved-decision>");
+    let quads = format!(
+        "{d} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{NS}Decision> {other} .\n\
+         {d} <{NS}name> \"moved decision\" {other} .\n\
+         {d} <{NS}rationale> \"r\" {other} .\n\
+         {d} <{NS}decisionKeyword> \"kept\" {other} .\n\
+         <{NS}domain/global> <{NS}hasDecision> {d} {other} .\n"
+    );
+    std::fs::write(w.ws.join(".base").join("graph.nq"), quads).unwrap();
+    let (code, out, err) = run(&w, &["decision", "update", "global.moved-decision", "--keywords", "new"], None);
+    assert_ne!(code, 0, "refused: {out}");
+    assert!(err.contains("is not in this tier's graph"), "{err}");
+    let json = base(&w, &["decision", "search", "--keyword", "moved", "--json"]);
+    assert!(json.contains("\"kept\"") && !json.contains("\"new\""), "the keywords are as they were: {json}");
+}

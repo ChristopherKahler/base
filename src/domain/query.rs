@@ -27,16 +27,16 @@ fn walk_key(term: TermRef<'_>) -> Option<String> {
 /// every other caller, and both go through `domain::rules` for the rules half, so
 /// there is still exactly one place that knows what a rule is.
 ///
-/// `prompt` is the text the block is served for: a global decision appears only when
-/// the text carries one of its keywords (BO-03, F5; see [`domain::global_decisions`]).
+/// `withheld` names records this block leaves out: the prompt hook passes the global
+/// decisions for an always-on domain, which their own block serves on keywords (BO-03, F5;
+/// see [`domain::global_decisions`]).
 pub fn query_domain_neighborhood(
     store: &oxigraph::store::Store,
     config: &BaseConfig,
     domain_def: &domain::DomainDef,
-    global: &domain::global_decisions::GlobalDecisions,
-    prompt: &str,
+    withheld: &dyn Fn(&str) -> bool,
 ) -> (String, Vec<String>) {
-    let (_rules, neighborhood, served) = query_domain(store, config, domain_def, Some((global, prompt)));
+    let (_rules, neighborhood, served) = query_domain(store, config, domain_def, Some(withheld));
     (neighborhood, served)
 }
 
@@ -50,23 +50,22 @@ pub fn query_domain_from_graph(
     query_domain(store, config, domain_def, None)
 }
 
-/// [`query_domain_from_graph`] as a prompt with `text` receives it: a global decision only on one of its
-/// keywords (F5). `base context <text>` uses it, so the preview matches the prompt.
-pub fn query_domain_for_text(
+/// [`query_domain_from_graph`] without the records `withheld` names: `base context <text>` passes the global
+/// decisions for an always-on domain, as the prompt hook does (F5).
+pub fn query_domain_without(
     store: &oxigraph::store::Store,
     config: &BaseConfig,
     domain_def: &domain::DomainDef,
-    global: &domain::global_decisions::GlobalDecisions,
-    text: &str,
+    withheld: &dyn Fn(&str) -> bool,
 ) -> (String, String, Vec<String>) {
-    query_domain(store, config, domain_def, Some((global, text)))
+    query_domain(store, config, domain_def, Some(withheld))
 }
 
 fn query_domain(
     store: &oxigraph::store::Store,
     config: &BaseConfig,
     domain_def: &domain::DomainDef,
-    for_text: Option<(&domain::global_decisions::GlobalDecisions, &str)>,
+    withheld: Option<&dyn Fn(&str) -> bool>,
 ) -> (String, String, Vec<String>) {
     // The IRIs this domain block actually served. Prompt-time traversal walks
     // from the things the prompt NAMES and would otherwise re-serve records the
@@ -151,13 +150,13 @@ fn query_domain(
                     }
                 })
                 .collect();
-            // F5: a global decision only when the text names one of its keywords. Dropped before the stub guard
-            // and before anything is marked served, so a withheld decision is neither printed nor claimed, and
-            // the walk below meets the same rule for it (`hook::walk`).
-            let neighbors: Vec<(String, String, Option<String>)> = match for_text {
-                Some((global, text)) => neighbors
+            // F5: an always-on domain's global decisions are served by their own block, on keywords. Dropped
+            // before the stub guard and before anything is marked served, so a withheld record is neither printed
+            // nor claimed here.
+            let neighbors: Vec<(String, String, Option<String>)> = match withheld {
+                Some(withheld) => neighbors
                     .into_iter()
-                    .filter(|(_, _, iri)| !iri.as_deref().is_some_and(|id| global.withheld_from(id, text)))
+                    .filter(|(_, _, iri)| !iri.as_deref().is_some_and(withheld))
                     .collect(),
                 None => neighbors,
             };
@@ -335,7 +334,8 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
     crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
 
     let graph_store = crate::store::load_merged(cwd);
-    // F5, as the prompt hook applies it: a global decision only when the text carries one of its keywords.
+    // F5, as the prompt hook applies it: an always-on domain's CONTEXT leaves its decisions out, and the ones the
+    // text names by keyword print in their own block after the domains.
     let global = graph_store
         .as_ref()
         .map(|s| domain::global_decisions::GlobalDecisions::load(s, config, &domains))
@@ -369,7 +369,11 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
                 // deliberately does not do, and this command claims to be the same
                 // engine. Records dedup; a served ROOT still walks and is never listed as
                 // its own record (the binding 0.14.2 ruling).
-                let (r, n, served) = query_domain_for_text(store, config, domain_def, &global, text);
+                let (r, n, served) = if domain_def.is_always() {
+                    query_domain_without(store, config, domain_def, &|id| global.contains(id))
+                } else {
+                    query_domain_from_graph(store, config, domain_def)
+                };
                 domain_served.extend(served);
                 (r, n)
             }
@@ -423,8 +427,17 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
     // byte budget was written to avoid. Repeated calls therefore give the same answer.
     //
     // Lean mode does not apply -- there is no prompt count on this path.
+    //
+    // The global decisions the text names by keyword, as the prompt hook prints them (F5), with no session dedup
+    // either, for the same reason.
+    let (decisions, listed) = global.prompt_block(text, &|_| false);
+    if !decisions.is_empty() {
+        println!("{decisions}");
+    }
+    domain_served.extend(listed.iter().map(|d| d.id.clone()));
     if let Some(store) = &graph_store {
-        let walked = crate::hook::walk::walk_from_text(store, cwd, config, text, &domain_served, &global);
+        let withheld = |id: &str| global.withheld_from(id, text);
+        let walked = crate::hook::walk::walk_from_text(store, cwd, config, text, &domain_served, &withheld);
         let (block, _dropped) = crate::hook::walk::render(&walked, config.injection.walk_budget);
         if !block.is_empty() {
             print!("{block}");

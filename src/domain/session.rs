@@ -55,16 +55,6 @@ impl Bracket {
         rules.always.iter().chain(tier.iter()).collect()
     }
 
-    /// The texts of [`Bracket::entries`].
-    pub fn rules<'a>(&self, rules: &'a crate::config::BracketRules) -> Vec<&'a str> {
-        self.entries(rules).into_iter().map(|r| r.text.as_str()).collect()
-    }
-}
-
-/// Render every rule in force at this tier as an injectable block. Empty string when the tier
-/// contributes nothing, so the hook can push it unconditionally.
-pub fn format_bracket_rules(bracket: Bracket, rules: &crate::config::BracketRules) -> String {
-    render_bracket_rules(bracket, &bracket.rules(rules))
 }
 
 /// Render the given rule texts as the bracket block for `bracket`, numbered from 0. Empty string for no rules.
@@ -210,6 +200,15 @@ pub struct SessionState {
     /// force-refresh, which exists for domain context, never re-sends a bracket rule.
     #[serde(default)]
     pub rules_shown: HashMap<String, ShownRule>,
+    /// Scoped [`bracket_rule_key`] id → whether a CLAUDE.md Claude Code loads covered that bracket rule when this
+    /// session first met it (BO-03, F3).
+    ///
+    /// Decided ONCE per session, the way Claude Code reads CLAUDE.md: at launch, and again at `/compact`, which is
+    /// also a session start, and session start clears this session's records (`clear_for`). A CLAUDE.md edited
+    /// mid-session is not in the reader's context, so a verdict read on every prompt would follow an edit the
+    /// reader never saw. And it costs one read per session instead of one per prompt.
+    #[serde(default)]
+    pub bracket_covered: HashMap<String, bool>,
     /// Scoped key → the bracket tier the PROMPT hook most recently computed for this session.
     ///
     /// `petrel`'s FINDING 1 on `5c099d1`. The prompt hook reads its tier from the transcript's real
@@ -334,6 +333,7 @@ impl SessionState {
         self.standards_injected.retain(|k, _| !k.starts_with(&prefix));
         self.bracket_tier.retain(|k, _| !k.starts_with(&prefix));
         self.rules_shown.retain(|k, _| !k.starts_with(&prefix));
+        self.bracket_covered.retain(|k, _| !k.starts_with(&prefix));
         self.dirty_apps.retain(|k| !k.starts_with(&prefix));
         self.prompt_counts.remove(session_id);
         self.last_seen.remove(session_id);
@@ -570,6 +570,18 @@ impl SessionState {
         self.rule_due(&id, content, Bracket::Fresh, None, ReShow::PerSession { on_tier_change: false }, 0)
     }
 
+    /// Whether this session found the bracket rule `text` covered by a loaded CLAUDE.md, or `None` when it has not
+    /// decided yet. See [`SessionState::bracket_covered`].
+    pub fn bracket_coverage(&self, text: &str) -> Option<bool> {
+        self.bracket_covered.get(&self.scoped(&bracket_rule_key(text).0)).copied()
+    }
+
+    /// Record this session's coverage verdict for the bracket rule `text`.
+    pub fn record_bracket_coverage(&mut self, text: &str, covered: bool) {
+        let key = self.scoped(&bracket_rule_key(text).0);
+        self.bracket_covered.insert(key, covered);
+    }
+
     /// Whether this standard was already injected this session with the same
     /// rule content. Edited standards (new hash) re-inject.
     pub fn is_standard_injected(&self, id: &str, hash: u64) -> bool {
@@ -691,19 +703,18 @@ mod tests {
         }
     }
 
+    /// The texts of [`Bracket::entries`].
+    fn texts(b: Bracket, r: &crate::config::BracketRules) -> Vec<&str> {
+        b.entries(r).into_iter().map(|e| e.text.as_str()).collect()
+    }
+
     #[test]
     fn bracket_rules_are_always_plus_tier() {
         let r = sample_rules();
-        assert_eq!(
-            Bracket::Fresh.rules(&r),
-            vec!["ALWAYS_A", "ALWAYS_B", "FRESH_ONLY"]
-        );
-        assert_eq!(
-            Bracket::Critical.rules(&r),
-            vec!["ALWAYS_A", "ALWAYS_B", "CRIT_ONLY"]
-        );
+        assert_eq!(texts(Bracket::Fresh, &r), vec!["ALWAYS_A", "ALWAYS_B", "FRESH_ONLY"]);
+        assert_eq!(texts(Bracket::Critical, &r), vec!["ALWAYS_A", "ALWAYS_B", "CRIT_ONLY"]);
         // A tier never leaks another tier's bucket.
-        assert!(!Bracket::Moderate.rules(&r).contains(&"DEP_ONLY"));
+        assert!(!texts(Bracket::Moderate, &r).contains(&"DEP_ONLY"));
     }
 
     #[test]
@@ -717,7 +728,7 @@ mod tests {
             Bracket::Depleted,
             Bracket::Critical,
         ] {
-            let got = b.rules(&r);
+            let got = texts(b, &r);
             assert!(got.contains(&"ALWAYS_A"), "{b} dropped ALWAYS_A");
             assert!(got.contains(&"ALWAYS_B"), "{b} dropped ALWAYS_B");
         }
@@ -727,12 +738,12 @@ mod tests {
     fn empty_rules_render_nothing() {
         let empty = crate::config::BracketRules::default();
         assert!(empty.is_empty());
-        assert_eq!(format_bracket_rules(Bracket::Depleted, &empty), "");
+        assert_eq!(render_bracket_rules(Bracket::Depleted, &texts(Bracket::Depleted, &empty)), "");
     }
 
     #[test]
     fn rendered_block_is_numbered_and_tier_labelled() {
-        let out = format_bracket_rules(Bracket::Depleted, &sample_rules());
+        let out = render_bracket_rules(Bracket::Depleted, &texts(Bracket::Depleted, &sample_rules()));
         assert!(out.starts_with("[BRACKET RULES — DEPLETED]\n"));
         assert!(out.contains("  0. ALWAYS_A\n"));
         assert!(out.contains("  2. DEP_ONLY\n"));

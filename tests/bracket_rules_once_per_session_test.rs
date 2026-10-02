@@ -191,7 +191,10 @@ fn a_claude_md_in_the_working_folder_or_above_covers_too() {
 }
 
 #[test]
-fn a_covered_rule_is_not_recorded_so_it_returns_when_claude_md_drops_it() {
+fn coverage_is_read_once_per_session_as_claude_code_reads_claude_md() {
+    // Claude Code reads CLAUDE.md at launch and again at `/compact`, which is a session start, and session start
+    // clears this session's records. An edit in between is not in the reader's context, so it does not change
+    // what this session is sent; the next session reads the file again.
     let tmp = tempfile::tempdir().unwrap();
     base::home::with_thread_home(tmp.path(), || {
         let root = tmp.path();
@@ -199,13 +202,46 @@ fn a_covered_rule_is_not_recorded_so_it_returns_when_claude_md_drops_it() {
         user_claude_md(root, CLAUDE_MD);
         let rules = BracketRules {
             always: vec![covered("T1_RULE never hedge in prose", &["### T1 — Confidence is numeric, never prose"])],
+            depleted: vec![covered("T2_RULE when you change a stated position", &["### T2 — Position changes are audited"])],
             ..Default::default()
         };
         let cfg = config(rules);
-        assert!(sent(&prompt(&cfg, root, "one")).is_empty(), "covered");
+        assert!(sent(&prompt(&cfg, root, "one")).is_empty(), "covered at the session's first prompt");
+        let s = SessionState::load(&root.join(".base"));
+        assert_eq!(s.bracket_coverage("T1_RULE never hedge in prose"), Some(true), "the verdict is recorded");
+        assert_eq!(
+            s.bracket_coverage("T2_RULE when you change a stated position"),
+            Some(true),
+            "for every marked rule of every tier, read once"
+        );
+
         user_claude_md(root, "# Instructions\n\nThe trait section was removed.\n");
-        assert_eq!(sent(&prompt(&cfg, root, "two")), ["T1_RULE"], "no longer covered and never sent, so due");
-        assert!(sent(&prompt(&cfg, root, "three")).is_empty(), "and then once only");
+        for i in 2..=4 {
+            let out = prompt(&cfg, root, &format!("prompt {i}"));
+            assert!(sent(&out).is_empty(), "prompt {i}: the session keeps the CLAUDE.md it started with:\n{out}");
+        }
+
+        SessionState::clear(&root.join(".base")); // what session start does for the next session
+        assert_eq!(sent(&prompt(&cfg, root, "new session")), ["T1_RULE"], "a new session reads the file again");
+    });
+}
+
+#[test]
+fn the_same_text_covered_in_one_bucket_is_covered_in_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    base::home::with_thread_home(tmp.path(), || {
+        let root = tmp.path();
+        workspace(root);
+        user_claude_md(root, CLAUDE_MD);
+        let cfg = config(BracketRules {
+            always: vec![covered("T1_RULE never hedge", &["### T1 — Confidence is numeric, never prose"])],
+            depleted: vec!["T1_RULE never hedge".into()],
+            ..Default::default()
+        });
+        for i in 1..=4 {
+            let out = prompt(&cfg, root, &format!("prompt {i}"));
+            assert!(sent(&out).is_empty(), "prompt {i}: one text, one rule, covered:\n{out}");
+        }
     });
 }
 
@@ -402,7 +438,8 @@ fn a_tier_with_no_configured_rules_records_nothing() {
     // base ships no bracket rules, so a default install renders nothing, and nothing may be recorded as sent:
     // that would silence the first real rule an operator configures mid-session.
     let empty = BracketRules::default();
-    let rendered = base::domain::session::format_bracket_rules(Bracket::Fresh, &empty);
+    let texts: Vec<&str> = Bracket::Fresh.entries(&empty).iter().map(|r| r.text.as_str()).collect();
+    let rendered = base::domain::session::render_bracket_rules(Bracket::Fresh, &texts);
     assert!(rendered.is_empty(), "a default install renders nothing: {rendered:?}");
 
     let tmp = tempfile::tempdir().unwrap();

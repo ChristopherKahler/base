@@ -14,9 +14,17 @@
 //! such domain, `GLOBAL`; a machine with another always-on domain has the same problem with it, so the rule
 //! follows the mode and not the name. The prompt hook already ranks every always-on domain as global (F2).
 //!
+//! HOW THE PROMPT SERVES THEM. An always-on domain's CONTEXT block no longer lists its decisions at all: it
+//! would change with every prompt's keywords, and the block is deduped by its whole text, so each change would
+//! send the rest of it again. The decisions a prompt names by keyword go in their own block instead
+//! ([`GlobalDecisions::prompt_block`]), each one once per session like a rule. A decision that is ALSO filed
+//! under a domain that is not always-on (`elsewhere`) is that domain's as well: its CONTEXT keeps it when it
+//! matches, and the walk treats it as any record.
+//!
 //! One place answers "is this record a global decision, and does this text name it", for every surface that
-//! serves decisions on a prompt: the domain neighbourhood (`domain::query`), the prompt-time walk
-//! (`hook::walk`), and `base context`, which previews what a prompt with that text receives.
+//! serves decisions on a prompt: the domain neighbourhood (`domain::query`), the decisions block, the
+//! prompt-time walk (`hook::walk`), `base context`, which previews what a prompt with that text receives, and
+//! session start.
 
 use std::collections::HashMap;
 
@@ -37,10 +45,21 @@ pub struct GlobalDecision {
     /// The slug `base decision update` addresses: `{domain}.{decision}`.
     pub slug: String,
     pub name: String,
-    /// The always-on domain it is filed under, as `domains.toml` names it.
+    /// The always-on domain it is filed under, as `domains.toml` names it; the first by name when there are two,
+    /// so the heading it is listed under is the same on every run.
     pub domain: String,
     /// Sorted, lowercased, deduplicated.
     pub keywords: Vec<String>,
+    /// Also filed under a domain that is not always-on.
+    pub elsewhere: bool,
+}
+
+impl GlobalDecision {
+    /// The record [`GlobalDecisions::prompt_block`] claims when it prints this decision: once per session, and
+    /// again if its text changes.
+    pub fn claim_key(&self) -> (String, u64) {
+        (format!("global-decision:{}", self.id), crate::domain::session::rules_hash(std::slice::from_ref(&self.name)))
+    }
 }
 
 /// Every live global decision in a store, by id. Superseded and transient records are not in it.
@@ -87,8 +106,9 @@ impl GlobalDecisions {
         }
         let list = always.keys().map(|iri| format!("<{iri}>")).collect::<Vec<_>>().join(", ");
         // Both filters INSIDE the GRAPH group, beside the pattern they constrain (`supersede::sparql_exclude_superseded`
-        // says why). The keywords are read from any graph: `base decision update` writes them where the decision's
-        // type triple is, which need not be where the domain's `hasDecision` edge was written.
+        // says why). Every domain that files the decision is returned, so one filed elsewhere too is known. The
+        // keywords are read from any graph: `base decision update` writes them where the decision's type triple is,
+        // which need not be where a domain's `hasDecision` edge was written.
         let no_transient = crate::ontology::transient::sparql_exclude(ns, "d");
         let no_superseded = crate::supersede::sparql_exclude_superseded(ns, "d");
         let sparql = format!(
@@ -97,9 +117,9 @@ impl GlobalDecisions {
                GRAPH ?g {{\n\
                  ?dom {p}:hasDecision ?d .\n\
                  ?d {p}:name ?name .\n\
-                 FILTER(?dom IN ({list}))\n\
                  {no_transient}{no_superseded}\
                }}\n\
+               FILTER EXISTS {{ GRAPH ?ag {{ ?ad {p}:hasDecision ?d . FILTER(?ad IN ({list})) }} }}\n\
                OPTIONAL {{ GRAPH ?kg {{ ?d {p}:{PRED_KEYWORD} ?kw }} }}\n\
              }}",
             pfx = crud::prefixes(ns),
@@ -125,9 +145,15 @@ impl GlobalDecisions {
                 id,
                 slug: crud::slug_of(&d),
                 name,
-                domain: always.get(&dom).map(|n| (*n).to_string()).unwrap_or_default(),
+                domain: String::new(),
                 keywords: Vec::new(),
+                elsewhere: false,
             });
+            match always.get(&dom) {
+                Some(n) if entry.domain.is_empty() || *n < entry.domain.as_str() => entry.domain = (*n).to_string(),
+                Some(_) => {}
+                None => entry.elsewhere = true,
+            }
             if let Some(kw) = literal("kw").map(|k| k.trim().to_lowercase()).filter(|k| !k.is_empty())
                 && !entry.keywords.contains(&kw)
             {
@@ -144,36 +170,67 @@ impl GlobalDecisions {
         self.by_id.is_empty()
     }
 
-    /// True when `id` (`<iri>`) is a global decision that a prompt with this text does NOT receive: one with
-    /// no keywords, or none of whose keywords is in the text. False for every other record, so a caller can
-    /// ask it about anything it is about to serve.
-    pub fn withheld_from(&self, id: &str, text: &str) -> bool {
-        self.by_id.get(id).is_some_and(|d| !keyword_hit(&d.keywords, text))
+    /// True when `id` (`<iri>`) is a global decision. An always-on domain's CONTEXT leaves every one of them out:
+    /// [`GlobalDecisions::prompt_block`] serves them.
+    pub fn contains(&self, id: &str) -> bool {
+        self.by_id.contains_key(id)
     }
 
-    /// The global decisions with no keywords, which only session start serves; by domain, then name.
-    pub fn without_keywords(&self) -> Vec<&GlobalDecision> {
-        let mut out: Vec<&GlobalDecision> = self.by_id.values().filter(|d| d.keywords.is_empty()).collect();
+    pub fn get(&self, id: &str) -> Option<&GlobalDecision> {
+        self.by_id.get(id)
+    }
+
+    /// True when `id` is a global decision filed only under always-on domains and a prompt with this text does
+    /// NOT receive it: it has no keywords, or none of them is in the text. False for every other record, so the
+    /// walk can ask it about anything it is about to list.
+    pub fn withheld_from(&self, id: &str, text: &str) -> bool {
+        self.by_id.get(id).is_some_and(|d| !d.elsewhere && !keyword_hit(&d.keywords, text))
+    }
+
+    /// The global decisions a prompt with this text names by keyword, by domain and then name, leaving out those
+    /// `skip` says were already served.
+    pub fn matched<'a>(&'a self, text: &str, skip: &dyn Fn(&GlobalDecision) -> bool) -> Vec<&'a GlobalDecision> {
+        let mut out: Vec<&GlobalDecision> =
+            self.by_id.values().filter(|d| keyword_hit(&d.keywords, text) && !skip(d)).collect();
         out.sort_by(|a, b| a.domain.cmp(&b.domain).then_with(|| a.name.cmp(&b.name)));
         out
     }
 
-    /// Session start's block (F5's fallback): one `[<DOMAIN> CONTEXT]` group per always-on domain, listing its
-    /// decisions with no keywords, the same line shape the prompt's context block uses. Empty when there are
-    /// none.
+    /// The prompt's decisions block: one `[<DOMAIN> CONTEXT · decisions matched by keyword]` group per domain, the
+    /// line shape the CONTEXT block uses, and the decisions it lists. Empty when the prompt names none.
+    pub fn prompt_block<'a>(&'a self, text: &str, skip: &dyn Fn(&GlobalDecision) -> bool) -> (String, Vec<&'a GlobalDecision>) {
+        let list = self.matched(text, skip);
+        (render(&list, "decisions matched by keyword"), list)
+    }
+
+    /// The global decisions with no keywords and no other domain, which only session start serves; by domain, then
+    /// name.
+    pub fn without_keywords(&self) -> Vec<&GlobalDecision> {
+        let mut out: Vec<&GlobalDecision> =
+            self.by_id.values().filter(|d| d.keywords.is_empty() && !d.elsewhere).collect();
+        out.sort_by(|a, b| a.domain.cmp(&b.domain).then_with(|| a.name.cmp(&b.name)));
+        out
+    }
+
+    /// Session start's block (F5's fallback): [`GlobalDecisions::without_keywords`], grouped as the prompt's block
+    /// is. Empty when there are none.
     pub fn session_start_block(&self) -> (String, usize) {
         let list = self.without_keywords();
-        let mut out = String::new();
-        let mut domain: Option<&str> = None;
-        for d in &list {
-            if domain != Some(d.domain.as_str()) {
-                out.push_str(&format!("[{} CONTEXT · decisions with no keywords, shown at session start only]\n", d.domain));
-                domain = Some(d.domain.as_str());
-            }
-            out.push_str(&format!("  - Decision: {}\n", d.name));
-        }
-        (out, list.len())
+        (render(&list, "decisions with no keywords, shown at session start only"), list.len())
     }
+}
+
+fn render(list: &[&GlobalDecision], what: &str) -> String {
+    let mut out = String::new();
+    let mut domain: Option<&str> = None;
+    for d in list {
+        if domain != Some(d.domain.as_str()) {
+            out.push_str(&format!("[{} CONTEXT · {what}]\n", d.domain));
+            domain = Some(d.domain.as_str());
+        }
+        out.push_str(&format!("  - Decision: {}\n", d.name));
+    }
+    out
 }
 
 #[cfg(test)]

@@ -212,7 +212,7 @@ pub fn collect(
     //
     // ASKED, NOT CLAIMED (D15). Each rule is recorded as sent by `commit`, only if
     // this block was printed, so a rule the budget dropped goes on the next prompt.
-    let bracket_block = bracket_rules_block(config, cwd, &session, bracket);
+    let bracket_block = bracket_rules_block(config, cwd, &mut session, bracket);
 
     // Deferred from above: no domains to match, but the bracket block still goes
     // out, and so do rules that carry matchers of their own: a rule added with
@@ -270,8 +270,9 @@ pub fn collect(
     // Single graph load per invocation (merged: global + workspace); the
     // injection loop and the walk share this store.
     let graph_store = crate::store::load_merged(cwd);
-    // The decisions of the always-on domains and their keywords (BO-03, F5): the neighbourhood and the walk
-    // both serve one of them only when this prompt carries one of its keywords.
+    // The decisions of the always-on domains and their keywords (BO-03, F5). One reaches this prompt only when the
+    // prompt carries one of its keywords, through the `global-decisions` block below, once per session; the
+    // always-on domain's CONTEXT leaves them out, and the walk skips the ones this prompt does not get.
     let global = graph_store
         .as_ref()
         .map(|s| crate::domain::global_decisions::GlobalDecisions::load(s, config, &domains))
@@ -334,7 +335,9 @@ pub fn collect(
         if let Some(ref store) = graph_store {
             let nothing_served = std::collections::HashSet::new();
             let walked =
-                crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &nothing_served, &global);
+                crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &nothing_served, &|id| {
+                    global_withheld(&global, &session, id, &prompt)
+                });
             // Dedup and render as one unit; the marks wait for the print -- see `render_walk_block`.
             let w = render_walk_block(&session, walked, config.injection.walk_budget);
             sink.blocks.extend(w.blocks);
@@ -404,7 +407,9 @@ pub fn collect(
         let neighborhood_text = match (&graph_store, lean_mode) {
             (Some(store), false) => {
                 let (n, served) =
-                    crate::domain::query::query_domain_neighborhood(store, config, domain_def, &global, &prompt);
+                    crate::domain::query::query_domain_neighborhood(store, config, domain_def, &|id| {
+                        domain_def.is_always() && global.contains(id)
+                    });
                 domain_served.extend(served);
                 n
             }
@@ -553,6 +558,27 @@ pub fn collect(
         }
     }
 
+    // F5: the global decisions this prompt names by keyword, each once per session and recorded only if printed
+    // (D15), at priority 4 with the rest of the always-on layer. Not held back in lean mode: unlike the
+    // neighbourhood, a keyword is a direct match to what the prompt is about. A decision another domain's
+    // CONTEXT already printed on this prompt is not listed twice.
+    let (decisions_text, listed) = global.prompt_block(&prompt, &|d| {
+        let (key, hash) = d.claim_key();
+        session.is_injected(&key, hash) || domain_served.contains(&d.id)
+    });
+    if !listed.is_empty() {
+        domain_served.extend(listed.iter().map(|d| d.id.clone()));
+        sink.blocks.push(
+            PromptBlock::new("global-decisions", Priority::Global, &decisions_text, listed.len(), "decision").with_claims(
+                listed.iter().map(|d| {
+                    let (key, hash) = d.claim_key();
+                    Claim::Injected { key, hash }
+                }),
+            ),
+        );
+        injected_any = true;
+    }
+
     // The linked command modes, each once per session per text, recorded only if printed (D15).
     for (key, priority, text, rules) in linked {
         let claim_key = format!("command:{key}");
@@ -592,7 +618,9 @@ pub fn collect(
     // `walk::walk_from_text`, which `base context` calls as well. One seam, so the
     // command and the prompt path cannot answer differently about the same graph.
     let walked = graph_store.as_ref().map(|store| {
-        crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &domain_served, &global)
+        crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &domain_served, &|id| {
+            global_withheld(&global, &session, id, &prompt)
+        })
     });
 
     // The walk's blocks rank at 2 with the domains' context, after it, so a reader
@@ -713,31 +741,58 @@ pub fn collect(
     })
 }
 
+/// The walk's F5 filter: a global decision filed only under always-on domains that this prompt does not name by
+/// keyword, or that this session was already given by the `global-decisions` block.
+fn global_withheld(
+    global: &crate::domain::global_decisions::GlobalDecisions,
+    session: &SessionState,
+    id: &str,
+    prompt: &str,
+) -> bool {
+    global.withheld_from(id, prompt)
+        || global.get(id).is_some_and(|d| {
+            let (key, hash) = d.claim_key();
+            !d.elsewhere && session.is_injected(&key, hash)
+        })
+}
+
 /// The bracket rules this prompt sends, as one block, or `None` when there are none (BO-03, F3).
 ///
 /// Two rules decide, in this order:
 ///
 /// 1. COVERED BY CLAUDE.md. A rule whose `covered_by` text is in a CLAUDE.md file Claude Code loads for this
 ///    session is never sent: the reader already has it. On 2026-10-01 the T1 to T6 rules took about 2,400 of
-///    3,864 bytes of a prompt while `~/.claude/CLAUDE.md` carried the same rules. The files are read only when a
-///    due rule carries a marker, so a config without markers costs nothing here.
+///    3,864 bytes of a prompt while `~/.claude/CLAUDE.md` carried the same rules. Decided once per session per
+///    rule text (`SessionState::bracket_covered` says why): the first prompt that meets a marked rule reads the
+///    files and records a verdict for every marked rule of every tier; a config without markers never reads them.
+///    A text is covered when any entry carrying it is, so the same text in two buckets is one rule here too.
 /// 2. ONCE PER SESSION. A rule goes out on the first prompt where its tier applies and never again in the
 ///    session; a tier change sends only the new tier's rules not yet sent (`SessionState::bracket_rule_due`).
 ///
 /// The block's header still names the tier, and the `<context-bracket>` line names it on every prompt.
-fn bracket_rules_block(config: &BaseConfig, cwd: &Path, session: &SessionState, bracket: Bracket) -> Option<PromptBlock> {
-    let due: Vec<&crate::config::BracketRule> = bracket
-        .entries(&config.bracket.rules)
+fn bracket_rules_block(config: &BaseConfig, cwd: &Path, session: &mut SessionState, bracket: Bracket) -> Option<PromptBlock> {
+    let rules = &config.bracket.rules;
+    let marked: Vec<&crate::config::BracketRule> = [&rules.always, &rules.fresh, &rules.moderate, &rules.depleted, &rules.critical]
         .into_iter()
-        .filter(|r| !r.text.trim().is_empty() && session.bracket_rule_due(&r.text))
+        .flatten()
+        .filter(|r| r.markers().next().is_some())
         .collect();
-    let loaded = if due.iter().any(|r| r.markers().next().is_some()) {
-        crate::claude_md::loaded_text(cwd)
-    } else {
-        String::new()
-    };
+    if marked.iter().any(|r| session.bracket_coverage(&r.text).is_none()) {
+        let loaded = crate::claude_md::loaded_text(cwd);
+        let mut verdict: HashMap<&str, bool> = HashMap::new();
+        for r in &marked {
+            *verdict.entry(r.text.as_str()).or_insert(false) |= r.covered_in(&loaded);
+        }
+        for (text, covered) in verdict {
+            if session.bracket_coverage(text).is_none() {
+                session.record_bracket_coverage(text, covered);
+            }
+        }
+    }
     let mut texts: Vec<&str> = Vec::new();
-    for rule in due.into_iter().filter(|r| !r.covered_in(&loaded)) {
+    for rule in bracket.entries(rules).into_iter().filter(|r| {
+        !r.text.trim().is_empty() && session.bracket_rule_due(&r.text) && session.bracket_coverage(&r.text) != Some(true)
+    }) {
         // The same text twice in one tier (in `always` and in the tier's bucket) is one rule, sent once.
         if !texts.contains(&rule.text.as_str()) {
             texts.push(&rule.text);
