@@ -451,8 +451,10 @@ fn append_line(log_path: &Path, line: &str) -> io::Result<()> {
 ///
 /// `pub(crate)` for `store::rename_with_retry` (#127), which faces the same
 /// family on the same files: an antivirus or the search indexer holding a handle
-/// makes the log append fail here and the graph rename fail there. One list, two
-/// callers — a second copy is a second thing to drift.
+/// makes the log append fail here and the graph rename fail there. Also for the
+/// graph lock (`store::classify_lock_open_failure`, BO-23), where a Windows
+/// delete still pending on the lock file fails a create with os error 5. One
+/// list, three callers — a second copy is a second thing to drift.
 pub(crate) fn is_transient_lock(e: &io::Error) -> bool {
     use io::ErrorKind::*;
     if matches!(e.kind(), PermissionDenied | Interrupted | WouldBlock) {

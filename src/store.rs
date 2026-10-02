@@ -1489,6 +1489,56 @@ pub fn lock_graph_bulk(graph: &Path) -> Result<GraphLockGuard> {
 /// to tell which bound produced it, or the two bounds are indistinguishable in
 /// the field.
 fn lock_graph_waiting(graph: &Path, wait: std::time::Duration) -> Result<GraphLockGuard> {
+    lock_graph_with(graph, wait, create_lock_file)
+}
+
+/// The production open: an exclusive create, so exactly one process gets the file.
+fn create_lock_file(lock: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock)
+}
+
+/// What one failed attempt to create the lock file means.
+#[derive(Debug, PartialEq, Eq)]
+enum LockOpenFailure {
+    /// The file exists: another writer holds the lock. Wait, reaping it if stale.
+    Held,
+    /// The transient lock family ([`crate::changelog::is_transient_lock`]). Waited
+    /// out like a held lock, never reaped: there may be no file to read a pid from.
+    ///
+    /// The case that put it here (BO-23): on Windows, creating a file another
+    /// writer has just deleted, while that delete is still pending, fails with
+    /// `PermissionDenied` (os error 5), not `AlreadyExists`. Eight threads taking
+    /// and releasing one lock hit that window; main's CI run 36977848361 lost a
+    /// write to it in `concurrent_writers_do_not_lose_rows`.
+    Transient,
+    /// Anything else is a real failure (a read-only volume, a missing folder), and
+    /// waiting would only turn a clear error into a slow one.
+    Fatal,
+}
+
+/// Classify a failed lock open. The family test is the store's one predicate,
+/// shared with `rename_with_retry` and the change-log append, never a copy.
+fn classify_lock_open_failure(e: &std::io::Error) -> LockOpenFailure {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        LockOpenFailure::Held
+    } else if crate::changelog::is_transient_lock(e) {
+        LockOpenFailure::Transient
+    } else {
+        LockOpenFailure::Fatal
+    }
+}
+
+/// [`lock_graph_waiting`] with the open passed in. Production passes
+/// [`create_lock_file`]; the tests pass an open that fails first, which is the only
+/// way to reach the Windows delete-pending window without depending on timing.
+fn lock_graph_with(
+    graph: &Path,
+    wait: std::time::Duration,
+    mut open: impl FnMut(&Path) -> std::io::Result<fs::File>,
+) -> Result<GraphLockGuard> {
     let lock = lock_path(graph);
     if let Some(parent) = lock.parent() {
         fs::create_dir_all(parent)
@@ -1506,11 +1556,7 @@ fn lock_graph_waiting(graph: &Path, wait: std::time::Duration) -> Result<GraphLo
     let deadline = std::time::Instant::now() + wait;
     let mut backoff = std::time::Duration::from_millis(5);
     loop {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-        {
+        let e = match open(&lock) {
             Ok(mut fh) => {
                 let _ = writeln!(fh, "{}", std::process::id());
                 HELD_LOCKS.with(|h| h.borrow_mut().push(lock.clone()));
@@ -1519,26 +1565,39 @@ fn lock_graph_waiting(graph: &Path, wait: std::time::Duration) -> Result<GraphLo
                     reentrant: false,
                 });
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(e) => e,
+        };
+        let failure = classify_lock_open_failure(&e);
+        match failure {
+            LockOpenFailure::Held => {
                 if reap_stale_lock(&lock) {
                     continue;
                 }
-                if std::time::Instant::now() >= deadline {
-                    anyhow::bail!(
-                        "timed out after {}s ({} bound) waiting for the graph lock {} — another \
-                         base process is writing this graph. Nothing was written.",
-                        wait.as_secs(),
-                        if wait == LOCK_WAIT_BULK { "bulk" } else { "hot-path" },
-                        lock.display()
-                    );
-                }
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(std::time::Duration::from_millis(100));
             }
-            Err(e) => {
+            LockOpenFailure::Transient => {}
+            LockOpenFailure::Fatal => {
                 return Err(e).with_context(|| format!("taking the graph lock {}", lock.display()));
             }
         }
+        if std::time::Instant::now() >= deadline {
+            let timeout = format!(
+                "timed out after {}s ({} bound) waiting for the graph lock {} — another \
+                 base process is writing this graph. Nothing was written.",
+                wait.as_secs(),
+                if wait == LOCK_WAIT_BULK { "bulk" } else { "hot-path" },
+                lock.display()
+            );
+            // A held lock bails exactly as it always has. A transient error that
+            // outlives the wait keeps the OS error as the cause: same message, and
+            // a real permission fault (a folder this user cannot write) is still
+            // named in the chain instead of being blamed on another writer.
+            return Err(match failure {
+                LockOpenFailure::Transient => anyhow::Error::new(e).context(timeout),
+                _ => anyhow::anyhow!(timeout),
+            });
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(100));
     }
 }
 
@@ -2052,5 +2111,262 @@ mod tests {
             "a NotFound burned the retry budget ({elapsed:?}) — the \
              is_transient_lock early return is not being taken"
         );
+    }
+
+    // ─── BO-23 graph lock: the transient lock family is contention ───────
+    //
+    // The lock loop is driven through `lock_graph_with` and an open that fails on
+    // purpose, so none of these depend on two writers meeting in a race window.
+
+    /// The error Windows returns for a create on a file whose delete is pending.
+    fn access_denied() -> std::io::Error {
+        std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+    }
+
+    /// A graph path in a fresh folder, and the folder that keeps it alive.
+    fn lock_target() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join(".base").join("graph.nq");
+        (dir, graph)
+    }
+
+    #[test]
+    fn lock_open_failure_is_classified_by_the_shared_predicate() {
+        use std::io::{Error, ErrorKind};
+
+        assert_eq!(
+            classify_lock_open_failure(&Error::from(ErrorKind::AlreadyExists)),
+            LockOpenFailure::Held
+        );
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::Interrupted, ErrorKind::WouldBlock] {
+            assert_eq!(
+                classify_lock_open_failure(&Error::from(kind)),
+                LockOpenFailure::Transient,
+                "{kind:?}"
+            );
+        }
+        for kind in [ErrorKind::NotFound, ErrorKind::ReadOnlyFilesystem, ErrorKind::StorageFull] {
+            assert_eq!(
+                classify_lock_open_failure(&Error::from(kind)),
+                LockOpenFailure::Fatal,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            classify_lock_open_failure(&Error::other("not a lock error")),
+            LockOpenFailure::Fatal
+        );
+
+        // The raw codes the OS actually returns, as the store meets them.
+        #[cfg(windows)]
+        {
+            // ACCESS_DENIED (the delete-pending case), SHARING_VIOLATION, LOCK_VIOLATION.
+            for code in [5, 32, 33] {
+                assert_eq!(
+                    classify_lock_open_failure(&Error::from_raw_os_error(code)),
+                    LockOpenFailure::Transient,
+                    "os error {code}"
+                );
+            }
+            // FILE_EXISTS, the create_new collision itself.
+            assert_eq!(
+                classify_lock_open_failure(&Error::from_raw_os_error(80)),
+                LockOpenFailure::Held
+            );
+            // WRITE_PROTECT: a read-only volume fails at once.
+            assert_eq!(
+                classify_lock_open_failure(&Error::from_raw_os_error(19)),
+                LockOpenFailure::Fatal
+            );
+        }
+        #[cfg(unix)]
+        {
+            // EACCES, EBUSY.
+            for code in [13, 16] {
+                assert_eq!(
+                    classify_lock_open_failure(&Error::from_raw_os_error(code)),
+                    LockOpenFailure::Transient,
+                    "errno {code}"
+                );
+            }
+            // EEXIST.
+            assert_eq!(
+                classify_lock_open_failure(&Error::from_raw_os_error(17)),
+                LockOpenFailure::Held
+            );
+            // EROFS: a read-only volume fails at once.
+            assert_eq!(
+                classify_lock_open_failure(&Error::from_raw_os_error(30)),
+                LockOpenFailure::Fatal
+            );
+        }
+    }
+
+    #[test]
+    fn graph_lock_retries_access_denied_as_contention() {
+        let (_dir, graph) = lock_target();
+        let mut calls = 0;
+        let guard = lock_graph_with(&graph, LOCK_WAIT, |lock| {
+            calls += 1;
+            if calls == 1 {
+                Err(access_denied())
+            } else {
+                create_lock_file(lock)
+            }
+        })
+        .expect("an access-denied first attempt must be waited out, not returned");
+
+        assert_eq!(calls, 2, "the second attempt is the one that takes the lock");
+        let lock = lock_path(&graph);
+        assert_eq!(lock_pid(&lock), Some(std::process::id()), "the lock holds this pid");
+        assert!(holds_graph_lock());
+        drop(guard);
+        assert!(!lock.exists(), "the guard released the lock");
+        assert!(!holds_graph_lock());
+    }
+
+    #[test]
+    fn graph_lock_times_out_on_persistent_access_denied() {
+        let (_dir, graph) = lock_target();
+        let mut calls = 0;
+        let err = lock_graph_with(&graph, std::time::Duration::from_millis(60), |_| {
+            calls += 1;
+            Err(access_denied())
+        })
+        .err()
+        .expect("an access-denied that never clears must fail at the deadline");
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with("timed out after 0s (hot-path bound) waiting for the graph lock")
+                && message.ends_with("Nothing was written."),
+            "the failure is the timeout message, got: {message}"
+        );
+        assert!(
+            !message.contains("taking the graph lock"),
+            "the access-denied was returned at once instead of waited out: {message}"
+        );
+        assert!(calls > 1, "the open was tried {calls} time(s); it must be retried");
+        // The OS error is kept as the cause, so a real permission fault is named.
+        let cause = err.chain().nth(1).expect("the OS error is the cause").to_string();
+        assert!(cause.contains(&access_denied().to_string()), "cause: {cause}");
+        assert!(!holds_graph_lock());
+    }
+
+    #[test]
+    fn graph_lock_fails_fast_outside_the_lock_family() {
+        let (_dir, graph) = lock_target();
+        let mut calls = 0;
+        // The full hot-path wait: had this error been retried, it would show as calls > 1.
+        let err = lock_graph_with(&graph, LOCK_WAIT, |_| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem))
+        })
+        .err()
+        .expect("an error outside the lock family must fail");
+        assert_eq!(calls, 1, "an error outside the lock family was retried");
+        assert!(
+            err.to_string().starts_with("taking the graph lock"),
+            "got: {err:#}"
+        );
+
+        // A lock folder that cannot be created still fails at once, before any open.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"").unwrap();
+        let graph = file.join(".base").join("graph.nq");
+        let mut opened = false;
+        let err = lock_graph_with(&graph, LOCK_WAIT, |lock| {
+            opened = true;
+            create_lock_file(lock)
+        })
+        .err()
+        .expect("a lock folder under a file cannot be created");
+        assert!(!opened, "the open ran although the folder could not be made");
+        assert!(
+            err.to_string().starts_with("creating directory for lock"),
+            "got: {err:#}"
+        );
+    }
+
+    /// The transient arm never reaps. A lock file that would be reaped on the held
+    /// arm (older than LOCK_STALE, holder gone) must survive an access-denied wait.
+    #[test]
+    fn graph_lock_does_not_reap_on_access_denied() {
+        let (_dir, graph) = lock_target();
+        let lock = lock_path(&graph);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        // u32::MAX is no running process on either platform.
+        std::fs::write(&lock, format!("{}\n", u32::MAX)).unwrap();
+        let old = std::time::SystemTime::now() - LOCK_STALE * 2;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let _ = lock_graph_with(&graph, std::time::Duration::from_millis(30), |_| {
+            Err(access_denied())
+        })
+        .err()
+        .expect("the open always fails");
+        assert!(lock.exists(), "the transient arm reaped a lock file");
+        assert_eq!(lock_pid(&lock), Some(u32::MAX), "the lock file was replaced");
+    }
+
+    /// The graph lock, `rename_with_retry` and the change-log append decide "is this
+    /// the lock family" with one function, `changelog::is_transient_lock`. A copy of
+    /// the list in any of them is a second thing to drift, so this reads the code.
+    #[test]
+    fn transient_lock_family_is_one_predicate() {
+        /// The body of the top-level `fn <name>(` in `src`, comment lines removed.
+        fn body_of(src: &str, name: &str) -> String {
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let start = code
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("fn {name} not found"));
+            let end = code[start..]
+                .find("\n}")
+                .unwrap_or_else(|| panic!("fn {name} has no closing brace at column 0"));
+            code[start..start + end].to_string()
+        }
+
+        let store = include_str!("store.rs");
+        let changelog = include_str!("changelog.rs");
+
+        for (file, src, name) in [
+            ("store.rs", store, "classify_lock_open_failure"),
+            ("store.rs", store, "rename_with_retry"),
+            ("changelog.rs", changelog, "append_line"),
+        ] {
+            let body = body_of(src, name);
+            assert!(
+                body.contains("is_transient_lock("),
+                "{file} fn {name} does not call is_transient_lock:\n{body}"
+            );
+            assert!(
+                !body.contains("PermissionDenied") && !body.contains("raw_os_error"),
+                "{file} fn {name} names lock-family errors itself instead of calling the predicate:\n{body}"
+            );
+        }
+        // The graph lock reaches the classification, and nothing else decides.
+        let lock_loop = body_of(store, "lock_graph_with");
+        assert!(lock_loop.contains("classify_lock_open_failure(&e)"), "{lock_loop}");
+        assert!(!lock_loop.contains("ErrorKind::"), "the lock loop matches error kinds itself:\n{lock_loop}");
+
+        // One definition of the family list. Only code outside the test modules is
+        // counted: this test's own string would otherwise count as a definition.
+        let defs = [store, changelog]
+            .iter()
+            .map(|s| s.split("#[cfg(test)]").next().unwrap().matches("fn is_transient_lock(").count())
+            .sum::<usize>();
+        assert_eq!(defs, 1, "is_transient_lock is defined {defs} times");
+        // And the predicate still behaves as the family the lock now waits on.
+        assert!(crate::changelog::is_transient_lock(&access_denied()));
     }
 }
