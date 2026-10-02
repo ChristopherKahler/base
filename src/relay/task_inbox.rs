@@ -2,13 +2,16 @@
 //! and `*ping <title> …`.
 //!
 //! A task relayed to a live session lands as one JSON file under
-//! `~/.base-gbl/.base/relay-inbox/<target-title>/<slug>.json`. The inbox is keyed
-//! by the receiver's stable TITLE, not its session id — so a receiver that
-//! restarts (fresh session id) still picks the task up the moment it reclaims
-//! its title with `base relay register`. The target's hooks resolve their
-//! session id → held titles and scan those dirs at session start and on each
-//! prompt, never on a tool call (BO-04, F13b). A new item is shown once, in full,
-//! as information; while a ping stays unanswered, session start lists it in one line.
+//! `~/.base-gbl/.base/relay-inbox/<target-title>/<slug>.json`. The folder is
+//! named for the receiver's TITLE, but each item carries the session id that held
+//! the title when it was sent, and only that session is ever shown it (BO-05, F12).
+//! A title that passes to another session (a restart, a /clear, a codename handed
+//! out again) does not pass its inbox: the previous holder's items are archived
+//! under `relay-inbox/.archive/<title>-<session>/` and their senders told. The
+//! target's hooks resolve their session id → held titles and scan those dirs at
+//! session start and on each prompt, never on a tool call (BO-04, F13b). A new
+//! item is shown once, in full, as information; while a ping stays unanswered,
+//! session start lists it in one line.
 //!
 //! Pings ride the same rail with IM semantics instead of work semantics: no
 //! briefing doc (the message IS the payload, mirrored to the graph), and the
@@ -32,7 +35,9 @@ use super::{age_str, now_iso, parse_ts, read_json, write_json_atomic};
 use crate::config::NamespaceConfig;
 
 /// A ping older than this never alerts again, loud or terse. A ping is a live message between sessions;
-/// one that has waited a day is history, and it stays in the inbox file for anyone who reads it.
+/// one that has waited a day is history. A delivered one stays in the inbox file for anyone who reads it;
+/// one that no session was ever shown is archived and its sender told (BO-05, carried in from BO-00's code
+/// review: it used to be skipped here forever, silently).
 /// Measured 2026-09-23: a ping sent 2026-08-29 to another session, already delivered, fired as
 /// "REPLY REQUIRED BEFORE YOUR NEXT ACTION" on every prompt of an unrelated session that took the title
 /// by tab reclaim. Tasks are not covered: a task is assigned work and persists until `relay done`.
@@ -59,8 +64,15 @@ pub struct InboxTask {
     pub from: String,
     /// Friendly title the task was addressed to.
     pub to_title: String,
-    /// Resolved target session id (also the inbox subdir name).
+    /// The session that held `to_title` when this was sent (BO-05, F12a). Delivery shows the item only to that session
+    /// ([`deliver_deferred`]); when the title passes to another session, the item is archived instead
+    /// ([`settle`]). An item with this empty is placed by the title history ([`super::session_registry::holder_at`]).
+    #[serde(default)]
     pub to_session: String,
+    /// The sending session, when it held the `from` title at send time. A notice that this item was not delivered goes
+    /// to that session only, never to a later holder of the sender's title (BO-05, F12d). Empty when unknown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from_session: String,
     #[serde(default = "default_priority")]
     pub priority: String,
     pub created: String,
@@ -155,6 +167,335 @@ pub fn enqueue(ns: &NamespaceConfig, task: &InboxTask) -> Result<PathBuf> {
     Ok(path)
 }
 
+// ─── Addressing (BO-05, F12) ─────────────────────────────────
+//
+// An inbox item is for the session that held its title when it was sent, never for whoever holds the title now. On
+// 2026-10-01 session 5b860473 was auto-given the title `lynx`, inherited the inbox of the session that had held it, and
+// was shown bison's pings about a doc it had never seen, while bison had no way to know they had gone to the wrong
+// session. Now a title's folder holds only what was sent to its holder: anything sent to another session is moved to
+// `relay-inbox/.archive/<title>-<that session>/`, and the sender of anything no session was shown is told, once.
+
+/// The folder under the inbox root that holds archived inboxes. A dot name: no title sanitizes to it, and the readers
+/// that walk the inbox root (`base relay tasks`, `base relay done`) never find an item directly inside it.
+const ARCHIVE: &str = ".archive";
+
+/// Who a notice that something was not delivered comes from. Never a thread (`is_chat` is false for its kind), so two
+/// notices to one session are both shown.
+pub const NOTICE_FROM: &str = "relay";
+
+/// Where the items sent to `session` under `title` are archived: `relay-inbox/.archive/<title>-<session>/`.
+pub fn archive_dir(title: &str, session: &str) -> Option<PathBuf> {
+    inbox_root().map(|r| r.join(ARCHIVE).join(sanitize(&format!("{title}-{session}"))))
+}
+
+/// Why an item left its title's inbox, which decides what its sender is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Why {
+    /// It was sent to a session that no longer holds the title.
+    Passed,
+    /// It carries no session id, and the title history has no line placing it (F12e).
+    Unplaced,
+    /// It was sent to the holder, which was never shown it in the day a ping stays live (BO-00's carry-in).
+    Stale,
+}
+
+/// One item moved to an archive folder that no session was shown.
+struct Archived {
+    task: InboxTask,
+    folder: PathBuf,
+    /// The session the folder is named for.
+    old: String,
+    why: Why,
+}
+
+/// A title has just been claimed by `holder` (an explicit `relay register`, a tab reclaim after /clear, a wordlist
+/// pick, or a launcher's `BASE_RELAY_AS`), taken from `previous` when another session held it. Archives everything in
+/// the title's inbox that was sent to another session and tells the senders, so the new holder starts with an inbox
+/// holding only what was sent to it. Fail-open: nothing here can stop a registration.
+pub fn settle(title: &str, holder: &str, previous: Option<&str>) {
+    let _ = sort_inbox(title, holder, previous);
+}
+
+/// Settle `title`'s inbox for `holder`, the session that holds the title now, and return the items addressed to it.
+///
+/// - An item stays when it was sent to `holder` or shown to it ([`addressee`], [`shown_to`]). Any other is moved to the
+///   archive folder of the session that was shown it, or else the session it was sent to (F12b, F12c).
+/// - An item with no session id is placed by the title history: read as sent to whoever held the title when it was
+///   written. When the history cannot say, it is archived with `previous`'s folder, or under `unknown`, and never
+///   delivered (F12e).
+/// - A ping addressed to `holder` that no session was shown and that has waited past [`PING_STALE_SECS`] is archived in
+///   `holder`'s folder. It used to be skipped forever, silently (BO-00's code review).
+/// - What `holder` had been shown under the title and lost when the title passed away from it comes back
+///   ([`restore_shown`]).
+///
+/// Each sender of an archived item that no session was shown is told, by one notice per folder ([`tell_senders`]).
+/// The lock is taken only when something has to move; when another process holds it, this one moves nothing and still
+/// returns only `holder`'s items.
+fn sort_inbox(title: &str, holder: &str, previous: Option<&str>) -> Vec<(PathBuf, InboxTask)> {
+    let Some(dir) = title_dir(title) else { return Vec::new() };
+    restore_shown(title, holder, &dir);
+    let items = read_tasks_in(&dir);
+    if items.is_empty() {
+        return items;
+    }
+    let mut kept = Vec::new();
+    let mut leaving: Vec<(PathBuf, InboxTask, String, Why)> = Vec::new();
+    for (path, mut task) in items {
+        let sent_to = addressee(title, &task);
+        let seen_by = shown_to(&task);
+        if sent_to.as_deref() == Some(holder) || seen_by.as_deref() == Some(holder) {
+            if task.status == "pending" && ping_is_stale(&task) {
+                leaving.push((path, task, holder.to_string(), Why::Stale));
+                continue;
+            }
+            if task.to_session.is_empty()
+                && let Some(s) = sent_to
+            {
+                // Placed by the history: the item says so from now on.
+                task.to_session = s;
+                let _ = write_json_atomic(&path, &task);
+            }
+            kept.push((path, task));
+            continue;
+        }
+        // Filed with the session that was shown it, if one was, so that session gets it back if it takes the title
+        // back; otherwise with the session it was sent to.
+        match seen_by.or(sent_to) {
+            Some(s) => leaving.push((path, task, s, Why::Passed)),
+            None => leaving.push((path, task, previous.unwrap_or("unknown").to_string(), Why::Unplaced)),
+        }
+    }
+    if leaving.is_empty() {
+        return kept;
+    }
+    let Some(lock) = SettleLock::take(&dir) else { return kept };
+    let mut archived: Vec<Archived> = Vec::new();
+    for (path, task, old, why) in leaving {
+        let Some(folder) = archive_dir(title, &old) else { continue };
+        if !move_into(&path, &folder) {
+            continue;
+        }
+        if task.kind == "notify" && task.status == "pending" {
+            // The spool holds back its copy only while the notify is in the inbox. Marked seen for this title, it is
+            // never shown to the title's new holder either (F12b).
+            mark_spool_seen(&task);
+        }
+        if never_shown(&task) {
+            archived.push(Archived { task, folder, old, why });
+        }
+    }
+    drop(lock);
+    tell_senders(title, holder, &archived);
+    kept
+}
+
+/// The session an item was sent to: its `to_session`, or for an item that records none, the history's holder of the
+/// title when it was written.
+fn addressee(title: &str, task: &InboxTask) -> Option<String> {
+    if task.to_session.is_empty() {
+        parse_ts(&task.created).and_then(|t| super::session_registry::holder_at(title, t))
+    } else {
+        Some(task.to_session.clone())
+    }
+}
+
+/// The session an item was shown to, once it was. An item stays with the title's holder when it was sent to it OR
+/// shown to it. After BO-05 a session is shown only what was sent to it, so the two agree; before, they could differ
+/// both ways: BO-04 showed a session that took a title over the previous holder's open task and unanswered pings (it
+/// keeps them), and a session that held a title for a while was shown what was sent to the holder before and after it
+/// (the holder keeps those).
+fn shown_to(task: &InboxTask) -> Option<String> {
+    (matches!(task.status.as_str(), "delivered" | "superseded") && !task.last_loud_session.is_empty())
+        .then(|| task.last_loud_session.clone())
+}
+
+/// A session that takes back a title it held gets back what it had been shown under it: an open task, an unanswered
+/// ping. They were its own; they left only because the title passed to another session meanwhile (for one, a headless
+/// run started from this session's terminal tab, which takes the tab's title: F27, BO-08). Items it was never shown
+/// stay archived, since their senders were told they were not delivered.
+fn restore_shown(title: &str, holder: &str, dir: &Path) {
+    let Some(folder) = archive_dir(title, holder) else { return };
+    if !folder.is_dir() {
+        return;
+    }
+    for (path, task) in read_tasks_in(&folder) {
+        if task.last_loud_session == holder && matches!(task.status.as_str(), "delivered" | "superseded") {
+            let _ = move_into(&path, dir);
+        }
+    }
+}
+
+/// Work or a message that no session was shown: its sender is owed a notice when it is archived. A notice is never
+/// itself the subject of one.
+fn never_shown(task: &InboxTask) -> bool {
+    task.status == "pending" && matches!(task.kind.as_str(), "ping" | "reply" | "task" | "notify")
+}
+
+/// Move one file into `folder`, keeping its name unless that name is already taken there, in which case a number is
+/// added: a rename onto an existing name would replace that file on Windows.
+fn move_into(path: &Path, folder: &Path) -> bool {
+    if std::fs::create_dir_all(folder).is_err() {
+        return false;
+    }
+    let Some(name) = path.file_name() else { return false };
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut dest = folder.join(name);
+    let mut n = 1;
+    while dest.exists() {
+        if n > 1000 {
+            return false;
+        }
+        dest = folder.join(format!("{stem}-{n}.json"));
+        n += 1;
+    }
+    std::fs::rename(path, dest).is_ok()
+}
+
+/// One process at a time moves a title's items, so a sender gets one notice per folder rather than one per process.
+/// A lock older than 30 seconds is a crashed holder's and is broken.
+struct SettleLock(PathBuf);
+
+impl SettleLock {
+    fn take(dir: &Path) -> Option<Self> {
+        let path = dir.join(".settle.lock");
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Some(Self(path)),
+                Err(_) => {
+                    let old = std::fs::metadata(&path)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|m| m.elapsed().ok())
+                        .is_some_and(|e| e.as_secs() > 30);
+                    if !old {
+                        return None;
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        None
+    }
+}
+
+impl Drop for SettleLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The session a notice about `task` goes to: the session that sent it, while that session still holds the sender's
+/// title. Which session sent it is the item's `from_session`, or, for an item that does not record one (a script's
+/// `--from`, a binary from before BO-05), the session the title history says held the sender's title when it was sent.
+/// Nobody is told when that cannot be established, when the sending session no longer holds its title (a later holder
+/// never sent it: telling it would repeat F12 the other way round), when the sender has no title, or when the
+/// sender's title is the one that passed (its holder is the session the item did not reach).
+fn notice_to(task: &InboxTask, title: &str) -> Option<String> {
+    let from = task.from.as_str();
+    if super::threadless(from) || from == NOTICE_FROM || from == title {
+        return None;
+    }
+    let holder = super::session_registry::resolve(from)?.session_id;
+    let sent_by = if task.from_session.is_empty() {
+        parse_ts(&task.created).and_then(|t| super::session_registry::holder_at(from, t))
+    } else {
+        Some(task.from_session.clone())
+    };
+    (sent_by.as_deref() == Some(holder.as_str())).then_some(holder)
+}
+
+/// Tell each sender what of theirs was archived without being shown: one notice per sender, folder and reason, in the
+/// sender's own inbox, addressed to the sending session (F12d). A sender that cannot be reached is not told; the
+/// archive folder keeps everything either way.
+fn tell_senders(title: &str, holder: &str, archived: &[Archived]) {
+    let mut groups: std::collections::BTreeMap<(String, String, PathBuf, Why), Vec<&Archived>> =
+        std::collections::BTreeMap::new();
+    for a in archived {
+        let Some(to) = notice_to(&a.task, title) else { continue };
+        groups.entry((a.task.from.clone(), to, a.folder.clone(), a.why)).or_default().push(a);
+    }
+    for ((from, to, folder, why), items) in groups {
+        let Some(dir) = title_dir(&from) else { continue };
+        let notice = InboxTask {
+            slug: super::ping_slug(),
+            summary: notice_text(title, holder, &items, &folder, why),
+            doc: String::new(),
+            from: NOTICE_FROM.into(),
+            to_title: from.clone(),
+            to_session: to,
+            from_session: String::new(),
+            priority: "high".into(),
+            created: now_iso(),
+            status: "pending".into(),
+            last_loud_session: String::new(),
+            last_alert_ts: String::new(),
+            kind: "undelivered".into(),
+            refs: Vec::new(),
+            spool_store: String::new(),
+            spool_id: String::new(),
+        };
+        let path = dir.join(format!("{}.json", sanitize(&notice.slug)));
+        if let Err(e) = write_json_atomic(&path, &notice) {
+            eprintln!("base relay: could not tell {from} that its message to {title} was not delivered: {e:#}");
+        }
+    }
+}
+
+/// What a sender is told (F12d, example 1): what was not delivered, whose the title was, who holds it now, where the
+/// items are, and what to do.
+fn notice_text(title: &str, holder: &str, items: &[&Archived], folder: &Path, why: Why) -> String {
+    let n = items.len();
+    let noun = if items.iter().all(|a| a.task.kind == "task") {
+        "task"
+    } else if items.iter().all(|a| matches!(a.task.kind.as_str(), "ping" | "reply")) {
+        "ping"
+    } else {
+        "message"
+    };
+    let what = if n == 1 { noun.to_string() } else { format!("{n} {noun}s") };
+    let sent: Vec<String> = items.iter().map(|a| super::clock(&a.task.created)).collect();
+    // Subject and object pronouns, and the verbs that agree with them.
+    let (was, it, them, carries, apply) = if n == 1 {
+        ("was", "it", "it", "carries", "applies")
+    } else {
+        ("were", "they", "them", "carry", "apply")
+    };
+    let path = folder.to_string_lossy().replace('\\', "/");
+    let now_holds = match super::session_registry::held_since(title, holder) {
+        Some(since) => format!("session {} (since {})", short(holder), super::clock(&since)),
+        None => format!("session {}", short(holder)),
+    };
+    let old = items.first().map(|a| a.old.as_str()).unwrap_or_default();
+    let opening = format!("your {what} to {title} (sent {}) {was} not delivered", sent.join(", "));
+    match why {
+        Why::Passed => {
+            let gone = match super::session_registry::titles_for(old).first() {
+                Some(t) => format!("which is now {t}"),
+                None => "which no longer holds it".to_string(),
+            };
+            format!(
+                "{opening}. {title} was session {}, {gone}; the title now belongs to {now_holds}, which has not seen \
+                 {them}. Archived at {path}/. Re-send to the new holder if {it} still {apply}.",
+                short(old)
+            )
+        }
+        Why::Unplaced => format!(
+            "{opening}: {it} {carries} no session id, and base has no record of which session held {title} when {it} \
+             {was} sent. The title now belongs to {now_holds}. Archived at {path}/. Re-send to the new holder if {it} \
+             still {apply}."
+        ),
+        Why::Stale => format!(
+            "{opening}: {it} waited more than a day, and {now_holds}, which holds {title}, was never shown {them}. \
+             Archived at {path}/. Re-send if {it} still {apply}."
+        ),
+    }
+}
+
+/// The first eight characters of a session id, as the registry prints it and a reader recognises it.
+fn short(session: &str) -> String {
+    session.chars().take(8).collect()
+}
+
 // ─── Delivery (target side, called from hooks) ───────────────
 
 /// Scan this session's inbox and render the injection block, if any. Mutates
@@ -197,13 +538,19 @@ fn unanswered(task: &InboxTask) -> bool {
 /// - Of one sender's unshown messages to one title, only the newest is shown; the older ones are marked `superseded`,
 ///   kept on disk, and the shown one carries a line naming the command that lists them. A sender with no title is
 ///   never treated as one thread ([`super::threadless`]).
-/// - Items this session has not been shown but another session was (a title taken over mid-session with
-///   `base relay register`, or a successor): on its next prompt or at its start, a task in full (it is work this
-///   session now holds), and unanswered pings listed in one line. Once per session.
 /// - Items already shown to this session: listed in one line at session start (a compacted context), never on a
 ///   prompt.
 /// - On a tool call ([`Phase::Tool`], only for a run with no inbox watcher, see [`super::monitorless`]): new items
 ///   only, the same way, and nothing listed.
+///
+/// BO-05 (F12b): only items addressed to THIS session are read. Anything in its titles' folders that was sent to
+/// another session is archived first and its sender told ([`sort_inbox`]). BO-04 showed a session that took a title
+/// over the previous holder's open task in full and its unanswered pings in a line; a session that takes a title now
+/// starts with an inbox holding only what was sent to it, so there is nothing of another session's to show.
+///
+/// That settling runs at once, before the block is built, and is not held back with the commits: it shows this session
+/// nothing, it only moves out what was never this session's (and a ping of its own that went a day unshown), and tells
+/// those senders. Everything this session is shown, hidden from or marked as having seen still waits for its commit.
 ///
 /// What this replaced: a loud block on every first sighting in ANY hook, pre-tool included, headed "REPLY REQUIRED
 /// BEFORE YOUR NEXT ACTION", then a terse "Reply RIGHT NOW" nag every three minutes on prompts and tool calls until the
@@ -217,10 +564,9 @@ pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<super::Part> {
     }
     let mut tasks: Vec<(PathBuf, InboxTask)> = Vec::new();
     for title in &titles {
-        if let Some(dir) = title_dir(title) {
-            tasks.extend(read_tasks_in(&dir));
-        }
+        tasks.extend(sort_inbox(title, session_id, None));
     }
+    // A delivered ping past a day is history: never listed again, and its file stays until its sender is answered.
     tasks.retain(|(_, t)| t.status != "done" && !ping_is_stale(t));
     tasks.sort_by(|a, b| order_key(&a.1).cmp(&order_key(&b.1)));
     if tasks.is_empty() {
@@ -248,39 +594,22 @@ pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<super::Part> {
     let mut commits: Vec<super::Commit> = Vec::new();
 
     for (i, (path, task)) in tasks.iter().enumerate() {
-        let path = path.clone();
-        let mut task = task.clone();
         if task.status == "pending" {
             if behind[i].is_some() {
-                commits.push(hide(path, task, session_id, &now));
+                commits.push(hide(path.clone(), task.clone(), session_id, &now));
             } else {
-                shown.push((i, render(&task)));
-                commits.push(consume(path, task, session_id, &now));
+                shown.push((i, render(task)));
+                commits.push(consume(path.clone(), task.clone(), session_id, &now));
             }
             continue;
         }
-        if phase == Phase::Tool {
-            continue;
-        }
-        let new_here = task.last_loud_session != session_id;
-        if !new_here && phase != Phase::SessionStart {
+        if phase != Phase::SessionStart {
             continue;
         }
         if task.kind == "task" {
-            if new_here {
-                shown.push((i, render(&task)));
-            } else {
-                open_tasks.push(format!("{} from {}", task.slug, sender(&task)));
-            }
-        } else if unanswered(&task) {
-            open_pings.push(format!("{} {}", sender(&task), super::clock(&task.created)));
-        } else {
-            continue;
-        }
-        if new_here {
-            task.last_loud_session = session_id.to_string();
-            task.last_alert_ts = now.clone();
-            commits.push(persist(path, task));
+            open_tasks.push(format!("{} from {}", task.slug, sender(task)));
+        } else if unanswered(task) {
+            open_pings.push(format!("{} {}", sender(task), super::clock(&task.created)));
         }
     }
 
@@ -329,10 +658,16 @@ fn slug_millis(slug: &str) -> u128 {
     digits.parse().unwrap_or(0)
 }
 
+/// Write an item back where it was read, unless it is no longer there: another process may have archived it between
+/// the read and this commit (BO-05), and writing it back would put a copy addressed to another session in the folder.
 fn persist(path: PathBuf, task: InboxTask) -> super::Commit {
-    Box::new(move || {
-        let _ = write_json_atomic(&path, &task);
-    })
+    Box::new(move || rewrite(&path, &task))
+}
+
+fn rewrite(path: &Path, task: &InboxTask) {
+    if path.is_file() {
+        let _ = write_json_atomic(path, task);
+    }
 }
 
 /// Mark a shown message as seen in the spool it came from, for a notify that carries one.
@@ -348,10 +683,10 @@ fn mark_spool_seen(task: &InboxTask) {
     }
 }
 
-/// What showing a message does to the inbox: a reply or notify is gone (a notify's spool copy is marked seen, so the
-/// spool never shows it again); a ping or task is recorded as delivered to this session.
+/// What showing a message does to the inbox: a reply, notify or not-delivered notice is gone (a notify's spool copy is
+/// marked seen, so the spool never shows it again); a ping or task is recorded as delivered to this session.
 fn consume(path: PathBuf, mut task: InboxTask, session_id: &str, now: &str) -> super::Commit {
-    if task.kind == "reply" || task.kind == "notify" {
+    if matches!(task.kind.as_str(), "reply" | "notify" | "undelivered") {
         return Box::new(move || {
             mark_spool_seen(&task);
             let _ = std::fs::remove_file(&path);
@@ -371,7 +706,7 @@ fn hide(path: PathBuf, mut task: InboxTask, session_id: &str, now: &str) -> supe
     task.last_alert_ts = now.to_string();
     Box::new(move || {
         mark_spool_seen(&task);
-        let _ = write_json_atomic(&path, &task);
+        rewrite(&path, &task);
     })
 }
 
@@ -406,6 +741,8 @@ fn render(task: &InboxTask) -> String {
         ),
         "ping" => format!("relay: ping from {from} ({when}) · reply: base relay ping --to {from} --msg \"...\""),
         "reply" => format!("relay: reply from {from} ({when}) · no answer needed"),
+        // BO-05 (F12d): base telling a sender that what it sent went to a session that no longer holds the title.
+        "undelivered" => format!("relay: not delivered ({when}) · no answer needed"),
         "notify" => match spool_parts(task) {
             // The wake notify for a spool message reads exactly as the spool delivery would show it: the store,
             // the message type, and for a question the command that answers it.
@@ -710,6 +1047,7 @@ mod tests {
             from: "api-session".into(),
             to_title: "caddy-backend".into(),
             to_session: session.into(),
+            from_session: String::new(),
             priority: "high".into(),
             created: crate::relay::now_iso(),
             status: "pending".into(),
@@ -730,6 +1068,7 @@ mod tests {
             from: from.into(),
             to_title: to_title.into(),
             to_session: session.into(),
+            from_session: String::new(),
             priority: "high".into(),
             created: crate::relay::now_iso(),
             status: "pending".into(),
@@ -785,22 +1124,25 @@ mod tests {
         });
     }
 
+    /// BO-05 (F12c) replaced "a new session re-announces the task loud": a restart that reclaims the title under a new
+    /// session id starts with an empty inbox, and the task waits in the old session's archive folder. The same session
+    /// starting again (a compaction) still gets its open task in one line.
     #[test]
-    fn new_session_re_announces_loud() {
+    fn a_new_session_on_the_title_does_not_inherit_the_task() {
         with_home(|home| {
             let ns = NamespaceConfig::default();
             bind("caddy-backend", "sid-B", home);
             enqueue(&ns, &sample("sid-B")).unwrap();
             assert!(deliver("sid-B", Phase::SessionStart).is_some());
-            // Receiver restarts and reclaims the SAME title under a new session id.
-            // The one inbox entry re-fires loud for the new session — the core of
-            // "persist until done, re-loud at session-start".
-            bind("caddy-backend", "sid-C", home);
-            let block = deliver("sid-C", Phase::SessionStart).expect("new session must see it");
-            assert!(block.starts_with("relay: task rebuild-auth-guard"), "{block}");
-            // The same session starting again (a compaction) gets the one-line listing, not the brief again.
-            let again = deliver("sid-C", Phase::SessionStart).expect("an open task is listed");
+            let again = deliver("sid-B", Phase::SessionStart).expect("an open task is listed");
             assert_eq!(again, "relay: 1 open task (rebuild-auth-guard from api-session) · when finished: base relay done <slug>\n");
+            // The receiver restarts and reclaims the SAME title under a new session id.
+            bind("caddy-backend", "sid-C", home);
+            assert!(deliver("sid-C", Phase::SessionStart).is_none(), "the new session is shown nothing of sid-B's");
+            assert!(read_tasks_in(&title_dir("caddy-backend").unwrap()).is_empty(), "its inbox starts empty");
+            let archived = read_tasks_in(&archive_dir("caddy-backend", "sid-B").unwrap());
+            assert_eq!(archived.len(), 1, "the task is in sid-B's archive folder");
+            assert_eq!(archived[0].1.slug, "rebuild-auth-guard");
         });
     }
 
@@ -825,8 +1167,9 @@ mod tests {
             enqueue(&ns, &pending).unwrap();
             assert!(deliver("sid-B", Phase::SessionStart).is_none(), "stale pings must not fire loud");
             assert!(deliver("sid-B", Phase::Prompt).is_none(), "nor on a prompt");
-            // Nothing is deleted: the files stay readable in the inbox.
-            assert_eq!(read_tasks_in(&title_dir("cougar").unwrap()).len(), 2);
+            // Nothing is deleted: both were sent to sid-A, so both are readable in sid-A's archive folder (BO-05).
+            assert!(read_tasks_in(&title_dir("cougar").unwrap()).is_empty());
+            assert_eq!(read_tasks_in(&archive_dir("cougar", "sid-A").unwrap()).len(), 2);
         });
     }
 
@@ -843,14 +1186,14 @@ mod tests {
             enqueue(&ns, &fresh).unwrap();
             let block = deliver("sid-B", Phase::SessionStart).expect("a ping under a day old fires");
             assert!(block.contains("still live"));
-            // An old TASK is assigned work and persists until done.
+            // An old TASK is assigned work and persists until done: never stale, never archived for its age.
             let mut task = sample("sid-B");
             task.to_title = "cougar".into();
             task.created = days_ago(25);
             enqueue(&ns, &task).unwrap();
-            bind("cougar", "sid-C", home);
-            let block = deliver("sid-C", Phase::SessionStart).expect("an old task still re-announces");
+            let block = deliver("sid-B", Phase::SessionStart).expect("an old task still announces");
             assert!(block.contains("relay: task rebuild-auth-guard"), "{block}");
+            assert!(read_tasks_in(&archive_dir("cougar", "sid-B").unwrap()).is_empty(), "nothing archived");
         });
     }
 
@@ -1169,23 +1512,23 @@ mod tests {
         }
     }
 
-    /// Review finding 1: a session that takes over a title mid-session (`base relay register`) is shown, on its next
-    /// prompt, the open task in full and the unanswered pings in one line that another session was shown. Once.
+    /// BO-04's review finding 1 showed a session that takes a title over mid-session (`base relay register`) the open
+    /// task and unanswered pings another session had been shown. BO-05 (F12c) reverses it: they were sent to session
+    /// A, so session B is shown nothing, they move to A's archive folder, and since A was shown both, nobody is told.
     #[test]
-    fn a_title_taken_over_mid_session_shows_its_open_items_once_on_a_prompt() {
+    fn a_title_taken_over_mid_session_shows_the_new_holder_nothing_of_the_old() {
         with_home(|home| {
             let ns = NamespaceConfig::default();
+            bind("heron", "sid-H", home);
             bind("caddy-backend", "sid-A", home);
             enqueue(&ns, &sample("sid-A")).unwrap();
             enqueue(&ns, &sample_ping("ping", "heron", "caddy-backend", "sid-A", "still waiting on you")).unwrap();
             assert!(deliver("sid-A", Phase::Prompt).is_some(), "control: session A was shown both");
             bind("caddy-backend", "sid-B", home);
-            let block = deliver("sid-B", Phase::Prompt).expect("session B is shown what it now holds");
-            assert!(block.contains("relay: task rebuild-auth-guard"), "the task, in full:\n{block}");
-            assert!(block.contains("brief: /tmp/rebuild-auth-guard.md"), "{block}");
-            assert!(block.contains("relay: 1 unanswered ping (heron "), "the ping, listed:\n{block}");
-            assert!(!block.contains("still waiting on you"), "a delivered ping is listed, not shown again:\n{block}");
-            assert!(deliver("sid-B", Phase::Prompt).is_none(), "once per session");
+            assert!(deliver("sid-B", Phase::Prompt).is_none(), "session B is shown nothing of A's");
+            assert!(deliver("sid-B", Phase::SessionStart).is_none(), "nor listed at its start");
+            assert_eq!(read_tasks_in(&archive_dir("caddy-backend", "sid-A").unwrap()).len(), 2);
+            assert!(read_tasks_in(&title_dir("heron").unwrap()).is_empty(), "a delivered ping's sender is not told");
         });
     }
 
@@ -1292,6 +1635,304 @@ mod tests {
             let part = deliver_deferred("sid-L", Phase::Prompt).expect("delivery");
             assert_eq!(part.items, 2, "{}", part.text);
             assert!(part.text.contains("relay (crew): notify from heron ("), "{}", part.text);
+        });
+    }
+
+    // ─── BO-05 (F12): addressed to a session, not a title ────────
+
+    use crate::relay::session_registry::{self as registry, SessionEntry, SessionRegistry};
+
+    /// Write the registry whole, the way the 2026-10-01 machine had it: every codename held by a live session except
+    /// `dead`, which `dead_session` held until its heartbeat stopped two hours ago.
+    fn registry_with_one_dead_title(dead: &str, dead_session: &str) {
+        let now = crate::relay::now_iso();
+        let mut reg = SessionRegistry::default();
+        for word in [
+            "falcon", "otter", "cobra", "lynx", "heron", "bison", "raven", "koala", "gecko", "panda", "tiger", "wolf",
+            "moose", "crane", "viper", "badger", "ferret", "marlin", "osprey", "jackal", "mantis", "walrus", "puffin",
+            "dingo", "quokka", "tapir", "narwhal", "cougar", "egret", "finch", "gopher", "hawk", "jaguar", "kestrel",
+            "lemur", "meerkat", "ocelot", "pelican", "quail", "robin", "seal", "toucan", "vole", "weasel", "zebra",
+            "wren", "stoat", "orca",
+        ] {
+            let (session, beat) = if word == dead { (dead_session.to_string(), hours_ago(2)) } else { (format!("sid-{word}"), now.clone()) };
+            reg.sessions.insert(
+                word.into(),
+                SessionEntry {
+                    title: word.into(),
+                    session_id: session,
+                    registered_at: hours_ago(5),
+                    last_heartbeat: beat,
+                    auto: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let dir = registry::global_base_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sessions.json"), serde_json::to_string_pretty(&reg).unwrap()).unwrap();
+    }
+
+    /// The notices in `title`'s inbox: base telling that session something it sent was not delivered.
+    fn notices(title: &str) -> Vec<InboxTask> {
+        read_tasks_in(&title_dir(title).unwrap()).into_iter().map(|(_, t)| t).filter(|t| t.kind == "undelivered").collect()
+    }
+
+    /// Example 1, the 2026-10-01 case on the path it took: the session holding `lynx` ended with two of bison's pings
+    /// unshown, and a new session was handed the codename `lynx` from the wordlist. The new session starts with an empty
+    /// inbox, the pings are in `.archive/lynx-<old session>/`, and bison is told, once, in its own inbox.
+    #[test]
+    fn a_codename_handed_out_again_archives_the_dead_holders_inbox() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            registry_with_one_dead_title("lynx", "aaaa1111-0000-4000-8000-000000000001");
+            for (i, msg) in ["go: edit the Everything In Progress doc", "stand down on the doc"].iter().enumerate() {
+                let mut p = sample_ping("ping", "bison", "lynx", "aaaa1111-0000-4000-8000-000000000001", msg);
+                p.slug = format!("ping-{i}");
+                p.from_session = "sid-bison".into();
+                enqueue(&ns, &p).unwrap();
+            }
+            let new = "5b860473-5522-5a45-85ed-de1df8fca274";
+            assert_eq!(registry::touch(new, home).as_deref(), Some("lynx"), "control: the wordlist hands out lynx");
+
+            assert!(read_tasks_in(&title_dir("lynx").unwrap()).is_empty(), "the new holder's inbox starts empty");
+            let archived = read_tasks_in(&archive_dir("lynx", "aaaa1111-0000-4000-8000-000000000001").unwrap());
+            assert_eq!(archived.len(), 2, "both pings are in the old holder's archive folder");
+            assert!(deliver(new, Phase::SessionStart).is_none() && deliver(new, Phase::Prompt).is_none());
+
+            let told = notices("bison");
+            assert_eq!(told.len(), 1, "bison is told once for both pings: {told:?}");
+            assert_eq!(told[0].to_session, "sid-bison", "the notice is addressed to the session that sent them");
+            let text = &told[0].summary;
+            assert!(text.starts_with("your 2 pings to lynx (sent "), "{text}");
+            assert!(text.contains(") were not delivered. lynx was session aaaa1111, which no longer holds it; "), "{text}");
+            assert!(text.contains("the title now belongs to session 5b860473 (since "), "{text}");
+            assert!(text.contains(", which has not seen them. Archived at "), "{text}");
+            assert!(text.contains("/relay-inbox/.archive/lynx-aaaa1111-0000-4000-8000-000000000001/"), "{text}");
+            assert!(text.ends_with("Re-send to the new holder if they still apply."), "{text}");
+
+            // bison's next prompt shows it, once, as information.
+            let block = deliver("sid-bison", Phase::Prompt).expect("bison is shown the notice");
+            assert!(block.starts_with("relay: not delivered ("), "{block}");
+            assert!(block.contains(") · no answer needed\nyour 2 pings to lynx"), "{block}");
+            assert!(deliver("sid-bison", Phase::Prompt).is_none() && deliver("sid-bison", Phase::SessionStart).is_none());
+        });
+    }
+
+    /// The /clear case: a new session in the same Windows Terminal tab reclaims the tab's title. It is still a new
+    /// session, so the title's inbox is settled as on any other change of holder.
+    #[test]
+    fn a_tab_reclaim_after_clear_archives_the_previous_sessions_inbox() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("heron", "sid-H", home);
+            // SAFETY: with_home holds ENV_LOCK, and scrub_shell_env has run.
+            unsafe { std::env::set_var("WT_SESSION", "tab-1") };
+            let title = registry::touch("sid-A", home).expect("an auto title");
+            let mut p = sample_ping("ping", "heron", &title, "sid-A", "are you there?");
+            p.from_session = "sid-H".into();
+            enqueue(&ns, &p).unwrap();
+            let reclaimed = registry::touch("sid-B", home);
+            unsafe { std::env::remove_var("WT_SESSION") };
+            assert_eq!(reclaimed.as_deref(), Some(title.as_str()), "control: the tab reclaims its title");
+            assert!(deliver("sid-B", Phase::Prompt).is_none(), "sid-B is not shown sid-A's ping");
+            assert_eq!(read_tasks_in(&archive_dir(&title, "sid-A").unwrap()).len(), 1);
+            assert_eq!(notices("heron").len(), 1, "heron is told");
+        });
+    }
+
+    /// F12d: the notice goes to the session that sent the ping. When that session no longer holds the sender's title,
+    /// the title's later holder never sent it and is not told; when base cannot say which session sent it, nobody is
+    /// told. The archive keeps the ping either way.
+    #[test]
+    fn a_notice_reaches_the_sending_session_never_a_later_holder_of_its_title() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("bison", "sid-bison-1", home);
+            bind("lynx", "sid-L1", home);
+            let mut p = sample_ping("ping", "bison", "lynx", "sid-L1", "first bison's question");
+            p.from_session = "sid-bison-1".into();
+            enqueue(&ns, &p).unwrap();
+            bind("bison", "sid-bison-2", home);
+            bind("lynx", "sid-L2", home);
+            assert_eq!(read_tasks_in(&archive_dir("lynx", "sid-L1").unwrap()).len(), 1, "archived");
+            assert!(notices("bison").is_empty(), "the second bison never sent it, so it is not told");
+            // A ping that does not say which session sent it (a script's --from) is placed by the title history: sent
+            // while sid-bison-2 held bison, so sid-bison-2 is told.
+            bind("lynx", "sid-L3", home);
+            enqueue(&ns, &sample_ping("ping", "bison", "lynx", "sid-L3", "from a script")).unwrap();
+            bind("lynx", "sid-L4", home);
+            let told = notices("bison");
+            assert_eq!(told.len(), 1, "{told:?}");
+            assert_eq!(told[0].to_session, "sid-bison-2");
+            // One from before bison's first history line (a binary from before BO-05): which session sent it cannot
+            // be known, so nobody is told, and the archive keeps it.
+            let mut legacy = sample_ping("ping", "bison", "lynx", "sid-L4", "from before the history");
+            legacy.slug = "ping-legacy".into();
+            legacy.created = hours_ago(3);
+            enqueue(&ns, &legacy).unwrap();
+            bind("lynx", "sid-L5", home);
+            assert_eq!(read_tasks_in(&archive_dir("lynx", "sid-L4").unwrap()).len(), 1, "archived");
+            assert_eq!(notices("bison").len(), 1, "no second notice: {:?}", notices("bison"));
+        });
+    }
+
+    /// F12e at the unit level: an item that carries no session id is read as sent to whoever held its title when it
+    /// was written, by the title history; the history's earliest line is as far back as that reaches.
+    #[test]
+    fn title_history_places_an_item_by_when_it_was_written() {
+        with_home(|home| {
+            bind("lynx", "sid-1", home);
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            bind("lynx", "sid-2", home);
+            let h = registry::holders("lynx");
+            assert_eq!(h.iter().map(|h| h.session_id.as_str()).collect::<Vec<_>>(), ["sid-1", "sid-2"]);
+            let at = |s: &str| crate::relay::parse_ts(s).unwrap();
+            assert_eq!(registry::holder_at("lynx", at(&h[0].since)).as_deref(), Some("sid-1"));
+            assert_eq!(registry::holder_at("lynx", chrono::Local::now()).as_deref(), Some("sid-2"));
+            assert_eq!(registry::holder_at("lynx", at(&h[0].since) - chrono::Duration::seconds(5)), None, "before the first line");
+            assert_eq!(registry::held_since("lynx", "sid-2"), Some(h[1].since.clone()));
+            // Re-registering the same session adds no line.
+            bind("lynx", "sid-2", home);
+            assert_eq!(registry::holders("lynx").len(), 2);
+        });
+    }
+
+    /// A ping no session was ever shown that has waited past a day is archived and its sender told, never skipped
+    /// silently (carried into BO-05 from BO-00's code review of `ping_is_stale`).
+    #[test]
+    fn a_never_delivered_stale_ping_is_archived_and_its_sender_told() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("heron", "sid-H", home);
+            bind("lynx", "sid-L", home);
+            let mut old = sample_ping("ping", "heron", "lynx", "sid-L", "a question from the day before");
+            old.created = days_ago(2);
+            old.from_session = "sid-H".into();
+            enqueue(&ns, &old).unwrap();
+            assert!(deliver("sid-L", Phase::Prompt).is_none(), "a stale ping is not shown");
+            assert_eq!(read_tasks_in(&archive_dir("lynx", "sid-L").unwrap()).len(), 1, "it is archived");
+            let told = notices("heron");
+            assert_eq!(told.len(), 1);
+            assert!(told[0].summary.contains("was not delivered: it waited more than a day, and session sid-L"), "{}", told[0].summary);
+        });
+    }
+
+    /// Review finding 1: before BO-05, a session that took a title over was shown the previous holder's open task in
+    /// full (BO-04), so on disk the task still names the previous holder while its listing belongs to the session that
+    /// was shown it. After the upgrade that session keeps it, and it leaves with that session's inbox, not the first's.
+    #[test]
+    fn what_bo_04_showed_a_takeover_holder_stays_that_holders() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("caddy-backend", "sid-B", home);
+            let mut shown_to_b = sample("sid-A");
+            shown_to_b.status = "delivered".into();
+            shown_to_b.last_loud_session = "sid-B".into();
+            enqueue(&ns, &shown_to_b).unwrap();
+            // And the other way round: a ping sent to sid-B that a session holding the title for a while was shown.
+            let mut sent_to_b = sample_ping("ping", "heron", "caddy-backend", "sid-B", "sent to B, shown to X");
+            sent_to_b.status = "delivered".into();
+            sent_to_b.last_loud_session = "sid-X".into();
+            enqueue(&ns, &sent_to_b).unwrap();
+            let listed = deliver("sid-B", Phase::SessionStart).expect("sid-B still lists its open task");
+            assert!(listed.contains("relay: 1 open task (rebuild-auth-guard from api-session)"), "{listed}");
+            assert!(listed.contains("relay: 1 unanswered ping (heron "), "what was sent to sid-B stays with it:
+{listed}");
+            bind("caddy-backend", "sid-C", home);
+            assert!(deliver("sid-C", Phase::SessionStart).is_none());
+            assert_eq!(read_tasks_in(&archive_dir("caddy-backend", "sid-B").unwrap()).len(), 1, "the task, in sid-B's folder");
+            assert_eq!(read_tasks_in(&archive_dir("caddy-backend", "sid-X").unwrap()).len(), 1, "the ping, with the session shown it");
+        });
+    }
+
+    /// Review finding 3: a session that takes back a title it held gets back what it had been shown under it, for one
+    /// after a headless run started from its terminal tab took the tab's title (F27, BO-08). What it was never shown
+    /// stays archived: its sender was told it was not delivered.
+    #[test]
+    fn a_session_that_takes_its_title_back_gets_back_what_it_was_shown() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("heron", "sid-H", home);
+            bind("otter", "sid-P", home);
+            enqueue(&ns, &sample_ping("ping", "heron", "otter", "sid-P", "seen before the child ran")).unwrap();
+            let mut task = sample("sid-P");
+            task.to_title = "otter".into();
+            enqueue(&ns, &task).unwrap();
+            assert!(deliver("sid-P", Phase::Prompt).is_some(), "control: sid-P was shown both");
+            let mut unseen = sample_ping("ping", "heron", "otter", "sid-P", "sent while the child held otter");
+            unseen.slug = "ping-unseen".into();
+            unseen.from_session = "sid-H".into();
+            enqueue(&ns, &unseen).unwrap();
+
+            bind("otter", "sid-child", home);
+            assert_eq!(read_tasks_in(&archive_dir("otter", "sid-P").unwrap()).len(), 3, "all of sid-P's left");
+            bind("otter", "sid-P", home);
+            let back = deliver("sid-P", Phase::SessionStart).expect("its open task and ping are back");
+            assert!(back.contains("relay: 1 open task (rebuild-auth-guard"), "{back}");
+            assert!(back.contains("relay: 1 unanswered ping (heron "), "{back}");
+            let still: Vec<String> =
+                read_tasks_in(&archive_dir("otter", "sid-P").unwrap()).into_iter().map(|(_, t)| t.slug).collect();
+            assert_eq!(still, vec!["ping-unseen".to_string()], "the unshown ping stays archived");
+            assert_eq!(notices("heron").len(), 1, "and its sender was told once");
+        });
+    }
+
+    /// Review finding 5: a delivery's write-back runs after the block is printed. If the title passed and the item was
+    /// archived in between, the write-back does not put a copy back in the folder.
+    #[test]
+    fn a_late_write_back_never_restores_an_archived_item() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-A", home);
+            enqueue(&ns, &sample_ping("ping", "bison", "lynx", "sid-A", "shown to A")).unwrap();
+            let part = deliver_deferred("sid-A", Phase::Prompt).expect("a block for A");
+            bind("lynx", "sid-B", home);
+            let _ = part.commit();
+            assert!(read_tasks_in(&title_dir("lynx").unwrap()).is_empty(), "nothing was written back into the folder");
+            assert_eq!(read_tasks_in(&archive_dir("lynx", "sid-A").unwrap()).len(), 1);
+        });
+    }
+
+    /// Review findings 7 and 9: the history is seeded once, by a marker, so a heartbeat never reads it; seed lines are
+    /// never shown as the time a session took a title; and compaction keeps each registered title's newest line and
+    /// the recent lines only, leaving the file well under the cap.
+    #[test]
+    fn the_history_is_seeded_once_and_compacted_to_what_a_lookup_needs() {
+        with_home(|home| {
+            let dir = registry::global_base_dir().unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut reg = SessionRegistry::default();
+            reg.sessions.insert(
+                "kite".into(),
+                SessionEntry { title: "kite".into(), session_id: "sid-K".into(), last_heartbeat: hours_ago(0), ..Default::default() },
+            );
+            std::fs::write(dir.join("sessions.json"), serde_json::to_string(&reg).unwrap()).unwrap();
+            bind("lynx", "sid-L", home);
+            let kite = registry::holders("kite");
+            assert_eq!(kite.len(), 1, "the title held since before the install got a seed line");
+            assert!(kite[0].observed);
+            assert_eq!(registry::held_since("kite", "sid-K"), None, "a seed line is not when sid-K took kite");
+            assert!(dir.join("title-history.seeded").is_file());
+            // Seeded once: after the marker, a registry write (here a heartbeat) never reads or writes the history.
+            let path = dir.join("title-history.jsonl");
+            let before = std::fs::read_to_string(&path).unwrap();
+            registry::heartbeat("sid-L");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "a heartbeat does not touch the history");
+
+            // Over the cap: 3,000 lines for titles nobody holds now, all from two months ago.
+            let mut big = before.clone();
+            let old = (chrono::Local::now() - chrono::Duration::days(60)).format("%Y-%m-%dT%H:%M:%S%z").to_string();
+            for i in 0..3000 {
+                big.push_str(&format!("{{\"title\":\"gone-{i}\",\"session_id\":\"sid-{i}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"since\":\"{old}\"}}\n"));
+            }
+            std::fs::write(&path, big).unwrap();
+            assert!(std::fs::metadata(&path).unwrap().len() > 256 * 1024, "control: over the cap");
+            bind("lynx", "sid-L2", home);
+            let len = std::fs::metadata(&path).unwrap().len();
+            assert!(len < 128 * 1024, "compacted well under the cap: {len} bytes");
+            assert_eq!(registry::holder_at("lynx", chrono::Local::now()).as_deref(), Some("sid-L2"));
+            assert_eq!(registry::holders("kite").len(), 1, "a registered title keeps its newest line");
+            assert!(registry::holders("gone-1").is_empty(), "an old line for a title nobody holds is dropped");
         });
     }
 }

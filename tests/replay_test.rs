@@ -666,3 +666,55 @@ fn replay_relay_takes_one_line_and_never_repeats() {
         .sum();
     println!("replay relay: {} prompts, {} tool calls, {relay_bytes} relay bytes in all", run.prompts.len(), run.tools.len());
 }
+
+/// BO-05 (F12). Measured on 2026-10-01: session 5b860473 was auto-given the title `lynx`, inherited the inbox of the
+/// session that had held it, and was shown bison's pings about a doc it had never seen. Through a whole corpus session
+/// now: `seed-kite` was held by a session that ended with two of seed-bison's pings unshown, and the corpus session is
+/// auto-titled `seed-kite` at its start. No output shows either ping or lists it as unanswered, both pings are in the
+/// old holder's archive folder, and seed-bison is told once, addressed to the session that sent them.
+#[test]
+fn replay_reassigned_title_never_inherits_pings() {
+    let s = seed::write(&root("relay-reassign"), &seed::TINY, &fixture("base.toml"));
+    std::fs::write(s.ws.join(".base").join("domains.toml"), fixture("domains.toml")).expect("domains.toml");
+    for (title, session) in [("seed-bison", "replay-bison"), ("seed-kite", "replay-ended")] {
+        let (code, _, err) = run_base_in_session(&s, &["relay", "register", "--as", title], session);
+        assert_eq!(code, 0, "register: {err}");
+    }
+    for msg in ["RELAY-PING-ONE: go: edit the progress doc", "RELAY-PING-TWO: stand down on the progress doc"] {
+        let (code, _, err) = run_base_in_session(&s, &["relay", "ping", "--to", "seed-kite", "--msg", msg], "replay-bison");
+        assert_eq!(code, 0, "ping: {err}");
+    }
+    let session = "replay-successor";
+    let mut outputs = Vec::new();
+    let (code, stdout, stderr) = run_session_start(&s, Some(session));
+    assert_eq!(code, 0, "session start: {stderr}");
+    outputs.push(stdout);
+    for prompt in prompts() {
+        let (code, stdout, stderr) = run_prompt_submit(&s, &prompt, Some(session));
+        assert_eq!(code, 0, "{prompt:?}: the prompt hook failed: {stderr}");
+        outputs.push(stdout);
+    }
+    assert!(outputs.len() >= 31, "control: the corpus session ran {} hooks", outputs.len());
+    let (_, sessions, _) = run_base(&s, &["relay", "sessions"]);
+    assert!(sessions.contains("session:replay-successor"), "control: the session was auto-titled:\n{sessions}");
+    for (i, out) in outputs.iter().enumerate() {
+        assert!(!out.contains("RELAY-PING") && !out.contains("unanswered"), "output {i} carries the old holder's pings:\n{out}");
+    }
+    let inbox = s.home.join(".base-gbl").join(".base").join("relay-inbox");
+    let count = |dir: &Path| -> Vec<serde_json::Value> {
+        std::fs::read_dir(dir)
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                    .map(|e| serde_json::from_str(&std::fs::read_to_string(e.path()).unwrap()).unwrap())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(count(&inbox.join(".archive").join("seed-kite-replay-ended")).len(), 2, "both pings are archived");
+    let told = count(&inbox.join("seed-bison"));
+    assert_eq!(told.len(), 1, "seed-bison is told once: {told:?}");
+    assert_eq!(told[0]["kind"], "undelivered");
+    assert_eq!(told[0]["to_session"], "replay-bison");
+    println!("replay relay reassignment: {} hooks, 0 inherited pings, 2 archived, 1 notice", outputs.len());
+}

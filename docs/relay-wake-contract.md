@@ -48,8 +48,15 @@ watcher, and whether it does is observable from outside the session.
   watcher) gets each new item once on its next tool call, in the same plain
   form, with no watcher line. `BASE_RELAY_AS` does not count: the operator's
   launchers set it on interactive sessions.
-- A title taken over mid-session (or a successor) is shown, once, the open
-  task in full and the unanswered pings in one line on its next prompt.
+- A ping, task or notify carries the session id that held its title when it
+  was sent, and only that session is shown it (BO-05, F12). A title that passes
+  to another session (a restart, a /clear, a codename handed out again, a
+  `relay register` from another session) does not pass its inbox: what was sent
+  to the previous holder moves to `relay-inbox/.archive/<title>-<session>/`, the
+  new holder starts with an inbox holding only what was sent to it, and each
+  sender of something no session was shown gets one `relay: not delivered`
+  notice, addressed to the session that sent it. A ping no session was shown in
+  a day is archived the same way, and its sender told.
 - A new ping is shown once. While it stays unanswered, session start lists it in
   one line; prompts do not repeat it.
 - Of one sender's unshown messages, only the newest is shown; the older ones are
