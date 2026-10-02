@@ -440,3 +440,39 @@ fn the_fingerprint_is_stable_across_calls() {
     assert_eq!(a.len(), 16, "expected 16 hex characters, got {a:?}");
     assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "not hex: {a:?}");
 }
+
+/// BO-05 (F12b): a watcher prints only the pings addressed to the session that held its title when it was armed. A
+/// ping file naming another session in `to_session` (sent to a previous holder, or to the next one while an old
+/// holder's watcher still runs) is never printed; one naming this session, or naming none, is.
+#[test]
+fn a_watcher_prints_only_the_pings_addressed_to_its_session() {
+    let Some(sh) = bash() else {
+        eprintln!("SKIPPED: bash not on PATH — this test cannot run here, and is not passing.");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    for (name, to, msg) in [
+        ("ping-001.json", Some("sess-mine"), "for this session"),
+        ("ping-002.json", Some("sess-other"), "for another session"),
+        ("ping-003.json", None, "from an old writer with no to_session"),
+    ] {
+        let to = to.map(|t| format!(r#""to_session": "{t}", "#)).unwrap_or_default();
+        let mut f = std::fs::File::create(inbox.join(name)).unwrap();
+        write!(f, r#"{{"slug": "x", "summary": "{msg}", "doc": "", "from": "bison", "to_title": "lynx", {to}"kind": "ping"}}"#)
+            .unwrap();
+    }
+    let script = base::relay::wake::watch_script_for_session(&inbox, "sess-mine").unwrap();
+    assert!(script.contains("SESSION=\"sess-mine\""), "{script}");
+    let stdout = run_loop(&sh, tmp.path(), &script, "sleep 8");
+    assert!(stdout.contains("for this session"), "{stdout}");
+    assert!(stdout.contains("from an old writer with no to_session"), "{stdout}");
+    assert!(!stdout.contains("for another session"), "another session's ping was printed:\n{stdout}");
+    assert_eq!(stdout.matches("RELAY PING from").count(), 2, "{stdout}");
+
+    // With no session (nobody held the title when it was armed) nothing is skipped.
+    let all = base::relay::wake::watch_script_for(&inbox).unwrap();
+    let stdout = run_loop(&sh, tmp.path(), &all, "sleep 8");
+    assert_eq!(stdout.matches("RELAY PING from").count(), 3, "{stdout}");
+}

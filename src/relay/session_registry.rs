@@ -194,14 +194,26 @@ pub struct Holder {
     pub title: String,
     pub session_id: String,
     pub since: String,
+    /// A seed line: `since` is when base first saw this holder (the first registry write after the install), not when
+    /// it took the title. Good for placing what came after it; never shown as the time a session took a title.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub observed: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Past this size the history is rewritten to the lines a lookup can still need ([`compact_history`]).
 const HISTORY_CAP_BYTES: u64 = 256 * 1024;
 
-/// How far back the history keeps every line once it is over [`HISTORY_CAP_BYTES`]. A ping older than a day is stale
-/// and archived anyway; a task is not, so the history covers a month of them. Each title's newest line is always kept.
+/// How far back the history keeps lines once it is over [`HISTORY_CAP_BYTES`]. A ping older than a day is stale and
+/// archived anyway; a task is not, so the history covers a month of them, at most [`HISTORY_KEEP_LINES`] lines.
 const HISTORY_KEEP_DAYS: i64 = 30;
+
+/// The most recent lines compaction keeps, besides each registered title's newest. About 130 KB, half the cap, so a
+/// compacted file has room to grow before the next compaction instead of being rewritten on every line.
+const HISTORY_KEEP_LINES: usize = 1_000;
 
 fn history_path() -> Option<PathBuf> {
     global_base_dir().map(|d| d.join("title-history.jsonl"))
@@ -210,10 +222,13 @@ fn history_path() -> Option<PathBuf> {
 /// Append that `title` now belongs to `session_id`. Called under the registry lock, so lines never interleave.
 /// Best-effort: a history that cannot be written makes old items unplaceable, never a registration fail.
 fn record_holder(title: &str, session_id: &str, since: &str) {
+    append_holder(&Holder { title: title.into(), session_id: session_id.into(), since: since.into(), observed: false });
+}
+
+fn append_holder(line: &Holder) {
     use std::io::Write as _;
     let Some(path) = history_path() else { return };
-    let line = Holder { title: title.into(), session_id: session_id.into(), since: since.into() };
-    let Ok(json) = serde_json::to_string(&line) else { return };
+    let Ok(json) = serde_json::to_string(line) else { return };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -225,18 +240,25 @@ fn record_holder(title: &str, session_id: &str, since: &str) {
     }
 }
 
-/// Keep the lines from the last [`HISTORY_KEEP_DAYS`] days and each title's newest line; drop the rest.
+/// Keep each registered title's newest line, and of the lines from the last [`HISTORY_KEEP_DAYS`] days the newest
+/// [`HISTORY_KEEP_LINES`]; drop the rest. A title no longer in the registry loses its lines with age, so the file stays
+/// bounded however many codenames come and go.
 fn compact_history(path: &Path) {
     let lines = read_history(path);
+    let registered: std::collections::BTreeSet<String> = load().sessions.into_keys().collect();
     let cutoff = chrono::Local::now() - chrono::Duration::days(HISTORY_KEEP_DAYS);
     let mut newest: BTreeMap<&str, usize> = BTreeMap::new();
     for (i, h) in lines.iter().enumerate() {
         newest.insert(&h.title, i);
     }
+    let recent_from = lines.len().saturating_sub(HISTORY_KEEP_LINES);
     let kept: String = lines
         .iter()
         .enumerate()
-        .filter(|(i, h)| newest.get(h.title.as_str()) == Some(i) || parse_ts(&h.since).is_some_and(|t| t >= cutoff))
+        .filter(|(i, h)| {
+            (registered.contains(&h.title) && newest.get(h.title.as_str()) == Some(i))
+                || (*i >= recent_from && parse_ts(&h.since).is_some_and(|t| t >= cutoff))
+        })
         .filter_map(|(_, h)| serde_json::to_string(h).ok())
         .map(|j| j + "\n")
         .collect();
@@ -270,9 +292,9 @@ pub fn holder_at(title: &str, at: chrono::DateTime<chrono::Local>) -> Option<Str
         .map(|h| h.session_id)
 }
 
-/// When `session_id` took `title`, if the history recorded it: the newest such line.
+/// When `session_id` took `title`, if the history recorded it: the newest such line that is not a seed line.
 pub fn held_since(title: &str, session_id: &str) -> Option<String> {
-    holders(title).into_iter().rev().find(|h| h.session_id == session_id).map(|h| h.since)
+    holders(title).into_iter().rev().find(|h| h.session_id == session_id && !h.observed).map(|h| h.since)
 }
 
 /// Short, distinct, easy-to-type codenames auto-assigned to unnamed sessions.
@@ -441,19 +463,26 @@ fn save(reg: &SessionRegistry) -> Result<()> {
     Ok(())
 }
 
-/// Give each title the history has no line for one line: its holder, from now. The history records only changes of
-/// holder, so a title one session has held since before this build would never get a line, and nothing sent to or by
-/// it could be placed by time. From the first registry write after the install, every title can be (BO-05, F12e).
-/// Called under the registry lock, from [`save`].
+/// Once, at the first registry write after the install: give each title the history has no line for a seed line, its
+/// holder from now. The history records only changes of holder, so a title one session has held since before this
+/// build would never get a line, and nothing sent to or by it could be placed by time. Every title created later gets
+/// its line from [`register`] or [`auto_register`]. A marker file makes it once, so a heartbeat never reads the history
+/// (BO-05, F12e). Called under the registry lock, from [`save`].
 fn seed_history(reg: &SessionRegistry) {
+    let Some(marker) = global_base_dir().map(|d| d.join("title-history.seeded")) else { return };
+    if marker.exists() {
+        return;
+    }
     let Some(path) = history_path() else { return };
     let known: std::collections::BTreeSet<String> = read_history(&path).into_iter().map(|h| h.title).collect();
     let now = now_iso();
     for e in reg.sessions.values() {
         if !e.session_id.is_empty() && !known.contains(&e.title) {
-            record_holder(&e.title, &e.session_id, &now);
+            let line = Holder { title: e.title.clone(), session_id: e.session_id.clone(), since: now.clone(), observed: true };
+            append_holder(&line);
         }
     }
+    let _ = std::fs::write(&marker, &now);
 }
 
 /// Lockfile mutex over the registry file. Mirrors [`RelayStore::with_lock`] —

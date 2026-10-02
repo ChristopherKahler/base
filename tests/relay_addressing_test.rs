@@ -264,6 +264,33 @@ fn title_changes_between_send_and_delivery() {
     assert_eq!(notices(&s, BISON).len(), 2, "and bison told again, for that one");
 }
 
+/// Review finding 4: a `relay send` message reaches the title's holder through two channels, the workspace spool and a
+/// wake notify in the inbox, and the spool holds its copy back only while the notify is there. When the title passes
+/// with the notify unshown, the notify is archived, the spool copy is marked seen for the title, so the new holder is
+/// not shown it either, and the sender is told.
+#[test]
+fn a_spool_message_follows_its_notify_into_the_archive() {
+    let s = fixture("spool");
+    ok(run_base(&s, &["relay", "init", "--project", "crew"]), "relay init");
+    register(&s, "seed-lark", "sess-lark");
+    register(&s, KITE, "sess-A");
+    ok(
+        run_base_in_session(&s, &["relay", "send", "--project", "crew", "--to", KITE, "--type", "notify", "--msg", "schema frozen for A"], "sess-lark"),
+        "relay send",
+    );
+    assert!(inbox(&s, KITE).iter().any(|t| t["kind"] == "notify"), "control: the send dropped a wake notify");
+
+    register(&s, KITE, "sess-B");
+    let shown = [prompt(&s, "sess-B"), start(&s, "sess-B")].join("\n");
+    assert!(!shown.contains("schema frozen for A"), "the new holder was shown the old holder's message:\n{shown}");
+    let polled = ok(run_base(&s, &["relay", "poll", "--project", "crew", "--for", KITE, "--peek"]), "relay poll");
+    assert!(polled.contains("No pending messages"), "the spool copy is marked seen:\n{polled}");
+    assert_eq!(archive(&s, KITE, "sess-A").len(), 1, "the notify is archived with A's inbox");
+    let told = notices(&s, "seed-lark");
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(text(&told[0], "summary").starts_with("your message to seed-kite (sent "), "{told:?}");
+}
+
 /// F12e: an item with no session id (written before this order) is treated as addressed to whoever held the title
 /// when it was written, by the title history. Placed on the holder, it is delivered and records the id; placed on an
 /// earlier holder, it is archived in that holder's folder; with no history that far back it cannot be known, so it

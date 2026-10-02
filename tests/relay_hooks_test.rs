@@ -133,6 +133,8 @@ fn relay_arm_prints_host_monitor_fields() {
     assert!(text.contains("Status line: echo \"<what you are working on>\" > "), "{text}");
     assert!(text.contains(&format!("Not registered yet? base relay register --as {TITLE}")), "{text}");
     assert!(!text.contains("persistent"), "the host Monitor tool has no persistent field:\n{text}");
+    // BO-05: the watcher prints only the pings addressed to the session holding the title.
+    assert!(text.contains(&format!("SESSION=\"{session}\"")), "{text}");
 
     // Named explicitly, any title.
     let other = ok(run_base_in_session(&s, &["relay", "arm", "--as", "lark"], session), "relay arm --as");

@@ -90,7 +90,16 @@ pub fn is_watching(title: &str) -> bool {
 /// titles can map to one directory — `auk-1` and `auk_1` both become `auk-1`. That is a
 /// real collision and a title field would not have fixed it well. It is a defect in the
 /// sanitizer, recorded here so the next reader does not re-derive it.
+///
+/// BO-05 (F12b): `SESSION` is the id of the session that held the title when the watcher was armed, and a ping file
+/// whose `to_session` names another session is skipped, never printed. A watcher is a delivery path: without this, an
+/// old holder's watcher still running on the folder printed in full every ping sent to the title's new holder, and a
+/// ping still addressed to the old holder was printed by the new holder's watcher before the hooks archived it. An
+/// empty `SESSION` (no holder when armed) or a file with no `to_session` skips nothing. Changing the template moves
+/// the fingerprint, so every watcher running the previous script reads `Outdated` and its session is told once to
+/// re-arm.
 const WATCH_TEMPLATE: &str = r#"INBOX="{inbox}"
+SESSION="{session}"
 mkdir -p "$INBOX"
 seen="|"
 reported="|"
@@ -105,6 +114,11 @@ while true; do
         echo "RELAY EMPTY READ: $b gave nothing on one read - a reply drained it, or it is on disk and empty, and this cannot tell which. Not consumed, so a later read still announces it. This line prints once. Path: $f"
         reported="$reported$b|" ;;
       esac
+      continue
+    fi
+    to=$(printf '%s' "$raw" | grep -o '"to_session": *"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ -n "$SESSION" ] && [ -n "$to" ] && [ "$to" != "$SESSION" ]; then
+      seen="$seen$b|"
       continue
     fi
     from=$(printf '%s' "$raw" | grep -o '"from": *"[^"]*"' | head -1 | cut -d'"' -f4)
@@ -219,8 +233,11 @@ fn human(secs: u64) -> String {
 /// The canonical watch loop for a title — the single source of truth every
 /// session arms verbatim (bash: Git Bash on Windows, bash in WSL). Touching
 /// the sentinel each poll IS the compliance proof.
+///
+/// The script skips pings addressed to any session but the one holding `title` now (BO-05).
 fn watch_script(title: &str) -> Option<String> {
-    watch_script_for(&title_dir(title)?)
+    let holder = super::session_registry::resolve(title).map(|e| e.session_id).unwrap_or_default();
+    watch_script_for_session(&title_dir(title)?, &holder)
 }
 
 /// `watch_script` for an explicit inbox, so the loop can be executed in a test
@@ -304,12 +321,20 @@ fn watch_script(title: &str) -> Option<String> {
 /// test between `ls` and `cat` can always be overtaken by the delete it is
 /// checking for.
 pub fn watch_script_for(inbox: &std::path::Path) -> Option<String> {
+    watch_script_for_session(inbox, "")
+}
+
+/// [`watch_script_for`] for a watcher that prints only the pings addressed to `session` (BO-05); empty prints all.
+pub fn watch_script_for_session(inbox: &std::path::Path, session: &str) -> Option<String> {
     let inbox = inbox.to_string_lossy().replace('\\', "/");
+    // A session id is a uuid: only its characters go into the shell string.
+    let session: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
     // Substitution happens AFTER the hash is taken, and `replace` is used rather than
     // `format!` because the template is a plain const whose braces are literal shell.
     Some(
         WATCH_TEMPLATE
             .replace("{inbox}", &inbox)
+            .replace("{session}", &session)
             .replace("{fp}", &template_fingerprint()),
     )
 }
