@@ -11,6 +11,7 @@ pub mod handoff_show;
 pub mod milestone;
 pub mod note;
 pub mod project;
+pub mod project_paths;
 pub mod rule;
 pub mod reminder;
 pub mod task;
@@ -398,6 +399,11 @@ pub fn resolve_slug(cwd: &Path, ns: &NamespaceConfig, entity_type: &str, input: 
         .context("no .base/ directory found. Use --global for global rules, or run `base scaffold` to create a workspace.")?;
     let trig_path = base_dir.join("graph.nq");
     let store = crate::store::load_graph(&trig_path)?;
+    resolve_slug_in(&store, ns, entity_type, input)
+}
+
+/// [`resolve_slug`] over a store the caller already loaded.
+pub fn resolve_slug_in(store: &oxigraph::store::Store, ns: &NamespaceConfig, entity_type: &str, input: &str) -> Result<String> {
     let pfx = prefixes(ns);
     let p = &ns.prefix;
     let type_name = capitalize_first(entity_type);
@@ -406,7 +412,7 @@ pub fn resolve_slug(cwd: &Path, ns: &NamespaceConfig, entity_type: &str, input: 
     if !input.contains(' ') {
         let iri = build_iri(ns, entity_type, input);
         let ask = format!("{pfx}\nASK WHERE {{ GRAPH ?g {{ <{iri}> a {p}:{type_name} }} }}");
-        if let Ok(QueryResults::Boolean(true)) = crate::store::query(&store, &ask) {
+        if let Ok(QueryResults::Boolean(true)) = crate::store::query(store, &ask) {
             return Ok(input.to_string());
         }
     }
@@ -416,7 +422,7 @@ pub fn resolve_slug(cwd: &Path, ns: &NamespaceConfig, entity_type: &str, input: 
     if slugified != input {
         let iri2 = build_iri(ns, entity_type, &slugified);
         let ask2 = format!("{pfx}\nASK WHERE {{ GRAPH ?g {{ <{iri2}> a {p}:{type_name} }} }}");
-        if let Ok(QueryResults::Boolean(true)) = crate::store::query(&store, &ask2) {
+        if let Ok(QueryResults::Boolean(true)) = crate::store::query(store, &ask2) {
             return Ok(slugified);
         }
     }
@@ -432,7 +438,7 @@ pub fn resolve_slug(cwd: &Path, ns: &NamespaceConfig, entity_type: &str, input: 
            }}\n\
          }} LIMIT 1"
     );
-    if let QueryResults::Solutions(solutions) = crate::store::query(&store, &sel)? {
+    if let QueryResults::Solutions(solutions) = crate::store::query(store, &sel)? {
         for row in solutions.filter_map(|r| r.ok()) {
             if let Some(term) = row.get("iri") {
                 let display = term_display(term.into());

@@ -105,8 +105,14 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
                     let del_old = format!("{prefixes}\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{file_iri}> ?p ?o }} }}");
                     let _ = store.update(&del_old);
 
-                    // Delete existing project triples (idempotent re-extract)
-                    let del_proj = format!("{prefixes}\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{project_iri}> ?p ?o }} }}");
+                    // Delete existing project triples (idempotent re-extract), except the parent link and `nested`,
+                    // which the operator sets and nothing re-derives (D13).
+                    let p = &ns.prefix;
+                    let del_proj = format!(
+                        "{prefixes}\nDELETE {{ GRAPH <{graph_iri}> {{ <{project_iri}> ?p ?o }} }} \
+                         WHERE {{ GRAPH <{graph_iri}> {{ <{project_iri}> ?p ?o \
+                         FILTER(?p NOT IN ({p}:parentProject, {p}:nested)) }} }}"
+                    );
                     let _ = store.update(&del_proj);
 
                     // Insert triples under the project IRI

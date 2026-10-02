@@ -568,6 +568,13 @@ write_full_output = true     # untrimmed hook output also goes to .base/hook-out
 [log]
 prompt_days = 90
 
+# ─── [doctor] — what `base doctor` calls stale ───────────────
+# A project's next step older than this many days is flagged, with the
+# command that rewrites it. Steps written before 0.16.0 carry no date and
+# are flagged as undated.
+[doctor]
+stale_next_days = 14
+
 # ─── [sync] — graph extraction globs ─────────────────────────
 # Which files `base sync` reads to extract metadata/AST into the graph.
 [sync]

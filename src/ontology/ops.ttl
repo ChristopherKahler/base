@@ -175,6 +175,20 @@ ops:blockedBy     rdf:type rdf:Property ;
 ops:nextAction    rdf:type rdf:Property ;
                   rdfs:range xsd:string .
 
+ops:nextActionAt  rdf:type rdf:Property ;
+                  rdfs:range xsd:dateTime ;
+                  rdfs:comment "When the next step was written; doctor flags old ones (F23)" .
+
+ops:parentProject rdf:type rdf:Property ;
+                  rdfs:domain ops:Project ;
+                  rdfs:range ops:Project ;
+                  rdfs:comment "The project this one sits inside; set explicitly, never derived from folders (D13)" .
+
+ops:nested        rdf:type rdf:Property ;
+                  rdfs:domain ops:Project ;
+                  rdfs:range xsd:boolean ;
+                  rdfs:comment "Work in this project also carries its parent's rules (D13); false when absent" .
+
 ops:revenue       rdf:type rdf:Property ;
                   rdfs:range xsd:string ;
                   rdfs:comment "Revenue description (e.g. '$33/mo recurring')" .

@@ -978,3 +978,47 @@ fn replay_headless_calls_leave_no_trace() {
     assert!(runs >= 4 + 4 * 30, "control: the corpus was driven through: {runs} hook runs");
     println!("replay headless: {runs} hook runs under BASE_HEADLESS, 0 bytes printed, 0 files written");
 }
+
+/// BO-09 (F25e, F23b, F23c; build rule 13), on a corpus store: `project list` advises only flags its commands take,
+/// every next step shows its age, doctor flags each undated step once, and an update reaches the corpus projects,
+/// which are filed under the seed's graph (`graph/ws/seed`) rather than the workspace folder's (`graph/ws/ws`). That
+/// last write was a silent no-op before 0.16.0. The corpus's projects are the same in every case (`seed::REAL`), so
+/// the first case carries the check.
+#[test]
+fn replay_project_records_hold_on_the_corpus_store() {
+    let case = cases().into_iter().next().expect("a corpus case");
+    let s = write_case_as(&case, "bo09-projects");
+    let run = |args: &[&str]| {
+        let (code, out, err) = run_base(&s, args);
+        assert!(code == 0 || args[0] == "doctor", "base {args:?}: {err}");
+        out
+    };
+
+    let list = run(&["project", "list"]);
+    let mut advised = 0;
+    for cmd in list.split('`').skip(1).step_by(2).filter(|c| c.starts_with("base project ")) {
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        let help = run(&["project", words[2], "--help"]);
+        for flag in words.iter().filter(|w| w.starts_with("--")) {
+            assert!(help.contains(flag), "`{cmd}` advises {flag}, which `base project {}` does not take:\n{help}", words[2]);
+            advised += 1;
+        }
+    }
+    assert!(advised >= 3, "control: the list's advice was read ({advised} flags):\n{list}");
+
+    let rows: Vec<&str> = list.lines().filter(|l| l.starts_with("| Project ")).collect();
+    assert_eq!(rows.len(), seed::REAL.projects, "{list}");
+    assert!(rows.iter().all(|r| r.contains(" (undated) |")), "every corpus step predates 0.16.0:\n{list}");
+
+    let doctor = run(&["doctor"]);
+    for i in 0..seed::REAL.projects {
+        assert_eq!(doctor.matches(&format!("project project-{i:02}: next step undated")).count(), 1, "project-{i:02}:\n{doctor}");
+    }
+
+    run(&["project", "update", "project-00", "--next-action", "ship slice 0 again"]);
+    let list = run(&["project", "list"]);
+    assert!(list.lines().any(|l| l.starts_with("| Project 00 |") && l.contains("ship slice 0 again (0 days)")), "{list}");
+    let doctor = run(&["doctor"]);
+    assert!(!doctor.contains("project project-00:"), "a rewritten step is not flagged:\n{doctor}");
+    println!("replay project records: {advised} advised flags exist, {} steps aged, 1 update landed", rows.len());
+}

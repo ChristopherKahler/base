@@ -182,6 +182,21 @@ fn managed_quads(
         .collect()
 }
 
+/// The project's next step in its home graph, as a literal value.
+fn next_action(store: &Store, ns: &crate::config::NamespaceConfig, iri: &str, graph_iri: &str) -> Option<String> {
+    let subject = NamedNodeRef::new(iri).ok()?;
+    let graph = NamedNodeRef::new(graph_iri).ok()?;
+    let pred = format!("{}nextAction", ns.uri);
+    let pred = NamedNodeRef::new(&pred).ok()?;
+    store
+        .quads_for_pattern(Some(subject.into()), Some(pred), None, Some(GraphNameRef::NamedNode(graph)))
+        .filter_map(|q| q.ok())
+        .find_map(|q| match q.object {
+            oxigraph::model::Term::Literal(l) => Some(l.value().to_string()),
+            _ => None,
+        })
+}
+
 pub struct IngestStats {
     pub scanned: usize,
     pub registered: usize,
@@ -247,18 +262,22 @@ pub fn ingest_paul_projects(
         // bug (N projects sharing one identical lastActive) and it also reverted any
         // mechanical deferral straight back to active. Truth for those fields now comes
         // from the reconcile pass (real folder touch), not from ingest.
+        // The operator's own links survive a re-ingest too (D13: a parent is set explicitly, never derived), and so
+        // does the time the next step was written (F23a), which is moved below only when the step itself changes.
         let delete = format!(
             "{pfx}\n\
              DELETE {{ GRAPH <{graph}> {{ <{iri}> ?pp ?oo }} }}\n\
              WHERE {{ GRAPH <{graph}> {{ <{iri}> ?pp ?oo .\n\
                FILTER(?pp NOT IN (\
                  rdf:type, {p}:status, {p}:lastActive, {p}:deferredReason, \
-                 {p}:resurfaceAt, {p}:createdAt, {p}:updatedAt)) }} }}"
+                 {p}:resurfaceAt, {p}:createdAt, {p}:updatedAt, \
+                 {p}:parentProject, {p}:nested, {p}:nextActionAt)) }} }}"
         );
         // F25: what the store already holds for this project, `updatedAt` excluded.
         // Compared against the same set after the re-ingest, it decides whether this
         // project really changed — and so whether the store is touched at all.
         let managed_before = managed_quads(store, ns, &iri, &graph);
+        let next_before = next_action(store, ns, &iri, &graph);
 
         let _ = store.update(&delete);
 
@@ -327,6 +346,23 @@ pub fn ingest_paul_projects(
             escape(&paul.status),
         );
         let _ = store.update(&seed);
+
+        // F23a: the phase line is this project's next step. A new or changed one is dated now; one that went away
+        // takes its date with it; an unchanged one keeps the date it was first written.
+        let next_after = next_action(store, ns, &iri, &graph);
+        if next_after != next_before {
+            let stamp = if next_after.is_some() {
+                format!("INSERT DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:nextActionAt \"{now}\"^^xsd:dateTime }} }}")
+            } else {
+                String::new()
+            };
+            let redate = format!(
+                "{pfx}\n\
+                 DELETE WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:nextActionAt ?o }} }}{sep}\n{stamp}",
+                sep = if stamp.is_empty() { "" } else { " ;" },
+            );
+            let _ = store.update(&redate);
+        }
 
         // Only a project whose managed set actually moved gets a fresh `updatedAt`,
         // and only such a project counts as ingested. An unchanged project leaves the
@@ -455,5 +491,76 @@ mod tests {
         let g = graphs_for(tmp.path(), &config.namespace, "lonely");
         assert_eq!(g.len(), 1);
         assert!(g[0].ends_with(&expected), "cwd-slug fallback expected {expected}, got {}", g[0]);
+    }
+
+    /// BO-09 (D13, F23a): a re-ingest keeps the parent link and `nested` the operator set, keeps the date of an
+    /// unchanged phase line, and dates a changed one.
+    #[test]
+    fn reingest_keeps_parent_nested_and_dates_a_changed_phase_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+        let config = config_with(&[]);
+        let ns = &config.namespace;
+        let with_phase = |n: u32, name: &str| {
+            let mut p = paul("Phased");
+            p.phase = Some(Phase { number: n, name: name.into(), status: "active".into() });
+            vec![(PathBuf::from("/nope/phased/.paul/paul.toml"), p)]
+        };
+        let field = |pred: &str| -> Option<String> {
+            let (store, _) = crud::load_workspace_store(tmp.path()).unwrap();
+            next_action_like(&store, ns, "phased", pred)
+        };
+
+        ingest_paul_projects(tmp.path(), &config, &with_phase(1, "build")).unwrap();
+        let first = field("nextActionAt").expect("a new phase line is dated");
+        assert_eq!(field("nextAction").as_deref(), Some("Phase 1: build [active]"));
+
+        // The operator links it under a parent and marks it nested, then the next session start re-ingests it.
+        crate::crud::project::add(tmp.path(), ns, "Holder", "active", Some("/nope")).unwrap();
+        let change = crate::crud::project::ProjectUpdate {
+            parent: Some(crate::crud::project::ParentChange::Set("holder".into())),
+            nested: Some(true),
+            ..Default::default()
+        };
+        crate::crud::project::apply_update(tmp.path(), ns, "phased", &change).unwrap();
+        // An old date, so a re-stamp would show.
+        let iri = crud::build_iri(ns, "project", "phased");
+        let p = &ns.prefix;
+        let old = "2026-01-01T00:00:00Z";
+        crud::load_and_mutate(
+            tmp.path(),
+            ns,
+            &format!(
+                "DELETE WHERE {{ GRAPH ?g {{ <{iri}> {p}:nextActionAt ?o }} }} ;\n\
+                 INSERT DATA {{ GRAPH <{}> {{ <{iri}> {p}:nextActionAt \"{old}\"^^xsd:dateTime }} }}",
+                crud::workspace_graph_iri(ns, &crud::workspace_slug(tmp.path()))
+            ),
+        )
+        .unwrap();
+        assert_ne!(first, old);
+
+        ingest_paul_projects(tmp.path(), &config, &with_phase(1, "build")).unwrap();
+        assert!(field("parentProject").is_some_and(|v| v.ends_with("project/holder")), "parent kept");
+        assert_eq!(field("nested").as_deref(), Some("true"), "nested kept");
+        assert_eq!(field("nextActionAt").as_deref(), Some(old), "an unchanged phase line keeps its date");
+
+        ingest_paul_projects(tmp.path(), &config, &with_phase(2, "ship")).unwrap();
+        assert_eq!(field("nextAction").as_deref(), Some("Phase 2: ship [active]"));
+        assert_ne!(field("nextActionAt").as_deref(), Some(old), "a changed phase line is dated again");
+        assert!(field("parentProject").is_some(), "still kept");
+    }
+
+    /// One value of `pred` on `<project/slug>`, in any graph: a literal's value, a node's IRI.
+    fn next_action_like(store: &Store, ns: &NamespaceConfig, slug: &str, pred: &str) -> Option<String> {
+        let iri = crud::build_iri(ns, "project", slug);
+        let q = format!("SELECT ?v WHERE {{ GRAPH ?g {{ <{iri}> <{}{pred}> ?v }} }} LIMIT 1", ns.uri);
+        let QueryResults::Solutions(mut sols) = store.query(&q).unwrap() else { return None };
+        sols.next().and_then(|r| r.ok()).and_then(|s| {
+            s.get("v").map(|t| match t {
+                oxigraph::model::Term::Literal(l) => l.value().to_string(),
+                oxigraph::model::Term::NamedNode(n) => n.as_str().to_string(),
+                other => other.to_string(),
+            })
+        })
     }
 }

@@ -42,7 +42,7 @@ use crate::store;
 /// Statuses that count as "working" — eligible to decay to `deferred` when cold.
 const WORKING_STATUSES: &[&str] = &["active", "in_progress", "planning", "not_started"];
 /// Statuses left strictly alone (done work shouldn't churn the graph).
-const TERMINAL_STATUSES: &[&str] = &["complete", "completed", "archived"];
+pub const TERMINAL_STATUSES: &[&str] = &["complete", "completed", "archived"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {

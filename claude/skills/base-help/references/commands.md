@@ -33,7 +33,8 @@ base hooks show [<block>] [--session <id>]   # one block of this session's last 
 Projects, milestones, tasks (read side):
 
 ```bash
-base project list                        # (--all, --workspace <W>, --unscoped, --json)
+base project list                        # (--all, --workspace <W>, --unscoped, --json); folder, parent, nested, next step + its age
+base project paths --suggest [--out <file>] [--json]   # a folder for each project whose folder is missing, a file, too broad or contradicted
 base project deferred                    # deferred projects, with the command that brings each back
 base project get <slug> [--json]         # one project, by slug or display name
 base milestone list [-p <project>] [--json]
@@ -112,8 +113,9 @@ base rule remove --domain X --index <N>   # by INDEX, not by text; get N from `b
 Projects, milestones, tasks (write side):
 
 ```bash
-base project add -n "..." -p "src/x" [-s <status>] [--stage <stage>]
-base project update <slug> [-s <status>] [-b "<blocked-by>"] [--next-action "..."]
+base project add -n "..." -p "src/x" [-s <status>] [--stage <stage>] [--parent <slug>] [--nested true|false]
+base project update <slug> [-s <status>] [-b "<blocked-by>"] [--next-action "..."] [--path <dir>] [--parent <slug>|none] [--nested true|false]
+base project paths --apply <file> [--dry-run]   # set the folders in a reviewed list; any bad line refuses the whole file
 base project repath <slug> <new-path>    # re-point folder path + domain trigger after a move
 base project peer <slug> -w <workspace> [--remove]   # additive peerWorkspace edge
 base milestone add -p <project> -n "..." [-d "..."]

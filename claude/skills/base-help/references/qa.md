@@ -357,12 +357,12 @@ Forks are additive, registering a new one never archives existing forks or the p
 ## Projects, milestones, tasks
 
 ### Q: How do I create a new project?
-**A:** `base project add -n "<name>" [-s active] [-p <path>] [--stage <stage>]`. Status defaults to `active`. If you omit `-p` and the `[protocol]` config is enabled, the folder is derived from the protocol stage and auto-created for you.
-<!-- v0.12.3 | verified: cli-help -->
+**A:** `base project add -n "<name>" [-s active] [-p <path>] [--stage <stage>] [--parent <slug>] [--nested true|false]`. Status defaults to `active`. If you omit `-p` and the `[protocol]` config is enabled, the folder is derived from the protocol stage and auto-created for you. The path is stored absolute with forward slashes: a relative one is resolved against the workspace root first. `--parent` names the project this one sits inside, and must be a registered project.
+<!-- v0.15.2 | verified: cli-help -->
 
 ### Q: How do I list projects, and does it show projects from other workspaces?
-**A:** `base project list` by default shows only projects homed in the current workspace. Add `--all` to see the flat union across every registered workspace, `--workspace <W>` to filter to one named workspace, `--unscoped` to see projects with no path or no registered home, and `--json` for the stable dashboard-contract output.
-<!-- v0.12.3 | verified: cli-help -->
+**A:** `base project list` by default shows only projects homed in the current workspace. Add `--all` to see the flat union across every registered workspace, `--workspace <W>` to filter to one named workspace, `--unscoped` to see projects with no folder inside a registered workspace, and `--json` for the stable dashboard-contract output. Each row shows the project's folder, its parent, whether it is nested, and its next step with that step's age: `(3 days)`, or `(undated)` for a step written before 0.16.0.
+<!-- v0.15.2 | verified: cli-help -->
 
 ### Q: How do I add a milestone or task to a project?
 **A:** Milestone: `base milestone add -p <PROJECT> -n "<name>" [-d "<description>"]`. Task: `base task add -p <PROJECT> -n "<name>" [--priority <p>] [-m <MILESTONE>]` to optionally group it under a milestone. Both accept the project as a slug or its display name.
@@ -386,12 +386,20 @@ Forks are additive, registering a new one never archives existing forks or the p
 <!-- v0.12.3 | verified: cli-help -->
 
 ### Q: How do I change a project's status, or record what's blocking it and what to do next?
-**A:** `base project update <slug> [-s <status>] [-b "<blocker>"] [--next-action "<next step>"]`, addressed by slug or display name. Only the flags you pass get rewritten, so this is safe to use for one field at a time. `--next-action` is the one worth actually using: it costs a single flag and it is what turns a project row from a bare name into something a future session can resume from. Confirm the write landed with `base project get <slug>`.
-<!-- v0.12.3 | verified: cli-help -->
+**A:** `base project update <slug> [-s <status>] [-b "<blocker>"] [--next-action "<next step>"] [--path <dir>] [--parent <slug>|none] [--nested true|false]`, addressed by slug or display name. Only the flags you pass get rewritten, so this is safe to use for one field at a time. `--next-action` is the one worth actually using: it costs a single flag and it is what turns a project row from a bare name into something a future session can resume from. It also records when the step was written: `base project list` shows its age, and `base doctor` flags a step older than `[doctor] stale_next_days` (14 by default) or one with no date, with the command that rewrites it. Confirm the write landed with `base project get <slug>`.
+<!-- v0.15.2 | verified: cli-help -->
 
 ### Q: My project folder moved. How do I re-point base at the new location?
-**A:** `base project repath <slug> <new-path>`, where the path is absolute or relative to the workspace root. Use this instead of deleting and re-adding the project: repath rewrites the project's folder path and its domain trigger together, so the path-based context injection keeps working, while delete-and-re-add loses the project's tasks, milestones, and decisions along with it.
-<!-- v0.12.3 | verified: cli-help -->
+**A:** `base project update <slug> --path <new-path>` (or `base project repath <slug> <new-path>`, which does the same), where the path is absolute or relative to the workspace root; it is stored absolute. Use this instead of deleting and re-adding the project: it rewrites the project's folder path and its domain trigger together, so the path-based context injection keeps working, while delete-and-re-add loses the project's tasks, milestones, and decisions along with it.
+<!-- v0.15.2 | verified: cli-help -->
+
+### Q: One project sits inside another. How do I tell base, and does the inner one get the outer one's rules?
+**A:** `base project update <inner> --parent <outer>` links them, and `--nested true` says work in the inner project also carries the outer project's rules; `--nested false` (the default) says it does not. Each project carries its own setting. A parent must be a registered project, and a link that would close a loop is refused: `Error: loop: <outer> already has parent <inner>`. `--parent none` removes the link. `--nested true` with no parent is stored with a warning, because it does nothing until a parent is set. The link is never guessed from folders.
+<!-- v0.15.2 | verified: cli-help -->
+
+### Q: Some projects point at the wrong folder, or a folder far too broad. How do I find each project's real folder?
+**A:** `base project paths --suggest` lists every project whose stored folder is missing, is a file, holds two or more other projects, or is contradicted by the project's own handoff, fork and project docs, with a proposed folder and the number of docs pointing inside it. When two folders both have evidence it lists both and never picks one. It writes nothing. Add `--out paths.toml` to get the suggestions as a list of `"slug" = "folder"` lines to review (two candidates arrive commented out, so you keep one), then `base project paths --apply paths.toml` sets each project's folder and moves its domain trigger with it; `--dry-run` shows what would change first. A list with any bad line (an unknown project, a folder that does not exist) is refused whole. WSL paths are never opened from Windows, so a project stored at one is reported as not checked.
+<!-- v0.15.2 | verified: cli-help -->
 
 ### Q: Can one project surface in more than one workspace?
 **A:** Yes. `base project peer <slug> -w <workspace>` adds an additive `peerWorkspace` edge so the project also shows up when you are working in that other workspace, without moving its home. Pass `--remove` with the same arguments to take the edge back off. Reach for this when two workspaces genuinely share a project; `base project move` is the different tool that actually relocates ownership from one workspace to another.

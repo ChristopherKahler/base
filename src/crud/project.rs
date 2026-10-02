@@ -33,9 +33,11 @@ pub fn add_with_stage(
     let ws_iri = crud::build_iri(ns, "workspace", &ws_slug);
     let now = crud::now_iso();
     let p = &ns.prefix;
-    let project_path = path
+    // F25b: stored absolute, `/`-separated; a relative path is the workspace root's.
+    let raw_path = path
         .map(|s| s.to_string())
         .unwrap_or_else(|| cwd.to_string_lossy().to_string());
+    let project_path = PathRoots::new(cwd, ns).from_cli(&raw_path).unwrap_or(raw_path);
 
     let name = crud::escape_sparql_literal(name);
     let project_path = crud::escape_sparql_literal(&project_path);
@@ -171,6 +173,148 @@ fn canon_registry(reg: &[WorkspaceEntry]) -> Vec<WorkspaceEntry> {
     scope::canonical_registry(reg)
 }
 
+// ─── F25b: one spelling for a project folder ─────────────────
+
+/// A project folder as base stores it (F25b): absolute, `/`-separated, `.` and `..` folded, a drive letter
+/// upper-cased, `\\server\share` as `//server/share`. A relative `raw` is joined to `root` (the workspace root the
+/// record is filed under), `~` to `home`. `None` for an empty path, or a relative one with nothing to join it to.
+pub fn absolute_path(raw: &str, root: Option<&Path>, home: Option<&Path>) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let joined = if crate::domain::matcher::is_absolute(t) {
+        t.to_string()
+    } else if t == "~" || t.starts_with("~/") || t.starts_with("~\\") {
+        format!("{}/{}", home?.display(), &t[1..])
+    } else {
+        format!("{}/{}", root?.display(), t)
+    };
+    Some(fold_path(&joined))
+}
+
+fn is_drive(c: &str) -> bool {
+    c.len() == 2 && c.as_bytes()[1] == b':' && c.as_bytes()[0].is_ascii_alphabetic()
+}
+
+/// `\` is `/`, empty and `.` parts go, `..` drops the part before it but never climbs past the drive, the share or `/`.
+fn fold_path(p: &str) -> String {
+    let s = p.replace('\\', "/");
+    let unc = s.starts_with("//");
+    let rooted = s.starts_with('/');
+    let mut parts: Vec<String> = Vec::new();
+    for c in s.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                let floor = if unc { 2 } else { usize::from(parts.first().is_some_and(|f| is_drive(f))) };
+                if parts.len() > floor {
+                    parts.pop();
+                }
+            }
+            c => parts.push(c.to_string()),
+        }
+    }
+    if let Some(first) = parts.first_mut()
+        && is_drive(first)
+    {
+        *first = first.to_ascii_uppercase();
+    }
+    let body = parts.join("/");
+    if unc {
+        format!("//{body}")
+    } else if rooted {
+        format!("/{body}")
+    } else if parts.len() == 1 && is_drive(&parts[0]) {
+        format!("{body}/")
+    } else {
+        body
+    }
+}
+
+/// Where a relative project path is rooted (F25b), the way `domain::registered_projects` roots one for the trigger
+/// rules: a record in this workspace's own graph against the workspace root, a record in any other graph against
+/// home. A path typed on the command line is the workspace root's (home's, outside a workspace).
+pub struct PathRoots {
+    ws_graph: String,
+    ws_root: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+}
+
+impl PathRoots {
+    pub fn new(cwd: &Path, ns: &NamespaceConfig) -> Self {
+        let home = crate::home::home_root();
+        // The global tier (`~/.base-gbl/.base`) is rooted at home, as doctor and the trigger rules root it.
+        let base = crate::config::find_workspace_base(cwd);
+        let global = home.as_ref().map(|h| h.join(".base-gbl").join(".base"));
+        let ws_root = match (&base, &global) {
+            (Some(b), Some(g)) if crate::scope::canonical_str(&b.display().to_string()) == crate::scope::canonical_str(&g.display().to_string()) => {
+                home.clone()
+            }
+            _ => base.and_then(|b| b.parent().map(Path::to_path_buf)),
+        };
+        Self { ws_graph: crud::workspace_graph_iri(ns, &crud::workspace_slug(cwd)), ws_root, home }
+    }
+
+    /// A path typed on the command line.
+    pub fn from_cli(&self, raw: &str) -> Option<String> {
+        absolute_path(raw, self.ws_root.as_deref().or(self.home.as_deref()), self.home.as_deref())
+    }
+
+    /// A path read from the record filed in `graph` (the full graph IRI). Unrootable: as stored.
+    pub fn stored(&self, raw: &str, graph: Option<&str>) -> String {
+        let root = if graph == Some(self.ws_graph.as_str()) { self.ws_root.as_deref() } else { self.home.as_deref() };
+        absolute_path(raw, root, self.home.as_deref()).unwrap_or_else(|| raw.to_string())
+    }
+
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
+    pub fn workspace_root(&self) -> Option<&Path> {
+        self.ws_root.as_deref()
+    }
+}
+
+/// A named graph's full IRI from a query row (`term_display` would cut it at the `#`).
+fn graph_cell(sol: &oxigraph::sparql::QuerySolution, key: &str) -> Option<String> {
+    sol.get(key).and_then(|t| match t {
+        oxigraph::model::Term::NamedNode(n) => Some(n.as_str().to_string()),
+        _ => None,
+    })
+}
+
+// ─── F23: how old a next step is ─────────────────────────────
+
+/// Whole days since `at` (an RFC 3339 time), `None` when undated or unreadable.
+pub fn age_days(at: Option<&str>, now: chrono::DateTime<chrono::Local>) -> Option<i64> {
+    let t = chrono::DateTime::parse_from_rfc3339(at?).ok()?;
+    Some(now.signed_duration_since(t).num_days().max(0))
+}
+
+/// `(undated)`, `(0 days)`, `(1 day)`, `(12 days)`.
+pub fn age_label(days: Option<i64>) -> String {
+    match days {
+        None => "(undated)".to_string(),
+        Some(1) => "(1 day)".to_string(),
+        Some(n) => format!("({n} days)"),
+    }
+}
+
+/// The first `max` characters of `s`, cut back to a word, with ` ...` when anything was cut.
+pub fn excerpt(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    let head = match cut.rfind(' ') {
+        Some(i) if i > 0 => cut[..i].trim_end(),
+        _ => cut.as_str(),
+    };
+    format!("{head} ...")
+}
+
 /// One project, all fields the graph holds. Stable `--json` contract for the dashboard.
 #[derive(Debug, serde::Serialize)]
 pub struct ProjectRecord {
@@ -178,13 +322,72 @@ pub struct ProjectRecord {
     pub name: String,
     pub status: String,
     pub priority: Option<String>,
+    /// Absolute, `/`-separated (F25b): a relative stored path is resolved on read.
     pub path: Option<String>,
     pub stage: Option<String>,
     pub blocked_by: Option<String>,
     pub next_action: Option<String>,
+    /// When the next step was written (F23a); `None` for one written before 0.16.0.
+    pub next_action_at: Option<String>,
+    /// Whole days since `next_action_at`; `None` when undated.
+    pub next_action_age_days: Option<i64>,
+    /// The parent project's slug (D13).
+    pub parent: Option<String>,
+    /// Work in this project also carries its parent's rules (D13). False unless set.
+    pub nested: bool,
     pub created: Option<String>,
     pub updated: Option<String>,
     pub last_active: Option<String>,
+}
+
+const RECORD_FIELDS: &str = "?priority ?path ?stage ?blockedBy ?nextAction ?nextActionAt ?parent ?nested ?created ?updated ?lastActive";
+
+/// The OPTIONAL patterns behind [`RECORD_FIELDS`] for subject `s` (a `?var` or an `<iri>`).
+fn record_optionals(p: &str, s: &str) -> String {
+    [
+        ("priority", "priority"),
+        ("path", "path"),
+        ("stage", "stage"),
+        ("blockedBy", "blockedBy"),
+        ("nextAction", "nextAction"),
+        ("nextActionAt", "nextActionAt"),
+        ("parentProject", "parent"),
+        ("nested", "nested"),
+        ("createdAt", "created"),
+        ("updatedAt", "updated"),
+        ("lastActive", "lastActive"),
+    ]
+    .iter()
+    .map(|(pred, var)| format!("             OPTIONAL {{ {s} {p}:{pred} ?{var} }}\n"))
+    .collect()
+}
+
+/// A record from one query row. `path` is the stored path, already resolved by the caller.
+fn record_from(
+    id: String,
+    path: Option<String>,
+    cell: &dyn Fn(&str) -> Option<String>,
+    now: chrono::DateTime<chrono::Local>,
+) -> ProjectRecord {
+    let next_action_at = cell("nextActionAt");
+    let next_action = cell("nextAction");
+    ProjectRecord {
+        id,
+        name: cell("name").unwrap_or_default(),
+        status: cell("status").unwrap_or_default(),
+        priority: cell("priority"),
+        path,
+        stage: cell("stage"),
+        blocked_by: cell("blockedBy"),
+        next_action_age_days: next_action.as_ref().and(age_days(next_action_at.as_deref(), now)),
+        next_action,
+        next_action_at,
+        parent: cell("parent").map(|p| crud::slug_of(&p)),
+        nested: cell("nested").is_some_and(|v| v == "true"),
+        created: cell("created"),
+        updated: cell("updated"),
+        last_active: cell("lastActive"),
+    }
 }
 
 /// Query scoped project records (typed). Returns the in-scope records plus the count
@@ -197,20 +400,14 @@ pub fn list_data(
 ) -> Result<(Vec<ProjectRecord>, usize)> {
     let ns = &config.namespace;
     let p = &ns.prefix;
+    let optionals = record_optionals(p, "?proj");
     let sparql = format!(
-        "SELECT ?proj ?name ?status ?priority ?path ?stage ?blockedBy ?nextAction ?created ?updated ?lastActive WHERE {{\n\
+        "SELECT ?proj ?g ?name ?status {RECORD_FIELDS} WHERE {{\n\
            GRAPH ?g {{\n\
              ?proj a {p}:Project ;\n\
                {p}:name ?name ;\n\
                {p}:status ?status .\n\
-             OPTIONAL {{ ?proj {p}:priority ?priority }}\n\
-             OPTIONAL {{ ?proj {p}:path ?path }}\n\
-             OPTIONAL {{ ?proj {p}:stage ?stage }}\n\
-             OPTIONAL {{ ?proj {p}:blockedBy ?blockedBy }}\n\
-             OPTIONAL {{ ?proj {p}:nextAction ?nextAction }}\n\
-             OPTIONAL {{ ?proj {p}:createdAt ?created }}\n\
-             OPTIONAL {{ ?proj {p}:updatedAt ?updated }}\n\
-             OPTIONAL {{ ?proj {p}:lastActive ?lastActive }}\n\
+{optionals}\
            }}\n\
          }}\n\
          ORDER BY ?name"
@@ -237,12 +434,16 @@ pub fn list_data(
         return Ok((Vec::new(), 0));
     };
 
+    let roots = PathRoots::new(&read_cwd, ns);
+    let now = chrono::Local::now();
     let mut records: Vec<ProjectRecord> = Vec::new();
     let mut unscoped_count = 0usize;
     for sol in solutions.filter_map(|r| r.ok()) {
         let cell = |k: &str| sol.get(k).map(|t| crud::term_display(t.into()));
+        // F25b: a relative stored path is resolved before anything reads it, so it can find its workspace.
+        let path = cell("path").map(|raw| roots.stored(&raw, graph_cell(&sol, "g").as_deref()));
         let home = scope::home(
-            cell("path").map(|s| canon_str(&s)).as_deref(),
+            path.as_deref().map(canon_str).as_deref(),
             &registry,
         );
         if matches!(home, scope::Home::Unscoped) {
@@ -256,21 +457,23 @@ pub fn list_data(
         if !scope::in_scope(&home, &peers, current.as_deref(), project_scope) {
             continue;
         }
-        records.push(ProjectRecord {
-            id: proj_iri.as_deref().map(crud::slug_of).unwrap_or_default(),
-            name: cell("name").unwrap_or_default(),
-            status: cell("status").unwrap_or_default(),
-            priority: cell("priority"),
-            path: cell("path"),
-            stage: cell("stage"),
-            blocked_by: cell("blockedBy"),
-            next_action: cell("nextAction"),
-            created: cell("created"),
-            updated: cell("updated"),
-            last_active: cell("lastActive"),
-        });
+        let id = proj_iri.as_deref().map(crud::slug_of).unwrap_or_default();
+        records.push(record_from(id, path, &cell, now));
     }
     Ok((records, unscoped_count))
+}
+
+/// A markdown table cell: one line, no column breaks.
+fn cell_text(s: &str) -> String {
+    s.replace(['\r', '\n'], " ").replace('|', "\\|")
+}
+
+/// The `next` column (F23b): the step, shortened, and its age.
+fn next_cell(r: &ProjectRecord) -> String {
+    match &r.next_action {
+        Some(n) => format!("{} {}", cell_text(&excerpt(n, 60)), age_label(r.next_action_age_days)),
+        None => "-".to_string(),
+    }
 }
 
 pub fn list(cwd: &Path, config: &BaseConfig, project_scope: scope::ProjectScope) -> Result<()> {
@@ -290,15 +493,19 @@ pub fn list(cwd: &Path, config: &BaseConfig, project_scope: scope::ProjectScope)
         };
         println!("No projects in {where_}.");
     } else {
-        const COLS: [&str; 4] = ["name", "status", "priority", "lastActive"];
+        // F25e, F23b: the folder, the parent link and the next step's age are on every row.
+        const COLS: [&str; 7] = ["name", "status", "path", "parent", "nested", "next", "lastActive"];
         println!("| {} |", COLS.join(" | "));
         println!("|{}|", COLS.iter().map(|_| "---").collect::<Vec<_>>().join("|"));
         for r in &records {
             println!(
-                "| {} | {} | {} | {} |",
-                r.name,
-                r.status,
-                r.priority.as_deref().unwrap_or("-"),
+                "| {} | {} | {} | {} | {} | {} | {} |",
+                cell_text(&r.name),
+                cell_text(&r.status),
+                r.path.as_deref().map(cell_text).unwrap_or_else(|| "-".into()),
+                r.parent.as_deref().unwrap_or("-"),
+                r.nested,
+                next_cell(r),
                 r.last_active.as_deref().unwrap_or("-"),
             );
         }
@@ -306,12 +513,19 @@ pub fn list(cwd: &Path, config: &BaseConfig, project_scope: scope::ProjectScope)
 
     // Backfill nudge: never silently lose un-homed projects (Req 3). Only in the
     // workspace-scoped (Current) view — `--all`/`--unscoped` already surface them.
+    // "Unscoped" is `scope::home`'s: no path, or a path inside no registered workspace.
     if matches!(project_scope, scope::ProjectScope::Current) && unscoped_count > 0 {
-        println!(
-            "\n{unscoped_count} project(s) have no #path (unscoped) — `base project list --unscoped`, or set a home with `base project update <slug> --path <dir>`."
-        );
+        println!("\n{}", unscoped_advice(unscoped_count));
     }
     Ok(())
+}
+
+/// The list's backfill advice (F25e). Every command it names exists: `project update --path` since 0.16.0.
+pub fn unscoped_advice(n: usize) -> String {
+    format!(
+        "{n} project(s) have no folder inside a registered workspace (unscoped): `base project list --unscoped` lists them. \
+         Set a project's folder with `base project update <slug> --path <dir>`; `base project paths --suggest` proposes one for each."
+    )
 }
 
 /// `--json` list: valid JSON array of the in-scope project records on stdout, nothing else.
@@ -365,20 +579,14 @@ pub fn peer(cwd: &Path, config: &BaseConfig, slug: &str, workspace: &str, remove
 pub fn get_data(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<Option<ProjectRecord>> {
     let iri = crud::build_iri(ns, "project", slug);
     let p = &ns.prefix;
+    let optionals = record_optionals(p, &format!("<{iri}>"));
     let sparql = format!(
-        "SELECT ?name ?status ?priority ?path ?stage ?blockedBy ?nextAction ?created ?updated ?lastActive WHERE {{\n\
+        "SELECT ?g ?name ?status {RECORD_FIELDS} WHERE {{\n\
            GRAPH ?g {{\n\
              <{iri}> a {p}:Project ;\n\
                {p}:name ?name ;\n\
                {p}:status ?status .\n\
-             OPTIONAL {{ <{iri}> {p}:priority ?priority }}\n\
-             OPTIONAL {{ <{iri}> {p}:path ?path }}\n\
-             OPTIONAL {{ <{iri}> {p}:stage ?stage }}\n\
-             OPTIONAL {{ <{iri}> {p}:blockedBy ?blockedBy }}\n\
-             OPTIONAL {{ <{iri}> {p}:nextAction ?nextAction }}\n\
-             OPTIONAL {{ <{iri}> {p}:createdAt ?created }}\n\
-             OPTIONAL {{ <{iri}> {p}:updatedAt ?updated }}\n\
-             OPTIONAL {{ <{iri}> {p}:lastActive ?lastActive }}\n\
+{optionals}\
            }}\n\
          }}\n\
          LIMIT 1"
@@ -389,19 +597,9 @@ pub fn get_data(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<Option<P
         && let Some(row) = solutions.filter_map(|r| r.ok()).next()
     {
         let cell = |k: &str| row.get(k).map(|t| crud::term_display(t.into()));
-        return Ok(Some(ProjectRecord {
-            id: slug.to_string(),
-            name: cell("name").unwrap_or_default(),
-            status: cell("status").unwrap_or_default(),
-            priority: cell("priority"),
-            path: cell("path"),
-            stage: cell("stage"),
-            blocked_by: cell("blockedBy"),
-            next_action: cell("nextAction"),
-            created: cell("created"),
-            updated: cell("updated"),
-            last_active: cell("lastActive"),
-        }));
+        let roots = PathRoots::new(cwd, ns);
+        let path = cell("path").map(|raw| roots.stored(&raw, graph_cell(&row, "g").as_deref()));
+        return Ok(Some(record_from(slug.to_string(), path, &cell, chrono::Local::now())));
     }
     Ok(None)
 }
@@ -419,8 +617,11 @@ pub fn get(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<()> {
             if let Some(v) = &r.priority { println!("  priority: {v}"); }
             if let Some(v) = &r.path { println!("  path: {v}"); }
             if let Some(v) = &r.stage { println!("  stage: {v}"); }
+            if let Some(v) = &r.parent { println!("  parent: {v}"); }
+            println!("  nested: {}", r.nested);
             if let Some(v) = &r.blocked_by { println!("  blockedBy: {v}"); }
-            if let Some(v) = &r.next_action { println!("  nextAction: {v}"); }
+            if let Some(v) = &r.next_action { println!("  nextAction: {v} {}", age_label(r.next_action_age_days)); }
+            if let Some(v) = &r.next_action_at { println!("  nextActionAt: {v}"); }
             if let Some(v) = &r.created { println!("  created: {v}"); }
             if let Some(v) = &r.updated { println!("  updated: {v}"); }
             if let Some(v) = &r.last_active { println!("  lastActive: {v}"); }
@@ -510,41 +711,240 @@ pub fn update(
     blocked_by: Option<&str>,
     next_action: Option<&str>,
 ) -> Result<()> {
+    let change = ProjectUpdate { status, blocked_by, next_action, ..ProjectUpdate::default() };
+    apply_update(cwd, ns, slug, &change).map(|_| ())
+}
+
+/// A parent link to write (D13): set to a project, or removed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParentChange {
+    Set(String),
+    Clear,
+}
+
+/// The fields one `base project update` writes. `None` leaves a field as it is.
+#[derive(Debug, Default)]
+pub struct ProjectUpdate<'a> {
+    pub status: Option<&'a str>,
+    pub blocked_by: Option<&'a str>,
+    pub next_action: Option<&'a str>,
+    /// As typed: resolved against the workspace root before it is stored (F25b).
+    pub path: Option<&'a str>,
+    pub parent: Option<ParentChange>,
+    pub nested: Option<bool>,
+}
+
+/// What an update did beyond the fields it was given.
+#[derive(Debug, Default)]
+pub struct UpdateOutcome {
+    /// Set when the path changed: old and new, and whether the project's domain trigger moved with it.
+    pub repath: Option<RepathResult>,
+    /// Allowed but worth saying (F25d): `nested = true` with no parent.
+    pub warnings: Vec<String>,
+}
+
+/// A project update refused before anything was written (F25c): no such parent, or a loop. The CLI prints it as
+/// `Error: <text>`.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// A SELECT over a store already loaded, with base's prefixes.
+fn select(store: &oxigraph::store::Store, ns: &NamespaceConfig, sparql: &str) -> Result<Vec<oxigraph::sparql::QuerySolution>> {
+    Ok(match crate::store::query(store, &format!("{}
+{sparql}", crud::prefixes(ns)))? {
+        QueryResults::Solutions(sols) => sols.filter_map(|r| r.ok()).collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// The named graph holding `<project/slug> a Project` in the workspace file: this workspace's own graph when it
+/// holds it, else the first other one that does. A project filed under another workspace's graph in this file (a
+/// `project move` leftover, a PAUL project homed elsewhere) is written where it lives; writing to this
+/// workspace's graph only, as `update` did before 0.16.0, matched nothing and reported success.
+pub fn project_graph(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<Option<String>> {
+    project_graph_in(&crud::load_workspace_graph(cwd)?, cwd, ns, slug)
+}
+
+fn project_graph_in(store: &oxigraph::store::Store, cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<Option<String>> {
     let iri = crud::build_iri(ns, "project", slug);
-    let ws_slug = crud::workspace_slug(cwd);
-    let graph = crud::workspace_graph_iri(ns, &ws_slug);
-    let now = crud::now_iso();
     let p = &ns.prefix;
+    let rows = select(store, ns, &format!("SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ <{iri}> a {p}:Project }} }} ORDER BY ?g"))?;
+    let graphs: Vec<String> = rows.iter().filter_map(|s| graph_cell(s, "g")).collect();
+    let own = crud::workspace_graph_iri(ns, &crud::workspace_slug(cwd));
+    Ok(graphs.iter().find(|g| **g == own).or(graphs.first()).cloned())
+}
+
+/// Every parent link in the workspace file: child slug → parent slug.
+fn parent_map(store: &oxigraph::store::Store, ns: &NamespaceConfig) -> Result<std::collections::HashMap<String, String>> {
+    let p = &ns.prefix;
+    let mut map = std::collections::HashMap::new();
+    for s in select(store, ns, &format!("SELECT ?c ?parent WHERE {{ GRAPH ?g {{ ?c {p}:parentProject ?parent }} }}"))? {
+        let get = |k: &str| s.get(k).map(|t| crud::slug_of(&crud::term_display(t.into())));
+        if let (Some(c), Some(parent)) = (get("c"), get("parent")) {
+            map.insert(c, parent);
+        }
+    }
+    Ok(map)
+}
+
+/// The slug `parent` names, or [`Refused`] when it names no registered project or the link would close a loop
+/// (F25c, D13). Accepts a slug or a display name, as every project command does.
+pub fn check_parent(cwd: &Path, ns: &NamespaceConfig, slug: &str, parent: &str) -> Result<String> {
+    check_parent_in(&crud::load_workspace_graph(cwd)?, ns, slug, parent)
+}
+
+fn check_parent_in(store: &oxigraph::store::Store, ns: &NamespaceConfig, slug: &str, parent: &str) -> Result<String> {
+    let parent_slug = match crud::resolve_slug_in(store, ns, "project", parent) {
+        Ok(s) => s,
+        Err(_) => {
+            return Err(Refused(format!(
+                "no project '{parent}': a parent must be a registered project (`base project list --all`)"
+            ))
+            .into());
+        }
+    };
+    if parent_slug == slug {
+        return Err(Refused(format!("loop: {slug} cannot be its own parent")).into());
+    }
+    // Walk up from the new parent. Reaching `slug` means the link closes a loop; the message names every link
+    // already on the way, so the one to remove is in front of the operator.
+    let parents = parent_map(store, ns)?;
+    let mut links: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cur = parent_slug.clone();
+    while let Some(up) = parents.get(&cur) {
+        links.push(format!("{cur} already has parent {up}"));
+        if *up == slug {
+            return Err(Refused(format!("loop: {}", links.join(", "))).into());
+        }
+        if !seen.insert(cur.clone()) {
+            break; // a loop above that does not run through `slug`; not this link's to refuse
+        }
+        cur = up.clone();
+    }
+    Ok(parent_slug)
+}
+
+/// What an update needs to know before it writes, from the project's own graph: its name (the domain's name), its
+/// path exactly as stored (to match the domain trigger written from it), its parent, and `nested`.
+struct Before {
+    name: String,
+    path: Option<String>,
+    parent: Option<String>,
+    nested: bool,
+}
+
+fn before_in(store: &oxigraph::store::Store, ns: &NamespaceConfig, iri: &str, graph: &str) -> Result<Option<Before>> {
+    let p = &ns.prefix;
+    let rows = select(
+        store,
+        ns,
+        &format!(
+            "SELECT ?name ?path ?parent ?nested WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:name ?name .              OPTIONAL {{ <{iri}> {p}:path ?path }} OPTIONAL {{ <{iri}> {p}:parentProject ?parent }}              OPTIONAL {{ <{iri}> {p}:nested ?nested }} }} }} LIMIT 1"
+        ),
+    )?;
+    Ok(rows.first().map(|r| {
+        let cell = |k: &str| r.get(k).map(|t| crud::term_display(t.into()));
+        Before {
+            name: cell("name").unwrap_or_default(),
+            path: cell("path"),
+            parent: cell("parent").map(|v| crud::slug_of(&v)),
+            nested: cell("nested").is_some_and(|v| v == "true"),
+        }
+    }))
+}
+
+/// Write one project's changed fields in one graph write, then move its domain trigger when the path moved.
+/// A parent is checked (and refused) before anything is written. Every check reads one load of the store.
+pub fn apply_update(cwd: &Path, ns: &NamespaceConfig, slug: &str, change: &ProjectUpdate) -> Result<UpdateOutcome> {
+    let iri = crud::build_iri(ns, "project", slug);
+    let store = crud::load_workspace_graph(cwd)?;
+    let Some(graph) = project_graph_in(&store, cwd, ns, slug)? else {
+        anyhow::bail!("project '{slug}' not found in this workspace graph");
+    };
+    let p = &ns.prefix;
+    let now = crud::now_iso();
+    let lit = |s: &str| format!("\"{}\"", crud::escape_sparql_literal(s));
+
+    let parent = match &change.parent {
+        Some(ParentChange::Set(want)) => Some(ParentChange::Set(check_parent_in(&store, ns, slug, want)?)),
+        other => other.clone(),
+    };
+    let new_path = match change.path {
+        Some(raw) => Some(
+            PathRoots::new(cwd, ns)
+                .from_cli(raw)
+                .ok_or_else(|| Refused(format!("--path '{raw}' names no folder")))?,
+        ),
+        None => None,
+    };
+    let Some(Before { name, path: old_path, parent: old_parent, nested: old_nested }) =
+        before_in(&store, ns, &iri, &graph)?
+    else {
+        anyhow::bail!("project '{slug}' not found in this workspace graph");
+    };
+    drop(store);
 
     let mut updates = Vec::new();
-
-    if let Some(s) = status {
-        updates.push(crud::field_update(&graph, &iri, &format!("{p}:status"), &format!("\"{s}\"")));
+    let mut set = |pred: &str, value: String| {
+        updates.push(crud::field_update(&graph, &iri, &format!("{p}:{pred}"), &value));
+    };
+    if let Some(s) = change.status {
+        set("status", lit(s));
     }
-    if let Some(b) = blocked_by {
-        updates.push(crud::field_update(&graph, &iri, &format!("{p}:blockedBy"), &format!("\"{b}\"")));
+    if let Some(b) = change.blocked_by {
+        set("blockedBy", lit(b));
     }
-    if let Some(n) = next_action {
-        updates.push(crud::field_update(&graph, &iri, &format!("{p}:nextAction"), &format!("\"{n}\"")));
+    if let Some(n) = change.next_action {
+        set("nextAction", lit(n));
+        // F23a: a next step carries the time it was written.
+        set("nextActionAt", format!("\"{now}\"^^xsd:dateTime"));
     }
+    if let Some(np) = &new_path {
+        set("path", lit(np));
+    }
+    if let Some(ParentChange::Set(ps)) = &parent {
+        set("parentProject", format!("<{}>", crud::build_iri(ns, "project", ps)));
+    }
+    if let Some(n) = change.nested {
+        set("nested", format!("\"{n}\"^^xsd:boolean"));
+    }
+    set("updatedAt", format!("\"{now}\"^^xsd:dateTime"));
+    set("lastActive", format!("\"{now}\"^^xsd:dateTime"));
+    if parent == Some(ParentChange::Clear) {
+        updates.push(format!("DELETE WHERE {{ GRAPH ?gg {{ <{iri}> {p}:parentProject ?old }} }}"));
+    }
+    crud::load_and_mutate(cwd, ns, &updates.join(" ;\n"))?;
 
-    // Always update timestamps
-    updates.push(crud::field_update(
-        &graph,
-        &iri,
-        &format!("{p}:updatedAt"),
-        &format!("\"{now}\"^^xsd:dateTime"),
-    ));
-    updates.push(crud::field_update(
-        &graph,
-        &iri,
-        &format!("{p}:lastActive"),
-        &format!("\"{now}\"^^xsd:dateTime"),
-    ));
-
-    let sparql = updates.join(" ;\n");
-    crud::load_and_mutate(cwd, ns, &sparql)
+    let mut outcome = UpdateOutcome::default();
+    if let Some(np) = new_path {
+        // The domain trigger follows the folder, as `project repath` always did.
+        let domain_changed =
+            crate::domain::repath_trigger(cwd, &name, old_path.as_deref(), &np).unwrap_or(false);
+        outcome.repath = Some(RepathResult { name, old_path, new_path: np, domain_changed });
+    }
+    let has_parent = match &parent {
+        Some(ParentChange::Set(_)) => true,
+        Some(ParentChange::Clear) => false,
+        None => old_parent.is_some(),
+    };
+    if change.nested.unwrap_or(old_nested) && !has_parent {
+        outcome.warnings.push(format!(
+            "{slug} has no parent, so nested = true does nothing until one is set: \
+             base project update {slug} --parent <slug>"
+        ));
+    }
+    Ok(outcome)
 }
+
 
 /// Lightweight (slug, display-name, stored-path) for every project — used by the
 /// folder-move nudge to match a moved directory against registered project paths.
@@ -568,6 +968,7 @@ pub fn list_paths(cwd: &Path, ns: &NamespaceConfig) -> Result<Vec<(String, Strin
 }
 
 /// Result of a repath, for caller reporting.
+#[derive(Debug)]
 pub struct RepathResult {
     pub name: String,
     pub old_path: Option<String>,
@@ -581,42 +982,12 @@ pub struct RepathResult {
 /// active-state reconcile, and its domain keeps matching. The domain name is the
 /// project's display name (the auto-created domain on `project add`).
 pub fn repath(cwd: &Path, ns: &NamespaceConfig, slug: &str, new_path: &str) -> Result<RepathResult> {
-    let iri = crud::build_iri(ns, "project", slug);
-    let ws_slug = crud::workspace_slug(cwd);
-    let graph = crud::workspace_graph_iri(ns, &ws_slug);
-    let p = &ns.prefix;
-
-    // Current name (= domain name) + old path, for the trigger swap + reporting.
-    let sel = format!(
-        "SELECT ?name ?path WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:name ?name . \
-         OPTIONAL {{ <{iri}> {p}:path ?path }} }} }}"
-    );
-    let (name, old_path) = match crud::load_and_query(cwd, ns, &sel)? {
-        QueryResults::Solutions(sols) => {
-            let mut name = String::new();
-            let mut old = None;
-            for row in sols.filter_map(|r| r.ok()) {
-                name = row.get("name").map(|t| crud::term_display(t.into())).unwrap_or_default();
-                old = row.get("path").map(|t| crud::term_display(t.into()));
-            }
-            (name, old)
-        }
-        _ => (String::new(), None),
-    };
-    if name.is_empty() {
-        anyhow::bail!("project '{slug}' not found in this workspace graph");
-    }
-
-    // 1) Update the graph path.
-    let np = crud::escape_sparql_literal(new_path);
-    let upd = crud::field_update(&graph, &iri, &format!("{p}:path"), &format!("\"{np}\""));
-    crud::load_and_mutate(cwd, ns, &upd)?;
-
-    // 2) Swap the domain trigger (domain name == project display name).
-    let domain_changed =
-        crate::domain::repath_trigger(cwd, &name, old_path.as_deref(), new_path).unwrap_or(false);
-
-    Ok(RepathResult { name, old_path, new_path: new_path.to_string(), domain_changed })
+    // One writer for a project's folder: `project update --path` and this command store the same absolute form
+    // (F25b) and move the domain trigger the same way.
+    let change = ProjectUpdate { path: Some(new_path), ..ProjectUpdate::default() };
+    apply_update(cwd, ns, slug, &change)?
+        .repath
+        .ok_or_else(|| anyhow::anyhow!("project '{slug}': the path was not written"))
 }
 
 /// Re-home a project end-to-end to another workspace graph: the project node + its
