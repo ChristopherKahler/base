@@ -252,13 +252,18 @@ struct DueNowFile {
     reminders: BTreeMap<String, String>,
 }
 
-/// A session id usable as a file name, or `None`. Claude Code's ids are UUIDs; anything else that
-/// arrives on the hook's stdin is refused rather than joined into a path.
-fn session_file_name(session_id: &str) -> Option<String> {
-    let ok = !session_id.is_empty()
+/// A session id usable as a file or folder name. Claude Code's ids are UUIDs; anything else that
+/// arrives on the hook's stdin is refused rather than joined into a path. The prompt hook's
+/// per-session blocks folder (`emit::prompt`) uses the same test.
+pub(crate) fn is_file_safe_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
         && session_id.len() <= 128
-        && session_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    ok.then(|| format!("{session_id}.json"))
+        && session_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A session id usable as a file name, or `None`.
+fn session_file_name(session_id: &str) -> Option<String> {
+    is_file_safe_session_id(session_id).then(|| format!("{session_id}.json"))
 }
 
 /// Keep the DUE NOW numbers `session_id`'s session start printed, and drop files of sessions not

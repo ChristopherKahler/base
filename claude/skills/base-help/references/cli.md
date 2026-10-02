@@ -10,6 +10,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base hook`
 - `base hooks`
 - `base hooks manifest`
+- `base hooks show`
 - `base ast` (alias: a)
 - `base ast query` (alias: q)
 - `base ast list` (alias: l)
@@ -254,6 +255,7 @@ Usage: base hooks <COMMAND>
 
 Commands:
   manifest  Print the hook command table as JSON, for an installer outside base
+  show      Print one block of this session's last prompt-hook output, exactly as the hook built it. A block the [budget] dropped names this command on its pointer line. With no block, list the last prompt's blocks
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -269,6 +271,25 @@ Print the hook command table as JSON, for an installer outside base
 Usage: base hooks manifest
 
 Options:
+  -h, --help
+          Print help
+```
+
+## base hooks show
+
+```text
+Print one block of this session's last prompt-hook output, exactly as the hook built it. A block the [budget] dropped names this command on its pointer line. With no block, list the last prompt's blocks
+
+Usage: base hooks show [OPTIONS] [BLOCK]
+
+Arguments:
+  [BLOCK]
+          The block's name, as the pointer line gives it (e.g. global-context, relay-wake)
+
+Options:
+      --session <SESSION>
+          Session id override (defaults to CLAUDE_CODE_SESSION_ID)
+
   -h, --help
           Print help
 ```

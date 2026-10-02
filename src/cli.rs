@@ -26,6 +26,15 @@ pub struct Cli {
 pub enum HooksAction {
     /// Print the hook command table as JSON, for an installer outside base
     Manifest,
+    /// Print one block of this session's last prompt-hook output, exactly as the hook built it. A block the
+    /// [budget] dropped names this command on its pointer line. With no block, list the last prompt's blocks.
+    Show {
+        /// The block's name, as the pointer line gives it (e.g. global-context, relay-wake)
+        block: Option<String>,
+        /// Session id override (defaults to CLAUDE_CODE_SESSION_ID)
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1658,6 +1667,29 @@ pub fn run() {
                     serde_json::to_string_pretty(&base::install::hooks_manifest())
                         .unwrap_or_else(|_| "{}".into())
                 );
+            }
+            // The command every prompt-hook pointer line names (BO-01). It reads the session's own blocks file,
+            // so another session's prompt in the same workspace can never answer for this one.
+            HooksAction::Show { block, session } => {
+                let session = session.or_else(|| {
+                    std::env::var("CLAUDE_CODE_SESSION_ID").ok().filter(|s| !s.is_empty())
+                });
+                let Some(dir) = base::crud::handoff_show::session_start_dir(&cwd) else {
+                    eprintln!("base hooks show: no .base here or in the global tier");
+                    std::process::exit(1);
+                };
+                match base::emit::prompt::show(&dir, session.as_deref(), block.as_deref()) {
+                    Ok(shown) => {
+                        if let Some(note) = shown.note {
+                            eprintln!("base hooks show: {note}");
+                        }
+                        print!("{}", shown.stdout);
+                    }
+                    Err(why) => {
+                        eprintln!("base hooks show: {why}");
+                        std::process::exit(1);
+                    }
+                }
             }
         },
 

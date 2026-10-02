@@ -45,6 +45,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod prompt;
 pub mod record;
 
 /// UTF-16 code units. **NOT the length the host measures** — this doc comment used to say it was,
@@ -63,100 +64,12 @@ pub fn u16_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
 
-/// What a hook actually emitted, so the caller can report it and rank 10 can record it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Measured {
-    /// What the hook wanted to say, in BYTES — the unit the host counts.
-    pub wanted_bytes: usize,
-    /// What it printed, notice included.
-    pub emitted_bytes: usize,
-    /// What the budget withheld. Zero when everything fitted.
-    pub withheld_bytes: usize,
-}
-
-impl Measured {
-    pub fn lost(&self) -> bool {
-        self.withheld_bytes > 0
-    }
-}
-
-/// Print `text` for `hook` under `budget_bytes`, measured in BYTES — the unit the host counts,
-/// established by probe on 2026-09-20 (see the module header) — and say what was withheld INSIDE
-/// the part that survives.
-///
-/// WHY THE NOTICE IS RESERVED BEFORE THE TRIM AND NOT APPENDED AFTER IT. That is rank 00's exact
-/// failure mode: base measured its own session-start loss correctly and put the report at byte
-/// 23,815 of 26,310 - eleven thousand bytes inside the region the host never delivers. The report
-/// of the loss was destroyed by the loss it reported. A writer that cuts at the boundary and then
-/// appends its notice rebuilds that defect in the fix for it, which is why the reserve comes first
-/// and why a test asserts the notice lands inside `budget_bytes`.
-///
-/// THE RESERVE NEEDS NO ITERATION. The notice's length depends on the withheld figure, the figure
-/// depends on the cut, and the cut depends on the reserve. The circle is cut by formatting the
-/// reserve with `wanted` - the whole text - standing in for the withheld figure. The real withheld
-/// is always at most `wanted`, so the reserved notice is never shorter than the final one.
-///
-/// WHAT THIS IS NOT. It does not degrade per block to a floor and it has no ranked trim order, as
-/// `Emission` does for session start. The tail is withheld and named. The two hooks are NOT
-/// equivalent afterwards and should not be read as though they were — and since 2026-09-20 they do
-/// not even measure in the same unit: this caps BYTES, `Emission` still caps UTF-16 units.
-///
-/// Trimming is on whole lines: half a rule is worse than no rule, because a truncated instruction
-/// still reads as an instruction.
-///
-/// `full_text` names the file holding the untrimmed text, when the caller wrote one. The notice then says where
-/// it is, so a session that sees the cut can read what was cut instead of only being told it happened.
-pub fn print_measured(hook: &str, key: &str, text: &str, budget_bytes: usize, full_text: Option<&str>) -> Measured {
-    let wanted = text.len();
-    if wanted <= budget_bytes {
-        print!("{text}");
-        return Measured { wanted_bytes: wanted, emitted_bytes: wanted, withheld_bytes: 0 };
-    }
-
-    let reserve = withheld_notice(hook, key, wanted, budget_bytes, full_text).len();
-    let room = budget_bytes.saturating_sub(reserve);
-
-    // Whole lines, so the cut never lands mid-character: every line is valid UTF-8 on its own, and
-    // counting its bytes cannot split one. Byte-slicing arbitrary text could.
-    let mut kept = String::new();
-    let mut kept_bytes = 0usize;
-    for line in text.split_inclusive('\n') {
-        let n = line.len();
-        if kept_bytes + n > room {
-            break;
-        }
-        kept.push_str(line);
-        kept_bytes += n;
-    }
-
-    let withheld = wanted.saturating_sub(kept_bytes);
-    let notice = withheld_notice(hook, key, withheld, budget_bytes, full_text);
-    if !kept.is_empty() && !kept.ends_with('\n') {
-        kept.push('\n');
-    }
-    let out = format!("{kept}{notice}");
-    print!("{out}");
-    Measured { wanted_bytes: wanted, emitted_bytes: out.len(), withheld_bytes: withheld }
-}
-
-/// The one line that survives. It names the hook, the loss and the key that governs it, because an
-/// operator who sees a truncation and cannot find the setting has been told nothing useful.
-/// WHY `key` IS A PARAMETER AND NOT THE LITERAL `prompt_chars` IT USED TO BE. Every key in
-/// `[budget]` governs a different hook, and this line's whole job is to send the operator to the one
-/// that caused the trim. Hard-coding one key made the notice correct only for as long as exactly one
-/// hook called this function - correct conditional on a neighbouring defect, which is the shape that
-/// survives review and breaks the day somebody repairs the neighbour. The person who wires
-/// `pre_tool_chars` is reading `pre_tool_use.rs`, not this function, so they would never see it
-/// coming: their overflow notice would name `prompt_chars` and send them to edit a setting that
-/// governs a different hook. That is the inert-field defect pointed at the operator, and it is worse
-/// than silence, because silence does not give directions.
-fn withheld_notice(hook: &str, key: &str, withheld_bytes: usize, budget_bytes: usize, full_text: Option<&str>) -> String {
-    let full = full_text.map(|p| format!("The full text is in {p}. ")).unwrap_or_default();
-    format!(
-        "\n[base: {hook} withheld {withheld_bytes} bytes against [budget] {key} = {budget_bytes}. {full}\
-Raise it in base.toml, or run `base doctor` to see what each hook emitted.]\n"
-    )
-}
+// The prompt hook's writer is `prompt`: whole blocks, dropped lowest priority first, each leaving a
+// pointer line (BO-01). Until 2026-10-01 it was `print_measured` here, which kept whole LINES from
+// the top until the budget ran out and appended one notice, so the cut could end inside a block
+// (line 37 of a 47-line wake script, 2026-10-01 14:11:29) and the order of the text, not its
+// value, decided what survived. The notice-inside-the-budget rule it carried still holds there:
+// every pointer line is counted before anything is printed.
 
 /// Trim order, and output order. `Pinned` is never degraded and `DueNow` is never collapsed or
 /// trimmed for the byte budget. The rest degrade from `Tail` upward.
@@ -209,16 +122,20 @@ pub enum Reason {
     SignalSuppressed,
     /// Skipped because its output had not changed since an earlier session.
     HashUnchanged,
+    /// Dropped whole by the prompt hook's byte budget, leaving its pointer line (BO-01). Not a trim:
+    /// the prompt hook's rows carry their bytes and `base doctor` names them on their own line.
+    Budget,
 }
 
 impl Reason {
     /// Every reason, so [`Reason::parse`] can invert [`Reason::as_str`].
-    pub(crate) const ALL: [Reason; 5] = [
+    pub(crate) const ALL: [Reason; 6] = [
         Reason::Collapsed,
         Reason::ListCut,
         Reason::TextShortened,
         Reason::SignalSuppressed,
         Reason::HashUnchanged,
+        Reason::Budget,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -228,6 +145,7 @@ impl Reason {
             Reason::TextShortened => "shortened",
             Reason::SignalSuppressed => "suppressed",
             Reason::HashUnchanged => "unchanged",
+            Reason::Budget => "budget",
         }
     }
 

@@ -565,13 +565,26 @@ impl SessionState {
     /// now in force have not been served since they came into force, which is what
     /// the ruling is about.
     pub fn claim_bracket_block(&mut self, tier: Bracket) -> bool {
-        let key = self.scoped("bracket");
-        let tier = tier.to_string();
-        if self.bracket_shown.get(&key).is_some_and(|shown| *shown == tier) {
+        if !self.bracket_block_due(tier) {
             return false;
         }
-        self.bracket_shown.insert(key, tier);
+        self.mark_bracket_block(tier);
         true
+    }
+
+    /// Whether `tier`'s bracket block is due, recording NOTHING. The prompt hook asks this, and records with
+    /// [`SessionState::mark_bracket_block`] only once the block is printed (D15): a block the budget dropped is still
+    /// due on the next prompt.
+    pub fn bracket_block_due(&self, tier: Bracket) -> bool {
+        self.bracket_shown
+            .get(&self.scoped("bracket"))
+            .is_none_or(|shown| *shown != tier.to_string())
+    }
+
+    /// Record that `tier`'s bracket block was shown.
+    pub fn mark_bracket_block(&mut self, tier: Bracket) {
+        let key = self.scoped("bracket");
+        self.bracket_shown.insert(key, tier.to_string());
     }
 
     /// Whether this standard was already injected this session with the same

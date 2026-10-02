@@ -1035,6 +1035,22 @@ pub struct SelectContext<'a> {
 /// `topic_max` by score and count what the cap cut, per domain. Only then record what is returned, so a rule the
 /// cap cut is never marked as shown and arrives on a later prompt.
 pub fn select(converted: &[Converted], event: &Event<'_>, session: &mut SessionState, cx: &SelectContext<'_>) -> Selection {
+    let selection = select_unrecorded(converted, event, session, cx);
+    for served in &selection.served {
+        session.mark_rule_shown(&served.rule.id, served.rule.content_hash, cx.bracket, served.why.scope(), cx.now);
+    }
+    selection
+}
+
+/// [`select`] without recording anything. The prompt hook records a rule only once the block carrying it is printed
+/// (D15, BO-01): it fits its output to the budget after selecting, and a rule the budget dropped must still be due on
+/// the next prompt.
+pub fn select_unrecorded(
+    converted: &[Converted],
+    event: &Event<'_>,
+    session: &SessionState,
+    cx: &SelectContext<'_>,
+) -> Selection {
     let parts = match event {
         Event::PreTool { command: Some(c), .. } => command_parts(c),
         _ => Vec::new(),
@@ -1071,12 +1087,11 @@ pub fn select(converted: &[Converted], event: &Event<'_>, session: &mut SessionS
     }
     topics.truncate(cx.rules.topic_max);
 
-    let mut served = Vec::new();
-    for (i, why) in others.into_iter().chain(topics) {
-        let rule = &converted[i].rule;
-        session.mark_rule_shown(&rule.id, rule.content_hash, cx.bracket, why.scope(), cx.now);
-        served.push(Served { rule: rule.clone(), why });
-    }
+    let served = others
+        .into_iter()
+        .chain(topics)
+        .map(|(i, why)| Served { rule: converted[i].rule.clone(), why })
+        .collect();
     Selection { served, topic_withheld }
 }
 
@@ -1119,7 +1134,30 @@ fn first_hit(c: &Converted, event: &Event<'_>, parts: &[Vec<String>], cx: &Selec
 ///
 /// Empty when nothing was served, which is also when nothing was withheld: the cap only withholds past `topic_max`.
 pub fn render_selection(selection: &Selection) -> String {
-    let mut groups: Vec<(String, Vec<&ServedRule>)> = Vec::new();
+    let mut out: String = selection_groups(selection).iter().map(|g| g.text.as_str()).collect();
+    for (domain, withheld) in &selection.topic_withheld {
+        out.push_str(&topic_withheld_line(domain, *withheld));
+    }
+    out
+}
+
+/// One header of [`render_selection`] and the rules under it.
+#[derive(Debug, Clone)]
+pub struct SelectionGroup {
+    /// Why every rule in the group was served; for a topic group, the first rule's score.
+    pub why: Why,
+    /// The domain of a topic group, whose header names it. `None` for every other kind.
+    pub topic_domain: Option<String>,
+    /// The header and its rules, exactly as [`render_selection`] prints them.
+    pub text: String,
+    pub served: Vec<Served>,
+}
+
+/// [`render_selection`]'s groups, apart: the prompt hook ranks a topic group and an `always` group differently (F2),
+/// and records each group's rules only if that group is printed (D15). F6's pointer lines are not in them; see
+/// [`topic_withheld_line`].
+pub fn selection_groups(selection: &Selection) -> Vec<SelectionGroup> {
+    let mut groups: Vec<(String, SelectionGroup)> = Vec::new();
     for served in &selection.served {
         let header = match &served.why {
             Why::Always => "[base rules · always]".to_string(),
@@ -1128,22 +1166,33 @@ pub fn render_selection(selection: &Selection) -> String {
             Why::Topic(_) => format!("[base rules · topic: {}]", served.rule.domain),
         };
         match groups.iter_mut().find(|(h, _)| *h == header) {
-            Some((_, rules)) => rules.push(&served.rule),
-            None => groups.push((header, vec![&served.rule])),
+            Some((_, g)) => g.served.push(served.clone()),
+            None => groups.push((
+                header,
+                SelectionGroup {
+                    why: served.why.clone(),
+                    topic_domain: matches!(served.why, Why::Topic(_)).then(|| served.rule.domain.clone()),
+                    text: String::new(),
+                    served: vec![served.clone()],
+                },
+            )),
         }
     }
-    let mut out = String::new();
-    for (header, rules) in groups {
-        out.push_str(&header);
-        out.push('\n');
-        for rule in rules {
-            out.push_str(&format!("  - {}\n", rule.rendered));
-        }
-    }
-    for (domain, withheld) in &selection.topic_withheld {
-        out.push_str(&format!("  ({withheld} more {domain} rules · all: base rule list --domain {domain})\n"));
-    }
-    out
+    groups
+        .into_iter()
+        .map(|(header, mut g)| {
+            g.text = format!("{header}\n");
+            for s in &g.served {
+                g.text.push_str(&format!("  - {}\n", s.rule.rendered));
+            }
+            g
+        })
+        .collect()
+}
+
+/// F6's pointer line for the topic rules of `domain` that `topic_max` cut.
+pub fn topic_withheld_line(domain: &str, withheld: usize) -> String {
+    format!("  ({withheld} more {domain} rules · all: base rule list --domain {domain})\n")
 }
 
 #[cfg(test)]

@@ -223,6 +223,9 @@ struct PromptRun {
     prompt: String,
     stdout: String,
     record: serde_json::Value,
+    /// The session the prompt ran in and the workspace, so a check can read the session's prompt blocks (BO-01).
+    session: String,
+    ws: PathBuf,
 }
 
 /// Every prompt, each as the first prompt of its own session on one seed carrying the corpus's
@@ -236,10 +239,11 @@ fn prompt_runs() -> &'static [PromptRun] {
             .into_iter()
             .enumerate()
             .map(|(i, prompt)| {
-                let (code, stdout, stderr) = run_prompt_submit(&s, &prompt, Some(&format!("replay-{i:02}")));
+                let session = format!("replay-{i:02}");
+                let (code, stdout, stderr) = run_prompt_submit(&s, &prompt, Some(&session));
                 assert_eq!(code, 0, "{prompt:?}: the prompt hook failed: {stderr}");
                 let record = last_record(&s, "user-prompt-submit");
-                PromptRun { prompt, stdout, record }
+                PromptRun { prompt, stdout, record, session, ws: s.ws.clone() }
             })
             .collect()
     })
@@ -390,6 +394,34 @@ fn replay_output_within_budget() {
         "control: no prompt matched a keyword domain, so the corpus injects nothing it could lose"
     );
     println!("replay: {} prompts, {cut} cut at the budget", prompt_runs().len());
+}
+
+/// BO-01 (F1, F2, F7). Every prompt's output is whole blocks and pointer lines and nothing else, rebuilt byte for byte
+/// from the session's blocks file; the blocks are in priority order; and the record names every dropped block by
+/// name, items and bytes, with `withheld_bytes` their sum. Before BO-01 the hook cut lines from the end, so a cut
+/// prompt ended inside a block and its record said `"withheld": []`.
+#[test]
+fn replay_prompt_output_is_whole_blocks_in_priority_order() {
+    let mut cut = 0;
+    for run in prompt_runs() {
+        let p = &run.prompt;
+        let file = seed::prompt_blocks(&run.ws, &run.session);
+        assert_eq!(run.stdout, seed::rebuilt_prompt_output(&run.stdout, &file), "{p:?}: not whole blocks and pointer lines");
+        let order: Vec<u8> = file.blocks.iter().map(|b| b.priority).collect();
+        assert!(order.windows(2).all(|w| w[0] <= w[1]), "{p:?}: blocks out of priority order: {order:?}");
+        let dropped: Vec<serde_json::Value> = file
+            .blocks
+            .iter()
+            .filter(|b| !b.printed)
+            .map(|b| serde_json::json!({"block": b.id, "items": b.items, "bytes": b.bytes, "reason": "budget"}))
+            .collect();
+        assert_eq!(run.record["withheld"], serde_json::Value::Array(dropped.clone()), "{p:?}: the record's rows");
+        let sum: usize = file.blocks.iter().filter(|b| !b.printed).map(|b| b.bytes).sum();
+        assert_eq!(number(&run.record, "withheld_bytes"), sum, "{p:?}: withheld_bytes is the sum of the rows");
+        cut += usize::from(!dropped.is_empty());
+    }
+    assert!(cut > 0, "control: no prompt in the corpus dropped a block, so nothing here was exercised");
+    println!("replay: {} prompts, {cut} with blocks dropped whole", prompt_runs().len());
 }
 
 #[test]
