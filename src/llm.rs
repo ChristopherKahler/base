@@ -6,34 +6,46 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-/// Run a single completion. `model` is an optional Claude Code model alias
-/// (e.g. "haiku" for cheap bulk extraction, "opus" for hard reasoning); None
-/// uses the Claude Code default.
-pub fn complete(prompt: &str, model: Option<&str>) -> Result<String> {
+/// `claude -p <prompt> --output-format text [--model <model>]`: the one place every call here is built.
+fn claude(prompt: &str, model: Option<&str>) -> Command {
     let mut cmd = Command::new("claude");
     cmd.arg("-p").arg(prompt).arg("--output-format").arg("text");
     if let Some(m) = model {
         cmd.arg("--model").arg(m);
     }
-    let out = cmd
+    cmd
+}
+
+/// A finished call's answer, or its stderr as the error. `what` names the call in the error.
+fn answer(success: bool, stdout: &[u8], stderr: &[u8], what: &str) -> Result<String> {
+    if !success {
+        bail!("{what} failed: {}", String::from_utf8_lossy(stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(stdout).trim().to_string())
+}
+
+/// Run a single completion. `model` is an optional Claude Code model alias
+/// (e.g. "haiku" for cheap bulk extraction, "opus" for hard reasoning); None
+/// uses the Claude Code default.
+pub fn complete(prompt: &str, model: Option<&str>) -> Result<String> {
+    let out = claude(prompt, model)
         .output()
         .context("failed to spawn `claude` — is Claude Code on PATH?")?;
-    if !out.status.success() {
-        bail!(
-            "claude -p failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    answer(out.status.success(), &out.stdout, &out.stderr, "claude -p")
 }
 
 /// [`complete`] with extra `claude` arguments, run in `cwd`, with stdin closed and a time limit. `base doctor --measure`
 /// uses it to load one settings file and nothing else. Stdin is closed because `claude -p` otherwise waits 3 s for piped
 /// input it will never get. The environment is inherited on purpose: `claude` finds its own login through it.
+///
+/// THE LIMIT COVERS THE OUTPUT TOO. `claude` exiting is not the end of the call: a child it started can still hold the
+/// output pipes, and waiting for them to close would have no deadline. After the exit the pipes get a short grace and
+/// then the call fails. On the time limit the whole process tree is stopped, not only `claude`.
 pub fn complete_with(
     prompt: &str,
     model: Option<&str>,
@@ -41,11 +53,8 @@ pub fn complete_with(
     cwd: Option<&Path>,
     limit: Duration,
 ) -> Result<String> {
-    let mut cmd = Command::new("claude");
-    cmd.arg("-p").arg(prompt).arg("--output-format").arg("text");
-    if let Some(m) = model {
-        cmd.arg("--model").arg(m);
-    }
+    const PIPE_GRACE: Duration = Duration::from_secs(10);
+    let mut cmd = claude(prompt, model);
     cmd.args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -56,36 +65,61 @@ pub fn complete_with(
     let mut child = cmd
         .spawn()
         .context("failed to spawn `claude` — is Claude Code on PATH?")?;
-    // Drained on their own threads so a full pipe can never stall the child while this one waits on it.
-    let drain = |r: Option<Box<dyn Read + Send>>| {
+    // Drained on their own threads so a full pipe can never stall the child while this one waits on it. Each sends
+    // its bytes when its pipe closes, so the wait for them can have a deadline.
+    let (tx, rx) = mpsc::channel::<(usize, Vec<u8>)>();
+    let pipes: [Option<Box<dyn Read + Send>>; 2] = [
+        child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+    ];
+    for (i, pipe) in pipes.into_iter().enumerate() {
+        let tx = tx.clone();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            if let Some(mut r) = r {
+            if let Some(mut r) = pipe {
                 let _ = r.read_to_end(&mut buf);
             }
-            buf
-        })
-    };
-    let stdout = drain(child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
-    let stderr = drain(child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+            let _ = tx.send((i, buf));
+        });
+    }
+    drop(tx);
     let deadline = Instant::now() + limit;
     let status = loop {
         if let Some(status) = child.try_wait().context("waiting on `claude`")? {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             bail!("claude -p gave no answer within {} s and was stopped", limit.as_secs());
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
-    if !status.success() {
-        bail!("claude -p failed: {}", String::from_utf8_lossy(&stderr).trim());
+    let mut out: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    for _ in 0..2 {
+        match rx.recv_timeout(PIPE_GRACE) {
+            Ok((i, buf)) => out[i] = buf,
+            Err(_) => bail!(
+                "claude -p exited but its output stayed open {} s later: a process it started still holds it",
+                PIPE_GRACE.as_secs()
+            ),
+        }
     }
-    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    answer(status.success(), &out[0], &out[1], "claude -p")
+}
+
+/// Stops `child` and everything it started. On Windows `Child::kill` ends one process, so the tree goes through
+/// `taskkill /T` first; elsewhere the kill is what there is.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// A completion that can see an image. `claude -p` is text-only on stdin, so we
@@ -97,22 +131,10 @@ pub fn complete_with_image(prompt: &str, image_path: &Path, model: Option<&str>)
         "{prompt}\n\nThe image is at this absolute path: {}\nUse the Read tool to view it, then answer.",
         image_path.display()
     );
-    let mut cmd = Command::new("claude");
-    cmd.arg("-p")
-        .arg(full)
-        .arg("--output-format").arg("text")
-        .arg("--allowedTools").arg("Read");
-    if let Some(m) = model {
-        cmd.arg("--model").arg(m);
-    }
-    let out = cmd
+    let out = claude(&full, model)
+        .arg("--allowedTools")
+        .arg("Read")
         .output()
         .context("failed to spawn `claude` for vision — is Claude Code on PATH?")?;
-    if !out.status.success() {
-        bail!(
-            "claude -p (vision) failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    answer(out.status.success(), &out.stdout, &out.stderr, "claude -p (vision)")
 }

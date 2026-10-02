@@ -4288,12 +4288,12 @@ pub fn run() {
                     Ok(p) => p,
                     Err(e) => die("base doctor --measure: cannot find this binary for the measure hook", e),
                 };
-                let mut runner = match base::measure::ClaudeRunner::new(exe) {
-                    Ok(r) => r,
-                    Err(e) => die("base doctor --measure", e),
-                };
-                let mut stdout = std::io::stdout();
-                match base::measure::run(&cwd, &mut runner, &host, &mut stdout) {
+                // The runner is dropped, and its scratch directory removed, before anything below can
+                // `process::exit`, which skips destructors.
+                let outcome = base::measure::ClaudeRunner::new(exe).and_then(|mut runner| {
+                    base::measure::run(&cwd, &mut runner, &host, &mut std::io::stdout())
+                });
+                match outcome {
                     Ok(base::measure::Outcome::Written) => {}
                     Ok(base::measure::Outcome::NotWritten) => std::process::exit(1),
                     Err(e) => die("base doctor --measure", e),

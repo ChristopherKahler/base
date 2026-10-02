@@ -231,6 +231,11 @@ pub const MAX_BYTES: usize = 64_000;
 pub const MAX_CALLS: usize = 12;
 /// An unreadable answer is asked again this many times at the same size, with a fresh nonce, and no more.
 pub const RETRIES: usize = 1;
+/// The highest marker a payload over the host's limit can show: the host hands the model a 2,000-character preview,
+/// and markers start every 100 bytes after a 100-byte BEGIN line. A cut reported past it means the model miscounted or
+/// the host truncated in place, so it is asked once more before it is believed (review finding 1: one miscounted
+/// `0078 NO` at 8,000 bytes would otherwise have set the budget to 7,500).
+pub const PREVIEW_MARKERS: usize = 20;
 
 /// One call of the search.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +266,9 @@ pub struct HookMeasure {
     pub probes: Vec<Probe>,
     /// Why the search stopped before it finished, when it did. A failed hook sets no budget.
     pub failure: Option<String>,
+    /// Why the narrowing stopped early after a size had been delivered whole and a larger one cut. The budget is
+    /// still the largest size delivered whole, so it is true, only wider than one step from the limit.
+    pub stopped: Option<String>,
 }
 
 impl HookMeasure {
@@ -305,9 +313,10 @@ impl HookMeasure {
         }
         let (seen, missed) = self.doubling();
         let seen = seen.map_or("nothing".to_string(), thousands);
+        let stopped = self.stopped.as_ref().map_or(String::new(), |why| format!("; stopped narrowing: {why}"));
         match (missed, self.budget()) {
             (Some(m), Some(b)) => format!(
-                "{name} sees {seen} · misses {} · narrowed to {} bytes ({calls} calls)",
+                "{name} sees {seen} · misses {} · narrowed to {} bytes ({calls} calls{stopped})",
                 thousands(m),
                 thousands(b)
             ),
@@ -331,10 +340,10 @@ pub fn search(
     nonces: &mut dyn FnMut() -> String,
     progress: &mut dyn FnMut(&Probe),
 ) -> HookMeasure {
-    let mut m = HookMeasure { hook, probes: Vec::new(), failure: None };
+    let mut m = HookMeasure { hook, probes: Vec::new(), failure: None, stopped: None };
     // `ask` returns Some(true) for whole, Some(false) for cut, None when the search must stop (m.failure says why).
     let mut ask = |m: &mut HookMeasure, bytes: usize| -> Option<bool> {
-        for _ in 0..=RETRIES {
+        for attempt in 0..=RETRIES {
             if m.probes.len() >= MAX_CALLS {
                 m.failure = Some(format!("stopped at the limit of {MAX_CALLS} calls"));
                 return None;
@@ -353,6 +362,7 @@ pub fn search(
             m.probes.push(probe);
             match verdict {
                 Verdict::Whole => return Some(true),
+                Verdict::Cut { marker } if marker > PREVIEW_MARKERS && attempt < RETRIES => continue,
                 Verdict::Cut { .. } => return Some(false),
                 Verdict::Unreadable => continue,
             }
@@ -387,6 +397,12 @@ pub fn search(
         match ask(&mut m, mid) {
             Some(true) => lo = mid,
             Some(false) => hi = Some(mid),
+            // A size was delivered whole and a larger one cut: what is known stands, it is only less narrow
+            // (review finding 8). With nothing delivered whole there is nothing to stand on.
+            None if lo > 0 => {
+                m.stopped = m.failure.take();
+                return m;
+            }
             None => return m,
         }
     }
@@ -576,7 +592,8 @@ fn key_of(line: &str) -> Option<&str> {
         return None;
     }
     let (k, _) = t.split_once('=')?;
-    Some(k.trim().trim_matches('"'))
+    // Basic and literal quoted keys are both valid TOML (review finding 9).
+    Some(k.trim().trim_matches(['"', '\'']))
 }
 
 /// Where a line's trailing comment starts (the `#` outside any string), if it has one.
@@ -768,7 +785,14 @@ pub fn run(cwd: &Path, runner: &mut dyn Runner, host: &str, out: &mut dyn Write)
             let _ = writeln!(out, "    {}", p.line());
             let _ = out.flush();
         };
-        results.push(search(runner, hook, &mut nonces, &mut progress));
+        let m = search(runner, hook, &mut nonces, &mut progress);
+        // All or nothing, so a hook that cannot be measured ends the run: every later call would be paid for and
+        // thrown away (review finding 5).
+        let failed = m.budget().is_none();
+        results.push(m);
+        if failed {
+            break;
+        }
     }
     for m in &results {
         writeln!(out, "  {}", m.row())?;
@@ -778,9 +802,12 @@ pub fn run(cwd: &Path, runner: &mut dyn Runner, host: &str, out: &mut dyn Write)
     }
 
     let budgets: Vec<(Hook, usize)> = results.iter().filter_map(|m| m.budget().map(|b| (m.hook, b))).collect();
-    if budgets.len() != results.len() {
-        let missing: Vec<&str> =
-            results.iter().filter(|m| m.budget().is_none()).map(|m| m.hook.name()).collect();
+    if budgets.len() != Hook::ALL.len() {
+        let missing: Vec<&str> = Hook::ALL
+            .iter()
+            .filter(|h| !budgets.iter().any(|(b, _)| b == *h))
+            .map(|h| h.name())
+            .collect();
         writeln!(out, "nothing written to {}: {} not measured", path.display(), missing.join(", "))?;
         return Ok(Outcome::NotWritten);
     }
@@ -826,6 +853,15 @@ pub fn run(cwd: &Path, runner: &mut dyn Runner, host: &str, out: &mut dyn Write)
             )?;
         }
     }
+    // And `measured_on`, or doctor here goes on asking for a re-measure that cannot change it (review finding 6).
+    if crate::doctor::version_in(&effective.measured_on).as_deref() != Some(host) {
+        writeln!(
+            out,
+            "  ⚠ in {} [budget] measured_on is {:?}: the workspace's base.toml sets it and overrides the measured \"{host}\"",
+            cwd.display(),
+            effective.measured_on
+        )?;
+    }
     Ok(Outcome::Written)
 }
 
@@ -848,11 +884,15 @@ mod tests {
         calls: usize,
         /// Replies served before the honest ones, one per call.
         garbled: Vec<&'static str>,
+        /// Over the limit, show the first `limit` bytes instead of the 2,000-character preview.
+        truncates: bool,
+        /// After this many calls every reply is unreadable.
+        fail_after: Option<usize>,
     }
 
     impl Fake {
         fn new(limit: usize) -> Self {
-            Self { limit, calls: 0, garbled: Vec::new() }
+            Self { limit, calls: 0, garbled: Vec::new(), truncates: false, fail_after: None }
         }
     }
 
@@ -862,7 +902,16 @@ mod tests {
             if !self.garbled.is_empty() {
                 return Ok(self.garbled.remove(0).to_string());
             }
-            let visible = if bytes <= self.limit { bytes } else { bytes.min(2000) };
+            if self.fail_after.is_some_and(|n| self.calls > n) {
+                return Ok("I could not tell.".to_string());
+            }
+            let visible = if bytes <= self.limit {
+                bytes
+            } else if self.truncates {
+                self.limit
+            } else {
+                bytes.min(2000)
+            };
             let last = markers_in(bytes, nonce);
             let marker = (1..=last).rev().find(|k| k * LINE_BYTES < visible).unwrap_or(0);
             Ok(format!("{marker:04} {}", if bytes <= visible { "YES" } else { "NO" }))
@@ -972,6 +1021,55 @@ mod tests {
         assert!(m.failure.as_deref().is_some_and(|f| f.contains("spawn")), "{:?}", m.failure);
     }
 
+    /// Review finding 1. A cut reported past the 2,000-character preview is asked once more before it is believed, so
+    /// one miscount cannot lower a budget; a host that really truncates in place says the same twice and is believed.
+    #[test]
+    fn measure_rechecks_a_cut_past_the_preview_before_believing_it() {
+        // Haiku miscounts at 4,000 (`0030 NO`, where every marker and END arrived): re-asked, whole, budget intact.
+        let mut fake = Fake::new(10_000);
+        fake.garbled = vec!["0030 NO"];
+        let (m, sizes) = measure(&mut fake);
+        assert_eq!(&sizes[..2], [4000, 4000], "the cut past the preview was asked again");
+        assert_eq!(m.budget(), Some(10_000));
+
+        // A host that truncates at its limit instead of previewing: the high cut repeats, so it stands.
+        let mut fake = Fake::new(10_000);
+        fake.truncates = true;
+        let (m, _) = measure(&mut fake);
+        assert_eq!(m.budget(), Some(10_000), "{:?}", m.probes);
+        assert!(m.probes.len() <= MAX_CALLS, "{} calls", m.probes.len());
+    }
+
+    /// Review finding 8. Once a size arrived whole and a larger one was cut, a reply that stays unreadable stops the
+    /// narrowing but keeps what is known: the largest size delivered whole, with the reason on the row.
+    #[test]
+    fn measure_keeps_a_proven_size_when_narrowing_stops_early() {
+        let mut fake = Fake::new(10_000);
+        fake.fail_after = Some(4); // 4,000 whole, 8,000 whole, 16,000 cut, 12,000 cut, then nothing readable
+        let (m, _) = measure(&mut fake);
+        assert_eq!(m.failure, None);
+        assert_eq!(m.budget(), Some(8000), "the largest size delivered whole");
+        assert!(m.row().contains("stopped narrowing: the reply at 10,000 bytes was unreadable 2 times"), "{}", m.row());
+
+        // With nothing delivered whole there is nothing to keep: the hook is not measured.
+        let mut fake = Fake::new(10_000);
+        fake.fail_after = Some(0);
+        let (m, _) = measure(&mut fake);
+        assert_eq!(m.budget(), None);
+        assert!(m.failure.is_some());
+    }
+
+    /// The install template pins `session_start_bytes` in every new base.toml, so it must ship the measured value and
+    /// the version beside it, or a fresh install reads as unmeasured to `base doctor`.
+    #[test]
+    fn measure_install_template_ships_the_measured_values() {
+        let src = include_str!("install.rs");
+        let bytes = format!("session_start_bytes = {}  #", crate::config::MEASURED_HOOK_BYTES);
+        let on = format!("measured_on = \"{}\"", crate::config::MEASURED_ON);
+        assert!(src.contains(&bytes), "the install template does not write {bytes:?}");
+        assert!(src.contains(&on), "the install template does not write {on:?}");
+    }
+
     #[test]
     fn measure_first_screen_answers_from_session_start() {
         let mut fake = Fake::new(10_000);
@@ -991,6 +1089,7 @@ mod tests {
                 verdict: Verdict::Cut { marker: 19 },
             }],
             failure: None,
+            stopped: None,
         };
         let line = first_screen(&cut).expect("an answer");
         assert!(line.contains("only to marker 0019 of 0038, about character 1,900"), "{line}");
@@ -1042,6 +1141,10 @@ prompt_bytes = 10000\npre_tool_bytes = 10000\nmeasured_on = \"2.1.287\"\n"
         // An edit that cannot be made cleanly is refused, not written: a dotted key elsewhere already defines it.
         let before = "budget.prompt_bytes = 4000\n";
         assert!(set_budget_keys(before, &keys[1..2]).is_err());
+
+        // A literal-quoted key is valid TOML and is the same key (review finding 9).
+        let before = "[budget]\n'session_start_bytes' = 9000\n";
+        assert_eq!(set_budget_keys(before, &keys[..1]).expect("written"), "[budget]\nsession_start_bytes = 10000\n");
     }
 
     #[test]
@@ -1069,15 +1172,32 @@ prompt_bytes = 10000\npre_tool_bytes = 10000\nmeasured_on = \"2.1.287\"\n"
                 "[budget]\nsession_start_bytes = 10000\nprompt_bytes = 10000\npre_tool_bytes = 10000\nmeasured_on = \"2.1.287\"\n"
             ), "{written}");
 
-            // A hook that does not measure leaves the file exactly as it was.
+            // A hook that does not measure leaves the file exactly as it was, and ends the run: the two hooks after
+            // it are never asked, because their results could only be thrown away (review finding 5).
             std::fs::write(&path, original).expect("reset");
             let mut fake = Fake::new(10_000);
             fake.garbled = vec!["?", "?"];
             let mut out = Vec::new();
             let got = run(home.path(), &mut fake, "2.1.287", &mut out).expect("run");
             assert_eq!(got, Outcome::NotWritten);
+            assert_eq!(fake.calls, 2, "calls were spent after the first hook failed");
             assert_eq!(std::fs::read_to_string(&path).expect("read"), original);
-            assert!(String::from_utf8(out).expect("utf8").contains("nothing written"));
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                text.contains("nothing written") && text.contains("session-start, user-prompt-submit, pre-tool-use not measured"),
+                "{text}"
+            );
+
+            // A workspace that sets measured_on overrides what was written, and the run says so (review finding 6).
+            std::fs::write(&path, original).expect("reset");
+            let ws = home.path().join("ws");
+            std::fs::create_dir_all(ws.join(".base")).expect("ws");
+            std::fs::write(ws.join(".base").join("base.toml"), "[budget]\nmeasured_on = \"claude-code 2.1.278\"\n")
+                .expect("ws base.toml");
+            let mut out = Vec::new();
+            run(&ws, &mut Fake::new(10_000), "2.1.287", &mut out).expect("run");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(text.contains("measured_on is \"claude-code 2.1.278\": the workspace's base.toml sets it"), "{text}");
 
             // A file the writer would refuse is refused before a single call is spent on it.
             std::fs::write(&path, "budget.prompt_bytes = 4000\n").expect("write");

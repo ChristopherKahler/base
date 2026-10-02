@@ -551,6 +551,7 @@ enabled = true            # master switch for all session-start injection
 # The old [signal] max_chars is read by nothing.
 [budget]
 session_start_bytes = 10000  # everything session start prints, in bytes
+measured_on = "2.1.287"      # the Claude Code the number above was measured on
 memory_chars = 4000          # the memory block inside it, in whole notes
 write_full_output = true     # the untrimmed session start also goes to .base/last-session-start.md
 

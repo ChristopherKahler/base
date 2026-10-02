@@ -897,6 +897,14 @@ pub struct BudgetConfig {
     /// at a key they do not have.
     #[serde(skip)]
     pub legacy_spellings: Vec<String>,
+    /// The hook budget keys the config sets by hand with no `measured_on` beside them, in the operator's spelling.
+    ///
+    /// WHY (BO-02 review). `measured_on` defaults to the version the shipped defaults were measured on, so a file
+    /// that pins `session_start_bytes = 9000` (every install before BO-02 got that line from the template) and says
+    /// nothing about `measured_on` would read as measured on today's host. Not deserialized: filled by `load` from
+    /// the raw merged table, like `legacy_spellings`.
+    #[serde(skip)]
+    pub unmeasured_keys: Vec<String>,
     /// The pre-tool hook's budget, in BYTES: what `base doctor --measure` measured the host delivering through
     /// pre-tool's `additionalContext`. Read by no hook yet; the pre-tool hook takes it in its own build order.
     ///
@@ -945,6 +953,7 @@ impl Default for BudgetConfig {
             session_start_bytes: default_session_start_bytes(),
             prompt_bytes: default_prompt_bytes(),
             legacy_spellings: Vec::new(),
+            unmeasured_keys: Vec::new(),
             pre_tool_bytes: default_pre_tool_bytes(),
             post_tool_chars: default_post_tool_chars(),
             first_screen_chars: default_first_screen_chars(),
@@ -1162,6 +1171,28 @@ fn legacy_budget_keys(merged: &toml::value::Table) -> Vec<LegacyBudgetKey> {
         .collect()
 }
 
+/// The hook budget keys, in every spelling, that a measurement covers.
+const HOOK_BUDGET_KEYS: [&str; 6] = [
+    "session_start_bytes",
+    "session_start_chars",
+    "prompt_bytes",
+    "prompt_chars",
+    "pre_tool_bytes",
+    "pre_tool_chars",
+];
+
+/// The hook budget keys the merged config sets with no `measured_on` beside them. See
+/// [`BudgetConfig::unmeasured_keys`].
+fn unmeasured_budget_keys(merged: &toml::value::Table) -> Vec<String> {
+    let Some(toml::Value::Table(budget)) = merged.get("budget") else {
+        return Vec::new();
+    };
+    if budget.contains_key("measured_on") {
+        return Vec::new();
+    }
+    HOOK_BUDGET_KEYS.iter().filter(|k| budget.contains_key(**k)).map(|k| k.to_string()).collect()
+}
+
 /// The one advisory this process gets, with its own latch.
 static LEGACY_KEYS_REPORTED: std::sync::Once = std::sync::Once::new();
 
@@ -1308,6 +1339,7 @@ impl BaseConfig {
         // spelling was used.
         let legacy = legacy_budget_keys(&merged);
         report_legacy_budget_keys(&legacy, &LEGACY_KEYS_REPORTED);
+        let unmeasured = unmeasured_budget_keys(&merged);
 
         match toml::Value::Table(merged).try_into() {
             Ok(config) => {
@@ -1317,6 +1349,7 @@ impl BaseConfig {
                 let mut config: Self = config;
                 config.budget.legacy_spellings =
                     legacy.iter().map(|k| k.old.to_string()).collect();
+                config.budget.unmeasured_keys = unmeasured;
                 (config, faults)
             }
             Err(e) => {
@@ -1590,6 +1623,30 @@ mod tests {
         // Explicit opt-out is honored.
         let c: BaseConfig = toml::from_str("[update]\nauto = false\n").unwrap();
         assert!(!c.update.auto);
+    }
+
+    /// BO-02 review: a hook budget set by hand with no `measured_on` beside it is recorded as unmeasured, so doctor
+    /// cannot vouch for it with the default `measured_on`. Every install before BO-02 has `session_start_bytes = 9000`
+    /// from the template and nothing else in `[budget]`.
+    #[test]
+    fn hook_budgets_set_with_no_measured_on_are_recorded_as_unmeasured() {
+        let table = |s: &str| -> toml::value::Table { toml::from_str(s).expect("table") };
+        assert_eq!(unmeasured_budget_keys(&table("[budget]\nsession_start_bytes = 9000\n")), ["session_start_bytes"]);
+        assert_eq!(unmeasured_budget_keys(&table("[budget]\nprompt_chars = 4000\nmemory_chars = 1\n")), ["prompt_chars"]);
+        assert!(unmeasured_budget_keys(&table("[budget]\nprompt_bytes = 1\nmeasured_on = \"2.1.287\"\n")).is_empty());
+        assert!(unmeasured_budget_keys(&table("[budget]\nmemory_chars = 1\n")).is_empty(), "not a hook budget");
+        assert!(unmeasured_budget_keys(&table("[signal]\nenabled = true\n")).is_empty());
+
+        // And `load` carries it through to the struct doctor reads.
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let gbl = tmp.path().join(".base-gbl");
+            std::fs::create_dir_all(&gbl).unwrap();
+            std::fs::write(gbl.join("base.toml"), "[budget]\nsession_start_bytes = 9000\n").unwrap();
+            let budget = BaseConfig::load(tmp.path()).budget;
+            assert_eq!(budget.unmeasured_keys, ["session_start_bytes"]);
+            assert_eq!(budget.measured_on, MEASURED_ON, "the default fills in, which is why the list is needed");
+        });
     }
 
     // ─── Global tier resolution ──────────────────────────────
