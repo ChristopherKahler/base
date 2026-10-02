@@ -105,6 +105,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base relay done`
 - `base relay tasks`
 - `base relay sessions`
+- `base relay arm`
 - `base learn`
 - `base recall`
 - `base changes`
@@ -1867,10 +1868,11 @@ Commands:
   export    Export the spool as inbox.nq (read-only graph snapshot)
   dispose   End-of-milestone teardown — the store is disposable by design
   task      Relay a briefed task to a live titled session. It auto-fires in that session's hooks (loud) until picked up — cross-workspace via the global tier
-  ping      Instant message to a live titled session — no doc, no done-ceremony. Screams in the receiver's hooks mid-turn; their reply ping clears it
+  ping      Instant message to a live titled session — no doc, no done-ceremony. Shown in the receiver's next prompt, or at once by its inbox watcher; their reply ping clears it
   done      Mark a relayed task done — clears the inbox alert and closes the graph mirror
-  tasks     List inbound relay tasks across all live sessions
+  tasks     List inbound relay tasks and pings across all live sessions, each with its message
   sessions  List titled sessions in the global registry (liveness for `*task` targets)
+  arm       Print what to start this session's inbox watcher with: the Monitor tool's fields, the re-arm step, the status line
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1960,6 +1962,12 @@ Options:
 
       --peek
           Peek without consuming
+
+      --all
+          Include messages already seen (the hooks hide a sender's older messages behind its newest one)
+
+      --from <FROM>
+          Only messages from this sender
 
       --project <PROJECT>
           
@@ -2127,7 +2135,7 @@ Options:
 ## base relay ping
 
 ```text
-Instant message to a live titled session — no doc, no done-ceremony. Screams in the receiver's hooks mid-turn; their reply ping clears it
+Instant message to a live titled session — no doc, no done-ceremony. Shown in the receiver's next prompt, or at once by its inbox watcher; their reply ping clears it
 
 Usage: base relay ping [OPTIONS] --to <TO> --msg <MSG>
 
@@ -2167,11 +2175,14 @@ Options:
 ## base relay tasks
 
 ```text
-List inbound relay tasks across all live sessions
+List inbound relay tasks and pings across all live sessions, each with its message
 
-Usage: base relay tasks
+Usage: base relay tasks [OPTIONS]
 
 Options:
+      --from <FROM>
+          Only items from this sender
+
   -h, --help
           Print help
 ```
@@ -2184,6 +2195,21 @@ List titled sessions in the global registry (liveness for `*task` targets)
 Usage: base relay sessions
 
 Options:
+  -h, --help
+          Print help
+```
+
+## base relay arm
+
+```text
+Print what to start this session's inbox watcher with: the Monitor tool's fields, the re-arm step, the status line
+
+Usage: base relay arm [OPTIONS]
+
+Options:
+      --as <TITLE>
+          The title to watch (defaults to every title this session holds)
+
   -h, --help
           Print help
 ```
@@ -2441,11 +2467,12 @@ Working in a workspace
 
 Running more than one session
 
-  Relay is on. Every session gets a codename and a wake contract, and all of it
-  stays in ~/.base-gbl/.base/relay-inbox/ on this machine.
+  Relay is on. Every session gets a codename; base relay arm prints the inbox
+  watcher that lets a ping wake it. All of it stays in
+  ~/.base-gbl/.base/relay-inbox/ on this machine.
 
   base config set relay.enabled false      turn it off
-  base config set relay.wake_nudge false   keep pings, drop the arming block
+  base config set relay.wake_nudge false   keep pings, drop the watcher reminder
 
 Star commands
 

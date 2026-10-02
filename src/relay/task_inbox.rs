@@ -6,16 +6,15 @@
 //! by the receiver's stable TITLE, not its session id — so a receiver that
 //! restarts (fresh session id) still picks the task up the moment it reclaims
 //! its title with `base relay register`. The target's hooks resolve their
-//! session id → held titles, scan those dirs on every event (session-start,
-//! prompt, tool-use, stop), and inject a loud "CONSUME AND EXECUTE" block the
-//! first time a given session sees it, then a throttled reminder until done.
+//! session id → held titles and scan those dirs at session start and on each
+//! prompt, never on a tool call (BO-04, F13b). A new item is shown once, in full,
+//! as information; while a ping stays unanswered, session start lists it in one line.
 //!
 //! Pings ride the same rail with IM semantics instead of work semantics: no
 //! briefing doc (the message IS the payload, mirrored to the graph), and the
-//! obligation is a REPLY, not completion — an inbound `kind == "ping"` nags on
-//! a short throttle until the receiver sends a ping back to the sender, which
-//! auto-clears it. The reply (`kind == "reply"`) is announced once and
-//! consumed on delivery, so an ack never demands its own ack.
+//! obligation is a REPLY, not completion. The receiver's ping back to the sender
+//! clears it. The reply (`kind == "reply"`) is announced once and consumed on
+//! delivery, so an ack never demands its own ack.
 //!
 //! Why a filesystem inbox and not the graph as the live medium: `base task
 //! list` is workspace-scoped, so two sessions on adjacent projects can't see
@@ -31,14 +30,6 @@ use serde::{Deserialize, Serialize};
 
 use super::{age_str, now_iso, parse_ts, read_json, write_json_atomic};
 use crate::config::NamespaceConfig;
-
-/// Terse reminders re-fire at most this often (per task) outside a fresh
-/// session — keeps a long autonomous run nudged without spamming every tool call.
-const TERSE_THROTTLE_SECS: i64 = 600;
-
-/// Unanswered pings nag much harder than open tasks — the sender is waiting
-/// on a live round-trip, not a work package.
-const PING_TERSE_THROTTLE_SECS: i64 = 180;
 
 /// A ping older than this never alerts again, loud or terse. A ping is a live message between sessions;
 /// one that has waited a day is history, and it stays in the inbox file for anyone who reads it.
@@ -89,6 +80,12 @@ pub struct InboxTask {
     /// File paths / entity ids the message references (pings).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refs: Vec<String>,
+    /// A notify's spool: the store root and the message id `relay send` wrote there. Showing the notify marks that
+    /// message seen in that store, so one message is never shown twice (BO-04, F13c). Empty for every other kind.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub spool_store: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub spool_id: String,
 }
 
 fn default_priority() -> String {
@@ -99,21 +96,14 @@ fn default_kind() -> String {
     "task".into()
 }
 
-/// Which hook is asking to deliver — controls loud vs terse.
+/// Which hook is asking to deliver. Relay content appears at session start and on a prompt, never at a turn's end, and
+/// on a tool call only for a run that cannot keep an inbox watcher (BO-04, F13b as amended by lynx).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     SessionStart,
     Prompt,
+    /// A tool call in a run with no inbox watcher ([`super::monitorless`]): new items only, nothing listed.
     Tool,
-    Stop,
-}
-
-impl Phase {
-    /// Prompt boundaries (session-start, user prompt) may re-announce loudly on
-    /// a new session; mid-turn phases (tool, stop) only ever nudge tersely.
-    fn is_boundary(self) -> bool {
-        matches!(self, Phase::SessionStart | Phase::Prompt)
-    }
 }
 
 // ─── Paths ───────────────────────────────────────────────────
@@ -142,7 +132,7 @@ fn read_tasks_in(dir: &Path) -> Vec<(PathBuf, InboxTask)> {
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .filter_map(|p| read_json::<InboxTask>(&p).map(|t| (p, t)))
         .collect();
-    out.sort_by(|a, b| a.1.created.cmp(&b.1.created));
+    out.sort_by(|a, b| (&a.1.created, &a.1.slug).cmp(&(&b.1.created, &b.1.slug)));
     out
 }
 
@@ -168,19 +158,57 @@ pub fn enqueue(ns: &NamespaceConfig, task: &InboxTask) -> Result<PathBuf> {
 // ─── Delivery (target side, called from hooks) ───────────────
 
 /// Scan this session's inbox and render the injection block, if any. Mutates
-/// task state (marks delivered, stamps alert timestamps) as a side effect so
-/// the loud alert fires once per session and terse reminders stay throttled.
+/// task state (marks delivered, deletes an announced reply or notify) as a side effect.
 pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
-    let (block, commits) = deliver_deferred(session_id, phase)?;
-    super::run_commits(commits);
-    Some(block)
+    deliver_deferred(session_id, phase).map(super::Part::commit)
 }
 
-/// [`deliver`] with the inbox NOT yet changed: recording a task or ping as delivered, stamping its alert time and
-/// deleting an announced reply or notify come back as commits, for the prompt hook to run only if it prints the
-/// block (BO-01). Until they run, the inbox reads as it did, so a dropped block is announced again, loud, at the next
-/// tool call or prompt.
-pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<(String, Vec<super::Commit>)> {
+/// The slug of the wake notify `relay send` drops for one spool message and one recipient title.
+pub fn notify_slug(message_id: &str, title: &str) -> String {
+    format!("notify-{message_id}-{title}")
+}
+
+/// Whether `title`'s inbox still holds the wake notify for spool message `message_id`. The spool delivery leaves such a
+/// message to the notify, so one message is never shown twice on one prompt (BO-04, F13c).
+pub fn has_notify(title: &str, message_id: &str) -> bool {
+    title_dir(title).is_some_and(|d| d.join(format!("{}.json", sanitize(&notify_slug(message_id, title)))).is_file())
+}
+
+/// True for the kinds that are messages between sessions rather than assigned work. One sender's newer message hides
+/// its older unshown ones; a task is never hidden.
+fn is_chat(task: &InboxTask) -> bool {
+    matches!(task.kind.as_str(), "ping" | "reply" | "notify")
+}
+
+/// A ping still waiting for its answer: shown (`delivered`) or hidden behind a newer message from the same sender
+/// (`superseded`). Hiding a ping never drops what it asks of the receiver; a reply to the sender clears both.
+fn unanswered(task: &InboxTask) -> bool {
+    task.kind == "ping" && matches!(task.status.as_str(), "delivered" | "superseded")
+}
+
+/// [`deliver`] with the inbox NOT yet changed: recording a task or ping as delivered, hiding a superseded message and
+/// deleting an announced reply or notify come back as commits, for the prompt hook to run only if it prints the block
+/// (BO-01). Until they run, the inbox reads as it did, so a dropped block is announced at the next prompt.
+///
+/// BO-04 (F13), WHAT EACH EVENT SHOWS:
+/// - A message no session has been shown (`pending`) is shown once, in full, on the first prompt or session start
+///   after it arrives. It is shown as information: who, when, the message, and the reply command. Nothing in it claims
+///   to come before the user's own prompt.
+/// - Of one sender's unshown messages to one title, only the newest is shown; the older ones are marked `superseded`,
+///   kept on disk, and the shown one carries a line naming the command that lists them. A sender with no title is
+///   never treated as one thread ([`super::threadless`]).
+/// - Items this session has not been shown but another session was (a title taken over mid-session with
+///   `base relay register`, or a successor): on its next prompt or at its start, a task in full (it is work this
+///   session now holds), and unanswered pings listed in one line. Once per session.
+/// - Items already shown to this session: listed in one line at session start (a compacted context), never on a
+///   prompt.
+/// - On a tool call ([`Phase::Tool`], only for a run with no inbox watcher, see [`super::monitorless`]): new items
+///   only, the same way, and nothing listed.
+///
+/// What this replaced: a loud block on every first sighting in ANY hook, pre-tool included, headed "REPLY REQUIRED
+/// BEFORE YOUR NEXT ACTION", then a terse "Reply RIGHT NOW" nag every three minutes on prompts and tool calls until the
+/// receiver answered.
+pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<super::Part> {
     // Which titles does this session hold? A never-registered session can't be
     // a relay target, so it does zero filesystem work beyond the registry read.
     let titles = super::session_registry::titles_for(session_id);
@@ -193,227 +221,293 @@ pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<(String, Vec<s
             tasks.extend(read_tasks_in(&dir));
         }
     }
+    tasks.retain(|(_, t)| t.status != "done" && !ping_is_stale(t));
+    tasks.sort_by(|a, b| order_key(&a.1).cmp(&order_key(&b.1)));
     if tasks.is_empty() {
         return None;
     }
 
-    let now = now_iso();
-    let mut loud_blocks: Vec<String> = Vec::new();
-    let mut terse_slugs: Vec<String> = Vec::new();
-    let mut terse_pings: Vec<String> = Vec::new();
-    let mut commits: Vec<super::Commit> = Vec::new();
-    let write = |path: PathBuf, task: InboxTask| -> super::Commit {
-        Box::new(move || {
-            let _ = write_json_atomic(&path, &task);
+    // Superseded: per (title, sender), every unshown chat message but the newest.
+    let keys: Vec<Option<(&str, &str)>> = tasks
+        .iter()
+        .map(|(_, t)| {
+            (t.status == "pending" && is_chat(t) && !super::threadless(&t.from))
+                .then_some((t.to_title.as_str(), t.from.as_str()))
         })
-    };
+        .collect();
+    let behind = super::superseded_by(&keys);
+    let mut hidden: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for newer in behind.iter().flatten() {
+        *hidden.entry(*newer).or_default() += 1;
+    }
 
-    for (path, mut task) in tasks {
-        if task.status == "done" || ping_is_stale(&task) {
-            continue;
-        }
-        let is_pending = task.status == "pending";
-        let is_new_session = task.last_loud_session != session_id;
-        // Loud on the very first sighting (any phase), or when a NEW session
-        // hits a prompt boundary — that's the "re-announce at session start"
-        // behavior. Otherwise it's a throttled terse nudge.
-        let loud = is_pending || (phase.is_boundary() && is_new_session);
+    let now = now_iso();
+    let mut shown: Vec<(usize, String)> = Vec::new();
+    let mut open_pings: Vec<String> = Vec::new();
+    let mut open_tasks: Vec<String> = Vec::new();
+    let mut commits: Vec<super::Commit> = Vec::new();
 
-        // A reply is IM-consumed: announced once, then gone. No obligation,
-        // no reminders — otherwise every ack would demand its own ack.
-        // A notify (relay-send wake, issue #9) gets the same lifecycle: the
-        // durable message sits in the workspace spool for `relay poll`; this
-        // file exists only to wake the receiver once.
-        if task.kind == "reply" || task.kind == "notify" {
-            if loud {
-                loud_blocks.push(if task.kind == "reply" {
-                    render_reply(&task)
-                } else {
-                    render_notify(&task)
-                });
-                commits.push(Box::new(move || {
-                    let _ = std::fs::remove_file(&path);
-                }));
+    for (i, (path, task)) in tasks.iter().enumerate() {
+        let path = path.clone();
+        let mut task = task.clone();
+        if task.status == "pending" {
+            if behind[i].is_some() {
+                commits.push(hide(path, task, session_id, &now));
+            } else {
+                shown.push((i, render(&task)));
+                commits.push(consume(path, task, session_id, &now));
             }
             continue;
         }
-
-        if loud {
-            loud_blocks.push(if task.kind == "ping" {
-                render_loud_ping(&task)
+        if phase == Phase::Tool {
+            continue;
+        }
+        let new_here = task.last_loud_session != session_id;
+        if !new_here && phase != Phase::SessionStart {
+            continue;
+        }
+        if task.kind == "task" {
+            if new_here {
+                shown.push((i, render(&task)));
             } else {
-                render_loud(&task)
-            });
-            task.status = "delivered".into();
+                open_tasks.push(format!("{} from {}", task.slug, sender(&task)));
+            }
+        } else if unanswered(&task) {
+            open_pings.push(format!("{} {}", sender(&task), super::clock(&task.created)));
+        } else {
+            continue;
+        }
+        if new_here {
             task.last_loud_session = session_id.to_string();
             task.last_alert_ts = now.clone();
-            commits.push(write(path, task));
-        } else if terse_due(&task.last_alert_ts, throttle_for(&task)) {
-            if task.kind == "ping" {
-                let from = if task.from.is_empty() { "?".to_string() } else { task.from.clone() };
-                terse_pings.push(format!("{from} ({})", task.summary));
-            } else {
-                terse_slugs.push(task.slug.clone());
-            }
-            task.last_alert_ts = now.clone();
-            commits.push(write(path, task));
+            commits.push(persist(path, task));
         }
     }
 
-    if loud_blocks.is_empty() && terse_slugs.is_empty() && terse_pings.is_empty() {
+    if shown.is_empty() && open_pings.is_empty() && open_tasks.is_empty() {
         return None;
     }
-
-    let mut out = String::new();
-    for b in &loud_blocks {
-        out.push_str(b);
+    let mut text = String::new();
+    for (i, rendered) in &shown {
+        text.push_str(rendered);
+        if let Some(n) = hidden.get(i) {
+            let from = sender(&tasks[*i].1);
+            text.push_str(&super::hidden_line(*n, from, &format!("base relay tasks --from {from}")));
+        }
     }
-    if !terse_pings.is_empty() {
-        out.push_str(&format!(
-            "<relay-ping-open>❗ UNANSWERED PING(s) — the sender is waiting on you: {}. \
-             Reply RIGHT NOW: `base relay ping --to <sender> --msg \"...\"` — a one-line ack counts.</relay-ping-open>\n",
-            terse_pings.join("; ")
+    if !open_pings.is_empty() {
+        text.push_str(&format!(
+            "relay: {} unanswered ping{} ({}) · read: base relay tasks --from <sender> · reply: base relay ping --to <sender> --msg \"...\"\n",
+            open_pings.len(),
+            if open_pings.len() == 1 { "" } else { "s" },
+            open_pings.join(", ")
         ));
     }
-    if !terse_slugs.is_empty() {
-        out.push_str(&format!(
-            "<relay-task-open>⏳ Relayed task(s) still assigned to this session and not yet done: {}. \
-             Finish, then run `base relay done <slug>`.</relay-task-open>\n",
-            terse_slugs.join(", ")
+    if !open_tasks.is_empty() {
+        text.push_str(&format!(
+            "relay: {} open task{} ({}) · when finished: base relay done <slug>\n",
+            open_tasks.len(),
+            if open_tasks.len() == 1 { "" } else { "s" },
+            open_tasks.join(", ")
         ));
     }
-    Some((out, commits))
+    let items = shown.len() + open_pings.len() + open_tasks.len();
+    Some(super::Part { text, commits, items })
 }
 
-fn throttle_for(task: &InboxTask) -> i64 {
-    if task.kind == "ping" { PING_TERSE_THROTTLE_SECS } else { TERSE_THROTTLE_SECS }
+/// The order items are read in: when they were sent, then, inside one second, the milliseconds a ping's or notify's
+/// slug carries, then the slug. `created` has one-second resolution, and the slugs alone sort every `notify-` before
+/// every `ping-`, so a ping sent after a notify in the same second would read as the older of the two.
+fn order_key(task: &InboxTask) -> (Option<chrono::DateTime<chrono::Local>>, u128, &str) {
+    (parse_ts(&task.created), slug_millis(&task.slug), &task.slug)
 }
 
-fn terse_due(last_alert_ts: &str, throttle_secs: i64) -> bool {
-    match parse_ts(last_alert_ts) {
-        Some(t) => (chrono::Local::now() - t).num_seconds() >= throttle_secs,
-        None => true, // never alerted (or unparseable) — due now
+/// The send time in milliseconds that `ping-<millis>-...` and `notify-<millis>-...` slugs open with; 0 for any other.
+fn slug_millis(slug: &str) -> u128 {
+    let rest = slug.strip_prefix("ping-").or_else(|| slug.strip_prefix("notify-")).unwrap_or("");
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().unwrap_or(0)
+}
+
+fn persist(path: PathBuf, task: InboxTask) -> super::Commit {
+    Box::new(move || {
+        let _ = write_json_atomic(&path, &task);
+    })
+}
+
+/// Mark a shown message as seen in the spool it came from, for a notify that carries one.
+fn mark_spool_seen(task: &InboxTask) {
+    if task.spool_store.is_empty() || task.spool_id.is_empty() {
+        return;
+    }
+    let root = PathBuf::from(&task.spool_store);
+    let project = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let store = super::RelayStore { root, project };
+    if store.exists() {
+        let _ = store.mark_seen(&task.to_title, std::slice::from_ref(&task.spool_id));
     }
 }
 
-fn render_loud(task: &InboxTask) -> String {
-    let doc_line = if task.doc.is_empty() {
-        String::new()
-    } else {
-        format!("Full brief: {}  ← read it in full before acting.\n", task.doc)
-    };
-    format!(
-        "<relay-task-inbound to=\"{title}\">\n\
-         🔔 NEW TASK TO IMMEDIATELY CONSUME AND EXECUTE — relayed from {from} to THIS session ({title}).\n\
-         Task: {slug} [{pri}]\n\
-         {summary}\n\
-         {doc_line}\
-         DIRECTIVE: Acknowledge in one line that you see it and are picking it up, then execute it now — this is operator-approved. \
-         Ask a question ONLY if you are genuinely blocked and cannot proceed; the point is to keep the workflow rolling without pulling the operator back in. \
-         When finished, run: base relay done {slug}\n\
-         </relay-task-inbound>\n",
-        title = task.to_title,
-        from = if task.from.is_empty() { "another session" } else { &task.from },
-        slug = task.slug,
-        pri = task.priority,
-        summary = task.summary,
-        doc_line = doc_line,
-    )
+/// What showing a message does to the inbox: a reply or notify is gone (a notify's spool copy is marked seen, so the
+/// spool never shows it again); a ping or task is recorded as delivered to this session.
+fn consume(path: PathBuf, mut task: InboxTask, session_id: &str, now: &str) -> super::Commit {
+    if task.kind == "reply" || task.kind == "notify" {
+        return Box::new(move || {
+            mark_spool_seen(&task);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+    task.status = "delivered".into();
+    task.last_loud_session = session_id.to_string();
+    task.last_alert_ts = now.to_string();
+    persist(path, task)
+}
+
+/// What hiding a superseded message does: the file stays, readable by `base relay tasks --from <sender>`, and is never
+/// shown by a hook. A hidden ping still counts as unanswered.
+fn hide(path: PathBuf, mut task: InboxTask, session_id: &str, now: &str) -> super::Commit {
+    task.status = "superseded".into();
+    task.last_loud_session = session_id.to_string();
+    task.last_alert_ts = now.to_string();
+    Box::new(move || {
+        mark_spool_seen(&task);
+        let _ = write_json_atomic(&path, &task);
+    })
+}
+
+fn sender(task: &InboxTask) -> &str {
+    if task.from.is_empty() { "another session" } else { &task.from }
 }
 
 fn refs_line(task: &InboxTask) -> String {
     if task.refs.is_empty() {
         String::new()
     } else {
-        format!("Refs: {}\n", task.refs.join(", "))
+        format!("refs: {}\n", task.refs.join(", "))
     }
 }
 
-fn render_loud_ping(task: &InboxTask) -> String {
-    // An untitled sender can't receive a reply ping — fall back to `done`.
-    let reply_line = if task.from.is_empty() {
-        format!(
-            "The sender is untitled, so you cannot ping back — consume the message and clear it with: base relay done {}\n",
+/// One relay item as information: a header line (what, who, when, what to run), then the message on its own line.
+///
+/// The message starts its own line, and that is load-bearing rather than cosmetic (#101): `hook/mod.rs` matches star
+/// commands against this rendered block, and a command only activates in the leading star-run of a line. `cli.rs`
+/// marks a send `kind = "reply"` whenever the target has an unanswered ping from the sender, so the operator ANSWERING
+/// a session's question arrives here. Pinned by `every_renderer_puts_the_operator_message_on_its_own_line`.
+///
+/// No header claims priority over the user (BO-04, F13a): no "REPLY REQUIRED", no "DIRECTIVE", no "RIGHT NOW", no
+/// urgency marks. Pinned by `relay_text_has_no_priority_claims`.
+fn render(task: &InboxTask) -> String {
+    let from = sender(task);
+    let when = super::clock(&task.created);
+    let header = match task.kind.as_str() {
+        "ping" if task.from.is_empty() => format!(
+            "relay: ping from {from} ({when}) · it has no relay title, so it cannot be answered; clear it: base relay done {}",
             task.slug
-        )
-    } else {
-        format!(
-            "DIRECTIVE: PAUSE and reply BEFORE your next action: `base relay ping --to \"{from}\" --msg \"<answer or ack>\"`. \
-             If the full answer needs time, send a one-line ack NOW (\"on it — folding into current work\") and a follow-up ping when you have it. \
-             Your reply clears this alert; until you send one it re-fires. \
-             Then resume your in-flight work and note the ping + your reply in ONE line of your response.\n",
-            from = task.from
-        )
+        ),
+        "ping" => format!("relay: ping from {from} ({when}) · reply: base relay ping --to {from} --msg \"...\""),
+        "reply" => format!("relay: reply from {from} ({when}) · no answer needed"),
+        "notify" => match spool_parts(task) {
+            // The wake notify for a spool message reads exactly as the spool delivery would show it: the store,
+            // the message type, and for a question the command that answers it.
+            Some((project, mtype, _)) => format!(
+                "relay ({project}): {mtype} from {from} ({when}){answer}",
+                answer = answer_command(&project, mtype, from),
+            ),
+            None => format!("relay: message from {from} ({when})"),
+        },
+        _ => format!(
+            "relay: task {slug} [{pri}] from {from} ({when}) · when finished: base relay done {slug}",
+            slug = task.slug,
+            pri = task.priority,
+        ),
     };
-    format!(
-        "<relay-ping-inbound from=\"{from}\" to=\"{title}\">\n\
-         🚨 INSTANT PING from {from} — REPLY REQUIRED BEFORE YOUR NEXT ACTION.\n\
-         {msg}\n\
-         {refs}\
-         {reply_line}\
-         </relay-ping-inbound>\n",
-        from = if task.from.is_empty() { "another session" } else { &task.from },
-        title = task.to_title,
-        msg = task.summary,
-        refs = refs_line(task),
-    )
+    let brief = if task.kind == "task" && !task.doc.is_empty() {
+        format!("brief: {}\n", task.doc)
+    } else {
+        String::new()
+    };
+    let msg = match spool_parts(task) {
+        Some((_, _, body)) if task.kind == "notify" => body,
+        _ => task.summary.as_str(),
+    };
+    format!("{header}\n{msg}\n{brief}{refs}", refs = refs_line(task))
 }
 
-/// The message starts its own line, like every other renderer here, and that
-/// is load-bearing rather than cosmetic (#101): `hook/mod.rs` matches star
-/// commands against this rendered block, and a command only activates in the
-/// leading star-run of a line. `cli.rs` marks a send `kind = "reply"` whenever
-/// the target has an unanswered ping from the sender, so the operator
-/// ANSWERING a session's question arrives here — interpolating the message
-/// after a prefix would make a command in it unreachable. Same for
-/// [`render_notify`]. Pinned by
-/// `every_renderer_puts_the_operator_message_on_its_own_line`.
-fn render_reply(task: &InboxTask) -> String {
-    format!(
-        "<relay-ping-reply from=\"{from}\" to=\"{title}\">\n\
-         🔔 PING REPLY from {from}:\n\
-         {msg}\n\
-         {refs}\
-         Consumed — no acknowledgment needed. Fold it into your work, continue, and mention it in one line of your response.\n\
-         </relay-ping-reply>\n",
-        from = if task.from.is_empty() { "another session" } else { &task.from },
-        title = task.to_title,
-        msg = task.summary,
-        refs = refs_line(task),
-    )
+/// A spool notify's store name, message type and message body. `relay send` writes the notify's summary as
+/// `[<type>] <message>`; a notify without a spool, or a summary in another shape, gives `None`.
+fn spool_parts(task: &InboxTask) -> Option<(String, &str, &str)> {
+    if task.spool_store.is_empty() {
+        return None;
+    }
+    let project = std::path::Path::new(&task.spool_store).file_name()?.to_string_lossy().into_owned();
+    let rest = task.summary.strip_prefix('[')?;
+    let (mtype, body) = rest.split_once("] ")?;
+    Some((project, mtype, body))
 }
 
-fn render_notify(task: &InboxTask) -> String {
-    format!(
-        "<relay-message-inbound from=\"{from}\" to=\"{title}\">\n\
-         📨 RELAY MESSAGE from {from}:\n\
-         {msg}\n\
-         {refs}\
-         The full message queue is in the workspace relay spool — consume it now (marks it seen): base relay poll\n\
-         </relay-message-inbound>\n",
-        from = if task.from.is_empty() { "another session" } else { &task.from },
-        title = task.to_title,
-        msg = task.summary,
-        refs = refs_line(task),
-    )
+/// The command that answers a spool question, for the two message types that ask for one; empty for the others.
+pub fn answer_command(project: &str, mtype: &str, from: &str) -> String {
+    if matches!(mtype, "question" | "contract-change") {
+        format!(" · answer: base relay send --project {project} --to {from} --type answer --msg \"...\"")
+    } else {
+        String::new()
+    }
 }
 
-/// The receiver's reply IS the ack: clear every pending inbound ping FROM
-/// `peer` sitting in any of `my_titles`' inboxes, flipping each graph mirror
-/// to answered (best-effort). Returns how many pings cleared.
+/// The receiver's reply IS the ack: clear every inbound ping FROM `peer` sitting in any of `my_titles`' inboxes,
+/// flipping each graph mirror to answered (best-effort), and with them every message from `peer` hidden as superseded.
+/// Returns how many pings cleared.
 pub fn clear_pings_from(ns: &NamespaceConfig, peer: &str, my_titles: &[String]) -> usize {
     let mut cleared = 0;
     for title in my_titles {
         let Some(dir) = title_dir(title) else { continue };
         for (path, task) in read_tasks_in(&dir) {
-            if task.kind == "ping" && task.from == peer && std::fs::remove_file(&path).is_ok() {
+            if task.from != peer {
+                continue;
+            }
+            if task.kind == "ping" && std::fs::remove_file(&path).is_ok() {
                 cleared += 1;
                 if let Err(e) = answer_in_graph(ns, &task.slug) {
                     eprintln!("base relay ping: graph mirror update skipped: {e:#}");
                 }
+            } else if task.status == "superseded" {
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
+    cleared
+}
+
+/// A ping to `peer` that answers one: when `peer` has a ping waiting in one of `my_titles`' inboxes, everything `peer`
+/// sent no later than the newest such ping is answered (BO-04, F13c, lynx's condition 3): the pings and superseded
+/// messages are cleared ([`clear_pings_from`]), an unshown reply or notify from then or before is cleared with its spool
+/// copy marked seen, and `peer`'s spool messages from then or before are marked seen. A ping that answers nothing marks
+/// nothing, and nothing `peer` sent after its newest ping is touched. Returns how many pings cleared.
+pub fn answer_from(ns: &NamespaceConfig, cwd: &Path, peer: &str, my_titles: &[String]) -> usize {
+    let mut cutoff: Option<chrono::DateTime<chrono::Local>> = None;
+    for title in my_titles {
+        let Some(dir) = title_dir(title) else { continue };
+        for (_, task) in read_tasks_in(&dir) {
+            if task.kind == "ping" && task.from == peer {
+                cutoff = cutoff.max(parse_ts(&task.created));
+            }
+        }
+    }
+    let Some(cutoff) = cutoff else { return 0 };
+    let cleared = clear_pings_from(ns, peer, my_titles);
+    for title in my_titles {
+        let Some(dir) = title_dir(title) else { continue };
+        for (path, task) in read_tasks_in(&dir) {
+            if task.from == peer
+                && matches!(task.kind.as_str(), "reply" | "notify")
+                && parse_ts(&task.created).is_some_and(|t| t <= cutoff)
+            {
+                mark_spool_seen(&task);
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    super::deliver::mark_answered(cwd, peer, my_titles, cutoff);
     cleared
 }
 
@@ -467,17 +561,19 @@ pub fn list_all() -> Vec<InboxTask> {
     out
 }
 
-/// Human-readable one-liner for a task (used by `base relay tasks`).
+/// Human-readable row for a task (used by `base relay tasks`): the facts on one line, the message on the next, so a
+/// superseded or already-shown message can be read again.
 pub fn format_row(t: &InboxTask) -> String {
     let kind = if t.kind == "task" { String::new() } else { format!(" ({})", t.kind) };
     format!(
-        "  {slug}{kind} → {title} [{status}, {pri}] · {age} · from {from}",
+        "  {slug}{kind} → {title} [{status}, {pri}] · {age} · from {from}\n      {summary}",
         slug = t.slug,
         title = t.to_title,
         status = t.status,
         pri = t.priority,
         age = age_str(&t.created),
         from = if t.from.is_empty() { "?" } else { &t.from },
+        summary = t.summary,
     )
 }
 
@@ -621,6 +717,8 @@ mod tests {
             last_alert_ts: String::new(),
             kind: "task".into(),
             refs: Vec::new(),
+            spool_store: String::new(),
+            spool_id: String::new(),
         }
     }
 
@@ -639,6 +737,8 @@ mod tests {
             last_alert_ts: String::new(),
             kind: kind.into(),
             refs: Vec::new(),
+            spool_store: String::new(),
+            spool_id: String::new(),
         }
     }
 
@@ -659,16 +759,16 @@ mod tests {
     }
 
     #[test]
-    fn pending_fires_loud_on_any_phase() {
+    fn a_pending_task_is_shown_in_full_on_a_prompt() {
         with_home(|home| {
             let ns = NamespaceConfig::default();
             bind("caddy-backend", "sid-B", home);
             enqueue(&ns, &sample("sid-B")).unwrap();
-            // Mid-turn (Tool) still fires loud when the task has never been seen.
-            let block = deliver("sid-B", Phase::Tool).expect("pending task must deliver");
-            assert!(block.contains("NEW TASK TO IMMEDIATELY CONSUME AND EXECUTE"));
-            assert!(block.contains("rebuild-auth-guard"));
-            assert!(block.contains("base relay done rebuild-auth-guard"));
+            let block = deliver("sid-B", Phase::Prompt).expect("pending task must deliver");
+            assert!(block.starts_with("relay: task rebuild-auth-guard [high] from api-session ("), "{block}");
+            assert!(block.contains("when finished: base relay done rebuild-auth-guard"), "{block}");
+            assert!(block.contains("\nRebuild the auth guard\n"), "{block}");
+            assert!(block.contains("brief: /tmp/rebuild-auth-guard.md"), "{block}");
         });
     }
 
@@ -681,7 +781,7 @@ mod tests {
             assert!(deliver("sid-B", Phase::SessionStart).is_some(), "first sighting loud");
             // Same session, right after: no re-loud, terse throttled → silent.
             assert!(deliver("sid-B", Phase::Prompt).is_none(), "must not re-fire same session");
-            assert!(deliver("sid-B", Phase::Tool).is_none(), "must not nudge every tool call");
+            assert!(deliver("sid-B", Phase::Prompt).is_none(), "and never repeats on later prompts");
         });
     }
 
@@ -697,7 +797,10 @@ mod tests {
             // "persist until done, re-loud at session-start".
             bind("caddy-backend", "sid-C", home);
             let block = deliver("sid-C", Phase::SessionStart).expect("new session must see it");
-            assert!(block.contains("NEW TASK TO IMMEDIATELY CONSUME"));
+            assert!(block.starts_with("relay: task rebuild-auth-guard"), "{block}");
+            // The same session starting again (a compaction) gets the one-line listing, not the brief again.
+            let again = deliver("sid-C", Phase::SessionStart).expect("an open task is listed");
+            assert_eq!(again, "relay: 1 open task (rebuild-auth-guard from api-session) · when finished: base relay done <slug>\n");
         });
     }
 
@@ -722,7 +825,6 @@ mod tests {
             enqueue(&ns, &pending).unwrap();
             assert!(deliver("sid-B", Phase::SessionStart).is_none(), "stale pings must not fire loud");
             assert!(deliver("sid-B", Phase::Prompt).is_none(), "nor on a prompt");
-            assert!(deliver("sid-B", Phase::Tool).is_none(), "nor on a tool call");
             // Nothing is deleted: the files stay readable in the inbox.
             assert_eq!(read_tasks_in(&title_dir("cougar").unwrap()).len(), 2);
         });
@@ -748,7 +850,7 @@ mod tests {
             enqueue(&ns, &task).unwrap();
             bind("cougar", "sid-C", home);
             let block = deliver("sid-C", Phase::SessionStart).expect("an old task still re-announces");
-            assert!(block.contains("NEW TASK TO IMMEDIATELY CONSUME"));
+            assert!(block.contains("relay: task rebuild-auth-guard"), "{block}");
         });
     }
 
@@ -827,24 +929,24 @@ mod tests {
                 r#"{"slug":"old-task","summary":"legacy","doc":"","from":"x","to_title":"caddy-backend","to_session":"sid-B","priority":"high","created":"2026-07-01T00:00:00-0500","status":"pending","last_loud_session":"","last_alert_ts":""}"#,
             )
             .unwrap();
-            let block = deliver("sid-B", Phase::Tool).expect("legacy task must deliver");
-            assert!(block.contains("NEW TASK TO IMMEDIATELY CONSUME"), "defaults to kind=task");
+            let block = deliver("sid-B", Phase::Prompt).expect("legacy task must deliver");
+            assert!(block.starts_with("relay: task old-task"), "defaults to kind=task: {block}");
         });
     }
 
     #[test]
-    fn ping_fires_loud_mid_turn_and_mandates_reply() {
+    fn a_ping_is_information_with_its_reply_command() {
         with_home(|home| {
             let ns = NamespaceConfig::default();
             bind("caddy-backend", "sid-B", home);
             enqueue(&ns, &sample_ping("ping", "orchestrator", "caddy-backend", "sid-B", "auth guard status?")).unwrap();
 
-            // Pre-tool-use (mid-turn) must scream immediately.
-            let block = deliver("sid-B", Phase::Tool).expect("ping must fire on Tool phase");
-            assert!(block.contains("INSTANT PING"));
-            assert!(block.contains("auth guard status?"));
-            assert!(block.contains("REPLY REQUIRED BEFORE YOUR NEXT ACTION"));
-            assert!(block.contains("base relay ping --to \"orchestrator\""));
+            let block = deliver("sid-B", Phase::Prompt).expect("a new ping is shown on the next prompt");
+            let header = block.lines().next().unwrap();
+            assert!(header.starts_with("relay: ping from orchestrator ("), "{block}");
+            assert!(header.ends_with(") · reply: base relay ping --to orchestrator --msg \"...\""), "{block}");
+            assert!(block.lines().any(|l| l == "auth guard status?"), "{block}");
+            assert!(deliver("sid-B", Phase::Prompt).is_none(), "shown once, never repeated on a prompt");
 
             // Unanswered → still in the inbox (unlike a reply, which consumes).
             assert_eq!(list_all().len(), 1);
@@ -858,8 +960,8 @@ mod tests {
             bind("orchestrator", "sid-A", home);
             enqueue(&ns, &sample_ping("reply", "caddy-backend", "orchestrator", "sid-A", "ack — on it")).unwrap();
 
-            let block = deliver("sid-A", Phase::Tool).expect("reply must announce");
-            assert!(block.contains("PING REPLY from caddy-backend"));
+            let block = deliver("sid-A", Phase::Prompt).expect("reply must announce");
+            assert!(block.starts_with("relay: reply from caddy-backend ("), "{block}");
             assert!(block.contains("ack — on it"));
             assert!(!block.contains("REPLY REQUIRED"), "a reply never demands its own ack");
 
@@ -876,10 +978,9 @@ mod tests {
             bind("worker-p11", "sid-N", home);
             enqueue(&ns, &sample_ping("notify", "orchestrator", "worker-p11", "sid-N", "[notify] contracts frozen")).unwrap();
 
-            let block = deliver("sid-N", Phase::Tool).expect("notify must announce");
-            assert!(block.contains("RELAY MESSAGE from orchestrator"));
+            let block = deliver("sid-N", Phase::Prompt).expect("notify must announce");
+            assert!(block.starts_with("relay: message from orchestrator ("), "{block}");
             assert!(block.contains("contracts frozen"));
-            assert!(block.contains("base relay poll"), "must route the receiver to the spool");
             assert!(!block.contains("REPLY REQUIRED"), "a notify never demands an ack");
 
             // Consumed on delivery — inbox empty, nothing re-fires.
@@ -895,6 +996,10 @@ mod tests {
             bind("caddy-backend", "sid-B", home);
             enqueue(&ns, &sample_ping("ping", "orchestrator", "caddy-backend", "sid-B", "status?")).unwrap();
             enqueue(&ns, &sample_ping("ping", "someone-else", "caddy-backend", "sid-B", "unrelated")).unwrap();
+            let mut hidden = sample_ping("reply", "orchestrator", "caddy-backend", "sid-B", "an older answer");
+            hidden.slug = "hidden-reply".into();
+            hidden.status = "superseded".into();
+            enqueue(&ns, &hidden).unwrap();
 
             // caddy-backend pings orchestrator back → only orchestrator's ping clears.
             let cleared = clear_pings_from(&ns, "orchestrator", &["caddy-backend".to_string()]);
@@ -914,7 +1019,7 @@ mod tests {
             p.slug = "ping-anon".into();
             enqueue(&ns, &p).unwrap();
 
-            let block = deliver("sid-B", Phase::Tool).expect("ping must fire");
+            let block = deliver("sid-B", Phase::Prompt).expect("ping must fire");
             assert!(block.contains("base relay done ping-anon"), "untitled sender → done escape hatch");
             assert_eq!(done(&ns, "ping-anon").unwrap(), 1);
             assert!(list_all().is_empty());
@@ -945,7 +1050,7 @@ mod tests {
                 t.slug = format!("slug-{kind}");
                 enqueue(&ns, &t).unwrap();
 
-                let block = deliver(&session, Phase::Tool)
+                let block = deliver(&session, Phase::Prompt)
                     .unwrap_or_else(|| panic!("kind={kind} must deliver"));
                 assert!(block.contains(msg), "kind={kind}: block must carry the message");
                 assert!(
@@ -959,5 +1064,234 @@ mod tests {
         // Law 23 — a loop that visited nothing is not a pass.
         assert_eq!(visited, kinds.len(), "visited {visited} of {} kinds", kinds.len());
         assert!(visited > 0, "visited ZERO renderers — this proves nothing");
+    }
+
+    fn hours_ago(h: i64) -> String {
+        (chrono::Local::now() - chrono::Duration::hours(h)).format("%Y-%m-%dT%H:%M:%S%z").to_string()
+    }
+
+    /// BO-04 F13c, with lynx's three conditions: one sender's older unshown messages are hidden behind its newest;
+    /// the shown one names the command that lists them; the files stay; a reply to that sender clears them.
+    #[test]
+    fn a_senders_older_messages_are_hidden_behind_its_newest_never_deleted() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-L", home);
+            let mut go = sample_ping("ping", "bison", "lynx", "sid-L", "go: edit the doc");
+            go.slug = "ping-0910".into();
+            go.created = hours_ago(3);
+            enqueue(&ns, &go).unwrap();
+            let mut other = sample_ping("ping", "heron", "lynx", "sid-L", "an unrelated question");
+            other.slug = "ping-1000".into();
+            other.created = hours_ago(2);
+            enqueue(&ns, &other).unwrap();
+            let mut stand_down = sample_ping("ping", "bison", "lynx", "sid-L", "stand down, the go is withdrawn");
+            stand_down.slug = "ping-1405".into();
+            stand_down.created = hours_ago(1);
+            enqueue(&ns, &stand_down).unwrap();
+
+            let block = deliver("sid-L", Phase::Prompt).expect("the newest ping is shown");
+            assert!(block.contains("stand down, the go is withdrawn"), "{block}");
+            assert!(!block.contains("go: edit the doc"), "a superseded message was shown:\n{block}");
+            assert!(block.contains("an unrelated question"), "another sender is its own thread:\n{block}");
+            assert!(
+                block.contains("(1 earlier message from bison hidden, this one is newer: base relay tasks --from bison)"),
+                "{block}"
+            );
+            // Hidden, never deleted: the file stays and the named listing shows its text.
+            let all = list_all();
+            let older = all.iter().find(|t| t.slug == "ping-0910").expect("the superseded file stays");
+            assert_eq!(older.status, "superseded");
+            assert!(format_row(older).contains("go: edit the doc"), "the listing shows the hidden message's text");
+            // Never shown again, on a prompt or at session start (the listing line names only delivered pings).
+            assert!(deliver("sid-L", Phase::Prompt).is_none());
+            let start = deliver("sid-L", Phase::SessionStart).expect("unanswered pings are listed");
+            assert!(!start.contains("go: edit the doc"), "{start}");
+            // The hidden ping is still unanswered, so it is listed (by sender and time, never its text).
+            let listed = format!(
+                "relay: 3 unanswered pings (bison {}, heron {}, bison {})",
+                crate::relay::clock(&go.created),
+                crate::relay::clock(&other.created),
+                crate::relay::clock(&stand_down.created)
+            );
+            assert!(start.starts_with(&listed), "{start}");
+            // Lynx replies to bison: everything earlier from bison is answered.
+            assert_eq!(clear_pings_from(&ns, "bison", &["lynx".to_string()]), 2);
+            assert!(list_all().iter().all(|t| t.from != "bison"), "nothing from bison is left to show");
+        });
+    }
+
+    /// Tasks are work, never superseded: two tasks from one sender are both shown.
+    #[test]
+    fn tasks_are_never_superseded() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("caddy-backend", "sid-B", home);
+            let mut one = sample("sid-B");
+            one.slug = "task-one".into();
+            enqueue(&ns, &one).unwrap();
+            let mut two = sample("sid-B");
+            two.slug = "task-two".into();
+            enqueue(&ns, &two).unwrap();
+            let block = deliver("sid-B", Phase::Prompt).expect("tasks deliver");
+            assert!(block.contains("relay: task task-one") && block.contains("relay: task task-two"), "{block}");
+            assert!(!block.contains("hidden"), "{block}");
+        });
+    }
+
+    /// F13a at the source: no renderer and no listing line claims to come before the user's prompt.
+    #[test]
+    fn no_renderer_claims_priority_over_the_user() {
+        let banned = [
+            "REPLY REQUIRED", "DIRECTIVE", "RIGHT NOW", "PAUSE", "IMMEDIATELY", "BEFORE YOUR NEXT ACTION",
+            "\u{1F6A8}", "\u{2757}", "\u{26A0}", "\u{1F514}", "\u{1F4E8}", "\u{23F3}",
+        ];
+        let mut texts: Vec<String> = Vec::new();
+        for kind in ["task", "ping", "reply", "notify"] {
+            texts.push(render(&sample_ping(kind, "bison", "lynx", "sid", "a message")));
+            texts.push(render(&sample_ping(kind, "", "lynx", "sid", "a message")));
+        }
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-1", home);
+            enqueue(&ns, &sample_ping("ping", "bison", "lynx", "sid-1", "first")).unwrap();
+            let mut t = sample("sid-1");
+            t.to_title = "lynx".into();
+            enqueue(&ns, &t).unwrap();
+            texts.push(deliver("sid-1", Phase::Prompt).unwrap());
+            texts.push(deliver("sid-1", Phase::SessionStart).unwrap());
+        });
+        assert_eq!(texts.len(), 10, "control: every renderer and both listings were read");
+        for text in &texts {
+            for phrase in banned {
+                assert!(!text.contains(phrase), "{phrase:?} in relay text:\n{text}");
+            }
+        }
+    }
+
+    /// Review finding 1: a session that takes over a title mid-session (`base relay register`) is shown, on its next
+    /// prompt, the open task in full and the unanswered pings in one line that another session was shown. Once.
+    #[test]
+    fn a_title_taken_over_mid_session_shows_its_open_items_once_on_a_prompt() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("caddy-backend", "sid-A", home);
+            enqueue(&ns, &sample("sid-A")).unwrap();
+            enqueue(&ns, &sample_ping("ping", "heron", "caddy-backend", "sid-A", "still waiting on you")).unwrap();
+            assert!(deliver("sid-A", Phase::Prompt).is_some(), "control: session A was shown both");
+            bind("caddy-backend", "sid-B", home);
+            let block = deliver("sid-B", Phase::Prompt).expect("session B is shown what it now holds");
+            assert!(block.contains("relay: task rebuild-auth-guard"), "the task, in full:\n{block}");
+            assert!(block.contains("brief: /tmp/rebuild-auth-guard.md"), "{block}");
+            assert!(block.contains("relay: 1 unanswered ping (heron "), "the ping, listed:\n{block}");
+            assert!(!block.contains("still waiting on you"), "a delivered ping is listed, not shown again:\n{block}");
+            assert!(deliver("sid-B", Phase::Prompt).is_none(), "once per session");
+        });
+    }
+
+    /// Review finding 3: a newer message of another kind hides an older ping, but never what the ping asks: the hidden
+    /// ping is still listed as unanswered at session start.
+    #[test]
+    fn a_ping_hidden_behind_a_newer_message_stays_unanswered() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-L", home);
+            let mut question = sample_ping("ping", "bison", "lynx", "sid-L", "which schema?");
+            question.slug = "ping-1".into();
+            question.created = hours_ago(2);
+            enqueue(&ns, &question).unwrap();
+            let mut fyi = sample_ping("notify", "bison", "lynx", "sid-L", "build is green");
+            fyi.slug = "notify-2".into();
+            fyi.created = hours_ago(1);
+            enqueue(&ns, &fyi).unwrap();
+            let block = deliver("sid-L", Phase::Prompt).expect("the newest is shown");
+            assert!(block.contains("build is green") && !block.contains("which schema?"), "{block}");
+            let start = deliver("sid-L", Phase::SessionStart).expect("the hidden ping is still owed an answer");
+            assert!(start.starts_with("relay: 1 unanswered ping (bison "), "{start}");
+        });
+    }
+
+    /// Review finding 5: senders with no title are not one conversation; each of their messages is shown.
+    #[test]
+    fn senders_with_no_title_never_supersede_each_other() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-L", home);
+            for (i, from) in ["unregistered", "unregistered", "", "unregistered-1234abcd"].iter().enumerate() {
+                let mut p = sample_ping("ping", from, "lynx", "sid-L", &format!("script message {i}"));
+                p.slug = format!("ping-{i}");
+                enqueue(&ns, &p).unwrap();
+            }
+            let block = deliver("sid-L", Phase::Prompt).expect("all four are shown");
+            for i in 0..4 {
+                assert!(block.contains(&format!("script message {i}")), "{block}");
+            }
+            assert!(!block.contains("hidden"), "{block}");
+        });
+    }
+
+    /// Review finding 6: inside one second, the order is the milliseconds the slugs carry, not `notify-` before `ping-`.
+    #[test]
+    fn inside_one_second_the_later_message_is_the_newer() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-L", home);
+            let second = hours_ago(1);
+            let mut go = sample_ping("ping", "bison", "lynx", "sid-L", "go: edit the doc");
+            go.slug = "ping-1700000000100-0001-0".into();
+            go.created = second.clone();
+            enqueue(&ns, &go).unwrap();
+            let mut stand_down = sample_ping("notify", "bison", "lynx", "sid-L", "stand down");
+            stand_down.slug = "notify-1700000000900-bison-77-lynx".into();
+            stand_down.created = second;
+            enqueue(&ns, &stand_down).unwrap();
+            let block = deliver("sid-L", Phase::Prompt).expect("delivery");
+            assert!(block.contains("stand down") && !block.contains("go: edit the doc"), "{block}");
+        });
+    }
+
+    /// Review finding 4: a ping that answers nothing marks nothing; a reply clears only what the sender sent up to its
+    /// newest ping, and a message the sender sent after that is still shown.
+    #[test]
+    fn a_reply_answers_what_came_before_it_and_nothing_after() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-L", home);
+            let cwd = home.join("ws");
+            let mut later = sample_ping("notify", "bison", "lynx", "sid-L", "sent after the ping");
+            later.slug = "notify-later".into();
+            later.created = hours_ago(1);
+            enqueue(&ns, &later).unwrap();
+            assert_eq!(answer_from(&ns, &cwd, "bison", &["lynx".to_string()]), 0, "no ping from bison: not a reply");
+            assert_eq!(list_all().len(), 1, "a ping that answers nothing marks nothing");
+            let mut question = sample_ping("ping", "bison", "lynx", "sid-L", "which schema?");
+            question.slug = "ping-q".into();
+            question.created = hours_ago(2);
+            enqueue(&ns, &question).unwrap();
+            let mut earlier = sample_ping("notify", "bison", "lynx", "sid-L", "sent before the ping");
+            earlier.slug = "notify-earlier".into();
+            earlier.created = hours_ago(3);
+            enqueue(&ns, &earlier).unwrap();
+            assert_eq!(answer_from(&ns, &cwd, "bison", &["lynx".to_string()]), 1);
+            let left: Vec<String> = list_all().into_iter().map(|t| t.slug).collect();
+            assert_eq!(left, vec!["notify-later".to_string()], "only what came after the ping is left");
+        });
+    }
+
+    /// Review finding 8: the block says how many items it carries, counted where they are rendered.
+    #[test]
+    fn a_block_counts_its_items_where_it_renders_them() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-L", home);
+            enqueue(&ns, &sample_ping("ping", "bison", "lynx", "sid-L", "relay: this body starts like a header")).unwrap();
+            let mut n = sample_ping("notify", "heron", "lynx", "sid-L", "[notify] spool news");
+            n.slug = "notify-a".into();
+            n.spool_store = home.join("crew").display().to_string();
+            enqueue(&ns, &n).unwrap();
+            let part = deliver_deferred("sid-L", Phase::Prompt).expect("delivery");
+            assert_eq!(part.items, 2, "{}", part.text);
+            assert!(part.text.contains("relay (crew): notify from heron ("), "{}", part.text);
+        });
     }
 }

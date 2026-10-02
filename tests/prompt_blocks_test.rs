@@ -97,12 +97,37 @@ fn set_budget(s: &seed::Seed, bytes: usize) {
     std::fs::write(&path, text.replace(&line, &format!("prompt_bytes = {bytes}"))).expect("base.toml");
 }
 
-/// Bind `title` to `session` and leave it a ping, so the prompt hook delivers a relay block and the wake contract.
+/// Bind `title` to `session` and leave it a ping, so the prompt hook delivers a relay block and the watcher nudge.
 fn ping(s: &seed::Seed, session: &str, title: &str) {
+    ping_sized(s, session, title, 0);
+}
+
+/// [`ping`] with a message of about `bytes` bytes. Before BO-04 the 3.4 KB wake contract was the relay block that
+/// pushed these fixtures over budget; it is one line now, and a long ping (a real one runs to 800 characters) is what
+/// still makes relay compete for the budget.
+fn ping_sized(s: &seed::Seed, session: &str, title: &str, bytes: usize) {
     let (code, _, err) = run_base_in_session(s, &["relay", "register", "--as", title], session);
     assert_eq!(code, 0, "register: {err}");
-    let (code, _, err) = run_base(s, &["relay", "ping", "--to", title, "--msg", "please ack the hook change"]);
+    let mut msg = String::from("please ack the hook change");
+    while msg.len() < bytes {
+        msg.push_str("; the build order moved and the brief has a new section to read before the next step");
+    }
+    let (code, _, err) = run_base(s, &["relay", "ping", "--to", title, "--msg", &msg]);
     assert_eq!(code, 0, "ping: {err}");
+}
+
+/// A spool message of about `bytes` bytes for the title the prompt hook delivers the spool as (`BASE_RELAY_AS`, set by
+/// the seed's runner), so the relay inbox block is built beside the ping block.
+fn spool_sized(s: &seed::Seed, bytes: usize) {
+    let (code, _, err) = run_base(s, &["relay", "init", "--project", "crew"]);
+    assert_eq!(code, 0, "relay init: {err}");
+    let mut msg = String::from("spool note for the hook");
+    while msg.len() < bytes {
+        msg.push_str("; the shared schema changed and the worker queue was re-cut, see the board before claiming");
+    }
+    let (code, _, err) =
+        run_base(s, &["relay", "send", "--project", "crew", "--from", "seed-lark", "--to", "seed-kite", "--type", "notify", "--msg", &msg]);
+    assert_eq!(code, 0, "relay send: {err}");
 }
 
 fn blocks(s: &seed::Seed, session: &str) -> BlocksFile {
@@ -150,7 +175,8 @@ fn run(s: &seed::Seed, prompt: &str, session: &str) -> String {
 #[test]
 fn prompt_submit_over_budget_never_ends_mid_block() {
     let s = fixture("mid-block", 2500, 6, "");
-    ping(&s, "mid-block-session", "kite-mid");
+    ping_sized(&s, "mid-block-session", "kite-mid", 2_000);
+    spool_sized(&s, 2_000);
     let stdout = run(&s, "fix the hook budget bytes", "mid-block-session");
     let file = blocks(&s, "mid-block-session");
 
@@ -184,7 +210,7 @@ fn prompt_submit_over_budget_never_ends_mid_block() {
 #[test]
 fn prompt_submit_priority_order_holds_on_the_real_hook() {
     let s = fixture("priority", 2500, 6, "");
-    ping(&s, "priority-session", "kite-pri");
+    ping_sized(&s, "priority-session", "kite-pri", 1_500);
     let stdout = run(&s, "fix the hook budget bytes", "priority-session");
     let file = blocks(&s, "priority-session");
     let budget = file.budget_bytes;
@@ -208,30 +234,32 @@ fn prompt_submit_priority_order_holds_on_the_real_hook() {
     assert!(stdout.len() <= budget);
 }
 
-/// The real wake contract, about 3.7 KB, against a 3,000-byte budget: dropped whole, its pointer line printed, and
-/// `base hooks show relay-wake` prints all of it.
+/// A relay block larger than the budget, against a 3,000-byte budget: dropped whole, its pointer line printed, and
+/// `base hooks show relay-tasks` prints all of it. Until BO-04 the 3.7 KB wake contract was this block; it is one line
+/// now, so a 3.2 KB ping stands in for it.
 #[test]
 fn prompt_submit_block_larger_than_budget_is_dropped_not_cut() {
     let s = fixture("oversized", 3000, 0, "");
-    ping(&s, "oversized-session", "kite-big");
+    ping_sized(&s, "oversized-session", "kite-big", 3_200);
     let stdout = run(&s, "fix the hook budget bytes", "oversized-session");
     let file = blocks(&s, "oversized-session");
-    let wake = file.blocks.iter().find(|r| r.id == "relay-wake").expect("control: the wake contract was built");
-    assert!(wake.bytes > 3000, "control: the wake contract is larger than the budget: {} bytes", wake.bytes);
-    assert!(!wake.printed);
-    assert!(!stdout.contains("RELAY WAKE CONTRACT"), "no part of the wake contract is printed:\n{stdout}");
-    assert!(stdout.lines().any(|l| l == pointer(wake, 3000)), "no pointer line for the wake contract:\n{stdout}");
+    let big = file.blocks.iter().find(|r| r.id == "relay-tasks").expect("control: the ping block was built");
+    assert!(big.bytes > 3000, "control: the ping block is larger than the budget: {} bytes", big.bytes);
+    assert!(!big.printed);
+    assert!(!stdout.contains("please ack the hook change"), "no part of the ping block is printed:\n{stdout}");
+    assert!(stdout.lines().any(|l| l == pointer(big, 3000)), "no pointer line for the ping block:\n{stdout}");
     assert!(stdout.len() <= 3000);
     // An oversized block does not take the blocks below it down with it: the re-admit puts back what fits.
-    assert!(file.blocks.iter().any(|r| r.priority > 3 && r.printed), "everything below the wake contract was lost:\n{stdout}");
-    let (code, shown, err) = run_base_in_session(&s, &["hooks", "show", "relay-wake"], "oversized-session");
+    assert!(file.blocks.iter().any(|r| r.priority > 3 && r.printed), "everything below the ping block was lost:\n{stdout}");
+    let (code, shown, err) = run_base_in_session(&s, &["hooks", "show", "relay-tasks"], "oversized-session");
     assert_eq!(code, 0, "{err}");
-    assert_eq!(shown, format!("{}\n", wake.text));
-    assert!(shown.starts_with("=== RELAY WAKE CONTRACT"));
+    assert_eq!(shown, format!("{}\n", big.text));
+    assert!(shown.starts_with("relay: ping from "));
 }
 
 /// Example 2 (2026-10-01): the last line of one block and the first of the next arrived on one line,
 /// `...companion runs on Brave<relay-ping-open>❗ UNANSWERED PING(s)...`. Every block starts on its own line.
+/// BO-04 replaced the relay tags with lines that open `relay: `; those must open their line too.
 #[test]
 fn prompt_submit_blocks_start_on_their_own_line() {
     let s = fixture("own-line", 20_000, 0, "");
@@ -248,14 +276,12 @@ fn prompt_submit_blocks_start_on_their_own_line() {
         );
     }
     for line in stdout.lines() {
-        if let Some(at) = line.find("<relay-") {
+        if let Some(at) = line.find("relay: ") {
             assert_eq!(at, 0, "a relay block glued onto another block's line: {line:?}");
         }
-        if let Some(at) = line.find("=== RELAY WAKE CONTRACT") {
-            assert_eq!(at, 0, "the wake contract glued onto another block's line: {line:?}");
-        }
     }
-    assert!(stdout.contains("\n\n<relay-ping-inbound"), "control: the relay ping is in the output");
+    assert!(stdout.contains("\n\nrelay: ping from "), "control: the relay ping is in the output");
+    assert!(stdout.contains("has no inbox watcher"), "control: the watcher nudge is in the output");
 }
 
 /// Example 4 (F7): the record names every dropped block by name, items and bytes, reason `budget`, in session start's
@@ -263,7 +289,8 @@ fn prompt_submit_blocks_start_on_their_own_line() {
 #[test]
 fn prompt_submit_withheld_blocks_logged_by_name_and_bytes() {
     let s = fixture("logged", 2500, 6, "");
-    ping(&s, "logged-session", "kite-log");
+    ping_sized(&s, "logged-session", "kite-log", 2_000);
+    spool_sized(&s, 2_000);
     let stdout = run(&s, "fix the hook budget bytes", "logged-session");
     let file = blocks(&s, "logged-session");
     let record = last_prompt_record(&s);
@@ -374,11 +401,12 @@ fn rule_marked_shown_only_when_emitted_whole() {
 
 /// Code review (2026-10-01): relay delivery used to consume as it rendered, so a relay block the budget dropped was
 /// already marked delivered and its wake nudge throttled. Now a dropped relay block is not consumed: the ping is still
-/// pending on disk, and the next prompt announces it loud again, with the wake contract still due.
+/// pending on disk, and the next prompt shows it. BO-04: the watcher nudge is one line, shorter than the pointer line
+/// that would replace it, so the fit never drops it and it is printed on the first prompt.
 #[test]
 fn a_dropped_relay_block_is_not_consumed() {
     let s = fixture("relay-kept", 50_000, 6, "");
-    ping(&s, "relay-measure", "kite-measure");
+    ping_sized(&s, "relay-measure", "kite-measure", 800);
     let _ = run(&s, "fix the hook output", "relay-measure");
     let measured = blocks(&s, "relay-measure");
     for id in ["relay-tasks", "relay-wake"] {
@@ -387,13 +415,13 @@ fn a_dropped_relay_block_is_not_consumed() {
     set_budget(&s, budget_dropping(&measured, |r| r.priority >= 3));
 
     let session = "relay-session";
-    ping(&s, session, "kite-rel");
+    ping_sized(&s, session, "kite-rel", 800);
     let one = run(&s, "fix the hook output", session);
     let file = blocks(&s, session);
-    for id in ["relay-tasks", "relay-wake"] {
-        let row = file.blocks.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("control: {id} built"));
-        assert!(!row.printed, "control: prompt 1 dropped {id}:\n{one}");
-    }
+    let row = file.blocks.iter().find(|r| r.id == "relay-tasks").expect("control: relay-tasks built");
+    assert!(!row.printed, "control: prompt 1 dropped relay-tasks:\n{one}");
+    let wake = file.blocks.iter().find(|r| r.id == "relay-wake").expect("control: relay-wake built");
+    assert!(wake.printed, "the one-line nudge is never dropped:\n{one}");
     let inbox = s.home.join(".base-gbl").join(".base").join("relay-inbox").join("kite-rel");
     let pings: Vec<String> = std::fs::read_dir(&inbox)
         .unwrap_or_else(|e| panic!("{}: {e}", inbox.display()))
@@ -406,10 +434,10 @@ fn a_dropped_relay_block_is_not_consumed() {
     assert_eq!(status, "pending", "a dropped ping was recorded as delivered:\n{}", pings[0]);
 
     let two = run(&s, "what is next on the list", session);
-    assert!(two.contains("INSTANT PING"), "the dropped ping was not announced again, loud:\n{two}");
+    assert!(two.contains("relay: ping from "), "the dropped ping was not shown on the next prompt:\n{two}");
     assert!(
-        blocks(&s, session).blocks.iter().any(|r| r.id == "relay-wake"),
-        "the dropped wake contract was throttled as though it had been read"
+        !blocks(&s, session).blocks.iter().any(|r| r.id == "relay-wake"),
+        "the printed nudge was not recorded, so it was said twice in one session"
     );
 }
 

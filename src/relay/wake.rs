@@ -25,9 +25,10 @@ use super::task_inbox::title_dir;
 /// one slow loop can't flap the board, a dead monitor shows within ~15s.
 pub const WATCH_STALE_SECS: u64 = 15;
 
-/// Stale-sentinel re-arm nudges are throttled per title so a session that
-/// cannot arm (no Monitor tool in its harness) isn't nagged every tool call.
-const NUDGE_COOLDOWN_SECS: u64 = 180;
+/// The longest deadline the host's Monitor tool accepts. Claude Code 2.1.286 and 2.1.287 describe the field as
+/// "Deadlines above 1800000ms are capped to 1800000ms" (30 minutes), and the tool has no `persistent` field, so a
+/// watcher always expires and is armed again (BO-04, F4c). `base relay arm` prints this value.
+pub const MONITOR_TIMEOUT_MS: u64 = 1_800_000;
 
 fn sentinel_path(title: &str) -> Option<PathBuf> {
     title_dir(title).map(|d| d.join(".watching"))
@@ -313,52 +314,38 @@ pub fn watch_script_for(inbox: &std::path::Path) -> Option<String> {
     )
 }
 
-/// The arming block injected into hook context (and printed by `relay
-/// register`) when a title's sentinel is stale. It is the operator's standing
-/// instruction from `[relay]` in base.toml, so it says what it is, where it
-/// comes from, and how to switch it off — it never asks the model to act
-/// without telling the operator.
-pub fn arm_block(title: &str) -> Option<String> {
-    arm_block_for(title, &operator_name())
+/// What `base relay arm` prints for a title: the host Monitor tool's three fields with their values, the re-arm
+/// instruction, and the status-line and register steps (BO-04, F4a and F4c).
+///
+/// BEFORE BO-04 this text, then called the wake contract, was injected into prompt-submit AND pre-tool: about 3,400
+/// bytes plus a 47-line script, repeated every three minutes while the sentinel was stale. On 2026-10-01 it took 3,400 of
+/// a 4,000-byte prompt budget and was cut at line 37 of the script, and it told the model to pass `persistent: true` to
+/// a Monitor tool that has no such field. The hooks now carry one line ([`nudge_line`]) and this text is printed only
+/// when asked for, by `base relay arm`, or by `base relay register` for a title with no current watcher.
+pub fn arm_text(title: &str) -> Option<String> {
+    arm_text_for(title, &operator_name())
 }
 
-/// `arm_block` with the operator label supplied — the pure half, so the text
-/// can be tested without a profile on disk.
-fn arm_block_for(title: &str, operator: &str) -> Option<String> {
+/// `arm_text` with the operator label supplied, the pure half, so the text can be tested without a profile on disk.
+fn arm_text_for(title: &str, operator: &str) -> Option<String> {
     let inbox_disp = title_dir(title)?.to_string_lossy().replace('\\', "/");
     let script = watch_script(title)?;
     let indented: String = script.lines().map(|l| format!("    {l}\n")).collect();
+    let minutes = MONITOR_TIMEOUT_MS / 60_000;
     Some(format!(
-        "=== RELAY WAKE CONTRACT ({title}) ===\n\
-         This session holds the relay title \"{title}\" and has no live wake monitor (sentinel \
-         stale or missing). The relay is base's local multi-session layer, on by way of \
-         `[relay]` in ~/.base-gbl/base.toml: `base config set relay.wake_nudge false` stops \
-         this block, `base config set relay.enabled false` stops the auto-codename too. \
-         Everything below stays on this machine — the monitor watches one local inbox folder, \
-         and the sentinel it touches is what `base relay board` reads.\n\
-         To arm it, call the Monitor tool once with the script below, then continue your task. \
-         If Monitor is a deferred tool in your harness, load it first (ToolSearch \
-         \"select:Monitor\") — a direct call fails with InputValidationError until the schema \
-         is loaded. No test ping is needed. If THIS session already runs a monitor for \
-         \"{title}\" armed with THIS script (its loop touches .watching), skip — never arm a \
-         duplicate. If your running monitor is an older script that does not touch the \
-         sentinel, TaskStop it first, then arm this one.\n\n\
+        "Start your relay watcher with the Monitor tool, using these fields:\n\
          \x20 description: relay wake: {title}\n\
-         \x20 persistent: true\n\
-         \x20 command:\n{indented}\n\
-         While the monitor runs, its loop touches the .watching sentinel every 5s poll; \
-         `base relay board` shows that as Watching, and this block repeats (at most once per \
-         3 minutes) until the sentinel is fresh.\n\
-         STATUS LINE: whenever what you are working on changes, write one short line to \
-         {inbox_disp}/.status (e.g. `echo \"building X\" > .../.status`). It is a local file \
-         the operator's ping hub shows on this session's card, so {operator} sees live work \
-         state at a glance.\n\
-         PROJECT TAG: register with NO --project first — `base relay register --as {title}` — \
-         which joins this workspace's relay store and puts you on `base relay board`, the \
-         operator's hub view. Then read your own row back before anything else; a registration \
-         you did not read back did not happen. Passing --project names a DIFFERENT store, and if \
-         no store by that name exists you are registered globally only and never appear on the \
-         board. Add the project keyword afterwards, once you are on it.\n"
+         \x20 timeout_ms:  {MONITOR_TIMEOUT_MS}   (the longest this Claude Code allows; it expires after {minutes} minutes)\n\
+         \x20 command:\n{indented}\
+         When the Monitor reports that it expired, run `base relay arm` again.\n\
+         If Monitor is a deferred tool, load it first: ToolSearch \"select:Monitor\". If this session already runs a \
+         watcher for \"{title}\" with this script, do not start a second one; if it runs an older script, stop that one \
+         (TaskStop) first.\n\
+         Status line: echo \"<what you are working on>\" > {inbox_disp}/.status (shown to {operator} on this session's \
+         card).\n\
+         Not registered yet? base relay register --as {title}, then check your row in base relay sessions.\n\
+         The watcher only reads this machine's inbox folder {inbox_disp}. `base config set relay.wake_nudge false` stops \
+         the one-line reminder in the hooks.\n"
     ))
 }
 
@@ -369,6 +356,17 @@ fn operator_name() -> String {
         .map(|p| p.name)
         .filter(|n| !n.trim().is_empty())
         .unwrap_or_else(|| "the operator".to_string())
+}
+
+/// The one line the hooks carry in place of the old wake contract (BO-04, F4b). It names the command that prints the
+/// rest; it never carries the script.
+pub fn nudge_line(title: &str, state: &Armed) -> String {
+    match state {
+        Armed::Outdated => format!(
+            "relay: {title}'s inbox watcher runs an old script · run base relay arm and start the Monitor it prints"
+        ),
+        _ => format!("relay: {title} has no inbox watcher · run base relay arm and start the Monitor it prints"),
+    }
 }
 
 /// Bring a throttle file's mtime to now. A zero-byte `fs::write` over an
@@ -390,53 +388,86 @@ fn stamp(path: &std::path::Path) {
     let _ = f.set_modified(std::time::SystemTime::now());
 }
 
-/// Stale-sentinel scan across every title this session holds. Returns the
-/// arming blocks due now, stamping the per-title nudge throttle. `force`
-/// (session-start) bypasses the cooldown — a fresh context must always be
-/// told to arm.
-pub fn arm_blocks_for(session_id: &str, force: bool) -> Option<String> {
-    let (block, commits) = arm_blocks_for_deferred(session_id, force)?;
-    super::run_commits(commits);
-    Some(block)
+/// Record that `session_id` was given the nudge line for this title: the file holds the session id and its mtime is the
+/// time of the nudge.
+fn stamp_nudge(path: &std::path::Path, session_id: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, session_id);
+    stamp(path);
 }
 
-/// [`arm_blocks_for`] with the nudge throttle NOT yet stamped: the stamps come back as commits, for the prompt hook
-/// to run only if it prints the block (BO-01). A wake contract the budget dropped is then still due at the next tool
-/// call, instead of being silenced for the cooldown without having been read.
-pub fn arm_blocks_for_deferred(session_id: &str, force: bool) -> Option<(String, Vec<super::Commit>)> {
+fn mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Whether the nudge line is due for this title on this event. The pure half, so every case is reachable in a test
+/// without waiting for a sentinel to age.
+///
+/// ONCE PER SESSION, AND ONCE PER STALE EVENT (BO-04, F4b). `last` is the session the line was last given to and when.
+/// A session already told is told again only when a watcher ran AFTER that (the sentinel was written later than the
+/// nudge) and is dead now: a 30-minute Monitor expiry is normal on this host, and each one is one event. A watcher that
+/// is alive but runs an older script (`Outdated`) is told once per session. `force` is session start: a fresh context
+/// is always told.
+///
+/// What this replaced: a 180-second cooldown, so a session that could not or did not arm was given the whole contract
+/// every three minutes across prompt-submit and pre-tool for as long as it ran.
+fn nudge_due(
+    state: &Armed,
+    last: Option<(&str, std::time::SystemTime)>,
+    sentinel: Option<std::time::SystemTime>,
+    session_id: &str,
+    force: bool,
+) -> bool {
+    if *state == Armed::Current {
+        return false;
+    }
+    if force {
+        return true;
+    }
+    let Some((told, at)) = last else {
+        return true;
+    };
+    if told != session_id {
+        return true;
+    }
+    *state == Armed::NotWatching && sentinel.is_some_and(|s| s > at)
+}
+
+/// The nudge lines due now for every title this session holds, one line per title, with the stamps held back as
+/// commits: the prompt hook runs them only if it prints the block (BO-01), so a dropped line is still due next prompt.
+pub fn nudge_lines_deferred(session_id: &str, force: bool) -> Option<super::Part> {
     // Harnesses without a Monitor tool (Agent SDK runs, brain.js NPCs) can't
-    // comply — let them opt out instead of eating a nudge every cooldown.
+    // comply — let them opt out of the line altogether.
     if std::env::var_os("BASE_NO_WAKE_NUDGE").is_some() {
         return None;
     }
+    nudge_lines_for(session_id, force)
+}
+
+/// [`nudge_lines_deferred`] without the environment opt-out, so a test does not depend on the shell it runs in.
+fn nudge_lines_for(session_id: &str, force: bool) -> Option<super::Part> {
     let mut out = String::new();
     let mut commits: Vec<super::Commit> = Vec::new();
     for title in super::session_registry::titles_for(session_id) {
-        // is_current, NOT is_watching. This gate used to ask whether a monitor EXISTS
-        // when the question is whether the running one MATCHES what base prints now. A
-        // live monitor touches its sentinel every 5s, so a session running an OLD
-        // script never went stale and was never shown the new one — every wake fix was
-        // undeliverable to exactly the sessions already running. Found by grebe,
-        // verified by auk in this file's own doc at lines 9-12.
-        if is_current(&title) {
+        // armed_state, NOT is_watching: a live watcher running an older script must still be told once, or a fix to
+        // the script never reaches the sessions already running one (grebe, 2026-09-20).
+        let state = armed_state(&title);
+        let Some(path) = nudge_path(&title) else { continue };
+        let told = std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string());
+        let last = told.as_deref().zip(mtime(&path));
+        let sentinel = sentinel_path(&title).and_then(|p| mtime(&p));
+        if !nudge_due(&state, last, sentinel, session_id, force) {
             continue;
         }
-        let due = force
-            || nudge_path(&title)
-                .and_then(|p| age_secs(&p))
-                .is_none_or(|a| a >= NUDGE_COOLDOWN_SECS);
-        if !due {
-            continue;
-        }
-        if let Some(p) = nudge_path(&title) {
-            commits.push(Box::new(move || stamp(&p)));
-        }
-        if let Some(block) = arm_block(&title) {
-            out.push_str(&block);
-            out.push('\n');
-        }
+        out.push_str(&nudge_line(&title, &state));
+        out.push('\n');
+        let sid = session_id.to_string();
+        commits.push(Box::new(move || stamp_nudge(&path, &sid)));
     }
-    (!out.is_empty()).then_some((out, commits))
+    let items = out.lines().count();
+    (!out.is_empty()).then_some(super::Part { text: out, commits, items })
 }
 
 #[cfg(test)]
@@ -521,37 +552,92 @@ mod tests {
         assert!(!fresh(&p), "sentinel older than threshold must read stale");
     }
 
+    /// F4c: the text `base relay arm` prints carries the host Monitor tool's fields and nothing it does not have.
     #[test]
-    fn arm_block_carries_the_sentinel_write_and_persistent_flag() {
-        // title_dir needs a home dir; any real home works — content only.
-        if let Some(block) = arm_block_for("wake-test-title", "Pat") {
-            // CHANGED 2026-09-20 WITH THE CONTRACT IT PINS. This asserted the loop
-            // ran `touch "$INBOX/.watching"`. The loop now WRITES the sentinel instead,
-            // with the template fingerprint and the title, so the old string is gone by
-            // design. The replacement has more teeth than the original, not less: it
-            // pins that both FIELDS reach the emitted block, which is what the gate
-            // reads. A test asserting only that some line mentions the path would pass
-            // over a loop that wrote nothing into it.
-            assert!(
-                block.contains("> \"$INBOX/.watching\""),
-                "the loop must WRITE the sentinel, not touch it"
+    fn arm_text_carries_the_sentinel_write_and_the_host_monitor_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let text = arm_text_for("wake-test-title", "Pat").expect("a home resolves an inbox");
+            // CHANGED 2026-09-20 WITH THE CONTRACT IT PINS: the loop WRITES the sentinel, with the template
+            // fingerprint, which is what the gate reads.
+            assert!(text.contains("> \"$INBOX/.watching\""), "the loop must WRITE the sentinel, not touch it");
+            assert!(text.contains(&template_fingerprint()), "the text must carry the template fingerprint");
+            assert!(text.contains("description: relay wake: wake-test-title"));
+            assert!(text.contains(&format!("timeout_ms:  {MONITOR_TIMEOUT_MS} ")), "{text}");
+            assert_eq!(MONITOR_TIMEOUT_MS, 1_800_000, "the host maximum on Claude Code 2.1.286 and 2.1.287");
+            assert!(text.contains("command:\n    INBOX="), "{text}");
+            assert!(text.contains("When the Monitor reports that it expired, run `base relay arm` again."));
+            assert!(!text.contains("persistent"), "the host Monitor tool has no persistent field:\n{text}");
+            assert!(text.contains("relay-inbox"));
+            assert!(text.contains("do not start a second one"));
+            // Issue #11 / #13: the operator comes from the profile, never the binary.
+            assert!(text.contains("shown to Pat"));
+            assert!(!text.contains("shown to Chris"), "the home path may contain a name; the sentence must not");
+            assert!(text.contains("relay.wake_nudge false"));
+            assert!(text.contains("base relay register --as wake-test-title"));
+        });
+    }
+
+    /// The pure rule behind F4b: once per session, once per stale event, never while a current watcher runs.
+    #[test]
+    fn nudge_due_is_once_per_session_and_once_per_stale_event() {
+        let now = std::time::SystemTime::now();
+        let ago = |s: u64| now - std::time::Duration::from_secs(s);
+        let w = Armed::NotWatching;
+        assert!(nudge_due(&w, None, None, "a", false), "never told: due");
+        assert!(!nudge_due(&w, Some(("a", ago(100))), None, "a", false), "told this session, no watcher since");
+        assert!(nudge_due(&w, Some(("b", ago(100))), None, "a", false), "told another session only");
+        assert!(nudge_due(&w, Some(("a", ago(600))), Some(ago(60)), "a", false), "a watcher ran after, and died");
+        assert!(!nudge_due(&w, Some(("a", ago(100))), Some(ago(200)), "a", false), "the watcher died before the line");
+        assert!(!nudge_due(&Armed::Current, None, None, "a", true), "a current watcher is never nudged, forced or not");
+        assert!(!nudge_due(&Armed::Outdated, Some(("a", ago(100))), Some(now), "a", false), "an old script: once");
+        assert!(nudge_due(&Armed::Outdated, Some(("b", ago(100))), Some(now), "a", false));
+        assert!(nudge_due(&w, Some(("a", ago(1))), None, "a", true), "session start always tells a fresh context");
+    }
+
+    fn set_mtime(p: &std::path::Path, t: std::time::SystemTime) {
+        std::fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+    }
+
+    /// BO-04 F4b, end to end on disk: the line, never the script; once per session; once more per stale event.
+    #[test]
+    fn wake_nudge_once_per_session_and_once_per_stale_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let home = tmp.path();
+            crate::relay::session_registry::register("kite", "sid-A", home, None).unwrap();
+            let lines = |sid: &str| -> Option<String> {
+                nudge_lines_for(sid, false).map(crate::relay::Part::commit)
+            };
+            let first = lines("sid-A").expect("a title with no watcher is told");
+            assert_eq!(
+                first,
+                "relay: kite has no inbox watcher · run base relay arm and start the Monitor it prints\n"
             );
-            assert!(
-                block.contains(&template_fingerprint()),
-                "the emitted block must carry the template fingerprint"
-            );
-            assert!(block.contains("persistent: true"));
-            assert!(block.contains("relay-inbox"));
-            assert!(block.contains("never arm a duplicate"));
-            // Issue #11 / #13: the operator comes from the profile, never the
-            // binary, and the block explains itself instead of demanding.
-            assert!(block.contains("so Pat sees live work state"));
-            assert!(!block.contains("Chris sees"), "the home path may contain a name; the sentence must not");
-            assert!(!block.contains("Do not ask permission"));
-            assert!(!block.contains("arm NOW"));
-            assert!(block.contains("relay.wake_nudge false"));
-            assert!(block.contains("relay.enabled false"));
-        }
+            assert!(lines("sid-A").is_none(), "once per session");
+            assert!(lines("sid-A").is_none(), "and still once");
+
+            // A watcher ran after the line (the sentinel was written later) and has died: one stale event.
+            let nudge = nudge_path("kite").unwrap();
+            let sentinel = sentinel_path("kite").unwrap();
+            let now = std::time::SystemTime::now();
+            set_mtime(&nudge, now - std::time::Duration::from_secs(1_900));
+            std::fs::write(&sentinel, template_fingerprint()).unwrap();
+            set_mtime(&sentinel, now - std::time::Duration::from_secs(60));
+            assert!(lines("sid-A").expect("a dead watcher is one event").contains("has no inbox watcher"));
+            assert!(lines("sid-A").is_none(), "once per stale event");
+
+            // A live watcher running today's script: nothing.
+            std::fs::write(&sentinel, template_fingerprint()).unwrap();
+            assert!(lines("sid-A").is_none(), "a current watcher is never nudged");
+
+            // A live watcher on an older script: told once, in its own words.
+            std::fs::write(&sentinel, "0000000000000000").unwrap();
+            assert!(lines("sid-A").is_none(), "this session was already told");
+            crate::relay::session_registry::register("kite", "sid-B", home, None).unwrap();
+            assert!(lines("sid-B").expect("a new session is told").contains("runs an old script"));
+            assert!(lines("sid-B").is_none());
+        });
     }
 
     #[test]
@@ -559,12 +645,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join(".watch-nudge");
         std::fs::write(&p, b"").unwrap();
-        let old = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(NUDGE_COOLDOWN_SECS * 10);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(1_800);
         std::fs::File::options().write(true).open(&p).unwrap().set_modified(old).unwrap();
-        assert!(age_secs(&p).unwrap() >= NUDGE_COOLDOWN_SECS, "precondition: stale");
+        assert!(age_secs(&p).unwrap() >= 1_800, "precondition: stale");
         stamp(&p);
-        assert!(age_secs(&p).unwrap() < NUDGE_COOLDOWN_SECS, "stamp must read as just touched");
+        assert!(age_secs(&p).unwrap() < 60, "stamp must read as just touched");
         // Through a missing parent too — the first nudge for a fresh title.
         let deep = tmp.path().join("a").join("b").join(".watch-nudge");
         stamp(&deep);

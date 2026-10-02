@@ -435,6 +435,48 @@ pub fn run_session_start(seed: &Seed, session: Option<&str>) -> (i32, String, St
     )
 }
 
+/// The pre-tool-use hook, driven as Claude Code drives it: JSON on stdin naming the tool and its input. `env` is set on
+/// the hook process on top of the scrubbed environment (`BASE_NO_WAKE_NUDGE`, `BASE_RELAY_AS`), so a test says which
+/// kind of run it is; with none, it is an interactive session's tool call.
+pub fn run_pre_tool_use(
+    seed: &Seed,
+    tool: &str,
+    input: serde_json::Value,
+    session: &str,
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
+    let payload = serde_json::json!({
+        "cwd": seed.ws.display().to_string(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool,
+        "tool_input": input,
+        "session_id": session,
+    })
+    .to_string();
+    let mut cmd = Command::new(BIN);
+    cmd.args(["hook", "pre-tool-use"])
+        .current_dir(&seed.ws)
+        .env("BASE_HOME", &seed.home)
+        .env("BASE_NO_AUTO_UPDATE", "1")
+        .env("BASE_AST_NO_SPAWN", "1")
+        .env_remove("BASE_NO_WAKE_NUDGE")
+        .env_remove("BASE_NO_AUTONAME")
+        .env_remove("BASE_RELAY_AS")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("the base binary runs");
+    child.stdin.take().expect("stdin").write_all(payload.as_bytes()).expect("stdin written");
+    let out = child.wait_with_output().expect("base finishes");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 /// Any other `base` command, from the seeded workspace.
 pub fn run_base(seed: &Seed, args: &[&str]) -> (i32, String, String) {
     run(seed, args, None, None)
