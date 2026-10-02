@@ -1290,6 +1290,9 @@ pub enum ForkAction {
     Archive { slug: String },
 }
 
+// `rule add`'s flags (P7 added `--path`) make its variant the large one. Parsed once per process, so the size costs
+// nothing, and boxing a clap variant would only make the match below harder to read.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum RuleAction {
     /// Add a rule to a domain in the graph
