@@ -26,10 +26,10 @@ paths = [".base-gbl"]
 rules = ["The base config rule"]
 
 [[domain]]
-name = "meet-caddy"
+name = "acme"
 mode = "triggered"
-prompt_keywords = ["caddy"]
-paths = ["Documents/Meet Caddy"]
+prompt_keywords = ["acme"]
+paths = ["Documents/Acme Client"]
 rules = ["Never say a floor out loud"]
 
 [[domain]]
@@ -104,7 +104,7 @@ fn register(root: &Path, name: &str, rel: &str) {
 fn register_operator_projects(root: &Path) {
     register(root, "agentic-os", "Documents/agentic-os");
     register(root, "first-client-kit", "Documents/first-client-kit");
-    register(root, "renda-group", "Documents/Meet Caddy/renda-group");
+    register(root, "acme-client", "Documents/Acme Client/acme-client");
     register(root, "handoffs", ".base-gbl/handoffs");
     register(root, "old-thing", "Documents-old/thing");
     register(root, "vp-operators", "genai/vp-operators");
@@ -174,8 +174,8 @@ fn a_keyword_prompt_injects_that_domain_and_nothing_path_triggered() {
         let config = BaseConfig::load(root);
 
         fresh(root);
-        let matched = prompt(&config, root, "kw-1", "how is the caddy deal going");
-        assert_eq!(matched, vec!["GLOBAL".to_string(), "meet-caddy".to_string()]);
+        let matched = prompt(&config, root, "kw-1", "how is the acme deal going");
+        assert_eq!(matched, vec!["GLOBAL".to_string(), "acme".to_string()]);
 
         fresh(root);
         let matched = prompt(&config, root, "kw-2", "show me the database schema");
@@ -183,26 +183,28 @@ fn a_keyword_prompt_injects_that_domain_and_nothing_path_triggered() {
     });
 }
 
-/// A file this session touched fires the domain whose trigger covers it and nothing
-/// broader: `Documents/Meet Caddy` covers one registered project and fires; `Documents`
-/// covers three and is inert; a session that touched nothing gets GLOBAL only.
+/// A file this session touched brings its own project's domain and nothing broader (D1, 0.16.0): the triggers
+/// `Documents/Acme Client` and `.base-gbl` hold the projects that own those files, so they stop at the project folder
+/// (until 0.16.0 the first fired here and the second went inert); a session that touched nothing gets GLOBAL only.
 #[test]
 fn a_file_this_session_touched_fires_its_domain_and_nothing_broader() {
     let tmp = home(GLOBAL_DOMAINS);
     base::home::with_thread_home(tmp.path(), || {
         let root = tmp.path();
         register_operator_projects(root);
+        crud::rule::add(root, &ns(), "acme-client", "The project's own rule", None).unwrap();
+        crud::rule::add(root, &ns(), "handoffs", "The handoffs rule", None).unwrap();
         let config = BaseConfig::load(root);
 
         fresh(root);
-        touch(root, "touched-caddy", "Documents/Meet Caddy/renda-group/notes.md");
-        let matched = prompt(&config, root, "touched-caddy", "hello there");
-        assert_eq!(matched, vec!["GLOBAL".to_string(), "meet-caddy".to_string()]);
+        touch(root, "touched-acme", "Documents/Acme Client/acme-client/notes.md");
+        let matched = prompt(&config, root, "touched-acme", "hello there");
+        assert_eq!(matched, vec!["GLOBAL".to_string(), "acme-client".to_string()]);
 
         fresh(root);
         touch(root, "touched-gbl", ".base-gbl/handoffs/2026-09-07-x.md");
         let matched = prompt(&config, root, "touched-gbl", "hello there");
-        assert_eq!(matched, vec!["GLOBAL".to_string(), "base-config".to_string()]);
+        assert_eq!(matched, vec!["GLOBAL".to_string(), "handoffs".to_string()]);
 
         fresh(root);
         let matched = prompt(&config, root, "touched-nothing", "hello there");
@@ -247,7 +249,7 @@ fn auto_inject_false_keeps_a_domain_out_of_the_session_start_cheat_sheet() {
     let tmp = home(&format!("{GLOBAL_DOMAINS}{CONFIDENTIAL_DOMAINS}"));
     base::home::with_thread_home(tmp.path(), || {
         let sheet = base::domain::query::context_triggers_block(tmp.path());
-        assert!(sheet.contains("meet-caddy: caddy"), "an unflagged keyword domain is listed:\n{sheet}");
+        assert!(sheet.contains("acme: acme"), "an unflagged keyword domain is listed:\n{sheet}");
         assert!(!sheet.contains("terms"), "a flagged domain is not named, nor its keywords:\n{sheet}");
     });
 }

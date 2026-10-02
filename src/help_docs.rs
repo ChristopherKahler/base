@@ -722,15 +722,16 @@ mod tests {
         );
     }
 
-    /// #70. The bank lagged shipped behaviour: F29 (0.14.1) added `auto_inject`, the
-    /// broadcast rule and doctor's `path triggers` section, and the coach had no pair
-    /// naming any of them. Red on 0.14.1's file.
+    /// #70, then BO-10. The bank lagged shipped behaviour once (F29's `auto_inject` and doctor's `path triggers`
+    /// section had no pair). 0.16.0 replaced F29's broadcast rule with file-scoped injection (D1, D13), so the bank
+    /// must name the new surfaces too: the parent label, `base domain paths` and `rule add --path`.
     #[test]
-    fn the_bank_answers_the_f29_questions() {
+    fn the_bank_answers_the_path_trigger_questions() {
         let qa = read(QA_MD);
-        for needle in ["auto_inject = false", "broadcast", "path triggers"] {
-            assert!(qa.contains(needle), "{QA_MD} has no pair naming `{needle}` (#70)");
+        for needle in ["auto_inject = false", "path triggers", "(parent of <child>)", "base domain paths --suggest", "base rule add --domain <name> --path"] {
+            assert!(qa.contains(needle), "{QA_MD} has no pair naming `{needle}` (#70, BO-10)");
         }
+        assert!(!qa.contains("is a broadcast"), "{QA_MD} still teaches F29's inert broadcast, which D1 removed");
     }
 
     #[test]

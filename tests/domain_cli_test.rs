@@ -56,9 +56,11 @@ fn add_path_trigger() {
 
     base::domain::add_trigger(tmp.path(), false, "dev", None, Some("src/")).unwrap();
 
+    // Stored as the full path it names, the workspace root's (P3, 0.16.0).
     let domains = base::domain::load_domains(tmp.path());
     let dev = domains.iter().find(|d| d.name == "dev").unwrap();
-    assert!(dev.paths.contains(&"src/".to_string()));
+    let full = base::crud::project::absolute_path(&tmp.path().join("src").display().to_string(), None, None).unwrap();
+    assert_eq!(dev.paths, vec![full]);
 }
 
 #[test]

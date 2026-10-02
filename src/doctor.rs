@@ -116,10 +116,11 @@ pub struct DoctorReport {
     /// corrupt file otherwise looks exactly like an absent one. Counts against
     /// `healthy`: silently-dead star commands are a fault, not an advisory.
     pub config_errors: Vec<String>,
-    /// Path triggers that cannot fire (F29 step 6): per tier, a domains.toml trigger that
-    /// is unrooted or covers two or more registered projects, with the projects named.
-    /// Counts against `healthy`: an inert trigger is a domain that silently stopped
-    /// loading, and the fix is one line in domains.toml.
+    /// Path triggers with a fault (D1, P3): per tier, a domains.toml trigger that is unrooted (it
+    /// cannot fire) or broad (it holds registered projects other than its own project's
+    /// children), with the projects named; and a project folder that is broad in the same way,
+    /// since the file being touched brings its project's rules (P2). Counts against `healthy`:
+    /// D1 rules out broad triggers, and `base domain paths --suggest` proposes the exact paths.
     pub trigger_faults: Vec<String>,
     /// Which Claude Code version `[budget]` was measured on, against the host running now.
     /// ADVISORY: read by the hook output section only, and it is not one of the five conjuncts.
@@ -435,6 +436,8 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
     for legacy in crate::config::BaseConfig::legacy_keys(cwd) {
         warnings.push(legacy.sentence());
     }
+    // P3: a trigger still written relative works, and is worth writing out.
+    warnings.extend(relative_trigger_advice(cwd));
     // Spec A7: what each hook emitted, from the tier dirs the failure trail reads, each dir once (the workspace and the
     // global dir are one path when cwd is the global tier root).
     let mut dirs_read = std::collections::HashSet::new();
@@ -558,27 +561,71 @@ fn unconverted_rule_count(cwd: &Path) -> usize {
     unconverted.len()
 }
 
-/// Every inert path trigger, per tier, as the sentence `add-trigger` refuses with
-/// (F29 step 6). Each tier is read from its own domains.toml and resolved against its
-/// own root, against the registered projects of the merged store.
+/// Every path trigger with a fault, per tier (D1, P3): unrooted, or broad, in the sentence
+/// [`crate::domain::matcher::fault_sentence`] builds. Each tier is read from its own domains.toml and
+/// resolved against its own root, against the registered projects of the merged store.
+///
+/// Then every broad project folder whose project has a domain: the file being touched brings its
+/// project's rules (P2), so a project folder is that domain's trigger too, written or not. Named
+/// once, and only when no trigger of the domain already names the same place, since that line covers it.
 fn trigger_faults(cwd: &Path) -> Vec<String> {
+    use crate::domain::matcher;
     let ctx = crate::domain::trigger_context(cwd);
-    let mut tiers: Vec<(&str, PathBuf, Option<PathBuf>)> = Vec::new();
-    if let Some(home) = crate::home::home_root() {
-        tiers.push(("global", home.join(".base-gbl").join("domains.toml"), Some(home)));
-    }
-    if let Some(base_dir) = crate::config::find_workspace_base(cwd) {
-        let root = base_dir.parent().map(Path::to_path_buf);
-        tiers.push(("workspace", base_dir.join("domains.toml"), root));
-    }
     let mut out = Vec::new();
-    for (tier, path, root) in tiers {
+    for (tier, path, root) in crate::domain::paths::tier_files(cwd) {
         let domains = crate::domain::load_domains_file(&path, root.as_deref());
-        for (domain, trigger, fault) in crate::domain::matcher::inert_triggers(&domains, &ctx) {
-            out.push(format!("{tier} tier: {}", crate::domain::matcher::fault_sentence(domain, trigger, &fault)));
+        for (domain, trigger, fault) in matcher::faulty_triggers(&domains, &ctx) {
+            out.push(format!("{} tier: {}", tier.label(), matcher::fault_sentence(domain, trigger, &fault)));
         }
     }
+    let domains = crate::domain::load_domains(cwd);
+    let mut named: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for r in ctx.registered.iter().filter(|r| !r.path.is_empty()) {
+        let Some(d) = domains.iter().find(|d| d.auto_inject && !d.is_always() && crate::crud::slugify(&d.name) == r.slug) else {
+            continue;
+        };
+        let written = d
+            .paths
+            .iter()
+            .any(|t| matcher::live_trigger(t, d.root.as_deref(), &ctx).is_some_and(|t| matcher::path_under(&t, &r.path) && matcher::path_under(&r.path, &t)));
+        let broad = matcher::trigger_breadth(&r.path, &d.name, &ctx);
+        if written || broad.is_empty() || !named.insert(r.slug.as_str()) {
+            continue;
+        }
+        let folder = crate::crud::project::absolute_path(&r.path, None, None).unwrap_or_else(|| r.path.clone());
+        out.push(format!(
+            "project `{}`'s folder `{folder}` holds {}: the rules of `{}` reach every file in it no other project holds (base project paths --suggest proposes its folder)",
+            r.slug,
+            matcher::count_projects(&broad),
+            d.name
+        ));
+    }
     out
+}
+
+/// One advisory line for the path triggers still written relative (P3: base stores a trigger as its full path).
+/// They resolve against their tier root and fire as before, so this is advice, not a fault. A pattern is left to the
+/// fault list, which names it as unrooted.
+fn relative_trigger_advice(cwd: &Path) -> Option<String> {
+    let mut relative: Vec<String> = Vec::new();
+    for (tier, path, root) in crate::domain::paths::tier_files(cwd) {
+        for d in crate::domain::load_domains_file(&path, root.as_deref()) {
+            for t in d.paths.iter().filter(|t| !crate::domain::matcher::is_absolute(t) && !t.trim().starts_with('~') && !t.contains(['*', '?'])) {
+                relative.push(format!("`{t}` on `{}` ({})", d.name, tier.label()));
+            }
+        }
+    }
+    if relative.is_empty() {
+        return None;
+    }
+    let shown: Vec<&str> = relative.iter().take(3).map(String::as_str).collect();
+    let more = relative.len().saturating_sub(shown.len());
+    let tail = if more > 0 { format!(" and {more} more") } else { String::new() };
+    Some(format!(
+        "{} path trigger(s) are written relative ({}{tail}); base stores a trigger as its full path: base domain paths --suggest writes them out",
+        relative.len(),
+        shown.join(", ")
+    ))
 }
 
 /// Render a clearly-delimited human report.

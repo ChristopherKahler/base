@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::domain::DomainDef;
 
 /// Why a domain matched. Only tracked when DEVMODE is on.
@@ -28,34 +30,55 @@ pub struct DomainMatch<'a> {
     /// The active path that satisfied a path trigger, when one did. Devmode names it,
     /// so "why did this domain load" has a file for an answer, not a mode (F29).
     pub path: Option<String>,
+    /// Set when the domain matched only as the parent of the project that owns a touched path, through
+    /// `nested = true` (D13): the project it came with. Such a match is ordered after every other one, so a tight
+    /// budget drops the parent's rules before the child's.
+    pub parent_of: Option<String>,
 }
 
-/// What the path rules need beyond the domain itself (F29).
+/// What the path rules need beyond the domain itself (F29, D1, D13).
 #[derive(Debug, Default, Clone)]
 pub struct TriggerContext {
     /// The home directory, for `~`-relative triggers.
     pub home: Option<String>,
-    /// Every registered project, for the broadcast test: a trigger that is a prefix of
-    /// two or more of these is inert.
+    /// Every registered project: their folders decide which project owns a touched path (P2), their parent links
+    /// carry the nested walk (D13), and a trigger may not hold them (P3).
     pub registered: Vec<Registered>,
 }
 
-/// A registered project as the trigger rules see it: its name and its path resolved
-/// the way `resolve_trigger` resolves a trigger, so the two compare.
-#[derive(Debug, Clone, PartialEq)]
+/// A registered project as the path rules see it.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Registered {
     pub name: String,
+    /// Its folder, resolved the way `resolve_trigger` resolves a trigger, so the two compare. Empty when the
+    /// project has none: it can still be a parent, and it owns nothing.
     pub path: String,
+    /// The project's slug. Its rules are the domain whose name has this slug (one name in three places, the
+    /// 2026-09-09 decision).
+    pub slug: String,
+    /// The slug of the project it sits inside (`ops:parentProject`, BO-09).
+    pub parent: Option<String>,
+    /// `nested = true`: work in this project also carries its parent's rules (D13).
+    pub nested: bool,
 }
 
-/// Why a path trigger is inert (F29, G0 step 6). It cannot fire; doctor names it per
-/// tier and devmode names it per prompt, so the drop is never silent.
+impl Registered {
+    /// A project with no parent, its slug taken from its name.
+    pub fn new(name: &str, path: &str) -> Self {
+        Self { name: name.to_string(), path: path.to_string(), slug: crate::crud::slugify(name), ..Default::default() }
+    }
+}
+
+/// A path trigger's fault. Doctor names it per tier, `add-trigger` refuses it, and devmode names the unrooted
+/// ones per prompt, so nothing is dropped silently.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TriggerFault {
-    /// Not a rooted path: a glob, or a relative trigger with no tier root to resolve against.
+    /// Not a rooted path: a glob, or a relative trigger with no tier root to resolve against. It cannot fire.
     Unrooted,
-    /// A prefix of the paths of two or more registered projects — a broadcast, not a trigger.
-    Covers(Vec<String>),
+    /// It holds registered projects it must not (D1): every project under it, except, when the trigger is its
+    /// domain's own project folder or lies inside it, that project and the projects below it through parent links.
+    /// It still fires, but never into a registered project folder that lies between it and the touched path.
+    Broad(Vec<String>),
 }
 
 impl std::fmt::Display for TriggerFault {
@@ -65,14 +88,19 @@ impl std::fmt::Display for TriggerFault {
                 f,
                 "is not a rooted path; write it absolute, ~-relative or relative to the tier root"
             ),
-            Self::Covers(names) => write!(
+            Self::Broad(names) => write!(
                 f,
-                "covers {} registered projects ({}); narrow it or set auto_inject = false",
-                names.len(),
-                names.join(", ")
+                "holds {}: a trigger must be one project's own folder or a file (base domain paths --suggest proposes one)",
+                count_projects(names)
             ),
         }
     }
+}
+
+/// `3 registered projects (a, b, c)`, `1 registered project (a)`.
+pub fn count_projects(names: &[String]) -> String {
+    let noun = if names.len() == 1 { "project" } else { "projects" };
+    format!("{} registered {noun} ({})", names.len(), names.join(", "))
 }
 
 /// Match domains against prompt text and active file paths.
@@ -80,6 +108,10 @@ impl std::fmt::Display for TriggerFault {
 /// Dedup/suppression is owned by the hook layer, which hashes the fully
 /// rendered output (rules + neighborhood + query results) — the only hash
 /// that accurately reflects what would be injected.
+///
+/// A path brings in the domains [`path_hits`] names: its owner's, the ones whose own trigger holds it with no
+/// project folder between, and the owner's nested parents. A domain matched only as such a parent comes after every
+/// other match (D13).
 pub fn match_domains<'a>(
     prompt: &str,
     domains: &'a [DomainDef],
@@ -87,14 +119,24 @@ pub fn match_domains<'a>(
     ctx: &TriggerContext,
 ) -> Vec<DomainMatch<'a>> {
     let prompt_lower = prompt.to_lowercase();
+    let hits = path_hits(domains, active_paths, ctx);
 
-    domains
+    let mut out: Vec<DomainMatch<'a>> = domains
         .iter()
-        .filter_map(|d| {
-            let (reason, path) = is_matched(d, &prompt_lower, active_paths, ctx)?;
-            Some(DomainMatch { domain: d, reason, path })
+        .enumerate()
+        .filter_map(|(i, d)| {
+            let hit = hits.iter().find(|h| h.domain == i);
+            let (reason, path) = is_matched(d, &prompt_lower, hit.map(|h| h.path.as_str()))?;
+            let parent_of = match (&reason, hit.map(|h| &h.via)) {
+                (MatchReason::Filepath, Some(PathVia::Parent(child))) => Some(child.clone()),
+                _ => None,
+            };
+            Some(DomainMatch { domain: d, reason, path, parent_of })
         })
-        .collect()
+        .collect();
+    // Stable: the rest keep their order, and the parents keep theirs behind them.
+    out.sort_by_key(|m| m.parent_of.is_some());
+    out
 }
 
 /// The automatic entry — what the prompt hook injects without being asked. A domain
@@ -113,13 +155,12 @@ pub fn match_domains_auto<'a>(
         .collect()
 }
 
-/// Determine if a domain matches the current context.
-/// Returns Some(reason) on match, None on no match.
+/// Determine if a domain matches the current context. `path_hit` is the touched path that brought the domain in,
+/// when one did ([`path_hits`]). Returns Some(reason) on match, None on no match.
 fn is_matched(
     domain: &DomainDef,
     prompt_lower: &str,
-    active_paths: &[String],
-    ctx: &TriggerContext,
+    path_hit: Option<&str>,
 ) -> Option<(MatchReason, Option<String>)> {
     // Exclude patterns are checked first — any match vetoes the domain, an always-on
     // one included. Until 0.14.0 `always` returned before this loop, so an exclude on
@@ -143,23 +184,13 @@ fn is_matched(
         .iter()
         .any(|kw| contains_word(prompt_lower, &kw.to_lowercase()));
 
-    // Path match: an active path lies under a trigger resolved against the tier the
-    // domain came from. The path that satisfied it rides along so devmode can name
-    // the file.
-    let path_hit = domain.paths.iter().find_map(|dp| {
-        // An inert trigger (unrooted, or a broadcast over registered projects) cannot
-        // fire; doctor and devmode name it.
-        let trigger = live_trigger(dp, domain.root.as_deref(), ctx)?;
-        active_paths.iter().find(|ap| path_under(ap, &trigger)).cloned()
-    });
-
     let reason = match (keyword_hit, path_hit.is_some()) {
         (true, true) => MatchReason::KeywordAndFilepath,
         (true, false) => MatchReason::Keyword,
         (false, true) => MatchReason::Filepath,
         (false, false) => return None,
     };
-    Some((reason, path_hit))
+    Some((reason, path_hit.map(String::from)))
 }
 
 /// Does `needle` occur in `text` as whole words? The characters on either side of an
@@ -184,6 +215,183 @@ pub fn contains_word(text: &str, needle: &str) -> bool {
         from = at + text[at..].chars().next().map_or(1, char::len_utf8);
     }
     false
+}
+
+// ─── The file being touched decides (D1, P2, D13) ────────────────────────────
+
+/// How a touched path brought a domain in.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PathVia {
+    /// The domain of the project that owns the path: the deepest registered project folder holding it (P2).
+    Owner,
+    /// One of the domain's own path triggers holds the path, with no registered project folder between the
+    /// trigger and the path: a file, a folder inside a project, or a place no project holds.
+    Trigger,
+    /// A parent of the owner, reached through `nested = true` at every level below it (D13), with the project it
+    /// is the parent of, named by that project's domain.
+    Parent(String),
+}
+
+/// One domain a touched path brings in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathHit {
+    /// The domain's index in the slice given to [`path_hits`].
+    pub domain: usize,
+    /// The touched path that brought it.
+    pub path: String,
+    pub via: PathVia,
+}
+
+/// Every domain the touched `paths` bring in, each once, at its first reason (D1, P2, D13).
+///
+/// For each path, in order: the domain of each project that owns it ([`owners`]); then every domain one of whose
+/// own triggers holds the path, unless a registered project folder lies between the trigger and the path, which is
+/// how `Documents` stops reaching into the projects under it while a trigger on a file, or on a folder inside the
+/// project, still fires; then the domains of the owner's nested parents ([`nested_parents`]). Every parent comes
+/// after every other hit, across all the paths, so a tight budget drops parent rules first.
+///
+/// Always-on domains are left out: they match every prompt anyway, and the tool hook never serves them.
+/// `auto_inject` is the caller's to honour, as with every other match.
+pub fn path_hits(domains: &[DomainDef], paths: &[String], ctx: &TriggerContext) -> Vec<PathHit> {
+    // A project's rules: the first triggered domain whose name has the project's slug.
+    let mut by_slug: HashMap<String, usize> = HashMap::new();
+    for (i, d) in domains.iter().enumerate().filter(|(_, d)| !d.is_always()) {
+        by_slug.entry(crate::crud::slugify(&d.name)).or_insert(i);
+    }
+    // Direct hits and parent hits are recorded apart: a domain reached as a parent through one path and owned (or
+    // held by its trigger) through another is a direct hit, labelled and ordered as one.
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut parent_seen: HashSet<usize> = HashSet::new();
+    let mut direct: Vec<PathHit> = Vec::new();
+    let mut parents: Vec<PathHit> = Vec::new();
+    for path in paths {
+        let owned = owners(path, &ctx.registered);
+        // The owner's folder: a trigger above it is above a project, and stops there.
+        let floor = owned.first().map(|o| o.path.as_str());
+        for o in &owned {
+            if let Some(&i) = by_slug.get(&o.slug)
+                && seen.insert(i)
+            {
+                direct.push(PathHit { domain: i, path: path.clone(), via: PathVia::Owner });
+            }
+        }
+        for (i, d) in domains.iter().enumerate() {
+            if d.is_always() || seen.contains(&i) {
+                continue;
+            }
+            let holds = d.paths.iter().any(|t| {
+                live_trigger(t, d.root.as_deref(), ctx)
+                    .is_some_and(|t| path_under(path, &t) && floor.is_none_or(|f| path_under(&t, f)))
+            });
+            if holds {
+                seen.insert(i);
+                direct.push(PathHit { domain: i, path: path.clone(), via: PathVia::Trigger });
+            }
+        }
+        for o in &owned {
+            for (child, parent) in nested_parents(o, &ctx.registered) {
+                if let Some(&i) = by_slug.get(&parent.slug)
+                    && !seen.contains(&i)
+                    && parent_seen.insert(i)
+                {
+                    // Named as the child's own block is headed: its domain's name, else the project's.
+                    let child_name = by_slug.get(&child.slug).map_or_else(|| child.name.clone(), |&c| domains[c].name.clone());
+                    parents.push(PathHit { domain: i, path: path.clone(), via: PathVia::Parent(child_name) });
+                }
+            }
+        }
+    }
+    parents.retain(|h| !seen.contains(&h.domain));
+    direct.extend(parents);
+    direct
+}
+
+/// The projects that own `path`: those whose folder is the deepest registered folder holding it (P2), each once,
+/// by slug. Usually one; two only when two projects share that folder. Empty when no project folder holds it.
+pub fn owners<'r>(path: &str, registered: &'r [Registered]) -> Vec<&'r Registered> {
+    let mut best: Vec<&Registered> = Vec::new();
+    let mut depth = 0;
+    for r in registered.iter().filter(|r| !r.path.is_empty() && path_under(path, &r.path)) {
+        let d = components(&r.path).len();
+        if d > depth {
+            best.clear();
+            depth = d;
+        }
+        if d == depth && !best.iter().any(|b| b.slug == r.slug) {
+            best.push(r);
+        }
+    }
+    best.sort_by(|a, b| a.slug.cmp(&b.slug));
+    best
+}
+
+/// The parents whose rules a path owned by `owner` also carries (D13), as (child, parent) pairs, nearest first:
+/// its parent while it says `nested = true`, then that parent's parent while the parent says so, and so on. A
+/// project registered twice (both tiers) is nested when either record says so. A parent that is not registered,
+/// or a loop (refused when set, BO-09), ends the walk.
+pub fn nested_parents<'r>(owner: &'r Registered, registered: &'r [Registered]) -> Vec<(&'r Registered, &'r Registered)> {
+    let nested = |slug: &str| registered.iter().any(|r| r.slug == slug && r.nested);
+    let parent_of = |slug: &str| registered.iter().find_map(|r| (r.slug == slug).then(|| r.parent.clone()).flatten());
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::from([owner.slug.clone()]);
+    let mut cur = owner;
+    while nested(&cur.slug) {
+        let Some(p) = parent_of(&cur.slug) else { break };
+        if !seen.insert(p.clone()) {
+            break;
+        }
+        let Some(rec) = registered.iter().find(|r| r.slug == p) else { break };
+        out.push((cur, rec));
+        cur = rec;
+    }
+    out
+}
+
+/// Is `id` the project `of`, or below it through parent links?
+fn descends(id: &str, of: &str, registered: &[Registered]) -> bool {
+    let mut cur = id.to_string();
+    for _ in 0..64 {
+        if cur == of {
+            return true;
+        }
+        match registered.iter().find_map(|r| (r.slug == cur).then(|| r.parent.clone()).flatten()) {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// The registered projects a resolved trigger of `domain` holds that it must not (D1, P3), by name, sorted: every
+/// project whose folder lies under it, except the project whose folder it is and that project's children (through
+/// parent links), and, when it lies inside the domain's own project folder, the domain's own project and its
+/// children. A project registered in both tiers counts once. Empty for a trigger that is one project's own folder,
+/// a file, or a folder that holds no other project: Example 4's "one project's own folder or a file".
+pub fn trigger_breadth(resolved: &str, domain: &str, ctx: &TriggerContext) -> Vec<String> {
+    let own = crate::crud::slugify(domain);
+    let inside_own = ctx
+        .registered
+        .iter()
+        .any(|r| r.slug == own && !r.path.is_empty() && path_under(resolved, &r.path));
+    let at: Vec<&str> = ctx
+        .registered
+        .iter()
+        .filter(|r| !r.path.is_empty() && path_under(&r.path, resolved) && path_under(resolved, &r.path))
+        .map(|r| r.slug.as_str())
+        .collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    for r in ctx.registered.iter().filter(|r| !r.path.is_empty() && path_under(&r.path, resolved)) {
+        let its = at.iter().any(|a| descends(&r.slug, a, &ctx.registered));
+        if its || (inside_own && descends(&r.slug, &own, &ctx.registered)) {
+            continue;
+        }
+        if seen.insert(r.slug.as_str()) {
+            names.push(r.name.clone());
+        }
+    }
+    names.sort_by_key(|n| n.to_lowercase());
+    names
 }
 
 /// A path as components on `/`, with the shapes this crate meets on one machine folded
@@ -269,50 +477,47 @@ pub fn path_under(active: &str, trigger: &str) -> bool {
     }
 }
 
-/// One trigger, judged: the resolved path it names when it may fire, else its fault.
-/// `root` is the tier the domain came from.
-pub fn trigger_state(trigger: &str, root: Option<&str>, ctx: &TriggerContext) -> Result<String, TriggerFault> {
+/// One trigger of `domain`, judged: the resolved path it names when it has no fault, else its fault. `root` is the
+/// tier the domain came from.
+pub fn trigger_state(trigger: &str, root: Option<&str>, domain: &str, ctx: &TriggerContext) -> Result<String, TriggerFault> {
     let Some(resolved) = resolve_trigger(trigger, root, ctx.home.as_deref()) else {
         return Err(TriggerFault::Unrooted);
     };
-    // Distinct projects, by name: the operator's `video-gen` is registered in both tiers
-    // (one relative, one absolute path) and is one project, not two.
-    let mut covered: Vec<String> = Vec::new();
-    for r in ctx.registered.iter().filter(|r| path_under(&r.path, &resolved)) {
-        if !covered.iter().any(|n| n.eq_ignore_ascii_case(&r.name)) {
-            covered.push(r.name.clone());
-        }
-    }
-    if covered.len() >= 2 {
-        Err(TriggerFault::Covers(covered))
-    } else {
-        Ok(resolved)
-    }
+    let broad = trigger_breadth(&resolved, domain, ctx);
+    if broad.is_empty() { Ok(resolved) } else { Err(TriggerFault::Broad(broad)) }
 }
 
-/// The resolved path of a trigger that may fire; `None` for an inert one.
+/// The resolved path of a trigger that can fire: every rooted one. Until 0.16.0 a trigger over two or more
+/// registered projects went inert here (F29), the opposite of D1; such a trigger now fires, and [`path_hits`] keeps
+/// it out of every project folder below it.
 pub fn live_trigger(trigger: &str, root: Option<&str>, ctx: &TriggerContext) -> Option<String> {
-    trigger_state(trigger, root, ctx).ok()
+    resolve_trigger(trigger, root, ctx.home.as_deref())
 }
 
-/// The fault of a trigger, if it has one.
-pub fn trigger_fault(trigger: &str, root: Option<&str>, ctx: &TriggerContext) -> Option<TriggerFault> {
-    trigger_state(trigger, root, ctx).err()
+/// The fault of a trigger of `domain`, if it has one.
+pub fn trigger_fault(trigger: &str, root: Option<&str>, domain: &str, ctx: &TriggerContext) -> Option<TriggerFault> {
+    trigger_state(trigger, root, domain, ctx).err()
 }
 
-/// Every inert trigger across `domains` as (domain, trigger, fault), for doctor and devmode.
+/// Every trigger across `domains` that cannot fire at all (unrooted), as (domain, trigger, fault): devmode names
+/// these on every prompt, since the domain silently lost a trigger.
 pub fn inert_triggers<'a>(domains: &'a [DomainDef], ctx: &TriggerContext) -> Vec<(&'a str, &'a str, TriggerFault)> {
+    faulty_triggers(domains, ctx).into_iter().filter(|(_, _, f)| *f == TriggerFault::Unrooted).collect()
+}
+
+/// Every trigger across `domains` with a fault, unrooted or broad, as (domain, trigger, fault), for doctor.
+pub fn faulty_triggers<'a>(domains: &'a [DomainDef], ctx: &TriggerContext) -> Vec<(&'a str, &'a str, TriggerFault)> {
     domains
         .iter()
         .flat_map(|d| {
-            d.paths
-                .iter()
-                .filter_map(move |t| trigger_fault(t, d.root.as_deref(), ctx).map(|f| (d.name.as_str(), t.as_str(), f)))
+            d.paths.iter().filter_map(move |t| {
+                trigger_fault(t, d.root.as_deref(), &d.name, ctx).map(|f| (d.name.as_str(), t.as_str(), f))
+            })
         })
         .collect()
 }
 
-/// The one sentence doctor prints and `add-trigger` refuses with.
+/// The one sentence doctor prints for a trigger with a fault.
 pub fn fault_sentence(domain: &str, trigger: &str, fault: &TriggerFault) -> String {
     format!("path trigger `{trigger}` on `{domain}` {fault}")
 }
@@ -441,7 +646,7 @@ mod tests {
     fn triggers_resolve_against_their_tier_root() {
         let r = |t: &str| resolve_trigger(t, Some("C:/Users/x"), Some("/home/u"));
         assert_eq!(r("Documents").as_deref(), Some("c:/Users/x/Documents"));
-        assert_eq!(r("Documents\\Meet Caddy/").as_deref(), Some("c:/Users/x/Documents/Meet Caddy"));
+        assert_eq!(r("Documents\\Studio Work/").as_deref(), Some("c:/Users/x/Documents/Studio Work"));
         assert_eq!(r("~/notes").as_deref(), Some("/home/u/notes"));
         assert_eq!(r("/srv/data").as_deref(), Some("/srv/data"));
         assert_eq!(r("D:\\vault").as_deref(), Some("d:/vault"));
@@ -457,7 +662,7 @@ mod tests {
     fn path_triggers_match_on_component_boundaries() {
         assert!(path_under("C:\\Users\\x\\Documents\\a.md", "c:/Users/x/Documents"));
         assert!(path_under("C:/Users/x/Documents", "c:/Users/x/Documents"));
-        assert!(path_under("/home/x/Documents/Meet Caddy/notes.md", "/home/x/Documents/Meet Caddy"));
+        assert!(path_under("/home/x/Documents/Studio Work/notes.md", "/home/x/Documents/Studio Work"));
         assert!(path_under("C:/Users/x/Tools/stt/a.py", "c:/Users/x/tools"));
         assert!(path_under("/mnt/c/Users/x/tools/a.py", "c:/Users/x/tools"));
         assert!(!path_under("C:/Users/x/MyDocuments/a.md", "c:/Users/x/Documents"));
@@ -495,54 +700,134 @@ mod tests {
         assert!(match_domains("write a haiku about tea", &domains, &[], &ctx()).is_empty());
     }
 
-    /// A trigger over two or more registered projects is a broadcast: inert, named. One
-    /// over a single project, or its own, is live. An unrooted one is inert too.
+    fn reg(name: &str, path: &str) -> Registered {
+        Registered::new(name, path)
+    }
+
+    fn child(name: &str, path: &str, parent: &str, nested: bool) -> Registered {
+        Registered { parent: Some(parent.into()), nested, ..Registered::new(name, path) }
+    }
+
+    fn rooted(name: &str, paths: &[&str]) -> DomainDef {
+        let mut d = make_domain(name, "triggered", &[], &["Rule"]);
+        d.paths = paths.iter().map(|p| p.to_string()).collect();
+        d.root = Some("C:/Users/x".into());
+        d
+    }
+
+    /// D1 and P3: a trigger over registered projects is broad and named, with the projects it holds; the domain's
+    /// own folder is not, even holding the domain's own child; one that is a file, or a folder no project sits in,
+    /// is not. A broad trigger still fires (F29's inert rule is gone), but only where no project folder lies between
+    /// it and the touched file. A project registered twice is one project. An unrooted trigger is still inert.
     #[test]
-    fn a_broadcast_trigger_is_inert_and_named() {
-        let reg = |n: &str, p: &str| Registered { name: n.into(), path: p.into() };
+    fn a_broad_trigger_is_named_and_stops_at_every_project_folder() {
         let ctx = TriggerContext {
             home: Some("/home/u".into()),
             registered: vec![
                 reg("agentic-os", "c:/Users/x/Documents/agentic-os"),
-                reg("renda-group", "c:/Users/x/Documents/Meet Caddy/renda-group"),
-                reg("meet-caddy", "c:/Users/x/Documents/Meet Caddy"),
+                reg("studio", "c:/Users/x/Documents/Studio"),
+                child("studio-client", "c:/Users/x/Documents/Studio/client", "studio", false),
                 reg("stt", "c:/Users/x/Tools/stt"),
                 reg("hub", "c:/Users/x/Tools/hub"),
+                reg("stt", "c:/Users/x/Tools/stt"),
             ],
         };
         let root = Some("C:/Users/x");
         assert_eq!(
-            trigger_fault("Documents", root, &ctx),
-            Some(TriggerFault::Covers(vec!["agentic-os".into(), "renda-group".into(), "meet-caddy".into()]))
+            trigger_fault("Documents", root, "notes", &ctx),
+            Some(TriggerFault::Broad(vec!["agentic-os".into(), "studio".into(), "studio-client".into()]))
         );
-        assert_eq!(trigger_fault("tools", root, &ctx), Some(TriggerFault::Covers(vec!["stt".into(), "hub".into()])));
-        assert_eq!(trigger_fault("Documents/Meet Caddy/renda-group", root, &ctx), None);
-        assert_eq!(trigger_fault("*.md", root, &ctx), Some(TriggerFault::Unrooted));
-        assert_eq!(trigger_fault("Documents", None, &ctx), Some(TriggerFault::Unrooted));
-
-        let mut broad = make_domain("vintrix", "triggered", &[], &["Rule"]);
-        broad.paths = vec!["Documents".into()];
-        broad.root = Some("C:/Users/x".into());
-        let touched = vec!["C:/Users/x/Documents/agentic-os/a.md".to_string()];
-        assert!(match_domains("hello", std::slice::from_ref(&broad), &touched, &ctx).is_empty());
-        let inert = inert_triggers(std::slice::from_ref(&broad), &ctx);
-        assert_eq!(inert.len(), 1);
+        assert_eq!(trigger_fault("tools", root, "notes", &ctx), Some(TriggerFault::Broad(vec!["hub".into(), "stt".into()])));
+        assert_eq!(trigger_fault("Documents/Studio", root, "studio", &ctx), None, "its own folder, holding its own child");
+        assert_eq!(trigger_fault("Documents/Studio/plan.md", root, "notes", &ctx), None, "a file");
+        assert_eq!(trigger_fault("Documents/Studio/drafts", root, "notes", &ctx), None, "a folder no project sits in");
+        assert_eq!(trigger_fault("Documents/Studio", root, "notes", &ctx), None, "one project's own folder, on a topic domain");
         assert_eq!(
-            fault_sentence(inert[0].0, inert[0].1, &inert[0].2),
-            "path trigger `Documents` on `vintrix` covers 3 registered projects (agentic-os, renda-group, meet-caddy); narrow it or set auto_inject = false"
+            trigger_fault("Documents/Studio/client", root, "studio", &ctx),
+            None,
+            "inside its own folder, on its child's folder"
         );
-        // A project registered twice (both tiers, two spellings) is one project.
-        let twice = TriggerContext {
+        assert_eq!(trigger_fault("*.md", root, "notes", &ctx), Some(TriggerFault::Unrooted));
+        assert_eq!(
+            fault_sentence("notes", "tools", &trigger_fault("tools", root, "notes", &ctx).unwrap()),
+            "path trigger `tools` on `notes` holds 2 registered projects (hub, stt): a trigger must be one project's own folder or a file (base domain paths --suggest proposes one)"
+        );
+
+        let notes = rooted("notes", &["Documents"]);
+        let domains = std::slice::from_ref(&notes);
+        let fire = |path: &str| !match_domains("hello", domains, &[path.to_string()], &ctx).is_empty();
+        assert!(fire("C:/Users/x/Documents/loose.md"), "no project holds it: the trigger fires (not inert)");
+        assert!(!fire("C:/Users/x/Documents/agentic-os/a.md"), "a project folder lies between");
+        assert!(!fire("C:/Users/x/Documents/Studio/client/a.md"), "two do");
+        assert_eq!(inert_triggers(domains, &ctx), vec![], "a broad trigger is not inert");
+        assert_eq!(faulty_triggers(domains, &ctx).len(), 1, "doctor still names it");
+    }
+
+    /// P2 and D13 in the matcher: the owner is the deepest project folder; its parent comes after it, labelled,
+    /// only while each level says nested; a trigger on a file or a folder inside the project fires; a sibling's
+    /// domain never does.
+    #[test]
+    fn the_owner_and_its_nested_parents_decide_and_parents_come_last() {
+        let ctx = TriggerContext {
             home: Some("/home/u".into()),
             registered: vec![
-                reg("video-gen", "c:/Users/x/Documents/video-gen"),
-                reg("video-gen", "c:/Users/x/Documents/video-gen"),
+                reg("studio", "c:/Users/x/Documents/Studio"),
+                child("studio-client", "c:/Users/x/Documents/Studio/client", "studio", true),
+                reg("agentic-os", "c:/Users/x/Documents/agentic-os"),
             ],
         };
-        assert_eq!(trigger_fault("Documents/video-gen", root, &twice), None);
-        // The same trigger with nothing registered under it is live.
-        let alone = TriggerContext { home: Some("/home/u".into()), registered: vec![reg("agentic-os", "c:/Users/x/Documents/agentic-os")] };
-        assert_eq!(match_domains("hello", std::slice::from_ref(&broad), &touched, &alone).len(), 1);
+        let domains = vec![
+            rooted("studio", &["C:/Users/x/Documents/Studio"]),
+            rooted("agentic-os", &["C:/Users/x/Documents/agentic-os"]),
+            rooted("studio-client", &[]),
+            rooted("plans", &["C:/Users/x/Documents/Studio/client/plan.md"]),
+        ];
+        let names = |path: &str| -> Vec<(String, Option<String>)> {
+            match_domains("hello", &domains, &[path.to_string()], &ctx)
+                .into_iter()
+                .map(|m| (m.domain.name.clone(), m.parent_of))
+                .collect()
+        };
+        assert_eq!(
+            names("C:/Users/x/Documents/Studio/client/plan.md"),
+            vec![
+                ("studio-client".to_string(), None),
+                ("plans".to_string(), None),
+                ("studio".to_string(), Some("studio-client".to_string())),
+            ],
+            "owner (no trigger needed), the file's own trigger, then the nested parent, last though declared first"
+        );
+        assert_eq!(names("C:/Users/x/Documents/Studio/brief.md"), vec![("studio".to_string(), None)]);
+        assert_eq!(names("C:/Users/x/Documents/elsewhere.md"), vec![]);
+
+        let hits = path_hits(&domains, &["C:/Users/x/Documents/Studio/client/a.md".into()], &ctx);
+        assert_eq!(hits.iter().map(|h| h.via.clone()).collect::<Vec<_>>(), vec![PathVia::Owner, PathVia::Parent("studio-client".into())]);
+        // Reached as a parent through one path and owned through the next: a direct hit, not a parent.
+        let two = ["C:/Users/x/Documents/Studio/client/a.md".to_string(), "C:/Users/x/Documents/Studio/brief.md".to_string()];
+        let vias: Vec<(usize, PathVia)> = path_hits(&domains, &two, &ctx).into_iter().map(|h| (h.domain, h.via)).collect();
+        assert_eq!(vias, vec![(2, PathVia::Owner), (0, PathVia::Owner)], "studio owns brief.md: {vias:?}");
+    }
+
+    /// D13: the walk climbs while each level says nested, stops at the first that does not, and stops on a loop.
+    #[test]
+    fn the_nested_walk_stops_at_the_first_false_and_on_a_loop() {
+        let registered = vec![
+            child("a", "c:/x/a", "b", true),
+            child("b", "c:/x/b", "c", false),
+            child("c", "c:/x/c", "d", true),
+            reg("d", "c:/x/d"),
+        ];
+        let walk = |slug: &str| -> Vec<String> {
+            let owner = registered.iter().find(|r| r.slug == slug).unwrap();
+            nested_parents(owner, &registered).iter().map(|(_, p)| p.slug.clone()).collect()
+        };
+        assert_eq!(walk("a"), vec!["b"], "b says false, so c is not reached");
+        assert_eq!(walk("c"), vec!["d"]);
+        assert_eq!(walk("b"), Vec::<String>::new());
+
+        let looped = vec![child("p", "c:/x/p", "q", true), child("q", "c:/x/q", "p", true)];
+        let owner = &looped[0];
+        assert_eq!(nested_parents(owner, &looped).len(), 1, "p -> q, then q -> p is a loop and ends the walk");
     }
 
     #[test]

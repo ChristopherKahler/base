@@ -1022,3 +1022,85 @@ fn replay_project_records_hold_on_the_corpus_store() {
     assert!(!doctor.contains("project project-00:"), "a rewritten step is not flagged:\n{doctor}");
     println!("replay project records: {advised} advised flags exist, {} steps aged, 1 update landed", rows.len());
 }
+
+/// BO-10 (topic P, D1, D13; build rule 13), on a corpus store. Three corpus projects get folders, project-01 nested in
+/// project-00, and a topic domain sits on all of `Documents` as F29's operators had it. A tool call on a project's
+/// file brings that project's rules and no sibling's, and the broad trigger never reaches into a project; a nested
+/// child brings its parent after its own block. Doctor names the broad trigger until `base domain paths` and a
+/// reviewed list narrow it, then names none, and the injection is unchanged.
+#[test]
+fn replay_file_scoped_injection_holds_on_the_corpus_store() {
+    let case = cases().into_iter().next().expect("a corpus case");
+    let s = write_case_as(&case, "bo10-file-scoped");
+    let run = |args: &[&str]| {
+        let (code, out, err) = run_base(&s, args);
+        assert!(code == 0 || args[0] == "doctor", "base {args:?}: {err}");
+        out
+    };
+    let slash = |p: &Path| p.display().to_string().replace('\\', "/");
+    let docs = s.ws.join("Documents");
+    let folders = [("project-00", "p00"), ("project-01", "p00/p01"), ("project-02", "p02")];
+    for (slug, rel) in folders {
+        let dir = docs.join(rel);
+        std::fs::create_dir_all(&dir).expect("a project folder");
+        std::fs::write(dir.join("notes.md"), "x\n").expect("a project file");
+        run(&["project", "update", slug, "--path", &slash(&dir)]);
+    }
+    std::fs::write(docs.join("loose.md"), "x\n").expect("a file in no project");
+    run(&["project", "update", "project-01", "--parent", "project-00", "--nested", "true"]);
+    for (slug, rel) in folders {
+        run(&["domain", "add-trigger", "--domain", slug, "--path", &slash(&docs.join(rel))]);
+        run(&["rule", "add", "--domain", slug, "--text", &format!("{slug} corpus rule")]);
+    }
+    let toml_path = s.ws.join(".base").join("domains.toml");
+    let mut domains = std::fs::read_to_string(&toml_path).expect("domains.toml");
+    domains.push_str("\n[[domain]]\nname = \"corpus-docs\"\npaths = [\"Documents\"]\nrules = [\"corpus-docs rule\"]\n");
+    std::fs::write(&toml_path, domains).expect("domains.toml");
+
+    let read = |file: &Path, session: &str| -> String {
+        let (code, stdout, stderr) = run_pre_tool_use(&s, "Read", serde_json::json!({ "file_path": slash(file) }), session, &[]);
+        assert_eq!(code, 0, "{stderr}");
+        match stdout.trim() {
+            "" => String::new(),
+            json => serde_json::from_str::<serde_json::Value>(json).expect("the JSON envelope")["hookSpecificOutput"]
+                ["additionalContext"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        }
+    };
+    let check = |leg: &str| {
+        let out = read(&docs.join("p02/notes.md"), &format!("bo10-{leg}-p02"));
+        assert!(out.contains("[FILE MATCH: project-02]\n  0. project-02 corpus rule"), "{leg}: {out}");
+        assert!(!out.contains("project-00 corpus rule") && !out.contains("corpus-docs rule"), "{leg}: reached into p02: {out}");
+        let out = read(&docs.join("p00/p01/notes.md"), &format!("bo10-{leg}-p01"));
+        let child = out.find("[FILE MATCH: project-01]").unwrap_or_else(|| panic!("{leg}: {out}"));
+        let parent = out.find("[FILE MATCH: project-00 (parent of project-01)]").unwrap_or_else(|| panic!("{leg}: {out}"));
+        assert!(child < parent && !out.contains("project-02 corpus rule"), "{leg}: {out}");
+        // A file no project holds: no project's rules; the topic domain's (its broad trigger before, the file after).
+        let out = read(&docs.join("loose.md"), &format!("bo10-{leg}-loose"));
+        for slug in ["project-00", "project-01", "project-02"] {
+            assert!(!out.contains(&format!("{slug} corpus rule")), "{leg}: {slug} on a loose file: {out}");
+        }
+        assert!(out.contains("[FILE MATCH: corpus-docs]"), "{leg}: {out}");
+    };
+
+    check("before");
+    let doctor = run(&["doctor"]);
+    assert!(doctor.contains("path trigger `Documents` on `corpus-docs` holds 3 registered projects"), "{doctor}");
+    let list = s.ws.join("bo10-paths.toml");
+    let suggested = run(&["domain", "paths", "--suggest", "--out", &slash(&list)]);
+    assert!(suggested.contains("corpus-docs: `Documents` holds 3 registered projects"), "listed for review, never guessed:\n{suggested}");
+    // The reviewer's decision: the topic domain is about the one loose file.
+    let mut reviewed = std::fs::read_to_string(&list).expect("the list");
+    reviewed.push_str(&format!(
+        "\n[[domain]]\ntier = \"workspace\"\nname = \"corpus-docs\"\npaths = [{}]\n",
+        toml::Value::String(slash(&docs.join("loose.md")))
+    ));
+    std::fs::write(&list, reviewed).expect("the reviewed list");
+    run(&["domain", "paths", "--apply", &slash(&list)]);
+    let doctor = run(&["doctor"]);
+    assert!(!doctor.contains("path trigger `"), "no broad trigger left:\n{doctor}");
+    check("after");
+    println!("replay file-scoped injection: 3 projects, 1 nested, broad trigger named then narrowed, 6 tool calls checked");
+}

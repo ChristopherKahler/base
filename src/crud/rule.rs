@@ -7,6 +7,71 @@ use oxigraph::store::Store;
 use crate::config::NamespaceConfig;
 use crate::crud;
 
+/// `base rule add --path` (P7): each path as the full path its place matcher stores, so the rule fires only when
+/// that file, or something under that folder, is touched. Refused, naming why, unless the rule can be scoped there.
+/// Relative input is the workspace root's (home outside a workspace), the rule every path flag in base follows.
+///
+/// For the domain of a registered project with a folder, the path must lie inside that folder and belong to that
+/// project: a path inside a project folder deeper in it belongs to that project, whose own domain takes the rule
+/// (P2, D13). For any domain the path must not hold a registered project other than its own, since the rule would
+/// then fire in that project whatever its `nested` says. Writes nothing.
+pub fn scoped_places(cwd: &Path, domain: &str, raw: &[String]) -> std::result::Result<Vec<String>, String> {
+    use crate::domain::matcher;
+    if raw.iter().all(|r| r.trim().is_empty()) {
+        return Ok(Vec::new());
+    }
+    let ns = crate::config::BaseConfig::load(cwd).namespace;
+    let roots = crud::project::PathRoots::new(cwd, &ns);
+    let ctx = crate::domain::trigger_context(cwd);
+    let own = crud::slugify(domain);
+    let spelled = |p: &str| crud::project::absolute_path(p, None, None).unwrap_or_else(|| p.to_string());
+    let own_folders: Vec<&matcher::Registered> =
+        ctx.registered.iter().filter(|r| r.slug == own && !r.path.is_empty()).collect();
+    let mut out = Vec::new();
+    for r in raw.iter().map(|r| r.trim()).filter(|r| !r.is_empty()) {
+        if r.contains(['*', '?']) {
+            return Err(format!("--path {r}: a pattern is not a path; name one file or folder"));
+        }
+        let Some(full) = roots.from_cli(r) else {
+            return Err(format!("--path {r}: cannot be made a full path here"));
+        };
+        let Some(resolved) = matcher::resolve_trigger(&full, None, ctx.home.as_deref()) else {
+            return Err(format!("--path {r}: cannot be made a full path here"));
+        };
+        if !own_folders.is_empty() {
+            if !own_folders.iter().any(|f| matcher::path_under(&resolved, &f.path)) {
+                return Err(format!(
+                    "{full} is not inside {domain}'s folder {}: a rule's --path lies inside its project",
+                    spelled(&own_folders[0].path)
+                ));
+            }
+            if let Some(o) = matcher::owners(&resolved, &ctx.registered).into_iter().find(|o| o.slug != own) {
+                return Err(format!(
+                    "{full} belongs to {} (its folder is {}): add the rule to that project's domain, base rule add --domain {} ...",
+                    o.name,
+                    spelled(&o.path),
+                    o.slug
+                ));
+            }
+        }
+        let mut held: Vec<String> = Vec::new();
+        for p in ctx.registered.iter().filter(|p| p.slug != own && !p.path.is_empty() && matcher::path_under(&p.path, &resolved)) {
+            if !held.contains(&p.name) {
+                held.push(p.name.clone());
+            }
+        }
+        if !held.is_empty() {
+            held.sort_by_key(|n| n.to_lowercase());
+            return Err(format!(
+                "{full} holds {}: a rule's --path is one file, or a folder inside one project",
+                matcher::count_projects(&held)
+            ));
+        }
+        out.push(full);
+    }
+    Ok(out)
+}
+
 /// Add a rule to a domain in the graph, optionally with a rationale (Phase 26).
 ///
 /// Thin delegate to [`add_with`] — see the note on `note::learn`.

@@ -85,6 +85,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base domain create`
 - `base domain remove`
 - `base domain remove-trigger`
+- `base domain paths`
 - `base standards` (alias: std)
 - `base standards sync`
 - `base standards list`
@@ -1647,6 +1648,7 @@ Commands:
   create          Create a new domain in domains.toml
   remove          Remove a domain from domains.toml
   remove-trigger  Remove a keyword or path trigger from a domain
+  paths           Make every path trigger an exact path, in both tiers: --suggest proposes one per domain (a project's domain gets its project's folder; relative triggers are written out), --apply writes a reviewed list
   help            Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1811,6 +1813,38 @@ Options:
 
       --path <PATH>
           
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base domain paths
+
+```text
+Make every path trigger an exact path, in both tiers: --suggest proposes one per domain (a project's domain gets its project's folder; relative triggers are written out), --apply writes a reviewed list
+
+Usage: base domain paths [OPTIONS] <--suggest|--apply <APPLY>>
+
+Options:
+      --global
+          Act on the global tier (~/.base-gbl) instead of the workspace you are in.
+          
+          Without it the write commands resolve the workspace, as `add-trigger` alone always did. Before #18 the other three ignored where you stood.
+
+      --suggest
+          List the proposals (writes nothing)
+
+      --out <OUT>
+          With --suggest: also write them as a list to review and pass to --apply
+
+      --apply <APPLY>
+          Set each listed domain's paths (and auto_inject) from a reviewed list
+
+      --dry-run
+          With --apply: say what would change and write nothing
+
+      --json
+          Emit JSON instead of text
 
   -h, --help
           Print help (see a summary with '-h')
@@ -2412,6 +2446,9 @@ Options:
 
       --place <PLACE>
           A folder, or a file the rule names (repeatable). Makes it a place rule
+
+      --path <PATH>
+          A file or folder the rule is scoped to (repeatable): stored as its full path, the rule fires only when that file or something under that folder is touched. For a project's domain it lies inside the project
 
       --tool <TOOL>
           A tool name, MCP tools included (repeatable). Makes it an action rule
