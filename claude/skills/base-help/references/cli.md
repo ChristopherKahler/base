@@ -1250,7 +1250,7 @@ Usage: base reminder snooze <SLUG> <DURATION>
 
 Arguments:
   <SLUG>
-          
+          The reminder's slug, or its number in the last session start's DUE NOW
 
   <DURATION>
           
@@ -1269,7 +1269,7 @@ Usage: base reminder archive <SLUG>
 
 Arguments:
   <SLUG>
-          
+          The reminder's slug, or its number in the last session start's DUE NOW
 
 Options:
   -h, --help

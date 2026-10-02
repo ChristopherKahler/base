@@ -156,12 +156,15 @@ fn run_event(
             // `[budget] session_start_bytes`, and printed ONCE (rank 00). The untrimmed text
             // goes to `.base/last-session-start.md` before anything prints.
             let mut out = session_start::SessionOutput::new();
+            out.set_session(session_id.as_deref());
             let handled = session_start::handle(&config, &cwd, session_id.as_deref(), &mut out);
             if handled.is_ok() {
-                // Relay inbox push: pending messages addressed to this session
-                // (unregistered sessions get a one-line notice that a relay is live).
+                // Relay inbox push: pending messages addressed to this session, due now
+                // (unregistered sessions get a one-line notice that a relay is live, which
+                // ranks in the tail: an invitation to join is not due now).
                 if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true, false) {
-                    out.push("relay-inbox", &block, 1);
+                    let kind = if crate::relay::deliver::is_notice(&block) { "relay-notice" } else { "relay-inbox" };
+                    out.push(kind, &block, 1);
                 }
                 // Session-targeted task relay: refresh liveness + announce any tasks
                 // assigned to this session (loud, re-announced on each new session), as two blocks
@@ -302,7 +305,30 @@ fn run_event(
             // and the one call site kept the constant: a parameter every caller passes the same
             // literal to has not removed the literal, it has moved it somewhere nobody greps.
             let key = config.budget.key_as_written("prompt_bytes");
-            crate::emit::print_measured("user-prompt-submit", key, &out, config.budget.prompt_bytes);
+            // Keep what was measured, as session start does (rank 10). Until 2026-09-23 the measurement was
+            // discarded here: hook-output.jsonl held 83 session-start rows and no prompt row, while the cut
+            // notice sent the operator to `base doctor`. The untrimmed text is written FIRST, so the notice can
+            // name a file that exists; a failed write just leaves the path out of the notice.
+            let dir = crate::crud::handoff_show::session_start_dir(&cwd);
+            // An empty emission leaves the previous file alone rather than overwriting it with nothing.
+            let full = dir
+                .as_ref()
+                .filter(|_| !out.is_empty())
+                .map(|d| crate::emit::write_full_output(&d.join(crate::emit::record::PROMPT_FULL_FILE), &out));
+            let full_path = full.as_ref().and_then(|f| f.written_path());
+            let measured =
+                crate::emit::print_measured("user-prompt-submit", key, &out, config.budget.prompt_bytes, full_path);
+            if let Some(dir) = dir {
+                let record = crate::emit::record::record_of_prompt(
+                    &measured,
+                    config.budget.prompt_bytes,
+                    "user-prompt-submit",
+                    session_id.as_deref(),
+                );
+                if let Err(why) = crate::emit::record::keep(&dir, &record) {
+                    eprintln!("base: the prompt hook could not keep its output record: {why}");
+                }
+            }
             let mut data = handled?;
             data.session_id = session_id;
             Ok(data)

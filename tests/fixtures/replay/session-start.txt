@@ -1,0 +1,86 @@
+# The replay corpus's session-start cases (tests/replay_test.rs). Each [case] is a store shape
+# written into a fresh real-size seed (tests/seed, `REAL` with no seed reminders), then session
+# start runs on it once.
+#
+#   reminder = <days past due> | <name>   repeatable; written oldest due first
+#   handoff  = <slug> | <project>         repeatable; open, created in the last hours in the order
+#                                         given, so the first one listed is the newest (letter A)
+#   deferred = <n>                        n deferred handoffs, so line 6 and the header's count print
+#   relay-store = <name>                  a relay store this session has not joined (the join notice)
+#
+# Synthetic or scrubbed: this repository is public. `replay_corpus_has_no_real_names` checks it.
+
+# real-5-due: the session start that failed on 2026-10-01 (BO-00 B4), scrubbed. Names as long as
+# the real ones, ten handoff slugs of the real lengths, eleven deferred, and a relay store the
+# session has not joined. Before B4 its first screen measured 2,871 UTF-16 units against 2,000.
+[real-5-due]
+reminder = 5 | Remediate the code map for ProjectL: stale cache hides extractor fixes + route files never walked. Fork: projectl-routes (~/.base-gbl/forks/2026-09-26-projectl-routes.md)
+reminder = 4 | Work the finances fork at the office PC: base fork show owner-finances-system (bring debts, spending, accounts)
+reminder = 3 | Write the network name list: everyone, unsorted, one sheet (task in consulting-practice)
+reminder = 2 | LinkedIn brain dump with agent-f: career history, roles, teams, wins, skills (task in consulting-practice)
+reminder = 1 | Start the dealer inventory crawl + normalize: base fork show projectv-dealer-inventory-crawl, paste its kickoff prompt into a new session
+handoff = 2026-09-29-1547-raven-projectv-data-procurement | projectv-data-procurement
+handoff = 2026-09-29-1455-jaguar-projectv-dealer-registry | projectv-dealer-registry
+handoff = 2026-09-29-1634-caracal-projectv-dealer-cleanup | projectv-dealer-cleanup
+handoff = 2026-09-30-0700-lemur-projectv-inventory-crawl | projectv-inventory-crawl
+handoff = 2026-09-29-1656-crane-harness-layer | harness-layer
+handoff = 2026-09-29-1110-snake-eyes-secure-engineering | secure-engineering
+handoff = 2026-09-29-0950-bison-projectv-accounting | projectv-accounting-process
+handoff = 2026-09-28-1950-moose-client-r-group | client-r-group
+handoff = consulting-practice | consulting-practice
+handoff = ai-evals | ai-evals
+deferred = 11
+relay-store = demo-store
+
+# ten-due: twice the reminders, the same long names, nine days past due down to today (a reminder
+# archives itself at day 10). DUE NOW keeps what fits and says what it cut.
+[ten-due]
+reminder = 9 | Remediate the code map for ProjectL: stale cache hides extractor fixes + route files never walked. Fork: projectl-routes (~/.base-gbl/forks/2026-09-26-projectl-routes.md)
+reminder = 8 | Work the finances fork at the office PC: base fork show owner-finances-system (bring debts, spending, accounts)
+reminder = 7 | Write the network name list: everyone, unsorted, one sheet (task in consulting-practice)
+reminder = 6 | LinkedIn brain dump with agent-f: career history, roles, teams, wins, skills (task in consulting-practice)
+reminder = 5 | Start the dealer inventory crawl + normalize: base fork show projectv-dealer-inventory-crawl, paste its kickoff prompt into a new session
+reminder = 4 | Renew the wildcard certificate for the staging domain before the old one lapses at the end of the month
+reminder = 3 | Send the quarterly board pack: numbers, the hiring plan and the open questions from last quarter's meeting
+reminder = 2 | Book the venue for the offsite and confirm the dates with everyone on the planning thread
+reminder = 1 | Rotate the API keys for the reporting job and update the vault entry the scheduler reads
+reminder = 0 | Reply to the vendor about the contract renewal terms before their Friday deadline
+handoff = 2026-09-29-1547-raven-projectv-data-procurement | projectv-data-procurement
+handoff = 2026-09-29-1455-jaguar-projectv-dealer-registry | projectv-dealer-registry
+handoff = 2026-09-29-1634-caracal-projectv-dealer-cleanup | projectv-dealer-cleanup
+handoff = 2026-09-30-0700-lemur-projectv-inventory-crawl | projectv-inventory-crawl
+handoff = 2026-09-29-1656-crane-harness-layer | harness-layer
+handoff = 2026-09-29-1110-snake-eyes-secure-engineering | secure-engineering
+handoff = 2026-09-29-0950-bison-projectv-accounting | projectv-accounting-process
+handoff = 2026-09-28-1950-moose-client-r-group | client-r-group
+handoff = consulting-practice | consulting-practice
+handoff = ai-evals | ai-evals
+deferred = 11
+relay-store = demo-store
+
+# fs1-shape: FS1's case on the real-size seed: ten 50-character slugs, the day-8 warning line, and
+# something deferred. Both reminders fit, so nothing is cut.
+[fs1-shape]
+reminder = 9 | Send the quarterly board pack
+reminder = 3 | Renew the wildcard certificate
+handoff = 2026-09-14-1735-agent-m-served-count-and-coach-x000 | project-00
+handoff = 2026-09-14-1735-agent-m-served-count-and-coach-x001 | project-01
+handoff = 2026-09-14-1735-agent-m-served-count-and-coach-x002 | project-02
+handoff = 2026-09-14-1735-agent-m-served-count-and-coach-x003 | project-03
+handoff = 2026-09-14-1735-agent-m-served-count-and-coach-x004 | project-04
+handoff = 2026-09-14-1735-agent-m-served-count-and-coach-x005 | project-05
+handoff = 2026-09-14-1735-agent-m-served-count-and-coach-x006 | project-06
+handoff = 2026-09-14-1735-agent-m-served-count-and-coach-x007 | project-07
+handoff = 2026-09-14-1735-agent-m-served-count-and-coach-x008 | project-08
+handoff = 2026-09-14-1735-agent-m-served-count-and-coach-x009 | project-09
+deferred = 1
+
+# none-due: nothing due, the real shape otherwise. The first screen is the header and instructions.
+[none-due]
+handoff = 2026-09-29-1547-raven-projectv-data-procurement | projectv-data-procurement
+handoff = 2026-09-29-1455-jaguar-projectv-dealer-registry | projectv-dealer-registry
+handoff = 2026-09-29-1634-caracal-projectv-dealer-cleanup | projectv-dealer-cleanup
+handoff = 2026-09-30-0700-lemur-projectv-inventory-crawl | projectv-inventory-crawl
+handoff = 2026-09-29-1656-crane-harness-layer | harness-layer
+deferred = 11
+relay-store = demo-store

@@ -1073,6 +1073,19 @@ pub enum GoalAction {
     },
 }
 
+/// `arg` as a reminder slug. A number the last session start printed in DUE NOW becomes the slug it
+/// printed under, and the line says which, so the reminder acted on is never a guess; anything else
+/// is taken as the slug itself.
+fn reminder_slug(cwd: &std::path::Path, arg: &str) -> String {
+    match crud::handoff_show::reminder_number(cwd, arg) {
+        Some(r) => {
+            println!("DUE NOW {arg} is '{}' (session start at {})", r.slug, r.written_at);
+            r.slug
+        }
+        None => arg.to_string(),
+    }
+}
+
 /// Parse a relative duration like "30s", "3m", "2h", "1d".
 fn parse_duration(s: &str) -> anyhow::Result<chrono::Duration> {
     let s = s.trim();
@@ -1133,9 +1146,16 @@ pub enum ReminderAction {
         archived: bool,
     },
     /// Move a reminder's surface time forward from now: 30s, 3m, 2h, 1d
-    Snooze { slug: String, duration: String },
+    Snooze {
+        /// The reminder's slug, or its number in the last session start's DUE NOW
+        slug: String,
+        duration: String,
+    },
     /// Archive a reminder: it stops surfacing and is kept. `remove` deletes.
-    Archive { slug: String },
+    Archive {
+        /// The reminder's slug, or its number in the last session start's DUE NOW
+        slug: String,
+    },
     /// Remove a reminder (hard delete)
     Remove { slug: String },
 }
@@ -2369,6 +2389,7 @@ pub fn run() {
                 }
             }
             ReminderAction::Snooze { slug, duration } => {
+                let slug = reminder_slug(&cwd, &slug);
                 let d = match parse_duration(&duration) {
                     Ok(d) => d,
                     Err(e) => die("Invalid duration", e),
@@ -2404,6 +2425,7 @@ pub fn run() {
                 }
             }
             ReminderAction::Archive { slug } => {
+                let slug = reminder_slug(&cwd, &slug);
                 match crud::reminder::archive(
                     base::home::home_root().as_deref(),
                     &cwd,

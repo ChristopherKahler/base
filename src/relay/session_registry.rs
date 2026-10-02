@@ -230,6 +230,11 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<String> {
         {
             prev.session_id = session_id.to_string();
             prev.last_heartbeat = now_iso();
+            // The row describes the session that holds it now. Without this a reclaimed title kept its
+            // predecessor's folder: cougar read Documents/std-video-engine on 2026-09-23 while its new
+            // session ran in the home folder.
+            prev.cwd = cwd.to_string_lossy().to_string();
+            prev.workspace = workspace_name(cwd);
             let t = prev.title.clone();
             save(&reg)?;
             return Ok(t);

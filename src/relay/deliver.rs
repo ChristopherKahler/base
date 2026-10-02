@@ -16,6 +16,16 @@ use super::{age_str, list_projects, relay_root, RelayStore};
 // Unregistered sessions get a one-line notice at session-start only, so an
 // operator opening the workspace knows a relay is live without being spammed.
 
+/// How the unregistered notice opens. Session start ranks the notice apart from delivered
+/// messages: a message for this session is due now, an invitation to join is not (BO-00 B4).
+pub const NOTICE_OPEN: &str = "<relay-notice>";
+
+/// True when `block`, as [`deliver`] returned it, is the unregistered notice rather than messages.
+/// The two never share a block: the notice is written only when no message was.
+pub fn is_notice(block: &str) -> bool {
+    block.starts_with(NOTICE_OPEN)
+}
+
 /// Collect and consume pending messages for the current session across all
 /// relay stores in this workspace. Returns the injection block, if any.
 /// `mid_turn` marks the pre-tool-use path: it skips the idle heartbeat write
@@ -90,7 +100,7 @@ pub fn deliver(
     if out.is_empty() && notice_when_unregistered && !unregistered.is_empty() {
         let (p, sessions, msgs) = &unregistered[0];
         out.push_str(&format!(
-            "<relay-notice>Relay store '{p}' active ({sessions} sessions, {msgs} messages). \
+            "{NOTICE_OPEN}Relay store '{p}' active ({sessions} sessions, {msgs} messages). \
              Join with: base relay register --as <title> · view: base relay board</relay-notice>\n"
         ));
     }

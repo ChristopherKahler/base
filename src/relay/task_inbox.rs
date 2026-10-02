@@ -40,6 +40,21 @@ const TERSE_THROTTLE_SECS: i64 = 600;
 /// on a live round-trip, not a work package.
 const PING_TERSE_THROTTLE_SECS: i64 = 180;
 
+/// A ping older than this never alerts again, loud or terse. A ping is a live message between sessions;
+/// one that has waited a day is history, and it stays in the inbox file for anyone who reads it.
+/// Measured 2026-09-23: a ping sent 2026-08-29 to another session, already delivered, fired as
+/// "REPLY REQUIRED BEFORE YOUR NEXT ACTION" on every prompt of an unrelated session that took the title
+/// by tab reclaim. Tasks are not covered: a task is assigned work and persists until `relay done`.
+const PING_STALE_SECS: i64 = 24 * 60 * 60;
+
+/// True for a ping whose `created` stamp is older than [`PING_STALE_SECS`]. An unparseable stamp is not
+/// stale, so a malformed file keeps the old behaviour rather than going quiet.
+fn ping_is_stale(task: &InboxTask) -> bool {
+    task.kind == "ping"
+        && parse_ts(&task.created)
+            .is_some_and(|t| (chrono::Local::now() - t).num_seconds() > PING_STALE_SECS)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxTask {
     pub slug: String,
@@ -178,7 +193,7 @@ pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
     let mut terse_pings: Vec<String> = Vec::new();
 
     for (path, mut task) in tasks {
-        if task.status == "done" {
+        if task.status == "done" || ping_is_stale(&task) {
             continue;
         }
         let is_pending = task.status == "pending";
@@ -664,6 +679,57 @@ mod tests {
             // "persist until done, re-loud at session-start".
             bind("caddy-backend", "sid-C", home);
             let block = deliver("sid-C", Phase::SessionStart).expect("new session must see it");
+            assert!(block.contains("NEW TASK TO IMMEDIATELY CONSUME"));
+        });
+    }
+
+    fn days_ago(days: i64) -> String {
+        (chrono::Local::now() - chrono::Duration::days(days)).format("%Y-%m-%dT%H:%M:%S%z").to_string()
+    }
+
+    #[test]
+    fn stale_ping_never_alerts_a_new_holder_of_the_title() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("cougar", "sid-B", home);
+            // The 2026-09-23 case: delivered long ago to a session that is gone.
+            let mut delivered = sample_ping("ping", "px-depth", "cougar", "sid-A", "ack. Ended.");
+            delivered.created = days_ago(25);
+            delivered.status = "delivered".into();
+            delivered.last_loud_session = "sid-A".into();
+            enqueue(&ns, &delivered).unwrap();
+            // And one that never reached anyone, from two days ago.
+            let mut pending = sample_ping("ping", "heron", "cougar", "sid-A", "old question");
+            pending.created = days_ago(2);
+            enqueue(&ns, &pending).unwrap();
+            assert!(deliver("sid-B", Phase::SessionStart).is_none(), "stale pings must not fire loud");
+            assert!(deliver("sid-B", Phase::Prompt).is_none(), "nor on a prompt");
+            assert!(deliver("sid-B", Phase::Tool).is_none(), "nor on a tool call");
+            // Nothing is deleted: the files stay readable in the inbox.
+            assert_eq!(read_tasks_in(&title_dir("cougar").unwrap()).len(), 2);
+        });
+    }
+
+    #[test]
+    fn fresh_ping_and_stale_task_still_fire() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("cougar", "sid-B", home);
+            // A ping just inside the window still alerts.
+            let mut fresh = sample_ping("ping", "heron", "cougar", "sid-B", "still live");
+            fresh.created = (chrono::Local::now() - chrono::Duration::hours(23))
+                .format("%Y-%m-%dT%H:%M:%S%z")
+                .to_string();
+            enqueue(&ns, &fresh).unwrap();
+            let block = deliver("sid-B", Phase::SessionStart).expect("a ping under a day old fires");
+            assert!(block.contains("still live"));
+            // An old TASK is assigned work and persists until done.
+            let mut task = sample("sid-B");
+            task.to_title = "cougar".into();
+            task.created = days_ago(25);
+            enqueue(&ns, &task).unwrap();
+            bind("cougar", "sid-C", home);
+            let block = deliver("sid-C", Phase::SessionStart).expect("an old task still re-announces");
             assert!(block.contains("NEW TASK TO IMMEDIATELY CONSUME"));
         });
     }

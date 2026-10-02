@@ -1,0 +1,11 @@
+# The replay corpus's config (tests/replay_test.rs), appended to the seed's global base.toml.
+# The budgets are the defaults, stated so the replay names what it checks against. The first
+# screen is held to 1,990, FS1's bar (tests/deferral_test.rs): where DUE NOW is trimmed to fit,
+# it is trimmed to the bar, and every case is held to it.
+[bracket]
+enabled = true
+
+[budget]
+session_start_bytes = 9000
+prompt_bytes = 4000
+first_screen_chars = 1990
