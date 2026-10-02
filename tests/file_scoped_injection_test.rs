@@ -264,6 +264,12 @@ fn old_shape(root: &Path) {
     std::fs::write(root.join(".base").join("domains.toml"), file).unwrap();
 }
 
+fn write_list(root: &Path, text: &str) -> std::path::PathBuf {
+    let p = root.join("hand.toml");
+    std::fs::write(&p, text).unwrap();
+    p
+}
+
 /// Examples 5 and the vintrix line (P6): a project's broad or relative trigger becomes its folder, base-config's
 /// become base's config files, vintrix's `auto_inject` goes back on, and a second run proposes nothing.
 #[test]
@@ -319,6 +325,18 @@ fn migration_rewrites_broad_and_relative_triggers() {
         assert_eq!(get("base-config").prompt_keywords, vec!["base-gbl".to_string()], "the rest of the domain kept");
         let again = base::domain::paths::suggest(root);
         assert!(again.changes.is_empty(), "nothing left to rewrite: {:#?}", again.changes);
+
+        // The live order: `project paths --apply` already moved the trigger to the folder. The flag still comes back.
+        base::domain::paths::apply_cmd(root, &write_list(root, "[[domain]]
+tier = \"workspace\"
+name = \"vintrix\"
+paths = []
+auto_inject = false
+"), false, true).unwrap();
+        base::domain::add_trigger(root, false, "vintrix", None, Some("Documents/Vintryx")).unwrap();
+        let narrowed = base::domain::paths::suggest(root);
+        let v = narrowed.changes.iter().find(|c| c.domain == "vintrix").expect("vintrix's flag is proposed");
+        assert_eq!((v.after.clone(), v.auto_inject_after), (vec![spelled(&root.join("Documents/Vintryx"))], true), "{v:?}");
 
         // A reviewed list with a relative or broad path is refused whole, and writes nothing.
         let toml_path = root.join(".base").join("domains.toml");

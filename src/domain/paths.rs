@@ -257,12 +257,29 @@ pub fn suggest(cwd: &Path) -> Report {
                     }
                 }
             }
-            let auto_after = d.auto_inject || replaced_broad;
+            // `auto_inject = false` was F29's advice for a broad trigger. It goes back on once the domain's trigger is
+            // its project's own folder and that folder is specific (D1): replaced here, or already narrowed by
+            // `base project paths --apply`, which moves the trigger with the folder. The list says so; a reviewer who
+            // set it for another reason deletes the line.
+            let narrowed = project.is_some_and(|p| {
+                folder_broad.is_empty()
+                    && after.iter().any(|a| {
+                        matcher::resolve_trigger(a, d.root.as_deref(), home_str.as_deref())
+                            .is_some_and(|r| matcher::path_under(&r, &p.path) && matcher::path_under(&p.path, &r))
+                    })
+                    && after.iter().all(|a| {
+                        matcher::resolve_trigger(a, d.root.as_deref(), home_str.as_deref())
+                            .is_none_or(|r| matcher::trigger_breadth(&r, &d.name, &ctx).is_empty())
+                    })
+            });
+            let auto_after = d.auto_inject || replaced_broad || narrowed;
             if !d.auto_inject && auto_after {
-                reasons.push("auto_inject goes back to true: it was F29's advice for a broad trigger, which D1 rules out".into());
+                reasons.push(
+                    "auto_inject goes back to true: its trigger is its project's own folder, and false was F29's advice for a broad trigger, which D1 rules out (delete this line to keep it off)".into(),
+                );
             }
             let before_spelled: Vec<String> = d.paths.iter().map(|t| spelled(t)).collect();
-            if after == d.paths || (after == before_spelled && reasons.is_empty() && auto_after == d.auto_inject) {
+            if auto_after == d.auto_inject && (after == d.paths || (after == before_spelled && reasons.is_empty())) {
                 if report.review.len() == reviewed_before {
                     report.unchanged += 1;
                 }
