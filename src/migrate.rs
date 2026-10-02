@@ -697,11 +697,13 @@ fn project_domain(facts: &Facts, ns: &NamespaceConfig, literal: &str) -> Option<
 }
 
 /// Is `rel` inside `dir`? Case-insensitive, because a Windows store holds
-/// `Tools/stt` and a trigger may say `tools/stt`.
+/// `Tools/stt` and a trigger may say `tools/stt`. `get` rather than a byte
+/// slice: when `dir.len()` lands inside a multi-byte char of `rel` (a note
+/// named `a → b.md`), the prefix cannot match, and slicing would panic.
 fn under(rel: &str, dir: &str) -> bool {
     !dir.is_empty()
         && rel.len() > dir.len()
-        && rel[..dir.len()].eq_ignore_ascii_case(dir)
+        && rel.get(..dir.len()).is_some_and(|head| head.eq_ignore_ascii_case(dir))
         && rel.as_bytes()[dir.len()] == b'/'
 }
 
@@ -1086,5 +1088,9 @@ mod tests {
         assert!(!under("Documents/video-generator/a.md", "Documents/video-gen"));
         assert!(!under("Documents/video-gen", "Documents/video-gen"), "the dir is not under itself");
         assert!(!under("anything", ""));
+        assert!(
+            !under("notes/a → b.md", "notes/a x"),
+            "a trigger length that splits a multi-byte char is a miss, not a panic"
+        );
     }
 }
