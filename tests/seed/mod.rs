@@ -374,6 +374,8 @@ fn run(
         .env_remove("BASE_NO_WAKE_NUDGE")
         .env_remove("BASE_NO_AUTONAME")
         .env_remove("BASE_RELAY_AS")
+        // Set inside base's own headless calls, where every hook returns at once (BO-08, F27).
+        .env_remove("BASE_HEADLESS")
         // A Windows Terminal tab id makes a session with no title reclaim whichever title was registered from the
         // same tab (BO-05 tests auto-title new sessions), so a run inside a terminal would differ from one in CI.
         .env_remove("WT_SESSION")
@@ -438,6 +440,36 @@ pub fn run_session_start(seed: &Seed, session: Option<&str>) -> (i32, String, St
     )
 }
 
+/// Any hook `event`, driven as Claude Code drives it: `payload` on stdin, from the workspace. `env` is set on the hook
+/// process on top of the scrubbed environment, so a test says which kind of run it is (BO-08: `BASE_HEADLESS`, and the
+/// relay title and terminal tab a headless call inherits from the session that started it).
+pub fn run_hook(seed: &Seed, event: &str, payload: &serde_json::Value, env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = Command::new(BIN);
+    cmd.args(["hook", event])
+        .current_dir(&seed.ws)
+        .env("BASE_HOME", &seed.home)
+        .env("BASE_NO_AUTO_UPDATE", "1")
+        .env("BASE_AST_NO_SPAWN", "1")
+        .env_remove("BASE_NO_WAKE_NUDGE")
+        .env_remove("BASE_NO_AUTONAME")
+        .env_remove("BASE_RELAY_AS")
+        .env_remove("BASE_HEADLESS")
+        .env_remove("WT_SESSION")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("the base binary runs");
+    child.stdin.take().expect("stdin").write_all(payload.to_string().as_bytes()).expect("stdin written");
+    let out = child.wait_with_output().expect("base finishes");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 /// The pre-tool-use hook, driven as Claude Code drives it: JSON on stdin naming the tool and its input. `env` is set on
 /// the hook process on top of the scrubbed environment (`BASE_NO_WAKE_NUDGE`, `BASE_RELAY_AS`), so a test says which
 /// kind of run it is; with none, it is an interactive session's tool call.
@@ -478,6 +510,8 @@ pub fn run_pre_tool_use_at(
         .env_remove("BASE_NO_WAKE_NUDGE")
         .env_remove("BASE_NO_AUTONAME")
         .env_remove("BASE_RELAY_AS")
+        // Set inside base's own headless calls, where every hook returns at once (BO-08, F27).
+        .env_remove("BASE_HEADLESS")
         .env_remove("WT_SESSION")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .envs(env.iter().copied())
@@ -556,6 +590,8 @@ pub fn run_base_in_session(seed: &Seed, args: &[&str], session: &str) -> (i32, S
         .env("BASE_NO_AUTO_UPDATE", "1")
         .env("BASE_AST_NO_SPAWN", "1")
         .env_remove("BASE_RELAY_AS")
+        // Set inside base's own headless calls, where every hook returns at once (BO-08, F27).
+        .env_remove("BASE_HEADLESS")
         .env_remove("WT_SESSION")
         .env("CLAUDE_CODE_SESSION_ID", session)
         .stdin(Stdio::null());

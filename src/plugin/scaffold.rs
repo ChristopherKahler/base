@@ -141,7 +141,7 @@ fn run_prepare(dir: &Path) -> Result<bool> {
         eprintln!("base: bun not found — skipping build (run ./prepare.sh after installing Bun: https://bun.sh)");
         return Ok(false);
     }
-    let status = Command::new("bash").arg("prepare.sh").current_dir(dir).status().context("running prepare.sh")?;
+    let status = super::prepare_command(dir)?.status().context("running prepare.sh")?;
     if !status.success() {
         eprintln!("base: warning — prepare.sh did not succeed; build skipped");
         return Ok(false);

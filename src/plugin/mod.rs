@@ -582,6 +582,15 @@ fn npm_install(dir: &Path) -> anyhow::Result<bool> {
     )
 }
 
+/// `bash prepare.sh` in `dir`, under the bash [`crate::shell::host_bash`] picks: the one way base runs a plugin's
+/// `prepare.sh` (the source build in `dist`, the build after `scaffold`). A bare `bash` here started the WSL launcher
+/// on Windows (F19); with no usable bash this fails with [`crate::shell::NO_BASH`] and starts nothing.
+pub(crate) fn prepare_command(dir: &Path) -> anyhow::Result<Command> {
+    let mut cmd = Command::new(crate::shell::host_bash()?);
+    cmd.arg("prepare.sh").current_dir(dir);
+    Ok(cmd)
+}
+
 /// Serialize a string as a valid TOML basic string token (including the
 /// surrounding quotes), escaping per the TOML spec. Critical on Windows: a path
 /// like `C:\Users\…` written raw into `"…"` turns `\U` into an invalid unicode
@@ -1073,6 +1082,84 @@ DUP=second
         assert!(dst.path().join("src/main.rs").exists());
         for d in ["target", "node_modules", ".git", "dist", "build"] {
             assert!(!dst.path().join(d).exists(), "{d} must be excluded");
+        }
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("readable folder").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// F19 (BO-08): both plugin call sites run `prepare.sh` through [`prepare_command`], which runs the bash
+    /// `crate::shell::host_bash` picks, and on Windows that bash runs on the host, not inside WSL.
+    ///
+    /// Three legs: the command is built from the resolver; a real `prepare.sh` run through it reports a non-Linux
+    /// kernel on Windows; and no product file launches a bare `bash` any more, so a new call site cannot skip the
+    /// resolver unnoticed.
+    #[test]
+    fn plugin_prepare_uses_resolved_bash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let resolved = crate::shell::host_bash();
+
+        // Leg 1: the command is the resolver's bash, running prepare.sh in the plugin folder.
+        match (prepare_command(tmp.path()), &resolved) {
+            (Ok(cmd), Ok(bash)) => {
+                assert_eq!(cmd.get_program(), bash.as_os_str());
+                assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["prepare.sh"]);
+                assert_eq!(cmd.get_current_dir(), Some(tmp.path()));
+            }
+            (Err(e), Err(_)) => assert_eq!(e.to_string(), crate::shell::NO_BASH),
+            (cmd, _) => panic!("the command and the resolver disagree: {:?} vs {resolved:?}", cmd.map(|c| c.get_program().to_owned())),
+        }
+
+        // Leg 2: run it. A runner with no host bash is a broken runner on CI; on a dev machine the leg says it skipped.
+        match &resolved {
+            Err(_) => {
+                assert!(std::env::var_os("CI").is_none(), "no host bash on this CI runner");
+                eprintln!("SKIPPED leg 2: no host bash here, so prepare.sh cannot run. Not a pass.");
+            }
+            Ok(bash) => {
+                std::fs::write(tmp.path().join("prepare.sh"), "uname -s > kernel.txt\n").expect("prepare.sh");
+                let status = prepare_command(tmp.path()).expect("built").status().expect("prepare.sh runs");
+                assert!(status.success(), "prepare.sh exited {status}");
+                let kernel = std::fs::read_to_string(tmp.path().join("kernel.txt")).expect("prepare.sh wrote kernel.txt");
+                let kernel = kernel.trim();
+                eprintln!("prepare.sh ran under {} and reported kernel {kernel}", bash.display());
+                assert!(!kernel.is_empty(), "uname -s printed nothing");
+                if cfg!(windows) {
+                    assert!(!kernel.starts_with("Linux"), "prepare.sh ran inside WSL (kernel {kernel:?}), not on the host");
+                }
+            }
+        }
+
+        // Leg 3: no product code starts a bare `bash`; dist.rs and scaffold.rs build through prepare_command.
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        // Built here, so this line is not itself a match.
+        let needle = format!("Command::new({:?})", "bash");
+        let bare: Vec<String> = files
+            .iter()
+            .flat_map(|f| {
+                let text = std::fs::read_to_string(f).expect("readable source");
+                text.lines()
+                    .enumerate()
+                    .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(&needle))
+                    .map(|(i, _)| format!("{}:{}", f.display(), i + 1))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(bare.is_empty(), "bare bash launches, which start the WSL launcher on Windows: {bare:?}");
+        for site in ["plugin/dist.rs", "plugin/scaffold.rs"] {
+            let text = std::fs::read_to_string(src.join(site)).expect("call site");
+            assert!(text.contains("prepare_command("), "{site} runs prepare.sh without prepare_command");
         }
     }
 }
