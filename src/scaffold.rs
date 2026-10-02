@@ -72,7 +72,7 @@ pub fn run(target: &Path) -> Result<()> {
 # enabled = true
 
 # [budget]             # what a hook may print, in bytes (the unit the host counts)
-# session_start_bytes = 9000
+# session_start_bytes = 10000
 # memory_chars = 4000  # the memory block inside it, in UTF-16: a readability limit
 
 # [flow]               # resurface scans: unblocked, deferred-due, recurring ideas

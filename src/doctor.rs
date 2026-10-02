@@ -479,7 +479,7 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         config_errors,
         trigger_faults,
         // One subprocess per `diagnose`, not one per render: both call sites below read this.
-        measured_on: check_measured_on(&crate::config::BaseConfig::load(cwd).budget.measured_on),
+        measured_on: check_measured_on(&crate::config::BaseConfig::load(cwd).budget),
         hook_output,
         seam: store::LOCK_SEAM_MARKER,
     }
@@ -780,13 +780,16 @@ pub enum MeasuredOn {
     Differs { measured: String, host: String },
     /// The check could not run. THIS IS NOT "THEY AGREE" and it never prints as reassurance.
     Unknown { configured: String, why: String },
+    /// Hook budgets set by hand with no `measured_on` beside them: never measured on any host, whatever the default
+    /// `measured_on` says (BO-02 review). Every install before BO-02 has `session_start_bytes = 9000` this way.
+    Unmeasured { keys: Vec<String> },
 }
 
 /// The first `N.N.N` in a string, so each side may carry whatever label it likes: `claude --version`
 /// prints `2.1.278 (Claude Code)` while `measured_on` holds `claude-code 2.1.278`. Comparing the raw
 /// strings would report a difference on every machine forever — a check that cannot pass is not a
 /// check, and it would have been indistinguishable from real drift.
-fn version_in(s: &str) -> Option<String> {
+pub(crate) fn version_in(s: &str) -> Option<String> {
     let c: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < c.len() {
@@ -859,24 +862,38 @@ fn host_version() -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Read `[budget] measured_on` against the live host. Runs a subprocess, so `diagnose` calls it once.
-pub fn check_measured_on(configured: &str) -> MeasuredOn {
-    compare_measured_on(configured, host_version().as_deref())
+/// Read `[budget] measured_on` against the live host. Runs a subprocess, so `diagnose` calls it once. Hook budgets
+/// set by hand with no `measured_on` beside them were never measured on any host, so they are reported as that
+/// before any version is compared.
+pub fn check_measured_on(budget: &crate::config::BudgetConfig) -> MeasuredOn {
+    if !budget.unmeasured_keys.is_empty() {
+        return MeasuredOn::Unmeasured { keys: budget.unmeasured_keys.clone() };
+    }
+    compare_measured_on(&budget.measured_on, host_version().as_deref())
 }
 
-/// The one line that frames every budget number under it.
+/// The running Claude Code's version, bare (`2.1.287`), or `None` when `claude --version` did not answer with one.
+/// `base doctor --measure` records it as `[budget] measured_on`.
+pub fn host_claude_version() -> Option<String> {
+    host_version().as_deref().and_then(version_in)
+}
+
+/// The one line that frames every budget number under it. `measured_on` is the shipped default until
+/// `base doctor --measure` writes the user's own, so the line names the key rather than "the defaults" (F6d).
 fn push_measured_on(out: &mut String, m: &MeasuredOn) {
     match m {
         MeasuredOn::Matches { version } => out.push_str(&format!(
-            "   budget defaults were measured on claude-code {version}, which is what this host runs.\n"
+            "   [budget] measured_on is {version}, which is what this host runs.\n"
         )),
         MeasuredOn::Differs { measured, host } => out.push_str(&format!(
-            "   ⚠ budget defaults were measured on claude-code {measured}; this host runs {host}. \
-             The numbers below were measured against a host that has since moved — re-measure them, \
-             then set [budget] measured_on to what you measured on.\n"
+            "   ⚠ [budget] measured_on is {measured}; this host runs {host} · run base doctor --measure\n"
         )),
         MeasuredOn::Unknown { configured, why } => out.push_str(&format!(
-            "   budget defaults say \"{configured}\" — NOT CHECKED against this host: {why}\n"
+            "   [budget] measured_on is \"{configured}\" — NOT CHECKED against this host: {why}\n"
+        )),
+        MeasuredOn::Unmeasured { keys } => out.push_str(&format!(
+            "   ⚠ [budget] {} set in base.toml with no measured_on beside it · run base doctor --measure\n",
+            keys.join(", ")
         )),
     }
 }
@@ -2120,6 +2137,39 @@ mod measured_on_tests {
                 "an unrunnable check printed the agreement line: {out}"
             );
         }
+    }
+
+    /// F6d, the brief's Example 4: Claude Code moved on after the budgets were measured, and doctor says so in one line
+    /// that names both versions and the command that re-measures. The value `base doctor --measure` writes is the bare
+    /// version (`2.1.286`), so that is the configured side here.
+    #[test]
+    fn doctor_flags_version_mismatch() {
+        let m = compare_measured_on("2.1.286", Some("2.1.290 (Claude Code)"));
+        let mut out = String::new();
+        push_measured_on(&mut out, &m);
+        assert_eq!(out, "   ⚠ [budget] measured_on is 2.1.286; this host runs 2.1.290 · run base doctor --measure\n");
+        // After a measure run on the host it names, the line agrees and points nowhere.
+        let mut out = String::new();
+        push_measured_on(&mut out, &compare_measured_on("2.1.290", Some("2.1.290 (Claude Code)")));
+        assert_eq!(out, "   [budget] measured_on is 2.1.290, which is what this host runs.\n");
+    }
+
+    /// BO-02 review: budgets pinned by hand with no `measured_on` beside them were never measured, so the default
+    /// `measured_on` must not vouch for them. No subprocess runs: the check answers before it asks the host.
+    #[test]
+    fn hand_set_budgets_with_no_measured_on_ask_for_a_measure() {
+        let budget = crate::config::BudgetConfig {
+            unmeasured_keys: vec!["session_start_bytes".to_string()],
+            ..Default::default()
+        };
+        let m = check_measured_on(&budget);
+        assert_eq!(m, MeasuredOn::Unmeasured { keys: vec!["session_start_bytes".to_string()] });
+        let mut out = String::new();
+        push_measured_on(&mut out, &m);
+        assert_eq!(
+            out,
+            "   ⚠ [budget] session_start_bytes set in base.toml with no measured_on beside it · run base doctor --measure\n"
+        );
     }
 
     /// The match line is quiet: no warning mark, so a reader skimming for problems does not find one.

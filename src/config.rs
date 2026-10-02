@@ -853,7 +853,8 @@ impl Default for SignalConfig {
 
 /// How much each hook event may print, in BYTES: the unit the host counts. Output over the
 /// host's limit is saved to a file and Claude sees a 2,000-character preview of it, so base
-/// measures and trims before it prints. Measured on Claude Code 2.1.278, 2026-09-20.
+/// measures and trims before it prints. The limit was measured on Claude Code 2.1.287, 2026-10-01,
+/// by `base doctor --measure`, which re-measures it on whatever Claude Code runs.
 ///
 /// THE UNIT IN THIS PARAGRAPH WAS FALSE UNTIL 2026-09-20 AND IT MISLED THREE SESSIONS. It read
 /// "UTF-16 code units: the unit Claude Code's limit counts", on the belief that the host is
@@ -863,8 +864,9 @@ impl Default for SignalConfig {
 ///
 /// Read today by session start: `session_start_bytes`, `first_screen_chars` and
 /// `write_full_output`; by the memory signal: `memory_chars`; by the prompt hook: `prompt_bytes`.
-/// `pre_tool_chars` and `post_tool_chars` are read by nothing yet; the tool hooks take them in
-/// their own commits.
+/// `pre_tool_bytes` and `post_tool_chars` are read by nothing yet; the tool hooks take them in
+/// their own commits. `base doctor --measure` writes `session_start_bytes`, `prompt_bytes`,
+/// `pre_tool_bytes` and `measured_on` from what the running Claude Code delivers (BO-02).
 ///
 /// `first_screen_chars` and `memory_chars` ARE GENUINELY UTF-16 AND KEEP THEIR NAMES. They are
 /// READABILITY limits - how much a reader takes in - not delivery ones, so the host's unit does
@@ -895,8 +897,21 @@ pub struct BudgetConfig {
     /// at a key they do not have.
     #[serde(skip)]
     pub legacy_spellings: Vec<String>,
-    #[serde(default = "default_pre_tool_chars")]
-    pub pre_tool_chars: usize,
+    /// The hook budget keys the config sets by hand with no `measured_on` beside them, in the operator's spelling.
+    ///
+    /// WHY (BO-02 review). `measured_on` defaults to the version the shipped defaults were measured on, so a file
+    /// that pins `session_start_bytes = 9000` (every install before BO-02 got that line from the template) and says
+    /// nothing about `measured_on` would read as measured on today's host. Not deserialized: filled by `load` from
+    /// the raw merged table, like `legacy_spellings`.
+    #[serde(skip)]
+    pub unmeasured_keys: Vec<String>,
+    /// The pre-tool hook's budget, in BYTES: what `base doctor --measure` measured the host delivering through
+    /// pre-tool's `additionalContext`. Read by no hook yet; the pre-tool hook takes it in its own build order.
+    ///
+    /// RENAMED WITH ITS UNIT (BO-02), for the reason `session_start_bytes` gives: it was `pre_tool_chars`, and the
+    /// number written here is now a measured byte count. The old spelling still sets it.
+    #[serde(default = "default_pre_tool_bytes", alias = "pre_tool_chars")]
+    pub pre_tool_bytes: usize,
     #[serde(default = "default_post_tool_chars")]
     pub post_tool_chars: usize,
     /// The header, the instructions and due-now items must fit inside this many units (spec A5).
@@ -915,13 +930,22 @@ pub struct BudgetConfig {
     pub write_full_output: bool,
 }
 
-fn default_session_start_bytes() -> usize { 9000 }
-fn default_prompt_bytes() -> usize { 4000 }
-fn default_pre_tool_chars() -> usize { 2500 }
+// THE THREE HOOK BUDGETS AND `measured_on` ARE A MEASUREMENT, NOT A CHOICE (F6c, BO-02). `base doctor --measure` on
+// Claude Code 2.1.287, 2026-10-01, 7 Haiku calls per hook: session start, prompt submit and pre-tool each delivered a
+// 10,000-byte payload whole and cut a 10,500-byte one to the 2,000-character preview. Rounded down to 500: 10,000.
+// Two 7,000-byte hooks on one prompt event both arrived whole, so the limit is per hook, not per event. When Claude
+// Code moves, `base doctor` says so; re-measure, then move all four together. Before this they were 9,000 / 4,000 /
+// 2,500 on 2.1.278, and the 4,000 had no host limit behind it.
+pub const MEASURED_HOOK_BYTES: usize = 10_000;
+pub const MEASURED_ON: &str = "2.1.287";
+
+fn default_session_start_bytes() -> usize { MEASURED_HOOK_BYTES }
+fn default_prompt_bytes() -> usize { MEASURED_HOOK_BYTES }
+fn default_pre_tool_bytes() -> usize { MEASURED_HOOK_BYTES }
 fn default_post_tool_chars() -> usize { 1000 }
 fn default_first_screen_chars() -> usize { 2000 }
 fn default_memory_chars() -> usize { 4000 }
-fn default_measured_on() -> String { "claude-code 2.1.278".into() }
+fn default_measured_on() -> String { MEASURED_ON.into() }
 
 impl Default for BudgetConfig {
     fn default() -> Self {
@@ -929,7 +953,8 @@ impl Default for BudgetConfig {
             session_start_bytes: default_session_start_bytes(),
             prompt_bytes: default_prompt_bytes(),
             legacy_spellings: Vec::new(),
-            pre_tool_chars: default_pre_tool_chars(),
+            unmeasured_keys: Vec::new(),
+            pre_tool_bytes: default_pre_tool_bytes(),
             post_tool_chars: default_post_tool_chars(),
             first_screen_chars: default_first_screen_chars(),
             memory_chars: default_memory_chars(),
@@ -1127,6 +1152,7 @@ impl BudgetConfig {
 pub const RENAMED_BUDGET_KEYS: &[LegacyBudgetKey] = &[
     LegacyBudgetKey { old: "session_start_chars", new: "session_start_bytes" },
     LegacyBudgetKey { old: "prompt_chars", new: "prompt_bytes" },
+    LegacyBudgetKey { old: "pre_tool_chars", new: "pre_tool_bytes" },
 ];
 
 /// Which renamed keys the merged config actually spells the old way.
@@ -1143,6 +1169,28 @@ fn legacy_budget_keys(merged: &toml::value::Table) -> Vec<LegacyBudgetKey> {
         .filter(|k| budget.contains_key(k.old))
         .cloned()
         .collect()
+}
+
+/// The hook budget keys, in every spelling, that a measurement covers.
+const HOOK_BUDGET_KEYS: [&str; 6] = [
+    "session_start_bytes",
+    "session_start_chars",
+    "prompt_bytes",
+    "prompt_chars",
+    "pre_tool_bytes",
+    "pre_tool_chars",
+];
+
+/// The hook budget keys the merged config sets with no `measured_on` beside them. See
+/// [`BudgetConfig::unmeasured_keys`].
+fn unmeasured_budget_keys(merged: &toml::value::Table) -> Vec<String> {
+    let Some(toml::Value::Table(budget)) = merged.get("budget") else {
+        return Vec::new();
+    };
+    if budget.contains_key("measured_on") {
+        return Vec::new();
+    }
+    HOOK_BUDGET_KEYS.iter().filter(|k| budget.contains_key(**k)).map(|k| k.to_string()).collect()
 }
 
 /// The one advisory this process gets, with its own latch.
@@ -1291,6 +1339,7 @@ impl BaseConfig {
         // spelling was used.
         let legacy = legacy_budget_keys(&merged);
         report_legacy_budget_keys(&legacy, &LEGACY_KEYS_REPORTED);
+        let unmeasured = unmeasured_budget_keys(&merged);
 
         match toml::Value::Table(merged).try_into() {
             Ok(config) => {
@@ -1300,6 +1349,7 @@ impl BaseConfig {
                 let mut config: Self = config;
                 config.budget.legacy_spellings =
                     legacy.iter().map(|k| k.old.to_string()).collect();
+                config.budget.unmeasured_keys = unmeasured;
                 (config, faults)
             }
             Err(e) => {
@@ -1496,13 +1546,17 @@ mod tests {
     /// nothing until you have overridden it.
     #[test]
     fn the_budget_keys_default_to_spec_part_h_and_read_back_when_set() {
-        assert_eq!(default_value("budget", "session_start_bytes"), Some(toml::Value::Integer(9000)));
+        // F6c: the three hook budgets ship as the value measured on Claude Code 2.1.287, recorded beside them.
+        for key in ["session_start_bytes", "prompt_bytes", "pre_tool_bytes"] {
+            assert_eq!(default_value("budget", key), Some(toml::Value::Integer(10_000)), "{key}");
+        }
+        assert_eq!(default_value("budget", "measured_on"), Some(toml::Value::String("2.1.287".into())));
         assert_eq!(default_value("budget", "first_screen_chars"), Some(toml::Value::Integer(2000)));
         assert_eq!(default_value("budget", "write_full_output"), Some(toml::Value::Boolean(true)));
         let cfg: BaseConfig =
             toml::from_str("[budget]\nsession_start_bytes = 1234\n").expect("a budget section parses");
         assert_eq!(cfg.budget.session_start_bytes, 1234);
-        assert_eq!(cfg.budget.prompt_bytes, 4000, "an unset key keeps its default");
+        assert_eq!(cfg.budget.prompt_bytes, 10_000, "an unset key keeps its default");
 
         // THE LEGACY SPELLING MUST STILL SET THE VALUE. Renaming a key an operator may have tuned
         // is only honest if the old name keeps working; retiring it silently would return them to
@@ -1513,18 +1567,22 @@ mod tests {
         let cfg: BaseConfig =
             toml::from_str("[budget]\nprompt_chars = 777\n").expect("the legacy key parses");
         assert_eq!(cfg.budget.prompt_bytes, 777, "the legacy alias still sets the value");
+        // BO-02 renamed pre-tool's key with its unit; the old spelling still sets it.
+        let cfg: BaseConfig =
+            toml::from_str("[budget]\npre_tool_chars = 555\n").expect("the legacy key parses");
+        assert_eq!(cfg.budget.pre_tool_bytes, 555, "the legacy alias still sets the value");
 
         // And the raw-table scan names exactly the keys spelled the old way.
         let table: toml::value::Table =
-            toml::from_str("[budget]\nsession_start_chars = 1\nprompt_bytes = 2\n").expect("table");
+            toml::from_str("[budget]\nsession_start_chars = 1\nprompt_bytes = 2\npre_tool_chars = 3\n").expect("table");
         let found: Vec<&str> = legacy_budget_keys(&table).iter().map(|k| k.old).collect();
-        assert_eq!(found, vec!["session_start_chars"], "only the old spelling is reported");
+        assert_eq!(found, vec!["session_start_chars", "pre_tool_chars"], "only the old spellings are reported");
         // Rank 04 adds the memory block's own key; the assertions above are unchanged.
         assert_eq!(default_value("budget", "memory_chars"), Some(toml::Value::Integer(4000)));
         let cfg: BaseConfig =
             toml::from_str("[budget]\nmemory_chars = 321\n").expect("a budget section parses");
         assert_eq!(cfg.budget.memory_chars, 321);
-        assert_eq!(cfg.budget.session_start_bytes, 9000, "an unset key keeps its default");
+        assert_eq!(cfg.budget.session_start_bytes, 10_000, "an unset key keeps its default");
     }
 
     #[test]
@@ -1565,6 +1623,30 @@ mod tests {
         // Explicit opt-out is honored.
         let c: BaseConfig = toml::from_str("[update]\nauto = false\n").unwrap();
         assert!(!c.update.auto);
+    }
+
+    /// BO-02 review: a hook budget set by hand with no `measured_on` beside it is recorded as unmeasured, so doctor
+    /// cannot vouch for it with the default `measured_on`. Every install before BO-02 has `session_start_bytes = 9000`
+    /// from the template and nothing else in `[budget]`.
+    #[test]
+    fn hook_budgets_set_with_no_measured_on_are_recorded_as_unmeasured() {
+        let table = |s: &str| -> toml::value::Table { toml::from_str(s).expect("table") };
+        assert_eq!(unmeasured_budget_keys(&table("[budget]\nsession_start_bytes = 9000\n")), ["session_start_bytes"]);
+        assert_eq!(unmeasured_budget_keys(&table("[budget]\nprompt_chars = 4000\nmemory_chars = 1\n")), ["prompt_chars"]);
+        assert!(unmeasured_budget_keys(&table("[budget]\nprompt_bytes = 1\nmeasured_on = \"2.1.287\"\n")).is_empty());
+        assert!(unmeasured_budget_keys(&table("[budget]\nmemory_chars = 1\n")).is_empty(), "not a hook budget");
+        assert!(unmeasured_budget_keys(&table("[signal]\nenabled = true\n")).is_empty());
+
+        // And `load` carries it through to the struct doctor reads.
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let gbl = tmp.path().join(".base-gbl");
+            std::fs::create_dir_all(&gbl).unwrap();
+            std::fs::write(gbl.join("base.toml"), "[budget]\nsession_start_bytes = 9000\n").unwrap();
+            let budget = BaseConfig::load(tmp.path()).budget;
+            assert_eq!(budget.unmeasured_keys, ["session_start_bytes"]);
+            assert_eq!(budget.measured_on, MEASURED_ON, "the default fills in, which is why the list is needed");
+        });
     }
 
     // ─── Global tier resolution ──────────────────────────────

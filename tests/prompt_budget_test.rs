@@ -31,8 +31,10 @@ use seed::run_prompt_submit;
 /// `[budget] prompt_chars`'s built-in default, which is what an operator with no `[budget]` section
 /// gets. Spelled here rather than imported so the test states the number it is asserting.
 ///
-/// **BYTES.** The name predates the measurement that settled the unit; see the file header.
-const PROMPT_BYTES: usize = 4000;
+/// **BYTES.** The name predates the measurement that settled the unit; see the file header. Since
+/// BO-02 it is the 10,000 bytes `base doctor --measure` found Claude Code 2.1.287 delivering whole;
+/// it was 4,000.
+const PROMPT_BYTES: usize = 10_000;
 
 /// The opening of a withheld block's pointer line. Both arms key off it, so it is spelled once.
 ///

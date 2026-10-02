@@ -33,3 +33,5 @@ check the doctor output and tell me what is unhealthy
 compare the before and after numbers from the hook output log
 the reminder numbers changed after a new session start; which one is 2
 summarize the last three session starts and what they withheld
+reconcile the ledger for the third quarter before the close
+the ledger and the payroll pay run disagree; reconcile them and check the hook output

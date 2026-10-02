@@ -26,8 +26,9 @@ use seed::{run_prompt_submit, run_session_start, units};
 
 /// FS1's bar (tests/deferral_test.rs), which `base.toml` sets as the first-screen limit.
 const BAR: usize = 1990;
-const SESSION_START_BYTES: usize = 9000;
-const PROMPT_BYTES: usize = 4000;
+/// The budgets `base.toml` sets: the shipped defaults, measured on Claude Code 2.1.287 (BO-02).
+const SESSION_START_BYTES: usize = 10_000;
+const PROMPT_BYTES: usize = 10_000;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
@@ -422,6 +423,38 @@ fn replay_prompt_output_is_whole_blocks_in_priority_order() {
     }
     assert!(cut > 0, "control: no prompt in the corpus dropped a block, so nothing here was exercised");
     println!("replay: {} prompts, {cut} with blocks dropped whole", prompt_runs().len());
+}
+
+/// BO-02 (F6c). The corpus runs at the shipped budgets, and those are now the size `base doctor --measure` found the
+/// host delivering whole on Claude Code 2.1.287: no prompt prints more than that, and a block larger than the old
+/// 4,000-byte cap prints whole. On the operator's store the always-on rules block is 9,372 bytes, and under the old
+/// cap it was dropped on every prompt (BO-01 FINAL STATE); the corpus's `ledger` domain is the same shape, synthetic.
+/// A later order that lowers the default, or lets the fixture drift from it, turns this red.
+#[test]
+fn replay_measured_budget_carries_a_block_the_old_cap_dropped() {
+    const OLD_CAP: usize = 4000;
+    let shipped = base::config::BudgetConfig::default();
+    assert_eq!(
+        (shipped.prompt_bytes, shipped.session_start_bytes),
+        (PROMPT_BYTES, SESSION_START_BYTES),
+        "control: the corpus runs at the shipped defaults"
+    );
+    assert_eq!(PROMPT_BYTES, base::config::MEASURED_HOOK_BYTES, "control: the shipped default is the measured size");
+    let mut carried = Vec::new();
+    for run in prompt_runs() {
+        let p = &run.prompt;
+        assert!(run.stdout.len() <= base::config::MEASURED_HOOK_BYTES, "{p:?}: printed {} bytes", run.stdout.len());
+        let file = seed::prompt_blocks(&run.ws, &run.session);
+        for b in file.blocks.iter().filter(|b| b.printed && b.bytes > OLD_CAP) {
+            assert!(run.stdout.contains(&b.text), "{p:?}: {} is marked printed but is not in the output whole", b.id);
+            carried.push(format!("{} ({} bytes)", b.id, b.bytes));
+        }
+    }
+    assert!(
+        !carried.is_empty(),
+        "control: no prompt carried a block over the old {OLD_CAP}-byte cap, so the measured budget was never exercised"
+    );
+    println!("replay: blocks over the old {OLD_CAP}-byte cap printed whole: {}", carried.join(", "));
 }
 
 #[test]

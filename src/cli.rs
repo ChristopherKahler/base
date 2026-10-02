@@ -358,6 +358,23 @@ pub enum Commands {
         /// Restore the workspace graph from a backup snapshot. Bare `--restore` lists snapshots.
         #[arg(long, num_args = 0..=1)]
         restore: Option<Option<String>>,
+        /// Measure how much hook text the running Claude Code delivers to the model (session start, prompt submit,
+        /// pre-tool) with headless `claude -p` calls on a cheap model, then write each hook's budget and
+        /// `measured_on` to ~/.base-gbl/base.toml. Up to 12 calls per hook.
+        #[arg(long, conflicts_with_all = ["json", "repair", "restore"])]
+        measure: bool,
+        /// Internal: `emit` prints one measure payload. The hooks `--measure` registers run it.
+        #[arg(requires = "measure", value_parser = ["emit"], hide = true)]
+        measure_step: Option<String>,
+        /// Internal (`--measure emit`): the hook the payload is for.
+        #[arg(long, requires = "measure_step", hide = true)]
+        hook: Option<String>,
+        /// Internal (`--measure emit`): the payload's size in bytes.
+        #[arg(long, requires = "measure_step", hide = true)]
+        bytes: Option<usize>,
+        /// Internal (`--measure emit`): the payload's nonce.
+        #[arg(long, requires = "measure_step", hide = true)]
+        nonce: Option<String>,
     },
     /// First-class graph maintenance (atomic, backs up first — never hand-edit graph.nq)
     Graph {
@@ -1597,6 +1614,30 @@ fn tier_cwd(cwd: &std::path::Path, global: bool) -> std::path::PathBuf {
 
 pub fn run() {
     let cli = Cli::parse();
+
+    // `base doctor --measure emit` is the hook a measure call registers, and its stdout IS the measurement: exactly
+    // the payload, nothing before or after. So it runs before `ensure_hooks_wired` below and before the config load,
+    // and touches nothing else.
+    if let Some(Commands::Doctor { measure_step: Some(_), hook, bytes, nonce, .. }) = &cli.command {
+        let (Some(hook), Some(bytes), Some(nonce)) = (hook, bytes, nonce) else {
+            eprintln!("base doctor --measure emit: needs --hook, --bytes and --nonce");
+            std::process::exit(2);
+        };
+        match base::measure::emit(hook, *bytes, nonce) {
+            Ok(text) => {
+                use std::io::Write;
+                let mut stdout = std::io::stdout().lock();
+                if stdout.write_all(text.as_bytes()).and_then(|()| stdout.flush()).is_err() {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("base doctor --measure emit: {e:#}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
 
     // #93: `ensure_hooks_wired` had exactly one caller — the session-start hook
     // — so a home whose hooks were never wired had no path back: no hook fires,
@@ -4232,12 +4273,32 @@ pub fn run() {
         },
 
         // ─── Doctor ───────────────────────────────────────────
-        Some(Commands::Doctor { json, repair, restore }) => {
+        Some(Commands::Doctor { json, repair, restore, measure, .. }) => {
             if !json {
                 outside_workspace_note(&cwd);
             }
             // Parser-independent: every branch must run BECAUSE the graph is broken.
-            if let Some(which) = restore {
+            if measure {
+                // F6: the budgets come from what this host delivers, measured, not from a number carried forward.
+                let Some(host) = base::doctor::host_claude_version() else {
+                    eprintln!("base doctor --measure: `claude --version` did not answer with a version; is Claude Code on PATH?");
+                    std::process::exit(1);
+                };
+                let exe = match std::env::current_exe() {
+                    Ok(p) => p,
+                    Err(e) => die("base doctor --measure: cannot find this binary for the measure hook", e),
+                };
+                // The runner is dropped, and its scratch directory removed, before anything below can
+                // `process::exit`, which skips destructors.
+                let outcome = base::measure::ClaudeRunner::new(exe).and_then(|mut runner| {
+                    base::measure::run(&cwd, &mut runner, &host, &mut std::io::stdout())
+                });
+                match outcome {
+                    Ok(base::measure::Outcome::Written) => {}
+                    Ok(base::measure::Outcome::NotWritten) => std::process::exit(1),
+                    Err(e) => die("base doctor --measure", e),
+                }
+            } else if let Some(which) = restore {
                 // --restore: workspace tier only (operator's corruptible graph).
                 let Some(base_dir) = base::config::find_workspace_base(&cwd) else {
                     eprintln!("doctor --restore: no workspace .base/ found from {}", cwd.display());
