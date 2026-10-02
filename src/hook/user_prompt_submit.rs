@@ -411,6 +411,13 @@ pub fn collect(
                         domain_def.is_always() && global.contains(id)
                     });
                 domain_served.extend(served);
+                // An always-on domain's CONTEXT block named the domain as served whenever it listed decisions, so the
+                // walk never listed the domain itself. Its decisions now have their own block and the CONTEXT is
+                // often empty, so the domain is marked here: the walk would otherwise add "domain GLOBAL" to blocks
+                // that reach it (measured on the BO-03 replay, 5 of 300 prompts).
+                if domain_def.is_always() {
+                    domain_served.insert(domain_walk_key(config, domain_def));
+                }
                 n
             }
             _ => String::new(),
@@ -739,6 +746,11 @@ pub fn collect(
         session_id: None, // populated by run() after handle returns
         ..Default::default()
     })
+}
+
+/// A domain's record in the walk's key form, `<iri>`.
+pub(crate) fn domain_walk_key(config: &BaseConfig, domain_def: &domain::DomainDef) -> String {
+    format!("<{}>", crate::crud::build_iri(&config.namespace, "domain", &crate::crud::slugify(&domain_def.name)))
 }
 
 /// The walk's F5 filter: a global decision filed only under always-on domains that this prompt does not name by

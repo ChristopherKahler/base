@@ -356,3 +356,24 @@ fn decision_update_refuses_keywords_outside_its_tier() {
     let json = base(&w, &["decision", "search", "--keyword", "moved", "--json"]);
     assert!(json.contains("\"kept\"") && !json.contains("\"new\""), "the keywords are as they were: {json}");
 }
+
+#[test]
+fn the_walk_does_not_list_an_always_on_domain_as_a_record() {
+    // Measured on BO-03's replay, 5 of 300 prompts: once GLOBAL's CONTEXT no longer lists decisions it is often empty,
+    // and it used to be what marked the domain as served, so the walk added "domain GLOBAL" to the blocks reaching it.
+    const NS: &str = "http://ops-sys.local/ontology#";
+    let w = workspace("");
+    let slug = log(&w, "GLOBAL", GRAZER);
+    // A second neighbour, so the walk has a record to print besides the domain.
+    let graph = w.ws.join(".base").join("graph.nq");
+    let mut text = std::fs::read_to_string(&graph).unwrap();
+    text.push_str(&format!(
+        "<{NS}project/probe> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{NS}Project> <{NS}graph/ws/work> .\n\
+         <{NS}project/probe> <{NS}name> \"Probe Project\" <{NS}graph/ws/work> .\n\
+         <{NS}decision/{slug}> <{NS}relatedTo> <{NS}project/probe> <{NS}graph/ws/work> .\n"
+    ));
+    std::fs::write(&graph, text).unwrap();
+    let out = prompt(&w, &format!("what does `{GRAZER}` mean for us"), "s-walk");
+    assert!(out.contains("Probe Project"), "control: the walk resolved the named decision and listed a neighbour:\n{out}");
+    assert!(!out.contains("domain    GLOBAL"), "the always-on domain is not listed as a record:\n{out}");
+}

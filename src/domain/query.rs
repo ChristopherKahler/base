@@ -375,6 +375,10 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
                     query_domain_from_graph(store, config, domain_def)
                 };
                 domain_served.extend(served);
+                // As the prompt hook does: an always-on domain is not listed by the walk as its own record.
+                if domain_def.is_always() {
+                    domain_served.insert(crate::hook::user_prompt_submit::domain_walk_key(config, domain_def));
+                }
                 (r, n)
             }
             None => (format_toml_rules(domain_def), String::new()),
