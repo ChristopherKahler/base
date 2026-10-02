@@ -536,9 +536,9 @@ pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<super::Part> {
             continue;
         }
         if task.kind == "task" {
-            open_tasks.push(format!("{} from {}", task.slug, sender(&task)));
-        } else if unanswered(&task) {
-            open_pings.push(format!("{} {}", sender(&task), super::clock(&task.created)));
+            open_tasks.push(format!("{} from {}", task.slug, sender(task)));
+        } else if unanswered(task) {
+            open_pings.push(format!("{} {}", sender(task), super::clock(&task.created)));
         }
     }
 

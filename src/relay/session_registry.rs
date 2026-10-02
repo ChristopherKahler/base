@@ -264,14 +264,14 @@ pub fn holders(title: &str) -> Vec<Holder> {
 pub fn holder_at(title: &str, at: chrono::DateTime<chrono::Local>) -> Option<String> {
     holders(title)
         .into_iter()
-        .filter(|h| parse_ts(&h.since).is_some_and(|t| t <= at))
-        .last()
+        .rev()
+        .find(|h| parse_ts(&h.since).is_some_and(|t| t <= at))
         .map(|h| h.session_id)
 }
 
 /// When `session_id` took `title`, if the history recorded it: the newest such line.
 pub fn held_since(title: &str, session_id: &str) -> Option<String> {
-    holders(title).into_iter().filter(|h| h.session_id == session_id).last().map(|h| h.since)
+    holders(title).into_iter().rev().find(|h| h.session_id == session_id).map(|h| h.since)
 }
 
 /// Short, distinct, easy-to-type codenames auto-assigned to unnamed sessions.
