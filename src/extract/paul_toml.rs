@@ -285,9 +285,11 @@ pub fn ingest_paul_projects(
         let mut extra_triples = String::new();
 
         if let Some(ref dir) = discovered_dir {
+            // F25b: one spelling, absolute with `/`, as every other writer stores a project folder.
+            let dir = crate::crud::project::absolute_path(dir, None, None).unwrap_or_else(|| dir.clone());
             extra_triples.push_str(&format!(
                 "      <{iri}> {p}:path \"{}\" .\n",
-                escape(dir)
+                escape(&dir)
             ));
         }
 
@@ -512,6 +514,7 @@ mod tests {
         };
 
         ingest_paul_projects(tmp.path(), &config, &with_phase(1, "build")).unwrap();
+        assert_eq!(field("path").as_deref(), Some("/nope/phased"), "F25b: the folder, `/`-separated");
         let first = field("nextActionAt").expect("a new phase line is dated");
         assert_eq!(field("nextAction").as_deref(), Some("Phase 1: build [active]"));
 

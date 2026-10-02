@@ -109,6 +109,9 @@ fn paul_json_resync_keeps_parent_and_nested() {
     write_paul_json(tmp.path(), "apps/myapp/.paul/paul.json", &json("1.1"));
     extract::sync(tmp.path(), &config, false).unwrap();
     let rec = base::crud::project::get_data(tmp.path(), &ns(), "myapp").unwrap().expect("myapp");
+    // The project's folder is the one holding `.paul`, stored absolute (F25b), not the paul.json file.
+    let want = base::crud::project::absolute_path(&tmp.path().join("apps").join("myapp").display().to_string(), None, None);
+    assert_eq!(rec.path, want, "{rec:?}");
     assert_eq!(rec.parent.as_deref(), Some("holder"), "parent kept: {rec:?}");
     assert!(rec.nested, "nested kept: {rec:?}");
     let trig = tmp.path().join(".base").join("graph.nq");

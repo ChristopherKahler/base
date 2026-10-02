@@ -28,7 +28,7 @@ use oxigraph::sparql::QueryResults;
 
 use crate::config::BaseConfig;
 use crate::crud;
-use crate::crud::project::{PathRoots, ProjectRecord, Refused};
+use crate::crud::project::{PathRoots, ProjectRecord, Refused, cell_text};
 use crate::domain::matcher::path_under;
 
 /// One proposed folder and what points at it.
@@ -149,6 +149,47 @@ fn local(p: &str) -> Option<PathBuf> {
     }
 }
 
+/// One spelling for a Windows folder whatever machine reads it: `/mnt/c/x` is `C:/x`. Every folder this module
+/// compares, tallies or proposes is in this form; [`local`] turns it into this machine's form only to open it.
+fn drive_form(p: &str) -> String {
+    let b = p.as_bytes();
+    if p.starts_with("/mnt/") && b.len() >= 6 && b[5].is_ascii_alphabetic() && (b.len() == 6 || b[6] == b'/') {
+        let rest = if b.len() > 7 { &p[7..] } else { "" };
+        return format!("{}:/{rest}", (b[5] as char).to_ascii_uppercase());
+    }
+    p.to_string()
+}
+
+/// Is `p` a folder this machine can check, and not there? A WSL path read from Windows is not missing: unchecked.
+pub(crate) fn is_missing(p: &str) -> bool {
+    local(p).is_some_and(|lp| !lp.exists())
+}
+
+/// The `.paul/paul.toml` or `.paul/paul.json` that makes a project a PAUL project: inside its folder, or the stored
+/// path itself when it names that file (`x/.paul/paul.json`, as `base sync` stored one before 0.16.0). Only a file
+/// this machine can open counts.
+pub(crate) fn paul_file(stored: &str) -> Option<String> {
+    let t = stored.trim_end_matches('/');
+    let folder = t.strip_suffix("/.paul/paul.json").or_else(|| t.strip_suffix("/.paul/paul.toml")).unwrap_or(t);
+    ["paul.toml", "paul.json"]
+        .iter()
+        .map(|f| format!("{folder}/.paul/{f}"))
+        .find(|f| local(f).is_some_and(|lp| lp.is_file()))
+}
+
+/// The project folder a PAUL file belongs to: the folder holding its `.paul`.
+pub(crate) fn paul_folder(file: &str) -> Option<String> {
+    let t = file.trim_end_matches('/');
+    t.strip_suffix("/.paul/paul.json").or_else(|| t.strip_suffix("/.paul/paul.toml")).map(str::to_string)
+}
+
+/// A path the operator may write from Windows without this machine opening it: a WSL path. Any other `/`-rooted
+/// path on Windows (`/Users/x`, a Git Bash `/c/x`) names no folder base can find, and is refused.
+fn wsl_shaped(p: &str) -> bool {
+    let low = p.to_ascii_lowercase();
+    low.starts_with("//wsl.localhost/") || low.starts_with("//wsl$/") || p.starts_with("/home/") || p.starts_with("/root/")
+}
+
 #[derive(Default)]
 struct Fs {
     kinds: HashMap<String, Option<Kind>>,
@@ -216,14 +257,25 @@ fn same(a: &str, b: &str) -> bool {
     path_under(a, b) && path_under(b, a)
 }
 
-/// `p` with everything from its first dot component on cut off: a path inside `.base`, `.cache`, `.git` or a
-/// worktree folder counts for the folder that holds the dot folder. `node_modules` (someone else's code) and the
-/// home folder's `AppData` (Windows' hidden app state) are cut the same way.
-fn above_dot_folders(p: &str, home: Option<&str>) -> String {
+/// `p` cut at its first dot folder, `AppData` (Windows' hidden app state) or `node_modules` (someone else's code): a
+/// path inside `.base`, `.cache`, `.git` or a worktree folder counts for the folder that holds it. Below the home
+/// folder or a workspace root (the deepest of `roots` holding `p`) only the parts after that root are looked at, so
+/// a workspace that itself sits under a temp folder keeps its own paths; a path under none of them is looked at whole.
+fn above_dot_folders(p: &str, roots: &[String]) -> String {
+    let start = roots
+        .iter()
+        .filter(|r| path_under(p, r))
+        .map(|r| r.split('/').filter(|c| !c.is_empty()).count())
+        .max()
+        .unwrap_or(0);
     let mut out = String::new();
+    let mut parts = 0;
     for (i, c) in p.split('/').enumerate() {
-        let app_data = c.eq_ignore_ascii_case("AppData") && home.is_some_and(|h| same(&out, h));
-        if (c.starts_with('.') && c != "." && c != "..") || c == "node_modules" || app_data {
+        if !c.is_empty() {
+            parts += 1;
+        }
+        let hidden = (c.starts_with('.') && c != "." && c != "..") || c == "node_modules" || c.eq_ignore_ascii_case("AppData");
+        if parts > start && hidden {
             break;
         }
         if i > 0 {
@@ -329,8 +381,6 @@ pub fn paths_in(text: &str, home: Option<&Path>) -> Vec<String> {
 
 struct Ctx {
     fs: Fs,
-    /// The home folder, resolved.
-    home: Option<String>,
     /// The home folder, its ancestors, Documents, Desktop, Downloads, every workspace root.
     fixed: Vec<String>,
     /// Every project's folder, resolved: (slug, folder).
@@ -371,9 +421,11 @@ impl Ctx {
     /// The folders a doc naming `point` counts for: the deepest folder that exists, and each folder above it,
     /// up to (not including) the first container.
     fn folders_for(&mut self, point: &str) -> Vec<String> {
-        // This machine's spelling, so `/mnt/c/x` and `C:/x` tally as one folder.
-        let Some(lp) = local(&above_dot_folders(point, self.home.as_deref())) else { return Vec::new() };
-        let mut cur = lp.to_string_lossy().replace('\\', "/");
+        // One spelling, so `/mnt/c/x` and `C:/x` tally as one folder and compare with the stored folders.
+        let mut cur = drive_form(&above_dot_folders(point, &self.fixed));
+        if local(&cur).is_none() {
+            return Vec::new();
+        }
         // The deepest folder that exists.
         loop {
             match self.fs.kind(&cur) {
@@ -431,10 +483,7 @@ fn project_docs(store: &oxigraph::store::Store, config: &BaseConfig, roots: &Pat
     if let Ok(QueryResults::Solutions(rows)) = crate::store::query(store, &sparql) {
         for r in rows.filter_map(|r| r.ok()) {
             let get = |k: &str| r.get(k).map(|t| crud::term_display(t.into()));
-            let g = r.get("g").and_then(|t| match t {
-                oxigraph::model::Term::NamedNode(n) => Some(n.as_str().to_string()),
-                _ => None,
-            });
+            let g = crate::crud::project::graph_cell(&r, "g");
             if let (Some(proj), Some(doc), Some(path)) = (get("proj"), get("doc"), get("path")) {
                 out.push((crud::slug_of(&proj), doc, roots.stored(&path, g.as_deref())));
             }
@@ -480,7 +529,6 @@ pub fn suggest(cwd: &Path, config: &BaseConfig) -> Result<Report> {
     }
     let mut ctx = Ctx {
         fs: Fs::default(),
-        home: home.clone(),
         fixed,
         folders: records.iter().filter_map(|r| r.path.clone().map(|p| (r.id.clone(), p))).collect(),
         parents: records.iter().filter_map(|r| r.parent.clone().map(|p| (r.id.clone(), p))).collect(),
@@ -589,7 +637,7 @@ pub fn suggest(cwd: &Path, config: &BaseConfig) -> Result<Report> {
         // A stored path that names a file, or reaches into a dot folder (`x/.paul/paul.json`), points at the
         // folder holding it: that folder is a candidate too, beside whatever the docs found.
         if let Some(s) = &now {
-            let holder = above_dot_folders(s, ctx.home.as_deref());
+            let holder = above_dot_folders(s, &ctx.fixed);
             if (holder != *s || ctx.fs.kind(s) == Some(Kind::File))
                 && let Some(h) = ctx.folders_for(&holder).into_iter().next()
             {
@@ -658,27 +706,23 @@ pub fn suggest(cwd: &Path, config: &BaseConfig) -> Result<Report> {
 
 // ─── Output ──────────────────────────────────────────────────
 
-fn cell(s: &str) -> String {
-    s.replace('|', "\\|")
-}
-
 /// The table `--suggest` prints.
 pub fn format_table(report: &Report) -> String {
     let mut out = String::new();
     out.push_str("| project | now | suggested folder | evidence |\n|---|---|---|---|\n");
     for s in &report.suggestions {
         let now = match &s.now {
-            Some(p) => format!("{} ({})", cell(p), s.reason),
+            Some(p) => format!("{} ({})", cell_text(p), s.reason),
             None => "(no folder)".to_string(),
         };
         match s.candidates.as_slice() {
             [] => out.push_str(&format!("| {} | {now} | none found | |\n", s.project)),
-            [c] => out.push_str(&format!("| {} | {now} | {} | {} |\n", s.project, cell(&c.folder), c.evidence())),
+            [c] => out.push_str(&format!("| {} | {now} | {} | {} |\n", s.project, cell_text(&c.folder), c.evidence())),
             many => {
                 let n = if many.len() == 2 { "TWO".to_string() } else { many.len().to_string() };
                 out.push_str(&format!("| {} | {now} | {n} CANDIDATES: | |\n", s.project));
                 for c in many {
-                    out.push_str(&format!("| | | {} | {} |\n", cell(&c.folder), c.evidence()));
+                    out.push_str(&format!("| | | {} | {} |\n", cell_text(&c.folder), c.evidence()));
                 }
             }
         }
@@ -762,14 +806,15 @@ pub struct Planned {
     pub not_checked: bool,
 }
 
-/// Read and check a reviewed list. Every line is checked before anything is written; any fault refuses the whole
-/// file, naming every faulty line.
+/// Read and check a reviewed list. Every line is checked, against one load of the store, before anything is
+/// written; any fault refuses the whole file, naming every faulty line.
 pub fn plan(cwd: &Path, config: &BaseConfig, file: &Path) -> Result<Vec<Planned>> {
     let ns = &config.namespace;
     let text = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let table: toml::Table = toml::from_str(&text)
         .map_err(|e| Refused(format!("{} is not a list of `\"slug\" = \"folder\"` lines: {e}", file.display())))?;
     let roots = PathRoots::new(cwd, ns);
+    let (records, _) = crud::project::list_data(cwd, config, &crate::scope::ProjectScope::All)?;
     let mut fs = Fs::default();
     let mut faults = Vec::new();
     let mut planned = Vec::new();
@@ -778,22 +823,27 @@ pub fn plan(cwd: &Path, config: &BaseConfig, file: &Path) -> Result<Vec<Planned>
             faults.push(format!("{slug}: the folder must be a quoted path"));
             continue;
         };
-        if crud::project::project_graph(cwd, ns, slug)?.is_none() {
+        let Some(record) = records.iter().find(|r| r.id == *slug) else {
             faults.push(format!("{slug}: no such project in this workspace"));
             continue;
-        }
+        };
         let Some(to) = roots.from_cli(raw) else {
             faults.push(format!("{slug}: '{raw}' names no folder"));
             continue;
         };
+        if cfg!(windows) && to.starts_with('/') && !to.starts_with("/mnt/") && !wsl_shaped(&to) {
+            faults.push(format!(
+                "{slug}: {to} is a Unix-style path Windows cannot open; write it as C:/... (or /home/... for a WSL project)"
+            ));
+            continue;
+        }
         let kind = fs.kind(&to);
         match kind {
             Some(Kind::Dir) | None => {}
             Some(Kind::File) => faults.push(format!("{slug}: {to} is a file, not a folder")),
             Some(Kind::Missing) => faults.push(format!("{slug}: {to} does not exist")),
         }
-        let from = crud::project::get_data(cwd, ns, slug)?.and_then(|r| r.path);
-        planned.push(Planned { project: slug.clone(), from, to, not_checked: kind.is_none() });
+        planned.push(Planned { project: slug.clone(), from: record.path.clone(), to, not_checked: kind.is_none() });
     }
     if !faults.is_empty() {
         return Err(Refused(format!("nothing was written; fix these lines first:\n  {}", faults.join("\n  "))).into());
@@ -801,33 +851,45 @@ pub fn plan(cwd: &Path, config: &BaseConfig, file: &Path) -> Result<Vec<Planned>
     Ok(planned)
 }
 
-/// `base project paths --apply <file> [--dry-run] [--json]`.
+/// `base project paths --apply <file> [--dry-run] [--json]`. Each line is reported as it is set, so a failure part
+/// way says which projects were already set and which were not.
 pub fn apply_cmd(cwd: &Path, config: &BaseConfig, file: &Path, dry_run: bool, json: bool) -> Result<()> {
     let planned = plan(cwd, config, file)?;
-    let mut lines = Vec::new();
-    for p in &planned {
+    let total = planned.len();
+    for (done, p) in planned.iter().enumerate() {
         let from = p.from.as_deref().unwrap_or("(none)");
         let note = if p.not_checked { " (a WSL path, not checked from this machine)" } else { "" };
         if dry_run {
-            lines.push(format!("would set {}: {from} → {}{note}", p.project, p.to));
+            if !json {
+                println!("would set {}: {from} → {}{note}", p.project, p.to);
+            }
             continue;
         }
         let change = crud::project::ProjectUpdate { path: Some(&p.to), ..Default::default() };
-        let outcome = crud::project::apply_update(cwd, &config.namespace, &p.project, &change)?;
-        let dom = match &outcome.repath {
-            Some(r) if r.domain_changed => format!(", domain '{}' trigger moved", r.name),
-            _ => String::new(),
-        };
-        lines.push(format!("{}: {from} → {}{dom}{note}", p.project, p.to));
+        let outcome = crud::project::apply_update(cwd, &config.namespace, &p.project, &change).with_context(|| {
+            let set: Vec<&str> = planned[..done].iter().map(|q| q.project.as_str()).collect();
+            format!(
+                "{}: not set. {done} of {total} were set before this ({}); the rest were not",
+                p.project,
+                if set.is_empty() { "none".to_string() } else { set.join(", ") }
+            )
+        })?;
+        if !json {
+            let dom = match &outcome.repath {
+                Some(r) if r.domain_changed => format!(", domain '{}' trigger moved", r.name),
+                _ => String::new(),
+            };
+            println!("{}: {from} → {}{dom}{note}", p.project, p.to);
+            for w in &outcome.warnings {
+                eprintln!("warning: {w}");
+            }
+        }
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "dry_run": dry_run, "projects": planned }))?);
     } else {
-        for l in &lines {
-            println!("{l}");
-        }
         let verb = if dry_run { "would be set" } else { "set" };
-        println!("{} project folder(s) {verb}.", planned.len());
+        println!("{total} project folder(s) {verb}.");
     }
     Ok(())
 }
@@ -864,15 +926,20 @@ mod tests {
 
     #[test]
     fn dot_folders_count_for_the_folder_above() {
-        let home = Some("C:/Users/x");
-        assert_eq!(above_dot_folders("C:/a/grazer/.worktrees/v/skills/grazer/SKILL.md", home), "C:/a/grazer");
-        assert_eq!(above_dot_folders("C:/Users/x/.base/forks/f.md", home), "C:/Users/x");
-        assert_eq!(above_dot_folders("C:/.hidden", home), "C:/");
-        assert_eq!(above_dot_folders("/home/u/p/x.md", home), "/home/u/p/x.md");
-        assert_eq!(above_dot_folders("C:/Users/x/AppData/Local/Temp/a.md", home), "C:/Users/x");
-        assert_eq!(above_dot_folders("C:/w/app/node_modules/pkg/README.md", home), "C:/w/app");
-        // Only the home folder's AppData: a fake home under another profile's temp folder keeps its paths.
-        assert_eq!(above_dot_folders("C:/Users/y/AppData/Local/Temp/w/p", home), "C:/Users/y/AppData/Local/Temp/w/p");
+        let roots = vec!["C:/Users/x".to_string(), "C:/Users/y/AppData/Local/Temp/.tmp1/ws".to_string()];
+        assert_eq!(above_dot_folders("C:/a/grazer/.worktrees/v/skills/grazer/SKILL.md", &roots), "C:/a/grazer");
+        assert_eq!(above_dot_folders("C:/Users/x/.base/forks/f.md", &roots), "C:/Users/x");
+        assert_eq!(above_dot_folders("C:/.hidden", &roots), "C:/");
+        assert_eq!(above_dot_folders("/home/u/p/x.md", &roots), "/home/u/p/x.md");
+        assert_eq!(above_dot_folders("C:/Users/x/AppData/Local/Temp/a.md", &roots), "C:/Users/x");
+        assert_eq!(above_dot_folders("C:/w/app/node_modules/pkg/README.md", &roots), "C:/w/app");
+        // Another profile's temp folder, outside every root: cut at its AppData.
+        assert_eq!(above_dot_folders("C:/Users/y/AppData/Local/Temp/w/p", &roots), "C:/Users/y");
+        // A workspace that sits in a temp folder keeps its own paths; only what is below it is looked at.
+        assert_eq!(
+            above_dot_folders("C:/Users/y/AppData/Local/Temp/.tmp1/ws/Documents/x/.git/HEAD", &roots),
+            "C:/Users/y/AppData/Local/Temp/.tmp1/ws/Documents/x"
+        );
     }
 
     #[test]
@@ -882,6 +949,19 @@ mod tests {
         assert_eq!(owner("base-ideation", &ids).map(String::as_str), Some("base"));
         assert_eq!(owner("basemode-gtm", &ids).map(String::as_str), Some("basemode"));
         assert_eq!(owner("bases", &ids), None);
+    }
+
+    #[test]
+    fn drive_form_spells_a_windows_folder_one_way() {
+        assert_eq!(drive_form("/mnt/c/Users/x"), "C:/Users/x");
+        assert_eq!(drive_form("/mnt/d"), "D:/");
+        assert_eq!(drive_form("/mnt/data/x"), "/mnt/data/x", "not a drive mount");
+        assert_eq!(drive_form("/home/u/p"), "/home/u/p");
+        assert_eq!(drive_form("C:/Users/x"), "C:/Users/x");
+        assert!(wsl_shaped("/home/u/p") && wsl_shaped("//wsl.localhost/Ubuntu/home/u"));
+        assert!(!wsl_shaped("/Users/x/proj") && !wsl_shaped("/c/Users/x"));
+        assert_eq!(paul_folder("C:/w/app/.paul/paul.toml").as_deref(), Some("C:/w/app"));
+        assert_eq!(paul_folder("C:/w/app"), None);
     }
 
     #[test]

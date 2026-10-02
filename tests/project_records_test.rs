@@ -221,6 +221,9 @@ fn nested_without_parent_warns() {
         "{err}"
     );
     assert_eq!(record(&s, "studio")["nested"], true, "stored anyway");
+    // Said once, when the setting is written: an update that touches neither parent nor nested says nothing.
+    let (_, _, err) = run_base(&s, &["project", "update", "studio", "--status", "blocked"]);
+    assert!(!err.contains("warning"), "{err}");
 
     // With a parent there is nothing to warn about.
     let (_, _, err) = run_base(&s, &["project", "update", "studio-client", "--parent", "studio", "--nested", "true"]);
@@ -276,6 +279,43 @@ fn relative_path_stored_absolute() {
     let paths: Vec<&str> = legacy_domain["paths"].as_array().unwrap().iter().filter_map(|p| p.as_str()).collect();
     assert_eq!(paths.len(), 1, "{paths:?}");
     assert!(same_path(paths[0], &stored(&s.ws.join("apps").join("web"))), "{paths:?}");
+
+    // A folder that is not there is stored as asked, and said.
+    let (code, _, err) = run_base(&s, &["project", "update", "legacy", "--path", "apps/nowhere"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("apps/nowhere does not exist on this machine"), "{err}");
+}
+
+/// A PAUL project's folder and next step come from its `.paul`, which the next session start or sync writes again:
+/// `update` still writes what it is asked, and says it will not last; doctor points at the file, not at a command
+/// whose result would be replaced.
+#[test]
+fn paul_projects_say_where_their_folder_and_step_come_from() {
+    let (_tmp, s) = fixture();
+    let phased = s.ws.join("apps").join("phased");
+    std::fs::create_dir_all(phased.join(".paul")).expect("folders");
+    std::fs::create_dir_all(s.ws.join("apps").join("other")).expect("folders");
+    std::fs::write(phased.join(".paul").join("paul.toml"), "name = \"phased\"\n").expect("paul.toml");
+    let g = ws_graph(&s);
+    append_quads(
+        &s,
+        &format!(
+            "{}<{NS}project/phased> <{NS}path> \"{}\" <{g}> .\n",
+            project_quads(&s, "phased", Some(("Phase 2: ship [active]", None))),
+            stored(&phased)
+        ),
+    );
+    let paul = format!("{}/.paul/paul.toml", stored(&phased));
+
+    let (_, out, _) = run_base(&s, &["doctor"]);
+    let line = out.lines().find(|l| l.contains("project phased:")).unwrap_or_else(|| panic!("{out}"));
+    assert!(contains(line, &format!("update: the phase in {paul} (base rewrites this step from it)")), "{line}");
+
+    let (code, _, err) = run_base(&s, &["project", "update", "phased", "--path", "apps/other", "--next-action", "mine"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(contains(&err, &format!("warning: phased's folder comes from {paul}")), "{err}");
+    assert!(contains(&err, &format!("warning: phased's next step comes from {paul}")), "{err}");
+    assert_eq!(record(&s, "phased")["next_action"], "mine", "written as asked");
 }
 
 /// F23a, F23b, Example 3: writing a next step records when; the list shows its age; an old one shows its days.
@@ -434,4 +474,12 @@ fn paths_suggest_lists_two_candidates() {
     let (code, _, err) = run_base(&s, &["project", "paths", "--apply", list.to_str().unwrap()]);
     assert_eq!(code, 1);
     assert!(err.contains("studio: ") && err.contains("Nowhere does not exist"), "{err}");
+
+    // A Unix-style path that is not a WSL one names no folder Windows can open, and is refused there; elsewhere it
+    // is a folder that does not exist.
+    std::fs::write(&list, "\"studio\" = \"/Users/nobody/proj\"\n").expect("edited");
+    let (code, _, err) = run_base(&s, &["project", "paths", "--apply", list.to_str().unwrap()]);
+    assert_eq!(code, 1, "{err}");
+    let why = if cfg!(windows) { "is a Unix-style path Windows cannot open" } else { "does not exist" };
+    assert!(err.contains("studio: /Users/nobody/proj") && err.contains(why), "{err}");
 }

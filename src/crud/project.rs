@@ -277,7 +277,7 @@ impl PathRoots {
 }
 
 /// A named graph's full IRI from a query row (`term_display` would cut it at the `#`).
-fn graph_cell(sol: &oxigraph::sparql::QuerySolution, key: &str) -> Option<String> {
+pub(crate) fn graph_cell(sol: &oxigraph::sparql::QuerySolution, key: &str) -> Option<String> {
     sol.get(key).and_then(|t| match t {
         oxigraph::model::Term::NamedNode(n) => Some(n.as_str().to_string()),
         _ => None,
@@ -464,7 +464,7 @@ pub fn list_data(
 }
 
 /// A markdown table cell: one line, no column breaks.
-fn cell_text(s: &str) -> String {
+pub(crate) fn cell_text(s: &str) -> String {
     s.replace(['\r', '\n'], " ").replace('|', "\\|")
 }
 
@@ -863,88 +863,117 @@ fn before_in(store: &oxigraph::store::Store, ns: &NamespaceConfig, iri: &str, gr
 }
 
 /// Write one project's changed fields in one graph write, then move its domain trigger when the path moved.
-/// A parent is checked (and refused) before anything is written. Every check reads one load of the store.
+///
+/// The checks (the project's graph, the parent and its loop, the fields before) and the write share one load of the
+/// store under the graph lock: two updates run at once cannot each pass the loop check and together close a loop,
+/// and the store is read once, not once per check.
 pub fn apply_update(cwd: &Path, ns: &NamespaceConfig, slug: &str, change: &ProjectUpdate) -> Result<UpdateOutcome> {
     let iri = crud::build_iri(ns, "project", slug);
-    let store = crud::load_workspace_graph(cwd)?;
-    let Some(graph) = project_graph_in(&store, cwd, ns, slug)? else {
-        anyhow::bail!("project '{slug}' not found in this workspace graph");
+    let roots = PathRoots::new(cwd, ns);
+    let new_path = match change.path {
+        Some(raw) => Some(roots.from_cli(raw).ok_or_else(|| Refused(format!("--path '{raw}' names no folder")))?),
+        None => None,
     };
     let p = &ns.prefix;
     let now = crud::now_iso();
     let lit = |s: &str| format!("\"{}\"", crud::escape_sparql_literal(s));
+    let trig = crud::workspace_graph_path(cwd)?;
 
-    let parent = match &change.parent {
-        Some(ParentChange::Set(want)) => Some(ParentChange::Set(check_parent_in(&store, ns, slug, want)?)),
-        other => other.clone(),
-    };
-    let new_path = match change.path {
-        Some(raw) => Some(
-            PathRoots::new(cwd, ns)
-                .from_cli(raw)
-                .ok_or_else(|| Refused(format!("--path '{raw}' names no folder")))?,
-        ),
-        None => None,
-    };
-    let Some(Before { name, path: old_path, parent: old_parent, nested: old_nested }) =
-        before_in(&store, ns, &iri, &graph)?
-    else {
-        anyhow::bail!("project '{slug}' not found in this workspace graph");
-    };
-    drop(store);
+    let (graph, before, parent) = crate::store::with_graph_lock(&trig, || {
+        let store = crate::store::load_or_empty(&trig)?;
+        let Some(graph) = project_graph_in(&store, cwd, ns, slug)? else {
+            anyhow::bail!("project '{slug}' not found in this workspace graph");
+        };
+        let parent = match &change.parent {
+            Some(ParentChange::Set(want)) => Some(ParentChange::Set(check_parent_in(&store, ns, slug, want)?)),
+            other => other.clone(),
+        };
+        let Some(before) = before_in(&store, ns, &iri, &graph)? else {
+            anyhow::bail!("project '{slug}' not found in this workspace graph");
+        };
 
-    let mut updates = Vec::new();
-    let mut set = |pred: &str, value: String| {
-        updates.push(crud::field_update(&graph, &iri, &format!("{p}:{pred}"), &value));
-    };
-    if let Some(s) = change.status {
-        set("status", lit(s));
-    }
-    if let Some(b) = change.blocked_by {
-        set("blockedBy", lit(b));
-    }
-    if let Some(n) = change.next_action {
-        set("nextAction", lit(n));
-        // F23a: a next step carries the time it was written.
-        set("nextActionAt", format!("\"{now}\"^^xsd:dateTime"));
-    }
-    if let Some(np) = &new_path {
-        set("path", lit(np));
-    }
-    if let Some(ParentChange::Set(ps)) = &parent {
-        set("parentProject", format!("<{}>", crud::build_iri(ns, "project", ps)));
-    }
-    if let Some(n) = change.nested {
-        set("nested", format!("\"{n}\"^^xsd:boolean"));
-    }
-    set("updatedAt", format!("\"{now}\"^^xsd:dateTime"));
-    set("lastActive", format!("\"{now}\"^^xsd:dateTime"));
-    if parent == Some(ParentChange::Clear) {
-        updates.push(format!("DELETE WHERE {{ GRAPH ?gg {{ <{iri}> {p}:parentProject ?old }} }}"));
-    }
-    crud::load_and_mutate(cwd, ns, &updates.join(" ;\n"))?;
+        let mut updates = Vec::new();
+        let mut set = |pred: &str, value: String| {
+            updates.push(crud::field_update(&graph, &iri, &format!("{p}:{pred}"), &value));
+        };
+        if let Some(s) = change.status {
+            set("status", lit(s));
+        }
+        if let Some(b) = change.blocked_by {
+            set("blockedBy", lit(b));
+        }
+        if let Some(n) = change.next_action {
+            set("nextAction", lit(n));
+            // F23a: a next step carries the time it was written.
+            set("nextActionAt", format!("\"{now}\"^^xsd:dateTime"));
+        }
+        if let Some(np) = &new_path {
+            set("path", lit(np));
+        }
+        if let Some(ParentChange::Set(ps)) = &parent {
+            set("parentProject", format!("<{}>", crud::build_iri(ns, "project", ps)));
+        }
+        if let Some(n) = change.nested {
+            set("nested", format!("\"{n}\"^^xsd:boolean"));
+        }
+        set("updatedAt", format!("\"{now}\"^^xsd:dateTime"));
+        set("lastActive", format!("\"{now}\"^^xsd:dateTime"));
+        if parent == Some(ParentChange::Clear) {
+            updates.push(format!("DELETE WHERE {{ GRAPH ?gg {{ <{iri}> {p}:parentProject ?old }} }}"));
+        }
+        let sparql = format!("{}\n{}", crud::prefixes(ns), updates.join(" ;\n"));
+        crate::store::update_and_write(&store, &trig, &sparql, crate::store::Scope::Target, crate::store::Intent::Knowledge)?;
+        Ok((graph, before, parent))
+    })?;
 
     let mut outcome = UpdateOutcome::default();
+    // A PAUL project's folder and next step come from its `.paul` folder, and the next session start or sync writes
+    // them again: say so rather than let the change quietly come undone.
+    let paul = before
+        .path
+        .as_deref()
+        .and_then(|raw| crate::crud::project_paths::paul_file(&roots.stored(raw, Some(&graph))));
+    if let Some(np) = &new_path {
+        if let Some(file) = &paul
+            && !crate::crud::project_paths::paul_folder(file).is_some_and(|f| crate::domain::matcher::path_under(np, &f) && crate::domain::matcher::path_under(&f, np))
+        {
+            outcome.warnings.push(format!(
+                "{slug}'s folder comes from {file}: the next session start or `base sync` sets it back unless that .paul folder moves too"
+            ));
+        }
+        if crate::crud::project_paths::is_missing(np) {
+            outcome.warnings.push(format!("{np} does not exist on this machine"));
+        }
+    }
+    if change.next_action.is_some()
+        && let Some(file) = &paul
+    {
+        outcome.warnings.push(format!(
+            "{slug}'s next step comes from {file}: the next session start or `base sync` replaces this one"
+        ));
+    }
     if let Some(np) = new_path {
         // The domain trigger follows the folder, as `project repath` always did.
         let domain_changed =
-            crate::domain::repath_trigger(cwd, &name, old_path.as_deref(), &np).unwrap_or(false);
-        outcome.repath = Some(RepathResult { name, old_path, new_path: np, domain_changed });
+            crate::domain::repath_trigger(cwd, &before.name, before.path.as_deref(), &np).unwrap_or(false);
+        outcome.repath = Some(RepathResult { name: before.name, old_path: before.path, new_path: np, domain_changed });
     }
-    let has_parent = match &parent {
-        Some(ParentChange::Set(_)) => true,
-        Some(ParentChange::Clear) => false,
-        None => old_parent.is_some(),
-    };
-    if change.nested.unwrap_or(old_nested) && !has_parent {
-        outcome.warnings.push(format!(
-            "{slug} has no parent, so nested = true does nothing until one is set: \
-             base project update {slug} --parent <slug>"
-        ));
+    // F25d: said when this update touches the link or the setting, not on every later update.
+    if change.nested.is_some() || change.parent.is_some() {
+        let has_parent = match &parent {
+            Some(ParentChange::Set(_)) => true,
+            Some(ParentChange::Clear) => false,
+            None => before.parent.is_some(),
+        };
+        if change.nested.unwrap_or(before.nested) && !has_parent {
+            outcome.warnings.push(format!(
+                "{slug} has no parent, so nested = true does nothing until one is set: \
+                 base project update {slug} --parent <slug>"
+            ));
+        }
     }
     Ok(outcome)
 }
-
 
 /// Lightweight (slug, display-name, stored-path) for every project — used by the
 /// folder-move nudge to match a moved directory against registered project paths.

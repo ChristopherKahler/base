@@ -512,8 +512,14 @@ pub fn stale_next_steps(cwd: &Path) -> Vec<String> {
             Some(d) if d > config.doctor.stale_next_days => format!("next step {d} days old"),
             Some(_) => continue,
         };
+        // A PAUL project's step is its phase line, rewritten from `.paul` at every session start: the fix is there,
+        // and `--next-action` would be replaced.
+        let fix = match r.path.as_deref().and_then(crate::crud::project_paths::paul_file) {
+            Some(file) => format!("update: the phase in {file} (base rewrites this step from it)"),
+            None => format!("update: base project update {} --next-action \"...\"", r.id),
+        };
         out.push(format!(
-            "project {id}: {what}: \"{step}\" · update: base project update {id} --next-action \"...\"",
+            "project {id}: {what}: \"{step}\" · {fix}",
             id = r.id,
             step = crate::crud::project::excerpt(next, 30),
         ));
