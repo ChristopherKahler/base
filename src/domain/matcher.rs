@@ -258,7 +258,10 @@ pub fn path_hits(domains: &[DomainDef], paths: &[String], ctx: &TriggerContext) 
     for (i, d) in domains.iter().enumerate().filter(|(_, d)| !d.is_always()) {
         by_slug.entry(crate::crud::slugify(&d.name)).or_insert(i);
     }
+    // Direct hits and parent hits are recorded apart: a domain reached as a parent through one path and owned (or
+    // held by its trigger) through another is a direct hit, labelled and ordered as one.
     let mut seen: HashSet<usize> = HashSet::new();
+    let mut parent_seen: HashSet<usize> = HashSet::new();
     let mut direct: Vec<PathHit> = Vec::new();
     let mut parents: Vec<PathHit> = Vec::new();
     for path in paths {
@@ -288,7 +291,8 @@ pub fn path_hits(domains: &[DomainDef], paths: &[String], ctx: &TriggerContext) 
         for o in &owned {
             for (child, parent) in nested_parents(o, &ctx.registered) {
                 if let Some(&i) = by_slug.get(&parent.slug)
-                    && seen.insert(i)
+                    && !seen.contains(&i)
+                    && parent_seen.insert(i)
                 {
                     // Named as the child's own block is headed: its domain's name, else the project's.
                     let child_name = by_slug.get(&child.slug).map_or_else(|| child.name.clone(), |&c| domains[c].name.clone());
@@ -297,6 +301,7 @@ pub fn path_hits(domains: &[DomainDef], paths: &[String], ctx: &TriggerContext) 
             }
         }
     }
+    parents.retain(|h| !seen.contains(&h.domain));
     direct.extend(parents);
     direct
 }
@@ -797,6 +802,10 @@ mod tests {
 
         let hits = path_hits(&domains, &["C:/Users/x/Documents/Studio/client/a.md".into()], &ctx);
         assert_eq!(hits.iter().map(|h| h.via.clone()).collect::<Vec<_>>(), vec![PathVia::Owner, PathVia::Parent("studio-client".into())]);
+        // Reached as a parent through one path and owned through the next: a direct hit, not a parent.
+        let two = ["C:/Users/x/Documents/Studio/client/a.md".to_string(), "C:/Users/x/Documents/Studio/brief.md".to_string()];
+        let vias: Vec<(usize, PathVia)> = path_hits(&domains, &two, &ctx).into_iter().map(|h| (h.domain, h.via)).collect();
+        assert_eq!(vias, vec![(2, PathVia::Owner), (0, PathVia::Owner)], "studio owns brief.md: {vias:?}");
     }
 
     /// D13: the walk climbs while each level says nested, stops at the first that does not, and stops on a loop.

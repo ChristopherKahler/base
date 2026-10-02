@@ -401,8 +401,12 @@ pub fn collect(
         // What this prompt serves, so the walk still resolves a rule this block held
         // back and does not list again one it serves.
         domain_served.extend(fresh.iter().filter_map(|(_, r)| r.iri.clone()));
-        let rules_text =
-            crate::domain::rules::render_block("DOMAIN", &fresh, rules.len(), &domain_def.name);
+        // D13: a domain that came only as a nested parent says whose parent it is, as the tool hook's block does.
+        let label = match &dm.parent_of {
+            Some(child) => format!("{} (parent of {child})", domain_def.name),
+            None => domain_def.name.clone(),
+        };
+        let rules_text = crate::domain::rules::render_block_as("DOMAIN", &label, &fresh, rules.len(), &domain_def.name);
 
         // An always-on domain's CONTEXT block named the domain as served whenever it listed decisions, so the walk
         // never listed the domain itself. Its decisions now have their own block and the CONTEXT is often empty, so

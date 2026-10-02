@@ -61,7 +61,14 @@ pub fn handle(
     let file_paths = extract_file_paths(event);
     // P1: every path this call touches, absolute. The tool's own paths above feed the code maps, the standards and
     // the rest exactly as before; this list decides which project's rules come with the call.
-    let touched = touched_paths(event, cwd, crate::home::home_root().as_deref(), &file_paths);
+    let named = touched_paths(event, cwd, crate::home::home_root().as_deref(), &file_paths);
+    // A Bash or PowerShell command that names no path touches the session's folder (Example 7), for the project and
+    // trigger match only: place rules and file keywords keep to what the call names.
+    let touched: Vec<String> = if named.is_empty() && tool_command(event).is_some() {
+        vec![cwd.display().to_string()]
+    } else {
+        named.clone()
+    };
     // Single SessionState lifecycle for the whole hook — rule marks, domain dedup
     // marks and AST-injected marks share one instance, saved once at the end (Q3).
     let base_dir = crate::config::find_workspace_base(cwd);
@@ -121,7 +128,7 @@ pub fn handle(
         let home_str = home.as_ref().map(|h| h.display().to_string());
         // The touched paths (P1), plus every path-shaped word of the command whether it exists or not, which is what
         // a place rule matched on before 0.16.0.
-        let mut paths: Vec<String> = touched.clone();
+        let mut paths: Vec<String> = named.clone();
         if let Some(cmd) = command {
             for p in crate::hook::automap::bash_paths(cmd, cwd, home.as_deref()) {
                 if let Some(s) = p.to_str()
@@ -188,7 +195,7 @@ pub fn handle(
                 .map(|s| domain::registered_projects(s, &config.namespace, cwd))
                 .unwrap_or_default(),
         };
-        let matched = match_by_file(&domains, &touched, &trigger_ctx);
+        let matched = match_by_file(&domains, &touched, &named, &trigger_ctx);
 
         for (domain_def, parent_of) in &matched {
             // Read the rules FIRST, then key the dedup on what came back.
@@ -248,7 +255,7 @@ pub fn handle(
                 domain::rules::render_block_as("FILE MATCH", &label, &fresh, rules.len(), &domain_def.name);
 
             // Query-triggered injection for filepath-matched domains
-            let query_text = match (&graph_store, &domain_def.query) {
+            let mut query_text = match (&graph_store, &domain_def.query) {
                 (Some(store), Some(query_name)) => {
                     let fmt = domain_def.query_format.as_deref().unwrap_or("list");
                     crate::domain::query::resolve_and_run_query(
@@ -257,6 +264,18 @@ pub fn handle(
                 }
                 _ => String::new(),
             };
+            // Once per session for the same output, as the rules are: with the session's folder standing in for a
+            // command that names no path, every shell call in a project would otherwise print it again.
+            if !query_text.is_empty() {
+                let key = format!("pre-tool-query:{}", domain_def.name);
+                let hash = domain::rules::content_hash(&query_text);
+                if session.is_injected(&key, hash) {
+                    query_text.clear();
+                } else {
+                    session.mark_injected(&key, hash);
+                    session_dirty = true;
+                }
+            }
 
             if !rules_text.is_empty() || !query_text.is_empty() {
                 if !rules_text.is_empty() {
@@ -450,6 +469,7 @@ fn is_source_file(path: &str) -> bool {
 fn match_by_file<'a>(
     domains: &'a [domain::DomainDef],
     paths: &[String],
+    named: &[String],
     ctx: &domain::matcher::TriggerContext,
 ) -> Vec<(&'a domain::DomainDef, Option<String>)> {
     let eligible = |d: &domain::DomainDef| d.auto_inject && !d.is_always();
@@ -465,13 +485,13 @@ fn match_by_file<'a>(
             _ => direct.push((d, None)),
         }
     }
-    // File keyword match: a keyword in a touched path (lightweight: a full content scan would read the file).
+    // File keyword match: a keyword in a path the call names (lightweight: a full content scan would read the file).
     for d in domains.iter().filter(|d| eligible(d)) {
         let listed = direct.iter().chain(&parents).any(|(x, _)| std::ptr::eq(*x, d));
         let file_kw_hit = d
             .file_keywords
             .iter()
-            .any(|kw| paths.iter().any(|fp| fp.to_lowercase().contains(&kw.to_lowercase())));
+            .any(|kw| named.iter().any(|fp| fp.to_lowercase().contains(&kw.to_lowercase())));
         if !listed && file_kw_hit {
             direct.push((d, None));
         }
@@ -480,10 +500,9 @@ fn match_by_file<'a>(
     direct
 }
 
-/// Every path a tool call touches, absolute, each once (P1): the tool's own file path (Read, Edit, Write, a notebook,
+/// Every path a tool call names, absolute, each once (P1): the tool's own file path (Read, Edit, Write, a notebook,
 /// a search's folder), a relative one joined to the session's folder; for Bash and PowerShell, every file or folder
-/// the command names ([`command_paths`]), or the session's folder itself when it names none, as `ls` alone lists the
-/// session's folder.
+/// the command names ([`command_paths`]). The caller stands the session's folder in for a command that names none.
 fn touched_paths(event: &serde_json::Value, cwd: &Path, home: Option<&Path>, file_paths: &[PathBuf]) -> Vec<String> {
     let mut out: Vec<PathBuf> = Vec::new();
     for p in file_paths {
@@ -491,11 +510,7 @@ fn touched_paths(event: &serde_json::Value, cwd: &Path, home: Option<&Path>, fil
         push_unique(&mut out, abs);
     }
     if let Some(cmd) = tool_command(event) {
-        let named = command_paths(cmd, cwd, home);
-        if named.is_empty() {
-            push_unique(&mut out, cwd.to_path_buf());
-        }
-        for p in named {
+        for p in command_paths(cmd, cwd, home) {
             push_unique(&mut out, p);
         }
     }

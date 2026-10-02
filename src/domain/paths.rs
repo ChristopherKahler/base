@@ -182,6 +182,7 @@ pub fn suggest(cwd: &Path) -> Report {
             let mut after: Vec<String> = Vec::new();
             let mut reasons: Vec<String> = Vec::new();
             let mut replaced_broad = false;
+            let reviewed_before = report.review.len();
             let mut review = |trigger: &str, why: String| {
                 report.review.push(Review { tier, domain: d.name.clone(), trigger: trigger.to_string(), why })
             };
@@ -206,6 +207,12 @@ pub fn suggest(cwd: &Path) -> Report {
                 }
                 let full = spelled(&resolved);
                 match project {
+                    // A relative trigger outside the project's folder names something else: written out in full.
+                    Some(p) if broad.is_empty() && !matcher::path_under(&resolved, &p.path) => {
+                        let missing = if exists_here(&full) == Some(false) { " (it does not exist)" } else { "" };
+                        reasons.push(format!("`{t}` is relative: written out as {full}{missing}"));
+                        push_place(&mut after, full, home_str.as_deref());
+                    }
                     Some(p) if folder_broad.is_empty() => {
                         let folder = spelled(&p.path);
                         reasons.push(if broad.is_empty() {
@@ -217,7 +224,7 @@ pub fn suggest(cwd: &Path) -> Report {
                         push_place(&mut after, folder, home_str.as_deref());
                     }
                     Some(p) => {
-                        push_place(&mut after, if broad.is_empty() { full } else { spelled(t) }, home_str.as_deref());
+                        push_place(&mut after, if broad.is_empty() { full } else { t.clone() }, home_str.as_deref());
                         if !broad.is_empty() {
                             review(
                                 t,
@@ -232,7 +239,7 @@ pub fn suggest(cwd: &Path) -> Report {
                         }
                     }
                     None if !broad.is_empty() => {
-                        push_place(&mut after, spelled(t), home_str.as_deref());
+                        push_place(&mut after, t.clone(), home_str.as_deref());
                         let why = if folderless {
                             format!(
                                 "holds {}, and project {slug} has no folder: base project update {slug} --path <dir>, then run this again",
@@ -256,7 +263,9 @@ pub fn suggest(cwd: &Path) -> Report {
             }
             let before_spelled: Vec<String> = d.paths.iter().map(|t| spelled(t)).collect();
             if after == d.paths || (after == before_spelled && reasons.is_empty() && auto_after == d.auto_inject) {
-                report.unchanged += 1;
+                if report.review.len() == reviewed_before {
+                    report.unchanged += 1;
+                }
                 continue;
             }
             report.changes.push(Change {
@@ -398,8 +407,10 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 /// Read and check a reviewed list. Every entry is checked before anything is written: the tier is `global` or
-/// `workspace` and its file holds the domain, one entry per domain, and every path is a full path (or `~`), not a
-/// pattern, and not broad for its domain (D1). Any fault refuses the whole file, naming every fault.
+/// `workspace` and its file holds the domain, one entry per domain, and every path it adds is a full path (or `~`),
+/// not a pattern, and not broad for its domain (D1); a path the domain already has, exactly as written, is kept
+/// unchecked, which is how a trigger listed for review survives the round trip. Any fault refuses the whole file,
+/// naming every fault.
 pub fn plan(cwd: &Path, file: &Path) -> Result<Vec<Planned>> {
     let text = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let list: ListFile = toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
@@ -431,6 +442,10 @@ pub fn plan(cwd: &Path, file: &Path) -> Result<Vec<Planned>> {
         }
         for p in &e.paths {
             let t = p.trim();
+            // Kept as the domain has it now: a trigger listed for review stays until someone decides it.
+            if d.paths.iter().any(|x| x.trim() == t) {
+                continue;
+            }
             if t.contains(['*', '?']) || !(matcher::is_absolute(t) || t == "~" || t.starts_with("~/") || t.starts_with("~\\")) {
                 faults.push(format!("{}: `{p}` is not a full path", e.name));
                 continue;

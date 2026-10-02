@@ -290,8 +290,20 @@ fn migration_rewrites_broad_and_relative_triggers() {
                 spelled(&root.join(".base").join("base.toml")),
             ]
         );
-        assert_eq!(change("alpha-app").after, vec![spelled(&root.join("Documents/alpha-app"))]);
-        assert!(report.review.is_empty(), "{:#?}", report.review);
+
+        // A topic domain with a broad trigger (listed for review, kept) and a relative file trigger (written out), and
+        // a project's relative trigger outside its own folder (written out, not replaced by the folder).
+        let toml_path = root.join(".base").join("domains.toml");
+        let mut file = std::fs::read_to_string(&toml_path).unwrap();
+        file.push_str("\n[[domain]]\nname = \"notes\"\npaths = [\"Documents\", \"Documents/Reference Tables 2026-09-17.md\"]\n");
+        assert!(file.contains("paths = [\"Documents/alpha-app\"]"), "old_shape made it relative: {file}");
+        file = file.replacen("paths = [\"Documents/alpha-app\"]", "paths = [\"Documents/alpha-app\", \"Documents/beta-app/notes.md\"]", 1);
+        std::fs::write(&toml_path, file).unwrap();
+        let report = base::domain::paths::suggest(root);
+        let change = |name: &str| report.changes.iter().find(|c| c.domain == name).unwrap_or_else(|| panic!("{name}: {report:#?}"));
+        assert_eq!(change("notes").after, vec!["Documents".to_string(), spelled(&root.join("Documents/Reference Tables 2026-09-17.md"))]);
+        assert_eq!(report.review.iter().map(|r| (r.domain.as_str(), r.trigger.as_str())).collect::<Vec<_>>(), vec![("notes", "Documents")]);
+        assert_eq!(change("alpha-app").after, vec![spelled(&root.join("Documents/alpha-app")), spelled(&root.join("Documents/beta-app/notes.md"))]);
 
         let list = root.join("paths.toml");
         std::fs::write(&list, base::domain::paths::format_list(&report)).unwrap();
@@ -375,6 +387,16 @@ fn bash_tokens_resolve_to_files() {
         assert_eq!(matched, vec!["vintryx-dealer-registry".to_string(), "vintrix".to_string()], "relative to the session's folder");
         let (matched, _) = tool(root, root, "Bash", serde_json::json!({ "command": "cat Documents/no-such-file.md" }));
         assert!(matched.is_empty(), "a word that names nothing on disk is not a touched path: {matched:?}");
+
+        let toml_path = root.join(".base").join("domains.toml");
+        let mut file = std::fs::read_to_string(&toml_path).unwrap();
+        file.push_str("\n[[domain]]\nname = \"kw\"\nfile_keywords = [\"dealer-registry\"]\nrules = [\"kw rule\"]\n");
+        std::fs::write(&toml_path, file).unwrap();
+        let registry = root.join("Documents/Vintryx/dealer-registry");
+        let (matched, _) = tool(root, &registry, "Bash", serde_json::json!({ "command": "echo hi" }));
+        assert!(!matched.contains(&"kw".to_string()), "a file keyword never matches the session's folder: {matched:?}");
+        let (matched, _) = tool(root, &registry, "Bash", serde_json::json!({ "command": "cat README.md" }));
+        assert!(matched.contains(&"kw".to_string()), "it matches a path the command names: {matched:?}");
     });
 }
 
@@ -423,10 +445,12 @@ fn prompt_hook_follows_the_same_owner_and_nested_rule() {
             writeln!(f, "{row}").unwrap();
             let config = BaseConfig::load(root);
             let event = serde_json::json!({ "prompt": "hello there", "session_id": "bo10-prompt" });
-            let matched = user_prompt_submit::handle(&config, root, &event, &mut String::new()).unwrap().domains_matched;
+            let mut out = String::new();
+            let matched = user_prompt_submit::handle(&config, root, &event, &mut out).unwrap().domains_matched;
             let want: Vec<String> =
                 if nested { vec!["vintryx-dealer-registry".into(), "vintrix".into()] } else { vec!["vintryx-dealer-registry".into()] };
             assert_eq!(matched, want, "nested = {nested}");
+            assert_eq!(out.contains("[DOMAIN: vintrix (parent of vintryx-dealer-registry)]"), nested, "{out}");
         });
     }
 }

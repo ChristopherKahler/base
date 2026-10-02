@@ -2902,6 +2902,7 @@ pub fn run() {
             DomainAction::Create { name, keyword, path } => {
                 match domain::create_domain(&cwd, global, &name, keyword.as_deref(), path.as_deref()) {
                     Ok(c) => println!("Domain '{name}' created ({} tier)", c.tier.label()),
+                    Err(e) if e.downcast_ref::<domain::TriggerRefused>().is_some() => die("Error", e),
                     Err(e) => die("Failed", e),
                 }
             }
