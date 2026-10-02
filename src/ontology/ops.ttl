@@ -194,6 +194,11 @@ ops:recall        rdf:type rdf:Property ;
                   rdfs:range xsd:string ;
                   rdfs:comment "Recall/trigger context for a decision" .
 
+ops:decisionKeyword rdf:type rdf:Property ;
+                  rdfs:domain ops:Decision ;
+                  rdfs:range xsd:string ;
+                  rdfs:comment "A word or phrase that serves this decision on a prompt containing it; a decision of an always-on domain with none is served at session start only (BO-03, F5)" .
+
 ops:ruleText      rdf:type rdf:Property ;
                   rdfs:domain ops:Rule ;
                   rdfs:range xsd:string ;

@@ -25,6 +25,7 @@ pub mod llm;
 pub mod multimodal;
 pub mod apply_ops;
 pub mod changelog;
+pub mod claude_md;
 pub mod command;
 pub mod config;
 pub mod crud;

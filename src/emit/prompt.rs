@@ -21,7 +21,7 @@
 //! so `base relay poll` prints nothing for a relay block the budget dropped.
 //!
 //! WHAT COUNTS AS SHOWN (D15). The hook records a rule as shown, a domain block or a walk name as
-//! injected, and the bracket block as served only when the block carrying that record was printed.
+//! injected, and a bracket rule as sent only when the block carrying that record was printed.
 //! Each block carries those records as [`Claim`]s, and the hook applies the claims of the blocks
 //! [`fit`] kept, after fitting. A dropped rule stays eligible for the next prompt. Until BO-01 the
 //! hook recorded everything it BUILT, before the cut, so a rule the cut removed was never sent again
@@ -71,8 +71,9 @@ pub enum Claim {
     Rule { id: String, content: u64, scope: Option<String> },
     /// A domain's block, or a walk name, was injected: `SessionState::mark_injected`.
     Injected { key: String, hash: u64 },
-    /// This tier's bracket block was shown: `SessionState::mark_bracket_block`.
-    BracketBlock,
+    /// One bracket rule was shown, once for the session (BO-03, F3): `SessionState::mark_rule_shown` under its
+    /// `session::bracket_rule_key`.
+    BracketRule { id: String, content: u64 },
 }
 
 /// One named block of the prompt hook's output.

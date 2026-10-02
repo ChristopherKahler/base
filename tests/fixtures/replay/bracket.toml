@@ -1,0 +1,16 @@
+# BO-03's replay config (tests/replay_test.rs, `bo03_session`), appended after base.toml. Synthetic bracket
+# rules: three carry `covered_by` lines that claude.md (this folder) holds, so they are never sent (F3); the
+# rest are sent once per session, each on the first prompt where its tier applies.
+[bracket.rules]
+always = [
+  "REPLAY_ALWAYS register the session before anything else, then read the registration back.",
+  { text = "REPLAY_R1 never hedge in prose; give a number from one to five.", covered_by = "### R1 — Confidence is a number" },
+]
+fresh = [
+  { text = "REPLAY_R2 a changed position names what changed it.", covered_by = "### R2 — Position changes are audited" },
+]
+moderate = [
+  { text = "REPLAY_R1R2 both still apply as context fills.", covered_by = ["### R1 —", "### R2 —"] },
+]
+depleted = ["REPLAY_DEPLETED write the handoff now, then keep working."]
+critical = ["REPLAY_CRITICAL stop, update the handoff and hand over."]

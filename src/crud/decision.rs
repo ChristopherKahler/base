@@ -85,6 +85,8 @@ pub struct DecisionRecord {
     pub domain: Option<String>,
     pub created: Option<String>,
     pub last_active: Option<String>,
+    /// Its keywords, sorted (BO-03, F5). Empty when it has none.
+    pub keywords: Vec<String>,
 }
 
 /// Query decision records (typed) matching a keyword across name/rationale/recall.
@@ -92,8 +94,9 @@ pub struct DecisionRecord {
 pub fn search_data(cwd: &Path, ns: &NamespaceConfig, keyword: &str) -> Result<Vec<DecisionRecord>> {
     let p = &ns.prefix;
     let kw_lower = crud::escape_sparql_literal(&keyword.to_lowercase());
+    let kw_pred = crate::domain::global_decisions::PRED_KEYWORD;
     let sparql = format!(
-        "SELECT ?d ?name ?rationale ?recall ?status ?created ?lastActive ?domain WHERE {{\n\
+        "SELECT ?d ?name ?rationale ?recall ?status ?created ?lastActive ?domain ?kw WHERE {{\n\
            GRAPH ?g {{\n\
              ?d a {p}:Decision ;\n\
                {p}:name ?name ;\n\
@@ -109,31 +112,42 @@ pub fn search_data(cwd: &Path, ns: &NamespaceConfig, keyword: &str) -> Result<Ve
                CONTAINS(LCASE(STR(?recall)), \"{kw_lower}\")\n\
              )\n\
            }}\n\
+           OPTIONAL {{ GRAPH ?kg {{ ?d {p}:{kw_pred} ?kw }} }}\n\
          }}"
     );
 
     let results = crud::load_and_query(cwd, ns, &sparql)?;
     let mut out: Vec<DecisionRecord> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // One row per keyword, so a decision's later rows add their keyword to the record its first row made.
+    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     if let QueryResults::Solutions(solutions) = results {
         for row in solutions.filter_map(|r| r.ok()) {
             let lit = |k: &str| row.get(k).map(|t| crud::term_display(t.into()));
             let iri = |k: &str| row.get(k).map(|t| crud::slug_of(&crud::term_display(t.into())));
             let Some(id) = iri("d") else { continue };
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            out.push(DecisionRecord {
-                id,
-                name: lit("name").unwrap_or_default(),
-                rationale: lit("rationale"),
-                recall: lit("recall"),
-                status: lit("status"),
-                domain: iri("domain"),
-                created: lit("created"),
-                last_active: lit("lastActive"),
+            let i = *at.entry(id.clone()).or_insert_with(|| {
+                out.push(DecisionRecord {
+                    id,
+                    name: lit("name").unwrap_or_default(),
+                    rationale: lit("rationale"),
+                    recall: lit("recall"),
+                    status: lit("status"),
+                    domain: iri("domain"),
+                    created: lit("created"),
+                    last_active: lit("lastActive"),
+                    keywords: Vec::new(),
+                });
+                out.len() - 1
             });
+            if let Some(kw) = lit("kw")
+                && !out[i].keywords.contains(&kw)
+            {
+                out[i].keywords.push(kw);
+            }
         }
+    }
+    for d in &mut out {
+        d.keywords.sort();
     }
     Ok(out)
 }
@@ -178,6 +192,25 @@ pub fn update(
     recall: Option<&str>,
     status: Option<&str>,
 ) -> Result<()> {
+    update_with(cwd, ns, slug, name, rationale, recall, status, None)
+}
+
+/// [`update`], plus the decision's keywords (BO-03, F5): `Some(list)` REPLACES every keyword the decision has
+/// with `list`, and `Some(&[])` clears them; `None` leaves them as they are. One write for every field.
+///
+/// A decision of an always-on domain is served on a prompt only when the prompt contains one of its keywords,
+/// and with none it is served at session start only (`domain::global_decisions`).
+#[allow(clippy::too_many_arguments)]
+pub fn update_with(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    slug: &str,
+    name: Option<&str>,
+    rationale: Option<&str>,
+    recall: Option<&str>,
+    status: Option<&str>,
+    keywords: Option<&[String]>,
+) -> Result<()> {
     let iri = crud::build_iri(ns, "decision", slug);
     let ws_slug = crud::workspace_slug(cwd);
     let graph = crud::workspace_graph_iri(ns, &ws_slug);
@@ -198,11 +231,46 @@ pub fn update(
     if let Some(v) = recall { field("recall", v); }
     if let Some(v) = status { field("status", v); }
 
+    if let Some(list) = keywords {
+        // The old keywords go from every graph, as `field_update` removes a single value wherever it is stamped,
+        // and the new ones go into this tier's graph. Both are conditioned on the decision's type triple being in
+        // that graph, as `field_update` is, and the write below refuses outright when it is not: an unconditional
+        // delete with a conditional insert would leave the decision with no keywords and print that it has some.
+        let pred = format!("{p}:{}", crate::domain::global_decisions::PRED_KEYWORD);
+        updates.push(format!(
+            "DELETE {{ GRAPH ?gg {{ <{iri}> {pred} ?old }} }}\n\
+             WHERE {{ GRAPH <{graph}> {{ <{iri}> a ?type }} GRAPH ?gg {{ <{iri}> {pred} ?old }} }}"
+        ));
+        if !list.is_empty() {
+            let values = list
+                .iter()
+                .map(|k| format!("\"{}\"", crud::escape_sparql_literal(k)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            updates.push(format!(
+                "INSERT {{ GRAPH <{graph}> {{ <{iri}> {pred} {values} }} }}\n\
+                 WHERE {{ GRAPH <{graph}> {{ <{iri}> a ?type }} }}"
+            ));
+        }
+    }
+
     updates.push(crud::field_update(&graph, &iri, &format!("{p}:updatedAt"), &format!("\"{now}\"^^xsd:dateTime")));
     updates.push(crud::field_update(&graph, &iri, &format!("{p}:lastActive"), &format!("\"{now}\"^^xsd:dateTime")));
 
     let sparql = updates.join(" ;\n");
-    crud::load_and_mutate(cwd, ns, &sparql)
+    if keywords.is_none() {
+        return crud::load_and_mutate(cwd, ns, &sparql);
+    }
+    crud::load_read_then_mutate(cwd, ns, |store| {
+        let ask = format!("{}\nASK {{ GRAPH <{graph}> {{ <{iri}> a ?type }} }}", crud::prefixes(ns));
+        match crate::store::query(store, &ask) {
+            Ok(QueryResults::Boolean(true)) => Ok(sparql),
+            _ => anyhow::bail!(
+                "decision '{slug}' is not in this tier's graph <{graph}>, so nothing was changed. Run the command from \
+                 the workspace that holds it, or `base decision -g update ...` for the global tier."
+            ),
+        }
+    })
 }
 
 pub fn delete(cwd: &Path, ns: &NamespaceConfig, keyword: &str) -> Result<usize> {
