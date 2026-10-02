@@ -81,10 +81,16 @@ pub struct ServedRule {
 /// Empty when nothing survived: a header with no rules under it costs the reader a
 /// line and tells them nothing.
 pub fn render_block(header: &str, shown: &[(usize, &ServedRule)], total: usize, domain: &str) -> String {
+    render_block_as(header, domain, shown, total, domain)
+}
+
+/// [`render_block`] with its own text after the header, `[FILE MATCH: vintrix (parent of vintryx-dealer-registry)]`
+/// (D13), while the pointer line still names the domain.
+pub fn render_block_as(header: &str, label: &str, shown: &[(usize, &ServedRule)], total: usize, domain: &str) -> String {
     if shown.is_empty() {
         return String::new();
     }
-    let mut out = format!("[{header}: {domain}]\n");
+    let mut out = format!("[{header}: {label}]\n");
     for (i, rule) in shown {
         out.push_str(&format!("  {i}. {}\n", rule.rendered));
     }
@@ -756,11 +762,16 @@ fn names_file(place: &str) -> bool {
 
 /// Does a touched `path` lie in `place` (F4)?
 ///
-/// Folders are the default. A file is a matcher only when the rule names that file, and then the path's trailing
-/// segments must be the place's segments. A relative folder names that folder wherever it sits, so `ping-chat-hub`
-/// and `Documents/renda-group` match on whole path segments, never on a substring. A `~` or absolute folder is
-/// resolved and compared with `path_under`, the seam the domain matcher uses.
+/// A `~` or absolute place, file or folder, is resolved and compared with `path_under`, the seam the domain matcher
+/// uses: the path is that file, or lies in that folder. `base rule add --path` writes only these (P7). A relative
+/// place keeps its F4 meaning: a file is a matcher only when the rule names that file, and then the path's trailing
+/// segments must be the place's segments; a relative folder names that folder wherever it sits, so `ping-chat-hub`
+/// and `Documents/studio` match on whole path segments, never on a substring.
 pub fn place_hit(path: &str, place: &str, home: Option<&str>) -> bool {
+    let t = place.trim();
+    if domain::matcher::is_absolute(t) || t == "~" || t.starts_with("~/") || t.starts_with("~\\") {
+        return domain::matcher::resolve_trigger(t, None, home).is_some_and(|r| domain::matcher::path_under(path, &r));
+    }
     let (pc, ac) = (path_components(place), path_components(path));
     if pc.is_empty() || ac.is_empty() || pc.len() > ac.len() {
         return false;
@@ -768,10 +779,6 @@ pub fn place_hit(path: &str, place: &str, home: Option<&str>) -> bool {
     let same = |a: &[&str], b: &[&str]| a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y));
     if names_file(place) {
         return same(&ac[ac.len() - pc.len()..], pc.as_slice());
-    }
-    let t = place.trim();
-    if domain::matcher::is_absolute(t) || t == "~" || t.starts_with("~/") || t.starts_with("~\\") {
-        return domain::matcher::resolve_trigger(t, None, home).is_some_and(|r| domain::matcher::path_under(path, &r));
     }
     ac.windows(pc.len()).any(|w| same(w, pc.as_slice()))
 }

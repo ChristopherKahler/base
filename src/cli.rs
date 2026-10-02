@@ -1312,6 +1312,10 @@ pub enum RuleAction {
         /// A folder, or a file the rule names (repeatable). Makes it a place rule
         #[arg(long)]
         place: Vec<String>,
+        /// A file or folder the rule is scoped to (repeatable): stored as its full path, the rule fires only when
+        /// that file or something under that folder is touched. For a project's domain it lies inside the project
+        #[arg(long)]
+        path: Vec<String>,
         /// A tool name, MCP tools included (repeatable). Makes it an action rule
         #[arg(long)]
         tool: Vec<String>,
@@ -1384,6 +1388,26 @@ pub enum DomainAction {
         keyword: Option<String>,
         #[arg(long)]
         path: Option<String>,
+    },
+    /// Make every path trigger an exact path, in both tiers: --suggest proposes one per domain (a project's domain
+    /// gets its project's folder; relative triggers are written out), --apply writes a reviewed list
+    #[command(group(clap::ArgGroup::new("mode").required(true).args(["suggest", "apply"])))]
+    Paths {
+        /// List the proposals (writes nothing)
+        #[arg(long)]
+        suggest: bool,
+        /// With --suggest: also write them as a list to review and pass to --apply
+        #[arg(long, requires = "suggest")]
+        out: Option<std::path::PathBuf>,
+        /// Set each listed domain's paths (and auto_inject) from a reviewed list
+        #[arg(long)]
+        apply: Option<std::path::PathBuf>,
+        /// With --apply: say what would change and write nothing
+        #[arg(long, requires = "apply")]
+        dry_run: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2839,8 +2863,28 @@ pub fn run() {
                     return;
                 }
                 match domain::add_trigger(&cwd, global, &name, keyword.as_deref(), path.as_deref()) {
-                    Ok(c) => println!("Trigger added to domain '{name}' ({} tier)", c.tier.label()),
+                    Ok(c) => {
+                        println!("Trigger added to domain '{name}' ({} tier)", c.tier.label());
+                        // P3: say the full path stored, since a relative one was expanded.
+                        if let Some(full) = path.as_deref().and_then(|p| domain::trigger_spelling(&cwd, global, p)) {
+                            println!("  path: {full}");
+                        }
+                    }
+                    Err(e) if e.downcast_ref::<domain::TriggerRefused>().is_some() => die("Error", e),
                     Err(e) => die("Failed", e),
+                }
+            }
+            DomainAction::Paths { suggest, out, apply, dry_run, json } => {
+                let r = if suggest {
+                    domain::paths::suggest_cmd(&cwd, out.as_deref(), json)
+                } else if let Some(file) = apply {
+                    domain::paths::apply_cmd(&cwd, &file, dry_run, json)
+                } else {
+                    unreachable!("clap requires --suggest or --apply")
+                };
+                if let Err(e) = r {
+                    let prefix = if e.downcast_ref::<domain::paths::Refused>().is_some() { "Error" } else { "Failed" };
+                    die(prefix, e);
                 }
             }
             DomainAction::List => domain::list_domains(&cwd, &config.namespace),
@@ -3447,7 +3491,13 @@ pub fn run() {
         Some(Commands::Rule { global, action }) => {
             let rule_cwd = tier_cwd(&cwd, global);
             match action {
-                RuleAction::Add { domain: name, text, rationale, supersedes, kind, place, tool, command, words } => {
+                RuleAction::Add { domain: name, text, rationale, supersedes, kind, place, path, tool, command, words } => {
+                    // P7: a --path is a place written as its full path, checked to lie inside the domain's project.
+                    let mut place = place;
+                    match crud::rule::scoped_places(&cwd, &name, &path) {
+                        Ok(full) => place.extend(full),
+                        Err(msg) => die("Error", msg),
+                    }
                     // F11: matchers are captured when the rule is created. A kind that needs a value it was not
                     // given is refused here, never stored as a matcher that cannot fire.
                     let matchers = match domain::rules::matchers_from_flags(&kind, &place, &tool, &command, words.as_deref()) {

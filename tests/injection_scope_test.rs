@@ -183,26 +183,28 @@ fn a_keyword_prompt_injects_that_domain_and_nothing_path_triggered() {
     });
 }
 
-/// A file this session touched fires the domain whose trigger covers it and nothing
-/// broader: `Documents/Meet Caddy` covers one registered project and fires; `Documents`
-/// covers three and is inert; a session that touched nothing gets GLOBAL only.
+/// A file this session touched brings its own project's domain and nothing broader (D1, 0.16.0): the triggers
+/// `Documents/Meet Caddy` and `.base-gbl` hold the projects that own those files, so they stop at the project folder
+/// (until 0.16.0 the first fired here and the second went inert); a session that touched nothing gets GLOBAL only.
 #[test]
 fn a_file_this_session_touched_fires_its_domain_and_nothing_broader() {
     let tmp = home(GLOBAL_DOMAINS);
     base::home::with_thread_home(tmp.path(), || {
         let root = tmp.path();
         register_operator_projects(root);
+        crud::rule::add(root, &ns(), "renda-group", "The project's own rule", None).unwrap();
+        crud::rule::add(root, &ns(), "handoffs", "The handoffs rule", None).unwrap();
         let config = BaseConfig::load(root);
 
         fresh(root);
         touch(root, "touched-caddy", "Documents/Meet Caddy/renda-group/notes.md");
         let matched = prompt(&config, root, "touched-caddy", "hello there");
-        assert_eq!(matched, vec!["GLOBAL".to_string(), "meet-caddy".to_string()]);
+        assert_eq!(matched, vec!["GLOBAL".to_string(), "renda-group".to_string()]);
 
         fresh(root);
         touch(root, "touched-gbl", ".base-gbl/handoffs/2026-09-07-x.md");
         let matched = prompt(&config, root, "touched-gbl", "hello there");
-        assert_eq!(matched, vec!["GLOBAL".to_string(), "base-config".to_string()]);
+        assert_eq!(matched, vec!["GLOBAL".to_string(), "handoffs".to_string()]);
 
         fresh(root);
         let matched = prompt(&config, root, "touched-nothing", "hello there");

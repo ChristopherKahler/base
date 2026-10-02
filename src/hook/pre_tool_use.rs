@@ -59,6 +59,9 @@ pub fn handle(
     }
 
     let file_paths = extract_file_paths(event);
+    // P1: every path this call touches, absolute. The tool's own paths above feed the code maps, the standards and
+    // the rest exactly as before; this list decides which project's rules come with the call.
+    let touched = touched_paths(event, cwd, crate::home::home_root().as_deref(), &file_paths);
     // Single SessionState lifecycle for the whole hook — rule marks, domain dedup
     // marks and AST-injected marks share one instance, saved once at the end (Q3).
     let base_dir = crate::config::find_workspace_base(cwd);
@@ -116,10 +119,17 @@ pub fn handle(
         let command = tool_command(event);
         let home = crate::home::home_root();
         let home_str = home.as_ref().map(|h| h.display().to_string());
-        let mut paths: Vec<String> = file_paths.iter().filter_map(|p| p.to_str().map(String::from)).collect();
+        // The touched paths (P1), plus every path-shaped word of the command whether it exists or not, which is what
+        // a place rule matched on before 0.16.0.
+        let mut paths: Vec<String> = touched.clone();
         if let Some(cmd) = command {
-            let named = crate::hook::automap::bash_paths(cmd, cwd, home.as_deref());
-            paths.extend(named.iter().filter_map(|p| p.to_str().map(String::from)));
+            for p in crate::hook::automap::bash_paths(cmd, cwd, home.as_deref()) {
+                if let Some(s) = p.to_str()
+                    && !paths.iter().any(|x| x == s)
+                {
+                    paths.push(s.to_string());
+                }
+            }
         }
         let keywords = HashMap::new();
         let cx = domain::rules::SelectContext {
@@ -138,9 +148,7 @@ pub fn handle(
         }
     }
 
-    // ─── Domain rule injection (file path match) ─────────────
     if !file_paths.is_empty() {
-
         // Track apps whose files are being edited this turn so the Stop hook can
         // refresh exactly those code maps — not just the session-cwd app. This is
         // what keeps blast-radius injection current: edits this turn → map refresh
@@ -169,11 +177,10 @@ pub fn handle(
                 crate::hook::automap::ensure_first_map(&root);
             }
         }
+    }
 
-        let file_path_strings: Vec<String> = file_paths
-            .iter()
-            .filter_map(|p| p.to_str().map(String::from))
-            .collect();
+    // ─── Domain rule injection: the touched file's project (P2, D13) ─────
+    if !touched.is_empty() {
         let trigger_ctx = domain::matcher::TriggerContext {
             home: crate::home::home_root().map(|h| h.display().to_string()),
             registered: graph_store
@@ -181,9 +188,9 @@ pub fn handle(
                 .map(|s| domain::registered_projects(s, &config.namespace, cwd))
                 .unwrap_or_default(),
         };
-        let matched = match_by_file(&domains, &file_path_strings, &trigger_ctx);
+        let matched = match_by_file(&domains, &touched, &trigger_ctx);
 
-        for domain_def in &matched {
+        for (domain_def, parent_of) in &matched {
             // Read the rules FIRST, then key the dedup on what came back.
             //
             // Until 0.16.0 this was the other way round: the key was
@@ -232,8 +239,13 @@ pub fn handle(
             if !fresh.is_empty() {
                 session_dirty = true;
             }
+            // D13: a parent's block says whose parent it is.
+            let label = match parent_of {
+                Some(child) => format!("{} (parent of {child})", domain_def.name),
+                None => domain_def.name.clone(),
+            };
             let rules_text =
-                domain::rules::render_block("FILE MATCH", &fresh, rules.len(), &domain_def.name);
+                domain::rules::render_block_as("FILE MATCH", &label, &fresh, rules.len(), &domain_def.name);
 
             // Query-triggered injection for filepath-matched domains
             let query_text = match (&graph_store, &domain_def.query) {
@@ -260,7 +272,9 @@ pub fn handle(
                 session_dirty = true;
             }
         }
+    }
 
+    if !file_paths.is_empty() {
         // ─── Markdown authoring guidance (Write/Edit on .md) ─────
         let tool_name = event
             .get("tool_name")
@@ -426,45 +440,130 @@ fn is_source_file(path: &str) -> bool {
     exts.iter().any(|ext| path.ends_with(ext))
 }
 
-/// Match domains by file path triggers and file_keywords against file content.
+/// The domains a tool call's touched paths bring in, in serving order, each with the project it is the nested parent
+/// of when that is why it came (D13): the touched file's project and the domains whose own trigger holds the file
+/// ([`domain::matcher::path_hits`], the one seam the prompt hook uses too), then the domains whose `file_keywords`
+/// appear in a touched path, then the parents, so a tight budget drops parent rules first.
+///
+/// `auto_inject = false` is honoured before any other test (F29 D3): this hook is the other automatic path. Always-on
+/// domains fire on the prompt, not here.
 fn match_by_file<'a>(
     domains: &'a [domain::DomainDef],
-    file_paths: &[String],
+    paths: &[String],
     ctx: &domain::matcher::TriggerContext,
-) -> Vec<&'a domain::DomainDef> {
-    domains
-        .iter()
-        .filter(|d| {
-            // `auto_inject = false` is honoured before any other test (F29 D3): this
-            // hook is the other automatic path, and a tool call under `Documents`
-            // used to serve the same block the prompt hook serves.
-            if !d.auto_inject {
-                return false;
+) -> Vec<(&'a domain::DomainDef, Option<String>)> {
+    let eligible = |d: &domain::DomainDef| d.auto_inject && !d.is_always();
+    let mut direct: Vec<(&domain::DomainDef, Option<String>)> = Vec::new();
+    let mut parents: Vec<(&domain::DomainDef, Option<String>)> = Vec::new();
+    for hit in domain::matcher::path_hits(domains, paths, ctx) {
+        let d = &domains[hit.domain];
+        if !eligible(d) {
+            continue;
+        }
+        match hit.via {
+            domain::matcher::PathVia::Parent(child) => parents.push((d, Some(child))),
+            _ => direct.push((d, None)),
+        }
+    }
+    // File keyword match: a keyword in a touched path (lightweight: a full content scan would read the file).
+    for d in domains.iter().filter(|d| eligible(d)) {
+        let listed = direct.iter().chain(&parents).any(|(x, _)| std::ptr::eq(*x, d));
+        let file_kw_hit = d
+            .file_keywords
+            .iter()
+            .any(|kw| paths.iter().any(|fp| fp.to_lowercase().contains(&kw.to_lowercase())));
+        if !listed && file_kw_hit {
+            direct.push((d, None));
+        }
+    }
+    direct.extend(parents);
+    direct
+}
+
+/// Every path a tool call touches, absolute, each once (P1): the tool's own file path (Read, Edit, Write, a notebook,
+/// a search's folder), a relative one joined to the session's folder; for Bash and PowerShell, every file or folder
+/// the command names ([`command_paths`]), or the session's folder itself when it names none, as `ls` alone lists the
+/// session's folder.
+fn touched_paths(event: &serde_json::Value, cwd: &Path, home: Option<&Path>, file_paths: &[PathBuf]) -> Vec<String> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in file_paths {
+        let abs = if domain::matcher::is_absolute(&p.to_string_lossy()) { p.clone() } else { cwd.join(p) };
+        push_unique(&mut out, abs);
+    }
+    if let Some(cmd) = tool_command(event) {
+        let named = command_paths(cmd, cwd, home);
+        if named.is_empty() {
+            push_unique(&mut out, cwd.to_path_buf());
+        }
+        for p in named {
+            push_unique(&mut out, p);
+        }
+    }
+    out.iter().map(|p| p.display().to_string()).collect()
+}
+
+fn push_unique(out: &mut Vec<PathBuf>, p: PathBuf) {
+    if !out.contains(&p) {
+        out.push(p);
+    }
+}
+
+/// The files and folders a Bash or PowerShell command names (P1): each word of each command it runs, wrappers taken
+/// off and quotes honoured ([`domain::rules::command_parts`]), that resolves to a file or folder that exists, absolute
+/// or relative to the session's folder; a `cd` re-bases the relative words after it, and `--flag=value` is read as its
+/// value. At most 64 words are looked at, so a long heredoc costs a bounded number of lookups.
+fn command_paths(cmd: &str, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    const MAX_WORDS: usize = 64;
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut base = cwd.to_path_buf();
+    let mut looked = 0usize;
+    for part in domain::rules::command_parts(cmd) {
+        let Some(first) = part.first() else { continue };
+        if matches!(domain::rules::program_name(first).as_str(), "cd" | "pushd" | "chdir" | "set-location" | "sl") {
+            if let Some(dir) = part.get(1).and_then(|w| resolve_word(w, &base, home)).filter(|p| p.is_dir()) {
+                push_unique(&mut out, dir.clone());
+                base = dir;
             }
-            // Skip always-on (those fire on user-prompt-submit, not here)
-            if d.is_always() {
-                return false;
+            continue;
+        }
+        for word in &part {
+            looked += 1;
+            if looked > MAX_WORDS {
+                return out;
             }
+            let w = word.split_once('=').filter(|(k, _)| k.starts_with('-')).map_or(word.as_str(), |(_, v)| v);
+            if let Some(p) = resolve_word(w, &base, home).filter(|p| p.exists()) {
+                push_unique(&mut out, p);
+            }
+        }
+    }
+    out
+}
 
-            // Path match: a touched file lies under a trigger resolved against the tier
-            // the domain came from — the one seam the prompt hook uses (F29), never a
-            // substring test.
-            let path_hit = d.paths.iter().any(|dp| {
-                domain::matcher::live_trigger(dp, d.root.as_deref(), ctx)
-                    .is_some_and(|t| file_paths.iter().any(|fp| domain::matcher::path_under(fp, &t)))
-            });
-
-            // File keyword match: check if any file_keywords appear in the file paths
-            // (lightweight — full content scan would require reading the file)
-            let file_kw_hit = d.file_keywords.iter().any(|kw| {
-                file_paths
-                    .iter()
-                    .any(|fp| fp.to_lowercase().contains(&kw.to_lowercase()))
-            });
-
-            path_hit || file_kw_hit
-        })
-        .collect()
+/// A command word as the path it would name, before anyone checks it exists. Flags, URLs, variables, globs and
+/// redirections are not paths. A network or WSL share (`\\wsl.localhost\...`) is never looked at: from Windows,
+/// opening one starts the WSL machine. `~` is `home`; Git Bash's `/c/...` is `C:/...` on Windows.
+fn resolve_word(word: &str, base: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let t = word.trim().trim_end_matches([',', ';']);
+    if t.is_empty() || t.starts_with('-') || t.contains("://") || t.contains(['*', '?', '$', '{', '}', '`', '<', '>', '|']) {
+        return None;
+    }
+    let slashed = t.replace('\\', "/");
+    if slashed.starts_with("//") {
+        return None;
+    }
+    if t == "~" || slashed.starts_with("~/") {
+        return home.map(|h| h.join(slashed.trim_start_matches('~').trim_start_matches('/')));
+    }
+    if cfg!(windows)
+        && let Some(rest) = slashed.strip_prefix('/')
+        && let Some((drive, tail)) = rest.split_once('/')
+        && drive.len() == 1
+        && drive.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return Some(PathBuf::from(format!("{}:/{}", drive.to_ascii_uppercase(), tail)));
+    }
+    Some(if domain::matcher::is_absolute(t) { PathBuf::from(t) } else { base.join(t) })
 }
 
 
@@ -607,6 +706,13 @@ fn extract_file_paths(event: &serde_json::Value) -> Vec<PathBuf> {
     if let Some(fp) = event
         .get("tool_input")
         .and_then(|ti| ti.get("path"))
+        .and_then(|v| v.as_str())
+    {
+        paths.push(PathBuf::from(fp));
+    }
+    if let Some(fp) = event
+        .get("tool_input")
+        .and_then(|ti| ti.get("notebook_path"))
         .and_then(|v| v.as_str())
     {
         paths.push(PathBuf::from(fp));

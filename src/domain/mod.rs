@@ -1,6 +1,7 @@
 pub mod global_decisions;
 pub mod link;
 pub mod matcher;
+pub mod paths;
 pub mod query;
 pub mod rules;
 pub mod session;
@@ -261,10 +262,12 @@ pub fn load_domains_file(path: &Path, root: Option<&Path>) -> Vec<DomainDef> {
     }
 }
 
-/// The registered projects as the trigger rules see them: every `ops:Project` with a
-/// path, resolved against the tier its record lives in (the workspace root for the
-/// workspace graph, home for every other graph) in the shape `resolve_trigger`
-/// produces, so a trigger and a project path compare (F29 step 6).
+/// The registered projects as the path rules see them: every `ops:Project`, its folder
+/// resolved against the tier its record lives in (the workspace root for the workspace
+/// graph, home for every other graph) in the shape `resolve_trigger` produces, so a
+/// trigger and a project folder compare (F29 step 6), with its slug, its parent link and
+/// `nested` (D13). A project with no folder is listed with an empty one: it owns nothing,
+/// and it can still be a parent.
 pub fn registered_projects(
     store: &oxigraph::store::Store,
     ns: &crate::config::NamespaceConfig,
@@ -272,12 +275,15 @@ pub fn registered_projects(
 ) -> Vec<matcher::Registered> {
     let p = &ns.prefix;
     let sparql = format!(
-        "{}\nSELECT ?g ?name ?path WHERE {{ GRAPH ?g {{ ?proj a {p}:Project ; {p}:name ?name ; {p}:path ?path }} }}",
+        "{}\nSELECT ?g ?proj ?name ?path ?parent ?nested WHERE {{ GRAPH ?g {{ ?proj a {p}:Project ; {p}:name ?name . \
+         OPTIONAL {{ ?proj {p}:path ?path }} OPTIONAL {{ ?proj {p}:parentProject ?parent }} \
+         OPTIONAL {{ ?proj {p}:nested ?nested }} }} }}",
         crate::crud::prefixes(ns)
     );
     let ws_graph = crate::crud::workspace_graph_iri(ns, &crate::crud::workspace_slug(cwd));
     let ws_root = crate::config::find_workspace_base(cwd).and_then(|b| b.parent().map(|r| r.display().to_string()));
     let home = crate::home::home_root().map(|h| h.display().to_string());
+    let project_iri = crate::crud::build_iri(ns, "project", "");
     let mut out = Vec::new();
     if let Ok(oxigraph::sparql::QueryResults::Solutions(rows)) = crate::store::query(store, &sparql) {
         for row in rows.filter_map(|r| r.ok()) {
@@ -287,17 +293,26 @@ pub fn registered_projects(
                     _ => None,
                 })
             };
-            let (Some(name), Some(path)) = (lit("name"), lit("path")) else {
+            let named = |k: &str| {
+                row.get(k).and_then(|t| match t.into() {
+                    oxigraph::model::TermRef::NamedNode(n) => Some(n.as_str().to_string()),
+                    _ => None,
+                })
+            };
+            let Some(name) = lit("name") else {
                 continue;
             };
-            let graph = row.get("g").and_then(|t| match t.into() {
-                oxigraph::model::TermRef::NamedNode(n) => Some(n.as_str().to_string()),
-                _ => None,
-            });
+            let slug = named("proj")
+                .and_then(|iri| iri.strip_prefix(&project_iri).map(String::from))
+                .unwrap_or_else(|| crate::crud::slugify(&name));
+            let parent = named("parent").and_then(|iri| iri.strip_prefix(&project_iri).map(String::from));
+            let nested = lit("nested").is_some_and(|v| v == "true");
+            let graph = named("g");
             let root = if graph.as_deref() == Some(ws_graph.as_str()) { ws_root.as_deref() } else { home.as_deref() };
-            if let Some(resolved) = matcher::resolve_trigger(&path, root, home.as_deref()) {
-                out.push(matcher::Registered { name, path: resolved });
-            }
+            let path = lit("path")
+                .and_then(|path| matcher::resolve_trigger(&path, root, home.as_deref()))
+                .unwrap_or_default();
+            out.push(matcher::Registered { name, path, slug, parent, nested });
         }
     }
     out
@@ -352,17 +367,13 @@ pub fn add_trigger(
         }
     };
 
-    // A trigger that cannot fire is refused before anything is written (F29 step 6): an
-    // unrooted path, or one that covers two or more registered projects.
-    if let Some(p) = path {
-        // The tier root is the parent of the tier dir the file sits in: `~/.base-gbl/
-        // domains.toml` roots at home, `<ws>/.base/domains.toml` at the workspace.
-        let root = toml_path.parent().and_then(Path::parent).map(|r| r.display().to_string());
-        let ctx = trigger_context(cwd);
-        if let Some(fault) = matcher::trigger_fault(p, root.as_deref(), &ctx) {
-            return Err(TriggerRefused(matcher::fault_sentence(domain_name, p, &fault)).into());
-        }
-    }
+    // P3: stored as its full path, and refused before anything is written when it cannot
+    // be rooted or holds other registered projects (D1).
+    let path = match path {
+        Some(p) => Some(checked_trigger(cwd, &toml_path, domain_name, p)?),
+        None => None,
+    };
+    let place = place_in(&toml_path);
 
     // Find or create domain
     let domain = if let Some(pos) = file.domain.iter().position(|d| d.name == domain_name) {
@@ -394,10 +405,11 @@ pub fn add_trigger(
     {
         domain.prompt_keywords.push(kw.to_string());
     }
+    // One trigger per place: `Documents/x` already written relative is the same trigger.
     if let Some(p) = path
-        && !domain.paths.contains(&p.to_string())
+        && !domain.paths.iter().any(|x| place(x).is_some_and(|px| Some(px) == place(&p)))
     {
-        domain.paths.push(p.to_string());
+        domain.paths.push(p);
     }
 
     // Atomic write via temp + rename
@@ -407,6 +419,84 @@ pub fn add_trigger(
     std::fs::rename(&tmp_path, &toml_path)?;
 
     Ok(tier::Changed { tier, count: 1 })
+}
+
+/// The full path `add-trigger` stores for `raw` in the tier `global` picks (P3), for the CLI to say what it wrote.
+pub fn trigger_spelling(cwd: &Path, global: bool, raw: &str) -> Option<String> {
+    let (toml_path, _) = tier::domains_toml_for_write(cwd, global);
+    let home = crate::home::home_root();
+    crate::crud::project::absolute_path(raw, toml_path.parent().and_then(Path::parent), home.as_deref())
+}
+
+/// The place a trigger in the domains.toml at `toml_path` names, resolved against that file's tier root, for
+/// comparing two spellings of one trigger.
+fn place_in(toml_path: &Path) -> impl Fn(&str) -> Option<String> {
+    let root = toml_path.parent().and_then(Path::parent).map(|r| r.display().to_string());
+    let home = crate::home::home_root().map(|h| h.display().to_string());
+    move |t: &str| matcher::resolve_trigger(t, root.as_deref(), home.as_deref())
+}
+
+/// `raw` as the full path a path trigger of `domain` is stored as (P3), or the refusal. Relative input is the tier
+/// root's, which is where a relative trigger in that file has always resolved: the workspace root, or home for the
+/// global tier; `~` is home. Refused, before anything is written, when it cannot be rooted (a glob, an empty path),
+/// or when it holds registered projects other than the domain's own project and its children (D1): the refusal
+/// names them and the domain's own folder.
+fn checked_trigger(cwd: &Path, toml_path: &Path, domain: &str, raw: &str) -> anyhow::Result<String> {
+    let root = toml_path.parent().and_then(Path::parent);
+    let home = crate::home::home_root();
+    let t = raw.trim();
+    let unrooted = || TriggerRefused(matcher::fault_sentence(domain, raw, &matcher::TriggerFault::Unrooted));
+    if t.contains(['*', '?']) {
+        return Err(unrooted().into());
+    }
+    let Some(full) = crate::crud::project::absolute_path(t, root, home.as_deref()) else {
+        return Err(unrooted().into());
+    };
+    let ctx = trigger_context(cwd);
+    let Some(resolved) = matcher::resolve_trigger(&full, None, ctx.home.as_deref()) else {
+        return Err(unrooted().into());
+    };
+    let broad = matcher::trigger_breadth(&resolved, domain, &ctx);
+    if broad.is_empty() {
+        return Ok(full);
+    }
+    let own = crate::crud::slugify(domain);
+    let folder = ctx.registered.iter().find(|r| r.slug == own && !r.path.is_empty());
+    // The domain's own project folder, holding a project not linked to it as a child: the fix is the link.
+    if folder.is_some_and(|f| matcher::path_under(&resolved, &f.path) && matcher::path_under(&f.path, &resolved)) {
+        return Err(TriggerRefused(format!(
+            "{full} is {domain}'s folder and also holds {} that {domain} is not the parent of: link each one first \
+             (base project update <slug> --parent {own}), then add the trigger.",
+            matcher::count_projects(&broad)
+        ))
+        .into());
+    }
+    let mut msg = format!(
+        "{full} contains {}. A trigger must be one project's own folder or a file.",
+        matcher::count_projects(&broad)
+    );
+    if let Some(folder) = folder {
+        let spelled = crate::crud::project::absolute_path(&folder.path, None, None).unwrap_or_else(|| folder.path.clone());
+        msg.push_str(&format!(" {domain}'s folder is {spelled}."));
+    }
+    Err(TriggerRefused(msg).into())
+}
+
+/// Set each listed domain's whole path list, and its `auto_inject`, in the domains.toml at `toml_path`: one read, one
+/// atomic write (`base domain paths --apply`, P6). A domain the file does not hold is an error, and nothing is written.
+pub fn set_paths(toml_path: &Path, entries: &[(String, Vec<String>, bool)]) -> anyhow::Result<()> {
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(toml_path)?)?;
+    for (name, paths, auto_inject) in entries {
+        let Some(d) = file.domain.iter_mut().find(|d| d.name == *name) else {
+            anyhow::bail!("no domain '{name}' in {}", toml_path.display());
+        };
+        d.paths = paths.clone();
+        d.auto_inject = *auto_inject;
+    }
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, toml_path)?;
+    Ok(())
 }
 
 /// Swap a path trigger on a domain: drop `old` (if present), add `new`. Used by
@@ -479,8 +569,9 @@ pub fn create_domain(
 
     let mut kws = Vec::new();
     if let Some(kw) = keyword { kws.push(kw.to_string()); }
+    // The same rule as `add-trigger` (P3): a full path, never one that holds other projects.
     let mut ps = Vec::new();
-    if let Some(p) = path { ps.push(p.to_string()); }
+    if let Some(p) = path { ps.push(checked_trigger(cwd, &toml_path, domain_name, p)?); }
 
     file.domain.push(DomainDef {
         name: domain_name.to_string(),
@@ -563,8 +654,11 @@ pub fn remove_trigger(
         removed += before - domain.prompt_keywords.len();
     }
     if let Some(p) = path {
+        // By the place it names, so `Documents/x` removes the `C:/.../Documents/x` that add-trigger stored (P3).
+        let place = place_in(&toml_path);
+        let target = place(p);
         let before = domain.paths.len();
-        domain.paths.retain(|pp| pp != p);
+        domain.paths.retain(|pp| pp != p && (target.is_none() || place(pp) != target));
         removed += before - domain.paths.len();
     }
     if removed == 0 {
