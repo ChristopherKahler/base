@@ -218,8 +218,8 @@ pub fn settle(title: &str, holder: &str, previous: Option<&str>) {
 
 /// Settle `title`'s inbox for `holder`, the session that holds the title now, and return the items addressed to it.
 ///
-/// - An item belongs to the session it was shown to, once shown, and before that to the session it was sent to
-///   ([`owner`]). One that belongs to another session is moved to that session's archive folder (F12b, F12c).
+/// - An item stays when it was sent to `holder` or shown to it ([`addressee`], [`shown_to`]). Any other is moved to the
+///   archive folder of the session that was shown it, or else the session it was sent to (F12b, F12c).
 /// - An item with no session id is placed by the title history: read as sent to whoever held the title when it was
 ///   written. When the history cannot say, it is archived with `previous`'s folder, or under `unknown`, and never
 ///   delivered (F12e).
@@ -241,19 +241,26 @@ fn sort_inbox(title: &str, holder: &str, previous: Option<&str>) -> Vec<(PathBuf
     let mut kept = Vec::new();
     let mut leaving: Vec<(PathBuf, InboxTask, String, Why)> = Vec::new();
     for (path, mut task) in items {
-        match owner(title, &task) {
-            Some(s) if s == holder => {
-                if task.status == "pending" && ping_is_stale(&task) {
-                    leaving.push((path, task, s, Why::Stale));
-                    continue;
-                }
-                if task.to_session.is_empty() {
-                    // Placed by the history: the item says so from now on.
-                    task.to_session = s;
-                    let _ = write_json_atomic(&path, &task);
-                }
-                kept.push((path, task));
+        let sent_to = addressee(title, &task);
+        let seen_by = shown_to(&task);
+        if sent_to.as_deref() == Some(holder) || seen_by.as_deref() == Some(holder) {
+            if task.status == "pending" && ping_is_stale(&task) {
+                leaving.push((path, task, holder.to_string(), Why::Stale));
+                continue;
             }
+            if task.to_session.is_empty()
+                && let Some(s) = sent_to
+            {
+                // Placed by the history: the item says so from now on.
+                task.to_session = s;
+                let _ = write_json_atomic(&path, &task);
+            }
+            kept.push((path, task));
+            continue;
+        }
+        // Filed with the session that was shown it, if one was, so that session gets it back if it takes the title
+        // back; otherwise with the session it was sent to.
+        match seen_by.or(sent_to) {
             Some(s) => leaving.push((path, task, s, Why::Passed)),
             None => leaving.push((path, task, previous.unwrap_or("unknown").to_string(), Why::Unplaced)),
         }
@@ -282,19 +289,24 @@ fn sort_inbox(title: &str, holder: &str, previous: Option<&str>) -> Vec<(PathBuf
     kept
 }
 
-/// The session an item belongs to: once shown, the session it was shown to; before that, the session it was sent to
-/// (`to_session`, or for an item that records none, the history's holder of the title when it was written). Sessions
-/// built after BO-05 are shown only what was sent to them, so the two agree; they differ only for what BO-04 showed a
-/// session that took a title over (an open task in full, unanswered pings in a line), which that session keeps.
-fn owner(title: &str, task: &InboxTask) -> Option<String> {
-    if matches!(task.status.as_str(), "delivered" | "superseded") && !task.last_loud_session.is_empty() {
-        return Some(task.last_loud_session.clone());
-    }
+/// The session an item was sent to: its `to_session`, or for an item that records none, the history's holder of the
+/// title when it was written.
+fn addressee(title: &str, task: &InboxTask) -> Option<String> {
     if task.to_session.is_empty() {
         parse_ts(&task.created).and_then(|t| super::session_registry::holder_at(title, t))
     } else {
         Some(task.to_session.clone())
     }
+}
+
+/// The session an item was shown to, once it was. An item stays with the title's holder when it was sent to it OR
+/// shown to it. After BO-05 a session is shown only what was sent to it, so the two agree; before, they could differ
+/// both ways: BO-04 showed a session that took a title over the previous holder's open task and unanswered pings (it
+/// keeps them), and a session that held a title for a while was shown what was sent to the holder before and after it
+/// (the holder keeps those).
+fn shown_to(task: &InboxTask) -> Option<String> {
+    (matches!(task.status.as_str(), "delivered" | "superseded") && !task.last_loud_session.is_empty())
+        .then(|| task.last_loud_session.clone())
 }
 
 /// A session that takes back a title it held gets back what it had been shown under it: an open task, an unanswered
@@ -1817,11 +1829,19 @@ mod tests {
             shown_to_b.status = "delivered".into();
             shown_to_b.last_loud_session = "sid-B".into();
             enqueue(&ns, &shown_to_b).unwrap();
+            // And the other way round: a ping sent to sid-B that a session holding the title for a while was shown.
+            let mut sent_to_b = sample_ping("ping", "heron", "caddy-backend", "sid-B", "sent to B, shown to X");
+            sent_to_b.status = "delivered".into();
+            sent_to_b.last_loud_session = "sid-X".into();
+            enqueue(&ns, &sent_to_b).unwrap();
             let listed = deliver("sid-B", Phase::SessionStart).expect("sid-B still lists its open task");
             assert!(listed.contains("relay: 1 open task (rebuild-auth-guard from api-session)"), "{listed}");
+            assert!(listed.contains("relay: 1 unanswered ping (heron "), "what was sent to sid-B stays with it:
+{listed}");
             bind("caddy-backend", "sid-C", home);
             assert!(deliver("sid-C", Phase::SessionStart).is_none());
-            assert_eq!(read_tasks_in(&archive_dir("caddy-backend", "sid-B").unwrap()).len(), 1, "in sid-B's folder");
+            assert_eq!(read_tasks_in(&archive_dir("caddy-backend", "sid-B").unwrap()).len(), 1, "the task, in sid-B's folder");
+            assert_eq!(read_tasks_in(&archive_dir("caddy-backend", "sid-X").unwrap()).len(), 1, "the ping, with the session shown it");
         });
     }
 
