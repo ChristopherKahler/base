@@ -182,10 +182,11 @@ pub fn list() -> Vec<SessionEntry> {
 // ─── Title history (BO-05, F12e) ─────────────────────────────
 //
 // `sessions.json` holds who has a title NOW. This file holds who had it before: one line each time a title binds to
-// a different session. It is what lets an inbox item that carries no session id be read as addressed to the session
-// that held its title when it was written, and what a notice names as the time the new holder took the title. It
-// starts empty the day this build is installed; an item written before a title's first line cannot be placed and is
-// archived, never delivered.
+// a different session, and one seed line for each title already held when this build first writes the registry. It
+// is what lets an inbox item that carries no session id be read as addressed to the session that held its title when
+// it was written, what says which session sent an item that does not record its sender's session, and what a notice
+// names as the time the new holder took the title. Nothing before a title's first line can be placed: an item from
+// then is archived, never delivered, and its sender is not told, since base cannot say which session sent it.
 
 /// One line of the title history: from `since`, `title` belonged to `session_id`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -435,7 +436,24 @@ fn save(reg: &SessionRegistry) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    write_json_atomic(&path, reg)
+    write_json_atomic(&path, reg)?;
+    seed_history(reg);
+    Ok(())
+}
+
+/// Give each title the history has no line for one line: its holder, from now. The history records only changes of
+/// holder, so a title one session has held since before this build would never get a line, and nothing sent to or by
+/// it could be placed by time. From the first registry write after the install, every title can be (BO-05, F12e).
+/// Called under the registry lock, from [`save`].
+fn seed_history(reg: &SessionRegistry) {
+    let Some(path) = history_path() else { return };
+    let known: std::collections::BTreeSet<String> = read_history(&path).into_iter().map(|h| h.title).collect();
+    let now = now_iso();
+    for e in reg.sessions.values() {
+        if !e.session_id.is_empty() && !known.contains(&e.title) {
+            record_holder(&e.title, &e.session_id, &now);
+        }
+    }
 }
 
 /// Lockfile mutex over the registry file. Mirrors [`RelayStore::with_lock`] —

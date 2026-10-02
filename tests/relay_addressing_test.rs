@@ -268,17 +268,21 @@ fn title_changes_between_send_and_delivery() {
 /// when it was written, by the title history. Placed on the holder, it is delivered and records the id; placed on an
 /// earlier holder, it is archived in that holder's folder; with no history that far back it cannot be known, so it
 /// is archived, never delivered: under `unknown` when no title changed hands, with the previous holder's inbox when
-/// one did. Each sender is told.
+/// one did. A sender is told when the history also says which session sent the item, and only then.
 #[test]
 fn legacy_ping_without_session_id() {
     let s = fixture("legacy");
     register(&s, BISON, "sess-bison");
+    register(&s, "seed-heron", "sess-heron");
     register(&s, KITE, "sess-2");
-    // The history as it reads after the title passed from session 1 to session 2 an hour ago.
+    // The history as it reads after the title passed from session 1 to session 2 an hour ago, with bison held by one
+    // session for six hours. heron's history starts now.
     let history = inbox_root(&s).parent().unwrap().join("title-history.jsonl");
     let mut lines = std::fs::read_to_string(&history).unwrap();
-    for (session, since) in [("sess-1", hours_ago(3)), ("sess-2", hours_ago(1))] {
-        lines.push_str(&serde_json::json!({ "title": KITE, "session_id": session, "since": since }).to_string());
+    for (title, session, since) in
+        [(KITE, "sess-1", hours_ago(3)), (KITE, "sess-2", hours_ago(1)), (BISON, "sess-bison", hours_ago(7))]
+    {
+        lines.push_str(&serde_json::json!({ "title": title, "session_id": session, "since": since }).to_string());
         lines.push('\n');
     }
     std::fs::write(&history, lines).unwrap();
@@ -286,14 +290,20 @@ fn legacy_ping_without_session_id() {
     legacy_ping(&s, KITE, "ping-legacy-now", BISON, "written while session 2 held it", &hours_ago(0));
     legacy_ping(&s, KITE, "ping-legacy-earlier", BISON, "written while session 1 held it", &hours_ago(2));
     legacy_ping(&s, KITE, "ping-legacy-unknown", BISON, "written before any history", &hours_ago(5));
+    legacy_ping(&s, KITE, "ping-legacy-heron", "seed-heron", "heron's, from before heron's history", &hours_ago(2));
 
     let shown = prompt(&s, "sess-2");
     assert!(shown.contains("written while session 2 held it"), "{shown}");
     assert!(!shown.contains("written while session 1 held it") && !shown.contains("before any history"), "{shown}");
     let kept = inbox(&s, KITE).into_iter().find(|t| t["slug"] == "ping-legacy-now").expect("delivered, kept");
     assert_eq!(kept["to_session"], "sess-2", "the item records the session the history placed it on");
-    assert_eq!(archive(&s, KITE, "sess-1").len(), 1, "placed on session 1, archived in its folder");
+    assert!(!shown.contains("heron's, from before"), "{shown}");
+    assert_eq!(archive(&s, KITE, "sess-1").len(), 2, "placed on session 1, archived in its folder");
     assert_eq!(archive(&s, KITE, "unknown").len(), 1, "cannot be known: archived, not delivered");
+    // The history places bison's items on bison's one session, so bison is told. It cannot say which session sent
+    // heron's (heron's history starts now), so heron is not: telling heron's holder might tell a session that never
+    // sent it.
+    assert!(notices(&s, "seed-heron").is_empty(), "{:?}", notices(&s, "seed-heron"));
     let told: Vec<String> = notices(&s, BISON).iter().map(|n| text(n, "summary")).collect();
     assert_eq!(told.len(), 2, "{told:?}");
     assert!(told.iter().any(|t| t.contains("seed-kite was session sess-1, which no longer holds it")), "{told:?}");

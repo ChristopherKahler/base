@@ -325,16 +325,24 @@ impl Drop for SettleLock {
     }
 }
 
-/// The session a notice to `from` goes to: the session that sent the item, if it still holds the sender's title; the
-/// title's holder when the item does not say which session sent it; nobody when the sending session no longer holds its
-/// title (a later holder of the title never sent it), when the sender has no title, or when the sender's title is the
-/// one that passed (its holder is the session the item did not reach).
-fn notice_to(from: &str, from_session: &str, title: &str) -> Option<String> {
+/// The session a notice about `task` goes to: the session that sent it, while that session still holds the sender's
+/// title. Which session sent it is the item's `from_session`, or, for an item that does not record one (a script's
+/// `--from`, a binary from before BO-05), the session the title history says held the sender's title when it was sent.
+/// Nobody is told when that cannot be established, when the sending session no longer holds its title (a later holder
+/// never sent it: telling it would repeat F12 the other way round), when the sender has no title, or when the
+/// sender's title is the one that passed (its holder is the session the item did not reach).
+fn notice_to(task: &InboxTask, title: &str) -> Option<String> {
+    let from = task.from.as_str();
     if super::threadless(from) || from == NOTICE_FROM || from == title {
         return None;
     }
     let holder = super::session_registry::resolve(from)?.session_id;
-    (from_session.is_empty() || holder == from_session).then_some(holder)
+    let sent_by = if task.from_session.is_empty() {
+        parse_ts(&task.created).and_then(|t| super::session_registry::holder_at(from, t))
+    } else {
+        Some(task.from_session.clone())
+    };
+    (sent_by.as_deref() == Some(holder.as_str())).then_some(holder)
 }
 
 /// Tell each sender what of theirs was archived without being shown: one notice per sender, folder and reason, in the
@@ -344,7 +352,7 @@ fn tell_senders(title: &str, holder: &str, archived: &[Archived]) {
     let mut groups: std::collections::BTreeMap<(String, String, PathBuf, Why), Vec<&Archived>> =
         std::collections::BTreeMap::new();
     for a in archived {
-        let Some(to) = notice_to(&a.task.from, &a.task.from_session, title) else { continue };
+        let Some(to) = notice_to(&a.task, title) else { continue };
         groups.entry((a.task.from.clone(), to, a.folder.clone(), a.why)).or_default().push(a);
     }
     for ((from, to, folder, why), items) in groups {
@@ -1664,7 +1672,8 @@ mod tests {
     }
 
     /// F12d: the notice goes to the session that sent the ping. When that session no longer holds the sender's title,
-    /// the title's later holder never sent it and is not told; the archive keeps the ping either way.
+    /// the title's later holder never sent it and is not told; when base cannot say which session sent it, nobody is
+    /// told. The archive keeps the ping either way.
     #[test]
     fn a_notice_reaches_the_sending_session_never_a_later_holder_of_its_title() {
         with_home(|home| {
@@ -1678,13 +1687,23 @@ mod tests {
             bind("lynx", "sid-L2", home);
             assert_eq!(read_tasks_in(&archive_dir("lynx", "sid-L1").unwrap()).len(), 1, "archived");
             assert!(notices("bison").is_empty(), "the second bison never sent it, so it is not told");
-            // A ping that does not say which session sent it (a script's --from) tells the title's holder.
+            // A ping that does not say which session sent it (a script's --from) is placed by the title history: sent
+            // while sid-bison-2 held bison, so sid-bison-2 is told.
             bind("lynx", "sid-L3", home);
             enqueue(&ns, &sample_ping("ping", "bison", "lynx", "sid-L3", "from a script")).unwrap();
             bind("lynx", "sid-L4", home);
             let told = notices("bison");
             assert_eq!(told.len(), 1, "{told:?}");
             assert_eq!(told[0].to_session, "sid-bison-2");
+            // One from before bison's first history line (a binary from before BO-05): which session sent it cannot
+            // be known, so nobody is told, and the archive keeps it.
+            let mut legacy = sample_ping("ping", "bison", "lynx", "sid-L4", "from before the history");
+            legacy.slug = "ping-legacy".into();
+            legacy.created = hours_ago(3);
+            enqueue(&ns, &legacy).unwrap();
+            bind("lynx", "sid-L5", home);
+            assert_eq!(read_tasks_in(&archive_dir("lynx", "sid-L4").unwrap()).len(), 1, "archived");
+            assert_eq!(notices("bison").len(), 1, "no second notice: {:?}", notices("bison"));
         });
     }
 
@@ -1719,6 +1738,7 @@ mod tests {
             bind("lynx", "sid-L", home);
             let mut old = sample_ping("ping", "heron", "lynx", "sid-L", "a question from the day before");
             old.created = days_ago(2);
+            old.from_session = "sid-H".into();
             enqueue(&ns, &old).unwrap();
             assert!(deliver("sid-L", Phase::Prompt).is_none(), "a stale ping is not shown");
             assert_eq!(read_tasks_in(&archive_dir("lynx", "sid-L").unwrap()).len(), 1, "it is archived");
