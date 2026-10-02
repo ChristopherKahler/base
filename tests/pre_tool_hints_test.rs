@@ -369,11 +369,9 @@ paths = [".github/workflows"]
     assert_eq!(standards_for(&s, &apps.mapped.join("railway.toml"), "railway up --service web", "bo07-pre-1"), vec!["A12"]);
     assert_eq!(standards_for(&s, &apps.mapped.join("notes.md"), "railway up --service web", "bo07-pre-2"), Vec::<String>::new());
     let workflow = apps.mapped.join(".github").join("workflows").join("ci.yml");
-    // A3 declared code only, so a workflow file is out of its scope. (A12 may score here: it takes the seed's deploy
-    // scope, and its ci-deploy class matches `.github/workflows` on a `/` path. On Windows the matcher's path markers
-    // see backslashes and miss, a separate, older defect, so only A3's absence is asserted.)
-    let got = standards_for(&s, &workflow, "run: npx playwright test", "bo07-pre-3");
-    assert!(!got.contains(&"A3".to_string()), "A3 declared code only: {got:?}");
+    // The same on both OSes: A12 takes the seed's deploy scope and scores through its ci-deploy class (the
+    // `.github/workflows` marker, matched on a `/` path everywhere since BO-07); A3 declared code only and stays off.
+    assert_eq!(standards_for(&s, &workflow, "run: npx playwright test", "bo07-pre-3"), vec!["A12"]);
     let spec = apps.mapped.join("tests").join("smoke.spec.ts");
     assert_eq!(standards_for(&s, &spec, "import { test } from 'playwright';", "bo07-pre-4"), vec!["A3"]);
     let (code, out, err) = seed::run_base(&s, &["standards", "get", "A12"]);

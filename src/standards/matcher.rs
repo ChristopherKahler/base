@@ -118,10 +118,11 @@ const CLASSES: &[(&str, &[&str], &[&str])] = &[
 
 #[derive(Debug)]
 pub struct FileContext {
-    /// Lowercased full path — for path-marker matching.
+    /// The full path, lowercased and with `/` separators: what every path test reads (the semantic classes' markers,
+    /// `triggers.paths`, `applies_to.paths`). A Windows path arrives with backslashes, and until BO-07 it was matched
+    /// as it came, so on Windows no marker with a `/` in it (`routes/`, `.github/workflows`, `migrations/`) ever
+    /// matched (F26c; lynx's ruling, 2026-10-02).
     pub path_lower: String,
-    /// The path with `/` separators, for `applies_to.paths` (F26c). Case is kept; the match ignores it.
-    pub path_slash: String,
     /// The file's extension, lower case, no dot. `None` for `Dockerfile`, `.env` and the like.
     pub extension: Option<String>,
     /// Basename for the rendered block header.
@@ -141,7 +142,7 @@ pub struct FileContext {
 /// files (Write) match before they exist.
 pub fn build_context(file_path: &Path, edit_payload: &str) -> FileContext {
     let path_str = file_path.to_string_lossy().to_string();
-    let path_lower = path_str.to_lowercase();
+    let path_lower = normalize_path(&path_str);
     let display = file_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -160,7 +161,6 @@ pub fn build_context(file_path: &Path, edit_payload: &str) -> FileContext {
     let classes = classify(&path_lower, &haystack);
 
     FileContext {
-        path_slash: path_str.replace('\\', "/"),
         extension: file_extension(file_path),
         path_lower,
         display,
@@ -268,22 +268,28 @@ pub fn in_scope(standard: &StandardDef, ctx: &FileContext) -> bool {
         || ctx
             .language
             .is_some_and(|lang| a.languages.iter().chain(languages).any(|l| l.eq_ignore_ascii_case(lang)))
-        || a.paths.iter().any(|p| path_matches(p, &ctx.path_slash))
+        || a.paths.iter().any(|p| path_matches(p, &ctx.path_lower))
+}
+
+/// A path or path marker in the one form every path test compares: `/` separators, lower case.
+pub fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
 }
 
 /// One `applies_to.paths` pattern against a `/`-separated path, ignoring case. A pattern with no `/` is matched
 /// against the file name alone (`Dockerfile*`, `.env*`); one with a `/` against the whole path, from any folder
 /// down unless it starts at a root (`.github/workflows/**` matches `C:/repo/.github/workflows/ci.yml`).
-pub fn path_matches(pattern: &str, path_slash: &str) -> bool {
+pub fn path_matches(pattern: &str, path: &str) -> bool {
     let pattern = pattern.replace('\\', "/");
+    let path = path.replace('\\', "/");
     let opts = glob::MatchOptions { case_sensitive: false, require_literal_separator: true, require_literal_leading_dot: false };
     if !pattern.contains('/') {
-        let name = path_slash.rsplit('/').next().unwrap_or(path_slash);
+        let name = path.rsplit('/').next().unwrap_or(&path);
         return glob::Pattern::new(&pattern).is_ok_and(|p| p.matches_with(name, opts));
     }
     let rooted = pattern.starts_with('/') || pattern.starts_with("**") || pattern.get(1..2) == Some(":");
     let full = if rooted { pattern } else { format!("**/{pattern}") };
-    glob::Pattern::new(&full).is_ok_and(|p| p.matches_with(path_slash, opts))
+    glob::Pattern::new(&full).is_ok_and(|p| p.matches_with(&path, opts))
 }
 
 /// Score one standard against the context. None = excluded or zero signal.
@@ -314,7 +320,7 @@ pub fn score(standard: &StandardDef, ctx: &FileContext) -> Option<u32> {
         .iter()
         .filter(|c| ctx.classes.iter().any(|fc| fc == c))
         .count() as u32;
-    let path_hit = t.paths.iter().any(|p| ctx.path_lower.contains(&p.to_lowercase()));
+    let path_hit = t.paths.iter().any(|p| ctx.path_lower.contains(&normalize_path(p)));
 
     let mut s = 0u32;
     s += W_CONTENT * content_hits.min(MAX_CONTENT_HITS);
@@ -452,11 +458,10 @@ mod tests {
     }
 
     fn ctx(path: &str, haystack: &str) -> FileContext {
-        let path_lower = path.to_lowercase();
+        let path_lower = normalize_path(path);
         let classes = super::classify(&path_lower, haystack);
         FileContext {
             language: detect_language(&path_lower),
-            path_slash: path.replace('\\', "/"),
             extension: file_extension(Path::new(path)),
             path_lower,
             display: path.rsplit('/').next().unwrap_or(path).to_string(),
@@ -659,6 +664,29 @@ mod tests {
         assert!(path_matches(r"**\api\**", "api/routes/users.ts"), "a backslash pattern reads as a slash");
         assert!(!path_matches("**/api/**", "/srv/app/src/llm.rs"));
         assert!(!path_matches("**/api/**", "/srv/app/apiary/x.rs"), "a folder whose name only starts with api");
+    }
+
+    /// F26c on Windows (lynx's ruling, 2026-10-02): a path with backslashes matches the semantic classes' markers and a
+    /// standard's path triggers exactly as the same path with slashes does. Built from a literal backslash string, so
+    /// it runs the same on both OSes.
+    #[test]
+    fn backslash_paths_match_path_markers() {
+        let windows = build_context(Path::new(r"C:\repo\.github\workflows\ci.yml"), "");
+        let unix = build_context(Path::new("/repo/.github/workflows/ci.yml"), "");
+        assert!(windows.classes.contains(&"ci-deploy"), "{:?}", windows.classes);
+        assert_eq!(windows.classes, unix.classes);
+        assert_eq!(windows.language, Some("yaml"));
+
+        let s = std_with_triggers(
+            "P1",
+            "high",
+            TriggerDef { paths: vec!["routes/".into()], content: vec!["x_marker".into()], ..Default::default() },
+        );
+        let windows = build_context(Path::new(r"C:\app\routes\web.php"), "x_marker");
+        let unix = build_context(Path::new("/app/routes/web.php"), "x_marker");
+        assert_eq!(score(&s, &windows), Some(W_CONTENT + W_PATH), "content and the path trigger");
+        assert_eq!(score(&s, &windows), score(&s, &unix));
+        assert!(path_matches(".github/workflows/**", r"C:\repo\.github\workflows\ci.yml"));
     }
 
     #[test]
