@@ -1507,6 +1507,8 @@ enum LockOpenFailure {
     Held,
     /// The transient lock family ([`crate::changelog::is_transient_lock`]). Waited
     /// out like a held lock, never reaped: there may be no file to read a pid from.
+    /// The one exception is a folder that refuses every new file; see
+    /// [`TRANSIENT_PROBE_AFTER`].
     ///
     /// The case that put it here (BO-23): on Windows, creating a file another
     /// writer has just deleted, while that delete is still pending, fails with
@@ -1528,6 +1530,46 @@ fn classify_lock_open_failure(e: &std::io::Error) -> LockOpenFailure {
         LockOpenFailure::Transient
     } else {
         LockOpenFailure::Fatal
+    }
+}
+
+/// Transient failures in a row before the lock asks whether its folder accepts new
+/// files at all.
+///
+/// The family is waited out because, on Windows, it is usually another writer's
+/// delete still pending on the lock file, which clears in an attempt or two. But
+/// the same family holds a real permission fault: on Linux `EACCES` from a folder
+/// this user cannot write, on Windows an ACL that denies it. Waited out, that
+/// fault cost the full bound on every attempt, and `post_tool_use` takes this lock
+/// for every tier on every tool call, so a stall of 10 s per call per tier. After
+/// five in a row (about 75 ms of backoff) one probe file beside the lock decides:
+/// a folder that takes it is waiting on this one file, so the wait goes on to the
+/// deadline; a folder that refuses it fails now, naming the fault.
+const TRANSIENT_PROBE_AFTER: u32 = 5;
+
+/// Whether the lock's folder lets this process create a new file: a probe file
+/// beside the lock, removed at once. It goes through the loop's own open, so the
+/// tests reach both answers.
+///
+/// A name collision counts as yes. The only file by that name is another thread of
+/// this process probing (or one it left behind), and either way the folder took it.
+fn folder_accepts_new_files(
+    lock: &Path,
+    open: &mut impl FnMut(&Path) -> std::io::Result<fs::File>,
+) -> bool {
+    let mut name = lock
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".probe-{}", std::process::id()));
+    let probe = lock.with_file_name(name);
+    match open(&probe) {
+        Ok(fh) => {
+            drop(fh);
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(e) => e.kind() == std::io::ErrorKind::AlreadyExists,
     }
 }
 
@@ -1555,6 +1597,7 @@ fn lock_graph_with(
 
     let deadline = std::time::Instant::now() + wait;
     let mut backoff = std::time::Duration::from_millis(5);
+    let mut transient_streak = 0u32;
     loop {
         let e = match open(&lock) {
             Ok(mut fh) => {
@@ -1567,18 +1610,35 @@ fn lock_graph_with(
             }
             Err(e) => e,
         };
-        let failure = classify_lock_open_failure(&e);
-        match failure {
+        // What a timeout carries as its cause: the OS error after a transient
+        // failure, nothing after a held lock (the message already says it).
+        let cause = match classify_lock_open_failure(&e) {
             LockOpenFailure::Held => {
+                transient_streak = 0;
                 if reap_stale_lock(&lock) {
                     continue;
                 }
+                None
             }
-            LockOpenFailure::Transient => {}
+            LockOpenFailure::Transient => {
+                transient_streak += 1;
+                if transient_streak == TRANSIENT_PROBE_AFTER
+                    && !folder_accepts_new_files(&lock, &mut open)
+                {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "taking the graph lock {}: its folder refuses new files too, so this \
+                             is a permission fault, not another writer",
+                            lock.display()
+                        )
+                    });
+                }
+                Some(e)
+            }
             LockOpenFailure::Fatal => {
                 return Err(e).with_context(|| format!("taking the graph lock {}", lock.display()));
             }
-        }
+        };
         if std::time::Instant::now() >= deadline {
             let timeout = format!(
                 "timed out after {}s ({} bound) waiting for the graph lock {} — another \
@@ -1587,13 +1647,9 @@ fn lock_graph_with(
                 if wait == LOCK_WAIT_BULK { "bulk" } else { "hot-path" },
                 lock.display()
             );
-            // A held lock bails exactly as it always has. A transient error that
-            // outlives the wait keeps the OS error as the cause: same message, and
-            // a real permission fault (a folder this user cannot write) is still
-            // named in the chain instead of being blamed on another writer.
-            return Err(match failure {
-                LockOpenFailure::Transient => anyhow::Error::new(e).context(timeout),
-                _ => anyhow::anyhow!(timeout),
+            return Err(match cause {
+                Some(e) => anyhow::Error::new(e).context(timeout),
+                None => anyhow::anyhow!(timeout),
             });
         }
         std::thread::sleep(backoff);
@@ -2225,13 +2281,22 @@ mod tests {
         assert!(!holds_graph_lock());
     }
 
+    /// The lock file alone refuses (its delete pending, or a handle on it), in a
+    /// folder that takes new files: waited out to the deadline, past the probe.
     #[test]
     fn graph_lock_times_out_on_persistent_access_denied() {
         let (_dir, graph) = lock_target();
-        let mut calls = 0;
-        let err = lock_graph_with(&graph, std::time::Duration::from_millis(60), |_| {
-            calls += 1;
-            Err(access_denied())
+        let lock = lock_path(&graph);
+        let (mut lock_opens, mut probes) = (0u32, 0u32);
+        // 300 ms: long enough to pass the probe (about 75 ms of backoff) and keep going.
+        let err = lock_graph_with(&graph, std::time::Duration::from_millis(300), |path| {
+            if path == lock.as_path() {
+                lock_opens += 1;
+                Err(access_denied())
+            } else {
+                probes += 1;
+                create_lock_file(path)
+            }
         })
         .err()
         .expect("an access-denied that never clears must fail at the deadline");
@@ -2246,11 +2311,51 @@ mod tests {
             !message.contains("taking the graph lock"),
             "the access-denied was returned at once instead of waited out: {message}"
         );
-        assert!(calls > 1, "the open was tried {calls} time(s); it must be retried");
-        // The OS error is kept as the cause, so a real permission fault is named.
+        assert!(
+            lock_opens > TRANSIENT_PROBE_AFTER,
+            "the open was tried {lock_opens} time(s); it must go on past the probe"
+        );
+        assert_eq!(probes, 1, "the folder is probed once");
+        let leftovers: Vec<_> = fs::read_dir(lock.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "the probe was left behind: {leftovers:?}");
+        // The OS error is kept as the cause.
         let cause = err.chain().nth(1).expect("the OS error is the cause").to_string();
         assert!(cause.contains(&access_denied().to_string()), "cause: {cause}");
         assert!(!holds_graph_lock());
+    }
+
+    /// A folder that refuses every new file is a permission fault (Linux `EACCES`
+    /// on a folder this user cannot write, a Windows ACL), not contention: it fails
+    /// after the probe, never at the 10 s bound, and says what it is.
+    #[test]
+    fn graph_lock_fails_when_the_folder_refuses_new_files() {
+        let (_dir, graph) = lock_target();
+        let lock = lock_path(&graph);
+        let (mut lock_opens, mut probes) = (0u32, 0u32);
+        let err = lock_graph_with(&graph, LOCK_WAIT, |path| {
+            if path == lock.as_path() {
+                lock_opens += 1;
+            } else {
+                probes += 1;
+            }
+            Err(access_denied())
+        })
+        .err()
+        .expect("a folder that refuses every file must fail");
+
+        assert_eq!(lock_opens, TRANSIENT_PROBE_AFTER, "tries before the probe");
+        assert_eq!(probes, 1, "one probe decides");
+        let message = err.to_string();
+        assert!(
+            message.starts_with("taking the graph lock") && message.contains("permission fault"),
+            "got: {message}"
+        );
+        assert!(!message.contains("timed out"), "waited out the bound: {message}");
+        let cause = err.chain().nth(1).expect("the OS error is the cause").to_string();
+        assert!(cause.contains(&access_denied().to_string()), "cause: {cause}");
     }
 
     #[test]
