@@ -237,19 +237,23 @@ fn new_ping_shown_once_then_listed_at_session_start() {
     assert!(!listed.contains("stand down"), "session start lists, it does not show again:\n{listed}");
     assert!(!prompt(&s, session).contains("relay:"), "and the prompt after it says nothing");
 
-    // The successor holding the title gets the same one line at its start.
-    let successor = "sess-once-2";
-    register(&s, successor);
-    assert!(start(&s, successor).contains("relay: 1 unanswered ping (bison "));
-
     // The listing command shows the text.
     let tasks = ok(run_base(&s, &["relay", "tasks", "--from", "bison"]), "relay tasks");
     assert!(tasks.contains("stand down on the progress doc"), "{tasks}");
 
     // A reply clears it.
     ok(run_base_in_session(&s, &["relay", "register", "--as", "bison"], "sess-bison"), "register bison");
-    ok(run_base_in_session(&s, &["relay", "ping", "--to", "bison", "--msg", "done"], successor), "reply");
-    assert!(!start(&s, successor).contains("unanswered"), "a reply ends the listing");
+    ok(run_base_in_session(&s, &["relay", "ping", "--to", "bison", "--msg", "done"], session), "reply");
+    assert!(!start(&s, session).contains("unanswered"), "a reply ends the listing");
+
+    // BO-05 (F12c) replaced "the successor holding the title gets the same one line at its start": a successor
+    // starts with an empty inbox. What was sent to this session is archived, and its sender told.
+    ping(&s, "bison", "one more for the first session");
+    let successor = "sess-once-2";
+    register(&s, successor);
+    let first = start(&s, successor);
+    assert!(!first.contains("unanswered") && !first.contains("one more for the first session"), "{first}");
+    assert!(inbox(&s).is_empty(), "the successor's inbox starts empty");
 }
 
 /// F13c, example 4: a superseded message is never shown, a delivered one never again, and one message sent through

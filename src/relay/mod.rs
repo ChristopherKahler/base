@@ -662,6 +662,15 @@ pub fn env_session_id() -> Option<String> {
     std::env::var("CLAUDE_CODE_SESSION_ID").ok().filter(|s| !s.is_empty())
 }
 
+/// The session sending as `origin`, recorded on what it sends (BO-05, F12d): this process's session when it holds that
+/// title now, else empty. A process sending as a title it does not hold (a script's `--from chris`) records nothing, so
+/// a notice about what it sent goes to that title's holder.
+pub fn sending_session(origin: &str) -> String {
+    env_session_id()
+        .filter(|sid| session_registry::resolve(origin).is_some_and(|e| &e.session_id == sid))
+        .unwrap_or_default()
+}
+
 // ─── Helpers ─────────────────────────────────────────────────
 
 /// A ping slug that cannot collide with another ping's.

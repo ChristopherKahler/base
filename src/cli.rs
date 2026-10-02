@@ -2947,6 +2947,7 @@ pub fn run() {
                                     from: sender.clone(),
                                     to_title: t.clone(),
                                     to_session: entry.session_id.clone(),
+                                    from_session: relay::sending_session(&sender),
                                     priority: "high".into(),
                                     created: base::relay::now_iso(),
                                     status: "pending".into(),
@@ -3099,11 +3100,13 @@ pub fn run() {
                         })
                     });
                     let slug = crud::slugify(&slug);
+                    let origin = origin.unwrap_or_default();
                     let task = base::relay::task_inbox::InboxTask {
                         slug: slug.clone(),
                         summary,
                         doc: doc.unwrap_or_default(),
-                        from: origin.unwrap_or_default(),
+                        from_session: relay::sending_session(&origin),
+                        from: origin,
                         to_title: to.clone(),
                         to_session: entry.session_id.clone(),
                         priority: priority.unwrap_or_else(|| "high".into()),
@@ -3215,10 +3218,12 @@ pub fn run() {
                         base::relay::task_inbox::answer_from(&config.namespace, &cwd, &to, &my_titles);
                     let kind = if answered > 0 { "reply" } else { "ping" };
                     let id = base::relay::ping_slug();
+                    // F12a: addressed to the session that holds the title now, and only that session is shown it.
                     let ping = base::relay::task_inbox::InboxTask {
                         slug: id.clone(),
                         summary: msg.clone(),
                         doc: String::new(),
+                        from_session: relay::sending_session(&origin),
                         from: origin,
                         to_title: to.clone(),
                         to_session: entry.session_id.clone(),

@@ -374,6 +374,9 @@ fn run(
         .env_remove("BASE_NO_WAKE_NUDGE")
         .env_remove("BASE_NO_AUTONAME")
         .env_remove("BASE_RELAY_AS")
+        // A Windows Terminal tab id makes a session with no title reclaim whichever title was registered from the
+        // same tab (BO-05 tests auto-title new sessions), so a run inside a terminal would differ from one in CI.
+        .env_remove("WT_SESSION")
         // Claude Code puts the session id in every Bash tool's environment, so a test run from a
         // session would otherwise hand that session to each command it spawns.
         .env_remove("CLAUDE_CODE_SESSION_ID")
@@ -462,6 +465,7 @@ pub fn run_pre_tool_use(
         .env_remove("BASE_NO_WAKE_NUDGE")
         .env_remove("BASE_NO_AUTONAME")
         .env_remove("BASE_RELAY_AS")
+        .env_remove("WT_SESSION")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .envs(env.iter().copied())
         .stdin(Stdio::piped())
@@ -492,6 +496,7 @@ pub fn run_base_in_session(seed: &Seed, args: &[&str], session: &str) -> (i32, S
         .env("BASE_NO_AUTO_UPDATE", "1")
         .env("BASE_AST_NO_SPAWN", "1")
         .env_remove("BASE_RELAY_AS")
+        .env_remove("WT_SESSION")
         .env("CLAUDE_CODE_SESSION_ID", session)
         .stdin(Stdio::null());
     let out = cmd.output().expect("the base binary runs");

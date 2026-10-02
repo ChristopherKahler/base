@@ -82,8 +82,11 @@ pub fn load() -> SessionRegistry {
 /// Bind (or re-bind) a title to the current session. Re-registering the same
 /// title with a fresh session id is the normal path — a new Claude session
 /// reclaims its stable title.
+///
+/// BO-05 (F12): a title that passes to a new session does not pass its inbox. What the previous holder was sent is
+/// archived, and the senders of anything it never saw are told ([`super::task_inbox::settle`]).
 pub fn register(title: &str, session_id: &str, cwd: &Path, project: Option<&str>) -> Result<()> {
-    with_lock(|| {
+    let previous = with_lock(|| {
         let mut reg = load();
         let now = now_iso();
         let workspace = workspace_name(cwd);
@@ -98,6 +101,10 @@ pub fn register(title: &str, session_id: &str, cwd: &Path, project: Option<&str>
         {
             entry.projects.push(p.to_string());
         }
+        let previous = (!entry.session_id.is_empty() && entry.session_id != session_id).then(|| entry.session_id.clone());
+        if entry.session_id != session_id {
+            record_holder(title, session_id, &now);
+        }
         entry.session_id = session_id.to_string();
         entry.cwd = cwd.to_string_lossy().to_string();
         entry.workspace = workspace;
@@ -109,8 +116,11 @@ pub fn register(title: &str, session_id: &str, cwd: &Path, project: Option<&str>
         // asked for (and, under the wake contract, gets nudged to arm it).
         reg.sessions
             .retain(|_, e| !(e.session_id == session_id && e.auto && e.title != title));
-        save(&reg)
-    })
+        save(&reg)?;
+        Ok(previous)
+    })?;
+    super::task_inbox::settle(title, session_id, previous.as_deref());
+    Ok(())
 }
 
 /// Refresh the heartbeat for whatever title(s) the current session holds.
@@ -169,6 +179,101 @@ pub fn list() -> Vec<SessionEntry> {
     load().sessions.into_values().collect()
 }
 
+// ─── Title history (BO-05, F12e) ─────────────────────────────
+//
+// `sessions.json` holds who has a title NOW. This file holds who had it before: one line each time a title binds to
+// a different session. It is what lets an inbox item that carries no session id be read as addressed to the session
+// that held its title when it was written, and what a notice names as the time the new holder took the title. It
+// starts empty the day this build is installed; an item written before a title's first line cannot be placed and is
+// archived, never delivered.
+
+/// One line of the title history: from `since`, `title` belonged to `session_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Holder {
+    pub title: String,
+    pub session_id: String,
+    pub since: String,
+}
+
+/// Past this size the history is rewritten to the lines a lookup can still need ([`compact_history`]).
+const HISTORY_CAP_BYTES: u64 = 256 * 1024;
+
+/// How far back the history keeps every line once it is over [`HISTORY_CAP_BYTES`]. A ping older than a day is stale
+/// and archived anyway; a task is not, so the history covers a month of them. Each title's newest line is always kept.
+const HISTORY_KEEP_DAYS: i64 = 30;
+
+fn history_path() -> Option<PathBuf> {
+    global_base_dir().map(|d| d.join("title-history.jsonl"))
+}
+
+/// Append that `title` now belongs to `session_id`. Called under the registry lock, so lines never interleave.
+/// Best-effort: a history that cannot be written makes old items unplaceable, never a registration fail.
+fn record_holder(title: &str, session_id: &str, since: &str) {
+    use std::io::Write as _;
+    let Some(path) = history_path() else { return };
+    let line = Holder { title: title.into(), session_id: session_id.into(), since: since.into() };
+    let Ok(json) = serde_json::to_string(&line) else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{json}");
+    }
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > HISTORY_CAP_BYTES) {
+        compact_history(&path);
+    }
+}
+
+/// Keep the lines from the last [`HISTORY_KEEP_DAYS`] days and each title's newest line; drop the rest.
+fn compact_history(path: &Path) {
+    let lines = read_history(path);
+    let cutoff = chrono::Local::now() - chrono::Duration::days(HISTORY_KEEP_DAYS);
+    let mut newest: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, h) in lines.iter().enumerate() {
+        newest.insert(&h.title, i);
+    }
+    let kept: String = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, h)| newest.get(h.title.as_str()) == Some(i) || parse_ts(&h.since).is_some_and(|t| t >= cutoff))
+        .filter_map(|(_, h)| serde_json::to_string(h).ok())
+        .map(|j| j + "\n")
+        .collect();
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    if std::fs::write(&tmp, kept).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+fn read_history(path: &Path) -> Vec<Holder> {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Every recorded holder of `title`, oldest first.
+pub fn holders(title: &str) -> Vec<Holder> {
+    let mut out: Vec<Holder> =
+        history_path().map(|p| read_history(&p)).unwrap_or_default().into_iter().filter(|h| h.title == title).collect();
+    out.sort_by_key(|h| parse_ts(&h.since));
+    out
+}
+
+/// The session that held `title` at `at`, from the history: the newest line for the title from no later than `at`.
+/// `None` when the history has no line for the title that early, which means it cannot be known.
+pub fn holder_at(title: &str, at: chrono::DateTime<chrono::Local>) -> Option<String> {
+    holders(title)
+        .into_iter()
+        .filter(|h| parse_ts(&h.since).is_some_and(|t| t <= at))
+        .last()
+        .map(|h| h.session_id)
+}
+
+/// When `session_id` took `title`, if the history recorded it: the newest such line.
+pub fn held_since(title: &str, session_id: &str) -> Option<String> {
+    holders(title).into_iter().filter(|h| h.session_id == session_id).last().map(|h| h.since)
+}
+
 /// Short, distinct, easy-to-type codenames auto-assigned to unnamed sessions.
 /// Kept to memorable single words so `*task <name> …` stays frictionless.
 const WORDLIST: &[&str] = &[
@@ -200,10 +305,15 @@ pub fn touch_with(session_id: &str, cwd: &Path, auto_name: bool) -> Option<Strin
     if !auto_name || std::env::var_os("BASE_NO_AUTONAME").is_some() {
         return None;
     }
-    auto_register(session_id, cwd).ok()
+    let (title, previous) = auto_register(session_id, cwd).ok()?;
+    // BO-05 (F12): the title's inbox is settled for its new holder, as on an explicit register.
+    super::task_inbox::settle(&title, session_id, previous.as_deref());
+    Some(title)
 }
 
-fn auto_register(session_id: &str, cwd: &Path) -> Result<String> {
+/// Draw or reclaim a title for an unnamed session. Returns the title and, when it was taken from another session,
+/// that session's id.
+fn auto_register(session_id: &str, cwd: &Path) -> Result<(String, Option<String>)> {
     with_lock(|| {
         let mut reg = load();
         prune_dead(&mut reg, session_id);
@@ -214,7 +324,7 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<String> {
             .find(|e| e.session_id == session_id)
             .map(|e| e.title.clone())
         {
-            return Ok(t);
+            return Ok((t, None));
         }
         // Same-tab continuity: /clear starts a NEW session id in the SAME
         // Windows Terminal tab (WT_SESSION persists). A title whose tab id
@@ -228,16 +338,19 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<String> {
                 .values_mut()
                 .find(|e| e.wt_session == wt && e.session_id != session_id)
         {
+            let previous = (!prev.session_id.is_empty()).then(|| prev.session_id.clone());
+            let now = now_iso();
             prev.session_id = session_id.to_string();
-            prev.last_heartbeat = now_iso();
+            prev.last_heartbeat = now.clone();
             // The row describes the session that holds it now. Without this a reclaimed title kept its
             // predecessor's folder: cougar read Documents/std-video-engine on 2026-09-23 while its new
             // session ran in the home folder.
             prev.cwd = cwd.to_string_lossy().to_string();
             prev.workspace = workspace_name(cwd);
             let t = prev.title.clone();
+            record_holder(&t, session_id, &now);
             save(&reg)?;
-            return Ok(t);
+            return Ok((t, previous));
         }
         // BASE_RELAY_AS pins the codename at launch (e.g. `cc work` wrapper);
         // otherwise fall back to the random wordlist pick.
@@ -245,7 +358,10 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<String> {
             Ok(t) if !t.is_empty() => t,
             _ => pick_name(session_id, &reg),
         };
+        // The pick may be a title another session held (a dead holder, or a launcher's BASE_RELAY_AS).
+        let previous = reg.sessions.get(&name).map(|e| e.session_id.clone()).filter(|s| !s.is_empty());
         let now = now_iso();
+        record_holder(&name, session_id, &now);
         reg.sessions.insert(
             name.clone(),
             SessionEntry {
@@ -261,7 +377,7 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<String> {
             },
         );
         save(&reg)?;
-        Ok(name)
+        Ok((name, previous))
     })
 }
 
