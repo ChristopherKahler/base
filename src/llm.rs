@@ -20,9 +20,10 @@ use anyhow::{bail, Context, Result};
 /// ([`headless`], checked first in `hook::dispatch`).
 pub const HEADLESS_ENV: &str = "BASE_HEADLESS";
 
-/// True inside one of base's own headless calls: [`HEADLESS_ENV`] is set, to anything.
+/// True inside one of base's own headless calls: [`HEADLESS_ENV`] is `1`, the value [`claude`] sets. Only that value
+/// counts, so `BASE_HEADLESS=0` or an empty export meant as "off" never turns every base hook off unseen.
 pub fn headless() -> bool {
-    std::env::var_os(HEADLESS_ENV).is_some()
+    std::env::var_os(HEADLESS_ENV).is_some_and(|v| v == "1")
 }
 
 /// `claude -p <prompt> --output-format text [--model <model>]` with [`HEADLESS_ENV`] set: the one place every call here
@@ -170,40 +171,5 @@ mod tests {
             assert_eq!(cmd.get_program(), "claude");
             assert_eq!(cmd.get_args().take(2).collect::<Vec<_>>(), ["-p", "a prompt"]);
         }
-    }
-
-    /// The other half of F27a: no product code starts a Claude Code session except through [`claude`]. A `claude` launch
-    /// anywhere else would carry no marker, so the scan allows only the builder itself and `claude --version` (which
-    /// starts no session, so runs no hooks).
-    #[test]
-    fn every_claude_session_is_built_by_the_one_builder() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut stack = vec![src.clone()];
-        let needle = format!("Command::new({:?})", "claude");
-        let mut found = Vec::new();
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).expect("readable folder").flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.extension().is_none_or(|e| e != "rs") {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&path).expect("readable source");
-                let lines: Vec<&str> = text.lines().collect();
-                for (i, line) in lines.iter().enumerate() {
-                    if line.trim_start().starts_with("//") || !line.contains(&needle) {
-                        continue;
-                    }
-                    let near = lines[i..lines.len().min(i + 3)].join("\n");
-                    let rel = path.strip_prefix(&src).expect("under src").to_string_lossy().replace('\\', "/");
-                    found.push((rel, near.contains("\"--version\"")));
-                }
-            }
-        }
-        let sessions: Vec<&String> = found.iter().filter(|(_, version)| !version).map(|(f, _)| f).collect();
-        assert_eq!(sessions, ["llm.rs"], "claude sessions started outside the builder carry no BASE_HEADLESS: {found:?}");
     }
 }

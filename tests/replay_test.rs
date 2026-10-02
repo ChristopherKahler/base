@@ -929,23 +929,6 @@ fn replay_pre_tool_hints_fit_the_file_or_command() {
     println!("replay pre-tool: {} calls, {hints} with an AST hint, {blocks} with a standards block, {bytes} bytes added", calls.len());
 }
 
-/// Every file under `root` with its size and modified time.
-fn files_under(root: &Path) -> std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime)> {
-    let mut out = std::collections::BTreeMap::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("readable folder").flatten() {
-            let meta = entry.metadata().expect("metadata");
-            if meta.is_dir() {
-                stack.push(entry.path());
-            } else {
-                out.insert(entry.path(), (meta.len(), meta.modified().expect("mtime")));
-            }
-        }
-    }
-    out
-}
-
 /// BO-08 (F27): inside base's own headless calls (`BASE_HEADLESS`, which every `claude -p` base starts carries), base's
 /// hooks print nothing and write nothing. Every corpus store shape gets a session start, and every corpus prompt a
 /// prompt hook, a tool call and a stop, all with the calling session's relay title and terminal tab inherited, the way
@@ -967,7 +950,7 @@ fn replay_headless_calls_leave_no_trace() {
     for case in cases() {
         let s = write_case_as(&case, &format!("headless-{}", case.name));
         let root = s.ws.parent().expect("seed root").to_path_buf();
-        let before = files_under(&root);
+        let before = seed::files_under(&root);
         let cwd = s.ws.display().to_string();
         quiet(
             &s,
@@ -976,12 +959,12 @@ fn replay_headless_calls_leave_no_trace() {
             &case.name,
         );
         runs += 1;
-        assert_eq!(files_under(&root), before, "[{}] a session start under the marker wrote to the store", case.name);
+        assert_eq!(seed::files_under(&root), before, "[{}] a session start under the marker wrote to the store", case.name);
     }
     let s = seed::write(&root("headless-prompts"), &seed::TINY, &fixture("base.toml"));
     std::fs::write(s.ws.join(".base").join("domains.toml"), fixture("domains.toml")).expect("domains.toml");
     let top = s.ws.parent().expect("seed root").to_path_buf();
-    let before = files_under(&top);
+    let before = seed::files_under(&top);
     let cwd = s.ws.display().to_string();
     for prompt in prompts() {
         let session = serde_json::json!("headless-child");
@@ -991,7 +974,7 @@ fn replay_headless_calls_leave_no_trace() {
         quiet(&s, "stop", serde_json::json!({ "cwd": cwd, "hook_event_name": "Stop", "stop_hook_active": false, "session_id": session }), &prompt);
         runs += 4;
     }
-    assert_eq!(files_under(&top), before, "a prompt, tool or stop hook under the marker wrote to the store");
+    assert_eq!(seed::files_under(&top), before, "a prompt, tool or stop hook under the marker wrote to the store");
     assert!(runs >= 4 + 4 * 30, "control: the corpus was driven through: {runs} hook runs");
     println!("replay headless: {runs} hook runs under BASE_HEADLESS, 0 bytes printed, 0 files written");
 }

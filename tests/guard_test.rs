@@ -238,3 +238,54 @@ fn no_literal_base_binary_path_outside_the_seam() {
         offenders.join("\n  ")
     );
 }
+
+/// Non-comment lines of the product source that start a program whose name begins with one of `programs`, as
+/// `(file relative to src/ with / separators, line number, the lines from there to two below)`. A prefix, so
+/// `"bash"` also catches `"bash.exe"` and `"claude"` catches `"claude.exe"` and `"claude.cmd"`.
+fn launches(programs: &[&str]) -> Vec<(String, usize, String)> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    // Built at run time, so no needle is spelled out on a line of its own.
+    let needles: Vec<String> = programs.iter().map(|p| format!("Command::new(\"{p}")).collect();
+    let mut out = Vec::new();
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let rel = f.strip_prefix(&src).expect("under src").to_string_lossy().replace('\\', "/");
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !needles.iter().any(|n| line.contains(n.as_str())) {
+                continue;
+            }
+            out.push((rel.clone(), i + 1, lines[i..lines.len().min(i + 3)].join("\n")));
+        }
+    }
+    out
+}
+
+/// BO-08, F19: on Windows a bare `bash` (or `bash.exe`, or `sh`) starts `C:\Windows\System32\bash.exe`, the WSL
+/// launcher, before anything on PATH. Product code runs bash only through `base::shell::host_bash` (plugin
+/// `prepare_command`), so no product file names one.
+#[test]
+fn no_bare_bash_launch_in_product_code() {
+    let found = launches(&["bash", "sh\"", "sh.exe"]);
+    assert!(found.is_empty(), "bare bash launches, which start the WSL launcher on Windows: {found:?}");
+}
+
+/// BO-08, F27a: every Claude Code session base starts carries `BASE_HEADLESS=1`, set in `llm::claude()`, so base's own
+/// hooks stay silent inside it. A `claude` started anywhere else would carry no marker. The scan allows the builder in
+/// `llm.rs` and `claude --version` (no session starts, so no hook runs). It cannot see a launch through a constant or
+/// through `cmd /c`; the builder test in `llm.rs` and `tests/headless_test.rs` pin the path base does use.
+#[test]
+fn every_claude_session_is_built_by_the_one_builder() {
+    let found = launches(&["claude"]);
+    let sessions: Vec<_> = found.iter().filter(|(_, _, near)| !near.contains("\"--version\"")).collect();
+    assert_eq!(
+        sessions.iter().map(|(f, _, _)| f.as_str()).collect::<Vec<_>>(),
+        ["llm.rs"],
+        "a claude session started outside llm::claude() carries no BASE_HEADLESS: {found:?}"
+    );
+    assert!(found.len() >= 2, "control: the builder and doctor's --version call were both seen: {found:?}");
+}

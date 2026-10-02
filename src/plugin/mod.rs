@@ -1085,24 +1085,12 @@ DUP=second
         }
     }
 
-    /// Every `.rs` file under `dir`, recursively.
-    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("readable folder").flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                rust_files(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-
     /// F19 (BO-08): both plugin call sites run `prepare.sh` through [`prepare_command`], which runs the bash
     /// `crate::shell::host_bash` picks, and on Windows that bash runs on the host, not inside WSL.
     ///
     /// Three legs: the command is built from the resolver; a real `prepare.sh` run through it reports a non-Linux
-    /// kernel on Windows; and no product file launches a bare `bash` any more, so a new call site cannot skip the
-    /// resolver unnoticed.
+    /// kernel on Windows; and both call sites build through [`prepare_command`]. That no other product file starts a
+    /// bare `bash` is `tests/guard_test.rs`'s check.
     #[test]
     fn plugin_prepare_uses_resolved_bash() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1139,24 +1127,8 @@ DUP=second
             }
         }
 
-        // Leg 3: no product code starts a bare `bash`; dist.rs and scaffold.rs build through prepare_command.
+        // Leg 3: dist.rs and scaffold.rs build through prepare_command.
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        rust_files(&src, &mut files);
-        // Built here, so this line is not itself a match.
-        let needle = format!("Command::new({:?})", "bash");
-        let bare: Vec<String> = files
-            .iter()
-            .flat_map(|f| {
-                let text = std::fs::read_to_string(f).expect("readable source");
-                text.lines()
-                    .enumerate()
-                    .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(&needle))
-                    .map(|(i, _)| format!("{}:{}", f.display(), i + 1))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        assert!(bare.is_empty(), "bare bash launches, which start the WSL launcher on Windows: {bare:?}");
         for site in ["plugin/dist.rs", "plugin/scaffold.rs"] {
             let text = std::fs::read_to_string(src.join(site)).expect("call site");
             assert!(text.contains("prepare_command("), "{site} runs prepare.sh without prepare_command");

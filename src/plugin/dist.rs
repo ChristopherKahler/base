@@ -334,7 +334,7 @@ fn source_fallback(manifest_path: &Path, ext: &ExtensionDef, dist: &DistSpec, wh
         );
     };
     eprintln!("base: {why} — building from local source ({}) …", src.display());
-    let status = super::prepare_command(&src)?.status();
+    let status = super::prepare_command(&src).and_then(|mut cmd| Ok(cmd.status()?));
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => bail!("source build failed: prepare.sh exited {}", s.code().unwrap_or(-1)),

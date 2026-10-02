@@ -9,8 +9,18 @@
 //!
 //! So on Windows [`host_bash`] walks `PATH` itself, skips every folder under `%SystemRoot%` (the WSL launcher) and every
 //! `WindowsApps` folder (the Store's alias stubs), and returns the absolute path of the first `bash.exe` left, so
-//! `Command` cannot re-resolve it. It never falls back to the launcher: when nothing is left, the error says what to
-//! install ([`NO_BASH`]). Elsewhere `bash` on `PATH` is the real thing, and the bare name is returned.
+//! `Command` cannot re-resolve it.
+//!
+//! A DEFAULT GIT FOR WINDOWS INSTALL PUTS NO `bash.exe` ON `PATH`. Its installer adds only `Git\cmd`, which holds
+//! `git.exe`; bash sits in `Git\bin` and `Git\usr\bin`, and only a Git Bash or Claude Code session has those on `PATH`.
+//! Checked on Chris's machine 2026-10-02: the machine and user `PATH` hold `C:\Program Files\Git\cmd` and nothing else of
+//! Git's, so `base` started from a plain PowerShell found no bash. So when no `bash.exe` is on `PATH`, the search takes
+//! `<Git>\bin\bash.exe` beside a `git.exe` that is. That one, not `usr\bin\bash.exe`: `bin\bash.exe` is Git's wrapper,
+//! which puts Git's own tools on the child's `PATH`. Started from a parent with only `Git\cmd` on `PATH`, `bin\bash.exe`
+//! ran `uname -s` and found `sed`; `usr\bin\bash.exe` answered `uname: command not found` (measured the same day).
+//!
+//! It never falls back to the launcher: when nothing is found, the error says what to install ([`NO_BASH`]). Elsewhere
+//! `bash` on `PATH` is the real thing, and the bare name is returned.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -19,8 +29,9 @@ use std::path::{Path, PathBuf};
 pub const NO_BASH: &str =
     "base needs Git Bash to run prepare.sh on Windows. Install Git for Windows, or run this from WSL.";
 
-/// The bash base runs scripts with: on Windows the absolute path of the first `bash.exe` on `PATH` outside
-/// `%SystemRoot%` and `WindowsApps`, or [`NO_BASH`] when there is none; elsewhere `bash`.
+/// The bash base runs a plugin's `prepare.sh` with: on Windows the absolute path of the first `bash.exe` on `PATH`
+/// outside `%SystemRoot%` and `WindowsApps`, else Git's `bin\bash.exe` beside a `git.exe` on `PATH`, else [`NO_BASH`];
+/// elsewhere `bash`. Every product caller runs `prepare.sh`, which is why the error names it (F19b's wording).
 pub fn host_bash() -> anyhow::Result<PathBuf> {
     if cfg!(windows) {
         windows_bash(std::env::var_os("PATH").as_deref(), std::env::var_os("SystemRoot").as_deref())
@@ -37,13 +48,23 @@ pub fn windows_bash(path: Option<&OsStr>, system_root: Option<&OsStr>) -> anyhow
         .map(|r| normalized(&r.to_string_lossy()))
         .filter(|r| !r.is_empty())
         .unwrap_or_else(|| r"c:\windows".to_string());
-    path.map(std::env::split_paths)
+    let dirs: Vec<PathBuf> = path
+        .map(std::env::split_paths)
         .into_iter()
         .flatten()
         .filter(|dir| dir.is_absolute() && !skipped(dir, &root))
-        .map(|dir| dir.join("bash.exe"))
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| anyhow::anyhow!(NO_BASH))
+        .collect();
+    let on_path = dirs.iter().map(|dir| dir.join("bash.exe")).find(|candidate| candidate.is_file());
+    // No bash.exe on PATH: Git's own `bin\bash.exe`, one or two folders above a git.exe that is (`Git\cmd\git.exe`,
+    // `Git\mingw64\bin\git.exe`). The same skips hold, so a git.exe under the Windows folder leads nowhere.
+    let beside_git = || {
+        dirs.iter()
+            .filter(|dir| dir.join("git.exe").is_file())
+            .flat_map(|dir| dir.ancestors().skip(1).take(2))
+            .map(|git_root| git_root.join("bin").join("bash.exe"))
+            .find(|candidate| candidate.is_file() && candidate.parent().is_some_and(|p| !skipped(p, &root)))
+    };
+    on_path.or_else(beside_git).ok_or_else(|| anyhow::anyhow!(NO_BASH))
 }
 
 /// A `PATH` folder the search must not take bash from: `%SystemRoot%` or anything under it, and any `WindowsApps`
@@ -165,6 +186,44 @@ mod tests {
         touch(&far.join("bash.exe"));
         let got = windows_bash(Some(&joined(&[&rel, &far])), Some(OsStr::new(r"C:\Windows"))).expect("the absolute entry");
         assert_eq!(got, far.join("bash.exe"));
+    }
+
+    /// A default Git for Windows install: only `Git\cmd` (git.exe) on PATH. The search takes Git's `bin\bash.exe`, not
+    /// `usr\bin\bash.exe` and not the launcher; `Git\mingw64\bin\git.exe` leads to the same file; a bash.exe on PATH
+    /// still comes first; and a git.exe whose Git folder has no `bin\bash.exe` gives the F19b error.
+    #[test]
+    fn default_git_install_finds_bash_beside_git_exe() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("Windows");
+        let system32 = root.join("System32");
+        let git = tmp.path().join("Program Files").join("Git");
+        touch(&system32.join("bash.exe"));
+        touch(&git.join("cmd").join("git.exe"));
+        touch(&git.join("mingw64").join("bin").join("git.exe"));
+        touch(&git.join("bin").join("bash.exe"));
+        touch(&git.join("usr").join("bin").join("bash.exe"));
+        let want = git.join("bin").join("bash.exe");
+
+        let got = windows_bash(Some(&joined(&[&system32, &git.join("cmd")])), Some(root.as_os_str())).expect("Git's bash");
+        assert_eq!(got, want);
+        let got = windows_bash(Some(&joined(&[&git.join("mingw64").join("bin")])), Some(root.as_os_str())).expect("Git's bash");
+        assert_eq!(got, want);
+
+        let tools = tmp.path().join("tools");
+        touch(&tools.join("bash.exe"));
+        let got = windows_bash(Some(&joined(&[&git.join("cmd"), &tools])), Some(root.as_os_str())).expect("a bash");
+        assert_eq!(got, tools.join("bash.exe"), "a bash.exe on PATH comes before one found through git.exe");
+
+        let bare = tmp.path().join("BareGit");
+        touch(&bare.join("cmd").join("git.exe"));
+        let err = windows_bash(Some(&joined(&[&bare.join("cmd")])), Some(root.as_os_str())).expect_err("no bin\\bash.exe");
+        assert_eq!(err.to_string(), NO_BASH);
+
+        // A git.exe in the Windows folder is skipped like a bash.exe there, so it cannot lead to a bash beside it.
+        touch(&system32.join("git.exe"));
+        touch(&root.join("bin").join("bash.exe"));
+        let err = windows_bash(Some(&joined(&[&system32])), Some(root.as_os_str())).expect_err("the Windows folder");
+        assert_eq!(err.to_string(), NO_BASH);
     }
 
     /// Off Windows the bare name is the real bash.

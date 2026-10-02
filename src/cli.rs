@@ -1725,8 +1725,9 @@ pub fn run() {
     let config = BaseConfig::load(&cwd);
 
     match cli.command {
-        // Dispatched above, before the config load.
-        Some(Commands::Hook { .. }) => {}
+        // Dispatched above, before the config load. Reaching this arm means that early return moved, and every base hook
+        // would silently do nothing, so it fails loudly instead.
+        Some(Commands::Hook { .. }) => unreachable!("hook events are dispatched before the config load"),
 
         // ─── Hooks manifest ─────────────────────────────────
         // Machine-readable only: stdout is one JSON object, because the sole

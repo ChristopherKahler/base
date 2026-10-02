@@ -11,7 +11,6 @@
 
 mod seed;
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -65,24 +64,6 @@ fn events(ws: &Path, session: &str) -> Vec<(&'static str, serde_json::Value)> {
     ]
 }
 
-/// Every file under `root` with its size and modified time: a hook that wrote anything at all changes this.
-fn tree(root: &Path) -> BTreeMap<PathBuf, (u64, std::time::SystemTime)> {
-    let mut out = BTreeMap::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("readable folder").flatten() {
-            let path = entry.path();
-            let meta = entry.metadata().expect("metadata");
-            if meta.is_dir() {
-                stack.push(path);
-            } else {
-                out.insert(path.strip_prefix(root).expect("under root").to_path_buf(), (meta.len(), meta.modified().expect("mtime")));
-            }
-        }
-    }
-    out
-}
-
 /// The rows of one of the workspace's hook logs: `hook-events.jsonl` (one row per hook run, every hook) or
 /// `hook-output.jsonl` (what session start and the prompt hook printed).
 fn rows(ws: &Path, log: &str) -> Vec<serde_json::Value> {
@@ -120,7 +101,7 @@ fn hooks_exit_silently_under_marker() {
     let inherited: &[(&str, &str)] =
         &[("BASE_RELAY_AS", "parent-kite"), ("WT_SESSION", "0f1e2d3c-tab"), ("CLAUDE_CODE_SESSION_ID", "headless-child")];
 
-    let before = tree(&root);
+    let before = seed::files_under(&root);
     let (events_before, output_before) = (rows(&s.ws, "hook-events.jsonl").len(), rows(&s.ws, "hook-output.jsonl").len());
     for (event, payload) in events(&s.ws, "headless-child") {
         let mut env = inherited.to_vec();
@@ -130,7 +111,7 @@ fn hooks_exit_silently_under_marker() {
         assert_eq!(stdout, "", "{event} under the marker printed to stdout");
         assert_eq!(stderr, "", "{event} under the marker printed to stderr");
     }
-    let after = tree(&root);
+    let after = seed::files_under(&root);
     let changed: Vec<_> = after
         .iter()
         .filter(|(p, v)| before.get(*p) != Some(*v))
@@ -141,16 +122,18 @@ fn hooks_exit_silently_under_marker() {
     assert_eq!(rows(&s.ws, "hook-events.jsonl").len(), events_before, "no hook-events row under the marker");
     assert_eq!(rows(&s.ws, "hook-output.jsonl").len(), output_before, "no hook-output row under the marker");
 
-    // Control: the same five hooks, same environment, no marker.
+    // Control: the same five hooks, same environment, with BASE_HEADLESS=0, which is not the marker (only 1 is).
     for (event, payload) in events(&s.ws, "headless-child") {
-        let (code, _, stderr) = run_hook(&s, event, &payload, inherited);
+        let mut env = inherited.to_vec();
+        env.push(("BASE_HEADLESS", "0"));
+        let (code, _, stderr) = run_hook(&s, event, &payload, &env);
         assert_eq!(code, 0, "{event} without the marker exited {code}: {stderr}");
     }
     let events = rows(&s.ws, "hook-events.jsonl");
     assert_eq!(
         hooks_in(&events[events_before..]),
         ["session-start", "user-prompt-submit", "pre-tool-use", "post-tool-use", "stop"],
-        "without the marker every hook logs a hook-events row, so the check above could see one"
+        "with BASE_HEADLESS=0 every hook logs a hook-events row, so the check above could see one"
     );
     let output = rows(&s.ws, "hook-output.jsonl");
     assert_eq!(
@@ -158,7 +141,7 @@ fn hooks_exit_silently_under_marker() {
         ["session-start", "user-prompt-submit"],
         "without the marker session start and the prompt hook keep their output records"
     );
-    assert_ne!(tree(&root), after, "without the marker the hooks write to the store");
+    assert_ne!(seed::files_under(&root), after, "without the marker the hooks write to the store");
     let _ = std::fs::remove_dir_all(&root);
 }
 
