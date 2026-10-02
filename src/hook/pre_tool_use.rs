@@ -10,7 +10,7 @@ use crate::domain;
 use crate::domain::session::SessionState;
 
 /// PreToolUse: see file path in tool call → match file_keywords + path triggers → inject rules BEFORE tool executes.
-/// Also: inject AST file map for source files, and redirect grep/find to ast query.
+/// Also: inject AST file map for source files, and point a code search at the code map that covers it (F20).
 ///
 /// Returns the injection text instead of printing it: Claude Code only feeds
 /// PreToolUse context to the model via the JSON `hookSpecificOutput.additionalContext`
@@ -38,19 +38,13 @@ pub fn handle(
         output.push('\n');
     }
 
-    // ─── Grep/find intercept (Bash tool) ─────────────────────
-    if let Some(hint) = grep_intercept(event, cwd) {
+    // ─── AST hint (F20) ──────────────────────────────────────
+    // A code search through Bash, PowerShell or context-mode is pointed at the code map that covers the folder it
+    // searches; nothing else is. The rules are in `ast_hint`.
+    if let Some(hint) = crate::hook::ast_hint::hint(event, cwd) {
         output.push_str(&hint);
         output.push('\n');
         data.grep_intercepted = true;
-    }
-
-    // ─── Context-mode source file intercept ──────────────────
-    // When context-mode (ctx_batch_execute, ctx_execute) is used to scan
-    // source files, nudge toward base ast query first.
-    if let Some(hint) = context_mode_intercept(event, cwd) {
-        output.push_str(&hint);
-        output.push('\n');
     }
 
     // ─── Bash first contact ──────────────────────────────────
@@ -426,170 +420,6 @@ fn is_source_file(path: &str) -> bool {
         ".f90", ".pas", ".sh", ".bash", ".json", ".toml", ".yaml", ".yml",
     ];
     exts.iter().any(|ext| path.ends_with(ext))
-}
-
-/// The hint for a folder no code map covers. It used to tell the session to run `base sync --ast`
-/// itself, against the 0.13.9 ruling that base maps an app automatically on first contact and a map is
-/// never built by hand. It also fired in folders that are not apps at all, such as the home folder,
-/// where no map will ever exist, so it now says that plainly instead of giving an instruction.
-const NO_MAP_HINT: &str = "<ast-hint>\n\
-No code map covers this folder. base maps an app automatically the first time a session works in it, \
-so there is nothing to run. A folder that is not an app is never mapped: search its files directly.\n\
-</ast-hint>";
-
-/// Check if AST data has been extracted for the current workspace.
-/// ast.ttl IS the AST store (never merged into graph.nq — AUDIT C10),
-/// so its existence is the correct populated check.
-///
-/// Resolution MUST go through `find_ast_ttl`, which checks the `.base-ast/`
-/// sidecar before the legacy `{ws}/.base/ast.ttl`. Hand-joining the legacy path
-/// here made this check unsatisfiable for every workspace mapped after the
-/// sidecar migration, so the "not yet populated" hint fired forever no matter
-/// how many times `base sync --ast` was run.
-fn ast_graph_populated(cwd: &Path) -> bool {
-    match crate::config::find_ast_ttl(cwd) {
-        Some(ast_path) => std::fs::metadata(&ast_path).map(|m| m.len() > 0).unwrap_or(false),
-        None => false,
-    }
-}
-
-/// Detect grep/find/rg in Bash commands and suggest ast query instead.
-fn grep_intercept(event: &serde_json::Value, cwd: &Path) -> Option<String> {
-    let tool_name = event.get("tool_name").and_then(|v| v.as_str())?;
-    if tool_name != "Bash" {
-        return None;
-    }
-
-    let command = event
-        .get("tool_input")
-        .and_then(|ti| ti.get("command"))
-        .and_then(|v| v.as_str())?;
-
-    // Intercept code search patterns (grep, rg, ag, ack, fd, find)
-    let is_code_search = command.starts_with("grep -r")
-        || command.starts_with("grep -rn")
-        || command.starts_with("grep -n")
-        || command.starts_with("grep -l")
-        || command.starts_with("grep -rl")
-        || command.contains("| grep")
-        || command.starts_with("rg ")
-        || command.starts_with("ag ")
-        || command.starts_with("ack ")
-        || command.starts_with("fd ")
-        || (command.starts_with("find ") && command.contains("-name"));
-
-    if !is_code_search {
-        return None;
-    }
-
-    // Try to extract the search term
-    let search_term = extract_search_term(command);
-
-    // Check if AST graph is populated — different message if not
-    if !ast_graph_populated(cwd) {
-        return Some(NO_MAP_HINT.to_string());
-    }
-
-    let suggestion = if let Some(term) = search_term {
-        format!(
-            "<ast-hint>\n\
-             AST graph available for this workspace. Try:\n\
-               base ast query --contains \"{term}\"\n\
-             The graph knows file locations, line numbers, and call relationships.\n\
-             </ast-hint>"
-        )
-    } else {
-        "<ast-hint>\n\
-         AST graph available for this workspace. Try `base ast query` for code navigation.\n\
-         Modes: --contains <name>, --file <path>, --calls <name>, --imports <path>\n\
-         </ast-hint>"
-            .to_string()
-    };
-
-    Some(suggestion)
-}
-
-/// Best-effort extraction of search term from grep/rg/find commands.
-fn extract_search_term(command: &str) -> Option<String> {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-
-    // grep -r "term" or grep -rn "term"
-    if parts.first().map(|s| *s == "grep").unwrap_or(false) {
-        for part in parts.iter() {
-            // Skip flags
-            if part.starts_with('-') {
-                continue;
-            }
-            // Skip "grep" itself
-            if *part == "grep" {
-                continue;
-            }
-            // First non-flag, non-grep token is the pattern
-            let term = part.trim_matches('"').trim_matches('\'');
-            if !term.is_empty() && !term.starts_with('/') && !term.starts_with('.') {
-                return Some(term.to_string());
-            }
-        }
-    }
-
-    // rg "term"
-    if parts.first().map(|s| *s == "rg").unwrap_or(false)
-        && let Some(term) = parts.get(1) {
-            let t = term.trim_matches('"').trim_matches('\'');
-            if !t.starts_with('-') {
-                return Some(t.to_string());
-            }
-        }
-
-    None
-}
-
-/// Detect context-mode MCP tools scanning source files and nudge toward base ast query.
-/// Catches ctx_batch_execute and ctx_execute when commands reference source file patterns.
-fn context_mode_intercept(event: &serde_json::Value, cwd: &Path) -> Option<String> {
-    let tool_name = event.get("tool_name").and_then(|v| v.as_str())?;
-
-    // Match context-mode MCP tool names (plugin-namespaced)
-    let is_ctx_tool = tool_name.contains("ctx_batch_execute")
-        || tool_name.contains("ctx_execute")
-        || tool_name.contains("ctx_execute_file");
-
-    if !is_ctx_tool {
-        return None;
-    }
-
-    // Check if the tool input references source files
-    let input = event.get("tool_input")?;
-    let input_str = serde_json::to_string(input).unwrap_or_default();
-
-    // Look for source file extensions in the command/query text
-    let has_source_refs = [".rs", ".py", ".js", ".ts", ".go", ".tsx", ".jsx", ".vue", ".svelte"]
-        .iter()
-        .any(|ext| input_str.contains(ext));
-
-    // Also catch common code navigation commands
-    let has_nav_commands = ["cat ", "head ", "tail ", "find ", "grep ", "ls src", "ls ./src"]
-        .iter()
-        .any(|cmd| input_str.contains(cmd));
-
-    if !has_source_refs && !has_nav_commands {
-        return None;
-    }
-
-    if !ast_graph_populated(cwd) {
-        return Some(NO_MAP_HINT.to_string());
-    }
-
-    Some(
-        "<ast-hint>\n\
-         BASE AST graph available. Before scanning source files, use:\n\
-           base ast query --file \"<filename>\"     (entity map for a file)\n\
-           base ast query --contains \"<name>\"     (find entities by name)\n\
-           base ast query --calls \"<function>\"     (call chain)\n\
-         The graph already knows the codebase structure — scan after, not before.\n\
-         </ast-hint>"
-            .to_string(),
-    )
 }
 
 /// Match domains by file path triggers and file_keywords against file content.

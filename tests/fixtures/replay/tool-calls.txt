@@ -1,0 +1,67 @@
+# Tool calls for the pre-tool hook (BO-07), shaped on a real working session's (2026-10-01, 240 calls, scrubbed):
+# its relay and handoff greps, its TOML and markdown searches, its fork-doc writes, plus the code searches and code
+# writes the hints exist for. One call per line:
+#
+#   expect | tool | cwd | input
+#
+# expect   none                 no <ast-hint> and no <standards> block
+#          query:<name>         an <ast-hint> suggesting base ast query --contains "<name>", no --target
+#          target:<name>        the same with --target, because the map is not the cwd's
+#          file:<name>          an <ast-hint> suggesting base ast query --file "<name>"
+#          generic              an <ast-hint> with no query
+#          nomap:building       the no-map hint for an app whose first map is under way
+#          nomap:never          the no-map hint for a folder base never maps on its own
+#          standards:<a,b>      a <standards> block carrying exactly these ids, in order
+# tool     Bash, PowerShell, ctx_batch (context-mode's batch: the input is one command), Write, Edit
+# cwd      ws, mapped, plain, cached, home
+# input    the command; for Write and Edit, <path> :: <content>. \n is a newline.
+# Paths: {home} {ws} {mapped} {plain} {cached} {loose}, written with forward slashes.
+
+none | Bash | ws | base handoff list 2>&1 | grep -i -E '0\.16|user.?test|uat|dogfood' | head -20; echo "---all"; base handoff list 2>&1
+none | Bash | ws | base handoff list --help 2>&1 | head -20; base handoff list --all 2>&1 | grep -i -E '0160|testing' | head
+none | Bash | ws | grep -rn -l '\[budget\]' {home}/.base-gbl/*.toml {ws}/.base/*.toml 2>/dev/null; for f in $(grep -rl '\[budget\]' {home}/.base-gbl/*.toml); do echo "$f"; done
+none | Bash | ws | base relay sessions 2>&1 | grep -i -E 'kite|title|---' | head -10; head -60 {home}/.base-gbl/handoffs/one.md
+none | Bash | ws | for f in {home}/.base-gbl/base.toml {ws}/.base/domains.toml; do echo "== $f"; grep -n -B1 -A6 -i -E '^\[(domains\.)?seed' "$f" | head -20; done
+none | Bash | ws | base fork list 2>&1 | head -3; base fork list 2>&1 | grep -i -E 'blockers|hook' | head -5; ls -d {ws}/.base 2>&1
+none | Bash | ws | grep -n -B2 -A3 -E '^paths|Documents' {ws}/.base/domains.toml | head -40
+none | Bash | ws | awk '/name = "seed"/,/^commands/' {ws}/.base/domains.toml | head -30; base project list 2>&1 | grep -i -E 'seed' | head
+none | Bash | ws | claude --version 2>&1 | head -1; claude --help 2>&1 | grep -i -E -- '--model|-p, --print|fallback' | head -8
+none | Bash | ws | base relay register --as seed-kite 2>&1 | tail -3; base relay sessions 2>&1 | grep -E 'seed-kite'
+none | Bash | ws | echo "CLAUDECODE=$CLAUDECODE"; base --help 2>&1 | grep -i -E 'supersede|context ' | head -4
+none | Bash | ws | grep -rln -i "DUE NOW" {home}/.base-gbl/handoffs {home}/.base-gbl/*.md 2>/dev/null | head -8; grep -rh -i -B1 "due now" {home}/notes/plan.md | head
+none | Bash | ws | python - <<'EOF'\nimport glob\nfor f in glob.glob('*.md'):\n    print(f)\n    # grep -rn select src/\nEOF\necho done
+none | Bash | ws | cd {home}/.base-gbl && for f in base.toml extra.toml; do cp $f $f.BAK; done && grep -n "budget" extra.toml
+none | Bash | ws | for i in 1 2 3; do r=$(base relay sessions 2>&1 | grep -E "^\s+seed-kite\s"); case "$r" in *x*) sleep 1;; *) break;; esac; done; echo "$r"
+none | Bash | mapped | head -12 src/lib.rs | grep '//'; echo ==; head -12 src/hook/mod.rs | grep '//'
+none | Bash | mapped | cat src/lib.rs
+none | Bash | mapped | ls src | head
+none | Bash | mapped | git grep -n "fn select"
+none | Bash | mapped | git -C {mapped} log --oneline -6 2>&1 | head -6
+none | Bash | mapped | cargo test --no-fail-fast 2>&1 | grep -E "test result" | head
+none | Bash | mapped | grep -rn --include=*.md -i "select" .
+none | Bash | mapped | rg -t md select
+none | Bash | mapped | find . -name '*.toml' -newer src/lib.rs
+none | Bash | mapped | find . -type d -name hook
+none | Bash | plain | grep -rn "fn main" src/
+none | Bash | home | grep -n fn {loose}/x.rs
+none | PowerShell | ws | Get-Content {ws}/.base/domains.toml | Select-String 'paths'
+none | PowerShell | ws | Select-String -Path {home}/.base-gbl/*.toml -Pattern 'budget'
+query:select | Bash | mapped | grep -rn "fn select(" src/
+query:user_prompt_submit | Bash | mapped | rg "user_prompt_submit::handle" src/hook
+query:TODO | Bash | mapped | grep -rn "TODO" src/
+query:scrub | Bash | mapped | grep -n -A12 '^\s*\$scrub\s*=' src/lib.rs | head -20
+query:tabArgs | Bash | mapped | grep -n -E 'tabArgs|wt\.exe|Start-Process' src/lib.rs
+query:handle | Bash | mapped | cd {mapped} && grep -rn -E 'fn handle\b' --include=*.rs src | head -5
+query:handler | PowerShell | mapped | Select-String -Path src/*.rs -Pattern 'handler'
+query:select | ctx_batch | mapped | grep -rn 'fn select' src
+target:select | Bash | ws | grep -rn "fn select(" {mapped}/src
+file:lib | Bash | mapped | find . -name 'lib*.rs'
+generic | Bash | mapped | for p in 'CONTEXT' 'select'; do grep -rn "$p" src/ | head -3; done
+nomap:building | Bash | plain | grep -rn --include=*.rs "fn main" .
+nomap:never | Bash | cached | grep -rn "fn main" src/*.rs
+standards:none | Write | ws | {home}/.base/forks/2026-10-01-hook-injection-audit.md :: # Audit\n\nThe hook spawns `claude -p` via Command::new and spawn(; the API answers 403 Forbidden on findOrFail.
+standards:none | Edit | ws | {home}/.base/forks/2026-10-01-hook-injection-audit.md :: Foreign and non-existent resources return 404; 403 Forbidden is for abilities. spawn( child_process
+standards:none | Write | ws | {home}/notes/data.json :: {"spawn(": "Command::new", "status": "403 Forbidden"}
+standards:none | Write | ws | {home}/notes/plan.txt :: Popen and execSync, then 403 Forbidden.
+standards:A4 | Write | mapped | {mapped}/src/llm.rs :: let out = std::process::Command::new("claude").arg("-p").spawn();
+standards:A8 | Write | mapped | {mapped}/api/routes/users.ts :: router.get('/members/:id', (req, res) => res.status(403).send('Forbidden'));

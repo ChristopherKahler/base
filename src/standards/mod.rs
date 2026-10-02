@@ -36,6 +36,41 @@ pub struct TriggerDef {
     pub paths: Vec<String>,
 }
 
+/// What kinds of file a standard is about (F26a). A file is in scope when ANY declared entry admits it: it is code
+/// and `code` is set, its extension is listed, its language is listed, or its path matches a pattern. Nothing
+/// declared means code files only (F26b), so a standard never lands on a markdown, text, JSON, TOML, YAML or CSV
+/// document unless it says so. `triggers.languages` is a declaration too: it always confined a standard to those
+/// languages.
+///
+/// Measured 2026-10-01 in session 5b860473: writing a markdown fork doc drew A4 (explicit subprocess environment)
+/// and, on a later edit, A8 (404 versus 403), because the doc's prose quoted `spawn(` and `403`. Scoring cannot tell
+/// prose about code from code; the file's kind can.
+///
+/// ```toml
+/// [standard.applies_to]
+/// code = true                                  # every file in a language the code map covers
+/// extensions = ["yml", "yaml"]                 # with or without the dot
+/// languages = ["dockerfile"]                   # as the matcher names them (dockerfile, yaml, toml, json, …)
+/// paths = [".github/workflows/**", ".env*"]    # globs; one with no `/` matches the file name anywhere
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AppliesTo {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub code: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+impl AppliesTo {
+    pub fn is_empty(&self) -> bool {
+        !self.code && self.extensions.is_empty() && self.languages.is_empty() && self.paths.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StandardDef {
     /// Stable ID — protocols.md section id ("A11") or catalog id ("SC-IDOR").
@@ -55,6 +90,9 @@ pub struct StandardDef {
     /// Provenance, e.g. "midas:protocols.md#A11".
     #[serde(default)]
     pub source: String,
+    /// The kinds of file this standard is about. Empty: code files only (F26b).
+    #[serde(default, skip_serializing_if = "AppliesTo::is_empty")]
+    pub applies_to: AppliesTo,
     #[serde(default)]
     pub triggers: TriggerDef,
     /// Per-stack idiom — the injected text arrives in the touched file's

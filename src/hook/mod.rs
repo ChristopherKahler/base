@@ -1,3 +1,4 @@
+pub mod ast_hint;
 pub mod automap;
 pub mod flow;
 pub mod memory;
@@ -35,7 +36,7 @@ pub struct HookEventData {
     pub cwd: Option<String>,
     /// Pre-tool-use: AST file map was injected for this file
     pub ast_injected: bool,
-    /// Pre-tool-use: grep/find was intercepted with ast-hint
+    /// Pre-tool-use: an AST hint was given, which happens only on a code search (F20)
     pub grep_intercepted: bool,
     /// Post-tool-use: section-specific AST context was injected (partial read)
     pub section_context: bool,
