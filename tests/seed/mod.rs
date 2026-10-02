@@ -448,8 +448,21 @@ pub fn run_pre_tool_use(
     session: &str,
     env: &[(&str, &str)],
 ) -> (i32, String, String) {
+    run_pre_tool_use_at(seed, &seed.ws, tool, input, session, env)
+}
+
+/// [`run_pre_tool_use`] with the session standing in `cwd` (the payload's cwd and the process's), as a session that
+/// has `cd`ed into an app does.
+pub fn run_pre_tool_use_at(
+    seed: &Seed,
+    cwd: &Path,
+    tool: &str,
+    input: serde_json::Value,
+    session: &str,
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
     let payload = serde_json::json!({
-        "cwd": seed.ws.display().to_string(),
+        "cwd": cwd.display().to_string(),
         "hook_event_name": "PreToolUse",
         "tool_name": tool,
         "tool_input": input,
@@ -458,7 +471,7 @@ pub fn run_pre_tool_use(
     .to_string();
     let mut cmd = Command::new(BIN);
     cmd.args(["hook", "pre-tool-use"])
-        .current_dir(&seed.ws)
+        .current_dir(cwd)
         .env("BASE_HOME", &seed.home)
         .env("BASE_NO_AUTO_UPDATE", "1")
         .env("BASE_AST_NO_SPAWN", "1")
@@ -479,6 +492,53 @@ pub fn run_pre_tool_use(
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// Folders the pre-tool hints are measured against (BO-07), all under the seed's home so the automatic-map rules treat
+/// them as a real machine's apps rather than temp folders.
+pub struct Apps {
+    /// An app with a code map (a stub `ast.ttl`; the hint reads only that it exists): `src/lib.rs`, `src/hook/mod.rs`,
+    /// `api/routes/users.ts`, and `docs/guide.md` (a folder holding no source).
+    pub mapped: PathBuf,
+    /// An app with no code map: `src/main.rs`.
+    pub plain: PathBuf,
+    /// An app under `<home>/.cache`, where base never maps on its own: `src/main.rs`.
+    pub cached: PathBuf,
+    /// A source file in no app: `<home>/loose/x.rs`.
+    pub loose: PathBuf,
+}
+
+/// Write [`Apps`] under `seed.home`, plus the docs and config the corpus searches: `<home>/.base-gbl/handoffs/one.md`,
+/// `<home>/.base-gbl/extra.toml`, `<home>/notes/plan.md`.
+pub fn write_apps(seed: &Seed) -> Apps {
+    let dev = seed.home.join("dev");
+    let mapped = dev.join("mapped-app");
+    let plain = dev.join("plain-app");
+    let cached = seed.home.join(".cache").join("cached-app");
+    let loose = seed.home.join("loose");
+    let files: [(&Path, &str, &str); 10] = [
+        (&mapped, ".base-ast/ast.ttl", "# a stub map: the hint reads only that one exists\n"),
+        (&mapped, "src/lib.rs", "// TODO: select\npub fn select() {}\n"),
+        (&mapped, "src/hook/mod.rs", "pub fn handle() { crate::user_prompt_submit::handle(); }\n"),
+        (&mapped, "api/routes/users.ts", "export const users = 1;\n"),
+        (&mapped, "docs/guide.md", "# guide\n\nselect\n"),
+        (&plain, "src/main.rs", "fn main() {}\n"),
+        (&cached, "src/main.rs", "fn main() {}\n"),
+        (&loose, "x.rs", "fn x() {}\n"),
+        (&seed.home, ".base-gbl/handoffs/one.md", "# one\n\nDUE NOW\n"),
+        (&seed.home, ".base-gbl/extra.toml", "[budget]\nprompt_bytes = 10000\n"),
+    ];
+    for (root, rel, text) in files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("app folder");
+        std::fs::write(&path, text).expect("app file");
+    }
+    for app in [&mapped, &plain, &cached] {
+        std::fs::create_dir_all(app.join(".git")).expect(".git");
+    }
+    std::fs::create_dir_all(seed.home.join("notes")).expect("notes");
+    std::fs::write(seed.home.join("notes").join("plan.md"), "# plan\n").expect("notes/plan.md");
+    Apps { mapped, plain, cached, loose }
 }
 
 /// Any other `base` command, from the seeded workspace.

@@ -22,7 +22,7 @@ mod seed;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use seed::{run_base, run_base_in_session, run_pre_tool_use, run_prompt_submit, run_session_start, units};
+use seed::{run_base, run_base_in_session, run_pre_tool_use, run_pre_tool_use_at, run_prompt_submit, run_session_start, units};
 
 /// FS1's bar (tests/deferral_test.rs), which `base.toml` sets as the first-screen limit.
 const BAR: usize = 1990;
@@ -794,4 +794,137 @@ fn replay_reassigned_title_never_inherits_pings() {
     assert_eq!(told[0]["kind"], "undelivered");
     assert_eq!(told[0]["to_session"], "replay-bison");
     println!("replay relay reassignment: {} hooks, 0 inherited pings, 2 archived, 1 notice", outputs.len());
+}
+
+/// One call from `tool-calls.txt`.
+struct ToolCall {
+    expect: String,
+    tool: String,
+    cwd: String,
+    input: String,
+}
+
+fn tool_calls() -> Vec<ToolCall> {
+    let text = fixture("tool-calls.txt");
+    let out: Vec<ToolCall> = content_lines(&text)
+        .map(|line| {
+            let mut parts = line.splitn(4, " | ");
+            let mut next = || parts.next().unwrap_or_else(|| panic!("not 'expect | tool | cwd | input': {line}")).trim().to_string();
+            ToolCall { expect: next(), tool: next(), cwd: next(), input: next() }
+        })
+        .collect();
+    assert!(out.len() >= 40, "control: the corpus has its tool calls: {}", out.len());
+    out
+}
+
+/// BO-07 (F20, F26). Measured on 2026-10-01 in session 5b860473: the AST hint on 45 of the 119 tool calls the pre-tool
+/// hook saw, nearly all of them `base … | grep`, TOML and markdown searches, or folders no map covers; and A4 and A8 on
+/// a markdown fork doc. Through a corpus of calls shaped on that session's: a hint only on a code search, naming the
+/// map that covers the folder searched and a plain name to look up; standards only on code (the shipped seed's own
+/// scopes); and every expectation in the corpus met.
+#[test]
+fn replay_pre_tool_hints_fit_the_file_or_command() {
+    let s = seed::write(&root("pre-tool-hints"), &seed::TINY, &fixture("base.toml"));
+    std::fs::write(s.ws.join(".base").join("domains.toml"), fixture("domains.toml")).expect("domains.toml");
+    let shipped = toml::to_string_pretty(&base::standards::sync::seed_file()).expect("the shipped standards");
+    std::fs::write(s.home.join(".base-gbl").join("standards.toml"), shipped).expect("standards.toml");
+    let apps = seed::write_apps(&s);
+    let slash = |p: &Path| p.display().to_string().replace('\\', "/");
+    let places = [
+        ("{home}", slash(&s.home)),
+        ("{ws}", slash(&s.ws)),
+        ("{mapped}", slash(&apps.mapped)),
+        ("{plain}", slash(&apps.plain)),
+        ("{cached}", slash(&apps.cached)),
+        ("{loose}", slash(&apps.loose)),
+    ];
+    let fill = |text: &str| places.iter().fold(text.replace("\\n", "\n"), |t, (k, v)| t.replace(k, v));
+
+    let session = "replay-pre-tool";
+    let (mut hints, mut blocks, mut bytes) = (0usize, 0usize, 0usize);
+    let calls = tool_calls();
+    for call in &calls {
+        let cwd: &Path = match call.cwd.as_str() {
+            "ws" => &s.ws,
+            "home" => &s.home,
+            "mapped" => &apps.mapped,
+            "plain" => &apps.plain,
+            "cached" => &apps.cached,
+            other => panic!("unknown cwd {other:?}"),
+        };
+        let input = fill(&call.input);
+        let (tool, json) = match call.tool.as_str() {
+            "Bash" | "PowerShell" => (call.tool.clone(), serde_json::json!({ "command": input })),
+            "ctx_batch" => (
+                "mcp__plugin_context-mode_context-mode__ctx_batch_execute".to_string(),
+                serde_json::json!({ "commands": [{ "label": "corpus", "command": input }] }),
+            ),
+            "Write" | "Edit" => {
+                let (path, content) = input.split_once(" :: ").unwrap_or_else(|| panic!("not '<path> :: <content>': {input}"));
+                std::fs::create_dir_all(Path::new(path).parent().expect("a folder")).expect("the file's folder");
+                let json = if call.tool == "Write" {
+                    serde_json::json!({ "file_path": path, "content": content })
+                } else {
+                    serde_json::json!({ "file_path": path, "old_string": "", "new_string": content })
+                };
+                (call.tool.clone(), json)
+            }
+            other => panic!("unknown tool {other:?}"),
+        };
+        let (code, stdout, stderr) = run_pre_tool_use_at(&s, cwd, &tool, json, session, &[]);
+        assert_eq!(code, 0, "{}: the pre-tool hook failed: {stderr}", call.input);
+        let out = match stdout.trim() {
+            "" => String::new(),
+            json => serde_json::from_str::<serde_json::Value>(json).expect("the JSON envelope")["hookSpecificOutput"]
+                ["additionalContext"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        };
+        bytes += out.len();
+        let hint = out.split("<ast-hint>").nth(1).map(|h| h.split("</ast-hint>").next().unwrap_or(h));
+        let ids: Vec<&str> = out
+            .split("<standards")
+            .nth(1)
+            .map(|b| {
+                b.lines()
+                    .filter_map(|l| l.trim().split_once(". [").and_then(|(_, rest)| rest.split(" · ").next()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        hints += usize::from(hint.is_some());
+        blocks += usize::from(!ids.is_empty());
+        let (kind, arg) = call.expect.split_once(':').unwrap_or((call.expect.as_str(), ""));
+        let what = format!("{} ({}):\n{out}", call.input, call.expect);
+        match kind {
+            "none" => assert!(hint.is_none() && ids.is_empty(), "expected nothing: {what}"),
+            "query" | "target" | "file" => {
+                let h = hint.unwrap_or_else(|| panic!("expected a hint: {what}"));
+                let mode = if kind == "file" { "--file" } else { "--contains" };
+                assert!(h.contains(&format!("{mode} \"{arg}\"")), "expected {mode} {arg:?}: {what}");
+                assert_eq!(h.contains("--target \""), kind == "target", "--target only when the map is not the cwd's: {what}");
+            }
+            "generic" => {
+                let h = hint.unwrap_or_else(|| panic!("expected a hint: {what}"));
+                assert!(h.contains("Try `base ast query` for code navigation.") && !h.contains("--contains \""), "{what}");
+            }
+            "nomap" => {
+                let h = hint.unwrap_or_else(|| panic!("expected a hint: {what}"));
+                let line = if arg == "never" { "never maps it automatically" } else { "building one in the background" };
+                assert!(h.contains("No code map covers") && h.contains(line), "{what}");
+            }
+            "standards" => {
+                assert!(hint.is_none(), "a write carries no AST hint: {what}");
+                if arg == "none" {
+                    assert!(ids.is_empty(), "expected no standards: {what}");
+                } else {
+                    for id in arg.split(',') {
+                        assert!(ids.contains(&id), "expected {id}: {what}");
+                    }
+                }
+            }
+            other => panic!("unknown expectation {other:?}"),
+        }
+    }
+    println!("replay pre-tool: {} calls, {hints} with an AST hint, {blocks} with a standards block, {bytes} bytes added", calls.len());
 }

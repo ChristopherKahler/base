@@ -83,6 +83,14 @@ const CODE_EXTS: &[&str] = &[
     "bash", "zsh", "vue", "svelte", "astro", "r", "f90", "pas", "m", "mm", "v", "sv",
 ];
 
+/// Whether a file extension (no dot, any case) is one of the languages the code map covers. One list for every
+/// question of that kind: the AST hint's "is this a code search" (F20) and an unscoped standard's "is this a code
+/// file" (F26b) read it, as does [`has_code_files`]. Markdown and JSON are extracted too, but as documents, not code.
+pub fn is_code_ext(ext: &str) -> bool {
+    let ext = ext.trim_start_matches('.');
+    CODE_EXTS.iter().any(|c| c.eq_ignore_ascii_case(ext))
+}
+
 /// Folders directly under home that are a cloud drive's root, not a project.
 const CLOUD_ROOTS: &[&str] = &[
     "OneDrive", "Dropbox", "Google Drive", "GoogleDrive", "iCloud Drive", "iCloudDrive", "Nextcloud", "Box",

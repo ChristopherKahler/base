@@ -36,6 +36,41 @@ pub struct TriggerDef {
     pub paths: Vec<String>,
 }
 
+/// What kinds of file a standard is about (F26a). A file is in scope when ANY declared entry admits it: it is code
+/// and `code` is set, its extension is listed, its language is listed, or its path matches a pattern. Nothing
+/// declared means code files only (F26b), so a standard never lands on a markdown, text, JSON, TOML, YAML or CSV
+/// document unless it says so. `triggers.languages` is a declaration too: it always confined a standard to those
+/// languages.
+///
+/// Measured 2026-10-01 in session 5b860473: writing a markdown fork doc drew A4 (explicit subprocess environment)
+/// and, on a later edit, A8 (404 versus 403), because the doc's prose quoted `spawn(` and `403`. Scoring cannot tell
+/// prose about code from code; the file's kind can.
+///
+/// ```toml
+/// [standard.applies_to]
+/// code = true                                  # every file in a language the code map covers
+/// extensions = ["yml", "yaml"]                 # with or without the dot
+/// languages = ["dockerfile"]                   # as the matcher names them (dockerfile, yaml, toml, json, …)
+/// paths = [".github/workflows/**", ".env*"]    # globs; one with no `/` matches the file name anywhere
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AppliesTo {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub code: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+impl AppliesTo {
+    pub fn is_empty(&self) -> bool {
+        !self.code && self.extensions.is_empty() && self.languages.is_empty() && self.paths.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StandardDef {
     /// Stable ID — protocols.md section id ("A11") or catalog id ("SC-IDOR").
@@ -55,6 +90,12 @@ pub struct StandardDef {
     /// Provenance, e.g. "midas:protocols.md#A11".
     #[serde(default)]
     pub source: String,
+    /// The kinds of file this standard is about. Empty: code files only (F26b).
+    #[serde(default, skip_serializing_if = "AppliesTo::is_empty")]
+    pub applies_to: AppliesTo,
+    /// `applies_to` was taken from the shipped seed at load, not read from the file (see [`inherit_seed_scopes`]).
+    #[serde(skip)]
+    pub scope_from_seed: bool,
     #[serde(default)]
     pub triggers: TriggerDef,
     /// Per-stack idiom — the injected text arrives in the touched file's
@@ -144,7 +185,25 @@ pub fn load_standards(cwd: &Path) -> Vec<StandardDef> {
         }
     }
 
+    inherit_seed_scopes(&mut standards);
     standards
+}
+
+/// A shipped standard (the seed's A1–A12 and SC-IDOR) that declares no scope takes the seed's (F26a), at load.
+///
+/// `base install` writes the seed only when no standards.toml exists, and `base standards sync` keeps annotations as
+/// they are, so a file written before scopes existed has none. Read with F26b alone, A1, A3, A5 and A12 would quietly
+/// stop at code files on upgrade and lose the workflow YAML, Dockerfiles, railway.toml and .env files their triggers
+/// name (code review, 2026-10-02). The seed is where those standards' annotations come from in the first place.
+/// A standard that wants code files only declares it, `applies_to = { code = true }`, and keeps it.
+pub fn inherit_seed_scopes(standards: &mut [StandardDef]) {
+    let seed = sync::seed_file();
+    for s in standards.iter_mut().filter(|s| s.applies_to.is_empty()) {
+        if let Some(shipped) = seed.standards.iter().find(|d| d.id == s.id && !d.applies_to.is_empty()) {
+            s.applies_to = shipped.applies_to.clone();
+            s.scope_from_seed = true;
+        }
+    }
 }
 
 // ─── Hook entry point ────────────────────────────────────────
