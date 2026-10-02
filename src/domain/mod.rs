@@ -430,11 +430,17 @@ pub fn repath_trigger(
         return Ok(false);
     };
 
+    // By the place a trigger names, not its spelling: a project stored as `Documents/x` and moved to an absolute
+    // folder (F25b, 0.16.0) drops its `Documents/x` trigger whether it was written `Documents/x` or `C:/.../x`.
+    let root = base_dir.parent().map(|r| r.display().to_string());
+    let home = crate::home::home_root().map(|h| h.display().to_string());
+    let place = |t: &str| matcher::resolve_trigger(t, root.as_deref(), home.as_deref());
+    let same = |a: &str, b: &str| a == b || place(a).is_some_and(|pa| Some(pa) == place(b));
     let before = domain.paths.clone();
     if let Some(o) = old {
-        domain.paths.retain(|x| x != o);
+        domain.paths.retain(|x| !same(x, o));
     }
-    if !domain.paths.iter().any(|x| x == new) {
+    if !domain.paths.iter().any(|x| same(x, new)) {
         domain.paths.push(new.to_string());
     }
     if domain.paths == before {

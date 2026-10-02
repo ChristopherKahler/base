@@ -272,6 +272,26 @@ pub struct BaseConfig {
     pub rules: RulesConfig,
     #[serde(default)]
     pub log: LogConfig,
+    #[serde(default)]
+    pub doctor: DoctorConfig,
+}
+
+// ─── Doctor Config (F23) ─────────────────────────────────────
+
+/// `[doctor]`: what `base doctor` reports as stale.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorConfig {
+    /// A project's next step older than this many days is flagged (F23b; D12's "N days", 14 by lynx's pick).
+    #[serde(default = "default_stale_next_days")]
+    pub stale_next_days: i64,
+}
+
+fn default_stale_next_days() -> i64 { 14 }
+
+impl Default for DoctorConfig {
+    fn default() -> Self {
+        Self { stale_next_days: default_stale_next_days() }
+    }
 }
 
 // ─── Log Config (D14) ────────────────────────────────────────

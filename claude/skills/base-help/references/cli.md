@@ -23,6 +23,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base project peer`
 - `base project repath`
 - `base project update` (alias: u)
+- `base project paths`
 - `base project move`
 - `base project delete`
 - `base milestone` (alias: m)
@@ -389,6 +390,7 @@ Commands:
   peer      Make a project also surface in another workspace (additive peerWorkspace edge)
   repath    Re-point a project's folder path (graph + domain trigger) after it moves
   update    Update a project (accepts slug or display name) [aliases: u]
+  paths     Find each project's real folder: --suggest proposes one, with the evidence, for every project whose folder is missing, not a folder, too broad or contradicted by its own docs; --apply writes a reviewed list
   move      Re-home a project to another workspace graph (node + tasks + domain + decisions/rules/notes). AST regenerates at the destination. PREVIEW unless --yes
   delete    Delete a project. Refuses a non-empty project unless --force (which cascade- deletes tasks/milestones/decisions/rules). PREVIEW unless --yes
   help      Print this message or the help of the given subcommand(s)
@@ -413,10 +415,18 @@ Options:
           [default: active]
 
   -p, --path <PATH>
-          Project path (workspace-relative). If omitted and [protocol] is enabled, the folder is derived from the protocol stage and auto-created
+          Project folder: absolute, or relative to the workspace root; stored absolute. If omitted and [protocol] is enabled, the folder is derived from the protocol stage and auto-created
 
       --stage <STAGE>
           Protocol lifecycle stage the project starts in (default: first stage)
+
+      --parent <PARENT>
+          The project this one sits inside (a registered project's slug)
+
+      --nested <NESTED>
+          true: work in this project also carries its parent's rules (default false)
+          
+          [possible values: true, false]
 
   -h, --help
           Print help
@@ -537,7 +547,45 @@ Options:
           
 
       --next-action <NEXT_ACTION>
+          The project's next step; records when it was written
+
+      --path <PATH>
+          The project's folder: absolute, or relative to the workspace root; stored absolute. Its domain's path trigger moves with it
+
+      --parent <PARENT>
+          The project this one sits inside (a registered project's slug); `none` removes the link
+
+      --nested <NESTED>
+          true: work in this project also carries its parent's rules; false: it does not (the default)
           
+          [possible values: true, false]
+
+  -h, --help
+          Print help
+```
+
+## base project paths
+
+```text
+Find each project's real folder: --suggest proposes one, with the evidence, for every project whose folder is missing, not a folder, too broad or contradicted by its own docs; --apply writes a reviewed list
+
+Usage: base project paths [OPTIONS] <--suggest|--apply <APPLY>>
+
+Options:
+      --suggest
+          List the suggestions (writes nothing)
+
+      --out <OUT>
+          With --suggest: also write them as a list to review and pass to --apply
+
+      --apply <APPLY>
+          Set each project in a reviewed list (`slug = "folder"` lines) to its folder
+
+      --dry-run
+          With --apply: say what would change and write nothing
+
+      --json
+          Emit JSON instead of a table
 
   -h, --help
           Print help

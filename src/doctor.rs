@@ -129,6 +129,10 @@ pub struct DoctorReport {
     /// **Advisory, never counted against `healthy`:** a first screen DUE NOW overflows is a reported state by ruling,
     /// and over budget is a report, not a defect (`auk`'s rank 10 G0 verdict, question 2).
     pub hook_output: Vec<crate::emit::record::TierSizes>,
+    /// Project next steps that are undated (written before 0.16.0) or older than `[doctor] stale_next_days`, one
+    /// line each with the command that rewrites the step (F23b, F23c). **Advisory, never counted against
+    /// `healthy`:** an old plan is worth a look, not a broken store.
+    pub next_steps: Vec<String>,
     /// The write seam this binary was built with, [`store::LOCK_SEAM_MARKER`].
     ///
     /// Not diagnostic information for an operator — it is here so a verification
@@ -481,7 +485,54 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         // One subprocess per `diagnose`, not one per render: both call sites below read this.
         measured_on: check_measured_on(&crate::config::BaseConfig::load(cwd).budget),
         hook_output,
+        next_steps: stale_next_steps(cwd),
         seam: store::LOCK_SEAM_MARKER,
+    }
+}
+
+/// Every project next step that is undated, or older than `[doctor] stale_next_days` (F23b, F23c), as the line
+/// doctor prints, with the command that rewrites it. Every project in the workspace file, once each; done work
+/// (`complete`, `completed`, `archived`) is left alone. Read-only.
+pub fn stale_next_steps(cwd: &Path) -> Vec<String> {
+    let config = crate::config::BaseConfig::load(cwd);
+    let Ok((records, _)) =
+        crate::crud::project::list_data(cwd, &config, &crate::scope::ProjectScope::All)
+    else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in records {
+        let Some(next) = &r.next_action else { continue };
+        if crate::protocol::reconcile::TERMINAL_STATUSES.contains(&r.status.as_str()) || !seen.insert(r.id.clone()) {
+            continue;
+        }
+        let what = match r.next_action_age_days {
+            None => "next step undated, probably stale".to_string(),
+            Some(d) if d > config.doctor.stale_next_days => format!("next step {d} days old"),
+            Some(_) => continue,
+        };
+        // A PAUL project's step is its phase line, rewritten from `.paul` at every session start: the fix is there,
+        // and `--next-action` would be replaced.
+        let fix = match r.path.as_deref().and_then(crate::crud::project_paths::paul_file) {
+            Some(file) => format!("update: the phase in {file} (base rewrites this step from it)"),
+            None => format!("update: base project update {} --next-action \"...\"", r.id),
+        };
+        out.push(format!(
+            "project {id}: {what}: \"{step}\" · {fix}",
+            id = r.id,
+            step = crate::crud::project::excerpt(next, 30),
+        ));
+    }
+    out
+}
+
+fn push_next_steps(out: &mut String, next_steps: &[String]) {
+    if !next_steps.is_empty() {
+        out.push_str("\n─── project next steps ───────────────\n");
+        for n in next_steps {
+            out.push_str(&format!("   ⚠ {n}\n"));
+        }
     }
 }
 
@@ -553,6 +604,7 @@ pub fn format_human(report: &DoctorReport) -> String {
         for w in &report.warnings {
             out.push_str(&format!("   ⚠ {w}\n"));
         }
+        push_next_steps(&mut out, &report.next_steps);
         push_hook_output(&mut out, &report.hook_output, &report.measured_on);
         return out;
     }
@@ -740,6 +792,8 @@ pub fn format_human(report: &DoctorReport) -> String {
             out.push_str(&format!("   ⚠ {t}\n"));
         }
     }
+
+    push_next_steps(&mut out, &report.next_steps);
 
     if !report.warnings.is_empty() {
         out.push_str("\n─── advisories ───────────────────────\n");
@@ -1846,6 +1900,7 @@ mod tests {
             config_errors: Vec::new(),
             trigger_faults: Vec::new(),
             hook_output: Vec::new(),
+            next_steps: Vec::new(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human = format_human(&report);
@@ -1865,6 +1920,7 @@ mod tests {
             config_errors: Vec::new(),
             trigger_faults: Vec::new(),
             hook_output: Vec::new(),
+            next_steps: Vec::new(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human2 = format_human(&report2);
@@ -2069,6 +2125,7 @@ mod coach_drift_tests {
             config_errors: vec![],
             trigger_faults: vec![],
             hook_output: vec![],
+            next_steps: Vec::new(),
             seam: store::LOCK_SEAM_MARKER,
         };
         assert!(report.healthy, "an advisory must not flip the verdict");
@@ -2279,6 +2336,7 @@ mod hook_output_tests {
                     events: vec![],
                 },
             ],
+            next_steps: Vec::new(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human = format_human(&report);
@@ -2354,6 +2412,7 @@ mod hook_output_tests {
                 file: FileState::Present { unreadable_lines: 0, unreadable_files: 0 },
                 events: vec![prompt],
             }],
+            next_steps: Vec::new(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human = format_human(&report);

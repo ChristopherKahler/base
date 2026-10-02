@@ -86,6 +86,40 @@ fn sync_extracts_paul_json() {
     }
 }
 
+/// BO-09 (D13): a re-sync of a paul.json project rewrites what the file says and keeps the parent link and
+/// `nested` the operator set, which nothing re-derives.
+#[test]
+fn paul_json_resync_keeps_parent_and_nested() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+    let json = |v: &str| format!(r#"{{"name": "myapp", "version": "{v}", "phase": {{"name": "Build", "status": "active"}}}}"#);
+    write_paul_json(tmp.path(), "apps/myapp/.paul/paul.json", &json("1.0"));
+    let mut config = default_config();
+    config.sync.include.push("**/.paul/paul.json".into());
+    extract::sync(tmp.path(), &config, false).unwrap();
+
+    base::crud::project::add(tmp.path(), &ns(), "Holder", "active", Some("/nope")).unwrap();
+    let change = base::crud::project::ProjectUpdate {
+        parent: Some(base::crud::project::ParentChange::Set("holder".into())),
+        nested: Some(true),
+        ..Default::default()
+    };
+    base::crud::project::apply_update(tmp.path(), &ns(), "myapp", &change).unwrap();
+
+    write_paul_json(tmp.path(), "apps/myapp/.paul/paul.json", &json("1.1"));
+    extract::sync(tmp.path(), &config, false).unwrap();
+    let rec = base::crud::project::get_data(tmp.path(), &ns(), "myapp").unwrap().expect("myapp");
+    // The project's folder is the one holding `.paul`, stored absolute (F25b), not the paul.json file.
+    let want = base::crud::project::absolute_path(&tmp.path().join("apps").join("myapp").display().to_string(), None, None);
+    assert_eq!(rec.path, want, "{rec:?}");
+    assert_eq!(rec.parent.as_deref(), Some("holder"), "parent kept: {rec:?}");
+    assert!(rec.nested, "nested kept: {rec:?}");
+    let trig = tmp.path().join(".base").join("graph.nq");
+    let text = std::fs::read_to_string(trig).unwrap();
+    assert!(text.contains("\"version: 1.1\""), "the re-sync did rewrite the record");
+    assert!(!text.contains("\"version: 1.0\""), "and dropped what the file no longer says");
+}
+
 #[test]
 fn sync_is_idempotent() {
     let tmp = tempfile::tempdir().unwrap();

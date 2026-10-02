@@ -765,13 +765,19 @@ pub enum ProjectAction {
         name: String,
         #[arg(short, long, default_value = "active")]
         status: String,
-        /// Project path (workspace-relative). If omitted and [protocol] is enabled,
-        /// the folder is derived from the protocol stage and auto-created.
+        /// Project folder: absolute, or relative to the workspace root; stored absolute. If omitted and
+        /// [protocol] is enabled, the folder is derived from the protocol stage and auto-created.
         #[arg(short, long)]
         path: Option<String>,
         /// Protocol lifecycle stage the project starts in (default: first stage).
         #[arg(long)]
         stage: Option<String>,
+        /// The project this one sits inside (a registered project's slug)
+        #[arg(long)]
+        parent: Option<String>,
+        /// true: work in this project also carries its parent's rules (default false)
+        #[arg(long)]
+        nested: Option<bool>,
     },
     /// List deferred projects: open but paused, not listed at session start
     Deferred,
@@ -823,8 +829,39 @@ pub enum ProjectAction {
         status: Option<String>,
         #[arg(short, long)]
         blocked_by: Option<String>,
+        /// The project's next step; records when it was written
         #[arg(long)]
         next_action: Option<String>,
+        /// The project's folder: absolute, or relative to the workspace root; stored absolute.
+        /// Its domain's path trigger moves with it.
+        #[arg(long)]
+        path: Option<String>,
+        /// The project this one sits inside (a registered project's slug); `none` removes the link
+        #[arg(long)]
+        parent: Option<String>,
+        /// true: work in this project also carries its parent's rules; false: it does not (the default)
+        #[arg(long)]
+        nested: Option<bool>,
+    },
+    /// Find each project's real folder: --suggest proposes one, with the evidence, for every project whose
+    /// folder is missing, not a folder, too broad or contradicted by its own docs; --apply writes a reviewed list
+    #[command(group(clap::ArgGroup::new("mode").required(true).args(["suggest", "apply"])))]
+    Paths {
+        /// List the suggestions (writes nothing)
+        #[arg(long)]
+        suggest: bool,
+        /// With --suggest: also write them as a list to review and pass to --apply
+        #[arg(long, requires = "suggest")]
+        out: Option<std::path::PathBuf>,
+        /// Set each project in a reviewed list (`slug = "folder"` lines) to its folder
+        #[arg(long)]
+        apply: Option<std::path::PathBuf>,
+        /// With --apply: say what would change and write nothing
+        #[arg(long, requires = "apply")]
+        dry_run: bool,
+        /// Emit JSON instead of a table
+        #[arg(long)]
+        json: bool,
     },
     /// Re-home a project to another workspace graph (node + tasks + domain +
     /// decisions/rules/notes). AST regenerates at the destination. PREVIEW unless --yes.
@@ -1571,6 +1608,12 @@ fn outside_workspace_note(cwd: &std::path::Path) {
     }
 }
 
+/// `Error` for a project change refused before anything was written (F25c: `Error: loop: ...`), `Failed` for a
+/// write that went wrong.
+fn project_error_prefix(e: &anyhow::Error) -> &'static str {
+    if e.downcast_ref::<crud::project::Refused>().is_some() { "Error" } else { "Failed" }
+}
+
 fn die(prefix: &str, e: impl std::fmt::Display) -> ! {
     eprintln!("{prefix}: {e:#}");
     std::process::exit(1);
@@ -1827,8 +1870,16 @@ pub fn run() {
 
         // ─── Project ─────────────────────────────────────
         Some(Commands::Project { action }) => match action {
-            ProjectAction::Add { name, status, path, stage } => {
+            ProjectAction::Add { name, status, path, stage, parent, nested } => {
                 let slug = crud::slugify(&name);
+                // F25c: a parent that names no project, or would close a loop, is refused before anything is written.
+                let parent = match parent.as_deref() {
+                    Some(p) => match crud::project::check_parent(&cwd, &config.namespace, &slug, p) {
+                        Ok(s) => Some(s),
+                        Err(e) => die(project_error_prefix(&e), e),
+                    },
+                    None => None,
+                };
                 // Explicit --path wins; otherwise the protocol provisions the folder.
                 let provisioned = if path.is_none() {
                     match crud::project::provision_folder(&cwd, &config.protocol, &name, &slug, stage.as_deref()) {
@@ -1843,7 +1894,30 @@ pub fn run() {
                 match resolved_path {
                     Some(rp) => match crud::project::add_with_stage(&cwd, &config.namespace, &name, &status, Some(&rp), resolved_stage.as_deref()) {
                         Ok(slug) => {
+                            // The path as stored (F25b): absolute, whatever was typed.
+                            let rp = crud::project::PathRoots::new(&cwd, &config.namespace).from_cli(&rp).unwrap_or(rp);
                             println!("Project '{name}' created (slug: {slug}, path: {rp})");
+                            if parent.is_some() || nested.is_some() {
+                                let change = crud::project::ProjectUpdate {
+                                    parent: parent.clone().map(crud::project::ParentChange::Set),
+                                    nested,
+                                    ..Default::default()
+                                };
+                                match crud::project::apply_update(&cwd, &config.namespace, &slug, &change) {
+                                    Ok(o) => {
+                                        if let Some(p) = &parent {
+                                            println!("   parent: {p}");
+                                        }
+                                        if let Some(n) = nested {
+                                            println!("   nested: {n}");
+                                        }
+                                        for w in &o.warnings {
+                                            eprintln!("warning: {w}");
+                                        }
+                                    }
+                                    Err(e) => die(project_error_prefix(&e), e),
+                                }
+                            }
                             // A registered project is an app: its code map starts
                             // now, not at the next session start.
                             let folder = {
@@ -1914,13 +1988,47 @@ pub fn run() {
                     }
                 }
             }
-            ProjectAction::Update { slug, status, blocked_by, next_action } => {
+            ProjectAction::Update { slug, status, blocked_by, next_action, path, parent, nested } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug) {
-                    match crud::project::update(&cwd, &config.namespace, &s, status.as_deref(), blocked_by.as_deref(), next_action.as_deref()) {
-                        Ok(()) => println!("Project '{s}' updated"),
-                        Err(e) => die("Failed", e),
+                    let change = crud::project::ProjectUpdate {
+                        status: status.as_deref(),
+                        blocked_by: blocked_by.as_deref(),
+                        next_action: next_action.as_deref(),
+                        path: path.as_deref(),
+                        parent: parent.map(|p| {
+                            if p.eq_ignore_ascii_case("none") {
+                                crud::project::ParentChange::Clear
+                            } else {
+                                crud::project::ParentChange::Set(p)
+                            }
+                        }),
+                        nested,
+                    };
+                    match crud::project::apply_update(&cwd, &config.namespace, &s, &change) {
+                        Ok(o) => {
+                            println!("Project '{s}' updated");
+                            if let Some(r) = &o.repath {
+                                let from = r.old_path.as_deref().unwrap_or("(none)");
+                                let dom = if r.domain_changed { format!(", domain '{}' trigger updated", r.name) } else { String::new() };
+                                println!("   path: {from} → {}{dom}", r.new_path);
+                            }
+                            for w in &o.warnings {
+                                eprintln!("warning: {w}");
+                            }
+                        }
+                        Err(e) => die(project_error_prefix(&e), e),
                     }
                 }
+            }
+            ProjectAction::Paths { suggest, out, apply, dry_run, json } => {
+                let r = if suggest {
+                    crud::project_paths::suggest_cmd(&cwd, &config, out.as_deref(), json)
+                } else if let Some(file) = apply {
+                    crud::project_paths::apply_cmd(&cwd, &config, &file, dry_run, json)
+                } else {
+                    unreachable!("clap requires --suggest or --apply")
+                };
+                if let Err(e) = r { die(project_error_prefix(&e), e); }
             }
             ProjectAction::Move { slug, to, dry_run, no_ast, yes } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug) {
