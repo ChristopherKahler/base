@@ -188,7 +188,11 @@ pub fn handle(
     // It now runs ONCE, here, for both paths. Queries render BESIDE the signals,
     // which is what `docs/settings-hook-config.md` has always promised. Where the
     // block lands in the output is decided by `LAYOUT`, not by when it is pushed.
-    let queries_shown = render_adhoc_queries(cwd, config, out);
+    // One parse of the graph for both readers here: the ad-hoc queries and the global decisions. Each used to
+    // be the only reader, and a second parse of a multi-megabyte store costs a second or more per session start.
+    let graph = load_session_graph(cwd, config);
+    let queries_shown = render_adhoc_queries(graph.as_ref(), cwd, config, out);
+    push_global_decisions(graph.as_ref(), cwd, config, out);
 
     if let Ok(signal_result) = crate::signal::run_signals(cwd, config, "session-start") {
         diagnostics.extend(signal_result.diagnostics.iter().cloned());
@@ -273,18 +277,10 @@ pub fn handle(
 /// This is QTF-1's fix, ruled option 2. Called ONCE, before the signal early-return,
 /// so ad-hoc queries render BESIDE the signals instead of only when every signal is
 /// silent -- which, on any workspace with real data, was never.
-fn render_adhoc_queries(cwd: &Path, config: &BaseConfig, out: &mut SessionOutput) -> usize {
-    let trig_files = discover_trig_files(cwd);
-    if trig_files.is_empty() {
-        return 0;
-    }
-    let paths: Vec<&Path> = trig_files.iter().map(|p| p.as_path()).collect();
-    let Ok(graph) = store::load_graphs(&paths) else {
+fn render_adhoc_queries(graph: Option<&oxigraph::store::Store>, cwd: &Path, config: &BaseConfig, out: &mut SessionOutput) -> usize {
+    let Some(graph) = graph else {
         return 0;
     };
-    if ontology::load_vocabulary(&graph, &config.namespace).is_err() {
-        return 0;
-    }
 
     let queries = load_queries(cwd, config);
     let mut output = String::new();
@@ -300,7 +296,7 @@ fn render_adhoc_queries(cwd: &Path, config: &BaseConfig, out: &mut SessionOutput
             u = config.namespace.uri,
             body = qdef.sparql,
         );
-        if let Ok(results) = store::query(&graph, &sparql) {
+        if let Ok(results) = store::query(graph, &sparql) {
             let section = format_results(results, &qdef.format, &qdef.description);
             if !section.is_empty() {
                 output.push_str(&section);
@@ -315,12 +311,40 @@ fn render_adhoc_queries(cwd: &Path, config: &BaseConfig, out: &mut SessionOutput
     shown
 }
 
+/// Both tiers' graphs with the vocabulary, for the session-start readers that query the graph directly. `None`
+/// when there is no graph or it will not load: FAIL-OPEN, as [`render_adhoc_queries`] explains, and the
+/// unhealthy-graph warning has already been collected by the time this runs.
+fn load_session_graph(cwd: &Path, config: &BaseConfig) -> Option<oxigraph::store::Store> {
+    let trig_files = discover_trig_files(cwd);
+    if trig_files.is_empty() {
+        return None;
+    }
+    let paths: Vec<&Path> = trig_files.iter().map(|p| p.as_path()).collect();
+    let graph = store::load_graphs(&paths).ok()?;
+    ontology::load_vocabulary(&graph, &config.namespace).ok()?;
+    Some(graph)
+}
+
+/// The global decisions with no keywords (BO-03, F5): a decision of an always-on domain reaches a prompt only
+/// on one of its keywords, so one with none is shown here, at session start, and nowhere else.
+fn push_global_decisions(graph: Option<&oxigraph::store::Store>, cwd: &Path, config: &BaseConfig, out: &mut SessionOutput) {
+    let Some(graph) = graph else {
+        return;
+    };
+    let domains = crate::domain::load_domains(cwd);
+    let global = crate::domain::global_decisions::GlobalDecisions::load(graph, config, &domains);
+    let (text, items) = global.session_start_block();
+    if items > 0 {
+        out.push("global-decisions", &text, items);
+    }
+}
+
 /// Spec B1: every block's rank, and inside its rank its place. The trimmer takes the bottom of the
 /// lowest rank first, so the `Tail` order is B1 row 8's list read upward: diagnostics shrink first,
 /// pulse last, and the relay wake contract outlasts the operator profile and the notices. A kind
 /// missing from this table sorts after all of it, and `every_pushed_kind_has_a_place_in_the_layout`
 /// fails the build when one does.
-pub const LAYOUT: [(&str, Rank); 32] = [
+pub const LAYOUT: [(&str, Rank); 33] = [
     ("instructions", Rank::Pinned),
     ("graph-unhealthy", Rank::DueNow),
     ("reminders", Rank::DueNow),
@@ -339,6 +363,8 @@ pub const LAYOUT: [(&str, Rank); 32] = [
     ("pulse", Rank::Tail),
     ("flow-resurface", Rank::Tail),
     ("memory", Rank::Tail),
+    // BO-03, F5: the global decisions with no keywords, which no prompt receives.
+    ("global-decisions", Rank::Tail),
     ("triggers", Rank::Tail),
     ("relay-tasks", Rank::Tail),
     ("relay-wake", Rank::Tail),

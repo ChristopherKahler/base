@@ -40,40 +40,53 @@ impl Bracket {
         }
     }
 
-    /// Rules to inject at this tier: `always` first, then the tier's own bucket.
+    /// The rules in force at this tier: `always` first, then the tier's own bucket.
     ///
     /// Additive rather than exclusive — a DEPLETED prompt gets `always` + `depleted`.
     /// `always` leads so the permanent rules keep a stable position in the block
-    /// regardless of tier, which matters for a rule that is re-read every prompt.
-    pub fn rules<'a>(&self, rules: &'a crate::config::BracketRules) -> Vec<&'a str> {
+    /// regardless of tier.
+    pub fn entries<'a>(&self, rules: &'a crate::config::BracketRules) -> Vec<&'a crate::config::BracketRule> {
         let tier = match self {
             Self::Fresh => &rules.fresh,
             Self::Moderate => &rules.moderate,
             Self::Depleted => &rules.depleted,
             Self::Critical => &rules.critical,
         };
-        rules
-            .always
-            .iter()
-            .chain(tier.iter())
-            .map(String::as_str)
-            .collect()
+        rules.always.iter().chain(tier.iter()).collect()
+    }
+
+    /// The texts of [`Bracket::entries`].
+    pub fn rules<'a>(&self, rules: &'a crate::config::BracketRules) -> Vec<&'a str> {
+        self.entries(rules).into_iter().map(|r| r.text.as_str()).collect()
     }
 }
 
-/// Render the bracket's rules as an injectable block. Empty string when the tier
+/// Render every rule in force at this tier as an injectable block. Empty string when the tier
 /// contributes nothing, so the hook can push it unconditionally.
 pub fn format_bracket_rules(bracket: Bracket, rules: &crate::config::BracketRules) -> String {
-    let selected = bracket.rules(rules);
-    if selected.is_empty() {
+    render_bracket_rules(bracket, &bracket.rules(rules))
+}
+
+/// Render the given rule texts as the bracket block for `bracket`, numbered from 0. Empty string for no rules.
+/// The prompt hook passes only the rules it is sending (F3): the ones not covered by a loaded CLAUDE.md and not
+/// yet sent this session.
+pub fn render_bracket_rules(bracket: Bracket, texts: &[&str]) -> String {
+    if texts.is_empty() {
         return String::new();
     }
     let mut out = format!("[BRACKET RULES — {bracket}]\n");
-    for (i, rule) in selected.iter().enumerate() {
+    for (i, rule) in texts.iter().enumerate() {
         out.push_str(&format!("  {i}. {rule}\n"));
     }
     out.push('\n');
     out
+}
+
+/// One bracket rule's identity in the per-rule record (F3): an id and a content hash, both from its text.
+/// The same text in two buckets is one rule, sent once; an edited text is a new rule, sent once more.
+pub fn bracket_rule_key(text: &str) -> (String, u64) {
+    let hash = rules_hash(&[text.to_string()]);
+    (format!("bracket:{hash:016x}"), hash)
 }
 
 // ─── Session State ──────────────────────────────────────────
@@ -189,17 +202,14 @@ pub struct SessionState {
     /// therefore once per session, while a place or action rule is keyed on its id
     /// AND the place or action that matched, and is therefore once per place and once
     /// per action.
+    ///
+    /// The bracket rules live here too, one record per rule under [`bracket_rule_key`] (BO-03, F3). Until
+    /// BO-03 a separate map, `bracket_shown`, held the one tier whose whole block had been served, and a tier
+    /// change sent the whole block again. A `.session` file that still carries that key loads as before:
+    /// serde ignores it. [`SessionState::clear_dedup`] does not clear this map, so the DEPLETED and CRITICAL
+    /// force-refresh, which exists for domain context, never re-sends a bracket rule.
     #[serde(default)]
     pub rules_shown: HashMap<String, ShownRule>,
-    /// Scoped key → the bracket tier whose rules block this session has been shown.
-    ///
-    /// Deliberately NOT cleared by [`SessionState::clear_dedup`]. The DEPLETED and
-    /// CRITICAL force-refresh exists to restore domain rules that erode as context
-    /// fills; K1 says the bracket block is served once per tier and nothing else,
-    /// so a force-refresh that re-sent it would put the old every-prompt behaviour
-    /// back on exactly the long sessions the ruling was written for.
-    #[serde(default)]
-    pub bracket_shown: HashMap<String, String>,
     /// Scoped key → the bracket tier the PROMPT hook most recently computed for this session.
     ///
     /// `petrel`'s FINDING 1 on `5c099d1`. The prompt hook reads its tier from the transcript's real
@@ -322,7 +332,6 @@ impl SessionState {
         self.injected.retain(|k, _| !k.starts_with(&prefix));
         self.ast_injected.retain(|k, _| !k.starts_with(&prefix));
         self.standards_injected.retain(|k, _| !k.starts_with(&prefix));
-        self.bracket_shown.retain(|k, _| !k.starts_with(&prefix));
         self.bracket_tier.retain(|k, _| !k.starts_with(&prefix));
         self.rules_shown.retain(|k, _| !k.starts_with(&prefix));
         self.dirty_apps.retain(|k| !k.starts_with(&prefix));
@@ -499,8 +508,8 @@ impl SessionState {
     ///   - the rule's own text or rationale changed, so it is a different rule to read;
     ///   - a new Claude session, which has its own scope and has been told nothing.
     ///
-    /// It DECIDES and RECORDS in one call, the way `claim_bracket_block` does, so two
-    /// call sites cannot drift into disagreeing about what was served.
+    /// It DECIDES and RECORDS in one call, so two call sites cannot drift into disagreeing
+    /// about what was served.
     pub fn claim_rule(
         &mut self,
         rule_id: &str,
@@ -544,47 +553,21 @@ impl SessionState {
         self.rules_shown.insert(key, ShownRule { at: now, tier: tier.to_string(), content });
     }
 
-    /// Claim the bracket-rules block for `tier`: true the first time this session
-    /// is served that tier's block, false afterwards, and true again the first time
-    /// a DIFFERENT tier is in force.
+    /// Whether this bracket rule is still to be sent in this session, recording NOTHING (BO-03, F3).
     ///
-    /// K1, ruled by Chris 2026-09-12: "no, inject one time, then no more, inject only
-    /// when bracket changes the rules for that bracket." Before this, the block was
-    /// exempt from dedup by design and rode every prompt — 2,931 bytes per prompt at
-    /// FRESH and 1,878 at MODERATE on the operator's machine, measured 2026-09-12,
-    /// while the same text also sat in `~/.claude/CLAUDE.md`.
+    /// Once per session per rule: true until the rule has been printed whole in this session, then false for
+    /// the rest of it, whatever the tier does. A tier change brings only the rules of the new tier that have
+    /// not been sent; a rule already sent is not repeated (lynx ruled per rule over per block, 2026-10-02, so
+    /// the DEPLETED and CRITICAL buckets still go out once when their tier arrives). An edited text is a new
+    /// rule ([`bracket_rule_key`]). The prompt hook records a rule with [`SessionState::mark_rule_shown`] only
+    /// once the block carrying it is printed (D15), so a rule the budget dropped stays due.
     ///
-    /// It DECIDES and RECORDS in one call, so the four return sites in the prompt
-    /// hook cannot drift apart: a gate applied at three of them is a gate a user
-    /// routes around by having no domains configured. Call it only once the block
-    /// has actually rendered to something — claiming a tier for a block that was
-    /// never printed would silence the first real one after an operator configures
-    /// bracket rules mid-session.
-    ///
-    /// A change BACK to an earlier tier serves that tier's block again. The rules
-    /// now in force have not been served since they came into force, which is what
-    /// the ruling is about.
-    pub fn claim_bracket_block(&mut self, tier: Bracket) -> bool {
-        if !self.bracket_block_due(tier) {
-            return false;
-        }
-        self.mark_bracket_block(tier);
-        true
-    }
-
-    /// Whether `tier`'s bracket block is due, recording NOTHING. The prompt hook asks this, and records with
-    /// [`SessionState::mark_bracket_block`] only once the block is printed (D15): a block the budget dropped is still
-    /// due on the next prompt.
-    pub fn bracket_block_due(&self, tier: Bracket) -> bool {
-        self.bracket_shown
-            .get(&self.scoped("bracket"))
-            .is_none_or(|shown| *shown != tier.to_string())
-    }
-
-    /// Record that `tier`'s bracket block was shown.
-    pub fn mark_bracket_block(&mut self, tier: Bracket) {
-        let key = self.scoped("bracket");
-        self.bracket_shown.insert(key, tier.to_string());
+    /// History: K1 (Chris, 2026-09-12) took the block off every prompt and sent it once per tier; on
+    /// 2026-10-01 that still sent the T1 to T6 rules, which CLAUDE.md already carries, again at each tier.
+    pub fn bracket_rule_due(&self, text: &str) -> bool {
+        let (id, content) = bracket_rule_key(text);
+        // `on_tier_change: false` makes the tier argument irrelevant: only the text and the session decide.
+        self.rule_due(&id, content, Bracket::Fresh, None, ReShow::PerSession { on_tier_change: false }, 0)
     }
 
     /// Whether this standard was already injected this session with the same

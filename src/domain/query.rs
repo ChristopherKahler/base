@@ -26,21 +26,47 @@ fn walk_key(term: TermRef<'_>) -> Option<String> {
 /// is still a block. [`query_domain_from_graph`] stays as the both-halves reader for
 /// every other caller, and both go through `domain::rules` for the rules half, so
 /// there is still exactly one place that knows what a rule is.
+///
+/// `prompt` is the text the block is served for: a global decision appears only when
+/// the text carries one of its keywords (BO-03, F5; see [`domain::global_decisions`]).
 pub fn query_domain_neighborhood(
     store: &oxigraph::store::Store,
     config: &BaseConfig,
     domain_def: &domain::DomainDef,
+    global: &domain::global_decisions::GlobalDecisions,
+    prompt: &str,
 ) -> (String, Vec<String>) {
-    let (_rules, neighborhood, served) = query_domain_from_graph(store, config, domain_def);
+    let (_rules, neighborhood, served) = query_domain(store, config, domain_def, Some((global, prompt)));
     (neighborhood, served)
 }
 
-/// Query a domain's rules and 1-hop neighborhood from the graph.
+/// Query a domain's rules and 1-hop neighborhood from the graph, every decision included.
 /// Returns (rules_text, neighborhood_text, served). Falls back to TOML if graph query fails.
 pub fn query_domain_from_graph(
     store: &oxigraph::store::Store,
     config: &BaseConfig,
     domain_def: &domain::DomainDef,
+) -> (String, String, Vec<String>) {
+    query_domain(store, config, domain_def, None)
+}
+
+/// [`query_domain_from_graph`] as a prompt with `text` receives it: a global decision only on one of its
+/// keywords (F5). `base context <text>` uses it, so the preview matches the prompt.
+pub fn query_domain_for_text(
+    store: &oxigraph::store::Store,
+    config: &BaseConfig,
+    domain_def: &domain::DomainDef,
+    global: &domain::global_decisions::GlobalDecisions,
+    text: &str,
+) -> (String, String, Vec<String>) {
+    query_domain(store, config, domain_def, Some((global, text)))
+}
+
+fn query_domain(
+    store: &oxigraph::store::Store,
+    config: &BaseConfig,
+    domain_def: &domain::DomainDef,
+    for_text: Option<(&domain::global_decisions::GlobalDecisions, &str)>,
 ) -> (String, String, Vec<String>) {
     // The IRIs this domain block actually served. Prompt-time traversal walks
     // from the things the prompt NAMES and would otherwise re-serve records the
@@ -125,6 +151,16 @@ pub fn query_domain_from_graph(
                     }
                 })
                 .collect();
+            // F5: a global decision only when the text names one of its keywords. Dropped before the stub guard
+            // and before anything is marked served, so a withheld decision is neither printed nor claimed, and
+            // the walk below meets the same rule for it (`hook::walk`).
+            let neighbors: Vec<(String, String, Option<String>)> = match for_text {
+                Some((global, text)) => neighbors
+                    .into_iter()
+                    .filter(|(_, _, iri)| !iri.as_deref().is_some_and(|id| global.withheld_from(id, text)))
+                    .collect(),
+                None => neighbors,
+            };
 
             // Stub guard (F29): a block whose only rows are the domain's own project —
             // `- Project: <domain>`, the record `project add` links to the domain it
@@ -299,6 +335,11 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
     crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
 
     let graph_store = crate::store::load_merged(cwd);
+    // F5, as the prompt hook applies it: a global decision only when the text carries one of its keywords.
+    let global = graph_store
+        .as_ref()
+        .map(|s| domain::global_decisions::GlobalDecisions::load(s, config, &domains))
+        .unwrap_or_default();
 
     let matched = domain::matcher::match_domains(text, &domains, &[], &domain::matcher::TriggerContext::default());
     // NO EARLY RETURN on an empty match. The walk below resolves what the TEXT names,
@@ -328,7 +369,7 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
                 // deliberately does not do, and this command claims to be the same
                 // engine. Records dedup; a served ROOT still walks and is never listed as
                 // its own record (the binding 0.14.2 ruling).
-                let (r, n, served) = query_domain_from_graph(store, config, domain_def);
+                let (r, n, served) = query_domain_for_text(store, config, domain_def, &global, text);
                 domain_served.extend(served);
                 (r, n)
             }
@@ -383,7 +424,7 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
     //
     // Lean mode does not apply -- there is no prompt count on this path.
     if let Some(store) = &graph_store {
-        let walked = crate::hook::walk::walk_from_text(store, cwd, config, text, &domain_served);
+        let walked = crate::hook::walk::walk_from_text(store, cwd, config, text, &domain_served, &global);
         let (block, _dropped) = crate::hook::walk::render(&walked, config.injection.walk_budget);
         if !block.is_empty() {
             print!("{block}");

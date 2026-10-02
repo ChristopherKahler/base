@@ -1045,6 +1045,11 @@ pub enum DecisionAction {
         recall: Option<String>,
         #[arg(short, long)]
         status: Option<String>,
+        /// Comma-separated words or phrases that replace the decision's keywords ("" clears them). A decision
+        /// of an always-on domain such as GLOBAL reaches a prompt only when the prompt contains one of them;
+        /// with none it is shown at session start only.
+        #[arg(long)]
+        keywords: Option<String>,
     },
 }
 
@@ -2158,13 +2163,19 @@ pub fn run() {
                         }
                     }
                 }
-                DecisionAction::Update { slug, name, rationale, recall, status } => {
+                DecisionAction::Update { slug, name, rationale, recall, status, keywords } => {
                     if let Some(s) = resolve(&cwd, &config.namespace, "decision", &slug) {
-                        match crud::decision::update(
+                        let keywords = keywords.as_deref().map(base::domain::global_decisions::parse_keywords);
+                        match crud::decision::update_with(
                             &cwd, &config.namespace, &s,
                             name.as_deref(), rationale.as_deref(), recall.as_deref(), status.as_deref(),
+                            keywords.as_deref(),
                         ) {
-                            Ok(()) => println!("Decision '{s}' updated"),
+                            Ok(()) => match &keywords {
+                                Some(k) if k.is_empty() => println!("Decision '{s}' updated · keywords cleared"),
+                                Some(k) => println!("Decision '{s}' updated · keywords: {}", k.join(", ")),
+                                None => println!("Decision '{s}' updated"),
+                            },
                             Err(e) => die("Failed", e),
                         }
                     }

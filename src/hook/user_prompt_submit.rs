@@ -75,10 +75,10 @@ impl PromptSink {
                         s.mark_injected(key, *hash);
                     }
                 }
-                Claim::BracketBlock => {
+                Claim::BracketRule { id, content } => {
                     done.bracket_block = true;
                     if let (Some(s), Some(p)) = (session.as_mut(), pending.as_ref()) {
-                        s.mark_bracket_block(p.tier);
+                        s.mark_rule_shown(id, *content, p.tier, None, now);
                     }
                 }
             }
@@ -202,32 +202,17 @@ pub fn collect(
         session.clear_dedup();
     }
 
-    // Bracket rules — tier-gated, and served ONCE per tier (F7, ruled by Chris as K1
-    // on 2026-09-12: "no, inject one time, then no more, inject only when bracket
-    // changes the rules for that bracket"). Built before the *command branch so a
-    // star command cannot bypass them.
+    // Bracket rules — tier-gated, built before the *command branch so a star command
+    // cannot bypass them, and pushed at all four return sites below, so a new return
+    // site added later cannot forget them. Priority 5, last (F2).
     //
-    // This block is pushed at all four return sites below, so a new return site
-    // added later cannot forget the rule. It is priority 5, last (F2): CLAUDE.md
-    // carries much the same text, and on 2026-10-01 it took 2.4 KB of a 3.9 KB
-    // prompt ahead of everything matched to the prompt.
+    // WHAT GOES IN THE BLOCK (BO-03, F3). Each rule in force at this tier, once per
+    // session, and only when no CLAUDE.md Claude Code loads already carries it. See
+    // `bracket_rules_block` for both rules.
     //
-    // ASKED, NOT CLAIMED (D15). The tier is recorded as served by `commit`, only
-    // if this block was printed, so a block the budget dropped goes on the next
-    // prompt. An empty render records nothing either: base ships no bracket rules,
-    // and claiming a tier for a block that was never printed would silence the
-    // first real one after an operator configures some.
-    let bracket_text = crate::domain::session::format_bracket_rules(bracket, &config.bracket.rules);
-    let bracket_block = (!bracket_text.is_empty() && session.bracket_block_due(bracket)).then(|| {
-        PromptBlock::new(
-            "bracket-rules",
-            Priority::Bracket,
-            &bracket_text,
-            bracket.rules(&config.bracket.rules).len(),
-            "rule",
-        )
-        .with_claims([Claim::BracketBlock])
-    });
+    // ASKED, NOT CLAIMED (D15). Each rule is recorded as sent by `commit`, only if
+    // this block was printed, so a rule the budget dropped goes on the next prompt.
+    let bracket_block = bracket_rules_block(config, cwd, &session, bracket);
 
     // Deferred from above: no domains to match, but the bracket block still goes
     // out, and so do rules that carry matchers of their own: a rule added with
@@ -285,6 +270,12 @@ pub fn collect(
     // Single graph load per invocation (merged: global + workspace); the
     // injection loop and the walk share this store.
     let graph_store = crate::store::load_merged(cwd);
+    // The decisions of the always-on domains and their keywords (BO-03, F5): the neighbourhood and the walk
+    // both serve one of them only when this prompt carries one of its keywords.
+    let global = graph_store
+        .as_ref()
+        .map(|s| crate::domain::global_decisions::GlobalDecisions::load(s, config, &domains))
+        .unwrap_or_default();
 
     // Rules with matchers of their own (4d): read once, served on this prompt whether or not a domain matches, and
     // kept out of every domain block below (F1).
@@ -343,7 +334,7 @@ pub fn collect(
         if let Some(ref store) = graph_store {
             let nothing_served = std::collections::HashSet::new();
             let walked =
-                crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &nothing_served);
+                crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &nothing_served, &global);
             // Dedup and render as one unit; the marks wait for the print -- see `render_walk_block`.
             let w = render_walk_block(&session, walked, config.injection.walk_budget);
             sink.blocks.extend(w.blocks);
@@ -413,7 +404,7 @@ pub fn collect(
         let neighborhood_text = match (&graph_store, lean_mode) {
             (Some(store), false) => {
                 let (n, served) =
-                    crate::domain::query::query_domain_neighborhood(store, config, domain_def);
+                    crate::domain::query::query_domain_neighborhood(store, config, domain_def, &global, &prompt);
                 domain_served.extend(served);
                 n
             }
@@ -601,7 +592,7 @@ pub fn collect(
     // `walk::walk_from_text`, which `base context` calls as well. One seam, so the
     // command and the prompt path cannot answer differently about the same graph.
     let walked = graph_store.as_ref().map(|store| {
-        crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &domain_served)
+        crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &domain_served, &global)
     });
 
     // The walk's blocks rank at 2 with the domains' context, after it, so a reader
@@ -720,6 +711,47 @@ pub fn collect(
         session_id: None, // populated by run() after handle returns
         ..Default::default()
     })
+}
+
+/// The bracket rules this prompt sends, as one block, or `None` when there are none (BO-03, F3).
+///
+/// Two rules decide, in this order:
+///
+/// 1. COVERED BY CLAUDE.md. A rule whose `covered_by` text is in a CLAUDE.md file Claude Code loads for this
+///    session is never sent: the reader already has it. On 2026-10-01 the T1 to T6 rules took about 2,400 of
+///    3,864 bytes of a prompt while `~/.claude/CLAUDE.md` carried the same rules. The files are read only when a
+///    due rule carries a marker, so a config without markers costs nothing here.
+/// 2. ONCE PER SESSION. A rule goes out on the first prompt where its tier applies and never again in the
+///    session; a tier change sends only the new tier's rules not yet sent (`SessionState::bracket_rule_due`).
+///
+/// The block's header still names the tier, and the `<context-bracket>` line names it on every prompt.
+fn bracket_rules_block(config: &BaseConfig, cwd: &Path, session: &SessionState, bracket: Bracket) -> Option<PromptBlock> {
+    let due: Vec<&crate::config::BracketRule> = bracket
+        .entries(&config.bracket.rules)
+        .into_iter()
+        .filter(|r| !r.text.trim().is_empty() && session.bracket_rule_due(&r.text))
+        .collect();
+    let loaded = if due.iter().any(|r| r.markers().next().is_some()) {
+        crate::claude_md::loaded_text(cwd)
+    } else {
+        String::new()
+    };
+    let mut texts: Vec<&str> = Vec::new();
+    for rule in due.into_iter().filter(|r| !r.covered_in(&loaded)) {
+        // The same text twice in one tier (in `always` and in the tier's bucket) is one rule, sent once.
+        if !texts.contains(&rule.text.as_str()) {
+            texts.push(&rule.text);
+        }
+    }
+    let text = crate::domain::session::render_bracket_rules(bracket, &texts);
+    if text.is_empty() {
+        return None;
+    }
+    let claims = texts.iter().map(|t| {
+        let (id, content) = crate::domain::session::bracket_rule_key(t);
+        Claim::BracketRule { id, content }
+    });
+    Some(PromptBlock::new("bracket-rules", Priority::Bracket, &text, texts.len(), "rule").with_claims(claims))
 }
 
 /// Rules that carry matchers of their own, for one prompt (4d): always rules on the session's first prompt and on

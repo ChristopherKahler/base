@@ -1034,6 +1034,9 @@ Options:
   -s, --status <STATUS>
           
 
+      --keywords <KEYWORDS>
+          Comma-separated words or phrases that replace the decision's keywords ("" clears them). A decision of an always-on domain such as GLOBAL reaches a prompt only when the prompt contains one of them; with none it is shown at session start only
+
   -h, --help
           Print help
 ```

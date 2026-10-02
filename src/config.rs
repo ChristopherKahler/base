@@ -406,26 +406,126 @@ pub struct BracketConfig {
 ///
 /// The tiered buckets are additive with `always`, not exclusive: at DEPLETED a
 /// prompt receives `always` + `depleted`.
+///
+/// EACH RULE IS SENT ONCE PER SESSION (BO-03, F3). A rule goes out on the first prompt
+/// where its tier applies and never again in that session, a tier change included; an
+/// edited rule text is a new rule and goes out once more. Before BO-03 the whole block
+/// went again on every tier change (K1, 2026-09-12), so `always` repeated at each tier.
+/// And a rule whose `covered_by` text is in a CLAUDE.md file Claude Code loads is not
+/// sent at all: the reader already has it ([`crate::claude_md`]).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BracketRules {
-    /// Injected with every tier's block, ahead of that tier's own entries, so the
-    /// permanent rules keep a stable position whatever the tier.
-    ///
-    /// NOT every prompt. K1 (Chris, 2026-09-12) ruled the whole block is served once
-    /// when it first applies and again only when the bracket changes tier. The older
-    /// wording here — "injected every prompt", "survives because it is re-sent" —
-    /// described the behaviour this key had before that ruling, and a comment left
-    /// contradicting the code is how the next reader restores the behaviour.
+    /// Injected at every tier, ahead of that tier's own entries, once per session.
     #[serde(default)]
-    pub always: Vec<String>,
+    pub always: Vec<BracketRule>,
     #[serde(default)]
-    pub fresh: Vec<String>,
+    pub fresh: Vec<BracketRule>,
     #[serde(default)]
-    pub moderate: Vec<String>,
+    pub moderate: Vec<BracketRule>,
     #[serde(default)]
-    pub depleted: Vec<String>,
+    pub depleted: Vec<BracketRule>,
     #[serde(default)]
-    pub critical: Vec<String>,
+    pub critical: Vec<BracketRule>,
+}
+
+/// One bracket rule: its text, and the CLAUDE.md text that makes sending it pointless.
+///
+/// Written either as a plain string, which is every rule written before BO-03, or as a table:
+///
+/// ```toml
+/// always = [
+///   "A rule with no marker.",
+///   { text = "T1 — Never hedge in prose ...", covered_by = "### T1 — Confidence is numeric, never prose" },
+///   { text = "T3/T4 — Adjacent: drain still applies ...", covered_by = ["### T3 —", "### T4 —"] },
+/// ]
+/// ```
+///
+/// `covered_by` is one line of text or a list of them. The rule is covered, and not sent, when EVERY
+/// listed text is in some CLAUDE.md file Claude Code loads for the session (F3). A rule that restates two
+/// CLAUDE.md sections lists both, so losing either section brings the rule back. An empty or blank marker
+/// covers nothing: an empty string is inside every file, and treating it as found would silence the rule
+/// on every machine.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BracketRule {
+    pub text: String,
+    pub covered_by: Vec<String>,
+}
+
+impl BracketRule {
+    /// The markers that can match: trimmed, blanks dropped.
+    pub fn markers(&self) -> impl Iterator<Item = &str> {
+        self.covered_by.iter().map(|m| m.trim()).filter(|m| !m.is_empty())
+    }
+
+    /// True when every marker is in `loaded` and there is at least one. `loaded` is the text of the
+    /// CLAUDE.md files Claude Code loads, as [`crate::claude_md::loaded_text`] reads them.
+    pub fn covered_in(&self, loaded: &str) -> bool {
+        let mut markers = self.markers().peekable();
+        markers.peek().is_some() && markers.all(|m| loaded.contains(m))
+    }
+}
+
+impl From<&str> for BracketRule {
+    fn from(text: &str) -> Self {
+        BracketRule { text: text.to_string(), covered_by: Vec::new() }
+    }
+}
+
+impl From<String> for BracketRule {
+    fn from(text: String) -> Self {
+        BracketRule { text, covered_by: Vec::new() }
+    }
+}
+
+/// A marker list as TOML may write it: one string or an array of them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Markers {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// A bracket rule as TOML may write it: a plain string, or a table with `text` and `covered_by`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawBracketRule {
+    Text(String),
+    Table {
+        text: String,
+        #[serde(default)]
+        covered_by: Option<Markers>,
+    },
+}
+
+impl<'de> Deserialize<'de> for BracketRule {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match RawBracketRule::deserialize(d)? {
+            RawBracketRule::Text(text) => BracketRule { text, covered_by: Vec::new() },
+            RawBracketRule::Table { text, covered_by } => BracketRule {
+                text,
+                covered_by: match covered_by {
+                    None => Vec::new(),
+                    Some(Markers::One(m)) => vec![m],
+                    Some(Markers::Many(ms)) => ms,
+                },
+            },
+        })
+    }
+}
+
+impl Serialize for BracketRule {
+    /// The shape it was read in: a plain string when there is no marker, so a config written before BO-03
+    /// serializes as it was written.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        if self.covered_by.is_empty() {
+            return s.serialize_str(&self.text);
+        }
+        let mut t = s.serialize_struct("BracketRule", 2)?;
+        t.serialize_field("text", &self.text)?;
+        t.serialize_field("covered_by", &self.covered_by)?;
+        t.end()
+    }
 }
 
 impl BracketRules {

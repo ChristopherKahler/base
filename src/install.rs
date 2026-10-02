@@ -521,12 +521,18 @@ refresh_interval = 5      # re-survey window pressure every N prompts
 # rule that must hold regardless of subject — it silently stops applying the moment
 # the conversation drifts off its triggers. These inject on the TIER alone.
 #
-# `always` goes out every prompt at every tier: the layer that survives a long
-# session because it is re-sent, not remembered. Tier buckets are ADDITIVE with it,
-# so a DEPLETED prompt receives always + depleted. Never deduped.
+# `always` applies at every tier; tier buckets are ADDITIVE with it, so a DEPLETED
+# prompt receives always + depleted. Each rule is sent ONCE per session, on the first
+# prompt where its tier applies; a tier change sends only the new tier's rules.
+#
+# A rule your CLAUDE.md already carries need not be sent at all: write it as a table
+# with `covered_by`, a line of text from that CLAUDE.md (or a list of them). When
+# every listed line is in a CLAUDE.md Claude Code loads for the session, the rule is
+# skipped.
 #
 # [bracket.rules]
-# always   = ["A rule that must never erode, with its BECAUSE attached."]
+# always   = ["A rule that must never erode, with its BECAUSE attached.",
+#             { text = "Never hedge; give a 1-5 confidence.", covered_by = "T1: Confidence is numeric" }]
 # fresh    = ["Room to spare — fuller guidance here."]
 # moderate = ["Condensed."]
 # depleted = ["Terse. Prefer precision over coverage."]

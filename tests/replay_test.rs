@@ -117,6 +117,9 @@ impl Quads {
     fn date(&mut self, s: &str, p: &str, v: &str) {
         self.0.push_str(&format!("<{0}{s}> <{0}{p}> \"{v}\"^^<{XSD_DATETIME}> <{1}> .\n", seed::NS, Self::graph()));
     }
+    fn iri(&mut self, s: &str, p: &str, o: &str) {
+        self.0.push_str(&format!("<{0}{s}> <{0}{p}> <{0}{o}> <{1}> .\n", seed::NS, Self::graph()));
+    }
 }
 
 /// A fresh seed root for `tag`, cleaned first and the clean asserted: a stale root would feed
@@ -455,6 +458,128 @@ fn replay_measured_budget_carries_a_block_the_old_cap_dropped() {
         "control: no prompt carried a block over the old {OLD_CAP}-byte cap, so the measured budget was never exercised"
     );
     println!("replay: blocks over the old {OLD_CAP}-byte cap printed whole: {}", carried.join(", "));
+}
+
+// ── BO-03 (F3, F5, F14b) ─────────────────────────────────────────────────────────────────────────────
+
+/// A global decision in BO-03's seed: its text, its keywords, and whether a later one supersedes it.
+struct GlobalFixture {
+    slug: &'static str,
+    text: &'static str,
+    keywords: &'static [&'static str],
+    superseded_by: Option<&'static str>,
+}
+
+/// Synthetic decisions of the corpus's always-on `global` domain, matched to words the corpus prompts use.
+const GLOBAL_DECISIONS: [GlobalFixture; 6] = [
+    GlobalFixture { slug: "release", text: "REPLAY_DECISION release builds are tagged only after the user test plan passes", keywords: &["release"], superseded_by: None },
+    GlobalFixture { slug: "dealer-normal", text: "REPLAY_DECISION dealer data is normalized before it is published", keywords: &["dealer"], superseded_by: None },
+    GlobalFixture { slug: "ledger", text: "REPLAY_DECISION the ledger closes only after review signs off", keywords: &["ledger", "payroll"], superseded_by: None },
+    GlobalFixture { slug: "codename", text: "REPLAY_DECISION every session keeps one codename across a refresh", keywords: &[], superseded_by: None },
+    GlobalFixture { slug: "dealer-weekly", text: "REPLAY_DECISION dealer lists are exported weekly", keywords: &["dealer"], superseded_by: Some("dealer-daily") },
+    GlobalFixture { slug: "dealer-daily", text: "REPLAY_DECISION dealer lists are exported daily", keywords: &["dealer"], superseded_by: None },
+];
+
+/// BO-03's session: the corpus's prompts, in order, as ONE session, so the bracket walks FRESH, MODERATE,
+/// DEPLETED and CRITICAL (turn thresholds 3, 10, 20); the corpus's domains; the bracket rules of
+/// `bracket.toml`; the user CLAUDE.md of `claude.md`; and the global decisions above. Then one session start.
+struct Bo03Session {
+    prompts: Vec<(String, String)>,
+    session_start: String,
+}
+
+fn bo03_session() -> &'static Bo03Session {
+    static RUN: OnceLock<Bo03Session> = OnceLock::new();
+    RUN.get_or_init(|| {
+        let s = seed::write(&root("bo03"), &seed::TINY, &format!("{}\n{}", fixture("base.toml"), fixture("bracket.toml")));
+        std::fs::write(s.ws.join(".base").join("domains.toml"), fixture("domains.toml")).expect("domains.toml");
+        std::fs::create_dir_all(s.home.join(".claude")).expect("the seed home's .claude");
+        std::fs::write(s.home.join(".claude").join("CLAUDE.md"), fixture("claude.md")).expect("CLAUDE.md");
+        let mut q = Quads(String::new());
+        for d in &GLOBAL_DECISIONS {
+            let iri = format!("decision/global.{}", d.slug);
+            q.typ(&iri, "Decision");
+            q.lit(&iri, "name", d.text);
+            q.lit(&iri, "rationale", "replay fixture");
+            q.iri("domain/global", "hasDecision", &iri);
+            for k in d.keywords {
+                q.lit(&iri, "decisionKeyword", k);
+            }
+            if let Some(next) = d.superseded_by {
+                q.iri(&iri, "supersededBy", &format!("decision/global.{next}"));
+                q.iri(&format!("decision/global.{next}"), "supersedes", &iri);
+            }
+        }
+        let graph = s.ws.join(".base").join("graph.nq");
+        let mut text = std::fs::read_to_string(&graph).expect("the seed's workspace graph");
+        text.push_str(&q.0);
+        std::fs::write(&graph, text).expect("the decisions' quads");
+        let prompts = prompts()
+            .into_iter()
+            .map(|prompt| {
+                let (code, stdout, stderr) = run_prompt_submit(&s, &prompt, Some("replay-bo03"));
+                assert_eq!(code, 0, "{prompt:?}: the prompt hook failed: {stderr}");
+                (prompt, stdout)
+            })
+            .collect();
+        let (code, session_start, stderr) = run_session_start(&s, Some("replay-bo03-start"));
+        assert_eq!(code, 0, "session start failed: {stderr}");
+        Bo03Session { prompts, session_start }
+    })
+}
+
+/// BO-03 F3. Over one session: a bracket rule covered by the user's CLAUDE.md is never sent, and every other rule
+/// is sent exactly once, its tier's rules included (DEPLETED and CRITICAL once each, at their tier). Before BO-03
+/// every rule in force went again at each tier change, covered or not.
+#[test]
+fn replay_bracket_rules_once_per_session_and_never_when_claude_md_covers_them() {
+    let run = bo03_session();
+    let count = |label: &str| run.prompts.iter().filter(|(_, out)| out.contains(&format!(". {label} "))).count();
+    for covered in ["REPLAY_R1", "REPLAY_R2", "REPLAY_R1R2"] {
+        assert_eq!(count(covered), 0, "{covered} is covered by claude.md and was sent");
+    }
+    for (label, tier) in [("REPLAY_ALWAYS", "FRESH"), ("REPLAY_DEPLETED", "DEPLETED"), ("REPLAY_CRITICAL", "CRITICAL")] {
+        assert_eq!(count(label), 1, "{label} is sent once in the session");
+        let (p, out) = run.prompts.iter().find(|(_, out)| out.contains(&format!(". {label} "))).unwrap();
+        assert!(out.contains(&format!("[{tier}]")), "{label} went at {tier}: {p:?}\n{out}");
+    }
+    assert!(
+        run.prompts.iter().all(|(_, out)| out.starts_with("<context-bracket>[")),
+        "control: every prompt names its tier in the header line"
+    );
+    println!("replay: {} prompts in one session, each uncovered bracket rule sent once, covered ones never", run.prompts.len());
+}
+
+/// BO-03 F5 and F14b. A global decision reaches a prompt only when the prompt carries one of its keywords; one with
+/// no keywords never does and is at session start; a superseded one never does.
+#[test]
+fn replay_global_decisions_only_on_their_keywords() {
+    let run = bo03_session();
+    let mut served = 0;
+    for (prompt, out) in &run.prompts {
+        let lower = prompt.to_lowercase();
+        for d in &GLOBAL_DECISIONS {
+            if !out.contains(d.text) {
+                continue;
+            }
+            assert!(d.superseded_by.is_none(), "{prompt:?}: a superseded decision was served:\n{out}");
+            assert!(
+                d.keywords.iter().any(|k| base::domain::matcher::contains_word(&lower, k)),
+                "{prompt:?}: {} was served without one of its keywords {:?}:\n{out}",
+                d.slug,
+                d.keywords
+            );
+            served += 1;
+        }
+    }
+    assert!(served > 0, "control: no prompt carried a keyword, so the rule was never exercised");
+    let keywordless = GLOBAL_DECISIONS.iter().find(|d| d.keywords.is_empty()).unwrap();
+    assert!(
+        run.session_start.contains(&format!("  - Decision: {}", keywordless.text)),
+        "the decision with no keywords is at session start:\n{}",
+        run.session_start
+    );
+    println!("replay: global decisions served {served} times, each on one of its keywords");
 }
 
 #[test]
