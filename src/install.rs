@@ -546,10 +546,11 @@ enabled = true            # master switch for all session-start injection
 # Claude Code saves hook output over its limit to a file and shows Claude only
 # the first 2,000 characters. base measures what it is about to print, in BYTES
 # (the unit the host counts), and cuts the bottom blocks to one line each,
-# naming where the rest is. Measured on Claude Code 2.1.278, 2026-09-20. The old
-# [signal] max_chars is read by nothing.
+# naming where the rest is. Measured on Claude Code 2.1.287, 2026-10-01; when
+# Claude Code updates, `base doctor --measure` re-measures and rewrites these.
+# The old [signal] max_chars is read by nothing.
 [budget]
-session_start_bytes = 9000   # everything session start prints, in bytes
+session_start_bytes = 10000  # everything session start prints, in bytes
 memory_chars = 4000          # the memory block inside it, in whole notes
 write_full_output = true     # the untrimmed session start also goes to .base/last-session-start.md
 

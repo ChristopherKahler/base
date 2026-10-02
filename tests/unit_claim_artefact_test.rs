@@ -301,9 +301,11 @@ fn loud(tag: &str) -> seed::Seed {
     let ws_base = s.ws.join(".base");
     std::fs::create_dir_all(&ws_base).expect("workspace .base");
     let mut toml = String::from("[[domain]]\nname = \"global\"\nmode = \"always\"\nrules = [\n");
-    for i in 0..15 {
+    // 60 rules, about 13 KB: over the 10,000-byte prompt budget measured in BO-02. It was 15 rules (about 3.5 KB) while
+    // the budget was 4,000, and at 10,000 that fixture no longer overflowed, so the controls below refused.
+    for i in 0..60 {
         toml.push_str(&format!(
-            "  \"Global rule {i}: deliberately long enough to overflow a four thousand byte \
+            "  \"Global rule {i}: deliberately long enough to overflow the ten thousand byte \
              budget, because a budget test whose fixture fits inside the budget proves nothing \
              about what happens when it does not.\",\n"
         ));

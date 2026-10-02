@@ -864,19 +864,24 @@ pub fn check_measured_on(configured: &str) -> MeasuredOn {
     compare_measured_on(configured, host_version().as_deref())
 }
 
-/// The one line that frames every budget number under it.
+/// The running Claude Code's version, bare (`2.1.287`), or `None` when `claude --version` did not answer with one.
+/// `base doctor --measure` records it as `[budget] measured_on`.
+pub fn host_claude_version() -> Option<String> {
+    host_version().as_deref().and_then(version_in)
+}
+
+/// The one line that frames every budget number under it. `measured_on` is the shipped default until
+/// `base doctor --measure` writes the user's own, so the line names the key rather than "the defaults" (F6d).
 fn push_measured_on(out: &mut String, m: &MeasuredOn) {
     match m {
         MeasuredOn::Matches { version } => out.push_str(&format!(
-            "   budget defaults were measured on claude-code {version}, which is what this host runs.\n"
+            "   [budget] measured_on is {version}, which is what this host runs.\n"
         )),
         MeasuredOn::Differs { measured, host } => out.push_str(&format!(
-            "   ⚠ budget defaults were measured on claude-code {measured}; this host runs {host}. \
-             The numbers below were measured against a host that has since moved — re-measure them, \
-             then set [budget] measured_on to what you measured on.\n"
+            "   ⚠ [budget] measured_on is {measured}; this host runs {host} · run base doctor --measure\n"
         )),
         MeasuredOn::Unknown { configured, why } => out.push_str(&format!(
-            "   budget defaults say \"{configured}\" — NOT CHECKED against this host: {why}\n"
+            "   [budget] measured_on is \"{configured}\" — NOT CHECKED against this host: {why}\n"
         )),
     }
 }
@@ -2120,6 +2125,21 @@ mod measured_on_tests {
                 "an unrunnable check printed the agreement line: {out}"
             );
         }
+    }
+
+    /// F6d, the brief's Example 4: Claude Code moved on after the budgets were measured, and doctor says so in one line
+    /// that names both versions and the command that re-measures. The value `base doctor --measure` writes is the bare
+    /// version (`2.1.286`), so that is the configured side here.
+    #[test]
+    fn doctor_flags_version_mismatch() {
+        let m = compare_measured_on("2.1.286", Some("2.1.290 (Claude Code)"));
+        let mut out = String::new();
+        push_measured_on(&mut out, &m);
+        assert_eq!(out, "   ⚠ [budget] measured_on is 2.1.286; this host runs 2.1.290 · run base doctor --measure\n");
+        // After a measure run on the host it names, the line agrees and points nowhere.
+        let mut out = String::new();
+        push_measured_on(&mut out, &compare_measured_on("2.1.290", Some("2.1.290 (Claude Code)")));
+        assert_eq!(out, "   [budget] measured_on is 2.1.290, which is what this host runs.\n");
     }
 
     /// The match line is quiet: no warning mark, so a reader skimming for problems does not find one.

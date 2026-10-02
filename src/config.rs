@@ -853,7 +853,8 @@ impl Default for SignalConfig {
 
 /// How much each hook event may print, in BYTES: the unit the host counts. Output over the
 /// host's limit is saved to a file and Claude sees a 2,000-character preview of it, so base
-/// measures and trims before it prints. Measured on Claude Code 2.1.278, 2026-09-20.
+/// measures and trims before it prints. The limit was measured on Claude Code 2.1.287, 2026-10-01,
+/// by `base doctor --measure`, which re-measures it on whatever Claude Code runs.
 ///
 /// THE UNIT IN THIS PARAGRAPH WAS FALSE UNTIL 2026-09-20 AND IT MISLED THREE SESSIONS. It read
 /// "UTF-16 code units: the unit Claude Code's limit counts", on the belief that the host is
@@ -863,8 +864,9 @@ impl Default for SignalConfig {
 ///
 /// Read today by session start: `session_start_bytes`, `first_screen_chars` and
 /// `write_full_output`; by the memory signal: `memory_chars`; by the prompt hook: `prompt_bytes`.
-/// `pre_tool_chars` and `post_tool_chars` are read by nothing yet; the tool hooks take them in
-/// their own commits.
+/// `pre_tool_bytes` and `post_tool_chars` are read by nothing yet; the tool hooks take them in
+/// their own commits. `base doctor --measure` writes `session_start_bytes`, `prompt_bytes`,
+/// `pre_tool_bytes` and `measured_on` from what the running Claude Code delivers (BO-02).
 ///
 /// `first_screen_chars` and `memory_chars` ARE GENUINELY UTF-16 AND KEEP THEIR NAMES. They are
 /// READABILITY limits - how much a reader takes in - not delivery ones, so the host's unit does
@@ -895,8 +897,13 @@ pub struct BudgetConfig {
     /// at a key they do not have.
     #[serde(skip)]
     pub legacy_spellings: Vec<String>,
-    #[serde(default = "default_pre_tool_chars")]
-    pub pre_tool_chars: usize,
+    /// The pre-tool hook's budget, in BYTES: what `base doctor --measure` measured the host delivering through
+    /// pre-tool's `additionalContext`. Read by no hook yet; the pre-tool hook takes it in its own build order.
+    ///
+    /// RENAMED WITH ITS UNIT (BO-02), for the reason `session_start_bytes` gives: it was `pre_tool_chars`, and the
+    /// number written here is now a measured byte count. The old spelling still sets it.
+    #[serde(default = "default_pre_tool_bytes", alias = "pre_tool_chars")]
+    pub pre_tool_bytes: usize,
     #[serde(default = "default_post_tool_chars")]
     pub post_tool_chars: usize,
     /// The header, the instructions and due-now items must fit inside this many units (spec A5).
@@ -915,13 +922,22 @@ pub struct BudgetConfig {
     pub write_full_output: bool,
 }
 
-fn default_session_start_bytes() -> usize { 9000 }
-fn default_prompt_bytes() -> usize { 4000 }
-fn default_pre_tool_chars() -> usize { 2500 }
+// THE THREE HOOK BUDGETS AND `measured_on` ARE A MEASUREMENT, NOT A CHOICE (F6c, BO-02). `base doctor --measure` on
+// Claude Code 2.1.287, 2026-10-01, 7 Haiku calls per hook: session start, prompt submit and pre-tool each delivered a
+// 10,000-byte payload whole and cut a 10,500-byte one to the 2,000-character preview. Rounded down to 500: 10,000.
+// Two 7,000-byte hooks on one prompt event both arrived whole, so the limit is per hook, not per event. When Claude
+// Code moves, `base doctor` says so; re-measure, then move all four together. Before this they were 9,000 / 4,000 /
+// 2,500 on 2.1.278, and the 4,000 had no host limit behind it.
+pub const MEASURED_HOOK_BYTES: usize = 10_000;
+pub const MEASURED_ON: &str = "2.1.287";
+
+fn default_session_start_bytes() -> usize { MEASURED_HOOK_BYTES }
+fn default_prompt_bytes() -> usize { MEASURED_HOOK_BYTES }
+fn default_pre_tool_bytes() -> usize { MEASURED_HOOK_BYTES }
 fn default_post_tool_chars() -> usize { 1000 }
 fn default_first_screen_chars() -> usize { 2000 }
 fn default_memory_chars() -> usize { 4000 }
-fn default_measured_on() -> String { "claude-code 2.1.278".into() }
+fn default_measured_on() -> String { MEASURED_ON.into() }
 
 impl Default for BudgetConfig {
     fn default() -> Self {
@@ -929,7 +945,7 @@ impl Default for BudgetConfig {
             session_start_bytes: default_session_start_bytes(),
             prompt_bytes: default_prompt_bytes(),
             legacy_spellings: Vec::new(),
-            pre_tool_chars: default_pre_tool_chars(),
+            pre_tool_bytes: default_pre_tool_bytes(),
             post_tool_chars: default_post_tool_chars(),
             first_screen_chars: default_first_screen_chars(),
             memory_chars: default_memory_chars(),
@@ -1127,6 +1143,7 @@ impl BudgetConfig {
 pub const RENAMED_BUDGET_KEYS: &[LegacyBudgetKey] = &[
     LegacyBudgetKey { old: "session_start_chars", new: "session_start_bytes" },
     LegacyBudgetKey { old: "prompt_chars", new: "prompt_bytes" },
+    LegacyBudgetKey { old: "pre_tool_chars", new: "pre_tool_bytes" },
 ];
 
 /// Which renamed keys the merged config actually spells the old way.
@@ -1496,13 +1513,17 @@ mod tests {
     /// nothing until you have overridden it.
     #[test]
     fn the_budget_keys_default_to_spec_part_h_and_read_back_when_set() {
-        assert_eq!(default_value("budget", "session_start_bytes"), Some(toml::Value::Integer(9000)));
+        // F6c: the three hook budgets ship as the value measured on Claude Code 2.1.287, recorded beside them.
+        for key in ["session_start_bytes", "prompt_bytes", "pre_tool_bytes"] {
+            assert_eq!(default_value("budget", key), Some(toml::Value::Integer(10_000)), "{key}");
+        }
+        assert_eq!(default_value("budget", "measured_on"), Some(toml::Value::String("2.1.287".into())));
         assert_eq!(default_value("budget", "first_screen_chars"), Some(toml::Value::Integer(2000)));
         assert_eq!(default_value("budget", "write_full_output"), Some(toml::Value::Boolean(true)));
         let cfg: BaseConfig =
             toml::from_str("[budget]\nsession_start_bytes = 1234\n").expect("a budget section parses");
         assert_eq!(cfg.budget.session_start_bytes, 1234);
-        assert_eq!(cfg.budget.prompt_bytes, 4000, "an unset key keeps its default");
+        assert_eq!(cfg.budget.prompt_bytes, 10_000, "an unset key keeps its default");
 
         // THE LEGACY SPELLING MUST STILL SET THE VALUE. Renaming a key an operator may have tuned
         // is only honest if the old name keeps working; retiring it silently would return them to
@@ -1513,18 +1534,22 @@ mod tests {
         let cfg: BaseConfig =
             toml::from_str("[budget]\nprompt_chars = 777\n").expect("the legacy key parses");
         assert_eq!(cfg.budget.prompt_bytes, 777, "the legacy alias still sets the value");
+        // BO-02 renamed pre-tool's key with its unit; the old spelling still sets it.
+        let cfg: BaseConfig =
+            toml::from_str("[budget]\npre_tool_chars = 555\n").expect("the legacy key parses");
+        assert_eq!(cfg.budget.pre_tool_bytes, 555, "the legacy alias still sets the value");
 
         // And the raw-table scan names exactly the keys spelled the old way.
         let table: toml::value::Table =
-            toml::from_str("[budget]\nsession_start_chars = 1\nprompt_bytes = 2\n").expect("table");
+            toml::from_str("[budget]\nsession_start_chars = 1\nprompt_bytes = 2\npre_tool_chars = 3\n").expect("table");
         let found: Vec<&str> = legacy_budget_keys(&table).iter().map(|k| k.old).collect();
-        assert_eq!(found, vec!["session_start_chars"], "only the old spelling is reported");
+        assert_eq!(found, vec!["session_start_chars", "pre_tool_chars"], "only the old spellings are reported");
         // Rank 04 adds the memory block's own key; the assertions above are unchanged.
         assert_eq!(default_value("budget", "memory_chars"), Some(toml::Value::Integer(4000)));
         let cfg: BaseConfig =
             toml::from_str("[budget]\nmemory_chars = 321\n").expect("a budget section parses");
         assert_eq!(cfg.budget.memory_chars, 321);
-        assert_eq!(cfg.budget.session_start_bytes, 9000, "an unset key keeps its default");
+        assert_eq!(cfg.budget.session_start_bytes, 10_000, "an unset key keeps its default");
     }
 
     #[test]

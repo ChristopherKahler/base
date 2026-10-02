@@ -169,6 +169,7 @@ base workspace sync                      # regenerate the registered-workspace b
 base reconcile [--dry-run]               # project active/deferred from real folder last-touch
 base operator init --name "<name>"       # identity block at session start
 base config set <key> <value>            # notable keys: devmode.enabled, multimodal.enabled
+base doctor --measure                    # measure what Claude Code delivers per hook; writes [budget] (~21 Haiku calls)
 base secret set <NAME>                   # echo-off prompt, writes 0600 ~/.base-gbl/.env
 base commands add --name X --description "..." [--rule "..."]   # --rule repeatable
 base commands remove <name>

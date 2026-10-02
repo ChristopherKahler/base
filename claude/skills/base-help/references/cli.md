@@ -3076,6 +3076,9 @@ Options:
       --restore [<RESTORE>]
           Restore the workspace graph from a backup snapshot. Bare `--restore` lists snapshots
 
+      --measure
+          Measure how much hook text the running Claude Code delivers to the model (session start, prompt submit, pre-tool) with headless `claude -p` calls on a cheap model, then write each hook's budget and `measured_on` to ~/.base-gbl/base.toml. Up to 12 calls per hook
+
   -h, --help
           Print help
 ```
