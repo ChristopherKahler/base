@@ -258,23 +258,34 @@ fn run_event(
             Ok(data)
         }
         "user-prompt-submit" => {
-            // Everything this event says is collected here and printed ONCE, measured against
+            // Everything this event says is collected here as named blocks and printed ONCE, fitted to
             // `[budget] prompt_bytes` (rank 00), exactly as session start does above.
             //
             // WHAT WAS WRONG, AND WHY MEASURING ONE EMITTER WOULD HAVE BEEN WORSE THAN MEASURING
             // NONE. This arm used to hold THREE SEQUENTIAL EMITTERS, each blind to the others'
             // spend: `handle` printed at its four return sites, then the relay inbox push printed,
             // then the task tick printed. A budget cannot be enforced by any one of them, because
-            // none knows what the next two are about to add — and `Measured::withheld_u16 == 0` from
-            // a writer that saw a third of the output is a POSITIVE CLAIM THAT NOTHING WAS LOST,
-            // made over output that overflows anyway. That reassurance is what stops anyone looking.
+            // none knows what the next two are about to add — and a writer reporting nothing withheld
+            // after seeing a third of the output is a POSITIVE CLAIM THAT NOTHING WAS LOST, made over
+            // output that overflows anyway. That reassurance is what stops anyone looking.
             //
             // Measured on Chris's install: 13.3 KB emitted here and 2 KB delivered, the whole relay
             // wake contract and every global domain rule past the second lost inline, with no notice
             // of any kind. The same session later emitted 26 KB — the overflow GROWS as a session
             // does, so the trim is the mechanism and not a backstop.
-            let mut out = String::new();
-            let handled = user_prompt_submit::handle(&config, &cwd, stdin_json, &mut out);
+            //
+            // AND THEN THE ONE WRITER CUT LINES (BO-01). Rank 00's writer kept whole lines from the top
+            // until the budget ran out. On 2026-10-01 it stopped at line 37 of a 47-line wake script, and
+            // the order of the text — handler, relay, task tick — decided what survived, so the bracket
+            // rules went first and the rules matched to the prompt last. Now each part is a named block
+            // with a priority, the fit drops whole blocks lowest priority first, each leaves a pointer
+            // line, and the session records as shown only what was printed (D15).
+            let mut sink = user_prompt_submit::PromptSink::default();
+            let handled = user_prompt_submit::collect(&config, &cwd, stdin_json, &mut sink);
+            // Each relay block's side effects (messages marked seen, a reply deleted once announced, a ping
+            // recorded as delivered, the wake nudge throttled) are held back with the block's id and run only if
+            // that block is printed. A dropped relay block stays pending and arrives, whole, at the next tool call.
+            let mut relay_commits: Vec<(&'static str, Vec<crate::relay::Commit>)> = Vec::new();
             // Both relay blocks stay gated on the handler succeeding, exactly as the `?` used to
             // gate them: on an error neither used to run, and this is not the change that alters it.
             if handled.is_ok() {
@@ -282,54 +293,72 @@ fn run_event(
                 // the dispatcher (not the handler) so star-command and empty-prompt
                 // early returns can't swallow a pending delivery. Silent when
                 // unregistered — the session-start notice already ran.
-                if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), false, false) {
-                    out.push_str(&block);
-                }
-                // Session-targeted task relay: refresh liveness + deliver assigned tasks.
-                if let Some(sid) = session_id.as_deref()
-                    && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Prompt, true)
+                use crate::emit::prompt::{Priority, PromptBlock};
+                if let Some((block, commits)) =
+                    crate::relay::deliver::deliver_deferred(&cwd, session_id.as_deref(), false, false)
                 {
-                    out.push_str(&block);
+                    let messages = block.matches("[RELAY] ").count();
+                    sink.blocks.push(PromptBlock::new("relay-inbox", Priority::Relay, &block, messages, "message"));
+                    relay_commits.push(("relay-inbox", commits));
+                }
+                // Session-targeted task relay: refresh liveness + deliver assigned tasks, then the wake
+                // contract as a block of its own, last in priority 3: at 3.4 KB it is the block most likely
+                // not to fit, and it must never take the pings above it down with it.
+                if let Some(sid) = session_id.as_deref() {
+                    let (tasks, wake) = relay_task_parts_deferred(
+                        sid,
+                        &cwd,
+                        &config.relay,
+                        crate::relay::task_inbox::Phase::Prompt,
+                        true,
+                    );
+                    if let Some((block, commits)) = tasks {
+                        let items = block.lines().filter(|l| l.starts_with("<relay-")).count();
+                        sink.blocks.push(PromptBlock::new("relay-tasks", Priority::Relay, &block, items, "item"));
+                        relay_commits.push(("relay-tasks", commits));
+                    }
+                    if let Some((block, commits)) = wake {
+                        let contracts = block.matches("=== RELAY WAKE CONTRACT").count();
+                        sink.blocks.push(PromptBlock::new("relay-wake", Priority::Relay, &block, contracts, "wake contract"));
+                        relay_commits.push(("relay-wake", commits));
+                    }
+                }
+            }
+            // Fitted to `[budget] prompt_bytes` under the key the operator actually wrote; then D15: what will be
+            // printed is recorded as shown, and nothing else.
+            let (fitted, committed) = sink.fit_and_commit(&config);
+            for (id, commits) in relay_commits {
+                if fitted.kept_blocks().any(|b| b.id == id) {
+                    crate::relay::run_commits(commits);
+                }
+            }
+            // Keep what was measured, as session start does (rank 10). The untrimmed text and this session's
+            // blocks are written BEFORE the print, so every pointer line names a block `base hooks show` can
+            // already print. An empty emission leaves the previous full-output file alone.
+            let dir = crate::crud::handoff_show::session_start_dir(&cwd);
+            if let Some(d) = dir.as_ref() {
+                if !fitted.full_text.is_empty() {
+                    let _ = crate::emit::write_full_output(&d.join(crate::emit::record::PROMPT_FULL_FILE), &fitted.full_text);
+                }
+                if let Some(sid) = session_id.as_deref()
+                    && let Some(why) = crate::emit::prompt::write_blocks(d, sid, &fitted).failure()
+                {
+                    eprintln!("base: the prompt hook could not keep its blocks for `base hooks show`: {why}");
                 }
             }
             // THE SINGLE EXIT. It runs before `handled?` for the same reason session start's does:
             // the sites this replaced had already printed by the time an error could be seen, so
             // dropping their text on an error would be a regression dressed as a refactor.
-            // THE KEY IS THE ONE THAT RESOLVED, NOT A LITERAL. This call used to pass
-            // "prompt_chars" - the LEGACY spelling - so every over-budget prompt told the operator
-            // to raise a key base would then warn them to rename. Base directed the operator into
-            // the exact state it scolds them for, on advice, every single prompt.
-            //
-            // `key` was made a parameter precisely to stop this, and the rationale sits nine lines
-            // above `withheld_notice` in emit/mod.rs predicting it in words. The refactor landed
-            // and the one call site kept the constant: a parameter every caller passes the same
-            // literal to has not removed the literal, it has moved it somewhere nobody greps.
-            let key = config.budget.key_as_written("prompt_bytes");
-            // Keep what was measured, as session start does (rank 10). Until 2026-09-23 the measurement was
-            // discarded here: hook-output.jsonl held 83 session-start rows and no prompt row, while the cut
-            // notice sent the operator to `base doctor`. The untrimmed text is written FIRST, so the notice can
-            // name a file that exists; a failed write just leaves the path out of the notice.
-            let dir = crate::crud::handoff_show::session_start_dir(&cwd);
-            // An empty emission leaves the previous file alone rather than overwriting it with nothing.
-            let full = dir
-                .as_ref()
-                .filter(|_| !out.is_empty())
-                .map(|d| crate::emit::write_full_output(&d.join(crate::emit::record::PROMPT_FULL_FILE), &out));
-            let full_path = full.as_ref().and_then(|f| f.written_path());
-            let measured =
-                crate::emit::print_measured("user-prompt-submit", key, &out, config.budget.prompt_bytes, full_path);
+            crate::emit::prompt::print(&fitted);
             if let Some(dir) = dir {
-                let record = crate::emit::record::record_of_prompt(
-                    &measured,
-                    config.budget.prompt_bytes,
-                    "user-prompt-submit",
-                    session_id.as_deref(),
-                );
+                let record = crate::emit::record::record_of_prompt(&fitted, "user-prompt-submit", session_id.as_deref());
                 if let Err(why) = crate::emit::record::keep(&dir, &record) {
                     eprintln!("base: the prompt hook could not keep its output record: {why}");
                 }
             }
             let mut data = handled?;
+            data.rules_injected = committed.rules;
+            data.bracket_rules_injected = committed.bracket_block;
             data.session_id = session_id;
             Ok(data)
         }
@@ -388,27 +417,48 @@ fn relay_task_parts(
     phase: crate::relay::task_inbox::Phase,
     boundary: bool,
 ) -> (Option<String>, Option<String>) {
+    let (tasks, wake) = relay_task_parts_deferred(session_id, cwd, relay, phase, boundary);
+    let run = |part: Option<(String, Vec<crate::relay::Commit>)>| {
+        part.map(|(block, commits)| {
+            crate::relay::run_commits(commits);
+            block
+        })
+    };
+    (run(tasks), run(wake))
+}
+
+/// [`relay_task_parts`] with each half's inbox writes and nudge stamps held back as commits: the prompt hook runs a
+/// half's commits only if it prints that half (BO-01).
+type DeferredPart = Option<(String, Vec<crate::relay::Commit>)>;
+
+fn relay_task_parts_deferred(
+    session_id: &str,
+    cwd: &std::path::Path,
+    relay: &crate::config::RelayConfig,
+    phase: crate::relay::task_inbox::Phase,
+    boundary: bool,
+) -> (DeferredPart, DeferredPart) {
     if boundary {
         // `[relay] enabled = false` stops the auto-codename; a session that
         // registered itself still keeps its liveness fresh.
         let _ = crate::relay::session_registry::touch_with(session_id, cwd, relay.enabled);
     }
-    let delivered = crate::relay::task_inbox::deliver(session_id, phase);
+    let delivered = crate::relay::task_inbox::deliver_deferred(session_id, phase);
     // Star commands inside relayed pings resolve exactly like typed prompts
     // (Chris directive 2026-08-17, spoken pings from the hub): scan the
     // delivery block and append every matched command mode's rules.
-    let delivered = delivered.map(|block| {
+    let delivered = delivered.map(|(block, commits)| {
         let commands = crate::command::load_commands(cwd);
         let matched = crate::command::match_commands(&block, &commands);
         if matched.is_empty() {
-            block
+            (block, commits)
         } else {
             let extra: String = matched
                 .iter()
                 .map(|c| crate::command::format_command_output(c))
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!("{block}\n{extra}")
+            (format!("{block}\n{extra}"), commits)
         }
     });
     // Wake contract: any of this session's titles with a stale .watching
@@ -420,7 +470,7 @@ fn relay_task_parts(
         && relay.wake_nudge
         && !matches!(phase, crate::relay::task_inbox::Phase::Stop))
         .then(|| {
-            crate::relay::wake::arm_blocks_for(
+            crate::relay::wake::arm_blocks_for_deferred(
                 session_id,
                 matches!(phase, crate::relay::task_inbox::Phase::SessionStart),
             )

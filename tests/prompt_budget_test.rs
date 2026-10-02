@@ -34,8 +34,12 @@ use seed::run_prompt_submit;
 /// **BYTES.** The name predates the measurement that settled the unit; see the file header.
 const PROMPT_BYTES: usize = 4000;
 
-/// The opening of the withheld notice. Both arms key off it, so it is spelled once.
-const NOTICE: &str = "[base: user-prompt-submit withheld ";
+/// The opening of a withheld block's pointer line. Both arms key off it, so it is spelled once.
+///
+/// BO-01: the hook drops whole blocks and each leaves its own line,
+/// `[base: withheld <block> (<items>, <bytes> bytes) over [budget] prompt_bytes = <n> · full text: base hooks show <block>]`,
+/// where it used to cut lines from the end and append one `[base: user-prompt-submit withheld N bytes ...]` notice.
+const NOTICE: &str = "[base: withheld ";
 
 /// Bytes, because that is what the host counts and therefore what the budget must bound.
 fn emitted_bytes(s: &str) -> usize {
@@ -52,15 +56,19 @@ fn emitted_bytes(s: &str) -> usize {
 /// budget are finally the same kind of number. They were not before 2026-09-20.
 const HIGH_WATER: usize = 26_016;
 
-/// The withheld figure the notice states, which is the only number in `stdout` that reports on text
-/// that is NOT in `stdout`.
+/// The withheld figure the pointer lines state, summed: the only numbers in `stdout` that report on
+/// text that is NOT in `stdout`. `None` when no line says anything was withheld.
 fn withheld_bytes(stdout: &str) -> Option<usize> {
-    let at = stdout.find(NOTICE)?;
-    stdout[at + NOTICE.len()..]
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
+    let sizes: Vec<usize> = stdout
+        .lines()
+        .filter(|l| l.starts_with(NOTICE))
+        .filter_map(|l| {
+            let (_, inner) = l.split_once(" (")?;
+            let (counted, _) = inner.split_once(" bytes)")?;
+            counted.rsplit(", ").next()?.replace(',', "").parse().ok()
+        })
+        .collect();
+    (!sizes.is_empty()).then(|| sizes.iter().sum())
 }
 
 /// A fixture LOUD ENOUGH TO OVERFLOW, which the bare seed is not.
@@ -219,7 +227,8 @@ fn the_withheld_notice_survives_the_trim_that_caused_it() {
         run_prompt_submit(&s, "write code to fix a bug in src/", Some("prompt-budget"));
     assert_eq!(code, 0);
 
-    let Some(at) = stdout.find(NOTICE) else {
+    // The LAST pointer line: every one of them must land inside the budget, and the last is the one that could not.
+    let Some(at) = stdout.rfind(NOTICE) else {
         // No notice is only acceptable if nothing was withheld. Over budget with no notice is the
         // silent loss this change exists to end.
         assert!(
@@ -235,7 +244,8 @@ fn the_withheld_notice_survives_the_trim_that_caused_it() {
     // of the notice needs no conversion at all. Under the old UTF-16 budget this line had to
     // re-measure the prefix, and a byte offset compared against a UTF-16 budget would have read as
     // correct while comparing two different quantities.
-    let notice_ends = at + NOTICE.len();
+    // The whole line, not its opening: a pointer line cut after its first words would name nothing.
+    let notice_ends = at + stdout[at..].find('\n').map_or(stdout.len() - at, |n| n + 1);
     assert!(
         notice_ends <= PROMPT_BYTES,
         "the withheld notice ends at byte {notice_ends}, past the {PROMPT_BYTES} the host \

@@ -395,12 +395,22 @@ fn stamp(path: &std::path::Path) {
 /// (session-start) bypasses the cooldown — a fresh context must always be
 /// told to arm.
 pub fn arm_blocks_for(session_id: &str, force: bool) -> Option<String> {
+    let (block, commits) = arm_blocks_for_deferred(session_id, force)?;
+    super::run_commits(commits);
+    Some(block)
+}
+
+/// [`arm_blocks_for`] with the nudge throttle NOT yet stamped: the stamps come back as commits, for the prompt hook
+/// to run only if it prints the block (BO-01). A wake contract the budget dropped is then still due at the next tool
+/// call, instead of being silenced for the cooldown without having been read.
+pub fn arm_blocks_for_deferred(session_id: &str, force: bool) -> Option<(String, Vec<super::Commit>)> {
     // Harnesses without a Monitor tool (Agent SDK runs, brain.js NPCs) can't
     // comply — let them opt out instead of eating a nudge every cooldown.
     if std::env::var_os("BASE_NO_WAKE_NUDGE").is_some() {
         return None;
     }
     let mut out = String::new();
+    let mut commits: Vec<super::Commit> = Vec::new();
     for title in super::session_registry::titles_for(session_id) {
         // is_current, NOT is_watching. This gate used to ask whether a monitor EXISTS
         // when the question is whether the running one MATCHES what base prints now. A
@@ -419,14 +429,14 @@ pub fn arm_blocks_for(session_id: &str, force: bool) -> Option<String> {
             continue;
         }
         if let Some(p) = nudge_path(&title) {
-            stamp(&p);
+            commits.push(Box::new(move || stamp(&p)));
         }
         if let Some(block) = arm_block(&title) {
             out.push_str(&block);
             out.push('\n');
         }
     }
-    (!out.is_empty()).then_some(out)
+    (!out.is_empty()).then_some((out, commits))
 }
 
 #[cfg(test)]

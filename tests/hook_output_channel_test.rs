@@ -205,9 +205,11 @@ fn the_events_that_deliver_plain_stdout_still_use_it() {
     // test is unchanged and is now asserted more strictly than before: plain stdout, no envelope,
     // and through THE single measured writer rather than any `print!` that happens to be in scope.
     // Three sequential emitters is what this arm used to be, and it is what must not come back.
+    // BO-01 replaced the line-cutting `emit::print_measured` with `emit::prompt::print`, the writer of the fitted
+    // blocks. The property is unchanged: one measured writer, plain stdout.
     let prompt = arm_of("\"user-prompt-submit\" =>");
     assert!(
-        prompt.contains("emit::print_measured("),
+        prompt.contains("emit::prompt::print("),
         "user-prompt-submit must keep plain stdout, through the one measured writer — the host \
          delivers plain stdout on this event"
     );

@@ -995,9 +995,18 @@ fn trim_clause(run: &crate::emit::record::Run) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    // The prompt hook cuts whole lines from the end and has no per-block rows, so without this its cut runs
-    // would read as "nothing trimmed".
-    let mut s = if run.withheld_bytes > 0 {
+    // The prompt hook drops whole blocks and names each one (BO-01, F7). A row written before BO-01 has no block names,
+    // only the bytes it cut from the end, and is said that way rather than as "nothing trimmed".
+    let mut s = if !run.dropped.is_empty() {
+        let names: Vec<String> = run
+            .dropped
+            .iter()
+            .map(|(block, items, bytes)| {
+                format!("{block} ({items} items, {} bytes)", crate::emit::prompt::thousands(*bytes))
+            })
+            .collect();
+        format!(" · withheld: {}", names.join(", "))
+    } else if run.withheld_bytes > 0 {
         format!(" · withheld {} bytes from the end", run.withheld_bytes)
     } else if run.trimmed.is_empty() {
         " · nothing trimmed".to_string()
@@ -2156,6 +2165,7 @@ mod hook_output_tests {
                     .collect(),
                 other_withheld: Vec::new(),
                 unrecognised: Vec::new(),
+                dropped: Vec::new(),
                 withheld_bytes: 0,
             }
         }
@@ -2224,5 +2234,66 @@ mod hook_output_tests {
             !human.contains("workspace tier · session-start: no run on record"),
             "a tier with runs on record is not absent:\n{human}"
         );
+    }
+
+    /// Example 5 (BO-01, F7): a prompt run names every block its budget dropped, with items and bytes, where it used
+    /// to say only how many bytes it cut from the end. A row written before BO-01 still reads the old way.
+    #[test]
+    fn doctor_names_the_blocks_a_prompt_run_withheld() {
+        use crate::emit::record::{EventSizes, FileState, Run, Size, TierSizes};
+        let run = |ts: &str, emitted: usize, dropped: Vec<(String, usize, usize)>, withheld_bytes: usize| Run {
+            ts: ts.to_string(),
+            emitted: Size::bytes(emitted),
+            budget: Size::bytes(4000),
+            full: Size::bytes(5081),
+            first_screen_u16: 0,
+            first_screen_len_u16: None,
+            over_budget: withheld_bytes > 0,
+            first_screen_ok: true,
+            trimmed: Vec::new(),
+            other_withheld: Vec::new(),
+            unrecognised: Vec::new(),
+            dropped,
+            withheld_bytes,
+        };
+        let after = run(
+            "t3",
+            3990,
+            vec![("global-context".to_string(), 5, 1150), ("bracket-rules".to_string(), 7, 2400)],
+            3550,
+        );
+        let before = run("t1", 3970, Vec::new(), 1336);
+        let prompt = EventSizes {
+            hook: "user-prompt-submit".to_string(),
+            runs: 2,
+            last: after,
+            largest: before,
+            over_budget_runs: 2,
+            latest_over_budget: Some("t3".to_string()),
+            first_screen_overflow_runs: 0,
+            latest_first_screen_overflow: None,
+        };
+        let report = DoctorReport {
+            measured_on: MeasuredOn::Matches { version: "2.1.278".to_string() },
+            tiers: vec![],
+            healthy: true,
+            warnings: vec![],
+            config_errors: vec![],
+            trigger_faults: vec![],
+            hook_output: vec![TierSizes {
+                tier: "workspace".to_string(),
+                dir: "/ws/.base".to_string(),
+                file: FileState::Present { unreadable_lines: 0, unreadable_files: 0 },
+                events: vec![prompt],
+            }],
+            seam: store::LOCK_SEAM_MARKER,
+        };
+        let human = format_human(&report);
+        for want in [
+            "   workspace tier · user-prompt-submit: last run 3990 of 4000 bytes at t3 · withheld: global-context (5 items, 1,150 bytes), bracket-rules (7 items, 2,400 bytes)\n",
+            "   workspace tier · user-prompt-submit: largest of the last 2 run(s) on record: 3970 of 4000 bytes at t1 · withheld 1336 bytes from the end\n",
+        ] {
+            assert!(human.contains(want), "missing {want:?} in:\n{human}");
+        }
     }
 }

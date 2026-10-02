@@ -483,3 +483,57 @@ pub fn measured(s: &str) -> String {
         s.lines().count()
     )
 }
+
+/// One block of a session's prompt blocks file, `.base/hook-output/<session>/prompt-blocks.json` (BO-01).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PromptRow {
+    pub id: String,
+    pub priority: u8,
+    pub items: usize,
+    pub noun: String,
+    pub bytes: usize,
+    pub printed: bool,
+    pub text: String,
+}
+
+/// A session's prompt blocks file: every block the prompt hook built on the session's last prompt.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PromptBlocksFile {
+    pub budget_bytes: usize,
+    pub blocks: Vec<PromptRow>,
+}
+
+/// `session`'s prompt blocks file in the workspace `ws`.
+pub fn prompt_blocks(ws: &Path, session: &str) -> PromptBlocksFile {
+    let path = ws.join(".base").join("hook-output").join(session).join("prompt-blocks.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// The line a dropped block leaves, built from its row the way the hook builds it.
+pub fn pointer_line(row: &PromptRow, budget: usize) -> String {
+    let counted = if row.items == 1 { format!("1 {}", row.noun) } else { format!("{} {}s", row.items, row.noun) };
+    format!(
+        "[base: withheld {} ({counted}, {} bytes) over [budget] prompt_bytes = {budget} · full text: base hooks show {}]",
+        row.id,
+        base::emit::prompt::thousands(row.bytes),
+        row.id
+    )
+}
+
+/// What the prompt hook must have printed, rebuilt from its blocks file: the `<context-bracket>` line when `stdout`
+/// starts with one, then every block whole or its pointer line, a blank line between, one newline at the end.
+pub fn rebuilt_prompt_output(stdout: &str, file: &PromptBlocksFile) -> String {
+    let header = stdout.lines().next().filter(|l| l.starts_with("<context-bracket>")).unwrap_or("");
+    let mut parts: Vec<String> = Vec::new();
+    if !header.is_empty() {
+        parts.push(header.to_string());
+    }
+    for row in &file.blocks {
+        parts.push(if row.printed { row.text.clone() } else { pointer_line(row, file.budget_bytes) });
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", parts.join("\n\n"))
+}
