@@ -453,7 +453,7 @@ fn the_instruction_block_names_archive_for_a_handled_reminder_as_due_now_does() 
     assert_nonempty("session start", &stdout, &stderr);
     assert_eq!(code, 0, "hooks fail open. stderr: {stderr}");
     assert!(
-        stdout.contains("DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:"),
+        stdout.contains("DO THIS FIRST IN YOUR FIRST REPLY:"),
         "control: the instruction block did not render:{NL_MARK}{stdout}",
     );
     assert!(
@@ -465,7 +465,8 @@ fn the_instruction_block_names_archive_for_a_handled_reminder_as_due_now_does() 
         "DUE NOW still spends the first screen on the reminder's slug:{NL_MARK}{stdout}",
     );
     assert!(
-        stdout.contains("a handled reminder → `base reminder archive <number>`."),
+        // BO-06 (D16b) reworded line 3 shorter; the command it names is unchanged.
+        stdout.contains("A handled reminder: `base reminder archive <number>`."),
         "the instruction block does not name archive for a handled reminder:{NL_MARK}{stdout}",
     );
     assert!(

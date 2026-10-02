@@ -56,11 +56,16 @@ fn pulse_shows_counts() {
     seed_workspace(tmp.path());
 
     let config = test_config();
-    let output = signal::pulse::run(tmp.path(), &config.namespace, &config.signal).unwrap();
+    // BO-06 (F10): the pulse prints the counts `run_signals` counted once, so it is read from there; it has no queries
+    // of its own any more. The deferred project is not active, as the working set does not count it.
+    let signals = signal::run_signals(tmp.path(), &config, "test").unwrap();
+    let pulse = signals.signals().iter().find(|s| s.name == "pulse").expect("the pulse signal");
+    let output = &pulse.blocks[0].text;
 
     assert!(output.contains("Pulse"), "Should have Pulse header");
-    assert!(output.contains("active"), "Should mention active count");
-    assert!(output.contains("blocked"), "Should mention blocked count");
+    assert!(output.contains("Projects: 1 active, 1 blocked, 0 completed"), "{output}");
+    assert!(output.contains("Tasks: 1 active"), "{output}");
+    assert_eq!((signals.counts.projects.active, signals.counts.tasks.active), (1, 1));
 }
 
 #[test]

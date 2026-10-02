@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 
 pub mod prompt;
 pub mod record;
+pub mod session_files;
 
 /// UTF-16 code units. **NOT the length the host measures** — this doc comment used to say it was,
 /// and that sentence is what misled three separate sessions into building on it as settled fact.

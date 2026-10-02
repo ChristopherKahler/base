@@ -109,7 +109,7 @@ fn the_header_instructions_and_due_now_fit_the_first_screen() {
         ("the header", "[BASE START ·"),
         (
             "the instruction block's first line",
-            "DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:",
+            "DO THIS FIRST IN YOUR FIRST REPLY:",
         ),
         ("the instruction block's last line", "Letters: A="),
         (
@@ -370,7 +370,8 @@ fn line_one_names_the_full_output_file_and_the_withheld_total() {
     let (seed, code, stdout, stderr) = real(REAL_BUDGET);
     controls(*code, stdout, stderr);
     let line1 = stdout.lines().next().unwrap_or_default();
-    let file = seed.ws.join(".base").join("last-session-start.md");
+    // The session's own file since BO-06 (F11b); `real` runs as session `layout-session`.
+    let file = seed.ws.join(".base").join("hook-output").join("layout-session").join("session-start.md");
     assert!(
         line1.ends_with(&format!(" · full: {}]", file.display())),
         "line 1 does not name the full-output file: {line1}"
@@ -556,7 +557,7 @@ fn due_now_stays_first_and_fits_the_first_screen_when_eighty_are_due() {
         80 - shown
     );
     assert!(
-        stdout.contains("DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:"),
+        stdout.contains("DO THIS FIRST IN YOUR FIRST REPLY:"),
         "control: the instruction block never collapses"
     );
 }

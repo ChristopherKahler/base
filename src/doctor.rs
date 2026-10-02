@@ -989,14 +989,32 @@ fn push_hook_output(
                     t.tier, e.hook, e.last.first_screen_u16, e.first_screen_overflow_runs, e.runs
                 ));
             }
-            // Where to read what the prompt hook's cut withheld, named only when the file is there.
+            // Where to read what the prompt hook's cut withheld, named only when the file is there: the workspace's
+            // latest of any session, then, inside a session, its own (BO-06, F11).
             let full = Path::new(&t.dir).join(crate::emit::record::PROMPT_FULL_FILE);
             if e.hook == "user-prompt-submit" && full.is_file() {
                 out.push_str(&format!(
-                    "   {} tier · {}: full text of the last prompt's output: {}\n",
+                    "   {} tier · {}: full text of the last prompt's output, any session: {}\n",
                     t.tier,
                     e.hook,
                     full.display()
+                ));
+            }
+            let own = match e.hook.as_str() {
+                "session-start" => Some(("start", crate::emit::session_files::SESSION_START_FILE)),
+                "user-prompt-submit" => Some(("last prompt's output", crate::emit::session_files::PROMPT_FILE)),
+                _ => None,
+            };
+            if let Some((what, name)) = own
+                && let Some(dir) = crate::relay::env_session_id()
+                    .and_then(|sid| crate::emit::session_files::session_dir(Path::new(&t.dir), &sid))
+                && dir.join(name).is_file()
+            {
+                out.push_str(&format!(
+                    "   {} tier · {}: full text of this session's {what}: {}\n",
+                    t.tier,
+                    e.hook,
+                    dir.join(name).display()
                 ));
             }
         }

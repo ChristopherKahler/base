@@ -559,7 +559,14 @@ enabled = true            # master switch for all session-start injection
 session_start_bytes = 10000  # everything session start prints, in bytes
 measured_on = "2.1.287"      # the Claude Code the number above was measured on
 memory_chars = 4000          # the memory block inside it, in whole notes
-write_full_output = true     # the untrimmed session start also goes to .base/last-session-start.md
+write_full_output = true     # untrimmed hook output also goes to .base/hook-output/<session>/
+
+# ─── [log] — how long base keeps what came from your prompts ──
+# Each session's own hook output (its full session start, its last prompt's
+# output, its handoff letters) is kept in .base/hook-output/<session id>/.
+# Session start removes a session's folder once untouched this many days.
+[log]
+prompt_days = 90
 
 # ─── [sync] — graph extraction globs ─────────────────────────
 # Which files `base sync` reads to extract metadata/AST into the graph.

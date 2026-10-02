@@ -270,6 +270,29 @@ pub struct BaseConfig {
     pub workspace: Vec<WorkspaceEntry>,
     #[serde(default)]
     pub rules: RulesConfig,
+    #[serde(default)]
+    pub log: LogConfig,
+}
+
+// ─── Log Config (D14) ────────────────────────────────────────
+
+/// `[log]`: how long base keeps what it derived from a session's prompts (D14, 2026-10-01: 90 days, three of the
+/// 30-day windows after which K8 calls a rule dead).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogConfig {
+    /// Days a session's own hook-output folder (`.base/hook-output/<session id>/`: its full session start, its last
+    /// prompt's output, its letters) is kept after it was last written. Session start removes older ones (BO-06,
+    /// F11e). Read as at least 1, so a session start never removes the folder of a session still running today.
+    #[serde(default = "default_prompt_days")]
+    pub prompt_days: u64,
+}
+
+fn default_prompt_days() -> u64 { 90 }
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self { prompt_days: default_prompt_days() }
+    }
 }
 
 // ─── Rules Config (spec Part H, commit 4) ───────────────────
@@ -1025,7 +1048,9 @@ pub struct BudgetConfig {
     /// The Claude Code version the defaults were measured on. The limit is the host's and can move.
     #[serde(default = "default_measured_on")]
     pub measured_on: String,
-    /// Write the untrimmed session start to `.base/last-session-start.md` before printing (spec A6).
+    /// Write the untrimmed session start before printing (spec A6), and the prompt hook's untrimmed output: to the
+    /// session's own `.base/hook-output/<session>/` and to the workspace's latest copies `last-session-start.md` and
+    /// `last-prompt-submit.md` (BO-06, F11). False writes none of them; the letters file is written either way.
     #[serde(default = "default_true")]
     pub write_full_output: bool,
 }

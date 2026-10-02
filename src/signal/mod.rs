@@ -1,4 +1,5 @@
 pub mod active_awareness;
+pub mod counts;
 pub mod flow_resurface;
 // staleness signal removed — superseded by [protocol] reconcile decay.
 pub mod memory;
@@ -83,8 +84,9 @@ pub struct SignalOutput {
     /// The slug of every reminder DUE NOW numbers, number 1 first, for the letters file
     /// `base reminder archive|snooze <number>` reads.
     pub reminders: Vec<String>,
-    /// Records marked deferred across HANDOFFS, FORKS, PROJECTS, TASKS and MILESTONES, for line 1 (B2).
-    pub deferred: usize,
+    /// Every number session start prints (BO-06, F10): the header and the pulse read these, and each block's first line
+    /// prints the same ones. Counted whether or not the signal listing the items is shown this session.
+    pub counts: counts::Counts,
     state: Option<(PathBuf, suppression::SignalState)>,
 }
 
@@ -130,7 +132,6 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     }
 
     let ns = &config.namespace;
-    let sig = &config.signal;
     let base_dir = crate::config::find_workspace_base(cwd);
 
     // (priority, signal): lower priority first, push order kept within a priority.
@@ -138,7 +139,8 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     let mut diagnostics: Vec<String> = Vec::new();
     let mut letters: Vec<(char, String)> = Vec::new();
     let mut reminders: Vec<String> = Vec::new();
-    let mut deferred = 0usize;
+    // Filled by the scans below as they list their items, each number once (BO-06, F10).
+    let mut counts = counts::Counts::default();
     let layout = &config.session_start;
     if layout.handoffs_shown > crate::crud::handoff_show::MAX_SHOWN {
         eprintln!(
@@ -163,9 +165,12 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     }
 
     match active_awareness::run_sections(cwd, config) {
-        Ok(sections) if !sections.is_empty() => {
-            deferred += sections.iter().map(|s| s.deferred).sum::<usize>();
-            let blocks = sections
+        Ok(set) if !set.sections.is_empty() => {
+            counts.projects = set.projects;
+            counts.tasks = set.tasks;
+            counts.milestones = set.milestones;
+            let blocks = set
+                .sections
                 .into_iter()
                 .map(|s| SignalBlock {
                     kind: s.kind,
@@ -178,14 +183,10 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
             results.push((1, Signal::new("active-awareness", blocks)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-active-awareness:no-match>")),
-        Err(e) => eprintln!("base: signal 'active-awareness' failed: {e}"),
-    }
-    match pulse::run(cwd, ns, sig) {
-        Ok(output) if !output.is_empty() => {
-            results.push((2, Signal::single("pulse", "pulse", output, 1, 1)));
+        Err(e) => {
+            eprintln!("base: signal 'active-awareness' failed: {e}");
+            counts.failed.extend(["projects", "tasks", "milestones"]);
         }
-        Ok(_) => diagnostics.push(format!("<{hook}-pulse:no-match>")),
-        Err(e) => eprintln!("base: signal 'pulse' failed: {e}"),
     }
     // Staleness is now owned by [protocol]: reconcile decays cold projects to
     // "deferred" at session-start, so a separate stale-flag scan is redundant.
@@ -210,7 +211,9 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     // are never skipped as unchanged: they must surface EVERY session until acted on.
     match flow_resurface::handoff_scan(cwd, ns, layout) {
         Ok((output, list, parked)) if !output.is_empty() => {
-            deferred += parked;
+            counts.handoffs_open = list.open;
+            counts.handoffs_listed = list.shown.len();
+            counts.handoffs_deferred = parked;
             letters = list.letters();
             results.push((
                 0,
@@ -218,11 +221,15 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
             ));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-handoff-scan:no-match>")),
-        Err(e) => eprintln!("base: signal 'handoff' failed: {e}"),
+        Err(e) => {
+            eprintln!("base: signal 'handoff' failed: {e}");
+            counts.failed.push("handoffs");
+        }
     }
     match flow_resurface::reminder_scan(cwd, ns) {
         Ok(due) if !due.text.is_empty() => {
             let n = due.slugs.len();
+            counts.reminders_due = n;
             reminders = due.slugs;
             let block = SignalBlock {
                 kind: "reminders",
@@ -234,18 +241,39 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
             results.push((0, Signal::new("reminder", vec![block])));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-reminder-scan:no-match>")),
-        Err(e) => eprintln!("base: signal 'reminder' failed: {e}"),
+        Err(e) => {
+            eprintln!("base: signal 'reminder' failed: {e}");
+            counts.failed.push("due");
+        }
     }
     // Forks — parallel side-work build-specs. Persistent like handoffs: their own
     // signal so they are never skipped as unchanged and surface every session until
     // picked up, snoozed, or archived. Additive (multiple open).
     match flow_resurface::fork_scan(cwd, ns, layout) {
         Ok((output, open, shown, parked)) if !output.is_empty() => {
-            deferred += parked;
+            counts.forks_open = open;
+            counts.forks_listed = shown;
+            counts.forks_deferred = parked;
             results.push((0, Signal::single("fork", "forks", output, open, shown)));
         }
         Ok(_) => diagnostics.push(format!("<{hook}-fork-scan:no-match>")),
-        Err(e) => eprintln!("base: signal 'fork' failed: {e}"),
+        Err(e) => {
+            eprintln!("base: signal 'fork' failed: {e}");
+            counts.failed.push("forks");
+        }
+    }
+
+    // The pulse, last: it prints the counts the scans above made, never its own (BO-06, F10). Its decisions count is
+    // the one number no block lists.
+    match pulse::decisions_this_week(cwd, ns) {
+        Ok(n) => counts.decisions_week = n,
+        Err(e) => eprintln!("base: signal 'pulse' could not count this week's decisions: {e}"),
+    }
+    let output = pulse::render(&counts);
+    if output.is_empty() {
+        diagnostics.push(format!("<{hook}-pulse:no-match>"));
+    } else {
+        results.push((2, Signal::single("pulse", "pulse", output, 1, 1)));
     }
 
     // Sort by priority
@@ -281,7 +309,7 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         diagnostics,
         letters,
         reminders,
-        deferred,
+        counts,
         state,
     })
 }

@@ -1082,9 +1082,13 @@ fn each_block_ends_with_its_notice_and_a_block_with_zero_open_still_renders() {
     }
     let line1 = out.lines().next().unwrap_or_default();
     assert!(line1.contains(" · deferred 7 · "), "line 1 lacks the deferred total: {line1}");
+    // BO-06 (D16b) removed the instruction block's deferred line, "Deferred = open but paused, not listed. Revive one:
+    // `base handoff show <words>` (forks: `base fork show`).", to give the first screen to DUE NOW. Every notice above
+    // says what it said, on the block whose records it counts, and line 2's `base handoff show` revives a deferred
+    // match; this checks the line stays gone, so the screen it paid for is not spent twice.
     assert!(
-        out.contains("Deferred = open but paused, not listed. Revive one: `base handoff show <words>` (forks: `base fork show`)."),
-        "the instruction block lacks the deferred line:\n{out}"
+        !out.contains("Deferred = open but paused"),
+        "the instruction block carries the deferred line BO-06 removed:\n{out}"
     );
 }
 

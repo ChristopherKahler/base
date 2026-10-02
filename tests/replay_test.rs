@@ -135,7 +135,12 @@ fn root(tag: &str) -> PathBuf {
 const REAL_NO_REMINDERS: seed::Sizes = seed::Sizes { due_reminders: 0, ..seed::REAL };
 
 fn write_case(case: &Case) -> seed::Seed {
-    let s = seed::write(&root(&case.name), &REAL_NO_REMINDERS, &fixture("base.toml"));
+    write_case_as(case, &case.name)
+}
+
+/// [`write_case`] under its own root `tag`, for a check that runs a case again without touching the shared run's seed.
+fn write_case_as(case: &Case, tag: &str) -> seed::Seed {
+    let s = seed::write(&root(tag), &REAL_NO_REMINDERS, &fixture("base.toml"));
     let mut q = Quads(String::new());
     for (i, (days, name)) in case.reminders.iter().enumerate() {
         let r = format!("reminder/replay-reminder-{i}");
@@ -580,6 +585,78 @@ fn replay_global_decisions_only_on_their_keywords() {
         run.session_start
     );
     println!("replay: global decisions served {served} times, each on one of its keywords");
+}
+
+// ── BO-06 (F10, F11, D16b) ───────────────────────────────────────────────────────────────────────────────
+
+/// The number on `line` after `prefix`, when the line starts with it.
+fn number_after(line: &str, prefix: &str) -> Option<usize> {
+    line.strip_prefix(prefix)?.split(|c: char| !c.is_ascii_digit()).find(|w| !w.is_empty())?.parse().ok()
+}
+
+/// Line 1's number before `label` (` · 5 due`) or after it (` · forks 157`).
+fn header_number(line1: &str, label: &str) -> usize {
+    line1
+        .split(" · ")
+        .find_map(|part| {
+            let words: Vec<&str> = part.split_whitespace().collect();
+            match words.as_slice() {
+                [n, l] if *l == label => n.parse().ok(),
+                [l, n, ..] if *l == label => n.parse().ok(),
+                _ => None,
+            }
+        })
+        .unwrap_or_else(|| panic!("no {label} on line 1: {line1}"))
+}
+
+/// BO-06 (F10). On every corpus case, line 1, the pulse and each block's first line print one number per label. Measured
+/// on 2026-10-01: line 1 said `projects 0 · tasks 0` beside a pulse of 28 and 145, and the pulse said `Reminders: 4
+/// overdue` beside a DUE NOW of 5.
+#[test]
+fn replay_counts_agree_on_every_corpus_case() {
+    let mut checked = 0;
+    for run in session_starts() {
+        let name = &run.case.name;
+        let out = &run.stdout;
+        let line1 = out.lines().next().unwrap_or_default();
+        let due = run.case.reminders.len();
+        assert_eq!(header_number(line1, "due"), due, "[{name}] line 1's due: {line1}");
+        let mut pairs = vec![("DUE NOW (", "due"), ("HANDOFFS (", "handoffs"), ("FORKS (", "forks")];
+        pairs.extend([("PROJECTS (", "projects"), ("TASKS (", "tasks"), ("MILESTONES (", "milestones")]);
+        pairs.extend([("Projects: ", "projects"), ("Tasks: ", "tasks"), ("Reminders: ", "due")]);
+        for (prefix, label) in pairs {
+            if let Some(n) = out.lines().find_map(|l| number_after(l, prefix)) {
+                assert_eq!(n, header_number(line1, label), "[{name}] {prefix:?} against line 1's {label}:\n{out}");
+                checked += 1;
+            }
+        }
+        if let Some(l) = out.lines().find(|l| l.starts_with("Reminders: ")) {
+            assert_eq!(l, format!("Reminders: {due} due"), "[{name}] the pulse uses DUE NOW's word and rule");
+        }
+    }
+    assert!(checked >= 30, "control: {checked} numbers compared across the corpus");
+    println!("replay: {checked} block and pulse numbers agree with line 1");
+}
+
+/// BO-06 (D16b, F11b). The 5-due case run as a session, the way Claude Code runs it: line 1 names the session's own
+/// file (about 45 units longer than the workspace one), and all five due reminders still print inside the 1,990 bar.
+/// Before BO-06 the case showed 3 of 5 with the shorter workspace path. The seed's root is a temp folder, longer than
+/// the operator's home, so this is harsher than his store: there it measured 1,930 (FINAL STATE of BO-06).
+#[test]
+fn replay_five_due_fit_with_the_session_file_named() {
+    let case = cases().into_iter().find(|c| c.name == "real-5-due").expect("the real-5-due case");
+    let s = write_case_as(&case, "r5s");
+    let session = "b0600000-0000-4000-8000-000000000005";
+    let (code, out, err) = run_session_start(&s, Some(session));
+    assert_eq!(code, 0, "{err}");
+    let own = s.ws.join(".base").join("hook-output").join(session).join("session-start.md");
+    let line1 = out.lines().next().unwrap_or_default();
+    assert!(line1.ends_with(&format!("· full: {}]", own.display())), "line 1 names the session's file: {line1}");
+    assert!(out.contains("DUE NOW (5) · all: base reminder list"), "all five print:\n{}", &out[..first_screen_end(&out)]);
+    let record = last_record(&s, "session-start");
+    let measured = number(&record, "first_screen_len_u16");
+    assert!(measured <= BAR && record["first_screen_ok"] == true, "first screen {measured} of {BAR}");
+    println!("replay [real-5-due as a session]: first screen {measured} of {BAR} UTF-16 units, all 5 due shown");
 }
 
 #[test]

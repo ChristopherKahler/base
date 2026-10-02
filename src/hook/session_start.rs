@@ -452,13 +452,6 @@ pub fn floor_line(kind: &str, items: usize, full: &FullOutput) -> String {
     }
 }
 
-/// Where the untrimmed session start goes (spec A6): the workspace `.base` when one resolves,
-/// else the global tier's `.base` when it exists. Never created here, so a session opened
-/// outside every tier gets no file and its floors say so. The letters file sits beside it.
-fn full_output_path(cwd: &Path) -> Option<PathBuf> {
-    crate::crud::handoff_show::session_start_dir(cwd).map(|dir| dir.join("last-session-start.md"))
-}
-
 fn kind_of(id: &str) -> &str {
     id.split('#').next().unwrap_or(id)
 }
@@ -541,7 +534,8 @@ impl SessionOutput {
             .as_ref()
             .map(|s| s.letters.clone())
             .unwrap_or_default();
-        let deferred = self.signals.as_ref().map(|s| s.deferred).unwrap_or(0);
+        // Every number the header prints, counted once with the blocks (BO-06, F10).
+        let counts = self.signals.as_ref().map(|s| s.counts.clone()).unwrap_or_default();
         if let Some(signals) = &self.signals {
             for signal in signals.signals() {
                 for block in &signal.blocks {
@@ -564,7 +558,7 @@ impl SessionOutput {
             placed.push(Placed {
                 id: "instructions".to_string(),
                 kind: "instructions".to_string(),
-                text: instruction_block(&letters, deferred),
+                text: instruction_block(&letters),
                 total: 0,
                 shown: 0,
                 fits: Vec::new(),
@@ -597,10 +591,26 @@ impl SessionOutput {
             let pushed = untrimmed.push(block);
             debug_assert!(pushed, "block ids are unique by construction");
         }
+        // The untrimmed text (spec A6) and the letters go where session start keeps its files: the workspace `.base`
+        // when one resolves, else the global tier's when it exists. Never created here, so a session opened outside
+        // every tier gets no file and its floors say so. Each session writes its own files and the workspace's latest
+        // copies (BO-06, F11); the header names the session's own. Folders of sessions gone `[log] prompt_days` are
+        // removed first (F11e).
+        let dir = crate::crud::handoff_show::session_start_dir(cwd);
+        if let Some(dir) = dir.as_deref() {
+            emit::session_files::prune(dir, config.log.prompt_days);
+        }
+        let session = self.session_id.as_deref();
         let full = if !budget.write_full_output {
             FullOutput::off()
-        } else if let Some(path) = full_output_path(cwd) {
-            let written = emit::write_full_output(&path, &untrimmed.full_text());
+        } else if let Some(dir) = dir.as_deref() {
+            let written = emit::session_files::write(
+                dir,
+                session,
+                emit::session_files::SESSION_START_FILE,
+                emit::session_files::LATEST_SESSION_START,
+                &untrimmed.full_text(),
+            );
             if let Some(why) = written.failure() {
                 eprintln!("base: session start could not write its full output: {why}");
             }
@@ -609,22 +619,16 @@ impl SessionOutput {
             FullOutput::not_written("no workspace .base and no global .base directory to hold it")
         };
         if self.signals.is_some()
-            && let Some(dir) = crate::crud::handoff_show::session_start_dir(cwd)
+            && let Some(dir) = dir.as_deref()
         {
             let reminders = self
                 .signals
                 .as_ref()
                 .map(|s| s.reminders.as_slice())
                 .unwrap_or_default();
-            let kept = crate::crud::handoff_show::write_letters(&dir, &letters, reminders);
+            let kept = crate::crud::handoff_show::write_letters(dir, session, &letters, reminders);
             if let Some(why) = kept.failure() {
-                eprintln!("base: session start could not keep its handoff letters: {why}");
-            }
-            if let Some(session) = self.session_id.as_deref() {
-                let kept = crate::crud::handoff_show::write_due_now(&dir, session, reminders);
-                if let Some(why) = kept.failure() {
-                    eprintln!("base: session start could not keep this session's DUE NOW numbers: {why}");
-                }
+                eprintln!("base: session start could not keep its handoff letters and DUE NOW numbers: {why}");
             }
         }
 
@@ -644,7 +648,7 @@ impl SessionOutput {
         for row in withheld {
             emission.note_withheld(row.block, row.items, row.reason, row.command);
         }
-        let header = |facts: &Facts<'_>| header_line(facts, deferred);
+        let header = |facts: &Facts<'_>| header_line(facts, &counts);
         let rendered = emission.render(&full, Some(&header));
         if !rendered.first_screen_ok {
             eprintln!(
@@ -684,12 +688,13 @@ struct Placed {
 }
 
 /// Spec B3, with B7's BEHAVIOR lines merged in: what Claude does first, written before any data
-/// so no trim can remove it. It names only commands that exist. The deferred line (B3) prints when
-/// anything is deferred, so a session with nothing deferred keeps the block it had without it.
+/// so no trim can remove it. It names only commands that exist. B3's deferred line (line 6) was
+/// removed by BO-06; see below.
 ///
 /// THE WORDING IS BUDGETED. The header, this block (Letters line included) and DUE NOW must end
 /// inside the first 2,000 UTF-16 units; `tests/deferral_test.rs` FS1 holds them to a 1,990 bar on
-/// the worst case (ten 50-character slugs, the two longest DUE NOW lines, line 6 printing). At
+/// the worst case (ten 50-character slugs, the two longest DUE NOW lines, and, until BO-06 removed
+/// it, line 6 printing). At
 /// 566c753 that case ended at 2011 units, 21 past the bar and 11 past the screen. Three phrases
 /// were shed (flint, 2026-09-21), each already said elsewhere on the same screen: line 4's
 /// "; several stay open" (line 4 already says forks are not a lettered choice), line 5's "and the
@@ -700,18 +705,34 @@ struct Placed {
 ///
 /// Line 3 names a reminder by its DUE NOW number since BO-00 B4 (2026-10-01): DUE NOW's lines no
 /// longer print the slug, and `base reminder archive|snooze <number>` read it from the letters file.
-pub fn instruction_block(letters: &[(char, String)], deferred: usize) -> String {
+///
+/// SHORTENED AGAIN BY BO-06 (D16b, 2026-10-02), so all five of Chris's due reminders fit the first
+/// screen with the header naming the session's own file (about 45 units longer than the workspace
+/// one). Measured on a copy of his store before: 865 units of instructions, DUE NOW at 3 of 5. Each
+/// phrase removed is said elsewhere on the screen or by a command shown there:
+/// - line 0's ", BEFORE ANYTHING ELSE": line 1's "Nothing prepended".
+/// - line 2's "by letter, project or a few words": `base handoff show`'s own help ("Takes a letter
+///   ..., a slug, a project name, or a few words"), and "<what they said>" passes whatever it is.
+/// - line 2's "Several matches: list them and ask": moved into `show`'s several-match line, the
+///   place it is needed ("None was picked; list them to the user and ask which").
+/// - line 3's quoted phrasings: "Snooze or archive a letter" says the same with the same commands.
+/// - line 4's "open": FORKS's own first line ("FORKS (N open, ...").
+/// - line 5: the same two pointers, reworded shorter.
+/// - line 6 whole: every block with something deferred ends with its notice ("N handoffs are marked
+///   deferred: they are open, but paused. Run base handoff deferred ..."), whose listing prints the
+///   command that brings each one back; and line 2's `base handoff show` revives a deferred match.
+///
+/// After: 617 units of instructions; on the copy of Chris's store, all 5 due reminders print and the
+/// first screen measures under the 1,990 bar (FINAL STATE of BO-06 has the numbers).
+pub fn instruction_block(letters: &[(char, String)]) -> String {
     let mut s = String::from(
-        "DO THIS FIRST, BEFORE ANYTHING ELSE IN YOUR FIRST REPLY:\n\
+        "DO THIS FIRST IN YOUR FIRST REPLY:\n\
          1. Show DUE NOW, then HANDOFFS, exactly as lettered. Nothing prepended. No \"is this stale?\" questions.\n\
-         2. The user names a handoff by letter, project or a few words: run `base handoff show <what they said>` and read the doc it prints. Several matches: list them and ask.\n\
-         3. \"snooze <letter> <N>d\" → `base handoff snooze <slug> <N>` · \"archive <letter>\" → `base handoff archive <slug>` · a handled reminder → `base reminder archive <number>`.\n\
-         4. FORKS are open side-work, not a lettered choice. `base fork snooze <title> <N>` · `base fork archive <title>`.\n\
-         5. Every block below is a summary. Its full list is the command on its line; the untrimmed output is the file on line 1. Never guess; run it.",
+         2. The user names a handoff: run `base handoff show <what they said>` and read the doc it prints.\n\
+         3. Snooze or archive a letter: `base handoff snooze <slug> <N>` · `base handoff archive <slug>`. A handled reminder: `base reminder archive <number>`.\n\
+         4. FORKS are side-work, not lettered: `base fork snooze <title> <N>` · `base fork archive <title>`.\n\
+         5. Each block below is a summary: the command on its line prints all of it; line 1 names the untrimmed file. Never guess; run it.",
     );
-    if deferred > 0 {
-        s.push_str("\n6. Deferred = open but paused, not listed. Revive one: `base handoff show <words>` (forks: `base fork show`).");
-    }
     if !letters.is_empty() {
         let map: Vec<String> = letters
             .iter()
@@ -724,12 +745,17 @@ pub fn instruction_block(letters: &[(char, String)], deferred: usize) -> String 
 }
 
 /// Spec B2, line 1: every count, the withheld total, and where the untrimmed output is. Rendered
-/// from the blocks at their final level on every trim pass, so it is measured as it is printed. The
-/// deferred total prints only when something is deferred, so a session with nothing deferred keeps
-/// today's line byte for byte.
-pub fn header_line(facts: &Facts<'_>, deferred: usize) -> String {
-    let total = |id: &str| facts.block(id).map(Block::items_total).unwrap_or(0);
+/// on every trim pass, so it is measured as it is printed. The deferred total prints only when
+/// something is deferred, so a session with nothing deferred keeps today's line byte for byte.
+///
+/// THE COUNTS ARE `counts`, NOT THE BLOCKS' (BO-06, F10). Until BO-06 each count was read off the
+/// block printed with it, and a block skipped as unchanged since an earlier session is not printed,
+/// so on 2026-10-01 line 1 said `projects 0 · tasks 0` while the pulse below it said 28 and 145.
+/// Every number here counts what exists, as the pulse and each block's first line do; only
+/// "(N shown)" counts what the handoff list shows at its final level.
+pub fn header_line(facts: &Facts<'_>, counts: &crate::signal::counts::Counts) -> String {
     let handoffs_shown = facts.block("handoffs").map(Block::items_shown).unwrap_or(0);
+    let deferred = counts.deferred();
     let full = match (facts.full.written_path(), facts.full.failure()) {
         (Some(path), _) => path.to_string(),
         (None, Some(why)) => format!("not written ({why})"),
@@ -742,12 +768,12 @@ pub fn header_line(facts: &Facts<'_>, deferred: usize) -> String {
     };
     format!(
         "[BASE START · {} due · handoffs {} open ({handoffs_shown} shown) · forks {} · projects {} · tasks {} · milestones {}{parked} · withheld {} · full: {full}]",
-        total("reminders"),
-        total("handoffs"),
-        total("forks"),
-        total("projects"),
-        total("tasks"),
-        total("milestones"),
+        counts.shown("due", counts.reminders_due),
+        counts.shown("handoffs", counts.handoffs_open),
+        counts.shown("forks", counts.forks_open),
+        counts.shown("projects", counts.projects.active),
+        counts.shown("tasks", counts.tasks.active),
+        counts.shown("milestones", counts.milestones.active),
         facts.withheld_total(),
     )
 }
@@ -1302,6 +1328,27 @@ mod tests {
         assert_eq!(level("relay-wake"), Some(Level::Full), "{}", rendered.text);
         assert_eq!(level("operator"), Some(Level::Collapsed), "{}", rendered.text);
         assert_eq!(level("extensions"), Some(Level::Collapsed), "{}", rendered.text);
+    }
+
+    /// BO-06 review: a count whose scan failed is printed `?` on line 1, never as a 0 nobody counted, and the pulse
+    /// leaves its line out. Control: the counts that were counted print as numbers.
+    #[test]
+    fn a_count_whose_scan_failed_prints_a_question_mark() {
+        let mut counts = crate::signal::counts::Counts {
+            reminders_due: 2,
+            forks_open: 4,
+            failed: vec!["projects", "tasks", "milestones"],
+            ..Default::default()
+        };
+        let full = FullOutput::off();
+        let facts = Facts { blocks: &[], withheld: &[], full: &full };
+        let line = header_line(&facts, &counts);
+        assert!(line.contains("· 2 due ·") && line.contains("· forks 4 ·"), "control: {line}");
+        assert!(line.contains("· projects ? · tasks ? · milestones ? ·"), "{line}");
+        counts.decisions_week = 3;
+        let pulse = crate::signal::pulse::render(&counts);
+        assert!(!pulse.contains("Projects:") && !pulse.contains("Tasks:"), "{pulse}");
+        assert!(pulse.contains("Reminders: 2 due") && pulse.contains("Decisions: 3 this week"), "control: {pulse}");
     }
 
     /// Every block in [`SHOWN_ONCE`] floors to the full-output file and never to a command: its

@@ -93,7 +93,9 @@ fn a_collapsed_shown_once_block_leaves_its_text_in_the_full_output_file() {
         "the hook printed nothing. stderr: {stderr}"
     );
 
-    let file = seed.ws.join(".base").join("last-session-start.md");
+    // The session's own file since BO-06 (F11b): the floor names what this session's start wrote, not the workspace's
+    // latest copy, which the next session to start in this workspace overwrites.
+    let file = seed.ws.join(".base").join("hook-output").join("t16-session").join("session-start.md");
     let full = std::fs::read_to_string(&file).unwrap_or_else(|e| {
         panic!(
             "no full-output file at {}: {e}\nstdout:\n{stdout}",

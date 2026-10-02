@@ -299,20 +299,22 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<DueNow> {
     let Some(store) = crate::store::load_merged(cwd) else {
         return Ok(DueNow::default());
     };
-    let now_str = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let now = chrono::Local::now();
     let p = &ns.prefix;
+    // Every reminder, and `crud::reminder::is_due` decides which are due: the same rule the header and the pulse
+    // count by (BO-06, F10c). Archived is read in the reminder's own graph, as the old `FILTER NOT EXISTS` read it.
     let sparql = format!(
-        "{pfx}\nSELECT ?r ?name ?when WHERE {{\n\
+        "{pfx}\nSELECT ?r ?name ?when ?archived WHERE {{\n\
            GRAPH ?g {{\n\
              ?r a {p}:Reminder ;\n\
                {p}:name ?name ;\n\
                {p}:resurfaceAt ?when .\n\
-             FILTER(?when <= \"{now_str}\"^^xsd:dateTime)\n\
-             FILTER NOT EXISTS {{ ?r {p}:status \"archived\" }}\n\
+             BIND(EXISTS {{ ?r {p}:status \"{archived}\" }} AS ?archived)\n\
            }}\n\
          }}\n\
          ORDER BY ?when",
-        pfx = crud::prefixes(ns)
+        pfx = crud::prefixes(ns),
+        archived = crud::reminder::ARCHIVED,
     );
 
     let QueryResults::Solutions(solutions) = crate::store::query(&store, &sparql)? else {
@@ -321,15 +323,19 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<DueNow> {
 
     let rows: Vec<(String, String, String)> = solutions
         .filter_map(|r| r.ok())
-        .map(|row| {
+        .filter_map(|row| {
             let get = |k: &str| {
                 row.get(k)
                     .map(|t| crud::term_display(t.into()))
                     .unwrap_or_default()
             };
+            let when = get("when");
+            if !crud::reminder::is_due(&when, get("archived") == "true", now) {
+                return None;
+            }
             let r = get("r");
             let slug = r.rsplit('/').next().unwrap_or(&r).to_string();
-            (slug, get("name"), get("when"))
+            Some((slug, get("name"), when))
         })
         .collect();
 
