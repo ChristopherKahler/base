@@ -321,19 +321,23 @@ impl RelayStore {
         titles
     }
 
-    /// Unseen messages addressed to `title`. Does NOT mark seen.
-    pub fn pending_for(&self, title: &str) -> Vec<Message> {
+    /// Every message addressed to `title` from another sender, seen or not, oldest first.
+    pub fn addressed(&self, title: &str) -> Vec<Message> {
         let reg = self.load_registry();
         let entry = reg.sessions.get(title);
         let session_id = entry.and_then(|e| e.session_id.as_deref());
         let phase = entry.and_then(|e| e.phase.as_deref());
-        let seen = self.load_seen(title);
         self.all_messages()
             .into_iter()
             .filter(|m| m.from != title)
             .filter(|m| Self::addressed_to(m, title, session_id, phase))
-            .filter(|m| !seen.contains(&m.id))
             .collect()
+    }
+
+    /// Unseen messages addressed to `title`. Does NOT mark seen.
+    pub fn pending_for(&self, title: &str) -> Vec<Message> {
+        let seen = self.load_seen(title);
+        self.addressed(title).into_iter().filter(|m| !seen.contains(&m.id)).collect()
     }
 
     pub fn mark_seen(&self, title: &str, ids: &[String]) -> Result<()> {
@@ -675,6 +679,19 @@ pub fn age_str(ts: &str) -> String {
         60..=3599 => format!("{}m", secs / 60),
         3600..=86399 => format!("{}h", secs / 3600),
         _ => format!("{}d", secs / 86400),
+    }
+}
+
+/// When a relay item was sent, as a reader names it: `14:05` today, `10-01 14:05` before today, `?` unreadable. The
+/// hooks show pings with this rather than an age, which goes stale the moment it is printed (BO-04).
+pub fn clock(ts: &str) -> String {
+    let Some(t) = parse_ts(ts) else {
+        return "?".into();
+    };
+    if t.date_naive() == chrono::Local::now().date_naive() {
+        t.format("%H:%M").to_string()
+    } else {
+        t.format("%m-%d %H:%M").to_string()
     }
 }
 

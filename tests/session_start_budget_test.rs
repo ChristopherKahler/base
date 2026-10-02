@@ -108,11 +108,11 @@ fn a_collapsed_shown_once_block_leaves_its_text_in_the_full_output_file() {
 
     let shown = file.display().to_string();
     // Commit C: the relay tick is two blocks since the B layout, the tasks delivered to the
-    // session and the wake contract. The seed delivers no task, so the wake contract carries the case
-    // the single `relay-tick` block carried.
+    // session and the watcher nudge. The seed delivers no task, so the nudge carries the case
+    // the single `relay-tick` block carried. BO-04: the nudge is one line, no longer the wake contract.
     let cases = [
         ("first-run", "base is installed."),
-        ("relay-wake", "=== RELAY WAKE CONTRACT"),
+        ("relay-wake", "has no inbox watcher · run base relay arm"),
     ];
     for (kind, marker) in cases {
         assert!(

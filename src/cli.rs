@@ -1418,6 +1418,12 @@ pub enum RelayAction {
         /// Peek without consuming
         #[arg(long)]
         peek: bool,
+        /// Include messages already seen (the hooks hide a sender's older messages behind its newest one)
+        #[arg(long)]
+        all: bool,
+        /// Only messages from this sender
+        #[arg(long)]
+        from: Option<String>,
         #[arg(long)]
         project: Option<String>,
     },
@@ -1499,7 +1505,7 @@ pub enum RelayAction {
         from: Option<String>,
     },
     /// Instant message to a live titled session — no doc, no done-ceremony.
-    /// Screams in the receiver's hooks mid-turn; their reply ping clears it.
+    /// Shown in the receiver's next prompt, or at once by its inbox watcher; their reply ping clears it.
     Ping {
         /// Target session's registered title
         #[arg(long)]
@@ -1519,10 +1525,20 @@ pub enum RelayAction {
         /// Task slug
         slug: String,
     },
-    /// List inbound relay tasks across all live sessions
-    Tasks,
+    /// List inbound relay tasks and pings across all live sessions, each with its message
+    Tasks {
+        /// Only items from this sender
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// List titled sessions in the global registry (liveness for `*task` targets)
     Sessions,
+    /// Print what to start this session's inbox watcher with: the Monitor tool's fields, the re-arm step, the status line
+    Arm {
+        /// The title to watch (defaults to every title this session holds)
+        #[arg(long = "as")]
+        title: Option<String>,
+    },
 }
 
 /// Resolve a user identifier (slug, display name, or mixed) to a canonical slug.
@@ -2897,14 +2913,13 @@ pub fn run() {
                                 .unwrap_or_else(|| " (no session binding — hook delivery needs CLAUDE_CODE_SESSION_ID)".into())
                         ),
                     }
-                    // Wake contract, in-band: registration is often a boot
-                    // sequence's last tool call, so the arming block must ride
-                    // the register output itself — a hook nudge on the NEXT
-                    // tool call never fires if the session goes idle here.
-                    if !base::relay::wake::is_watching(&title)
-                        && let Some(block) = base::relay::wake::arm_block(&title)
+                    // The watcher setup, in-band: registration is often a boot sequence's last tool call, so what
+                    // `base relay arm` prints rides the register output itself when this title has no watcher
+                    // running today's script. A hook line on the NEXT prompt never fires if the session goes idle here.
+                    if !base::relay::wake::is_current(&title)
+                        && let Some(text) = base::relay::wake::arm_text(&title)
                     {
-                        println!("\n{block}");
+                        println!("\n{text}");
                     }
                 }
                 RelayAction::Send { to, mtype, msg, from, refs, project } => {
@@ -2926,7 +2941,7 @@ pub fn run() {
                                     continue;
                                 };
                                 let notify = base::relay::task_inbox::InboxTask {
-                                    slug: format!("notify-{}-{}", m.id, t),
+                                    slug: base::relay::task_inbox::notify_slug(&m.id, &t),
                                     summary: format!("[{}] {}", m.mtype, m.msg),
                                     doc: String::new(),
                                     from: sender.clone(),
@@ -2939,6 +2954,8 @@ pub fn run() {
                                     last_alert_ts: String::new(),
                                     kind: "notify".into(),
                                     refs: refs.clone(),
+                                    spool_store: store.root.to_string_lossy().into_owned(),
+                                    spool_id: m.id.clone(),
                                 };
                                 match base::relay::task_inbox::enqueue(&config.namespace, &notify) {
                                     Ok(_) => woken += 1,
@@ -2946,19 +2963,24 @@ pub fn run() {
                                 }
                             }
                             if woken > 0 {
-                                println!("Wake notify → {woken} inbox(es); fires on the receiver's monitor or next tool call.");
+                                println!("Wake notify → {woken} inbox(es); fires on the receiver's watcher or next prompt.");
                             }
                         }
                         Err(e) => die("Send failed", e),
                     }
                 }
-                RelayAction::Poll { for_title, peek, project } => {
+                RelayAction::Poll { for_title, peek, all, from, project } => {
                     let store = match relay::resolve_store(&cwd, project.as_deref()) {
                         Ok(s) => s,
                         Err(e) => die("Relay", e),
                     };
                     let Some(title) = need_identity(&store, for_title) else { return };
-                    let pending = store.pending_for(&title);
+                    // `--all` reads seen messages too: the hooks hide a sender's older messages behind its newest one
+                    // and name this command as where they can still be read (BO-04, F13c).
+                    let pending: Vec<_> = if all { store.addressed(&title) } else { store.pending_for(&title) }
+                        .into_iter()
+                        .filter(|m| from.as_deref().is_none_or(|f| m.from == f))
+                        .collect();
                     if pending.is_empty() {
                         println!("No pending messages for '{title}'.");
                         return;
@@ -3091,6 +3113,8 @@ pub fn run() {
                         last_alert_ts: String::new(),
                         kind: "task".into(),
                         refs: Vec::new(),
+                        spool_store: String::new(),
+                        spool_id: String::new(),
                     };
                     match base::relay::task_inbox::enqueue(&config.namespace, &task) {
                         Ok(path) => println!(
@@ -3115,7 +3139,7 @@ pub fn run() {
                     } else if !base::relay::wake::is_watching(&to) {
                         eprintln!(
                             "Note: '{to}' has no live wake monitor ({}) — if idle it will NOT wake; \
-                             the ping lands on its next tool call or prompt.",
+                             the ping lands on its next prompt.",
                             base::relay::wake::watch_cell(&to)
                         );
                     }
@@ -3186,6 +3210,9 @@ pub fn run() {
                     // mark this ping a reply so it can't demand its own ack.
                     let answered =
                         base::relay::task_inbox::clear_pings_from(&config.namespace, &to, &my_titles);
+                    // A reply answers everything that sender sent before it, in the spool too, so an earlier message
+                    // from them is never shown after this (BO-04, F13c).
+                    base::relay::deliver::mark_answered(&cwd, &to, &my_titles);
                     let kind = if answered > 0 { "reply" } else { "ping" };
                     let id = base::relay::ping_slug();
                     let ping = base::relay::task_inbox::InboxTask {
@@ -3202,13 +3229,15 @@ pub fn run() {
                         last_alert_ts: String::new(),
                         kind: kind.into(),
                         refs,
+                        spool_store: String::new(),
+                        spool_id: String::new(),
                     };
                     match base::relay::task_inbox::enqueue(&config.namespace, &ping) {
                         Ok(_) if answered > 0 => println!(
-                            "Ping (reply) → {to}: \"{msg}\" — cleared {answered} inbound ping(s); fires on their next tool call."
+                            "Ping (reply) → {to}: \"{msg}\" — cleared {answered} inbound ping(s); fires on their watcher or next prompt."
                         ),
                         Ok(_) => println!(
-                            "Ping → {to}: \"{msg}\" — fires on their next tool call; clears when they ping back."
+                            "Ping → {to}: \"{msg}\" — fires on their watcher or next prompt; clears when they ping back."
                         ),
                         Err(e) => die("Relay ping failed", e),
                     }
@@ -3224,8 +3253,43 @@ pub fn run() {
                         Err(e) => die("Relay done failed", e),
                     }
                 }
-                RelayAction::Tasks => {
-                    let tasks = base::relay::task_inbox::list_all();
+                RelayAction::Arm { title } => {
+                    let titles: Vec<String> = match title {
+                        Some(t) => vec![t],
+                        None => relay::env_session_id()
+                            .map(|sid| relay::session_registry::titles_for(&sid))
+                            .unwrap_or_default(),
+                    };
+                    if titles.is_empty() {
+                        die(
+                            "Relay arm",
+                            anyhow::anyhow!(
+                                "this session holds no relay title. Register first: base relay register --as <title>, \
+                                 or name one: base relay arm --as <title>"
+                            ),
+                        );
+                    }
+                    for (i, t) in titles.iter().enumerate() {
+                        let Some(text) = base::relay::wake::arm_text(t) else {
+                            die("Relay arm", anyhow::anyhow!("no home directory, so there is no inbox to watch"));
+                        };
+                        if i > 0 {
+                            println!();
+                        }
+                        if base::relay::wake::is_current(t) {
+                            println!(
+                                "A watcher for '{t}' is running this script now. Start one only if it is not this \
+                                 session's.\n"
+                            );
+                        }
+                        print!("{text}");
+                    }
+                }
+                RelayAction::Tasks { from } => {
+                    let tasks: Vec<_> = base::relay::task_inbox::list_all()
+                        .into_iter()
+                        .filter(|t| from.as_deref().is_none_or(|f| t.from == f))
+                        .collect();
                     if tasks.is_empty() {
                         println!("No inbound relay tasks.");
                     } else {

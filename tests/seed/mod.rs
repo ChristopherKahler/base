@@ -435,6 +435,19 @@ pub fn run_session_start(seed: &Seed, session: Option<&str>) -> (i32, String, St
     )
 }
 
+/// The pre-tool-use hook, driven as Claude Code drives it: JSON on stdin naming the tool and its input.
+pub fn run_pre_tool_use(seed: &Seed, tool: &str, input: serde_json::Value, session: &str) -> (i32, String, String) {
+    let payload = serde_json::json!({
+        "cwd": seed.ws.display().to_string(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool,
+        "tool_input": input,
+        "session_id": session,
+    })
+    .to_string();
+    run(seed, &["hook", "pre-tool-use"], Some(&payload), Some("seed-kite"))
+}
+
 /// Any other `base` command, from the seeded workspace.
 pub fn run_base(seed: &Seed, args: &[&str]) -> (i32, String, String) {
     run(seed, args, None, None)

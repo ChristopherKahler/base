@@ -162,15 +162,15 @@ fn run_event(
                 // Relay inbox push: pending messages addressed to this session, due now
                 // (unregistered sessions get a one-line notice that a relay is live, which
                 // ranks in the tail: an invitation to join is not due now).
-                if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true, false) {
+                if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true) {
                     let kind = if crate::relay::deliver::is_notice(&block) { "relay-notice" } else { "relay-inbox" };
                     out.push(kind, &block, 1);
                 }
-                // Session-targeted task relay: refresh liveness + announce any tasks
-                // assigned to this session (loud, re-announced on each new session), as two blocks
-                // that rank apart: the tasks delivered to this session and the wake contract (spec B1).
+                // Session-targeted task relay: refresh liveness + announce any tasks and pings for this
+                // session (new ones in full, unanswered ones listed in one line), as two blocks that rank
+                // apart: the items delivered to this session and the one-line watcher nudge (spec B1, BO-04).
                 if let Some(sid) = session_id.as_deref() {
-                    let (tasks, wake) = relay_task_parts(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::SessionStart, true);
+                    let (tasks, wake) = relay_task_parts(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::SessionStart);
                     if let Some(block) = tasks {
                         out.push("relay-tasks", &block, 1);
                     }
@@ -199,26 +199,15 @@ fn run_event(
             Ok(HookEventData { session_id, ..Default::default() })
         }
         "pre-tool-use" => {
-            let (mut data, mut context) = pre_tool_use::handle(&config, &cwd, stdin_json)?;
+            let (mut data, context) = pre_tool_use::handle(&config, &cwd, stdin_json)?;
             let (tool_name, file_path) = extract_tool_context(stdin_json);
             data.tool_name = tool_name;
             data.file_path = file_path;
-            // Mid-turn task-relay scan: a pending task or ping fires loud
-            // immediately so an autonomous run picks it up without waiting for
-            // the next prompt.
-            if let Some(sid) = session_id.as_deref()
-                && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Tool, false)
-            {
-                context.push('\n');
-                context.push_str(&block);
-            }
-            // Mid-turn spool push: a question from a squad peer must interrupt
-            // the running turn, not queue behind a prompt boundary that an
-            // autonomous run may never hit.
-            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), false, true) {
-                context.push('\n');
-                context.push_str(&block);
-            }
+            // No relay text on a tool call (BO-04, F4 and F13b). Pings, tasks and the watcher nudge used to ride here
+            // too, so on 2026-10-01 ordinary Bash and ToolSearch calls carried the whole 3.4 KB wake contract and a
+            // "Reply RIGHT NOW" line, and a withdrawn message reappeared mid-turn. Relay content is delivered at
+            // session start and on the next prompt; a session that must hear a ping mid-turn runs the inbox watcher
+            // (`base relay arm`), whose Monitor wakes it.
             // PreToolUse context only reaches the model through the JSON
             // envelope — plain stdout is transcript-only on this event.
             let context = context.trim().to_string();
@@ -295,31 +284,30 @@ fn run_event(
                 // unregistered — the session-start notice already ran.
                 use crate::emit::prompt::{Priority, PromptBlock};
                 if let Some((block, commits)) =
-                    crate::relay::deliver::deliver_deferred(&cwd, session_id.as_deref(), false, false)
+                    crate::relay::deliver::deliver_deferred(&cwd, session_id.as_deref(), false)
                 {
-                    let messages = block.matches("[RELAY] ").count();
+                    let messages = block.lines().filter(|l| l.starts_with("relay (")).count();
                     sink.blocks.push(PromptBlock::new("relay-inbox", Priority::Relay, &block, messages, "message"));
                     relay_commits.push(("relay-inbox", commits));
                 }
-                // Session-targeted task relay: refresh liveness + deliver assigned tasks, then the wake
-                // contract as a block of its own, last in priority 3: at 3.4 KB it is the block most likely
-                // not to fit, and it must never take the pings above it down with it.
+                // Session-targeted task relay: refresh liveness + deliver new tasks and pings, then the
+                // watcher nudge as a block of its own, last in priority 3. Since BO-04 it is one line per title
+                // (it was the 3.4 KB wake contract), so it no longer competes with the pings above it.
                 if let Some(sid) = session_id.as_deref() {
                     let (tasks, wake) = relay_task_parts_deferred(
                         sid,
                         &cwd,
                         &config.relay,
                         crate::relay::task_inbox::Phase::Prompt,
-                        true,
                     );
                     if let Some((block, commits)) = tasks {
-                        let items = block.lines().filter(|l| l.starts_with("<relay-")).count();
+                        let items = block.lines().filter(|l| l.starts_with("relay: ")).count();
                         sink.blocks.push(PromptBlock::new("relay-tasks", Priority::Relay, &block, items, "item"));
                         relay_commits.push(("relay-tasks", commits));
                     }
                     if let Some((block, commits)) = wake {
-                        let contracts = block.matches("=== RELAY WAKE CONTRACT").count();
-                        sink.blocks.push(PromptBlock::new("relay-wake", Priority::Relay, &block, contracts, "wake contract"));
+                        let titles = block.lines().count();
+                        sink.blocks.push(PromptBlock::new("relay-wake", Priority::Relay, &block, titles, "watcher nudge"));
                         relay_commits.push(("relay-wake", commits));
                     }
                 }
@@ -364,21 +352,9 @@ fn run_event(
         }
         "stop" => {
             stop::handle(&config, &cwd)?;
-            // #76: Stop has no additive model-facing channel. This block used to go out
-            // as plain stdout, which the host captures and drops — and it was redundant
-            // as well as undeliverable, because the same open task is re-announced by the
-            // Phase::Prompt and Phase::Tool ticks the moment the session moves again.
-            //
-            // What a Stop hook CAN do is speak to the operator. `systemMessage` produces
-            // a `hook_system_message` record where plain stdout produces none, measured
-            // on Claude Code 2.1.263 with two Stop hooks on one event — and neither
-            // reached the model, which is the point: this line is for the person.
-            if let Some(sid) = session_id.as_deref()
-                && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Stop, false)
-            {
-                let envelope = serde_json::json!({ "systemMessage": block.trim() });
-                println!("{envelope}");
-            }
+            // No relay delivery at a turn's end (BO-04, F13b: relay content appears at session start and on a prompt
+            // only). This arm used to run the task tick and print its block as a `systemMessage` for the operator,
+            // and in doing so it recorded a new ping as delivered before any prompt had shown it to the model.
             Ok(HookEventData { session_id, ..Default::default() })
         }
         _ => Ok(HookEventData::default()),
@@ -389,35 +365,17 @@ fn run_event(
     })
 }
 
-/// Session-targeted task-relay tick: on boundary events (session-start, prompt)
-/// ensure this session has an auto-assigned codename and a fresh heartbeat, then
-/// deliver any tasks/pings assigned to it, returning the injection block. The
-/// caller decides the output channel — plain stdout on boundary events, the
-/// JSON additionalContext envelope on pre-tool-use.
+/// Session-targeted task relay at a boundary (session start, prompt): ensure this session has an auto-assigned
+/// codename and a fresh heartbeat, then return its two halves, kept apart: the tasks and pings delivered to this
+/// session, and the one-line watcher nudge. Session start places them as two blocks.
 /// Fail-open — a broken inbox or registry never blocks the hook.
-fn relay_task_tick(
-    session_id: &str,
-    cwd: &std::path::Path,
-    relay: &crate::config::RelayConfig,
-    phase: crate::relay::task_inbox::Phase,
-    boundary: bool,
-) -> Option<String> {
-    match relay_task_parts(session_id, cwd, relay, phase, boundary) {
-        (Some(d), Some(w)) => Some(format!("{d}\n{w}")),
-        (a, b) => a.or(b),
-    }
-}
-
-/// [`relay_task_tick`]'s two halves, kept apart: the tasks and pings delivered to this session, and
-/// the wake contract. Session start places them as two blocks; every other event joins them.
 fn relay_task_parts(
     session_id: &str,
     cwd: &std::path::Path,
     relay: &crate::config::RelayConfig,
     phase: crate::relay::task_inbox::Phase,
-    boundary: bool,
 ) -> (Option<String>, Option<String>) {
-    let (tasks, wake) = relay_task_parts_deferred(session_id, cwd, relay, phase, boundary);
+    let (tasks, wake) = relay_task_parts_deferred(session_id, cwd, relay, phase);
     let run = |part: Option<(String, Vec<crate::relay::Commit>)>| {
         part.map(|(block, commits)| {
             crate::relay::run_commits(commits);
@@ -436,13 +394,10 @@ fn relay_task_parts_deferred(
     cwd: &std::path::Path,
     relay: &crate::config::RelayConfig,
     phase: crate::relay::task_inbox::Phase,
-    boundary: bool,
 ) -> (DeferredPart, DeferredPart) {
-    if boundary {
-        // `[relay] enabled = false` stops the auto-codename; a session that
-        // registered itself still keeps its liveness fresh.
-        let _ = crate::relay::session_registry::touch_with(session_id, cwd, relay.enabled);
-    }
+    // `[relay] enabled = false` stops the auto-codename; a session that
+    // registered itself still keeps its liveness fresh.
+    let _ = crate::relay::session_registry::touch_with(session_id, cwd, relay.enabled);
     let delivered = crate::relay::task_inbox::deliver_deferred(session_id, phase);
     // Star commands inside relayed pings resolve exactly like typed prompts
     // (Chris directive 2026-08-17, spoken pings from the hub): scan the
@@ -461,16 +416,12 @@ fn relay_task_parts_deferred(
             (format!("{block}\n{extra}"), commits)
         }
     });
-    // Wake contract: any of this session's titles with a stale .watching
-    // sentinel gets its Monitor arming block re-injected — forced at
-    // session-start, throttled mid-turn. Stop is excluded: arming belongs at
-    // starts of activity, not turn ends. `[relay] wake_nudge = false` (or
-    // `enabled = false`) never injects it.
-    let wake = (relay.enabled
-        && relay.wake_nudge
-        && !matches!(phase, crate::relay::task_inbox::Phase::Stop))
+    // Watcher nudge (BO-04, F4b): one line per title with no current inbox watcher, never the script. Once per
+    // session, and once more each time a watcher dies; session start always says it, since a fresh context has not
+    // seen it. `[relay] wake_nudge = false` (or `enabled = false`) never injects it.
+    let wake = (relay.enabled && relay.wake_nudge)
         .then(|| {
-            crate::relay::wake::arm_blocks_for_deferred(
+            crate::relay::wake::nudge_lines_deferred(
                 session_id,
                 matches!(phase, crate::relay::task_inbox::Phase::SessionStart),
             )

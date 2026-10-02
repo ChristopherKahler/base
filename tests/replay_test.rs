@@ -22,7 +22,7 @@ mod seed;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use seed::{run_prompt_submit, run_session_start, units};
+use seed::{run_base, run_base_in_session, run_pre_tool_use, run_prompt_submit, run_session_start, units};
 
 /// FS1's bar (tests/deferral_test.rs), which `base.toml` sets as the first-screen limit.
 const BAR: usize = 1990;
@@ -598,4 +598,71 @@ fn replay_corpus_has_no_real_names() {
         read += 1;
     }
     assert!(read >= 4, "control: the corpus files were read: {read}");
+}
+
+/// One session holding a relay title, no inbox watcher, and two pending pings from two senders, driven through every
+/// corpus prompt in order with a Bash tool call after each, the way a working session runs. The prompts and the tool
+/// calls' outputs, in order.
+struct RelayRun {
+    prompts: Vec<String>,
+    tools: Vec<String>,
+}
+
+fn relay_run() -> &'static RelayRun {
+    static RUN: OnceLock<RelayRun> = OnceLock::new();
+    RUN.get_or_init(|| {
+        let s = seed::write(&root("relay"), &seed::TINY, &fixture("base.toml"));
+        std::fs::write(s.ws.join(".base").join("domains.toml"), fixture("domains.toml")).expect("domains.toml");
+        let session = "replay-relay";
+        let (code, _, err) = run_base_in_session(&s, &["relay", "register", "--as", "seed-kite"], session);
+        assert_eq!(code, 0, "register: {err}");
+        for (from, msg) in [("seed-bison", "RELAY-PING-ONE: stand down on the progress doc"), ("seed-heron", "RELAY-PING-TWO: which schema?")] {
+            let (code, _, err) = run_base(&s, &["relay", "ping", "--from", from, "--to", "seed-kite", "--msg", msg]);
+            assert_eq!(code, 0, "ping: {err}");
+        }
+        let mut run = RelayRun { prompts: Vec::new(), tools: Vec::new() };
+        for prompt in prompts() {
+            let (code, stdout, stderr) = run_prompt_submit(&s, &prompt, Some(session));
+            assert_eq!(code, 0, "{prompt:?}: the prompt hook failed: {stderr}");
+            run.prompts.push(stdout);
+            let (code, stdout, stderr) = run_pre_tool_use(&s, "Bash", serde_json::json!({ "command": "ls" }), session);
+            assert_eq!(code, 0, "the pre-tool hook failed: {stderr}");
+            run.tools.push(stdout);
+        }
+        run
+    })
+}
+
+/// BO-04 (F4, F13). Measured on 2026-10-01 in session 5b860473: the 3,400-byte wake contract on six prompts and on
+/// ordinary tool calls, "Reply RIGHT NOW" on every prompt and many tool calls while a ping stayed unanswered. Across a
+/// whole corpus session now: the watcher nudge is one line, said once; each ping is shown once, on the first prompt;
+/// no tool call carries relay text; nothing claims priority over the user; the script is never in a hook.
+#[test]
+fn replay_relay_takes_one_line_and_never_repeats() {
+    let run = relay_run();
+    assert!(run.prompts.len() >= 20, "control: the corpus session ran {} prompts", run.prompts.len());
+    let all_prompts = run.prompts.join("\n");
+    let nudge = "relay: seed-kite has no inbox watcher · run base relay arm and start the Monitor it prints";
+    assert_eq!(all_prompts.matches(nudge).count(), 1, "the nudge is said once per session");
+    assert!(run.prompts[0].contains(nudge), "and on the first prompt:\n{}", run.prompts[0]);
+    for marker in ["RELAY-PING-ONE", "RELAY-PING-TWO"] {
+        assert_eq!(all_prompts.matches(marker).count(), 1, "{marker} is shown once in the session");
+        assert!(run.prompts[0].contains(marker), "{marker} is shown on the first prompt:\n{}", run.prompts[0]);
+    }
+    for (i, out) in run.prompts.iter().chain(&run.tools).enumerate() {
+        for banned in ["RELAY WAKE CONTRACT", "$INBOX/.watching", "persistent", "REPLY REQUIRED", "RIGHT NOW", "DIRECTIVE"] {
+            assert!(!out.contains(banned), "output {i} carries {banned:?}:\n{out}");
+        }
+    }
+    for (i, out) in run.tools.iter().enumerate() {
+        assert!(!out.contains("relay:") && !out.contains("RELAY-PING"), "tool call {i} carries relay text:\n{out}");
+    }
+    let relay_bytes: usize = run
+        .prompts
+        .iter()
+        .flat_map(|p| p.split("\n\n"))
+        .filter(|b| b.starts_with("relay:") || b.starts_with("relay ("))
+        .map(|b| b.len())
+        .sum();
+    println!("replay relay: {} prompts, {} tool calls, {relay_bytes} relay bytes in all", run.prompts.len(), run.tools.len());
 }

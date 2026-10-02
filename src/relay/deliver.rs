@@ -1,15 +1,14 @@
 use std::path::Path;
 
-use super::{age_str, list_projects, relay_root, RelayStore};
+use super::{list_projects, relay_root, RelayStore};
 
 // ─── Hook delivery (the push path) ───────────────────────────
 //
-// Session-start, prompt-submit AND pre-tool-use inject pending relay messages
-// addressed to the current session. The mid-turn (tool) path exists because
-// autonomous runs — Cadre members, PAUL workers — can go a whole milestone
-// without hitting a prompt boundary; a question must interrupt the turn, not
-// queue behind it. Polling is only for explicit `wait` gates — a session
-// should never burn tokens checking an empty inbox.
+// Session start and prompt-submit inject pending relay messages addressed to the
+// current session. Never pre-tool (BO-04, F13b): relay text on tool calls competed
+// with the user's own prompt, and a session that must hear a message mid-turn runs
+// the inbox watcher (`base relay arm`), whose Monitor wakes it. Polling is only for
+// explicit `wait` gates — a session should never burn tokens checking an empty inbox.
 //
 // Identity: BASE_RELAY_AS env (Cadre Pulse contracts, routines) or registry
 // binding by session id (interactive sessions that ran `base relay register`).
@@ -28,16 +27,8 @@ pub fn is_notice(block: &str) -> bool {
 
 /// Collect and consume pending messages for the current session across all
 /// relay stores in this workspace. Returns the injection block, if any.
-/// `mid_turn` marks the pre-tool-use path: it skips the idle heartbeat write
-/// (a locked registry mutation on every tool call would be pure contention)
-/// and never emits the unregistered notice.
-pub fn deliver(
-    cwd: &Path,
-    session_id: Option<&str>,
-    notice_when_unregistered: bool,
-    mid_turn: bool,
-) -> Option<String> {
-    let (block, commits) = deliver_deferred(cwd, session_id, notice_when_unregistered, mid_turn)?;
+pub fn deliver(cwd: &Path, session_id: Option<&str>, notice_when_unregistered: bool) -> Option<String> {
+    let (block, commits) = deliver_deferred(cwd, session_id, notice_when_unregistered)?;
     super::run_commits(commits);
     Some(block)
 }
@@ -45,11 +36,15 @@ pub fn deliver(
 /// [`deliver`] with the messages NOT yet marked seen: the marks come back as commits, for the prompt hook to run only
 /// if it prints the block (BO-01). The liveness heartbeat is not held back; it says the session is alive, not that it
 /// read anything.
+///
+/// BO-04 (F13): each message is shown as information, once: a header (store, type, sender, time, and for a question
+/// the answer command), then the message on its own line. Of one sender's unseen messages only the newest is shown; the
+/// older ones are marked seen with it, and a line names the command that still lists them. A message whose wake notify
+/// is still in this session's inbox is left to that notify, so one message is never shown twice.
 pub fn deliver_deferred(
     cwd: &Path,
     session_id: Option<&str>,
     notice_when_unregistered: bool,
-    mid_turn: bool,
 ) -> Option<(String, Vec<super::Commit>)> {
     let root = relay_root(cwd)?;
     let projects = list_projects(&root);
@@ -65,43 +60,45 @@ pub fn deliver_deferred(
         let store = RelayStore { root: root.join(p), project: p.clone() };
         match store.identity(session_id) {
             Some(title) => {
-                let pending = store.pending_for(&title);
+                store.heartbeat(&title);
+                let pending: Vec<_> = store
+                    .pending_for(&title)
+                    .into_iter()
+                    .filter(|m| !super::task_inbox::has_notify(&title, &m.id))
+                    .collect();
                 if pending.is_empty() {
-                    if !mid_turn {
-                        store.heartbeat(&title);
-                    }
                     continue;
                 }
-                store.heartbeat(&title);
-                out.push_str(&format!("<relay project=\"{p}\" you=\"{title}\">\n"));
-                let ids: Vec<String> = pending.iter().map(|m| m.id.clone()).collect();
-                for m in &pending {
-                    let refs = if m.refs.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [refs: {}]", m.refs.join(", "))
-                    };
+                // `pending_for` is oldest first, so the last message from each sender is its newest.
+                let mut newest: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+                for (i, m) in pending.iter().enumerate() {
+                    newest.insert(m.from.as_str(), i);
+                }
+                for (i, m) in pending.iter().enumerate() {
+                    if newest[m.from.as_str()] != i {
+                        continue;
+                    }
+                    let answer = super::task_inbox::answer_command(p, &m.mtype, &m.from);
                     out.push_str(&format!(
-                        "[RELAY] from {} · {} · {} ago: {}{refs}\n",
-                        m.from,
+                        "relay ({p}): {} from {} ({}){answer}\n{}\n",
                         m.mtype,
-                        age_str(&m.ts),
+                        m.from,
+                        super::clock(&m.ts),
                         m.msg
                     ));
+                    if !m.refs.is_empty() {
+                        out.push_str(&format!("refs: {}\n", m.refs.join(", ")));
+                    }
+                    let earlier = pending[..i].iter().filter(|o| o.from == m.from).count();
+                    if earlier > 0 {
+                        out.push_str(&format!(
+                            "({earlier} earlier message{s} from {from} hidden, this one is newer: base relay poll --project {p} --peek --all --from {from})\n",
+                            s = if earlier == 1 { "" } else { "s" },
+                            from = m.from,
+                        ));
+                    }
                 }
-                let needs_reply = pending.iter().any(|m| {
-                    matches!(m.mtype.as_str(), "question" | "contract-change")
-                });
-                if needs_reply {
-                    out.push_str(
-                        "⚠️ REPLY REQUIRED NOW — before your next action, send: \
-                         base relay send --to <sender> --type answer --msg \"...\" \
-                         A one-line ack (\"on it\") counts if the full answer needs time. \
-                         Never leave a question unanswered — the sender is blocked on you. \
-                         Then resume your work.\n",
-                    );
-                }
-                out.push_str("</relay>\n");
+                let ids: Vec<String> = pending.iter().map(|m| m.id.clone()).collect();
                 commits.push(Box::new(move || {
                     let _ = store.mark_seen(&title, &ids);
                 }));
@@ -123,6 +120,24 @@ pub fn deliver_deferred(
     }
 
     (!out.is_empty()).then_some((out, commits))
+}
+
+/// A reply to `peer` answers everything `peer` sent before it (BO-04, F13c): every unseen spool message from `peer`
+/// to one of `my_titles`, in every store of this workspace, is marked seen. Returns how many.
+pub fn mark_answered(cwd: &Path, peer: &str, my_titles: &[String]) -> usize {
+    let Some(root) = relay_root(cwd) else { return 0 };
+    let mut marked = 0;
+    for p in list_projects(&root) {
+        let store = RelayStore { root: root.join(&p), project: p };
+        for title in my_titles {
+            let ids: Vec<String> =
+                store.pending_for(title).into_iter().filter(|m| m.from == peer).map(|m| m.id).collect();
+            if !ids.is_empty() && store.mark_seen(title, &ids).is_ok() {
+                marked += ids.len();
+            }
+        }
+    }
+    marked
 }
 
 #[cfg(test)]
@@ -188,29 +203,38 @@ mod tests {
         s.register("quill", Some("sess-abc"), "/firm", None).unwrap();
         s.send("sterling", "quill", "notify", "3 units queued for you", &[]).unwrap();
 
-        let block = deliver(tmp.path(), Some("sess-abc"), true, false).expect("delivery expected");
-        assert!(block.contains("you=\"quill\""));
+        let block = deliver(tmp.path(), Some("sess-abc"), true).expect("delivery expected");
+        assert!(block.starts_with("relay (proj): notify from sterling ("), "{block}");
         assert!(block.contains("3 units queued for you"));
 
         // Consumed — second delivery is empty (registered → no notice either).
-        assert!(deliver(tmp.path(), Some("sess-abc"), true, false).is_none());
+        assert!(deliver(tmp.path(), Some("sess-abc"), true).is_none());
     }
 
+    /// BO-04, F13c with lynx's conditions: of one sender's unseen messages only the newest is shown, the line under it
+    /// names the command that still lists the older ones, nothing is deleted, and a second delivery shows nothing.
     #[test]
-    fn mid_turn_delivers_questions_between_tool_calls() {
+    fn the_newest_message_per_sender_is_shown_and_the_older_ones_listed() {
         let _guard = env_guard();
         let tmp = tempfile::tempdir().unwrap();
         let s = setup(tmp.path());
-        s.register("worker", Some("sess-w"), "/wt", None).unwrap();
-        s.send("orch", "worker", "question", "which schema version?", &[]).unwrap();
+        s.register("lynx", Some("sess-l"), "/main", None).unwrap();
+        s.send("bison", "lynx", "answer", "go: edit the doc", &[]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.send("heron", "lynx", "notify", "unrelated news", &[]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.send("bison", "lynx", "answer", "stand down, the go is withdrawn", &[]).unwrap();
 
-        // Pre-tool-use path: the question interrupts the running turn.
-        let block = deliver(tmp.path(), Some("sess-w"), false, true).expect("mid-turn delivery");
-        assert!(block.contains("which schema version?"));
-        assert!(block.contains("REPLY REQUIRED NOW"));
-
-        // Empty inbox mid-turn: silent, no notice.
-        assert!(deliver(tmp.path(), Some("sess-w"), false, true).is_none());
+        let block = deliver(tmp.path(), Some("sess-l"), false).expect("delivery");
+        assert!(block.contains("stand down, the go is withdrawn"), "{block}");
+        assert!(!block.contains("go: edit the doc"), "a superseded message was shown:\n{block}");
+        assert!(block.contains("unrelated news"), "another sender's message is not superseded:\n{block}");
+        assert!(
+            block.contains("(1 earlier message from bison hidden, this one is newer: base relay poll --project proj --peek --all --from bison)"),
+            "{block}"
+        );
+        assert_eq!(s.all_messages().len(), 3, "superseding hides, never deletes");
+        assert!(deliver(tmp.path(), Some("sess-l"), false).is_none(), "a delivered message is never shown again");
     }
 
     #[test]
@@ -221,9 +245,25 @@ mod tests {
         s.register("orch", Some("sess-1"), "/main", None).unwrap();
         s.send("worker", "orch", "contract-change", "need col rename", &[]).unwrap();
 
-        let block = deliver(tmp.path(), Some("sess-1"), true, false).unwrap();
-        assert!(block.contains("base relay send --to <sender> --type answer"));
-        assert!(block.contains("REPLY REQUIRED NOW"));
+        let block = deliver(tmp.path(), Some("sess-1"), true).unwrap();
+        assert!(block.contains("answer: base relay send --project proj --to worker --type answer"), "{block}");
+        assert!(!block.contains("REPLY REQUIRED"), "relay text never claims priority over the user:\n{block}");
+        assert!(block.lines().any(|l| l == "need col rename"), "the message starts its own line:\n{block}");
+    }
+
+    /// F13c condition 3: a reply to a sender marks every earlier message from that sender seen.
+    #[test]
+    fn a_reply_marks_everything_earlier_from_that_sender_seen() {
+        let _guard = env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let s = setup(tmp.path());
+        s.register("lynx", Some("sess-r"), "/main", None).unwrap();
+        s.send("bison", "lynx", "answer", "go: edit the doc", &[]).unwrap();
+        s.send("heron", "lynx", "notify", "from someone else", &[]).unwrap();
+        assert_eq!(mark_answered(tmp.path(), "bison", &["lynx".to_string()]), 1);
+        let block = deliver(tmp.path(), Some("sess-r"), false).expect("heron's message is still due");
+        assert!(!block.contains("go: edit the doc"), "{block}");
+        assert!(block.contains("from someone else"), "{block}");
     }
 
     #[test]
@@ -234,11 +274,11 @@ mod tests {
         s.send("a", "b", "notify", "x", &[]).unwrap();
 
         // session-start path: notice.
-        let block = deliver(tmp.path(), Some("unknown-sess"), true, false).unwrap();
+        let block = deliver(tmp.path(), Some("unknown-sess"), true).unwrap();
         assert!(block.contains("<relay-notice>"));
 
         // prompt-submit path: silent.
-        assert!(deliver(tmp.path(), Some("unknown-sess"), false, false).is_none());
+        assert!(deliver(tmp.path(), Some("unknown-sess"), false).is_none());
     }
 
     #[test]
@@ -250,7 +290,7 @@ mod tests {
 
         // SAFETY: test-local env mutation; no parallel test reads this var.
         unsafe { std::env::set_var("BASE_RELAY_AS", "quill") };
-        let block = deliver(tmp.path(), None, false, false);
+        let block = deliver(tmp.path(), None, false);
         unsafe { std::env::remove_var("BASE_RELAY_AS") };
 
         let block = block.expect("env identity should receive delivery");
