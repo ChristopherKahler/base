@@ -96,7 +96,10 @@ fn ast_hint_only_on_code_search() {
     let gbl_map = s.home.join(".base-gbl").join(".base-ast");
     std::fs::create_dir_all(&gbl_map).unwrap();
     std::fs::write(gbl_map.join("ast.ttl"), "# stub\n").unwrap();
-    let none: [(&Path, String); 14] = [
+    let none: [(&Path, String); 16] = [
+        // rg reading a pipe searches text; rg with no pattern searches nothing (code review).
+        (&apps.mapped, "git log --oneline | rg fix".into()),
+        (&apps.mapped, "rg --version".into()),
         // A folder of docs inside an app with a map is a docs search (F20b), and so is a docs folder of a mapped tier.
         (&apps.mapped, r#"grep -rn "select" docs/"#.into()),
         (&apps.mapped, format!(r#"grep -rln -i "DUE NOW" {home}/.base-gbl/handoffs"#)),
@@ -129,6 +132,17 @@ fn ast_hint_only_on_code_search() {
         assert!(out.contains("<ast-hint>") && out.contains(line), "{command:?} should suggest {line:?}:\n{out}");
         assert!(!out.contains("--target"), "the cwd's own map needs no --target:\n{out}");
     }
+
+    // A workspace root keeps its source four folders down (crates/foo/src); a search from the root still counts.
+    let mono = s.home.join("dev").join("mono");
+    for (rel, text) in [(".base-ast/ast.ttl", "# stub\n"), ("crates/foo/src/lib.rs", "fn handler() {}\n"), ("README.md", "# mono\n")] {
+        let p = mono.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+    std::fs::create_dir_all(mono.join(".git")).unwrap();
+    let out = bash(&s, &mono, "rg handler");
+    assert!(out.contains(r#"base ast query --contains "handler""#), "a workspace root:\n{out}");
 
     // From a folder with no map, the map named is the searched folder's, and the query says so.
     let out = bash(&s, &s.ws, &format!(r#"grep -rn "fn select(" {}/src"#, sh(&apps.mapped)));
@@ -193,6 +207,15 @@ fn ast_hint_without_a_map_says_what_is_true() {
     assert!(other.contains("No code map covers"), "another session is told:\n{other}");
     let out = bash(&s, &apps.plain, r#"grep -rn "fn main" src/"#);
     assert!(!out.contains("<ast-hint>"), "a folder with no map and no source file named:\n{out}");
+    // An empty ast.ttl (a build cut off part-way) answers no query, so it is no map (code review).
+    let cut = s.home.join("dev").join("cut-app");
+    std::fs::create_dir_all(cut.join(".base-ast")).unwrap();
+    std::fs::create_dir_all(cut.join(".git")).unwrap();
+    std::fs::create_dir_all(cut.join("src")).unwrap();
+    std::fs::write(cut.join(".base-ast").join("ast.ttl"), "").unwrap();
+    std::fs::write(cut.join("src").join("x.rs"), "fn x() {}\n").unwrap();
+    let out = bash(&s, &cut, r#"grep -rn --include=*.rs "fn x" ."#);
+    assert!(!out.contains("A code map covers"), "an empty map is not offered as one:\n{out}");
     let out = bash(&s, &s.ws, &format!("grep -n fn {}/x.rs", sh(&apps.loose)));
     assert!(!out.contains("<ast-hint>"), "a file in no app:\n{out}");
 }
@@ -309,4 +332,47 @@ content = ["OPEN_HANDLE"]
     for name in ["main.rs", "job.py", "app.ts", "run.sh", "Kernel.php"] {
         assert_eq!(standards_for(&s, &at(name), "OPEN_HANDLE", &format!("bo07-code-{name}")), vec!["S-ANY"], "{name}");
     }
+}
+
+/// A standards.toml written before scopes existed (code review, 2026-10-02): its shipped standards take the seed's
+/// scope at load, so A12 still reaches railway.toml and still skips a markdown note; a standard that declares
+/// `code = true` keeps exactly that; `base standards get` says where the scope came from.
+#[test]
+fn standards_written_before_scopes_keep_deploy_files() {
+    let (s, apps) = world("pre-scope");
+    std::fs::write(
+        s.home.join(".base-gbl").join("standards.toml"),
+        r#"
+[[standard]]
+id = "A12"
+title = "Single-service constraint awareness"
+rule = "Know your platform's structural limits."
+severity = "medium"
+[standard.triggers]
+content = ["railway", "Railway", "RAILWAY_"]
+semantic = ["ci-deploy"]
+paths = ["railway.json", "railway.toml"]
+
+[[standard]]
+id = "A3"
+title = "Browser smoke gate is mandatory"
+rule = "Every pipeline runs a headless-browser smoke."
+severity = "high"
+applies_to = { code = true }
+[standard.triggers]
+content = ["playwright"]
+semantic = ["ci-deploy"]
+paths = [".github/workflows"]
+"#,
+    )
+    .expect("standards.toml");
+    assert_eq!(standards_for(&s, &apps.mapped.join("railway.toml"), "railway up --service web", "bo07-pre-1"), vec!["A12"]);
+    assert_eq!(standards_for(&s, &apps.mapped.join("notes.md"), "railway up --service web", "bo07-pre-2"), Vec::<String>::new());
+    let workflow = apps.mapped.join(".github").join("workflows").join("ci.yml");
+    assert_eq!(standards_for(&s, &workflow, "run: npx playwright test", "bo07-pre-3"), Vec::<String>::new(), "A3 declared code only");
+    let spec = apps.mapped.join("tests").join("smoke.spec.ts");
+    assert_eq!(standards_for(&s, &spec, "import { test } from 'playwright';", "bo07-pre-4"), vec!["A3"]);
+    let (code, out, err) = seed::run_base(&s, &["standards", "get", "A12"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("Applies to: code files; paths ") && out.contains("(the shipped seed's;"), "{out}");
 }

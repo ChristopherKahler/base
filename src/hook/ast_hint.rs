@@ -170,6 +170,10 @@ pub fn code_searches(command: &str, shell: Shell, cwd: &Path, home: Option<&Path
         let Some(mut spec) = search_spec(&head.name, args, shell) else {
             continue;
         };
+        if simple.piped_in && spec.reads_pipe && spec.targets.is_empty() {
+            // `git log | rg fix`: rg searches the pipe, not the cwd.
+            spec.default_cwd = false;
+        }
         if spec.targets.is_empty() && !spec.default_cwd {
             // No file named and none implied: it reads its input. Through `xargs`, or Select-String fed by
             // Get-ChildItem, that input is a list of files from the command before it; otherwise it is text.
@@ -202,18 +206,61 @@ enum Said {
     Unmapped { root: PathBuf, text: String },
 }
 
-fn hint_for(search: &CodeSearch, cwd: &Path) -> Option<Said> {
-    for s in &search.folders {
-        let Some(ttl) = crate::config::find_ast_ttl(&s.folder) else {
+/// The code map that answers for `folder`: [`crate::config::find_ast_ttl`], when the file holds anything. An empty
+/// `ast.ttl` (a build cut off part-way) answers no query, so it is no map; the hint this replaced checked the same.
+fn map_for(folder: &Path) -> Option<PathBuf> {
+    crate::config::find_ast_ttl(folder).filter(|t| std::fs::metadata(t).is_ok_and(|m| m.len() > 0))
+}
+
+/// How far [`holds_source`] looks: deep enough for a Cargo or npm workspace (`crates/foo/src/lib.rs` is four folders
+/// down from the root), bounded so a search never pays for a big tree.
+const PROBE_DEPTH: usize = 6;
+const PROBE_ENTRIES: usize = 4000;
+
+/// Whether a folder holds source files, breadth first so a file near the top is found first, skipping hidden
+/// folders and the build and dependency folders automap skips. automap's own probe stops three levels down, which
+/// misses a workspace's `crates/*/src` and `packages/*/src`.
+fn holds_source(dir: &Path) -> bool {
+    let mut queue = std::collections::VecDeque::from([(dir.to_path_buf(), 0usize)]);
+    let mut seen = 0usize;
+    while let Some((d, depth)) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
         };
-        // A bare folder counts only when it holds source files: `grep -rn x ~/.base-gbl/handoffs` searches
-        // markdown, whatever map the folder above it carries. A bounded probe (automap's), and only here, where a map
-        // would otherwise make the hint fire.
-        if !s.holds_code && !automap::has_code_files(&s.folder) {
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > PROBE_ENTRIES {
+                return false;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if depth + 1 < PROBE_DEPTH && !name.starts_with('.') && !automap::is_noise_dir(&name) {
+                    queue.push_back((path, depth + 1));
+                }
+            } else if path.extension().and_then(|e| e.to_str()).is_some_and(automap::is_code_ext) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn hint_for(search: &CodeSearch, cwd: &Path) -> Option<Said> {
+    for s in &search.folders {
+        let Some(ttl) = map_for(&s.folder) else {
+            continue;
+        };
+        // A bare folder counts only when it holds source files: `grep -rn x docs/` searches markdown, whatever map
+        // the app around it carries. Probed only here, where a map would otherwise make the hint fire.
+        if !s.holds_code && !holds_source(&s.folder) {
             continue;
         }
-        let cwd_map = crate::config::find_ast_ttl(cwd);
+        let cwd_map = map_for(cwd);
         let target = (cwd_map.as_deref() != Some(ttl.as_path())).then(|| map_root(&ttl));
         return Some(Said::Mapped(render_mapped(search.kind, search.name.as_deref(), target.as_deref())));
     }
@@ -747,20 +794,32 @@ struct Spec {
     types: Vec<String>,
     /// Searches the folder it starts in when no target is named (grep -r, rg, ag, ack, find, fd).
     default_cwd: bool,
+    /// Searches its input instead when that input is a pipe and no path is named (rg, ag, ack). GNU grep -r does not:
+    /// it searches the cwd regardless.
+    reads_pipe: bool,
 }
 
 fn search_spec(name: &str, args: &[String], shell: Shell) -> Option<Spec> {
     match (name, shell) {
-        ("grep" | "egrep" | "fgrep", _) => Some(grep(args)),
+        ("grep" | "egrep" | "fgrep", _) => grep(args),
         ("rg", _) => rg(args),
-        ("ag", _) => Some(ag_ack(args, true)),
-        ("ack" | "ack-grep", _) => Some(ag_ack(args, false)),
+        ("ag", _) => ag_ack(args, true),
+        ("ack" | "ack-grep", _) => ag_ack(args, false),
         // In PowerShell, `find` is Windows' find.exe, a different program.
         ("find", Shell::Bash) => find(args),
         ("fd" | "fdfind", _) => fd(args),
         ("select-string" | "sls", Shell::PowerShell) => Some(select_string(args)),
         _ => None,
     }
+}
+
+/// A short option `-x…` as its letter and whatever is attached after it, counted in characters. An argument is text
+/// the model typed (`-é`, an em dash for `--`), and a byte slice through a character would panic the hook and lose
+/// every other injection for the tool call.
+fn short_option(a: &str) -> (char, String) {
+    let mut chars = a.chars().skip(1);
+    let letter = chars.next().unwrap_or(' ');
+    (letter, chars.collect())
 }
 
 /// `--name=value` or `--name value`: the value, and how many words it used.
@@ -771,7 +830,7 @@ fn long_value(arg: &str, rest: &[String]) -> (Option<String>, usize) {
     }
 }
 
-fn grep(args: &[String]) -> Spec {
+fn grep(args: &[String]) -> Option<Spec> {
     let mut spec = Spec { kind: Some(Kind::Content), ..Spec::default() };
     let mut operands: Vec<String> = Vec::new();
     let mut have_pattern_option = false;
@@ -850,16 +909,20 @@ fn grep(args: &[String]) -> Spec {
         }
         i += used;
     }
-    if !have_pattern_option && !operands.is_empty() {
+    if !have_pattern_option {
+        // No pattern: `grep --version`, `grep --help`. Nothing is searched.
+        if operands.is_empty() {
+            return None;
+        }
         spec.patterns.push(operands.remove(0));
     }
     spec.targets = operands;
     spec.default_cwd = recursive;
-    spec
+    Some(spec)
 }
 
 fn rg(args: &[String]) -> Option<Spec> {
-    let mut spec = Spec { kind: Some(Kind::Content), default_cwd: true, ..Spec::default() };
+    let mut spec = Spec { kind: Some(Kind::Content), default_cwd: true, reads_pipe: true, ..Spec::default() };
     let mut operands: Vec<String> = Vec::new();
     let mut have_pattern_option = false;
     let mut i = 0;
@@ -936,7 +999,11 @@ fn rg(args: &[String]) -> Option<Spec> {
         }
         i += used;
     }
-    if !have_pattern_option && !operands.is_empty() {
+    if !have_pattern_option {
+        // No pattern: `rg --version`, `rg -h`. Nothing is searched.
+        if operands.is_empty() {
+            return None;
+        }
         spec.patterns.push(operands.remove(0));
     }
     spec.targets = operands;
@@ -944,8 +1011,8 @@ fn rg(args: &[String]) -> Option<Spec> {
 }
 
 /// ag and ack: `PATTERN [PATH…]`, recursive from the cwd, with language switches (`--rust`, `--type=rust`).
-fn ag_ack(args: &[String], ag: bool) -> Spec {
-    let mut spec = Spec { kind: Some(Kind::Content), default_cwd: true, ..Spec::default() };
+fn ag_ack(args: &[String], ag: bool) -> Option<Spec> {
+    let mut spec = Spec { kind: Some(Kind::Content), default_cwd: true, reads_pipe: true, ..Spec::default() };
     let mut operands: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -975,29 +1042,32 @@ fn ag_ack(args: &[String], ag: bool) -> Spec {
             }
             continue;
         }
-        let o = a.chars().nth(1).unwrap_or(' ');
+        let (o, attached) = short_option(a);
+        let (value, used) = if attached.is_empty() { (args.get(i + 1).cloned(), 2) } else { (Some(attached), 1) };
         let takes = if ag { matches!(o, 'A' | 'B' | 'C' | 'G' | 'm' | 'p') } else { matches!(o, 'A' | 'B' | 'C' | 'm' | 't') };
         if o == 'g' {
             // -g PATTERN lists the files whose names match: a names search.
             spec.kind = Some(Kind::Names);
-            let (value, used) = if a.len() > 2 { (Some(a[2..].to_string()), 1) } else { (args.get(i + 1).cloned(), 2) };
             spec.patterns.extend(value);
             i += used;
             continue;
         }
         if o == 't' && !ag {
-            let (value, used) = if a.len() > 2 { (Some(a[2..].to_string()), 1) } else { (args.get(i + 1).cloned(), 2) };
             spec.types.extend(value);
             i += used;
             continue;
         }
-        i += if takes && a.len() == 2 { 2 } else { 1 };
+        i += if takes { used } else { 1 };
     }
-    if spec.kind == Some(Kind::Content) && !operands.is_empty() {
+    if spec.kind == Some(Kind::Content) {
+        // No pattern: `ag --version`, `ack --help`. Nothing is searched.
+        if operands.is_empty() {
+            return None;
+        }
         spec.patterns.push(operands.remove(0));
     }
     spec.targets = operands;
-    spec
+    Some(spec)
 }
 
 /// GNU find: `[PATH…] EXPRESSION`. A search only with a name test; `-type d` looks for folders, not code.
@@ -1060,10 +1130,13 @@ fn fd(args: &[String]) -> Option<Spec> {
         let (name, value, used) = if let Some(long) = a.strip_prefix("--") {
             let (v, u) = long_value(a, &args[i + 1..]);
             (long.split('=').next().unwrap_or(long).to_string(), v, u)
-        } else if a.len() > 2 {
-            (a[1..2].to_string(), Some(a[2..].to_string()), 1)
         } else {
-            (a[1..].to_string(), args.get(i + 1).cloned(), 2)
+            let (letter, attached) = short_option(a);
+            if attached.is_empty() {
+                (letter.to_string(), args.get(i + 1).cloned(), 2)
+            } else {
+                (letter.to_string(), Some(attached), 1)
+            }
         };
         match name.as_str() {
             "e" | "extension" => {
@@ -1446,13 +1519,38 @@ mod tests {
 
     #[test]
     fn grep_options_are_parsed() {
-        let s = grep(&["-rn".into(), "--include=*.rs".into(), "-e".into(), "foo".into(), "src".into()]);
+        let s = grep(&["-rn".into(), "--include=*.rs".into(), "-e".into(), "foo".into(), "src".into()]).unwrap();
         assert_eq!(s.patterns, vec!["foo"]);
         assert_eq!(s.targets, vec!["src"]);
         assert_eq!(s.filters, vec!["*.rs"]);
         assert!(s.default_cwd);
-        let s = grep(&["-n".into(), "-B2".into(), "x".into()]);
+        let s = grep(&["-n".into(), "-B2".into(), "x".into()]).unwrap();
         assert_eq!(s.patterns, vec!["x"]);
         assert!(s.targets.is_empty() && !s.default_cwd, "no file, not recursive: reads stdin");
+    }
+
+    /// Code review, 2026-10-02: rg, ag and ack read a pipe when one is given and no path is, and a command with no
+    /// pattern searches nothing.
+    #[test]
+    fn piped_or_patternless_is_no_search() {
+        let cwd = std::env::temp_dir();
+        for cmd in ["git log | rg fix", "base handoff list | ag 0160", "cat x.rs | ack fn", "rg --version", "rg -h", "ag --version", "ack --help", "grep --help"] {
+            assert!(code_searches(cmd, Shell::Bash, &cwd, None).is_empty(), "{cmd}");
+        }
+        let searches = code_searches("find . -name '*.rs' | xargs rg select", Shell::Bash, &cwd, None);
+        assert_eq!(searches.iter().map(|s| s.kind).collect::<Vec<_>>(), vec![Kind::Names, Kind::Content], "xargs rg reads the files find lists");
+        assert_eq!(searches[1].name.as_deref(), Some("select"));
+        assert!(searches[1].names_code);
+    }
+
+    /// Code review, 2026-10-02: an option the model typed with a non-ASCII letter, or an em dash for `--`, is parsed by
+    /// characters; a byte slice through it would panic the hook.
+    #[test]
+    fn non_ascii_options_never_panic() {
+        let cwd = std::env::temp_dir();
+        for cmd in ["fd -é foo", "fd —name x", "fd -eé x", "ag -é x src", "ag -gé", "ack -té x", "rg -é x", "grep -é x src", "find . -name é*"] {
+            let _ = code_searches(cmd, Shell::Bash, &cwd, None);
+        }
+        let _ = code_searches("Select-String -Pàttern x -Path é.rs", Shell::PowerShell, &cwd, None);
     }
 }

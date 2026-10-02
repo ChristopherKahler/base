@@ -117,6 +117,7 @@ pub fn sync_standards(
                         controls: proto.controls,
                         source,
                         applies_to: AppliesTo::default(),
+                        scope_from_seed: false,
                         triggers: TriggerDef::default(),
                         stacks: Default::default(),
                     });
@@ -350,6 +351,7 @@ fn std_seed(
         controls: Vec::new(),
         source: format!("midas:protocols.md#{id}"),
         applies_to: AppliesTo::default(),
+        scope_from_seed: false,
         triggers,
         stacks: stacks
             .iter()
@@ -672,6 +674,8 @@ pub fn scope_text(s: &StandardDef) -> String {
     }
     if parts.is_empty() {
         "code files (nothing declared)".into()
+    } else if s.scope_from_seed {
+        format!("{} (the shipped seed's; declare applies_to to change it)", parts.join("; "))
     } else {
         parts.join("; ")
     }

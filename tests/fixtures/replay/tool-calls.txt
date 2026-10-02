@@ -37,6 +37,8 @@ none | Bash | mapped | cat src/lib.rs
 none | Bash | mapped | ls src | head
 none | Bash | mapped | git grep -n "fn select"
 none | Bash | mapped | git -C {mapped} log --oneline -6 2>&1 | head -6
+none | Bash | mapped | git log --oneline | rg -i fix
+none | Bash | mapped | rg --version
 none | Bash | mapped | cargo test --no-fail-fast 2>&1 | grep -E "test result" | head
 none | Bash | mapped | grep -rn --include=*.md -i "select" .
 none | Bash | mapped | rg -t md select

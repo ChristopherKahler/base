@@ -445,6 +445,7 @@ mod tests {
             controls: vec![],
             source: String::new(),
             applies_to: Default::default(),
+            scope_from_seed: false,
             triggers,
             stacks: Default::default(),
         }
