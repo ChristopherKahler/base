@@ -498,7 +498,7 @@ pub fn run_pre_tool_use_at(
 /// them as a real machine's apps rather than temp folders.
 pub struct Apps {
     /// An app with a code map (a stub `ast.ttl`; the hint reads only that it exists): `src/lib.rs`, `src/hook/mod.rs`,
-    /// `api/routes/users.ts`.
+    /// `api/routes/users.ts`, and `docs/guide.md` (a folder holding no source).
     pub mapped: PathBuf,
     /// An app with no code map: `src/main.rs`.
     pub plain: PathBuf,
@@ -516,11 +516,12 @@ pub fn write_apps(seed: &Seed) -> Apps {
     let plain = dev.join("plain-app");
     let cached = seed.home.join(".cache").join("cached-app");
     let loose = seed.home.join("loose");
-    let files: [(&Path, &str, &str); 9] = [
+    let files: [(&Path, &str, &str); 10] = [
         (&mapped, ".base-ast/ast.ttl", "# a stub map: the hint reads only that one exists\n"),
         (&mapped, "src/lib.rs", "// TODO: select\npub fn select() {}\n"),
         (&mapped, "src/hook/mod.rs", "pub fn handle() { crate::user_prompt_submit::handle(); }\n"),
         (&mapped, "api/routes/users.ts", "export const users = 1;\n"),
+        (&mapped, "docs/guide.md", "# guide\n\nselect\n"),
         (&plain, "src/main.rs", "fn main() {}\n"),
         (&cached, "src/main.rs", "fn main() {}\n"),
         (&loose, "x.rs", "fn x() {}\n"),

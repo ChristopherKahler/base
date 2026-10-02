@@ -59,6 +59,9 @@ file:lib | Bash | mapped | find . -name 'lib*.rs'
 generic | Bash | mapped | for p in 'CONTEXT' 'select'; do grep -rn "$p" src/ | head -3; done
 nomap:building | Bash | plain | grep -rn --include=*.rs "fn main" .
 nomap:never | Bash | cached | grep -rn "fn main" src/*.rs
+none | Bash | mapped | grep -rn "select" docs/
+nomap:never | Bash | ws | grep -rn "fn main" {cached}/src/main.rs
+none | Bash | ws | grep -rn -E "fn (main|run)" {cached}/src/main.rs
 standards:none | Write | ws | {home}/.base/forks/2026-10-01-hook-injection-audit.md :: # Audit\n\nThe hook spawns `claude -p` via Command::new and spawn(; the API answers 403 Forbidden on findOrFail.
 standards:none | Edit | ws | {home}/.base/forks/2026-10-01-hook-injection-audit.md :: Foreign and non-existent resources return 404; 403 Forbidden is for abilities. spawn( child_process
 standards:none | Write | ws | {home}/notes/data.json :: {"spawn(": "Command::new", "status": "403 Forbidden"}

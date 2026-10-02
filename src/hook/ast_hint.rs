@@ -12,13 +12,15 @@
 //!     output (`… | grep x`): that searches text, not files.
 //!   * What is searched decides (F20a, F20b): the files named, the `--include` / `-g` / `-t` / `-name` filters, and
 //!     the folders. A search confined to docs, config or data (`.md`, `.toml`, `.json`, …) never fires. A search over
-//!     source files, or over a folder inside an app with a code map, does.
+//!     source files, or over a folder inside an app with a code map, does; a folder named bare counts only when it
+//!     holds source files, so a folder of markdown under a mapped tier is a docs search.
 //!   * The map is the searched folder's, never the cwd's. When it is not the map `base ast query` reads from the cwd,
 //!     the suggestion carries `--target`.
 //!   * The suggested query is a plain name (F20c): regex syntax stripped, the longest name-like token kept.
 //!   * With no map, only a search that names source files is told so, and the text is true for that folder (BO-00's
 //!     review, lynx): a build is under way, it has been failing, the tree is too large to map unattended, or base
-//!     never maps that place on its own. A folder that is in no app hears nothing.
+//!     never maps that place on its own. It is said once per session per app. A folder that is in no app hears
+//!     nothing.
 //!
 //! Parsing is shell-shaped, not a shell: quotes, escapes, pipes, list operators, redirections, heredoc bodies and
 //! `cd` are followed; variables and command substitutions are never expanded, so a target spelled with one is
@@ -26,6 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::domain::session::SessionState;
 use crate::hook::automap::{self, MapPlan};
 
 /// Which shell's quoting a command is written in.
@@ -53,24 +56,51 @@ pub struct CodeSearch {
     /// The query to suggest, already a plain name (F20c). `None` when the pattern has no name-like token.
     pub name: Option<String>,
     /// The folders searched, in the order named; the cwd (or the last `cd`) when the search names none.
-    pub folders: Vec<PathBuf>,
+    pub folders: Vec<Searched>,
     /// The search names source files: by extension, or through a filter that admits only code.
     pub names_code: bool,
 }
 
-/// The `<ast-hint>` for this tool call, or `None`. Reads the filesystem (which folders have a map) and, for a code
-/// search in an app with no map, starts that app's first map the way any first contact does, so that the text
-/// saying a build is under way is true.
-pub fn hint(event: &serde_json::Value, cwd: &Path) -> Option<String> {
+/// One folder a search reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Searched {
+    pub folder: PathBuf,
+    /// Known to be a search over source here: a source file was named in it, or a filter admits only code. A folder
+    /// named bare is checked for source files before it counts (F20b: a folder of docs is a docs search).
+    pub holds_code: bool,
+}
+
+/// The `<ast-hint>` for a tool call, and whether `session` was marked.
+#[derive(Debug, Default)]
+pub struct Hint {
+    pub text: Option<String>,
+    pub marked: bool,
+}
+
+/// The `<ast-hint>` for this tool call, if it has one. Reads the filesystem (which folders have a map, whether a bare
+/// folder holds source files) and, for a code search in an app with no map, starts that app's first map the way any
+/// first contact does, so that the text saying a build is under way is true. A no-map text is said once per session
+/// per app, and again only if it changes: session 5b860473 searched one worktree eight times, and eight copies of
+/// the same 330 bytes told it nothing new after the first.
+pub fn hint(event: &serde_json::Value, cwd: &Path, session: &mut SessionState) -> Hint {
     let home = crate::home::home_root();
     for (command, shell) in tool_commands(event) {
         for search in code_searches(&command, shell, cwd, home.as_deref()) {
-            if let Some(text) = hint_for(&search, cwd) {
-                return Some(text);
+            match hint_for(&search, cwd) {
+                Some(Said::Mapped(text)) => return Hint { text: Some(text), marked: false },
+                Some(Said::Unmapped { root, text }) => {
+                    let key = format!("ast-hint-no-map{}{}", '\u{1f}', root.display());
+                    let version = crate::domain::session::rules_hash(std::slice::from_ref(&text));
+                    if !session.has_ast_injected(&key, version) {
+                        session.mark_ast_injected(&key, version);
+                        return Hint { text: Some(text), marked: true };
+                    }
+                }
+                None => {}
             }
         }
     }
-    None
+    Hint::default()
 }
 
 /// The shell commands a tool call is about to run, each with the shell that parses it: Bash's and PowerShell's
@@ -166,18 +196,32 @@ pub fn code_searches(command: &str, shell: Shell, cwd: &Path, home: Option<&Path
 
 // ─── The hint text ───────────────────────────────────────────
 
-fn hint_for(search: &CodeSearch, cwd: &Path) -> Option<String> {
-    for folder in &search.folders {
-        if let Some(ttl) = crate::config::find_ast_ttl(folder) {
-            let cwd_map = crate::config::find_ast_ttl(cwd);
-            let target = (cwd_map.as_deref() != Some(ttl.as_path())).then(|| map_root(&ttl));
-            return Some(render_mapped(search.kind, search.name.as_deref(), target.as_deref()));
+/// What the hint says about one search.
+enum Said {
+    Mapped(String),
+    Unmapped { root: PathBuf, text: String },
+}
+
+fn hint_for(search: &CodeSearch, cwd: &Path) -> Option<Said> {
+    for s in &search.folders {
+        let Some(ttl) = crate::config::find_ast_ttl(&s.folder) else {
+            continue;
+        };
+        // A bare folder counts only when it holds source files: `grep -rn x ~/.base-gbl/handoffs` searches
+        // markdown, whatever map the folder above it carries. A bounded probe (automap's), and only here, where a map
+        // would otherwise make the hint fire.
+        if !s.holds_code && !automap::has_code_files(&s.folder) {
+            continue;
         }
+        let cwd_map = crate::config::find_ast_ttl(cwd);
+        let target = (cwd_map.as_deref() != Some(ttl.as_path())).then(|| map_root(&ttl));
+        return Some(Said::Mapped(render_mapped(search.kind, search.name.as_deref(), target.as_deref())));
     }
     if !search.names_code {
         return None;
     }
-    let root = crate::config::ast_app_root(search.folders.first()?)?;
+    let first = search.folders.iter().find(|s| s.holds_code)?;
+    let root = crate::config::ast_app_root(&first.folder)?;
     // First contact, as a Bash command naming the folder already is: a first map starts here when the app has
     // none. `None` means a map appeared since the check above.
     let plan = automap::bash_first_contact(&root)?;
@@ -185,7 +229,8 @@ fn hint_for(search: &CodeSearch, cwd: &Path) -> Option<String> {
     let failing = plan != MapPlan::Build
         && base_ast.join(".last-error").is_file()
         && !base_ast.join(".building").is_file();
-    render_unmapped(&root, plan, failing)
+    let text = render_unmapped(&root, plan, failing)?;
+    Some(Said::Unmapped { root, text })
 }
 
 /// The folder a map belongs to: the parent of `.base-ast/` (or of a legacy `.base/`).
@@ -1304,9 +1349,13 @@ fn classify(spec: Spec, base: &Path, home: Option<&Path>) -> Option<CodeSearch> 
         return None;
     }
     let names_code = code_filter || !code_folders.is_empty();
-    let mut all = code_folders;
-    for f in folders {
-        push_unique(&mut all, f);
+    // A folder named bare is a code search there only through a code filter; otherwise the hint checks it for
+    // source files before it counts.
+    let mut all: Vec<Searched> = code_folders.into_iter().map(|folder| Searched { folder, holds_code: true }).collect();
+    for folder in folders {
+        if !all.iter().any(|s| s.folder == folder) {
+            all.push(Searched { folder, holds_code: code_filter });
+        }
     }
     let name = spec.patterns.iter().filter_map(|p| query_name(p)).fold(None::<String>, |best, t| match best {
         Some(b) if b.len() >= t.len() => Some(b),

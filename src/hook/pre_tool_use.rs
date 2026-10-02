@@ -38,15 +38,6 @@ pub fn handle(
         output.push('\n');
     }
 
-    // ─── AST hint (F20) ──────────────────────────────────────
-    // A code search through Bash, PowerShell or context-mode is pointed at the code map that covers the folder it
-    // searches; nothing else is. The rules are in `ast_hint`.
-    if let Some(hint) = crate::hook::ast_hint::hint(event, cwd) {
-        output.push_str(&hint);
-        output.push('\n');
-        data.grep_intercepted = true;
-    }
-
     // ─── Bash first contact ──────────────────────────────────
     // A session booted in a workspace navigates with the shell: `cd app &&
     // cat src/x` names paths the tool_input never does. Existing paths in
@@ -76,6 +67,19 @@ pub fn handle(
         .map(SessionState::load)
         .unwrap_or_default();
     let mut session_dirty = false;
+
+    // ─── AST hint (F20) ──────────────────────────────────────
+    // A code search through Bash, PowerShell or context-mode is pointed at the code map that covers the folder it
+    // searches; nothing else is. The rules are in `ast_hint`. After Bash first contact above, so a no-map hint reads
+    // the build that contact just started.
+    let hint = crate::hook::ast_hint::hint(event, cwd, &mut session);
+    if let Some(text) = hint.text {
+        output.push_str(&text);
+        output.push('\n');
+        data.grep_intercepted = true;
+    }
+    session_dirty |= hint.marked;
+
     let domains = domain::load_domains(cwd);
     // Sync BEFORE the single graph load so the store sees fresh rules. Marker-gated,
     // a no-op when fresh; it ran only for a matched domain until F29, and the match

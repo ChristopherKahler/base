@@ -91,7 +91,15 @@ fn write_standards(s: &Seed, extra: &str) {
 fn ast_hint_only_on_code_search() {
     let (s, apps) = world("only-code");
     let home = sh(&s.home);
-    let none: [(&Path, String); 12] = [
+    // The global tier carries a code map, as on the machine measured (it holds scripts), so the handoffs row below
+    // is decided by what the folder holds, not by the absence of a map.
+    let gbl_map = s.home.join(".base-gbl").join(".base-ast");
+    std::fs::create_dir_all(&gbl_map).unwrap();
+    std::fs::write(gbl_map.join("ast.ttl"), "# stub\n").unwrap();
+    let none: [(&Path, String); 14] = [
+        // A folder of docs inside an app with a map is a docs search (F20b), and so is a docs folder of a mapped tier.
+        (&apps.mapped, r#"grep -rn "select" docs/"#.into()),
+        (&apps.mapped, format!(r#"grep -rln -i "DUE NOW" {home}/.base-gbl/handoffs"#)),
         (&apps.mapped, "base fork --help".into()),
         (&s.ws, format!("ls -1t {home}/.base-gbl/handoffs/*.md | head -8")),
         (&s.ws, format!("grep -rn -l '\\[budget\\]' {home}/.base-gbl/*.toml")),
@@ -173,6 +181,16 @@ fn ast_hint_without_a_map_says_what_is_true() {
     assert!(!out.contains("nothing to run"), "the old claim:\n{out}");
     let out = bash(&s, &apps.cached, r#"grep -rn "fn main" src/*.rs"#);
     assert!(out.contains("never maps it automatically (a cache directory)") && out.contains("base sync --ast --target"), "{out}");
+    // Said once per session per app: the same search again in the same session hears nothing; another session hears
+    // it. (Run from the workspace, where the session's record is kept.)
+    let again = format!(r#"grep -rn "fn main" {}/src/main.rs"#, sh(&apps.cached));
+    let input = || serde_json::json!({ "command": again });
+    let first = context(&s, &s.ws, "Bash", input(), "bo07-once");
+    assert!(first.contains("No code map covers"), "first time in the session:\n{first}");
+    let second = context(&s, &s.ws, "Bash", input(), "bo07-once");
+    assert!(!second.contains("<ast-hint>"), "the same session is not told twice:\n{second}");
+    let other = context(&s, &s.ws, "Bash", input(), "bo07-other");
+    assert!(other.contains("No code map covers"), "another session is told:\n{other}");
     let out = bash(&s, &apps.plain, r#"grep -rn "fn main" src/"#);
     assert!(!out.contains("<ast-hint>"), "a folder with no map and no source file named:\n{out}");
     let out = bash(&s, &s.ws, &format!("grep -n fn {}/x.rs", sh(&apps.loose)));
