@@ -282,6 +282,10 @@ fn run_event(
             // line, and the session records as shown only what was printed (D15).
             let mut sink = user_prompt_submit::PromptSink::default();
             let handled = user_prompt_submit::collect(&config, &cwd, stdin_json, &mut sink);
+            // Each relay block's side effects (messages marked seen, a reply deleted once announced, a ping
+            // recorded as delivered, the wake nudge throttled) are held back with the block's id and run only if
+            // that block is printed. A dropped relay block stays pending and arrives, whole, at the next tool call.
+            let mut relay_commits: Vec<(&'static str, Vec<crate::relay::Commit>)> = Vec::new();
             // Both relay blocks stay gated on the handler succeeding, exactly as the `?` used to
             // gate them: on an error neither used to run, and this is not the change that alters it.
             if handled.is_ok() {
@@ -290,29 +294,44 @@ fn run_event(
                 // early returns can't swallow a pending delivery. Silent when
                 // unregistered — the session-start notice already ran.
                 use crate::emit::prompt::{Priority, PromptBlock};
-                if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), false, false) {
+                if let Some((block, commits)) =
+                    crate::relay::deliver::deliver_deferred(&cwd, session_id.as_deref(), false, false)
+                {
                     let messages = block.matches("[RELAY] ").count();
                     sink.blocks.push(PromptBlock::new("relay-inbox", Priority::Relay, &block, messages, "message"));
+                    relay_commits.push(("relay-inbox", commits));
                 }
                 // Session-targeted task relay: refresh liveness + deliver assigned tasks, then the wake
                 // contract as a block of its own, last in priority 3: at 3.4 KB it is the block most likely
                 // not to fit, and it must never take the pings above it down with it.
                 if let Some(sid) = session_id.as_deref() {
-                    let (tasks, wake) =
-                        relay_task_parts(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Prompt, true);
-                    if let Some(block) = tasks {
+                    let (tasks, wake) = relay_task_parts_deferred(
+                        sid,
+                        &cwd,
+                        &config.relay,
+                        crate::relay::task_inbox::Phase::Prompt,
+                        true,
+                    );
+                    if let Some((block, commits)) = tasks {
                         let items = block.lines().filter(|l| l.starts_with("<relay-")).count();
                         sink.blocks.push(PromptBlock::new("relay-tasks", Priority::Relay, &block, items, "item"));
+                        relay_commits.push(("relay-tasks", commits));
                     }
-                    if let Some(block) = wake {
+                    if let Some((block, commits)) = wake {
                         let contracts = block.matches("=== RELAY WAKE CONTRACT").count();
                         sink.blocks.push(PromptBlock::new("relay-wake", Priority::Relay, &block, contracts, "wake contract"));
+                        relay_commits.push(("relay-wake", commits));
                     }
                 }
             }
             // Fitted to `[budget] prompt_bytes` under the key the operator actually wrote; then D15: what will be
-            // printed is recorded as shown, and nothing else, and the session is saved.
+            // printed is recorded as shown, and nothing else.
             let (fitted, committed) = sink.fit_and_commit(&config);
+            for (id, commits) in relay_commits {
+                if fitted.kept_blocks().any(|b| b.id == id) {
+                    crate::relay::run_commits(commits);
+                }
+            }
             // Keep what was measured, as session start does (rank 10). The untrimmed text and this session's
             // blocks are written BEFORE the print, so every pointer line names a block `base hooks show` can
             // already print. An empty emission leaves the previous full-output file alone.
@@ -398,27 +417,48 @@ fn relay_task_parts(
     phase: crate::relay::task_inbox::Phase,
     boundary: bool,
 ) -> (Option<String>, Option<String>) {
+    let (tasks, wake) = relay_task_parts_deferred(session_id, cwd, relay, phase, boundary);
+    let run = |part: Option<(String, Vec<crate::relay::Commit>)>| {
+        part.map(|(block, commits)| {
+            crate::relay::run_commits(commits);
+            block
+        })
+    };
+    (run(tasks), run(wake))
+}
+
+/// [`relay_task_parts`] with each half's inbox writes and nudge stamps held back as commits: the prompt hook runs a
+/// half's commits only if it prints that half (BO-01).
+type DeferredPart = Option<(String, Vec<crate::relay::Commit>)>;
+
+fn relay_task_parts_deferred(
+    session_id: &str,
+    cwd: &std::path::Path,
+    relay: &crate::config::RelayConfig,
+    phase: crate::relay::task_inbox::Phase,
+    boundary: bool,
+) -> (DeferredPart, DeferredPart) {
     if boundary {
         // `[relay] enabled = false` stops the auto-codename; a session that
         // registered itself still keeps its liveness fresh.
         let _ = crate::relay::session_registry::touch_with(session_id, cwd, relay.enabled);
     }
-    let delivered = crate::relay::task_inbox::deliver(session_id, phase);
+    let delivered = crate::relay::task_inbox::deliver_deferred(session_id, phase);
     // Star commands inside relayed pings resolve exactly like typed prompts
     // (Chris directive 2026-08-17, spoken pings from the hub): scan the
     // delivery block and append every matched command mode's rules.
-    let delivered = delivered.map(|block| {
+    let delivered = delivered.map(|(block, commits)| {
         let commands = crate::command::load_commands(cwd);
         let matched = crate::command::match_commands(&block, &commands);
         if matched.is_empty() {
-            block
+            (block, commits)
         } else {
             let extra: String = matched
                 .iter()
                 .map(|c| crate::command::format_command_output(c))
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!("{block}\n{extra}")
+            (format!("{block}\n{extra}"), commits)
         }
     });
     // Wake contract: any of this session's titles with a stale .watching
@@ -430,7 +470,7 @@ fn relay_task_parts(
         && relay.wake_nudge
         && !matches!(phase, crate::relay::task_inbox::Phase::Stop))
         .then(|| {
-            crate::relay::wake::arm_blocks_for(
+            crate::relay::wake::arm_blocks_for_deferred(
                 session_id,
                 matches!(phase, crate::relay::task_inbox::Phase::SessionStart),
             )

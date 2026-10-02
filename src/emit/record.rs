@@ -64,8 +64,9 @@ pub fn record_of(r: &Rendered, hook: &str, session_id: Option<&str>) -> serde_js
 /// F7 (BO-01). Until 2026-10-01 this row said how many bytes the cut withheld and `"withheld": []`, so what a prompt
 /// lost could not be named: 8,719 bytes of one real prompt are unknown for that reason. Every dropped block is now a
 /// row in the shape session start writes (`block`, `items`, `reason`) plus its `bytes`, and `withheld_bytes` is their
-/// sum. `over_budget` keeps its meaning for this hook, something was withheld, so doctor's counts read as before. No
-/// first-screen fields: this hook has no first screen, and a value would read as a measurement.
+/// sum. `over_budget` keeps its meaning for this hook, something was withheld, so doctor's counts read as before, and
+/// is also true for output still over the budget after every drop. No first-screen fields: this hook has no first
+/// screen, and a value would read as a measurement.
 pub fn record_of_prompt(f: &super::prompt::Fitted, hook: &str, session_id: Option<&str>) -> serde_json::Value {
     let withheld: Vec<serde_json::Value> = f
         .dropped_blocks()
@@ -85,7 +86,9 @@ pub fn record_of_prompt(f: &super::prompt::Fitted, hook: &str, session_id: Optio
         "emitted_bytes": f.emitted_bytes(),
         "budget_bytes": f.budget_bytes,
         "full_bytes": f.full_bytes(),
-        "over_budget": f.lost(),
+        // Something was withheld, or (only with a budget smaller than the header and the blocks too short to drop)
+        // the output is still over it: either way the host may not deliver all of it.
+        "over_budget": f.lost() || f.still_over_budget(),
         "withheld_bytes": f.withheld_bytes(),
         "withheld": withheld,
     })
@@ -100,10 +103,16 @@ pub fn keep(dir: &Path, record: &serde_json::Value) -> Result<(), String> {
 fn keep_capped(dir: &Path, record: &serde_json::Value, cap: u64) -> Result<(), String> {
     let path = dir.join(FILE);
     if std::fs::metadata(&path).is_ok_and(|m| m.len() >= cap) {
-        carry_windows(dir);
+        // The carry is read BEFORE the rename replaces PREVIOUS and written only AFTER the rename succeeded: a rename
+        // refused under an open handle leaves PREVIOUS in place, and carrying its rows anyway would count them twice.
+        let carried = carry_windows(dir);
         // A rename refused under an open handle loses nothing: the append below still happens, the file grows past
         // its cap, and a later record renames it.
-        let _ = crate::store::rename_with_retry(&path, &dir.join(PREVIOUS));
+        if crate::store::rename_with_retry(&path, &dir.join(PREVIOUS)).is_ok()
+            && let Some(body) = carried
+        {
+            let _ = super::write_full_output(&dir.join(CARRIED), &body);
+        }
     }
     let mut line = record.to_string();
     line.push('\n');
@@ -120,10 +129,10 @@ fn keep_capped(dir: &Path, record: &serde_json::Value, cap: u64) -> Result<(), S
 ///
 /// Doctor reads a window of runs PER HOOK, and one hook's rows must never rotate another's out of it. The prompt hook
 /// writes a row on every prompt and session start one per session, so two files of rows can hold no session start at
-/// all (named in BO-00's code review, from `8c8fe9b`; carried into BO-01). [`CARRIED`] is rewritten through a temp
-/// file and a rename, and only at a rotation, so the append path stays one write. It holds at most [`WINDOW`] rows per
-/// hook.
-fn carry_windows(dir: &Path) {
+/// all (named in BO-00's code review, from `8c8fe9b`; carried into BO-01). Returns the new [`CARRIED`] body, which the
+/// caller writes through a temp file and a rename, only at a rotation, so the append path stays one write. It holds at
+/// most [`WINDOW`] rows per hook. `None` when there is nothing to carry.
+fn carry_windows(dir: &Path) -> Option<String> {
     let mut rows: Vec<String> = Vec::new();
     for name in [CARRIED, PREVIOUS] {
         if let Ok(bytes) = std::fs::read(dir.join(name)) {
@@ -155,9 +164,7 @@ fn carry_windows(dir: &Path) {
         .filter(|(_, c)| **c)
         .map(|(l, _)| format!("{l}\n"))
         .collect();
-    if !body.is_empty() {
-        let _ = super::write_full_output(&dir.join(CARRIED), &body);
-    }
+    (!body.is_empty()).then_some(body)
 }
 
 /// A withheld row read back: block, items, reason.
@@ -304,6 +311,7 @@ pub fn read(tier: &str, dir: &Path, window: usize) -> TierSizes {
     let mut present = false;
     let (mut unreadable_lines, mut unreadable_files) = (0usize, 0usize);
     let mut runs: Vec<(String, Run)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for name in [CARRIED, PREVIOUS, FILE] {
         let bytes = match std::fs::read(dir.join(name)) {
             Ok(bytes) => bytes,
@@ -316,7 +324,9 @@ pub fn read(tier: &str, dir: &Path, window: usize) -> TierSizes {
         };
         present = true;
         for line in String::from_utf8_lossy(&bytes).lines() {
-            if line.trim().is_empty() {
+            // A row carried into CARRIED is never also in PREVIOUS or FILE, since the carry is written only after a
+            // successful rotation; skipping an exact repeat keeps two concurrent rotations from counting one twice.
+            if line.trim().is_empty() || !seen.insert(line.to_string()) {
                 continue;
             }
             match parse(line) {
@@ -474,6 +484,24 @@ mod tests {
         let (_, run) = parse(&record_of_prompt(&f, "user-prompt-submit", None).to_string()).unwrap();
         assert_eq!((run.withheld_bytes, run.dropped.len()), (0, 0));
         assert!(!run.over_budget);
+        // A budget smaller than the header, which is always kept: nothing withheld, still over. The row says so, rather
+        // than reading as within budget (code review, 2026-10-01).
+        let f = fit("<context-bracket>[FRESH] (prompt 1)</context-bracket>", PromptBlocks::new(), 30, "prompt_bytes");
+        assert!(!f.lost() && f.still_over_budget(), "control: over with nothing dropped");
+        let (_, run) = parse(&record_of_prompt(&f, "user-prompt-submit", None).to_string()).unwrap();
+        assert!(run.over_budget, "still over budget is recorded as over budget");
+    }
+
+    /// A row carried into CARRIED that is also still in PREVIOUS (a carry written by one rotation while another's
+    /// rename failed) is read once, never counted twice (code review, 2026-10-01).
+    #[test]
+    fn a_row_in_two_files_is_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = line("session-start", 7, &[]);
+        keep(dir.path(), &row).unwrap();
+        std::fs::write(dir.path().join(CARRIED), format!("{row}\n")).unwrap();
+        let t = read("workspace", dir.path(), WINDOW);
+        assert_eq!(t.event("session-start").map(|e| e.runs), Some(1));
     }
 
     /// One hook's rows never rotate another's out of doctor's window (BO-00 review, carried into BO-01): 25 session

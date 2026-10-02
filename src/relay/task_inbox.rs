@@ -171,6 +171,16 @@ pub fn enqueue(ns: &NamespaceConfig, task: &InboxTask) -> Result<PathBuf> {
 /// task state (marks delivered, stamps alert timestamps) as a side effect so
 /// the loud alert fires once per session and terse reminders stay throttled.
 pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
+    let (block, commits) = deliver_deferred(session_id, phase)?;
+    super::run_commits(commits);
+    Some(block)
+}
+
+/// [`deliver`] with the inbox NOT yet changed: recording a task or ping as delivered, stamping its alert time and
+/// deleting an announced reply or notify come back as commits, for the prompt hook to run only if it prints the
+/// block (BO-01). Until they run, the inbox reads as it did, so a dropped block is announced again, loud, at the next
+/// tool call or prompt.
+pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<(String, Vec<super::Commit>)> {
     // Which titles does this session hold? A never-registered session can't be
     // a relay target, so it does zero filesystem work beyond the registry read.
     let titles = super::session_registry::titles_for(session_id);
@@ -191,6 +201,12 @@ pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
     let mut loud_blocks: Vec<String> = Vec::new();
     let mut terse_slugs: Vec<String> = Vec::new();
     let mut terse_pings: Vec<String> = Vec::new();
+    let mut commits: Vec<super::Commit> = Vec::new();
+    let write = |path: PathBuf, task: InboxTask| -> super::Commit {
+        Box::new(move || {
+            let _ = write_json_atomic(&path, &task);
+        })
+    };
 
     for (path, mut task) in tasks {
         if task.status == "done" || ping_is_stale(&task) {
@@ -215,7 +231,9 @@ pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
                 } else {
                     render_notify(&task)
                 });
-                let _ = std::fs::remove_file(&path);
+                commits.push(Box::new(move || {
+                    let _ = std::fs::remove_file(&path);
+                }));
             }
             continue;
         }
@@ -229,7 +247,7 @@ pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
             task.status = "delivered".into();
             task.last_loud_session = session_id.to_string();
             task.last_alert_ts = now.clone();
-            let _ = write_json_atomic(&path, &task);
+            commits.push(write(path, task));
         } else if terse_due(&task.last_alert_ts, throttle_for(&task)) {
             if task.kind == "ping" {
                 let from = if task.from.is_empty() { "?".to_string() } else { task.from.clone() };
@@ -238,7 +256,7 @@ pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
                 terse_slugs.push(task.slug.clone());
             }
             task.last_alert_ts = now.clone();
-            let _ = write_json_atomic(&path, &task);
+            commits.push(write(path, task));
         }
     }
 
@@ -264,7 +282,7 @@ pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
             terse_slugs.join(", ")
         ));
     }
-    Some(out)
+    Some((out, commits))
 }
 
 fn throttle_for(task: &InboxTask) -> i64 {

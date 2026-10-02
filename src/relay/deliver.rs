@@ -37,6 +37,20 @@ pub fn deliver(
     notice_when_unregistered: bool,
     mid_turn: bool,
 ) -> Option<String> {
+    let (block, commits) = deliver_deferred(cwd, session_id, notice_when_unregistered, mid_turn)?;
+    super::run_commits(commits);
+    Some(block)
+}
+
+/// [`deliver`] with the messages NOT yet marked seen: the marks come back as commits, for the prompt hook to run only
+/// if it prints the block (BO-01). The liveness heartbeat is not held back; it says the session is alive, not that it
+/// read anything.
+pub fn deliver_deferred(
+    cwd: &Path,
+    session_id: Option<&str>,
+    notice_when_unregistered: bool,
+    mid_turn: bool,
+) -> Option<(String, Vec<super::Commit>)> {
     let root = relay_root(cwd)?;
     let projects = list_projects(&root);
     if projects.is_empty() {
@@ -44,6 +58,7 @@ pub fn deliver(
     }
 
     let mut out = String::new();
+    let mut commits: Vec<super::Commit> = Vec::new();
     let mut unregistered: Vec<(String, usize, usize)> = Vec::new();
 
     for p in &projects {
@@ -87,7 +102,9 @@ pub fn deliver(
                     );
                 }
                 out.push_str("</relay>\n");
-                let _ = store.mark_seen(&title, &ids);
+                commits.push(Box::new(move || {
+                    let _ = store.mark_seen(&title, &ids);
+                }));
             }
             None => {
                 let reg = store.load_registry();
@@ -105,7 +122,7 @@ pub fn deliver(
         ));
     }
 
-    (!out.is_empty()).then_some(out)
+    (!out.is_empty()).then_some((out, commits))
 }
 
 #[cfg(test)]

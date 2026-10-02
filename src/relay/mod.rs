@@ -101,6 +101,23 @@ pub struct Claims {
     pub claims: BTreeMap<String, Claim>,
 }
 
+/// A relay side effect held back until the text announcing it is printed: marking a message seen, deleting a reply
+/// once announced, recording a ping as delivered, stamping a wake-nudge throttle.
+///
+/// BO-01. The prompt hook fits its output to a byte budget AFTER the relay blocks are built, and may drop one whole.
+/// Delivery used to consume as it rendered, so a dropped block's messages were marked seen, its replies deleted and
+/// its wake nudge throttled, and the reader never saw them. The prompt hook now runs these only for the blocks it
+/// printed; a dropped block stays pending and arrives at the next tool call or prompt. Every other caller runs them
+/// at once, as before.
+pub type Commit = Box<dyn FnOnce()>;
+
+/// Run held-back relay side effects.
+pub fn run_commits(commits: Vec<Commit>) {
+    for commit in commits {
+        commit();
+    }
+}
+
 // ─── Store handle ────────────────────────────────────────────
 
 pub struct RelayStore {

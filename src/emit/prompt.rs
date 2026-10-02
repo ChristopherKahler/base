@@ -282,7 +282,8 @@ impl Fitted {
 ///    what it fixes is an oversized block (the 3.4 KB wake contract) taking every block below it
 ///    down with it.
 /// 4. Only when the pointer lines themselves do not fit do they become one line, and the blocks
-///    still kept are dropped from the bottom until that fits.
+///    still kept are dropped from the bottom until that fits; then step 3 runs again, since the one
+///    line is far shorter than the pointer lines it replaced.
 pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -> Fitted {
     let header = header.trim_matches(['\r', '\n']);
     let mut blocks = blocks.blocks;
@@ -306,6 +307,22 @@ pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -
         )
     };
 
+    // Put back, highest priority first, every dropped block that fits the room left. Nothing kept is dropped for it.
+    let readmit = |kept: &mut Vec<bool>, text: &mut String, render: &dyn Fn(&[bool]) -> String| {
+        for i in 0..n {
+            if kept[i] {
+                continue;
+            }
+            kept[i] = true;
+            let trial = render(kept);
+            if trial.len() <= budget_bytes {
+                *text = trial;
+            } else {
+                kept[i] = false;
+            }
+        }
+    };
+
     let full_text = render(&kept);
     let mut text = full_text.clone();
     if text.len() > budget_bytes {
@@ -320,18 +337,7 @@ pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -
             text = render(&kept);
         }
         if text.len() <= budget_bytes {
-            for i in 0..n {
-                if kept[i] {
-                    continue;
-                }
-                kept[i] = true;
-                let trial = render(&kept);
-                if trial.len() <= budget_bytes {
-                    text = trial;
-                } else {
-                    kept[i] = false;
-                }
-            }
+            readmit(&mut kept, &mut text, &render);
         } else {
             text = render_aggregate(&kept);
             for i in (0..n).rev() {
@@ -342,6 +348,10 @@ pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -
                     kept[i] = false;
                     text = render_aggregate(&kept);
                 }
+            }
+            // The one line is far shorter than the pointer lines it replaced, so blocks may fit again.
+            if text.len() <= budget_bytes {
+                readmit(&mut kept, &mut text, &render_aggregate);
             }
         }
     }
@@ -391,7 +401,11 @@ pub fn write_blocks(base: &Path, session_id: &str, fitted: &Fitted) -> FullOutpu
         return FullOutput::not_written(format!("session id {session_id:?} is not a file name"));
     }
     let root = base.join(SESSION_DIR);
-    prune(&root);
+    // Old sessions are swept when a NEW session writes its first file, not on every prompt: the hook's hot path pays
+    // one existence check, and the sweep runs about once per session.
+    if !root.join(session_id).join(BLOCKS_FILE).exists() {
+        prune(&root);
+    }
     let file = BlocksFile {
         written_at: crate::crud::now_iso(),
         session_id: session_id.to_string(),
@@ -715,6 +729,18 @@ mod tests {
         for b in f.kept_blocks() {
             assert!(f.text.contains(&b.text), "{} is printed whole", b.id);
         }
+    }
+
+    /// Code review (2026-10-01): the one-line mode used to stop there, although its line is far shorter than the
+    /// pointer lines it replaced. The matched block it freed room for comes back.
+    #[test]
+    fn the_one_line_mode_puts_back_what_fits() {
+        let mut list = vec![block("hooks-rules", Priority::Matched, 400)];
+        list.extend((0..12).map(|i| block(&format!("walk-name-{i}"), Priority::Context, 300)));
+        let f = fit(HEADER, blocks(list), 1000, KEY);
+        assert!(f.text.len() <= 1000, "{} bytes:\n{}", f.text.len(), f.text);
+        assert_eq!(f.text.lines().filter(|l| l.starts_with("[base: withheld")).count(), 1, "one line:\n{}", f.text);
+        assert_eq!(kept_ids(&f).first(), Some(&"hooks-rules"), "the matched block was put back:\n{}", f.text);
     }
 
     #[test]

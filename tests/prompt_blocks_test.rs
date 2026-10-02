@@ -70,6 +70,25 @@ fn fixture(tag: &str, budget: usize, rules: usize, extra: &str) -> seed::Seed {
     s
 }
 
+/// The header of a session's first prompt in the fixture (`fresh_until = 0`).
+const FIRST_HEADER: &str = "<context-bracket>[MODERATE] (prompt 1)</context-bracket>\n";
+
+/// The budget at which a prompt that builds `measured`'s blocks prints exactly this: every block `drop` names dropped,
+/// unless it is no longer than its own pointer line (the fit never drops those), and every other block printed. The
+/// pointer lines name the budget, so its digit count is part of the size: settle on a fixed point.
+fn budget_dropping(measured: &BlocksFile, drop: impl Fn(&Row) -> bool) -> usize {
+    let mut probe = measured.clone();
+    probe.budget_bytes = 1000;
+    for _ in 0..4 {
+        let b = probe.budget_bytes;
+        for (row, m) in probe.blocks.iter_mut().zip(&measured.blocks) {
+            row.printed = !(drop(m) && m.bytes > pointer(m, b).len());
+        }
+        probe.budget_bytes = rebuilt(FIRST_HEADER, &probe).len();
+    }
+    probe.budget_bytes
+}
+
 /// Rewrite `[budget] prompt_bytes` in the seed's global base.toml.
 fn set_budget(s: &seed::Seed, bytes: usize) {
     let path = s.home.join(".base-gbl").join("base.toml");
@@ -332,19 +351,7 @@ fn rule_marked_shown_only_when_emitted_whole() {
     for id in gone {
         assert!(measured.blocks.iter().any(|r| r.id == id), "control: the fixture builds {id}");
     }
-    let mut probe = BlocksFile {
-        budget_bytes: 1000,
-        blocks: measured
-            .blocks
-            .iter()
-            .map(|r| Row { printed: !gone.contains(&r.id.as_str()), ..r.clone() })
-            .collect(),
-    };
-    // The pointer lines name the budget, so its digit count is part of the size: settle on a fixed point.
-    for _ in 0..4 {
-        probe.budget_bytes = rebuilt("<context-bracket>[MODERATE] (prompt 1)</context-bracket>\n", &probe).len();
-    }
-    set_budget(&s, probe.budget_bytes);
+    set_budget(&s, budget_dropping(&measured, |r| gone.contains(&r.id.as_str())));
     let session = "d15-session";
     let one = run(&s, "fix the hook output", session);
     let file = blocks(&s, session);
@@ -363,4 +370,105 @@ fn rule_marked_shown_only_when_emitted_whole() {
     let three = run(&s, "and after that", session);
     assert!(!three.contains("Global rule one"), "printed rules were not recorded as shown:\n{three}");
     assert!(!three.contains("[BRACKET RULES"), "the printed bracket block was not recorded:\n{three}");
+}
+
+/// Code review (2026-10-01): relay delivery used to consume as it rendered, so a relay block the budget dropped was
+/// already marked delivered and its wake nudge throttled. Now a dropped relay block is not consumed: the ping is still
+/// pending on disk, and the next prompt announces it loud again, with the wake contract still due.
+#[test]
+fn a_dropped_relay_block_is_not_consumed() {
+    let s = fixture("relay-kept", 50_000, 6, "");
+    ping(&s, "relay-measure", "kite-measure");
+    let _ = run(&s, "fix the hook output", "relay-measure");
+    let measured = blocks(&s, "relay-measure");
+    for id in ["relay-tasks", "relay-wake"] {
+        assert!(measured.blocks.iter().any(|r| r.id == id), "control: the fixture builds {id}");
+    }
+    set_budget(&s, budget_dropping(&measured, |r| r.priority >= 3));
+
+    let session = "relay-session";
+    ping(&s, session, "kite-rel");
+    let one = run(&s, "fix the hook output", session);
+    let file = blocks(&s, session);
+    for id in ["relay-tasks", "relay-wake"] {
+        let row = file.blocks.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("control: {id} built"));
+        assert!(!row.printed, "control: prompt 1 dropped {id}:\n{one}");
+    }
+    let inbox = s.home.join(".base-gbl").join(".base").join("relay-inbox").join("kite-rel");
+    let pings: Vec<String> = std::fs::read_dir(&inbox)
+        .unwrap_or_else(|e| panic!("{}: {e}", inbox.display()))
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("ping-"))
+        .map(|e| std::fs::read_to_string(e.path()).expect("ping file"))
+        .collect();
+    assert_eq!(pings.len(), 1, "control: one ping in the inbox");
+    let status = serde_json::from_str::<serde_json::Value>(&pings[0]).expect("ping JSON")["status"].clone();
+    assert_eq!(status, "pending", "a dropped ping was recorded as delivered:\n{}", pings[0]);
+
+    let two = run(&s, "what is next on the list", session);
+    assert!(two.contains("INSTANT PING"), "the dropped ping was not announced again, loud:\n{two}");
+    assert!(
+        blocks(&s, session).blocks.iter().any(|r| r.id == "relay-wake"),
+        "the dropped wake contract was throttled as though it had been read"
+    );
+}
+
+/// Code review (2026-10-01): a domain's steering lines and its CONTEXT were one hash, recorded only when both printed.
+/// A context the budget keeps dropping then re-sent the role line on every prompt. Now each part is recorded when its
+/// own block prints: the role line goes once, and the dropped context stays due.
+#[test]
+fn a_dropped_context_stays_due_and_printed_steering_does_not_repeat() {
+    let s = fixture("context-due", 50_000, 2, "[relay]\nwake_nudge = false\n");
+    let domains = std::fs::read_to_string(s.ws.join(".base").join("domains.toml")).unwrap().replace(
+        "name = \"hooks\"\n",
+        "name = \"hooks\"\nrole = \"You are reviewing hook output, block by block.\"\n",
+    );
+    std::fs::write(s.ws.join(".base").join("domains.toml"), domains).unwrap();
+    for i in 0..6 {
+        let text = format!("Decision {i}: the context block is long enough here that it competes for the budget");
+        let (code, _, err) = run_base(&s, &["decision", "log", "--domain", "hooks", "--decision", &text, "--rationale", "test"]);
+        assert_eq!(code, 0, "{err}");
+    }
+    let _ = run(&s, "fix the hook output", "context-measure");
+    let measured = blocks(&s, "context-measure");
+    assert!(measured.blocks.iter().any(|r| r.id == "hooks-context"), "control: the fixture builds hooks-context");
+    set_budget(&s, budget_dropping(&measured, |r| r.priority >= 2));
+
+    let session = "context-session";
+    let one = run(&s, "fix the hook output", session);
+    let file = blocks(&s, session);
+    let rules = file.blocks.iter().find(|r| r.id == "hooks-rules").expect("control: hooks-rules built");
+    assert!(rules.printed && rules.text.contains("You are reviewing hook output"), "control: the role printed:\n{one}");
+    assert!(file.blocks.iter().any(|r| r.id == "hooks-context" && !r.printed), "control: the context was dropped:\n{one}");
+
+    let two = run(&s, "fix the hook output again", session);
+    let file = blocks(&s, session);
+    assert!(!two.contains("You are reviewing hook output"), "the printed role line was sent again:\n{two}");
+    assert!(file.blocks.iter().any(|r| r.id == "hooks-context"), "the dropped context is no longer due:\n{two}");
+}
+
+/// Code review (2026-10-01): a command mode linked by two domains went into the first domain's block only. With the
+/// always-on domain first (priority 4) and the keyword domain kept (priority 1), dropping the first lost the mode. It
+/// is one block now, at the better of the two priorities, and once per session.
+#[test]
+fn a_command_linked_by_two_domains_is_one_block_at_the_better_priority() {
+    let s = fixture("linked", 50_000, 0, "[relay]\nwake_nudge = false\n");
+    let domains = std::fs::read_to_string(s.ws.join(".base").join("domains.toml"))
+        .unwrap()
+        .replace("mode = \"always\"\n", "mode = \"always\"\ncommands = [\"audit\"]\n")
+        .replace("prompt_keywords = [\"hook\", \"hooks\"]\n", "prompt_keywords = [\"hook\", \"hooks\"]\ncommands = [\"audit\"]\n");
+    std::fs::write(s.ws.join(".base").join("domains.toml"), domains).unwrap();
+    let session = "linked-session";
+    let one = run(&s, "fix the hook output", session);
+    let file = blocks(&s, session);
+    let modes: Vec<&Row> = file.blocks.iter().filter(|r| r.id.starts_with("command-audit")).collect();
+    assert_eq!(modes.len(), 1, "one block for the mode:\n{one}");
+    assert_eq!(modes[0].priority, 1, "at the keyword domain's priority, not the always-on one's");
+    assert!(
+        file.blocks.iter().filter(|r| !r.id.starts_with("command-")).all(|r| !r.text.contains("[*AUDIT ACTIVATED]")),
+        "the mode is also inside a domain block"
+    );
+    assert_eq!(one.matches("[*AUDIT ACTIVATED]").count(), 1);
+    let two = run(&s, "fix the hook output again", session);
+    assert!(!two.contains("[*AUDIT ACTIVATED]"), "a printed mode is sent once per session:\n{two}");
 }

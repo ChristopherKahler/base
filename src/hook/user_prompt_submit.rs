@@ -29,9 +29,8 @@ pub struct PromptSink {
     pending: Option<Pending>,
 }
 
-/// The session state `handle` changed, held until the output is fitted.
+/// Where the session lives and the tier it was served at, held until the output is fitted.
 struct Pending {
-    session: SessionState,
     base_dir: PathBuf,
     tier: Bracket,
 }
@@ -44,52 +43,48 @@ pub struct Committed {
 }
 
 impl PromptSink {
+    /// Save what `collect` changed (the prompt count, the tier, a force-refresh) NOW, as every return site did before
+    /// BO-01, and keep where it lives for `commit`. The records of what was shown are not in it: they wait for the
+    /// fit. Saving here and reloading in `commit` keeps the window between a load and a save of the shared `.session`
+    /// file as short as it was, rather than holding the state across the relay delivery in between.
     fn hold(&mut self, session: SessionState, base_dir: Option<PathBuf>, tier: Bracket) {
         if let Some(base_dir) = base_dir {
-            self.pending = Some(Pending { session, base_dir, tier });
+            let _ = session.save(&base_dir);
+            self.pending = Some(Pending { base_dir, tier });
         }
     }
 
-    /// Record in the session what `fitted` printed, and save it (D15). A dropped block's rules stay due. A
-    /// domain's block hash is recorded only when every block carrying it was printed, so a domain whose rules
-    /// arrived and whose context was dropped serves its context again.
+    /// Record in the session what `fitted` printed, and save it (D15): the session is reloaded, the claims of the
+    /// printed blocks are applied, and it is saved. A dropped block's rules, context, walk names and bracket block stay
+    /// due. Each claim sits on exactly one block, so nothing printed is recorded on another block's account.
     pub fn commit(&mut self, fitted: &Fitted) -> Committed {
         let mut done = Committed::default();
-        let vetoed: HashSet<(&str, u64)> = fitted
-            .dropped_blocks()
-            .flat_map(|b| b.claims.iter())
-            .filter_map(|c| match c {
-                Claim::Injected { key, hash } => Some((key.as_str(), *hash)),
-                _ => None,
-            })
-            .collect();
-        let mut pending = self.pending.take();
+        let pending = self.pending.take();
+        let mut session = pending.as_ref().map(|p| SessionState::load(&p.base_dir));
         let now = SessionState::now_secs();
         for claim in fitted.kept_blocks().flat_map(|b| b.claims.iter()) {
             match claim {
                 Claim::Rule { id, content, scope } => {
                     done.rules += 1;
-                    if let Some(p) = pending.as_mut() {
-                        p.session.mark_rule_shown(id, *content, p.tier, scope.as_deref(), now);
+                    if let (Some(s), Some(p)) = (session.as_mut(), pending.as_ref()) {
+                        s.mark_rule_shown(id, *content, p.tier, scope.as_deref(), now);
                     }
                 }
                 Claim::Injected { key, hash } => {
-                    if let Some(p) = pending.as_mut()
-                        && !vetoed.contains(&(key.as_str(), *hash))
-                    {
-                        p.session.mark_injected(key, *hash);
+                    if let Some(s) = session.as_mut() {
+                        s.mark_injected(key, *hash);
                     }
                 }
                 Claim::BracketBlock => {
                     done.bracket_block = true;
-                    if let Some(p) = pending.as_mut() {
-                        p.session.mark_bracket_block(p.tier);
+                    if let (Some(s), Some(p)) = (session.as_mut(), pending.as_ref()) {
+                        s.mark_bracket_block(p.tier);
                     }
                 }
             }
         }
-        if let Some(p) = pending {
-            let _ = p.session.save(&p.base_dir);
+        if let (Some(s), Some(p)) = (session, pending) {
+            let _ = s.save(&p.base_dir);
         }
         done
     }
@@ -378,10 +373,11 @@ pub fn collect(
     // Track injection metadata for DEVMODE
     let mut loaded_domains: Vec<(String, String, usize)> = Vec::new(); // (name, match_reason, rule_count)
     let mut deduped_count = 0usize;
-    // Steering layer (v0.4): dedup domain-linked command injection across domains,
-    // and remember whether any fresh content was injected (gates the grounding block).
-    let mut injected_commands: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Remember whether any fresh content was injected (gates the grounding block).
     let mut injected_any = matcher_served;
+    // Domain-linked command modes (Phase 28), one entry per command: the best priority among the domains that link
+    // it, its rendered rules, and how many. Each becomes a block of its own after the loop (BO-01).
+    let mut linked: Vec<(String, Priority, String, usize)> = Vec::new();
     // Every record IRI the domain blocks serve this prompt. The walk below dedups
     // against it, so a record cannot arrive twice under two headings.
     let mut domain_served: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -390,6 +386,7 @@ pub fn collect(
     // Format and emit matched rules
     for dm in &matched {
         let domain_def = dm.domain;
+        let (rules_priority, context_priority) = domain_priorities(&dm.reason);
 
         // The rules and the neighbourhood are read separately now, because they are
         // deduped differently: the rules per RULE (F9), the neighbourhood as a block.
@@ -427,24 +424,23 @@ pub fn collect(
         // Role (Phase 29): first line of the domain block.
         let role_line = domain_def.role.as_deref().map(str::trim).filter(|r| !r.is_empty());
 
-        // Domain-linked command rules (Phase 28): inject each linked mode's rules
-        // once. Explicit *commands short-circuit before domain matching, so this
-        // path only fires when no explicit star was typed — no cross-dedup needed.
-        let mut command_block = String::new();
+        // Domain-linked command rules (Phase 28). Explicit *commands short-circuit
+        // before domain matching, so this path only fires when no explicit star was
+        // typed. BO-01: a linked mode is no longer folded into the first domain's
+        // block. Two domains of different priorities can link one mode, and the
+        // budget can drop the one that carried it while keeping the other, so the
+        // mode is one block, at the better of the two priorities.
         if command_activation_fires(&domain_def.command_activation, &dm.reason) {
             for cmd_name in &domain_def.commands {
-                let key = cmd_name.to_lowercase();
-                if injected_commands.contains(&key) {
-                    continue;
-                }
                 if let Some(cmd) = commands.iter().find(|c| c.name.eq_ignore_ascii_case(cmd_name)) {
                     let rendered = crate::command::format_command_output(cmd);
-                    if !rendered.is_empty() {
-                        if !command_block.is_empty() {
-                            command_block.push('\n');
-                        }
-                        command_block.push_str(&rendered);
-                        injected_commands.insert(key);
+                    if rendered.is_empty() {
+                        continue;
+                    }
+                    let key = cmd.name.to_lowercase();
+                    match linked.iter_mut().find(|(k, ..)| *k == key) {
+                        Some(entry) => entry.1 = entry.1.min(rules_priority),
+                        None => linked.push((key, rules_priority, rendered, cmd.rules.len())),
                     }
                 }
             }
@@ -453,41 +449,6 @@ pub fn collect(
         // Output mode (Phase 31) + format directive (Phase 32).
         let output_mode_line = output_mode_directive(domain_def.output_mode.as_deref());
         let format_line = domain_def.format.as_deref().map(str::trim).filter(|f| !f.is_empty());
-
-        // Skip only when the domain contributes nothing — rules, neighborhood, a
-        // query, or any steering directive all count as content.
-        if rules_text.is_empty()
-            && neighborhood_text.is_empty()
-            && domain_def.query.is_none()
-            && role_line.is_none()
-            && command_block.is_empty()
-            && output_mode_line.is_none()
-            && format_line.is_none()
-        {
-            // A domain that HAS rules and had every one of them already served this
-            // session is not "contributes nothing". It is a dedup, and it has to be
-            // COUNTED as one.
-            //
-            // Since F9 dedups one rule at a time, a fully served domain arrives here
-            // with an empty `rules_text`, and a domain carrying nothing else used to
-            // `continue` before the dedup branch below ever ran. The injection was
-            // right and the report was not: the domain dropped out of
-            // `HookEventData::suppressed`, which feeds the JSONL log, and out of the
-            // devmode dedup list. A domain that silently vanishes from the count reads
-            // as a domain that never matched — a false clean bill in the telemetry.
-            // `graph_injection_test::dedup_skips_unchanged_graph_injection` caught it
-            // on the first full-suite run after F9 landed.
-            if !rules.is_empty() {
-                deduped_count += 1;
-                let dedup_reason = if config.devmode.enabled {
-                    format!("dedup [{}]", dm.reason)
-                } else {
-                    "dedup".into()
-                };
-                loaded_domains.push((domain_def.name.clone(), dedup_reason, 0));
-            }
-            continue;
-        }
 
         // Notes surface ONLY through explicit queries — no bulk dumps.
         // If a domain needs notes injected, configure `query = "..."` in domains.toml
@@ -500,64 +461,50 @@ pub fn collect(
             _ => String::new(),
         };
 
-        // The steering order the hash has always been computed over:
-        // role → command rules → rules → neighborhood → query → output-mode → format.
-        let mut sections: Vec<&str> = Vec::new();
-        if let Some(r) = role_line {
-            sections.push(r);
-        }
-        if !command_block.is_empty() {
-            sections.push(&command_block);
-        }
-        if !rules_text.is_empty() {
-            sections.push(&rules_text);
-        }
-        if !neighborhood_text.is_empty() {
-            sections.push(&neighborhood_text);
-        }
-        if !query_text.is_empty() {
-            sections.push(&query_text);
-        }
-        if let Some(om) = output_mode_line {
-            sections.push(om);
-        }
-        if let Some(f) = format_line {
-            sections.push(f);
-        }
-        let domain_output = sections.join("\n");
-
-        // The rules have already been deduped one at a time above. What is hashed
-        // here is everything ELSE the block carries — the neighbourhood, the query,
-        // the steering lines — which is still a block and still deduped as one.
+        // TWO PARTS, DEDUPED AND RANKED APART (BO-01). The rules were deduped one at
+        // a time above. The steering lines and the CONTEXT were one block hash until
+        // BO-01, and they are two now, each recorded only when its own block is
+        // printed: a context the budget keeps dropping stays due, and the steering
+        // lines that did print are not sent again with it on every prompt.
         //
         // Hash over SORTED lines: SPARQL result order shifts when the graph file is
         // rewritten (post-tool-use fires on every edit), and an order-sensitive hash
         // would re-inject unchanged content every prompt.
-        let combined_hash = {
-            let mut lines: Vec<String> = domain_output
-                .lines()
-                .filter(|l| !rules_text.contains(*l))
-                .map(String::from)
-                .collect();
+        let sorted_hash = |text: &str| {
+            let mut lines: Vec<String> = text.lines().map(String::from).collect();
             lines.sort();
             rules_hash(&lines)
         };
+        let steering: Vec<&str> = [role_line, output_mode_line, format_line].into_iter().flatten().collect();
+        let steering_hash = sorted_hash(&steering.join("\n"));
+        let steering_due = !steering.is_empty() && !session.is_injected(&domain_def.name, steering_hash);
+        let context_text: String = [neighborhood_text.as_str(), query_text.as_str()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let context_key = format!("context:{}", domain_def.name);
+        let context_hash = sorted_hash(&context_text);
+        let context_due = !context_text.is_empty() && !session.is_injected(&context_key, context_hash);
         let injected_rule_count = fresh.len();
 
-        // A fresh rule is served even when nothing else about the block changed. The
-        // block hash can only suppress the block when it carries no new rule.
-        if rules_text.is_empty() && session.is_injected(&domain_def.name, combined_hash) {
-            deduped_count += 1;
-            let dedup_reason = if config.devmode.enabled {
-                format!("dedup [{}]", dm.reason)
-            } else {
-                "dedup".into()
-            };
-            loaded_domains.push((
-                domain_def.name.clone(),
-                dedup_reason,
-                injected_rule_count,
-            ));
+        // Nothing due. A domain that HAS rules and had every one of them already served
+        // this session is not "contributes nothing": it is a dedup, and it has to be
+        // COUNTED as one, or it drops out of `HookEventData::suppressed` and the
+        // devmode dedup list and reads as a domain that never matched
+        // (`graph_injection_test::dedup_skips_unchanged_graph_injection`). A domain
+        // with nothing at all to say (no rules, a query that returned nothing) is
+        // neither injected nor a dedup, and no longer turns on the grounding block.
+        if rules_text.is_empty() && !steering_due && !context_due {
+            if !rules.is_empty() || !steering.is_empty() || !context_text.is_empty() {
+                deduped_count += 1;
+                let dedup_reason = if config.devmode.enabled {
+                    format!("dedup [{}]", dm.reason)
+                } else {
+                    "dedup".into()
+                };
+                loaded_domains.push((domain_def.name.clone(), dedup_reason, injected_rule_count));
+            }
             continue;
         }
 
@@ -578,32 +525,53 @@ pub fn collect(
             injected_rule_count,
         ));
 
-        // TWO BLOCKS, RANKED APART (F2): the rules with their steering lines, and the CONTEXT with the query. A
-        // domain matched to the prompt puts its rules at 1 and its context at 2; an always-on domain puts both at 4.
-        // The block hash is recorded only if every block carrying it is printed (see `PromptSink::commit`).
-        let (rules_priority, context_priority) = domain_priorities(&dm.reason);
+        // The rules block: the steering lines ride with fresh rules, as they always
+        // did, and alone when they changed. A domain matched to the prompt puts its
+        // rules at 1 and its context at 2; an always-on domain puts both at 4 (F2).
         let slug = crate::crud::slugify(&domain_def.name);
-        let rules_part: Vec<&str> = [role_line, Some(command_block.as_str()), Some(rules_text.as_str()), output_mode_line, format_line]
-            .into_iter()
-            .flatten()
-            .filter(|s| !s.is_empty())
-            .collect();
-        let context_part: Vec<&str> =
-            [neighborhood_text.as_str(), query_text.as_str()].into_iter().filter(|s| !s.is_empty()).collect();
-        let domain_claim = Claim::Injected { key: domain_def.name.clone(), hash: combined_hash };
-        sink.blocks.push(
+        let with_steering = steering_due || !rules_text.is_empty();
+        let rules_part: Vec<&str> = [
+            role_line.filter(|_| with_steering),
+            Some(rules_text.as_str()),
+            output_mode_line.filter(|_| with_steering),
+            format_line.filter(|_| with_steering),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
+        // Recorded whenever the rules block prints, steering lines or not: the domain's own key says it was served.
+        let steering_claim =
+            with_steering.then(|| Claim::Injected { key: domain_def.name.clone(), hash: steering_hash });
+        let rules_block =
             PromptBlock::new(format!("{slug}-rules"), rules_priority, &rules_part.join("\n"), fresh.len(), "rule")
                 .with_claims(fresh.iter().map(|(_, r)| Claim::Rule {
                     id: r.id.clone(),
                     content: r.content_hash,
                     scope: None,
                 }))
-                .with_claims([domain_claim.clone()]),
-        );
-        let context_text = context_part.join("\n");
+                .with_claims(steering_claim);
+        injected_any |= !rules_block.text.is_empty();
+        sink.blocks.push(rules_block);
+        if context_due {
+            sink.blocks.push(
+                PromptBlock::new(format!("{slug}-context"), context_priority, &context_text, count_records(&context_text), "record")
+                    .with_claims([Claim::Injected { key: context_key, hash: context_hash }]),
+            );
+            injected_any = true;
+        }
+    }
+
+    // The linked command modes, each once per session per text, recorded only if printed (D15).
+    for (key, priority, text, rules) in linked {
+        let claim_key = format!("command:{key}");
+        let hash = rules_hash(std::slice::from_ref(&text));
+        if session.is_injected(&claim_key, hash) {
+            continue;
+        }
         sink.blocks.push(
-            PromptBlock::new(format!("{slug}-context"), context_priority, &context_text, count_records(&context_text), "record")
-                .with_claims([domain_claim]),
+            PromptBlock::new(format!("command-{}", crate::crud::slugify(&key)), priority, &text, rules, "rule")
+                .with_claims([Claim::Injected { key: claim_key, hash }]),
         );
         injected_any = true;
     }
