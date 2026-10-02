@@ -28,9 +28,13 @@ pub fn is_notice(block: &str) -> bool {
 /// Collect and consume pending messages for the current session across all
 /// relay stores in this workspace. Returns the injection block, if any.
 pub fn deliver(cwd: &Path, session_id: Option<&str>, notice_when_unregistered: bool) -> Option<String> {
-    let (block, commits) = deliver_deferred(cwd, session_id, notice_when_unregistered)?;
-    super::run_commits(commits);
-    Some(block)
+    deliver_deferred(cwd, session_id, notice_when_unregistered).map(super::Part::commit)
+}
+
+/// [`deliver`] on a tool call, for a run with no inbox watcher ([`super::monitorless`]): new messages only, no join
+/// notice, and no liveness write (a locked registry write on every tool call would be pure contention).
+pub fn deliver_mid_turn(cwd: &Path, session_id: Option<&str>) -> Option<String> {
+    collect(cwd, session_id, false, false).map(super::Part::commit)
 }
 
 /// [`deliver`] with the messages NOT yet marked seen: the marks come back as commits, for the prompt hook to run only
@@ -41,18 +45,24 @@ pub fn deliver(cwd: &Path, session_id: Option<&str>, notice_when_unregistered: b
 /// the answer command), then the message on its own line. Of one sender's unseen messages only the newest is shown; the
 /// older ones are marked seen with it, and a line names the command that still lists them. A message whose wake notify
 /// is still in this session's inbox is left to that notify, so one message is never shown twice.
-pub fn deliver_deferred(
+pub fn deliver_deferred(cwd: &Path, session_id: Option<&str>, notice_when_unregistered: bool) -> Option<super::Part> {
+    collect(cwd, session_id, notice_when_unregistered, true)
+}
+
+fn collect(
     cwd: &Path,
     session_id: Option<&str>,
     notice_when_unregistered: bool,
-) -> Option<(String, Vec<super::Commit>)> {
+    heartbeat: bool,
+) -> Option<super::Part> {
     let root = relay_root(cwd)?;
     let projects = list_projects(&root);
     if projects.is_empty() {
         return None;
     }
 
-    let mut out = String::new();
+    let mut text = String::new();
+    let mut items = 0usize;
     let mut commits: Vec<super::Commit> = Vec::new();
     let mut unregistered: Vec<(String, usize, usize)> = Vec::new();
 
@@ -60,7 +70,9 @@ pub fn deliver_deferred(
         let store = RelayStore { root: root.join(p), project: p.clone() };
         match store.identity(session_id) {
             Some(title) => {
-                store.heartbeat(&title);
+                if heartbeat {
+                    store.heartbeat(&title);
+                }
                 let pending: Vec<_> = store
                     .pending_for(&title)
                     .into_iter()
@@ -69,17 +81,16 @@ pub fn deliver_deferred(
                 if pending.is_empty() {
                     continue;
                 }
-                // `pending_for` is oldest first, so the last message from each sender is its newest.
-                let mut newest: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+                // `pending_for` is oldest first, and every message here is to this one title.
+                let keys: Vec<Option<&str>> =
+                    pending.iter().map(|m| (!super::threadless(&m.from)).then_some(m.from.as_str())).collect();
+                let behind = super::superseded_by(&keys);
                 for (i, m) in pending.iter().enumerate() {
-                    newest.insert(m.from.as_str(), i);
-                }
-                for (i, m) in pending.iter().enumerate() {
-                    if newest[m.from.as_str()] != i {
+                    if behind[i].is_some() {
                         continue;
                     }
                     let answer = super::task_inbox::answer_command(p, &m.mtype, &m.from);
-                    out.push_str(&format!(
+                    text.push_str(&format!(
                         "relay ({p}): {} from {} ({}){answer}\n{}\n",
                         m.mtype,
                         m.from,
@@ -87,16 +98,14 @@ pub fn deliver_deferred(
                         m.msg
                     ));
                     if !m.refs.is_empty() {
-                        out.push_str(&format!("refs: {}\n", m.refs.join(", ")));
+                        text.push_str(&format!("refs: {}\n", m.refs.join(", ")));
                     }
-                    let earlier = pending[..i].iter().filter(|o| o.from == m.from).count();
+                    let earlier = behind.iter().filter(|b| **b == Some(i)).count();
                     if earlier > 0 {
-                        out.push_str(&format!(
-                            "({earlier} earlier message{s} from {from} hidden, this one is newer: base relay poll --project {p} --peek --all --from {from})\n",
-                            s = if earlier == 1 { "" } else { "s" },
-                            from = m.from,
-                        ));
+                        let command = format!("base relay poll --project {p} --peek --all --from {}", m.from);
+                        text.push_str(&super::hidden_line(earlier, &m.from, &command));
                     }
+                    items += 1;
                 }
                 let ids: Vec<String> = pending.iter().map(|m| m.id.clone()).collect();
                 commits.push(Box::new(move || {
@@ -111,27 +120,37 @@ pub fn deliver_deferred(
         }
     }
 
-    if out.is_empty() && notice_when_unregistered && !unregistered.is_empty() {
+    if text.is_empty() && notice_when_unregistered && !unregistered.is_empty() {
         let (p, sessions, msgs) = &unregistered[0];
-        out.push_str(&format!(
+        text.push_str(&format!(
             "{NOTICE_OPEN}Relay store '{p}' active ({sessions} sessions, {msgs} messages). \
              Join with: base relay register --as <title> · view: base relay board</relay-notice>\n"
         ));
     }
 
-    (!out.is_empty()).then_some((out, commits))
+    (!text.is_empty()).then_some(super::Part { text, commits, items })
 }
 
-/// A reply to `peer` answers everything `peer` sent before it (BO-04, F13c): every unseen spool message from `peer`
-/// to one of `my_titles`, in every store of this workspace, is marked seen. Returns how many.
-pub fn mark_answered(cwd: &Path, peer: &str, my_titles: &[String]) -> usize {
+/// A reply to `peer` answers everything `peer` sent before it (BO-04, F13c): every unseen spool message from `peer` to
+/// one of `my_titles`, sent no later than `cutoff` (the newest ping being answered), in every store of this workspace,
+/// is marked seen. Returns how many.
+pub fn mark_answered(
+    cwd: &Path,
+    peer: &str,
+    my_titles: &[String],
+    cutoff: chrono::DateTime<chrono::Local>,
+) -> usize {
     let Some(root) = relay_root(cwd) else { return 0 };
     let mut marked = 0;
     for p in list_projects(&root) {
         let store = RelayStore { root: root.join(&p), project: p };
         for title in my_titles {
-            let ids: Vec<String> =
-                store.pending_for(title).into_iter().filter(|m| m.from == peer).map(|m| m.id).collect();
+            let ids: Vec<String> = store
+                .pending_for(title)
+                .into_iter()
+                .filter(|m| m.from == peer && super::parse_ts(&m.ts).is_some_and(|t| t <= cutoff))
+                .map(|m| m.id)
+                .collect();
             if !ids.is_empty() && store.mark_seen(title, &ids).is_ok() {
                 marked += ids.len();
             }
@@ -260,7 +279,7 @@ mod tests {
         s.register("lynx", Some("sess-r"), "/main", None).unwrap();
         s.send("bison", "lynx", "answer", "go: edit the doc", &[]).unwrap();
         s.send("heron", "lynx", "notify", "from someone else", &[]).unwrap();
-        assert_eq!(mark_answered(tmp.path(), "bison", &["lynx".to_string()]), 1);
+        assert_eq!(mark_answered(tmp.path(), "bison", &["lynx".to_string()], chrono::Local::now()), 1);
         let block = deliver(tmp.path(), Some("sess-r"), false).expect("heron's message is still due");
         assert!(!block.contains("go: edit the doc"), "{block}");
         assert!(block.contains("from someone else"), "{block}");

@@ -437,7 +437,7 @@ fn nudge_due(
 
 /// The nudge lines due now for every title this session holds, one line per title, with the stamps held back as
 /// commits: the prompt hook runs them only if it prints the block (BO-01), so a dropped line is still due next prompt.
-pub fn nudge_lines_deferred(session_id: &str, force: bool) -> Option<(String, Vec<super::Commit>)> {
+pub fn nudge_lines_deferred(session_id: &str, force: bool) -> Option<super::Part> {
     // Harnesses without a Monitor tool (Agent SDK runs, brain.js NPCs) can't
     // comply — let them opt out of the line altogether.
     if std::env::var_os("BASE_NO_WAKE_NUDGE").is_some() {
@@ -447,7 +447,7 @@ pub fn nudge_lines_deferred(session_id: &str, force: bool) -> Option<(String, Ve
 }
 
 /// [`nudge_lines_deferred`] without the environment opt-out, so a test does not depend on the shell it runs in.
-fn nudge_lines_for(session_id: &str, force: bool) -> Option<(String, Vec<super::Commit>)> {
+fn nudge_lines_for(session_id: &str, force: bool) -> Option<super::Part> {
     let mut out = String::new();
     let mut commits: Vec<super::Commit> = Vec::new();
     for title in super::session_registry::titles_for(session_id) {
@@ -466,7 +466,8 @@ fn nudge_lines_for(session_id: &str, force: bool) -> Option<(String, Vec<super::
         let sid = session_id.to_string();
         commits.push(Box::new(move || stamp_nudge(&path, &sid)));
     }
-    (!out.is_empty()).then_some((out, commits))
+    let items = out.lines().count();
+    (!out.is_empty()).then_some(super::Part { text: out, commits, items })
 }
 
 #[cfg(test)]
@@ -606,10 +607,7 @@ mod tests {
             let home = tmp.path();
             crate::relay::session_registry::register("kite", "sid-A", home, None).unwrap();
             let lines = |sid: &str| -> Option<String> {
-                nudge_lines_for(sid, false).map(|(text, commits)| {
-                    crate::relay::run_commits(commits);
-                    text
-                })
+                nudge_lines_for(sid, false).map(crate::relay::Part::commit)
             };
             let first = lines("sid-A").expect("a title with no watcher is told");
             assert_eq!(

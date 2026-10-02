@@ -118,6 +118,64 @@ pub fn run_commits(commits: Vec<Commit>) {
     }
 }
 
+/// One relay block as a hook builds it: the text, the side effects to run only if it is printed (BO-01), and how many
+/// messages, tasks or titles it carries, counted where they are rendered rather than guessed from its lines (a message
+/// body may itself begin `relay: `).
+pub struct Part {
+    pub text: String,
+    pub commits: Vec<Commit>,
+    pub items: usize,
+}
+
+impl Part {
+    /// Run the side effects and keep the text: for the hooks that print a part whole.
+    pub fn commit(self) -> String {
+        run_commits(self.commits);
+        self.text
+    }
+}
+
+/// True when this hook process runs in a harness that has said it cannot keep an inbox watcher (`BASE_NO_WAKE_NUDGE`,
+/// the documented opt-out for Agent SDK runs and workers with no Monitor tool). Only such a run is given new relay
+/// items on a tool call (BO-04, lynx's amendment to F13b): it has no other way to hear a question mid-run. Interactive
+/// sessions never are; `BASE_RELAY_AS` does not mark one, because the operator's own launchers set it on every
+/// interactive session.
+pub fn monitorless() -> bool {
+    std::env::var_os("BASE_NO_WAKE_NUDGE").is_some()
+}
+
+/// A sender whose messages are each a thread of their own, so nothing it sends supersedes anything else: no title at
+/// all, or the placeholder a session with no title is recorded under. Two unrelated scripts both recorded as
+/// `unregistered` are not one conversation.
+pub fn threadless(from: &str) -> bool {
+    from.trim().is_empty() || from.starts_with(UNREGISTERED)
+}
+
+/// BO-04, F13c, in one place for both delivery paths: of the items in one thread (one sender within one receiver's
+/// inbox), only the newest is shown. `keys[i]` is item i's thread, or `None` for an item that is never superseded.
+/// Items are oldest first. Returns, per item, the index of the newer item it is hidden behind, or `None` when shown.
+pub fn superseded_by<K: Eq + std::hash::Hash>(keys: &[Option<K>]) -> Vec<Option<usize>> {
+    let mut newest: std::collections::HashMap<&K, usize> = std::collections::HashMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        if let Some(k) = k {
+            newest.insert(k, i);
+        }
+    }
+    keys.iter()
+        .enumerate()
+        .map(|(i, k)| k.as_ref().and_then(|k| Some(newest[k]).filter(|&n| n != i)))
+        .collect()
+}
+
+/// The line under a shown message that hid `n` older ones from `from`, naming the command that still lists them, so a
+/// hidden message is never lost silently (lynx's condition 1 on F13c).
+pub fn hidden_line(n: usize, from: &str, command: &str) -> String {
+    format!(
+        "({n} earlier message{} from {from} hidden, this one is newer: {command})\n",
+        if n == 1 { "" } else { "s" }
+    )
+}
+
 // ─── Store handle ────────────────────────────────────────────
 
 pub struct RelayStore {

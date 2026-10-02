@@ -3208,11 +3208,11 @@ pub fn run() {
                     // Replying? Any pending inbound ping FROM the target in OUR
                     // inbox means this send is the answer — clear those now, and
                     // mark this ping a reply so it can't demand its own ack.
+                    // A reply answers everything that sender sent up to their newest ping, in the spool too, so an
+                    // earlier message from them is never shown after this (BO-04, F13c). A ping that answers nothing
+                    // marks nothing.
                     let answered =
-                        base::relay::task_inbox::clear_pings_from(&config.namespace, &to, &my_titles);
-                    // A reply answers everything that sender sent before it, in the spool too, so an earlier message
-                    // from them is never shown after this (BO-04, F13c).
-                    base::relay::deliver::mark_answered(&cwd, &to, &my_titles);
+                        base::relay::task_inbox::answer_from(&config.namespace, &cwd, &to, &my_titles);
                     let kind = if answered > 0 { "reply" } else { "ping" };
                     let id = base::relay::ping_slug();
                     let ping = base::relay::task_inbox::InboxTask {

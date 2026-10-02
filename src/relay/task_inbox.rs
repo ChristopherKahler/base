@@ -96,12 +96,14 @@ fn default_kind() -> String {
     "task".into()
 }
 
-/// Which hook is asking to deliver. Relay content appears at session start and on a prompt only, never on a tool call
-/// or at a turn's end (BO-04, F13b).
+/// Which hook is asking to deliver. Relay content appears at session start and on a prompt, never at a turn's end, and
+/// on a tool call only for a run that cannot keep an inbox watcher (BO-04, F13b as amended by lynx).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     SessionStart,
     Prompt,
+    /// A tool call in a run with no inbox watcher ([`super::monitorless`]): new items only, nothing listed.
+    Tool,
 }
 
 // ─── Paths ───────────────────────────────────────────────────
@@ -158,9 +160,7 @@ pub fn enqueue(ns: &NamespaceConfig, task: &InboxTask) -> Result<PathBuf> {
 /// Scan this session's inbox and render the injection block, if any. Mutates
 /// task state (marks delivered, deletes an announced reply or notify) as a side effect.
 pub fn deliver(session_id: &str, phase: Phase) -> Option<String> {
-    let (block, commits) = deliver_deferred(session_id, phase)?;
-    super::run_commits(commits);
-    Some(block)
+    deliver_deferred(session_id, phase).map(super::Part::commit)
 }
 
 /// The slug of the wake notify `relay send` drops for one spool message and one recipient title.
@@ -180,6 +180,12 @@ fn is_chat(task: &InboxTask) -> bool {
     matches!(task.kind.as_str(), "ping" | "reply" | "notify")
 }
 
+/// A ping still waiting for its answer: shown (`delivered`) or hidden behind a newer message from the same sender
+/// (`superseded`). Hiding a ping never drops what it asks of the receiver; a reply to the sender clears both.
+fn unanswered(task: &InboxTask) -> bool {
+    task.kind == "ping" && matches!(task.status.as_str(), "delivered" | "superseded")
+}
+
 /// [`deliver`] with the inbox NOT yet changed: recording a task or ping as delivered, hiding a superseded message and
 /// deleting an announced reply or notify come back as commits, for the prompt hook to run only if it prints the block
 /// (BO-01). Until they run, the inbox reads as it did, so a dropped block is announced at the next prompt.
@@ -189,15 +195,20 @@ fn is_chat(task: &InboxTask) -> bool {
 ///   after it arrives. It is shown as information: who, when, the message, and the reply command. Nothing in it claims
 ///   to come before the user's own prompt.
 /// - Of one sender's unshown messages to one title, only the newest is shown; the older ones are marked `superseded`,
-///   kept on disk, and the shown one carries a line naming the command that lists them.
-/// - A ping already shown, while unanswered, is listed in one line at session start and is never repeated on a prompt.
-/// - A task already shown to another session is shown in full at this session's start (it is work this session now
-///   holds); one already shown to this session is listed in one line.
+///   kept on disk, and the shown one carries a line naming the command that lists them. A sender with no title is
+///   never treated as one thread ([`super::threadless`]).
+/// - Items this session has not been shown but another session was (a title taken over mid-session with
+///   `base relay register`, or a successor): on its next prompt or at its start, a task in full (it is work this
+///   session now holds), and unanswered pings listed in one line. Once per session.
+/// - Items already shown to this session: listed in one line at session start (a compacted context), never on a
+///   prompt.
+/// - On a tool call ([`Phase::Tool`], only for a run with no inbox watcher, see [`super::monitorless`]): new items
+///   only, the same way, and nothing listed.
 ///
 /// What this replaced: a loud block on every first sighting in ANY hook, pre-tool included, headed "REPLY REQUIRED
 /// BEFORE YOUR NEXT ACTION", then a terse "Reply RIGHT NOW" nag every three minutes on prompts and tool calls until the
 /// receiver answered.
-pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<(String, Vec<super::Commit>)> {
+pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<super::Part> {
     // Which titles does this session hold? A never-registered session can't be
     // a relay target, so it does zero filesystem work beyond the registry read.
     let titles = super::session_registry::titles_for(session_id);
@@ -211,18 +222,24 @@ pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<(String, Vec<s
         }
     }
     tasks.retain(|(_, t)| t.status != "done" && !ping_is_stale(t));
+    tasks.sort_by(|a, b| order_key(&a.1).cmp(&order_key(&b.1)));
     if tasks.is_empty() {
         return None;
     }
 
-    // Superseded: per (title, sender), every unshown chat message but the newest. `read_tasks_in` sorts oldest first.
-    let mut newest: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
-    for (i, (_, t)) in tasks.iter().enumerate() {
-        if t.status == "pending" && is_chat(t) {
-            newest.insert((t.to_title.clone(), t.from.clone()), i);
-        }
-    }
+    // Superseded: per (title, sender), every unshown chat message but the newest.
+    let keys: Vec<Option<(&str, &str)>> = tasks
+        .iter()
+        .map(|(_, t)| {
+            (t.status == "pending" && is_chat(t) && !super::threadless(&t.from))
+                .then_some((t.to_title.as_str(), t.from.as_str()))
+        })
+        .collect();
+    let behind = super::superseded_by(&keys);
     let mut hidden: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for newer in behind.iter().flatten() {
+        *hidden.entry(*newer).or_default() += 1;
+    }
 
     let now = now_iso();
     let mut shown: Vec<(usize, String)> = Vec::new();
@@ -231,53 +248,55 @@ pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<(String, Vec<s
     let mut commits: Vec<super::Commit> = Vec::new();
 
     for (i, (path, task)) in tasks.iter().enumerate() {
-        let mut task = task.clone();
         let path = path.clone();
+        let mut task = task.clone();
         if task.status == "pending" {
-            if is_chat(&task) {
-                let keep = newest[&(task.to_title.clone(), task.from.clone())];
-                if keep != i {
-                    *hidden.entry(keep).or_default() += 1;
-                    commits.push(hide(path, task, session_id, &now));
-                    continue;
-                }
-            }
-            shown.push((i, render(&task)));
-            commits.push(consume(path, task, session_id, &now));
-            continue;
-        }
-        if phase != Phase::SessionStart {
-            continue;
-        }
-        match (task.kind.as_str(), task.status.as_str()) {
-            ("task", _) if task.last_loud_session != session_id => {
+            if behind[i].is_some() {
+                commits.push(hide(path, task, session_id, &now));
+            } else {
                 shown.push((i, render(&task)));
-                task.last_loud_session = session_id.to_string();
-                task.last_alert_ts = now.clone();
-                commits.push(write_back(path, task));
+                commits.push(consume(path, task, session_id, &now));
             }
-            ("task", _) => open_tasks.push(format!("{} from {}", task.slug, sender(&task))),
-            ("ping", "delivered") => open_pings.push(format!("{} {}", sender(&task), super::clock(&task.created))),
-            _ => {}
+            continue;
+        }
+        if phase == Phase::Tool {
+            continue;
+        }
+        let new_here = task.last_loud_session != session_id;
+        if !new_here && phase != Phase::SessionStart {
+            continue;
+        }
+        if task.kind == "task" {
+            if new_here {
+                shown.push((i, render(&task)));
+            } else {
+                open_tasks.push(format!("{} from {}", task.slug, sender(&task)));
+            }
+        } else if unanswered(&task) {
+            open_pings.push(format!("{} {}", sender(&task), super::clock(&task.created)));
+        } else {
+            continue;
+        }
+        if new_here {
+            task.last_loud_session = session_id.to_string();
+            task.last_alert_ts = now.clone();
+            commits.push(persist(path, task));
         }
     }
 
     if shown.is_empty() && open_pings.is_empty() && open_tasks.is_empty() {
         return None;
     }
-    let mut out = String::new();
-    for (i, text) in &shown {
-        out.push_str(text);
+    let mut text = String::new();
+    for (i, rendered) in &shown {
+        text.push_str(rendered);
         if let Some(n) = hidden.get(i) {
             let from = sender(&tasks[*i].1);
-            out.push_str(&format!(
-                "({n} earlier message{s} from {from} hidden, this one is newer: base relay tasks --from {from})\n",
-                s = if *n == 1 { "" } else { "s" },
-            ));
+            text.push_str(&super::hidden_line(*n, from, &format!("base relay tasks --from {from}")));
         }
     }
     if !open_pings.is_empty() {
-        out.push_str(&format!(
+        text.push_str(&format!(
             "relay: {} unanswered ping{} ({}) · read: base relay tasks --from <sender> · reply: base relay ping --to <sender> --msg \"...\"\n",
             open_pings.len(),
             if open_pings.len() == 1 { "" } else { "s" },
@@ -285,17 +304,32 @@ pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<(String, Vec<s
         ));
     }
     if !open_tasks.is_empty() {
-        out.push_str(&format!(
+        text.push_str(&format!(
             "relay: {} open task{} ({}) · when finished: base relay done <slug>\n",
             open_tasks.len(),
             if open_tasks.len() == 1 { "" } else { "s" },
             open_tasks.join(", ")
         ));
     }
-    Some((out, commits))
+    let items = shown.len() + open_pings.len() + open_tasks.len();
+    Some(super::Part { text, commits, items })
 }
 
-fn write_back(path: PathBuf, task: InboxTask) -> super::Commit {
+/// The order items are read in: when they were sent, then, inside one second, the milliseconds a ping's or notify's
+/// slug carries, then the slug. `created` has one-second resolution, and the slugs alone sort every `notify-` before
+/// every `ping-`, so a ping sent after a notify in the same second would read as the older of the two.
+fn order_key(task: &InboxTask) -> (Option<chrono::DateTime<chrono::Local>>, u128, &str) {
+    (parse_ts(&task.created), slug_millis(&task.slug), &task.slug)
+}
+
+/// The send time in milliseconds that `ping-<millis>-...` and `notify-<millis>-...` slugs open with; 0 for any other.
+fn slug_millis(slug: &str) -> u128 {
+    let rest = slug.strip_prefix("ping-").or_else(|| slug.strip_prefix("notify-")).unwrap_or("");
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().unwrap_or(0)
+}
+
+fn persist(path: PathBuf, task: InboxTask) -> super::Commit {
     Box::new(move || {
         let _ = write_json_atomic(&path, &task);
     })
@@ -326,11 +360,11 @@ fn consume(path: PathBuf, mut task: InboxTask, session_id: &str, now: &str) -> s
     task.status = "delivered".into();
     task.last_loud_session = session_id.to_string();
     task.last_alert_ts = now.to_string();
-    write_back(path, task)
+    persist(path, task)
 }
 
 /// What hiding a superseded message does: the file stays, readable by `base relay tasks --from <sender>`, and is never
-/// shown by a hook.
+/// shown by a hook. A hidden ping still counts as unanswered.
 fn hide(path: PathBuf, mut task: InboxTask, session_id: &str, now: &str) -> super::Commit {
     task.status = "superseded".into();
     task.last_loud_session = session_id.to_string();
@@ -421,8 +455,8 @@ pub fn answer_command(project: &str, mtype: &str, from: &str) -> String {
 }
 
 /// The receiver's reply IS the ack: clear every inbound ping FROM `peer` sitting in any of `my_titles`' inboxes,
-/// flipping each graph mirror to answered (best-effort), and with them every message from `peer` hidden as superseded,
-/// so a reply leaves nothing earlier from that sender to show (BO-04, F13c). Returns how many pings cleared.
+/// flipping each graph mirror to answered (best-effort), and with them every message from `peer` hidden as superseded.
+/// Returns how many pings cleared.
 pub fn clear_pings_from(ns: &NamespaceConfig, peer: &str, my_titles: &[String]) -> usize {
     let mut cleared = 0;
     for title in my_titles {
@@ -441,6 +475,39 @@ pub fn clear_pings_from(ns: &NamespaceConfig, peer: &str, my_titles: &[String]) 
             }
         }
     }
+    cleared
+}
+
+/// A ping to `peer` that answers one: when `peer` has a ping waiting in one of `my_titles`' inboxes, everything `peer`
+/// sent no later than the newest such ping is answered (BO-04, F13c, lynx's condition 3): the pings and superseded
+/// messages are cleared ([`clear_pings_from`]), an unshown reply or notify from then or before is cleared with its spool
+/// copy marked seen, and `peer`'s spool messages from then or before are marked seen. A ping that answers nothing marks
+/// nothing, and nothing `peer` sent after its newest ping is touched. Returns how many pings cleared.
+pub fn answer_from(ns: &NamespaceConfig, cwd: &Path, peer: &str, my_titles: &[String]) -> usize {
+    let mut cutoff: Option<chrono::DateTime<chrono::Local>> = None;
+    for title in my_titles {
+        let Some(dir) = title_dir(title) else { continue };
+        for (_, task) in read_tasks_in(&dir) {
+            if task.kind == "ping" && task.from == peer {
+                cutoff = cutoff.max(parse_ts(&task.created));
+            }
+        }
+    }
+    let Some(cutoff) = cutoff else { return 0 };
+    let cleared = clear_pings_from(ns, peer, my_titles);
+    for title in my_titles {
+        let Some(dir) = title_dir(title) else { continue };
+        for (path, task) in read_tasks_in(&dir) {
+            if task.from == peer
+                && matches!(task.kind.as_str(), "reply" | "notify")
+                && parse_ts(&task.created).is_some_and(|t| t <= cutoff)
+            {
+                mark_spool_seen(&task);
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    super::deliver::mark_answered(cwd, peer, my_titles, cutoff);
     cleared
 }
 
@@ -1040,8 +1107,10 @@ mod tests {
             assert!(deliver("sid-L", Phase::Prompt).is_none());
             let start = deliver("sid-L", Phase::SessionStart).expect("unanswered pings are listed");
             assert!(!start.contains("go: edit the doc"), "{start}");
+            // The hidden ping is still unanswered, so it is listed (by sender and time, never its text).
             let listed = format!(
-                "relay: 2 unanswered pings (heron {}, bison {})",
+                "relay: 3 unanswered pings (bison {}, heron {}, bison {})",
+                crate::relay::clock(&go.created),
                 crate::relay::clock(&other.created),
                 crate::relay::clock(&stand_down.created)
             );
@@ -1098,5 +1167,131 @@ mod tests {
                 assert!(!text.contains(phrase), "{phrase:?} in relay text:\n{text}");
             }
         }
+    }
+
+    /// Review finding 1: a session that takes over a title mid-session (`base relay register`) is shown, on its next
+    /// prompt, the open task in full and the unanswered pings in one line that another session was shown. Once.
+    #[test]
+    fn a_title_taken_over_mid_session_shows_its_open_items_once_on_a_prompt() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("caddy-backend", "sid-A", home);
+            enqueue(&ns, &sample("sid-A")).unwrap();
+            enqueue(&ns, &sample_ping("ping", "heron", "caddy-backend", "sid-A", "still waiting on you")).unwrap();
+            assert!(deliver("sid-A", Phase::Prompt).is_some(), "control: session A was shown both");
+            bind("caddy-backend", "sid-B", home);
+            let block = deliver("sid-B", Phase::Prompt).expect("session B is shown what it now holds");
+            assert!(block.contains("relay: task rebuild-auth-guard"), "the task, in full:\n{block}");
+            assert!(block.contains("brief: /tmp/rebuild-auth-guard.md"), "{block}");
+            assert!(block.contains("relay: 1 unanswered ping (heron "), "the ping, listed:\n{block}");
+            assert!(!block.contains("still waiting on you"), "a delivered ping is listed, not shown again:\n{block}");
+            assert!(deliver("sid-B", Phase::Prompt).is_none(), "once per session");
+        });
+    }
+
+    /// Review finding 3: a newer message of another kind hides an older ping, but never what the ping asks: the hidden
+    /// ping is still listed as unanswered at session start.
+    #[test]
+    fn a_ping_hidden_behind_a_newer_message_stays_unanswered() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-L", home);
+            let mut question = sample_ping("ping", "bison", "lynx", "sid-L", "which schema?");
+            question.slug = "ping-1".into();
+            question.created = hours_ago(2);
+            enqueue(&ns, &question).unwrap();
+            let mut fyi = sample_ping("notify", "bison", "lynx", "sid-L", "build is green");
+            fyi.slug = "notify-2".into();
+            fyi.created = hours_ago(1);
+            enqueue(&ns, &fyi).unwrap();
+            let block = deliver("sid-L", Phase::Prompt).expect("the newest is shown");
+            assert!(block.contains("build is green") && !block.contains("which schema?"), "{block}");
+            let start = deliver("sid-L", Phase::SessionStart).expect("the hidden ping is still owed an answer");
+            assert!(start.starts_with("relay: 1 unanswered ping (bison "), "{start}");
+        });
+    }
+
+    /// Review finding 5: senders with no title are not one conversation; each of their messages is shown.
+    #[test]
+    fn senders_with_no_title_never_supersede_each_other() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-L", home);
+            for (i, from) in ["unregistered", "unregistered", "", "unregistered-1234abcd"].iter().enumerate() {
+                let mut p = sample_ping("ping", from, "lynx", "sid-L", &format!("script message {i}"));
+                p.slug = format!("ping-{i}");
+                enqueue(&ns, &p).unwrap();
+            }
+            let block = deliver("sid-L", Phase::Prompt).expect("all four are shown");
+            for i in 0..4 {
+                assert!(block.contains(&format!("script message {i}")), "{block}");
+            }
+            assert!(!block.contains("hidden"), "{block}");
+        });
+    }
+
+    /// Review finding 6: inside one second, the order is the milliseconds the slugs carry, not `notify-` before `ping-`.
+    #[test]
+    fn inside_one_second_the_later_message_is_the_newer() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-L", home);
+            let second = hours_ago(1);
+            let mut go = sample_ping("ping", "bison", "lynx", "sid-L", "go: edit the doc");
+            go.slug = "ping-1700000000100-0001-0".into();
+            go.created = second.clone();
+            enqueue(&ns, &go).unwrap();
+            let mut stand_down = sample_ping("notify", "bison", "lynx", "sid-L", "stand down");
+            stand_down.slug = "notify-1700000000900-bison-77-lynx".into();
+            stand_down.created = second;
+            enqueue(&ns, &stand_down).unwrap();
+            let block = deliver("sid-L", Phase::Prompt).expect("delivery");
+            assert!(block.contains("stand down") && !block.contains("go: edit the doc"), "{block}");
+        });
+    }
+
+    /// Review finding 4: a ping that answers nothing marks nothing; a reply clears only what the sender sent up to its
+    /// newest ping, and a message the sender sent after that is still shown.
+    #[test]
+    fn a_reply_answers_what_came_before_it_and_nothing_after() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-L", home);
+            let cwd = home.join("ws");
+            let mut later = sample_ping("notify", "bison", "lynx", "sid-L", "sent after the ping");
+            later.slug = "notify-later".into();
+            later.created = hours_ago(1);
+            enqueue(&ns, &later).unwrap();
+            assert_eq!(answer_from(&ns, &cwd, "bison", &["lynx".to_string()]), 0, "no ping from bison: not a reply");
+            assert_eq!(list_all().len(), 1, "a ping that answers nothing marks nothing");
+            let mut question = sample_ping("ping", "bison", "lynx", "sid-L", "which schema?");
+            question.slug = "ping-q".into();
+            question.created = hours_ago(2);
+            enqueue(&ns, &question).unwrap();
+            let mut earlier = sample_ping("notify", "bison", "lynx", "sid-L", "sent before the ping");
+            earlier.slug = "notify-earlier".into();
+            earlier.created = hours_ago(3);
+            enqueue(&ns, &earlier).unwrap();
+            assert_eq!(answer_from(&ns, &cwd, "bison", &["lynx".to_string()]), 1);
+            let left: Vec<String> = list_all().into_iter().map(|t| t.slug).collect();
+            assert_eq!(left, vec!["notify-later".to_string()], "only what came after the ping is left");
+        });
+    }
+
+    /// Review finding 8: the block says how many items it carries, counted where they are rendered.
+    #[test]
+    fn a_block_counts_its_items_where_it_renders_them() {
+        with_home(|home| {
+            let ns = NamespaceConfig::default();
+            bind("lynx", "sid-L", home);
+            enqueue(&ns, &sample_ping("ping", "bison", "lynx", "sid-L", "relay: this body starts like a header")).unwrap();
+            let mut n = sample_ping("notify", "heron", "lynx", "sid-L", "[notify] spool news");
+            n.slug = "notify-a".into();
+            n.spool_store = home.join("crew").display().to_string();
+            enqueue(&ns, &n).unwrap();
+            let part = deliver_deferred("sid-L", Phase::Prompt).expect("delivery");
+            assert_eq!(part.items, 2, "{}", part.text);
+            assert!(part.text.contains("relay (crew): notify from heron ("), "{}", part.text);
+        });
     }
 }

@@ -625,7 +625,7 @@ fn relay_run() -> &'static RelayRun {
             let (code, stdout, stderr) = run_prompt_submit(&s, &prompt, Some(session));
             assert_eq!(code, 0, "{prompt:?}: the prompt hook failed: {stderr}");
             run.prompts.push(stdout);
-            let (code, stdout, stderr) = run_pre_tool_use(&s, "Bash", serde_json::json!({ "command": "ls" }), session);
+            let (code, stdout, stderr) = run_pre_tool_use(&s, "Bash", serde_json::json!({ "command": "ls" }), session, &[]);
             assert_eq!(code, 0, "the pre-tool hook failed: {stderr}");
             run.tools.push(stdout);
         }

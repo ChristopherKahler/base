@@ -199,7 +199,7 @@ fn run_event(
             Ok(HookEventData { session_id, ..Default::default() })
         }
         "pre-tool-use" => {
-            let (mut data, context) = pre_tool_use::handle(&config, &cwd, stdin_json)?;
+            let (mut data, mut context) = pre_tool_use::handle(&config, &cwd, stdin_json)?;
             let (tool_name, file_path) = extract_tool_context(stdin_json);
             data.tool_name = tool_name;
             data.file_path = file_path;
@@ -208,6 +208,23 @@ fn run_event(
             // "Reply RIGHT NOW" line, and a withdrawn message reappeared mid-turn. Relay content is delivered at
             // session start and on the next prompt; a session that must hear a ping mid-turn runs the inbox watcher
             // (`base relay arm`), whose Monitor wakes it.
+            //
+            // The one exception (lynx's amendment to F13b): a run that has said it cannot keep a watcher
+            // (`BASE_NO_WAKE_NUDGE`: Agent SDK runs, workers with no Monitor tool) has no other way to hear a question
+            // mid-run, so it is given NEW items once, in the same plain form, and never a watcher line or the script.
+            // Shown once across prompt and tool calls: what a tool call shows, the next prompt does not.
+            if crate::relay::monitorless() {
+                if let Some(sid) = session_id.as_deref()
+                    && let Some(part) = crate::relay::task_inbox::deliver_deferred(sid, crate::relay::task_inbox::Phase::Tool)
+                {
+                    context.push('\n');
+                    context.push_str(&with_star_commands(part.commit(), &cwd));
+                }
+                if let Some(block) = crate::relay::deliver::deliver_mid_turn(&cwd, session_id.as_deref()) {
+                    context.push('\n');
+                    context.push_str(&block);
+                }
+            }
             // PreToolUse context only reaches the model through the JSON
             // envelope — plain stdout is transcript-only on this event.
             let context = context.trim().to_string();
@@ -283,12 +300,9 @@ fn run_event(
                 // early returns can't swallow a pending delivery. Silent when
                 // unregistered — the session-start notice already ran.
                 use crate::emit::prompt::{Priority, PromptBlock};
-                if let Some((block, commits)) =
-                    crate::relay::deliver::deliver_deferred(&cwd, session_id.as_deref(), false)
-                {
-                    let messages = block.lines().filter(|l| l.starts_with("relay (")).count();
-                    sink.blocks.push(PromptBlock::new("relay-inbox", Priority::Relay, &block, messages, "message"));
-                    relay_commits.push(("relay-inbox", commits));
+                if let Some(part) = crate::relay::deliver::deliver_deferred(&cwd, session_id.as_deref(), false) {
+                    sink.blocks.push(PromptBlock::new("relay-inbox", Priority::Relay, &part.text, part.items, "message"));
+                    relay_commits.push(("relay-inbox", part.commits));
                 }
                 // Session-targeted task relay: refresh liveness + deliver new tasks and pings, then the
                 // watcher nudge as a block of its own, last in priority 3. Since BO-04 it is one line per title
@@ -300,15 +314,13 @@ fn run_event(
                         &config.relay,
                         crate::relay::task_inbox::Phase::Prompt,
                     );
-                    if let Some((block, commits)) = tasks {
-                        let items = block.lines().filter(|l| l.starts_with("relay: ")).count();
-                        sink.blocks.push(PromptBlock::new("relay-tasks", Priority::Relay, &block, items, "item"));
-                        relay_commits.push(("relay-tasks", commits));
+                    if let Some(part) = tasks {
+                        sink.blocks.push(PromptBlock::new("relay-tasks", Priority::Relay, &part.text, part.items, "item"));
+                        relay_commits.push(("relay-tasks", part.commits));
                     }
-                    if let Some((block, commits)) = wake {
-                        let titles = block.lines().count();
-                        sink.blocks.push(PromptBlock::new("relay-wake", Priority::Relay, &block, titles, "watcher nudge"));
-                        relay_commits.push(("relay-wake", commits));
+                    if let Some(part) = wake {
+                        sink.blocks.push(PromptBlock::new("relay-wake", Priority::Relay, &part.text, part.items, "watcher nudge"));
+                        relay_commits.push(("relay-wake", part.commits));
                     }
                 }
             }
@@ -365,6 +377,22 @@ fn run_event(
     })
 }
 
+/// Star commands inside relayed pings resolve exactly like typed prompts (Chris directive 2026-08-17, spoken pings from
+/// the hub): scan the delivered block and append every matched command mode's rules.
+fn with_star_commands(block: String, cwd: &std::path::Path) -> String {
+    let commands = crate::command::load_commands(cwd);
+    let matched = crate::command::match_commands(&block, &commands);
+    if matched.is_empty() {
+        return block;
+    }
+    let extra: String = matched
+        .iter()
+        .map(|c| crate::command::format_command_output(c))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{block}\n{extra}")
+}
+
 /// Session-targeted task relay at a boundary (session start, prompt): ensure this session has an auto-assigned
 /// codename and a fresh heartbeat, then return its two halves, kept apart: the tasks and pings delivered to this
 /// session, and the one-line watcher nudge. Session start places them as two blocks.
@@ -376,18 +404,12 @@ fn relay_task_parts(
     phase: crate::relay::task_inbox::Phase,
 ) -> (Option<String>, Option<String>) {
     let (tasks, wake) = relay_task_parts_deferred(session_id, cwd, relay, phase);
-    let run = |part: Option<(String, Vec<crate::relay::Commit>)>| {
-        part.map(|(block, commits)| {
-            crate::relay::run_commits(commits);
-            block
-        })
-    };
-    (run(tasks), run(wake))
+    (tasks.map(crate::relay::Part::commit), wake.map(crate::relay::Part::commit))
 }
 
 /// [`relay_task_parts`] with each half's inbox writes and nudge stamps held back as commits: the prompt hook runs a
 /// half's commits only if it prints that half (BO-01).
-type DeferredPart = Option<(String, Vec<crate::relay::Commit>)>;
+type DeferredPart = Option<crate::relay::Part>;
 
 fn relay_task_parts_deferred(
     session_id: &str,
@@ -398,23 +420,9 @@ fn relay_task_parts_deferred(
     // `[relay] enabled = false` stops the auto-codename; a session that
     // registered itself still keeps its liveness fresh.
     let _ = crate::relay::session_registry::touch_with(session_id, cwd, relay.enabled);
-    let delivered = crate::relay::task_inbox::deliver_deferred(session_id, phase);
-    // Star commands inside relayed pings resolve exactly like typed prompts
-    // (Chris directive 2026-08-17, spoken pings from the hub): scan the
-    // delivery block and append every matched command mode's rules.
-    let delivered = delivered.map(|(block, commits)| {
-        let commands = crate::command::load_commands(cwd);
-        let matched = crate::command::match_commands(&block, &commands);
-        if matched.is_empty() {
-            (block, commits)
-        } else {
-            let extra: String = matched
-                .iter()
-                .map(|c| crate::command::format_command_output(c))
-                .collect::<Vec<_>>()
-                .join("\n");
-            (format!("{block}\n{extra}"), commits)
-        }
+    let delivered = crate::relay::task_inbox::deliver_deferred(session_id, phase).map(|mut part| {
+        part.text = with_star_commands(part.text, cwd);
+        part
     });
     // Watcher nudge (BO-04, F4b): one line per title with no current inbox watcher, never the script. Once per
     // session, and once more each time a watcher dies; session start always says it, since a fresh context has not

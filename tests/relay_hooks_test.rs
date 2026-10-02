@@ -71,7 +71,7 @@ fn start(s: &seed::Seed, session: &str) -> String {
 }
 
 fn tool(s: &seed::Seed, session: &str) -> String {
-    ok(run_pre_tool_use(s, "Bash", serde_json::json!({ "command": "ls" }), session), "pre-tool hook")
+    ok(run_pre_tool_use(s, "Bash", serde_json::json!({ "command": "ls" }), session, &[]), "pre-tool hook")
 }
 
 /// The inbox files for the title, parsed.
@@ -178,7 +178,8 @@ fn relay_text_has_no_priority_claims() {
     }
 }
 
-/// F13b: relay content is never on a tool call, and a tool call consumes nothing.
+/// F13b: relay content is never on an interactive session's tool call, and a tool call consumes nothing. An interactive
+/// session may carry `BASE_RELAY_AS` (the operator's launchers set it on every one), and that changes nothing.
 #[test]
 fn relay_never_in_pre_tool() {
     let s = fixture("no-pre-tool");
@@ -190,14 +191,20 @@ fn relay_never_in_pre_tool() {
         run_base(&s, &["relay", "send", "--project", "crew", "--from", "lark", "--to", TITLE, "--type", "notify", "--msg", "spool news"]),
         "relay send",
     );
-    for (tool_name, input) in [
-        ("Bash", serde_json::json!({ "command": "ls" })),
-        ("ToolSearch", serde_json::json!({ "query": "select:Monitor" })),
-        ("Read", serde_json::json!({ "file_path": s.ws.join("notes.md").display().to_string() })),
-    ] {
-        let out = ok(run_pre_tool_use(&s, tool_name, input, session), "pre-tool hook");
-        for needle in ["relay:", "relay (", "status of the build?", "spool news", "inbox watcher"] {
-            assert!(!out.contains(needle), "{tool_name}: {needle:?} on a tool call:\n{out}");
+    let interactive: [&[(&str, &str)]; 2] = [&[], &[("BASE_RELAY_AS", TITLE)]];
+    for env in interactive {
+        for (tool_name, input) in [
+            ("Bash", serde_json::json!({ "command": "ls" })),
+            ("ToolSearch", serde_json::json!({ "query": "select:Monitor" })),
+            ("Read", serde_json::json!({ "file_path": s.ws.join("notes.md").display().to_string() })),
+        ] {
+            let out = ok(run_pre_tool_use(&s, tool_name, input, session, env), "pre-tool hook");
+            for needle in ["relay:", "relay (", "status of the build?", "spool news", "inbox watcher"] {
+                assert!(!out.contains(needle), "{tool_name} {env:?}: {needle:?} on a tool call:\n{out}");
+            }
+            for marker in SCRIPT_MARKERS {
+                assert!(!out.contains(marker), "{tool_name} {env:?}: {marker:?} on a tool call:\n{out}");
+            }
         }
     }
     let ping_file = inbox(&s).into_iter().find(|t| t["kind"] == "ping").expect("the ping is in the inbox");
@@ -284,4 +291,54 @@ fn delivered_or_superseded_message_never_shown_again() {
     assert!(!later.contains("the schema is frozen"), "a delivered message was shown again:\n{later}");
     let polled = ok(run_base(&s, &["relay", "poll", "--project", "crew", "--for", TITLE, "--peek"]), "relay poll");
     assert!(polled.contains("No pending messages"), "the spool copy was marked seen with the notify:\n{polled}");
+}
+
+/// Lynx's amendment to F13b, its three conditions. A run that has said it cannot keep an inbox watcher
+/// (`BASE_NO_WAKE_NUDGE`) gets each NEW ping, reply, notify and task once, on its next tool call, in the plain F13a
+/// form, with no watcher line and never the script; and what a tool call showed, no later tool call or prompt shows
+/// again. (Condition 1, no relay on a tool call when the variable is not set, is `relay_never_in_pre_tool`.)
+#[test]
+fn monitorless_run_gets_new_items_once_on_a_tool_call() {
+    let s = fixture("monitorless");
+    ok(run_base(&s, &["relay", "init", "--project", "crew"]), "relay init");
+    let session = "sess-sdk";
+    register(&s, session);
+    ping(&s, "bison", "which schema is live?");
+    ok(
+        run_base(&s, &["relay", "task", "--to", TITLE, "--slug", "wire-the-form", "--summary", "wire the form", "--from", "heron"]),
+        "relay task",
+    );
+    ok(
+        run_base(&s, &["relay", "send", "--project", "crew", "--from", "lark", "--to", TITLE, "--type", "notify", "--msg", "the schema is frozen"]),
+        "relay send",
+    );
+    ok(run_base_in_session(&s, &["relay", "register", "--as", "heron"], "sess-heron"), "register heron");
+    ok(run_base_in_session(&s, &["relay", "ping", "--to", "heron", "--msg", "status?"], session), "ask heron");
+    ok(run_base_in_session(&s, &["relay", "ping", "--to", TITLE, "--msg", "status is green"], "sess-heron"), "heron answers");
+
+    let sdk: &[(&str, &str)] = &[("BASE_NO_WAKE_NUDGE", "1")];
+    let ls = || serde_json::json!({ "command": "ls" });
+    let first = ok(run_pre_tool_use(&s, "Bash", ls(), session, sdk), "pre-tool hook");
+    let texts = ["which schema is live?", "wire the form", "the schema is frozen", "status is green"];
+    for needle in ["relay: ping from bison (", "relay: task wire-the-form", "relay (crew): notify from lark (", "relay: reply from heron ("]
+        .iter()
+        .chain(texts.iter())
+    {
+        assert!(first.contains(needle), "{needle:?} was not on the first tool call:\n{first}");
+    }
+    for marker in SCRIPT_MARKERS {
+        assert!(!first.contains(marker), "{marker:?} on a tool call:\n{first}");
+    }
+    assert!(!first.contains("inbox watcher") && !first.contains("base relay arm"), "a watcher line on a tool call:\n{first}");
+    for claim in PRIORITY_CLAIMS {
+        assert!(!first.contains(claim), "{claim:?} in relay text:\n{first}");
+    }
+
+    // Once: not on the next tool call, and not on the next prompt.
+    let again = ok(run_pre_tool_use(&s, "Bash", ls(), session, sdk), "pre-tool hook");
+    assert!(!again.contains("relay:") && !again.contains("relay ("), "shown twice on tool calls:\n{again}");
+    let next = prompt(&s, session);
+    for text in texts {
+        assert!(!next.contains(text), "{text:?} shown again on the prompt after the tool call:\n{next}");
+    }
 }
