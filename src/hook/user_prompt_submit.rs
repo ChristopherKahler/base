@@ -404,6 +404,13 @@ pub fn collect(
         let rules_text =
             crate::domain::rules::render_block("DOMAIN", &fresh, rules.len(), &domain_def.name);
 
+        // An always-on domain's CONTEXT block named the domain as served whenever it listed decisions, so the walk
+        // never listed the domain itself. Its decisions now have their own block and the CONTEXT is often empty, so
+        // the domain is marked here, in lean mode too: the walk would otherwise add "domain GLOBAL" to blocks that
+        // reach it (measured on the BO-03 replay, 5 of 300 prompts).
+        if domain_def.is_always() {
+            domain_served.insert(domain_walk_key(config, domain_def));
+        }
         let neighborhood_text = match (&graph_store, lean_mode) {
             (Some(store), false) => {
                 let (n, served) =
@@ -411,13 +418,6 @@ pub fn collect(
                         domain_def.is_always() && global.contains(id)
                     });
                 domain_served.extend(served);
-                // An always-on domain's CONTEXT block named the domain as served whenever it listed decisions, so the
-                // walk never listed the domain itself. Its decisions now have their own block and the CONTEXT is
-                // often empty, so the domain is marked here: the walk would otherwise add "domain GLOBAL" to blocks
-                // that reach it (measured on the BO-03 replay, 5 of 300 prompts).
-                if domain_def.is_always() {
-                    domain_served.insert(domain_walk_key(config, domain_def));
-                }
                 n
             }
             _ => String::new(),
@@ -565,8 +565,9 @@ pub fn collect(
         }
     }
 
-    // F5: the global decisions this prompt names by keyword, each once per session and recorded only if printed
-    // (D15), at priority 4 with the rest of the always-on layer. Not held back in lean mode: unlike the
+    // F5: the global decisions this prompt names by keyword, each once per session (and again after a DEPLETED or
+    // CRITICAL force-refresh, as CONTEXT is) and recorded only if printed (D15), at priority 4 with the rest of the
+    // always-on layer. Not held back in lean mode: unlike the
     // neighbourhood, a keyword is a direct match to what the prompt is about. A decision another domain's
     // CONTEXT already printed on this prompt is not listed twice.
     let (decisions_text, listed) = global.prompt_block(&prompt, &|d| {
@@ -754,7 +755,7 @@ pub(crate) fn domain_walk_key(config: &BaseConfig, domain_def: &domain::DomainDe
 }
 
 /// The walk's F5 filter: a global decision filed only under always-on domains that this prompt does not name by
-/// keyword, or that this session was already given by the `global-decisions` block.
+/// keyword, or any global decision this session was already given by the `global-decisions` block.
 fn global_withheld(
     global: &crate::domain::global_decisions::GlobalDecisions,
     session: &SessionState,
@@ -764,7 +765,7 @@ fn global_withheld(
     global.withheld_from(id, prompt)
         || global.get(id).is_some_and(|d| {
             let (key, hash) = d.claim_key();
-            !d.elsewhere && session.is_injected(&key, hash)
+            session.is_injected(&key, hash)
         })
 }
 

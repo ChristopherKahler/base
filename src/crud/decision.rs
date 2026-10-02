@@ -267,7 +267,7 @@ pub fn update_with(
             Ok(QueryResults::Boolean(true)) => Ok(sparql),
             _ => anyhow::bail!(
                 "decision '{slug}' is not in this tier's graph <{graph}>, so nothing was changed. Run the command from \
-                 the workspace that holds it, or with -g for the global tier."
+                 the workspace that holds it, or `base decision -g update ...` for the global tier."
             ),
         }
     })

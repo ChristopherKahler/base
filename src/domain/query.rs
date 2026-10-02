@@ -434,7 +434,7 @@ pub fn context_pull(config: &BaseConfig, cwd: &Path, text: &str) {
     //
     // The global decisions the text names by keyword, as the prompt hook prints them (F5), with no session dedup
     // either, for the same reason.
-    let (decisions, listed) = global.prompt_block(text, &|_| false);
+    let (decisions, listed) = global.prompt_block(text, &|d| domain_served.contains(&d.id));
     if !decisions.is_empty() {
         println!("{decisions}");
     }

@@ -17,9 +17,10 @@
 //! HOW THE PROMPT SERVES THEM. An always-on domain's CONTEXT block no longer lists its decisions at all: it
 //! would change with every prompt's keywords, and the block is deduped by its whole text, so each change would
 //! send the rest of it again. The decisions a prompt names by keyword go in their own block instead
-//! ([`GlobalDecisions::prompt_block`]), each one once per session like a rule. A decision that is ALSO filed
-//! under a domain that is not always-on (`elsewhere`) is that domain's as well: its CONTEXT keeps it when it
-//! matches, and the walk treats it as any record.
+//! ([`GlobalDecisions::prompt_block`]), each one once per session, and again after a DEPLETED or CRITICAL
+//! force-refresh, as a domain's CONTEXT is. A decision that is ALSO filed under a configured domain that is not
+//! always-on (`elsewhere`) is that domain's as well: its CONTEXT keeps it when it matches, and the walk treats it
+//! as any record. A `hasDecision` edge from anything else (a plan, a domain no longer configured) does not count.
 //!
 //! One place answers "is this record a global decision, and does this text name it", for every surface that
 //! serves decisions on a prompt: the domain neighbourhood (`domain::query`), the decisions block, the
@@ -50,7 +51,7 @@ pub struct GlobalDecision {
     pub domain: String,
     /// Sorted, lowercased, deduplicated.
     pub keywords: Vec<String>,
-    /// Also filed under a domain that is not always-on.
+    /// Also filed under a configured domain that is not always-on.
     pub elsewhere: bool,
 }
 
@@ -72,11 +73,15 @@ pub struct GlobalDecisions {
 /// `prompt_keywords` meet (`matcher::contains_word`), so `CLAUDE_CONFIG_DIR` and `second account` match as
 /// written and `port` does not match `support`.
 pub fn keyword_hit(keywords: &[String], text: &str) -> bool {
-    let lower = text.to_lowercase();
+    hit_lower(keywords, &text.to_lowercase())
+}
+
+/// [`keyword_hit`] on a text already lowercased, so a caller testing many decisions lowercases it once.
+fn hit_lower(keywords: &[String], lower: &str) -> bool {
     keywords
         .iter()
         .map(|k| k.trim().to_lowercase())
-        .any(|k| crate::domain::matcher::contains_word(&lower, &k))
+        .any(|k| crate::domain::matcher::contains_word(lower, &k))
 }
 
 /// Split `--keywords "a, b, c"` into the stored list: trimmed, blanks dropped, case-insensitive duplicates
@@ -104,22 +109,28 @@ impl GlobalDecisions {
         if always.is_empty() {
             return Self::default();
         }
+        // The configured domains that are not always-on: only an edge from one of these makes a decision `elsewhere`.
+        let others: std::collections::HashSet<String> = domains
+            .iter()
+            .filter(|d| !d.is_always())
+            .map(|d| crud::build_iri(ns, "domain", &crud::slugify(&d.name)))
+            .collect();
         let list = always.keys().map(|iri| format!("<{iri}>")).collect::<Vec<_>>().join(", ");
         // Both filters INSIDE the GRAPH group, beside the pattern they constrain (`supersede::sparql_exclude_superseded`
-        // says why). Every domain that files the decision is returned, so one filed elsewhere too is known. The
-        // keywords are read from any graph: `base decision update` writes them where the decision's type triple is,
-        // which need not be where a domain's `hasDecision` edge was written.
+        // says why). The always-on edge, the name, the other domains' edges and the keywords are each read from any
+        // graph: an edge need not be written where the decision's name is (`base decision update` writes keywords
+        // where the type triple is, and a domain may be linked from another tier).
         let no_transient = crate::ontology::transient::sparql_exclude(ns, "d");
         let no_superseded = crate::supersede::sparql_exclude_superseded(ns, "d");
         let sparql = format!(
             "{pfx}\n\
-             SELECT ?dom ?d ?name ?kw WHERE {{\n\
+             SELECT ?dom ?d ?name ?od ?kw WHERE {{\n\
+               GRAPH ?ag {{ ?dom {p}:hasDecision ?d . FILTER(?dom IN ({list})) }}\n\
                GRAPH ?g {{\n\
-                 ?dom {p}:hasDecision ?d .\n\
                  ?d {p}:name ?name .\n\
                  {no_transient}{no_superseded}\
                }}\n\
-               FILTER EXISTS {{ GRAPH ?ag {{ ?ad {p}:hasDecision ?d . FILTER(?ad IN ({list})) }} }}\n\
+               OPTIONAL {{ GRAPH ?og {{ ?od {p}:hasDecision ?d }} }}\n\
                OPTIONAL {{ GRAPH ?kg {{ ?d {p}:{PRED_KEYWORD} ?kw }} }}\n\
              }}",
             pfx = crud::prefixes(ns),
@@ -149,10 +160,13 @@ impl GlobalDecisions {
                 keywords: Vec::new(),
                 elsewhere: false,
             });
-            match always.get(&dom) {
-                Some(n) if entry.domain.is_empty() || *n < entry.domain.as_str() => entry.domain = (*n).to_string(),
-                Some(_) => {}
-                None => entry.elsewhere = true,
+            if let Some(n) = always.get(&dom)
+                && (entry.domain.is_empty() || *n < entry.domain.as_str())
+            {
+                entry.domain = (*n).to_string();
+            }
+            if named("od").is_some_and(|od| others.contains(&od)) {
+                entry.elsewhere = true;
             }
             if let Some(kw) = literal("kw").map(|k| k.trim().to_lowercase()).filter(|k| !k.is_empty())
                 && !entry.keywords.contains(&kw)
@@ -190,8 +204,9 @@ impl GlobalDecisions {
     /// The global decisions a prompt with this text names by keyword, by domain and then name, leaving out those
     /// `skip` says were already served.
     pub fn matched<'a>(&'a self, text: &str, skip: &dyn Fn(&GlobalDecision) -> bool) -> Vec<&'a GlobalDecision> {
+        let lower = text.to_lowercase();
         let mut out: Vec<&GlobalDecision> =
-            self.by_id.values().filter(|d| keyword_hit(&d.keywords, text) && !skip(d)).collect();
+            self.by_id.values().filter(|d| hit_lower(&d.keywords, &lower) && !skip(d)).collect();
         out.sort_by(|a, b| a.domain.cmp(&b.domain).then_with(|| a.name.cmp(&b.name)));
         out
     }
