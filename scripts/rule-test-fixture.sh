@@ -21,7 +21,9 @@ bin="$target/debug/base"
 # write as a write into the real home (PR #191, run 37113466070). RUNNER_TEMP (D:\a\_temp there) is outside the
 # profile, so on a Windows runner the home goes there. Both spellings are printed, so a log shows which applied.
 if command -v cygpath >/dev/null 2>&1; then
-  echo "temp folder: bash TMP=${TMP:-} · native $(powershell.exe -NoProfile -Command '[IO.Path]::GetTempPath()' 2>/dev/null | tr -d '\r')"
+  # cmd.exe echoes the variables as a native program receives them, with no expansion (.NET's GetTempPath would
+  # expand an 8.3 short name and hide it).
+  echo "temp folder: bash TMP=${TMP:-} · native TMP=$(cmd.exe //c 'echo %TMP%' 2>/dev/null | tr -d '\r') TEMP=$(cmd.exe //c 'echo %TEMP%' 2>/dev/null | tr -d '\r')"
 fi
 if command -v cygpath >/dev/null 2>&1 && [ -n "${RUNNER_TEMP:-}" ]; then
   tmp="$(mktemp -d -p "$(cygpath -u "$RUNNER_TEMP")")"
