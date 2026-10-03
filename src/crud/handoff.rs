@@ -334,8 +334,8 @@ impl Dates {
     }
 }
 
-/// The dates of `slug`'s copy in a tier other than `written`, when one holds it: the newest copy by `createdAt` when
-/// several do. A create of a slug that only another tier holds is a MOVE (BO-11's re-register path; the F22b sweep's
+/// The dates of `slug`'s open or deferred copy in a tier other than `written`, when one holds it: the newest copy by
+/// `createdAt` when several do. A create of a slug that only another tier holds is a MOVE (BO-11's re-register path; the F22b sweep's
 /// moves), and a move keeps the record's dates (F22c): before BO-12 every moved record got `now` and jumped to the top
 /// of session start as if it were new.
 ///
@@ -367,6 +367,11 @@ fn dates_elsewhere(gbl_root: Option<&Path>, standing_cwd: &Path, written: &Path,
         }
         let store = Store::new().ok()?;
         if store.load_from_reader(oxigraph::io::RdfFormat::NQuads, lines.as_bytes()).is_err() {
+            continue;
+        }
+        // Only a live copy is being moved. An archived one with the same name is an old record, and a new handoff that
+        // happens to reuse its doc name must not take its age and defer at once (code review, finding 4).
+        if !matches!(field(&store, "status").as_deref(), Some("open" | "deferred")) {
             continue;
         }
         let Some(created) = field(&store, "createdAt") else { continue };

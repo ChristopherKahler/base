@@ -180,6 +180,9 @@ pub enum Disagreement {
 /// F24a: compaction after the repairs.
 #[derive(Debug, Serialize)]
 pub struct Compaction {
+    /// How the tier got compact: `by the repair's write` (its dump is one line per quad), `base graph compact` (a tier
+    /// the repair left alone that had duplicate lines), or `already compact` (nothing to do, so no snapshot).
+    pub how: &'static str,
     pub lines_before: usize,
     /// The quads the tier holds once repaired, which compaction writes one per line. Planned runs say "about": a write
     /// landing before `--yes` moves it.
@@ -193,7 +196,7 @@ pub struct Compaction {
 pub struct Backups {
     /// `[graph] keep_backups` for this tier.
     pub keep: usize,
-    /// Snapshots this run takes, counted among the kept: the fix's own when the graph changes, and compaction's.
+    /// Snapshots this run takes, counted among the kept: one when the graph changes or is compacted, else none.
     pub new: usize,
     /// Existing snapshots kept, newest first.
     pub kept: Vec<String>,
@@ -225,17 +228,18 @@ pub struct ConfigFix {
 /// doctor --fix` and the upgrade path both call this). Errors are per tier and per file, so one that fails does not
 /// stop the others.
 pub fn run(cwd: &Path, apply: bool) -> Report {
-    let config = BaseConfig::load(cwd);
-    let ctx = Ctx {
-        cwd,
-        ns: &config.namespace,
-        registry: &config.workspace,
-        home: crate::home::home_root(),
-    };
+    // The registry from the workspace's own config, found by the walk, so a run from a subfolder reads what doctor reads.
+    let root = crate::config::find_workspace_base(cwd).and_then(|b| b.parent().map(Path::to_path_buf));
+    let config = BaseConfig::load(root.as_deref().unwrap_or(cwd));
+    let home = crate::home::home_root();
     let tiers = crate::doctor::tier_paths(cwd)
         .into_iter()
         .map(|(tier, path)| {
             let mut fix = TierFix::new(&tier, &path);
+            // Each tier read with its own namespace, from its own base.toml, as `doctor::diagnose_tier` reads it.
+            let tier_root = path.parent().and_then(Path::parent).unwrap_or(&path);
+            let tier_config = BaseConfig::load(tier_root);
+            let ctx = Ctx { cwd, ns: &tier_config.namespace, registry: &config.workspace, home: home.clone() };
             if let Err(e) = tier_fix(&ctx, &path, apply, &mut fix) {
                 fix.error = Some(format!("{e:#}"));
             }
@@ -272,31 +276,58 @@ fn tier_fix(ctx: &Ctx<'_>, path: &Path, apply: bool, fix: &mut TierFix) -> Resul
             &planned
         }
     };
+    let quads_before = store.len().context("counting the store")?;
     let moves = repair_store(ctx, path, store, fix)?;
     let lines_after = store.len().context("counting the repaired store")?;
     let changed = fix.changes_graph();
+    // F24a. The repair's own write is a compaction: the store dumped one line per quad, duplicates gone, which is all
+    // `base graph compact` does. So compaction runs by itself only on a tier the repair leaves alone and that has
+    // duplicate lines; otherwise a re-run on a repaired store would take a snapshot to change nothing, and rotate out
+    // the one taken before the repair (code review, finding 1).
+    let how = if changed {
+        "by the repair's write"
+    } else if lines_before > quads_before {
+        "base graph compact"
+    } else {
+        "already compact"
+    };
+    let new = usize::from(how != "already compact");
 
     if let Some(locked) = locked {
+        let mut backup = None;
         if changed {
-            fix.snapshot = Some(store::snapshot(path, "fix")?.display().to_string());
+            let snap = store::snapshot(path, "fix")?.display().to_string();
+            fix.snapshot = Some(snap.clone());
+            backup = Some(snap);
             // Destinations first: a failure here leaves this tier unwritten, so nothing is lost, and a run after it
-            // finds the same records to move (a destination graph is a set, a destination file is deduplicated).
-            for (dest, quads) in &moves {
+            // finds the same records to move (a destination graph is a set, a destination file is deduplicated). Each
+            // destination is written once, however many graphs go to it: one lock, one snapshot, one write.
+            let mut by_dest: BTreeMap<String, (Dest, Vec<Quad>)> = BTreeMap::new();
+            for (dest, quads) in moves {
+                let key = match &dest {
+                    Dest::Workspace { path } | Dest::File { path, .. } => path.clone(),
+                    Dest::Left { .. } => continue,
+                };
+                by_dest.entry(key).or_insert_with(|| (dest, Vec::new())).1.extend(quads);
+            }
+            for (dest, quads) in by_dest.values() {
                 write_destination(dest, quads)?;
             }
             locked.write(Change::Op("doctor.fix"))?;
         }
         drop(locked);
-        let out = crate::graph::compact_tier(path)?;
-        // The tier's lines before this run, as the plan counted them: compaction's own count is taken after the
-        // repair's write, which already dropped every duplicate the store collapses.
-        fix.compact = Some(Compaction { lines_before, lines_after: out.lines_after, backup: Some(out.backup) });
+        let mut lines_now = lines_after;
+        if how == "base graph compact" {
+            let out = crate::graph::compact_tier(path)?;
+            lines_now = out.lines_after;
+            backup = Some(out.backup);
+        }
+        fix.compact = Some(Compaction { how, lines_before, lines_after: lines_now, backup });
         store::prune_backups(path, keep, None);
         let after: BTreeSet<PathBuf> = store::backups(path).into_iter().map(|b| b.path).collect();
-        fix.backups = backup_report(path, keep, usize::from(changed) + 1, &before_backups, |b| after.contains(&b.path));
+        fix.backups = backup_report(path, keep, new, &before_backups, |b| after.contains(&b.path));
     } else {
-        fix.compact = Some(Compaction { lines_before, lines_after, backup: None });
-        let new = usize::from(changed) + 1;
+        fix.compact = Some(Compaction { how, lines_before, lines_after, backup: None });
         let kept: BTreeSet<PathBuf> =
             before_backups.iter().take(keep.saturating_sub(new)).map(|b| b.path.clone()).collect();
         fix.backups = backup_report(path, keep, new, &before_backups, |b| kept.contains(&b.path));
@@ -368,6 +399,15 @@ fn move_foreign(ctx: &Ctx<'_>, path: &Path, store: &Store, fix: &mut TierFix) ->
     let mut graphs: Vec<(String, Vec<Quad>)> = by_graph.into_iter().collect();
     graphs.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
 
+    // Quads per subject over the whole tier, once: what a foreign graph's records still have elsewhere in it.
+    let mut per_subject: HashMap<String, usize> = HashMap::new();
+    if !graphs.is_empty() {
+        for q in store.iter().filter_map(Result::ok) {
+            if let Some(s) = subject_iri(&q.subject) {
+                *per_subject.entry(s).or_default() += 1;
+            }
+        }
+    }
     let mut moves = Vec::new();
     for (graph, quads) in graphs {
         let workspace = crate::doctor::graph_owner(&graph, &ctx.ns.uri).unwrap_or_default().to_string();
@@ -380,12 +420,8 @@ fn move_foreign(ctx: &Ctx<'_>, path: &Path, store: &Store, fix: &mut TierFix) ->
         }
         let mut kinds: Vec<(String, usize)> = kinds.into_iter().collect();
         kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let left_behind = store
-            .iter()
-            .filter_map(Result::ok)
-            .filter(|q| !matches!(&q.graph_name, GraphName::NamedNode(g) if g.as_str() == graph))
-            .filter(|q| subject_iri(&q.subject).is_some_and(|s| subjects.contains(&s)))
-            .count();
+        let left_behind = subjects.iter().map(|s| per_subject.get(s).copied().unwrap_or(0)).sum::<usize>()
+            - quads.iter().filter(|q| subject_iri(&q.subject).is_some()).count();
         let dest = if quads.len() >= own {
             Dest::Left {
                 why: format!(
@@ -456,7 +492,12 @@ fn destination(ctx: &Ctx<'_>, path: &Path, workspace: &str) -> Dest {
             reachable.push(graph);
         }
     }
-    let file = path.with_file_name(format!("foreign-{workspace}.nq")).display().to_string();
+    // The name comes from a graph IRI, which an inbound op can make anything: only its slug reaches a file name.
+    let safe = match crate::crud::slugify(workspace) {
+        s if s.is_empty() => "unnamed".to_string(),
+        s => s,
+    };
+    let file = path.with_file_name(format!("foreign-{safe}.nq")).display().to_string();
     match reachable.as_slice() {
         [one] => Dest::Workspace { path: one.display().to_string() },
         [] if named.is_empty() => Dest::File { path: file, why: format!("no registered workspace named {workspace}") },
@@ -485,7 +526,8 @@ fn write_destination(dest: &Dest, quads: &[Quad]) -> Result<()> {
             }
             locked.write(Change::Op("doctor.fix.move-in"))
         }
-        Dest::File { path, .. } => {
+        // Locked like a graph: two runs appending to one file at once would each write the other's lines away.
+        Dest::File { path, .. } => store::with_graph_lock(Path::new(path), || {
             let path = Path::new(path);
             let existing = std::fs::read_to_string(path).unwrap_or_default();
             let have: BTreeSet<&str> = existing.lines().map(str::trim).collect();
@@ -507,7 +549,7 @@ fn write_destination(dest: &Dest, quads: &[Quad]) -> Result<()> {
             let tmp = path.with_extension("nq.fix-tmp");
             std::fs::write(&tmp, &text).with_context(|| format!("writing {}", tmp.display()))?;
             std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
-        }
+        }),
     }
 }
 
@@ -757,8 +799,8 @@ fn settle_disagreements(ns: &NamespaceConfig, store: &Store) -> Result<Vec<Disag
             .quads_for_pattern(None, Some(sup), Some(r.into()), None)
             .filter_map(Result::ok)
             .filter_map(|q| subject_iri(&q.subject))
-            .min()
-            .filter(|by| !supersede::would_cycle(store, ns, record, by));
+            .filter(|by| !supersede::would_cycle(store, ns, record, by))
+            .min();
         let g = quads[0].graph_name.as_ref();
         match by {
             Some(by) => {
@@ -1026,10 +1068,12 @@ fn format_tier(out: &mut String, t: &TierFix, applied: bool) {
         row(out, "supersession disagreement", &format!("{}: {}", t.supersession.len(), each.join("; ")));
     }
     if let Some(cp) = &t.compact {
-        let value = if applied {
-            format!("{} -> {} lines", cp.lines_before, cp.lines_after)
+        let value = if cp.how == "already compact" {
+            format!("{} lines, already compact (one line per quad): nothing to do", cp.lines_before)
+        } else if applied {
+            format!("{} -> {} lines ({})", cp.lines_before, cp.lines_after, cp.how)
         } else {
-            format!("{} lines -> about {}", cp.lines_before, cp.lines_after)
+            format!("{} lines -> about {} ({})", cp.lines_before, cp.lines_after, cp.how)
         };
         row(out, "compact", &value);
     }

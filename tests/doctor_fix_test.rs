@@ -183,8 +183,8 @@ fn fix_prints_plan_without_changing() {
         "note/the-hub-port-is-7420 corrects decision/base-config.hub-port",
         "1 found: 0 linked, 1 become plain notes",
         "supersession disagreement",
-        "compact",
-        "keep 3, remove 4",
+        "(by the repair's write)",
+        "keep 3, remove 3",
         "[signal] max_chars = 2000 -> [budget] memory_chars = 2000 (memory_chars was unset",
         "nothing changed: base doctor --fix --yes applies this plan",
     ] {
@@ -380,20 +380,34 @@ fn fix_compacts_after_repair() {
     let after = text(&graph);
     let unique: std::collections::BTreeSet<&str> = after.lines().collect();
     assert_eq!(unique.len(), after.lines().count(), "duplicate lines survived compaction");
-    let row = format!("{lines_before} -> {} lines", after.lines().count());
+    let row = format!("{lines_before} -> {} lines (by the repair's write)", after.lines().count());
     assert!(done.lines().any(|l| l.trim_start().starts_with("compact ") && l.ends_with(&row)), "no `{row}` row:\n{done}");
-    let snaps: Vec<String> = base::store::backups(&graph)
-        .iter()
-        .map(|b| b.path.file_name().unwrap().to_string_lossy().into_owned())
-        .collect();
-    assert!(snaps.iter().any(|n| n.starts_with("graph.nq.bak-compact-")), "compaction took no snapshot: {snaps:?}");
-    assert!(snaps.iter().any(|n| n.starts_with("graph.nq.bak-fix-")), "the repair took no snapshot first: {snaps:?}");
+    let snaps = |p: &Path| -> Vec<String> {
+        base::store::backups(p).iter().map(|b| b.path.file_name().unwrap().to_string_lossy().into_owned()).collect()
+    };
+    assert!(snaps(&graph).iter().any(|n| n.starts_with("graph.nq.bak-fix-")), "the repair took no snapshot first");
     assert_eq!(base::store::graph_health(&graph), base::store::GraphHealth::Healthy);
+
+    // A re-run on the repaired store has nothing to do: no snapshot, and no backup rotated out (review finding 1).
+    let before_rerun = snaps(&graph);
+    let again = ok(&s, &["doctor", "--fix", "--yes"]);
+    assert!(again.contains("already compact") && again.contains("keep 3 (nothing to remove)"), "{again}");
+    assert_eq!(snaps(&graph), before_rerun, "a re-run with nothing to fix changed the backups");
+
+    // A tier the repair leaves alone, with duplicate lines, runs the existing `base graph compact`.
+    let plain = home("compact-plain");
+    let mut w = Quads::ws("ws");
+    own_records(&mut w, 2);
+    let dup = w.out.lines().next().expect("a line").to_string();
+    write(&ws_graph(&plain), &format!("{}{dup}\n", w.out));
+    let done = ok(&plain, &["doctor", "--fix", "--yes"]);
+    assert!(done.contains("(base graph compact)"), "{done}");
+    assert!(snaps(&ws_graph(&plain)).iter().any(|n| n.starts_with("graph.nq.bak-compact-")), "{done}");
 }
 
-/// F24b: ten backups and `keep_backups = 3`. The run's own snapshot is one of the three kept (F15a: every apply
-/// snapshots first), so the plan names the eight oldest, and the apply removes exactly those. A copy made by hand under
-/// another name is never touched.
+/// F24b: ten backups and `keep_backups = 3` on a store with nothing to repair or compact, so the run takes no snapshot of
+/// its own: the plan names the seven oldest, and the apply removes exactly those. A copy made by hand under another name
+/// is never touched.
 #[test]
 fn fix_keeps_n_backups() {
     let s = home("backups");
@@ -426,10 +440,10 @@ fn fix_keeps_n_backups() {
         .iter()
         .map(|r| Path::new(r[0].as_str().unwrap()).file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    let oldest: Vec<String> = names[..8].to_vec();
+    let oldest: Vec<String> = names[..7].to_vec();
     let mut sorted = removed.clone();
     sorted.sort();
-    assert_eq!(sorted, oldest, "the plan names the eight oldest");
+    assert_eq!(sorted, oldest, "the plan names the seven oldest");
 
     ok(&s, &["doctor", "--fix", "--yes"]);
     let left: Vec<String> = base::store::backups(&ws_graph(&s))
@@ -437,7 +451,7 @@ fn fix_keeps_n_backups() {
         .map(|b| b.path.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
     assert_eq!(left.len(), 3, "{left:?}");
-    for kept in &names[8..] {
+    for kept in &names[7..] {
         assert!(left.contains(kept), "{kept} was the newest and is gone: {left:?}");
     }
     for gone in &oldest {
@@ -506,6 +520,11 @@ fn moving_a_handoff_keeps_its_dates() {
             .date(&h, "resurfaceAt", resurface)
             .date(&h, "lastActive", active);
     }
+    // An archived record that a new handoff's doc name happens to match: not a move, so its age is not taken.
+    let old = "handoff/2026-08-01-old-archived";
+    g.typ(old, "Handoff").lit(old, "project", "operator").lit(old, "kind", "handoff").lit(old, "status", "archived");
+    g.date(old, "createdAt", created).date(old, "resurfaceAt", resurface).date(old, "lastActive", active);
+    write(&docs.join("2026-08-01-old-archived.md"), "# reused name\n");
     write(&gbl_graph(&s), &g.out);
     // A record of another workspace in this one, carrying the same three dates, for `--fix` to move.
     let mut w = Quads::ws("ws");
@@ -544,6 +563,9 @@ fn moving_a_handoff_keeps_its_dates() {
     ];
     assert_eq!(dates_of(&ws_graph(&s), "2026-09-21-1540-meerkat-operator"), want, "the moved handoff's dates");
     assert_eq!(dates_of(&ws_graph(&s), "chris-finances-system"), want, "the moved fork's dates");
+
+    ok(&s, &["handoff", "create", "--project", "operator", "--doc", &doc("2026-08-01-old-archived"), "--lane", "new-work"]);
+    assert_ne!(dates_of(&ws_graph(&s), "2026-08-01-old-archived"), want, "a new handoff took an archived record's age");
 
     // Control: a re-register of a slug this tier already holds re-points it to now.
     ok(&s, &["fork", "create", "--project", "operator", "--doc", &doc("chris-finances-system"), "--slug", "chris-finances-system"]);
