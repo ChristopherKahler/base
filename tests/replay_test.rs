@@ -1169,3 +1169,71 @@ fn replay_project_rename_holds_on_the_corpus_store() {
     assert_eq!(orphans(&run(&["doctor", "--json"]).0), orphans_before, "doctor's orphan count moved");
     println!("replay project rename: handoff fields {handoffs:?} (workspace, global) followed, 0 old IDs, orphans {orphans_before} before and after");
 }
+
+/// BO-11 (build rule 13), on a corpus store: a create in a named lane archives only that lane's earlier handoff and
+/// leaves the corpus's own handoffs on the project open, in both tiers (corpus `project-15` has one in each, written
+/// before lanes existed); `unarchive` undoes an archive; and with the home a workspace, as on the measured machine, a
+/// create standing in a doc folder inside the global root lands in the home's tier and leaves the global graph's
+/// bytes as they were.
+#[test]
+fn replay_handoff_lanes_and_tiers_hold_on_the_corpus_store() {
+    let case = cases().into_iter().next().expect("a corpus case");
+    let s = write_case_as(&case, "bo11-lanes");
+    let run_at = |cwd: &Path, relay_as: &str, args: &[&str]| -> String {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_base"))
+            .args(args)
+            .current_dir(cwd)
+            .env("BASE_HOME", &s.home)
+            .env("BASE_NO_AUTO_UPDATE", "1")
+            .env("BASE_AST_NO_SPAWN", "1")
+            .env("BASE_RELAY_AS", relay_as)
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("WT_SESSION")
+            .env_remove("BASE_HEADLESS")
+            .output()
+            .expect("the base binary runs");
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "base {args:?}: {stdout}{stderr}");
+        stdout.into_owned()
+    };
+    let (ws, gbl) = (s.ws.join(".base").join("graph.nq"), s.home.join(".base-gbl").join(".base").join("graph.nq"));
+    let text = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let status_of = |p: &Path, slug: &str| -> Vec<String> {
+        let subject = format!("handoff/{slug}> <{}status> \"", seed::NS);
+        text(p).lines().filter_map(|l| l.split(&subject).nth(1)?.split('"').next().map(String::from)).collect()
+    };
+    let docs = s.ws.parent().expect("seed root").join("handoffs");
+    let doc = |slug: &str| -> String {
+        let path = docs.join(format!("{slug}.md"));
+        std::fs::write(&path, format!("# {slug}\n")).expect("doc");
+        path.display().to_string()
+    };
+    let (corpus_g, corpus_w) = (seed::handoff_slug(15, "handoff"), seed::handoff_slug(16, "handoff"));
+    assert_eq!(status_of(&gbl, &corpus_g), ["open"], "control: corpus project-15 has an open handoff in the global tier");
+    assert_eq!(status_of(&ws, &corpus_w), ["open"], "control: and one in the workspace tier");
+
+    let first = "2026-10-02-2300-agent-a-project-15";
+    let out = run_at(&s.ws, "agent-a", &["handoff", "create", "--project", "project-15", "--doc", &doc(first)]);
+    assert!(out.contains("archived: nothing (no earlier open handoff by agent-a on project-15)"), "{out}");
+    assert!(out.contains(&format!("{corpus_g} (no lane)")) && out.contains(&format!("{corpus_w} (no lane)")), "{out}");
+    let second = "2026-10-02-2310-agent-a-project-15";
+    let out = run_at(&s.ws, "agent-a", &["handoff", "create", "--project", "project-15", "--doc", &doc(second)]);
+    assert!(out.contains(&format!("archived: {first} (workspace tier)")), "{out}");
+    assert_eq!((status_of(&gbl, &corpus_g), status_of(&ws, &corpus_w)), (vec!["open".to_string()], vec!["open".to_string()]));
+
+    let out = run_at(&s.ws, "agent-a", &["handoff", "unarchive", first]);
+    assert_eq!(out.trim(), format!("unarchived {first} (workspace tier): status archived -> open"));
+    assert_eq!(status_of(&ws, first), ["open"]);
+
+    // F22a: the home becomes a workspace, and a session stands in the handoff doc folder inside the global root.
+    std::fs::create_dir_all(s.home.join(".base")).expect("home workspace");
+    let folder = s.home.join(".base-gbl").join("handoffs");
+    std::fs::create_dir_all(&folder).expect("doc folder");
+    let gbl_before = std::fs::read(&gbl).expect("global graph");
+    let leak = "2026-10-02-2320-agent-b-corpus-new";
+    let out = run_at(&folder, "agent-b", &["handoff", "create", "--project", "corpus-new", "--doc", &doc(leak)]);
+    assert!(out.contains("registered (slug: 2026-10-02-2320-agent-b-corpus-new)"), "{out}");
+    assert_eq!(status_of(&s.home.join(".base").join("graph.nq"), leak), ["open"], "in the home's workspace tier");
+    assert!(std::fs::read(&gbl).expect("global graph") == gbl_before, "the global graph was written");
+    println!("replay handoff lanes: 2 corpus handoffs on project-15 left open across 2 creates; unarchive undone; a create in the global root's doc folder landed in the home tier");
+}

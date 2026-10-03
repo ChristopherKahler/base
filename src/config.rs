@@ -46,16 +46,83 @@ fn global_tier_root() -> Option<PathBuf> {
 /// The workspace tier keeps the walk and keeps refusing when it finds nothing:
 /// there, no known correct location exists, which is the whole reason
 /// `crud::require_base_for_write` never auto-creates (issue #8).
+///
+/// The walk never stops at the global tier's own `.base` (BO-11, F22a). A shell
+/// parked in `~/.base-gbl/handoffs` or `~/.base-gbl/forks`, where the handoff and
+/// fork docs live, found `~/.base-gbl/.base` first and wrote the global tier while
+/// the operator was inside the workspace at `~`: 59 open handoffs and forks leaked
+/// that way on Chris's machine, every one stamped `graph/ws/base-gbl`. Now the walk
+/// passes it and finds the workspace around it. Only a folder inside the global
+/// root that no workspace encloses still resolves the global tier when that tier
+/// exists, as before: outside every workspace, that is the tier it is in. With no
+/// global tier on disk yet it resolves nothing and the write is refused, as before
+/// (issue #8): nothing here creates the global tier without `-g`.
+///
+/// The global `.base` is recognised however the path is spelled: a cwd in another
+/// letter case, or in a `\\?\` or 8.3 form, names the same folder on Windows, and a
+/// plain comparison would let the leak through for it.
 pub fn find_workspace_base(cwd: &Path) -> Option<PathBuf> {
-    if let Some(root) = global_tier_root()
+    let root = global_tier_root();
+    if let Some(root) = &root
         && cwd == root
     {
         return global_base_dir();
     }
-    walk_up(cwd, |dir| {
+    let global = global_base_dir();
+    let is_global = |base: &Path| {
+        let Some(g) = global.as_deref() else {
+            return false;
+        };
+        // Resolving a path is a system call and this walk runs on every hook, so only a `.base` whose folder could be
+        // the global root (named `.base-gbl` in any case, or an 8.3 short name) is resolved.
+        let could_be = base
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(".base-gbl") || n.contains('~'));
+        base == g || (could_be && same_dir(base, g))
+    };
+    let found = walk_up(cwd, |dir| {
         let base = dir.join(".base");
-        base.is_dir().then_some(base)
-    })
+        (base.is_dir() && !is_global(&base)).then_some(base)
+    });
+    if found.is_none()
+        && let (Some(root), Some(global)) = (&root, &global)
+        && global.is_dir()
+        && is_within(cwd, root)
+    {
+        return Some(global.clone());
+    }
+    found
+}
+
+/// `a` and `b` name one folder: equal as written, or once both are resolved (letter
+/// case, `\\?\` and 8.3 forms on Windows). Resolving needs both to exist.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+}
+
+/// `path` is `root` or inside it, as written or once both are resolved.
+fn is_within(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+        || matches!((path.canonicalize(), root.canonicalize()), (Ok(x), Ok(y)) if x.starts_with(&y))
+}
+
+/// The workspace that encloses the global tier's root folder, if any.
+///
+/// Standing in `~/.base-gbl` itself is not asking for the global tier; `-g` is. But
+/// that folder is also the path `-g` swaps cwd for, which [`find_workspace_base`]
+/// answers with the global tier. So `cli::tier_cwd` routes a cwd that IS the
+/// global root, without `-g`, through this: the folder above it, when a workspace
+/// holds it (BO-11, F22a). `None` when no workspace encloses the root, where the
+/// global tier is the right answer.
+pub fn workspace_around_global_root(cwd: &Path) -> Option<PathBuf> {
+    let root = global_tier_root()?;
+    if cwd != root {
+        return None;
+    }
+    let parent = root.parent()?;
+    find_workspace_base(parent).map(|_| parent.to_path_buf())
 }
 
 /// Walk up from `start` (inclusive), returning the first ancestor for which
@@ -1838,6 +1905,75 @@ mod tests {
             std::fs::create_dir_all(&deep).unwrap();
 
             assert_eq!(find_workspace_base(&deep), Some(ws.join(".base")));
+        });
+    }
+
+    /// BO-11 (F22a): a folder inside the global root, where the handoff and fork docs live, is inside the workspace
+    /// at home when home is one, and the walk passes the global tier's own `.base` to find it. The root itself stays
+    /// the global tier: it is the path `-g` swaps cwd for, and `workspace_around_global_root` is what routes a plain
+    /// cwd there to the workspace.
+    #[test]
+    fn a_folder_inside_the_global_root_resolves_the_workspace_around_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let root = tmp.path().join(".base-gbl");
+            let docs = root.join("handoffs");
+            std::fs::create_dir_all(root.join(".base")).unwrap();
+            std::fs::create_dir_all(&docs).unwrap();
+            std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+
+            assert_eq!(find_workspace_base(&docs), Some(tmp.path().join(".base")));
+            assert_eq!(find_workspace_base(&root), Some(root.join(".base")), "the -g path is still the global tier");
+            assert_eq!(workspace_around_global_root(&root), Some(tmp.path().to_path_buf()));
+            assert_eq!(workspace_around_global_root(&docs), None, "only the root itself is rerouted");
+        });
+    }
+
+    /// With no workspace around it, a folder inside the global root resolves the global tier, as it always did:
+    /// outside every workspace, that is the tier it is in.
+    #[test]
+    fn a_folder_inside_the_global_root_with_no_workspace_around_it_is_the_global_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let root = tmp.path().join(".base-gbl");
+            let docs = root.join("forks");
+            std::fs::create_dir_all(root.join(".base")).unwrap();
+            std::fs::create_dir_all(&docs).unwrap();
+
+            assert_eq!(find_workspace_base(&docs), Some(root.join(".base")));
+            assert_eq!(workspace_around_global_root(&root), None);
+        });
+    }
+
+    /// Review finding 1: with no global tier on disk yet and no workspace around it, a folder inside the global root
+    /// resolves nothing, so the write is refused as it always was (issue #8), rather than creating the global tier
+    /// without `-g`.
+    #[test]
+    fn a_folder_inside_a_global_root_with_no_tier_yet_resolves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let docs = tmp.path().join(".base-gbl").join("handoffs");
+            std::fs::create_dir_all(&docs).unwrap();
+            assert!(!tmp.path().join(".base-gbl").join(".base").exists(), "precondition: no global tier yet");
+            assert_eq!(find_workspace_base(&docs), None);
+        });
+    }
+
+    /// Review finding 5: Windows paths are case-blind, so a cwd spelled in another case is still inside the global
+    /// root, and the walk must still pass the global tier's `.base` to reach the workspace around it.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_inside_the_global_root_spelled_in_another_case_still_resolves_the_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let root = tmp.path().join(".base-gbl");
+            std::fs::create_dir_all(root.join(".base")).unwrap();
+            std::fs::create_dir_all(root.join("forks")).unwrap();
+            std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+            let shouted = PathBuf::from(tmp.path().join(".BASE-GBL").join("FORKS").display().to_string());
+            assert!(shouted.is_dir(), "control: the volume is case-blind, so the shouted path exists");
+            let found = find_workspace_base(&shouted).expect("a workspace");
+            assert!(same_dir(&found, &tmp.path().join(".base")), "the workspace around it, got {}", found.display());
         });
     }
 

@@ -1249,7 +1249,8 @@ pub enum ReminderAction {
 
 #[derive(Subcommand)]
 pub enum HandoffAction {
-    /// Register a handoff doc (archives the project's prior open or deferred handoff in every tier)
+    /// Register a handoff doc (archives the earlier open or deferred handoff in the same project and lane, in every
+    /// tier; other lanes' handoffs stay open)
     Create {
         #[arg(long)]
         project: String,
@@ -1258,6 +1259,11 @@ pub enum HandoffAction {
         /// Graph slug / title to summon it by (default: doc basename)
         #[arg(long)]
         slug: Option<String>,
+        /// The lane this handoff continues, for a lane several sessions hand back and forth. Default: the author's
+        /// codename (the doc's by:, else the codename in a <date>-<codename>-<project> slug, else this session's
+        /// relay title)
+        #[arg(long)]
+        lane: Option<String>,
     },
     /// List handoffs across global + workspace tiers
     List,
@@ -1275,8 +1281,10 @@ pub enum HandoffAction {
     Deferred,
     /// Snooze a handoff for N days (hide until then)
     Snooze { slug: String, days: i64 },
-    /// Archive a handoff (stop resurfacing)
+    /// Archive a handoff (stop resurfacing; `unarchive` undoes it)
     Archive { slug: String },
+    /// Undo an archive: set an archived handoff back to open, in the tier that holds it
+    Unarchive { slug: String },
 }
 
 #[derive(Subcommand)]
@@ -1305,8 +1313,10 @@ pub enum ForkAction {
     Deferred,
     /// Snooze a fork for N days (hide until then)
     Snooze { slug: String, days: i64 },
-    /// Archive a fork (stop resurfacing)
+    /// Archive a fork (stop resurfacing; `unarchive` undoes it)
     Archive { slug: String },
+    /// Undo an archive: set an archived fork back to open, in the tier that holds it
+    Unarchive { slug: String },
 }
 
 // `rule add`'s flags (P7 added `--path`) make its variant the large one. Parsed once per process, so the size costs
@@ -1708,13 +1718,47 @@ fn no_global_config() -> ! {
     )
 }
 
+/// `base handoff unarchive` and `base fork unarchive` (BO-11, F18c): one line per tier that held the slug, and a
+/// failure when nothing was archived, so a no-op never reads as success (#72).
+fn unarchive_cli(noun: &str, cwd: &std::path::Path, ns: &base::config::NamespaceConfig, slug: &str) {
+    let home = base::home::home_root();
+    let found = match crud::handoff::unarchive(home.as_deref(), cwd, ns, slug) {
+        Ok(found) => found,
+        Err(e) => die("Failed", e),
+    };
+    if found.is_empty() {
+        die(
+            "Failed",
+            format!(
+                "no {noun} '{slug}' in either tier — nothing was unarchived. Searched:\n  {}",
+                crud::handoff::searched_tiers(home.as_deref(), cwd).join("\n  ")
+            ),
+        );
+    }
+    use crud::handoff::UnarchiveOutcome;
+    for t in &found {
+        match t.outcome {
+            UnarchiveOutcome::Reopened => println!("unarchived {slug} ({}): status archived -> open", t.tier),
+            UnarchiveOutcome::LeftArchived => println!(
+                "left {slug} ({}): still archived; another tier holds it open or holds a newer copy",
+                t.tier
+            ),
+            UnarchiveOutcome::NotArchived => println!("left {slug} ({}): status {}, not archived", t.tier, t.before),
+        }
+    }
+    if !found.iter().any(|t| t.outcome == UnarchiveOutcome::Reopened) {
+        die("Failed", format!("{noun} '{slug}' was not unarchived in any tier; nothing changed"));
+    }
+}
+
 /// Which tier a write targets: `-g/--global` swaps cwd for `~/.base-gbl`, so
 /// the global tier is something you opt into rather than something you land in
 /// (issue #8). Without the flag, tier-bound writes resolve from cwd and fail
 /// loudly outside a workspace instead of silently discarding.
 fn tier_cwd(cwd: &std::path::Path, global: bool) -> std::path::PathBuf {
     if !global {
-        return cwd.to_path_buf();
+        // Standing in `~/.base-gbl` without `-g` writes the workspace around it, not the global tier (BO-11, F22a).
+        return base::config::workspace_around_global_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
     }
     match base::home::home_root() {
         Some(h) => h.join(".base-gbl"),
@@ -2445,11 +2489,23 @@ pub fn run() {
             let standing_cwd = &cwd;
             let cwd = tier_cwd(standing_cwd, global);
             match action {
-                HandoffAction::Create { project, doc, slug } => {
+                HandoffAction::Create { project, doc, slug, lane } => {
                     // An old project name files the handoff under the renamed project (BO-24, R4).
                     let project = domain::canonical_name(standing_cwd, &project);
                     let gbl = base::home::home_root();
-                    match crud::handoff::create(
+                    let relay_title = std::env::var("BASE_RELAY_AS")
+                        .ok()
+                        .filter(|t| !t.trim().is_empty())
+                        .or_else(|| {
+                            base::relay::env_session_id()
+                                .and_then(|sid| base::relay::session_registry::title_of(&sid))
+                        });
+                    let inputs = crud::handoff::LaneInputs {
+                        flag: lane,
+                        relay_title,
+                        titles: base::relay::known_titles(standing_cwd),
+                    };
+                    match crud::handoff::create_in_lane(
                         gbl.as_deref(),
                         &cwd,
                         standing_cwd,
@@ -2457,6 +2513,7 @@ pub fn run() {
                         &project,
                         &doc,
                         slug.as_deref(),
+                        &inputs,
                     ) {
                         Ok(out) => {
                             // First line unchanged: scripts and the *end flow read it.
@@ -2464,13 +2521,33 @@ pub fn run() {
                                 "Handoff for '{project}' registered (slug: {})",
                                 out.slug
                             );
-                            // Every archive, in every tier, on its own line with its tier (`auk`'s Q2 ruling).
-                            // 0.14.1 archived silently (#71); 0.15.2 archived one tier and only named the other.
+                            match &out.lane {
+                                Some(l) => println!("lane: {} (from {})", l.name, l.from.describe()),
+                                None => println!(
+                                    "lane: none (no --lane, no by: in the doc, no codename in the slug, no relay title)"
+                                ),
+                            }
+                            // Every archive, in every tier, on its own line with its tier (`auk`'s Q2 ruling), and
+                            // a line when there was none (F18b). 0.14.1 archived silently (#71); 0.15.2 archived
+                            // one tier and only named the other.
                             if out.archived.is_empty() {
-                                println!("no prior open or deferred handoff for '{project}' in any tier");
+                                let whose = match &out.lane {
+                                    Some(l) if l.from == crud::handoff::LaneFrom::Flag => format!("in lane {}", l.name),
+                                    Some(l) => format!("by {}", l.name),
+                                    None => "with no lane".to_string(),
+                                };
+                                println!("archived: nothing (no earlier open handoff {whose} on {project})");
                             }
                             for (prior, tier) in &out.archived {
-                                println!("archived prior handoff: {prior} ({tier})");
+                                println!("archived: {prior} ({tier})");
+                            }
+                            if !out.left_open.is_empty() {
+                                let others: Vec<String> = out
+                                    .left_open
+                                    .iter()
+                                    .map(|(s, l)| format!("{s} ({})", l.as_deref().unwrap_or("no lane")))
+                                    .collect();
+                                println!("left open, other lanes: {}", others.join(", "));
                             }
                         }
                         Err(e) => die("Failed", e),
@@ -2566,6 +2643,7 @@ pub fn run() {
                         Err(e) => die("Failed", e),
                     }
                 }
+                HandoffAction::Unarchive { slug } => unarchive_cli("handoff", &cwd, &config.namespace, &slug),
             }
         }
 
@@ -2667,6 +2745,7 @@ pub fn run() {
                         Err(e) => die("Failed", e),
                     }
                 }
+                ForkAction::Unarchive { slug } => unarchive_cli("fork", &cwd, &config.namespace, &slug),
             }
         }
         // ─── Reminder ────────────────────────────────────

@@ -147,11 +147,11 @@ Pairs tagged `verified: reference` alone carry the weakest provenance in either 
 ## Handoffs and forks
 
 ### Q: What's the difference between a handoff and a fork?
-**A:** A handoff is your one continuity thread per project, it's what "resume this project" means. Creating a new handoff for a project **archives the previous one** automatically, so there's only ever one open handoff per project. A fork is a build-spec for parallel side-work, and forks are additive: creating one never touches the project's handoff or any sibling forks. Use handoff for "this is where the main thread left off," use fork for "here's a separate thing to build later."
-<!-- v0.12.3 | verified: cli-help -->
+**A:** A handoff is a continuity thread: what "resume this work" means. Each project has one open handoff per lane, and a lane is the author's codename unless you name one with `--lane`. Creating a new handoff **archives the previous one in the same project and lane** automatically, and leaves other sessions' handoffs on the project open. A fork is a build-spec for parallel side-work, and forks are additive: creating one never touches a handoff or any sibling forks. Use handoff for "this is where my thread left off," use fork for "here's a separate thing to build later."
+<!-- v0.16.0 | verified: source -->
 
 ### Q: What's the trap people fall into with handoff vs. fork?
-**A:** Using `*handoff` for side-work. `handoff create` archives the project's prior open handoff without asking first, and prints each handoff it archived. So if you run it a second time to capture some side-quest instead of your main continuity doc, you just archived your real "resume here" thread and replaced it with the side-quest; what it prints tells you after the fact. If you meant to keep both, the second one should have been a `*fork`, not a second handoff.
+**A:** Using `*handoff` for side-work. `handoff create` archives your prior open handoff in the same project and lane without asking first, and prints each handoff it archived. So if you run it a second time to capture some side-quest instead of your main continuity doc, you just archived your real "resume here" thread and replaced it with the side-quest; what it prints tells you after the fact, and `base handoff unarchive <slug>` brings it back. If you meant to keep both, the second one should have been a `*fork`, not a second handoff.
 <!-- v0.16.0 | verified: source -->
 
 ### Q: How do I create a handoff?
@@ -163,7 +163,7 @@ base handoff create --project "<project>" --doc "<absolute-doc-path>"
 <!-- v0.12.3 | verified: cli-help -->
 
 ### Q: I wrote a handoff doc but nothing showed up next session. Why?
-**A:** The doc file itself is inert, only the graph node created by `base handoff create` gets scanned at session start. This is a real trap: some flows (like a PAUL handoff) print their own "HANDOFF CREATED" confirmation box that looks like the end of the job, but producing the doc is only half of it. Always verify with `base handoff list` and confirm it shows exactly one open handoff pointing at your doc path before assuming you're covered.
+**A:** The doc file itself is inert, only the graph node created by `base handoff create` gets scanned at session start. This is a real trap: some flows (like a PAUL handoff) print their own "HANDOFF CREATED" confirmation box that looks like the end of the job, but producing the doc is only half of it. Always verify with `base handoff list` and confirm it shows your handoff open and pointing at your doc path before assuming you're covered.
 <!-- v0.12.3 | verified: reference -->
 
 ### Q: How do I create a fork?
@@ -179,8 +179,16 @@ Forks are additive, registering a new one never archives existing forks or the p
 <!-- v0.16.0 | verified: source -->
 
 ### Q: How do I dismiss a handoff or fork I don't need anymore?
-**A:** Two options: `base handoff snooze <slug> <days>` (or `base fork snooze <slug> <days>`) hides it until that many days pass; `base handoff archive <slug>` (or `base fork archive <slug>`) stops it resurfacing for good. Note snooze takes positional arguments, not flags, e.g. `base handoff snooze my-project-handoff 3`, not `--days 3`.
-<!-- v0.12.3 | verified: cli-help -->
+**A:** Two options: `base handoff snooze <slug> <days>` (or `base fork snooze <slug> <days>`) hides it until that many days pass; `base handoff archive <slug>` (or `base fork archive <slug>`) stops it resurfacing. An archive can be undone with `base handoff unarchive <slug>` (or `base fork unarchive <slug>`). Note snooze takes positional arguments, not flags, e.g. `base handoff snooze my-project-handoff 3`, not `--days 3`.
+<!-- v0.16.0 | verified: cli-help -->
+
+### Q: How do I undo an archive?
+**A:** `base handoff unarchive <slug>` (or `base fork unarchive <slug>`) sets an archived handoff or fork back to open, in the tier that holds it, marks it active now, and prints what changed: `unarchived <slug> (workspace tier): status archived -> open`. A slug that is not archived anywhere fails with the status it found, and one no tier holds fails naming the tiers it searched; nothing is written either way.
+<!-- v0.16.0 | verified: cli-help -->
+
+### Q: Several sessions work one project. Will their handoffs archive each other's?
+**A:** No. A new handoff archives only the earlier open handoff in the same project and the same lane. The lane is `--lane <name>` when you pass it; otherwise it is the author's codename, taken from the doc's `by:` field, else from the codename in a `{YYYY-MM-DD-HHMM}-{codename}-{project}` slug (matched against the relay's registered titles), else from the running session's relay title. `create` prints the lane, what it archived (or `archived: nothing (...)`), and the other lanes' handoffs it left open. Two sessions that hand one line of work back and forth share a lane by passing the same `--lane`, and then each new handoff archives the other's. A handoff that names no lane anywhere shares the lane of the project's other handoffs that name none.
+<!-- v0.16.0 | verified: source -->
 
 ### Q: What is the "doc==slug protocol"?
 **A:** By convention across handoff, fork, and task-relay docs, the markdown filename (minus extension) and the graph slug/title you use to summon it should match exactly. `handoff create` and `fork create` both default `--slug` to the doc's basename specifically to enforce this, so a filename like `2026-08-13-1400-otter-my-project.md` naturally becomes the slug `2026-08-13-1400-otter-my-project`. Keeping filename and slug identical means you can always find the right doc just from the slug shown in `list`, without a separate lookup.
@@ -361,8 +369,12 @@ Forks are additive, registering a new one never archives existing forks or the p
 <!-- v0.12.3 | verified: cli-help -->
 
 ### Q: How do I clean up something that keeps resurfacing from the wrong place?
-**A:** Run `base handoff list` or `base fork list`, both list across global and workspace tiers together and show which tier each entry lives in. If something is surfacing that shouldn't be, snooze it (`base handoff snooze <slug> <days>`) or permanently stop it with `base handoff archive <slug>` (or the `fork` equivalents). If it's leaking from global because it was written outside a registered workspace, the long-term fix is `base scaffold` on that project so future writes land in its own tier.
-<!-- v0.12.3 | verified: reference -->
+**A:** Run `base handoff list` or `base fork list`, both list across global and workspace tiers together and show which tier each entry lives in. If something is surfacing that shouldn't be, snooze it (`base handoff snooze <slug> <days>`) or stop it with `base handoff archive <slug>` (or the `fork` equivalents); `unarchive` undoes an archive. If it's leaking from global because it was written outside a workspace, the long-term fix is `base scaffold` on that project so future writes land in its own tier.
+<!-- v0.16.0 | verified: reference -->
+
+### Q: Which tier does a handoff, fork, decision or note go to?
+**A:** Inside a workspace, its tier, unless you pass `-g` (`--global`). That includes the folders inside `~/.base-gbl` where handoff and fork docs live (`~/.base-gbl/handoffs`, `~/.base-gbl/forks`), and `~/.base-gbl` itself, when your home folder is a workspace: before 0.16.0 a shell parked there wrote the global tier while you were inside the workspace at `~`. Outside every workspace, a folder inside `~/.base-gbl` still writes the global tier, and any other folder refuses to write and points you at `-g` or `base scaffold`.
+<!-- v0.16.0 | verified: source -->
 
 ---
 
