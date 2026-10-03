@@ -109,6 +109,13 @@ impl Stored {
 
     /// The change with the user's edits: new wording and keywords, each only when given.
     pub fn edited(&self, text: Option<&str>, keywords: Option<&[String]>) -> Result<Change, String> {
+        // Refused rather than dropped: the edit is stored as what the user changed.
+        if self.kind == "keyword-gap" && text.is_some_and(|t| !t.trim().is_empty()) {
+            return Err(format!("{} is a keyword gap: it changes keywords, not wording; give --keywords", self.id));
+        }
+        if self.kind == "rewrite" && keywords.is_some() {
+            return Err(format!("{} is a rewrite: it changes the wording, not keywords; give --text", self.id));
+        }
         let mut p = self.clone();
         if let Some(t) = text.map(str::trim).filter(|t| !t.is_empty()) {
             p.text = Some(t.to_string());
@@ -120,21 +127,9 @@ impl Stored {
     }
 }
 
-/// The tiers to read, each as a working directory in it, never the same graph twice.
+/// The tiers to read, each as a working directory in it, never the same graph twice: `rule update`'s own list.
 fn tier_cwds(cwd: &Path) -> Vec<(Tier, PathBuf)> {
-    let mut out: Vec<(Tier, PathBuf)> = vec![(Tier::Workspace, cwd.to_path_buf())];
-    if let Some(h) = crate::home::home_root() {
-        out.push((Tier::Global, h.join(".base-gbl")));
-    }
-    let mut seen: Vec<PathBuf> = Vec::new();
-    out.retain(|(_, c)| match crate::config::find_workspace_base(c) {
-        Some(b) if !seen.contains(&b) => {
-            seen.push(b);
-            true
-        }
-        _ => false,
-    });
-    out
+    crud::rule::tier_cwds(cwd)
 }
 
 /// Every proposal in both tiers' graphs, lowest id first.
@@ -349,18 +344,22 @@ fn apply_and_store(
     extra: &[(&str, String)],
     outcome: &Outcome,
 ) -> Result<String, String> {
-    let applied = apply(config, cwd, p, change)?;
-    let mut fields: Vec<(&str, String)> = extra.to_vec();
-    fields.push(("appliedTo", applied.to.clone()));
+    // Claimed first, under its tier's lock and only while still pending, so a second review of the same proposal stops
+    // here before anything is applied twice. A failed apply puts it back to pending.
+    set_status(config, p, status, extra)?;
+    let applied = match apply(config, cwd, p, change) {
+        Ok(a) => a,
+        Err(e) => {
+            return Err(match reopen(config, p) {
+                Ok(()) => format!("{e} (nothing applied; {} is still pending)", p.id),
+                Err(back) => format!("{e}; and putting {} back to pending failed: {back}", p.id),
+            });
+        }
+    };
     let verb = if status == "edited" { "edited and applied" } else { "approved" };
-    let mut s = String::new();
-    if let Err(e) = set_status(config, p, status, &fields) {
-        s.push_str(&format!(
-            "{verb} {}: {}, but its status was not stored ({e}); it still reads as pending\n",
-            p.id, applied.line
-        ));
-    } else {
-        s.push_str(&format!("{verb} {}: {}\n", p.id, applied.line));
+    let mut s = format!("{verb} {}: {}\n", p.id, applied.line);
+    if let Err(e) = write_fields(config, p, None, &[], &[("appliedTo", applied.to.clone())]) {
+        s.push_str(&format!("  (where it was written was not recorded on {}: {e})\n", p.id));
     }
     for n in &applied.notes {
         s.push_str(&format!("  {n}\n"));
@@ -387,26 +386,55 @@ fn reject(config: &BaseConfig, p: &Stored, reason: Option<&str>) -> Result<Strin
 /// Store `status` on `p`, with `reviewedAt` and `fields`, in the graph that holds it, under that tier's lock, only while
 /// it is still pending there.
 fn set_status(config: &BaseConfig, p: &Stored, status: &str, fields: &[(&str, String)]) -> Result<(), String> {
+    let mut insert: Vec<(&str, String)> = vec![("status", status.to_string()), ("reviewedAt", crud::now_iso())];
+    insert.extend(fields.iter().cloned());
+    write_fields(config, p, Some("pending"), &["status"], &insert)
+}
+
+/// An approval whose change could not be applied: pending again, with nothing of the review left on it.
+fn reopen(config: &BaseConfig, p: &Stored) -> Result<(), String> {
+    let review = ["status", "reviewedAt", "rejectReason", "editedText", "editedKeyword", "appliedTo"];
+    write_fields(config, p, None, &review, &[("status", "pending".to_string())])
+}
+
+/// On `p`, in the graph that holds it, under that tier's lock: remove every value of `delete`, then add `insert`
+/// (`reviewedAt` as a dateTime). With `require`, only while its status is that, else nothing is written.
+fn write_fields(
+    config: &BaseConfig,
+    p: &Stored,
+    require: Option<&str>,
+    delete: &[&str],
+    insert: &[(&str, String)],
+) -> Result<(), String> {
     let ns = &config.namespace;
     let pfx = &ns.prefix;
     let (iri, graph) = (p.iri.clone(), p.graph.clone());
-    let mut lines = format!("    <{iri}> {pfx}:status \"{status}\" .\n    <{iri}> {pfx}:reviewedAt \"{}\"^^xsd:dateTime .\n", crud::now_iso());
-    for (pred, v) in fields {
-        lines.push_str(&format!("    <{iri}> {pfx}:{pred} \"{}\" .\n", crud::escape_sparql_literal(v)));
+    let mut lines = String::new();
+    for (pred, v) in insert {
+        let value = if *pred == "reviewedAt" {
+            format!("\"{v}\"^^xsd:dateTime")
+        } else {
+            format!("\"{}\"", crud::escape_sparql_literal(v))
+        };
+        lines.push_str(&format!("    <{iri}> {pfx}:{pred} {value} .\n"));
     }
+    let mut sparql = String::new();
+    for pred in delete {
+        sparql.push_str(&format!(
+            "DELETE {{ GRAPH <{graph}> {{ <{iri}> {pfx}:{pred} ?v }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> {pfx}:{pred} ?v }} }} ;\n"
+        ));
+    }
+    sparql.push_str(&format!("INSERT DATA {{ GRAPH <{graph}> {{\n{lines}  }} }}"));
     let id = p.id.clone();
+    let require = require.map(String::from);
     crud::load_read_then_mutate(&p.tier_cwd, ns, |store| {
-        let ask = format!(
-            "{}\nASK {{ GRAPH <{graph}> {{ <{iri}> {pfx}:status \"pending\" }} }}",
-            crud::prefixes(ns)
-        );
-        if !matches!(crate::store::query(store, &ask)?, QueryResults::Boolean(true)) {
-            anyhow::bail!("{id} is no longer pending (another review got to it first)");
+        if let Some(want) = require.as_deref() {
+            let ask = format!("{}\nASK {{ GRAPH <{graph}> {{ <{iri}> {pfx}:status \"{want}\" }} }}", crud::prefixes(ns));
+            if !matches!(crate::store::query(store, &ask)?, QueryResults::Boolean(true)) {
+                anyhow::bail!("{id} is no longer {want} (another review got to it first); nothing changed");
+            }
         }
-        Ok(format!(
-            "DELETE {{ GRAPH <{graph}> {{ <{iri}> {pfx}:status ?s }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> {pfx}:status ?s }} }} ;\n\
-             INSERT DATA {{ GRAPH <{graph}> {{\n{lines}  }} }}"
-        ))
+        Ok(sparql)
     })
     .map_err(|e| format!("{e:#}"))
 }
@@ -624,14 +652,21 @@ fn apply_rule_words(config: &BaseConfig, cwd: &Path, spec: &str, add: &[String],
 fn apply_decision_keywords(config: &BaseConfig, cwd: &Path, slug: &str, add: &[String], drop: &[String]) -> Result<Applied, String> {
     let ns = &config.namespace;
     let (tier, tier_cwd) = decision_tier(config, cwd, slug)?;
-    let now: Vec<String> = crate::store::load_merged(cwd)
-        .map(|s| {
-            crate::domain::global_decisions::GlobalDecisions::load(&s, config, &crate::domain::load_domains(cwd))
-                .by_slug(slug)
-                .map(|g| g.keywords.clone())
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
+    // Its keywords in every graph, whatever domain it is under: `update_with` replaces the whole list.
+    let iri = crud::build_iri(ns, "decision", slug);
+    let q = format!(
+        "{}\nSELECT DISTINCT ?kw WHERE {{ GRAPH ?g {{ <{iri}> {p}:{kwp} ?kw }} }}",
+        crud::prefixes(ns),
+        p = ns.prefix,
+        kwp = crate::domain::global_decisions::PRED_KEYWORD
+    );
+    let mut now: Vec<String> = Vec::new();
+    if let Some(store) = crate::store::load_merged(cwd)
+        && let Ok(QueryResults::Solutions(rows)) = crate::store::query(&store, &q)
+    {
+        now.extend(rows.filter_map(Result::ok).filter_map(|r| r.get("kw").map(|k| crud::term_display(k.into()))));
+    }
+    now.sort();
     let next = replay::edit_list(&now, add, drop);
     crud::decision::update_with(&tier_cwd, ns, slug, None, None, None, None, Some(&next)).map_err(|e| format!("{e:#}"))?;
     let to = format!("graph ({} tier)", tier.label());
@@ -698,8 +733,18 @@ fn rewrite_rule(config: &BaseConfig, cwd: &Path, spec: &str, text: &str) -> Resu
     if old_slug.is_empty() {
         return Err(format!("{short}: its graph record has no rule IRI to supersede"));
     }
-    crud::rule::add_with_tests(&tier_cwd, ns, &rule.domain, text, rationale.as_deref(), Some(&old_slug), &matchers, &tests)
-        .map_err(|e| format!("{e:#}"))?;
+    if let Err(e) = crud::rule::add_with_tests(&tier_cwd, ns, &rule.domain, text, rationale.as_deref(), Some(&old_slug), &matchers, &tests) {
+        // A file rule's graph copy was made for this write alone: without the new wording superseding it, it would be
+        // served beside its own line, so it goes again.
+        let mut msg = format!("{e:#}");
+        if matches!(home, crud::rule::TestHome::Toml { .. })
+            && let Some(index) = old_slug.rsplit("cli-").next().and_then(|i| i.parse::<u32>().ok())
+            && let Err(undo) = crud::rule::remove(&tier_cwd, ns, &rule.domain, index)
+        {
+            msg.push_str(&format!("; and its graph copy {old_slug} could not be removed ({undo:#}): remove it with base rule remove"));
+        }
+        return Err(msg);
+    }
     let new_short = crate::domain::rule_test::short_ref(&rule.domain, &rules::rule_id(&rule.domain, text));
     if let crud::rule::TestHome::Toml { file, .. } = &home {
         match crate::domain::remove_rule(file, &rule.domain, &rule.id) {
@@ -966,7 +1011,14 @@ pub fn interactive(config: &BaseConfig, cwd: &Path) {
                 (Err(e), _) | (_, Err(e)) => Err(e.clone()),
             },
             'r' => reject(config, p, None),
-            'e' => edit_here(config, cwd, p),
+            'e' => match edit_here(config, cwd, p, &replayer) {
+                Ok(Some(text)) => Ok(text),
+                Ok(None) => {
+                    println!("stopped; {left} left pending");
+                    return;
+                }
+                Err(e) => Err(e),
+            },
             _ => Ok("skipped\n".to_string()),
         };
         match result {
@@ -986,8 +1038,9 @@ pub fn interactive(config: &BaseConfig, cwd: &Path) {
     }
 }
 
-/// `e`: the wording and the keywords (Enter keeps each), the edited change's replay, then apply or skip.
-fn edit_here(config: &BaseConfig, cwd: &Path, p: &Stored) -> Result<String, String> {
+/// `e`: the wording and the keywords (Enter keeps each), the edited change's replay, then apply or skip. `Ok(None)`
+/// when the user stops the review at that prompt (`q`, Ctrl-C, Ctrl-D).
+fn edit_here(config: &BaseConfig, cwd: &Path, p: &Stored, replayer: &replay::Replayer<'_>) -> Result<Option<String>, String> {
     let mut extra: Vec<(&str, String)> = Vec::new();
     let mut text: Option<String> = None;
     if p.kind != "keyword-gap" {
@@ -1008,12 +1061,13 @@ fn edit_here(config: &BaseConfig, cwd: &Path, p: &Stored) -> Result<String, Stri
         }
     }
     let change = p.edited(text.as_deref(), keywords.as_deref())?;
-    let outcome = replay::run(config, cwd, &change)?;
+    let outcome = replayer.run(&change)?;
     for line in replay::render(&format!("edited: {}", change.describe()), &outcome).lines() {
         println!("      {line}");
     }
     match choose("      [a]pply [s]kip > ", &['a', 's']) {
-        Some('a') => apply_and_store(config, cwd, p, &change, "edited", &extra, &outcome),
-        _ => Ok("skipped\n".to_string()),
+        Some('a') => apply_and_store(config, cwd, p, &change, "edited", &extra, &outcome).map(Some),
+        Some(_) => Ok(Some("skipped\n".to_string())),
+        None => Ok(None),
     }
 }

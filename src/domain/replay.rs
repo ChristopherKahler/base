@@ -295,13 +295,24 @@ fn plan<'a>(config: &BaseConfig, live: &Bench<'a>, store: Option<&Store>, change
             }
             let want = crud::slugify(name);
             let mut domains = live.domains.clone();
+            // A domain the graph holds and no domains.toml does (decisions filed under it) matches no prompt today;
+            // approving writes it into domains.toml with these keywords, so the changed config has it.
+            let before = match domains.iter().position(|d| crud::slugify(&d.name) == want) {
+                Some(_) => Probe::Domain(name.clone()),
+                None => {
+                    let fresh: crate::domain::DomainDef = serde_json::from_value(serde_json::json!({ "name": name }))
+                        .map_err(|e| format!("domain {name}: {e}"))?;
+                    domains.push(fresh);
+                    Probe::Nothing
+                }
+            };
             let Some(d) = domains.iter_mut().find(|d| crud::slugify(&d.name) == want) else {
                 return Err(format!("no domain '{name}' (base domain list shows them)"));
             };
             d.prompt_keywords = edit_list(&d.prompt_keywords, &change.add, &change.drop);
             let name = d.name.clone();
             let after = live.changed(domains, live.converted.clone());
-            Ok(Plan { after, before: Probe::Domain(name.clone()), after_probe: Probe::Domain(name) })
+            Ok(Plan { after, before, after_probe: Probe::Domain(name) })
         }
         Target::Rule(r) => {
             let rule = find_rule(live, r)?;
@@ -316,7 +327,8 @@ fn plan<'a>(config: &BaseConfig, live: &Bench<'a>, store: Option<&Store>, change
                             converted.remove(i);
                         }
                     }
-                    None if !change.add.is_empty() => converted.push(Converted {
+                    // Served on its own words only when its domain is injected at all (`rules_with_matchers`).
+                    None if !change.add.is_empty() && injected(live, &rule.domain) => converted.push(Converted {
                         rule: rules::build(&rule.domain, rule.text.clone(), None, None),
                         matchers: edit_topic_words(&[], &change.add, &[]),
                     }),
@@ -340,16 +352,31 @@ fn plan<'a>(config: &BaseConfig, live: &Bench<'a>, store: Option<&Store>, change
                 let edited = edit_list(&g.keywords, &change.add, &change.drop);
                 return Ok(Plan { after, before: Probe::Keywords(g.keywords.clone()), after_probe: Probe::Keywords(edited) });
             }
-            // Any other decision is served through its domain's CONTEXT, so its own keywords change nothing.
-            let domain = decision_domain(config, store, &live.domains, slug)
-                .ok_or_else(|| format!("no decision '{slug}' (slugs come from base decision search --keyword <word>)"))?;
-            Ok(Plan { after, before: Probe::Domain(domain.clone()), after_probe: Probe::Domain(domain) })
+            // Any other decision is served through its domain's CONTEXT, so its own keywords change nothing. One filed
+            // under no configured domain reaches no prompt at all, before or after.
+            if let Some(domain) = decision_domain(config, store, &live.domains, slug) {
+                return Ok(Plan { after, before: Probe::Domain(domain.clone()), after_probe: Probe::Domain(domain) });
+            }
+            let ns = &config.namespace;
+            let ask = format!(
+                "{}\nASK {{ GRAPH ?g {{ <{}> a {}:Decision }} }}",
+                crud::prefixes(ns),
+                crud::build_iri(ns, "decision", slug),
+                ns.prefix
+            );
+            if !matches!(crate::store::query(store, &ask), Ok(QueryResults::Boolean(true))) {
+                return Err(format!("no decision '{slug}' (slugs come from base decision search --keyword <word>)"));
+            }
+            Ok(Plan { after, before: Probe::Nothing, after_probe: Probe::Nothing })
         }
         Target::NewRule { domain, text } => {
             let mut converted = live.converted.clone();
             let rule = rules::build(domain, text.clone(), None, None);
             let after_ref = RuleRef { id: rule.id.clone(), domain: domain.clone(), text: text.clone() };
-            let after_probe = if change.add.is_empty() {
+            let after_probe = if !injected(live, domain) {
+                // `auto_inject = false`: no hook serves the domain's rules, words or not (`rules_with_matchers`).
+                Probe::Nothing
+            } else if change.add.is_empty() {
                 // `rule add` without words: a rule with no matchers, served through its domain.
                 Probe::Domain(domain.clone())
             } else {
@@ -360,6 +387,13 @@ fn plan<'a>(config: &BaseConfig, live: &Bench<'a>, store: Option<&Store>, change
             Ok(Plan { after, before: Probe::Nothing, after_probe })
         }
     }
+}
+
+/// Whether the hooks inject `domain`'s rules at all: not under `auto_inject = false` (F29 D3). A domain domains.toml
+/// does not hold is injected, as `rules_with_matchers` keeps a rule whose domain has no entry.
+fn injected(bench: &Bench<'_>, domain: &str) -> bool {
+    let want = crud::slugify(domain);
+    bench.domains.iter().find(|d| crud::slugify(&d.name) == want).is_none_or(|d| d.auto_inject)
 }
 
 /// The one rule `spec` (`<domain>.<id>`, or an id) names among the bench's rules.

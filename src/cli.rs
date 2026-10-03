@@ -1469,7 +1469,7 @@ pub enum RuleAction {
     /// start or stop serving it, and its share of all of them (TOO BROAD above [tune] broad_share)
     Replay {
         /// A proposal's id, p-0007
-        #[arg(conflicts_with_all = ["domain", "rule", "decision"])]
+        #[arg(conflicts_with_all = ["domain", "rule", "decision", "add_keyword", "drop_keyword"])]
         proposal: Option<String>,
         /// Change this domain's prompt keywords
         #[arg(long, conflicts_with_all = ["rule", "decision"])]
@@ -3996,7 +3996,7 @@ pub fn run() {
                     let (header, change) = match proposal {
                         Some(id) => {
                             let want = base::corrections::review::normalize_id(&id);
-                            let Some(p) = base::corrections::review::load(&config, &cwd).into_iter().find(|p| p.id == want) else {
+                            let Some(p) = base::corrections::review::load(&config, &rule_cwd).into_iter().find(|p| p.id == want) else {
                                 die("Error", format!("no proposal {want} in this workspace or the global tier (base rule review lists them)"))
                             };
                             let change = p.change().unwrap_or_else(|e| die("Error", e));
@@ -4016,7 +4016,7 @@ pub fn run() {
                             (change.describe(), change)
                         }
                     };
-                    match replay::run(&config, &cwd, &change) {
+                    match replay::run(&config, &rule_cwd, &change) {
                         Ok(o) => print!("{}", replay::render(&header, &o)),
                         Err(msg) => die("Error", msg),
                     }
@@ -4031,9 +4031,9 @@ pub fn run() {
                         _ => Action::List,
                     };
                     if matches!(action, Action::List) && review::on_terminal() {
-                        review::interactive(&config, &cwd);
+                        review::interactive(&config, &rule_cwd);
                     } else {
-                        match review::run(&config, &cwd, &action) {
+                        match review::run(&config, &rule_cwd, &action) {
                             Ok(out) => print!("{out}"),
                             Err(msg) => die("Error", msg),
                         }

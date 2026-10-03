@@ -155,6 +155,17 @@ fn replay_reports_new_and_stopped() {
     assert!(out.contains("  newly served on 0\n  stops serving on 1 prompt, e.g.:\n    \"run doctor and tell me what it says\"\n"), "{out}");
     assert!(out.contains("  share: 0 / 19 = 0.0%\n"), "{out}");
 
+    // A domain no domains.toml holds matches no prompt today; approving writes it with the keyword, so replay counts it.
+    let out = ok(&s, &["rule", "replay", "--domain", "graph-only", "--add-keyword", "doctor"]);
+    assert!(out.contains("  newly served on 1 prompt, e.g.:\n    \"run doctor and tell me what it says\"\n"), "{out}");
+    // Under auto_inject = false no hook serves the domain's rules, so a new rule there is served on nothing.
+    let toml = std::fs::read_to_string(domains_toml(&s)).unwrap();
+    std::fs::write(domains_toml(&s), format!("{toml}\n[[domain]]\nname = \"quiet\"\nmode = \"triggered\"\nauto_inject = false\n")).unwrap();
+    let out = ok(&s, &["rule", "propose", "--new", "--domain", "quiet", "--text", "Plan on Mondays.", "--keywords", "plan", "--example", "plan the week"]);
+    assert!(out.starts_with("proposal p-0002 · new rule · domain quiet"), "{out}");
+    let out = ok(&s, &["rule", "replay", "p-0002"]);
+    assert!(out.contains("  newly served on 0\n") && out.contains("  share: 0 / 19 = 0.0%\n"), "{out}");
+
     // Nothing logged yet: said, not an error.
     let empty = home("replay-empty");
     base_domain(&empty);
@@ -375,6 +386,9 @@ fn review_noninteractive_flags() {
     assert!(listing.contains("[2/3] p-0002 new rule · base · \"Name the tier before a write.\""), "{listing}");
     assert!(listing.contains("act on one: base rule review --approve <id>"), "{listing}");
 
+    // An edit naming a field the kind does not use is refused, never stored as a change that was not made.
+    let err = refused(&s, &["rule", "review", "--edit", "p-0001", "--text", "new wording"]);
+    assert!(err.contains("p-0001 is a keyword gap: it changes keywords, not wording"), "{err}");
     assert!(ok(&s, &["rule", "review", "--approve", "p-0001"]).starts_with("approved p-0001:"));
     assert!(ok(&s, &["rule", "review", "--approve", "p-0002"]).starts_with("approved p-0002:"));
     let err = refused(&s, &["rule", "review", "--approve", "p-0001"]);
