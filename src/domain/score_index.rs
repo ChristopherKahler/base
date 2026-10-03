@@ -365,8 +365,8 @@ mod tests {
     }
 
     /// Examples 1 and 4, in invented words of the same shape: a prompt about the prompt-submit hook losing what it
-    /// injects ranks the hook rule (its text, its domain's keywords and its test prompts) first and over the default
-    /// `min_score`, and two unrelated global decisions about other tools score under it.
+    /// injects ranks the hook rule (its text, its domain's keywords and its test prompts) first and over a `min_score`
+    /// of 6, and two unrelated global decisions about other tools score under it.
     #[test]
     fn bm25_ranks_hook_rule_above_profile_decision_for_prompt_3() {
         let hook = rule(
@@ -387,7 +387,8 @@ mod tests {
                       output arrives complete and so does pre-tool";
         let scores = index.scores(prompt);
         assert_eq!(scores.ranked.first().map(|s| s.doc.id.as_str()), Some(hook.doc.id.as_str()), "{:?}", scores.ranked);
-        let min = crate::config::MatchConfig::default().min_score;
+        // An explicit threshold: `[match] min_score` has no default, so by default no score serves a rule (Q7 ruling).
+        let min = 6.0;
         assert!(scores.get(&hook.doc.id) >= min, "the hook rule passes min_score {min}: {}", scores.get(&hook.doc.id));
         for d in &sources[3..] {
             assert!(scores.get(&d.doc.id) < min, "{} under min_score: {}", d.doc.id, scores.get(&d.doc.id));

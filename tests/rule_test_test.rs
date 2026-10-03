@@ -82,6 +82,15 @@ fn short(domain: &str, text: &str) -> String {
     format!("{domain}.{}", &rule_id(domain, text)[..8])
 }
 
+/// The line `base rule test` prints for one test prompt, and the line under it. Since BO-18 the prompt's line ends with
+/// its BM25 score (held out of its own rule for a `fires_on` prompt), so it is found by its start.
+fn outcome<'a>(out: &'a str, label: &str, prompt: &str) -> (&'a str, Option<&'a str>) {
+    let start = format!("  {label:<12}\"{prompt}\"   score ");
+    let lines: Vec<&str> = out.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with(&start)).unwrap_or_else(|| panic!("no line starting {start:?} in:\n{out}"));
+    (lines[at], lines.get(at + 1).copied())
+}
+
 fn read(p: &Path) -> String {
     std::fs::read_to_string(p).unwrap_or_default()
 }
@@ -125,13 +134,16 @@ fn rule_test_reports_miss() {
     assert_eq!(code, 1, "a miss exits 1: {out}{err}");
     for want in [
         format!("{id}   \"Measure twice"),
-        format!("  MISS        \"{F8_PROMPT}\"\n              matched: GLOBAL(always) · base: has no prompt keywords\n"),
-        format!("  MISS        \"{F8_PROMPT_2}\"\n"),
-        format!("  ok (quiet)  \"{QUIET}\"\n"),
+        // BO-18: `[match] min_score` is unset by default, so the tests are judged by keyword only, and one line says so.
+        "scores: BM25, each fires-on prompt held out of its own rule; [match] min_score is unset, so the tests are judged by keyword only\n".to_string(),
         "1 rule tested, 2 misses, 0 false fires · 2 rules in base have no tests\n".to_string(),
     ] {
         assert!(out.contains(&want), "missing {want:?} in:\n{out}");
     }
+    let why = "              matched: GLOBAL(always) · base: has no prompt keywords";
+    assert_eq!(outcome(&out, "MISS", F8_PROMPT).1, Some(why), "{out}");
+    assert_eq!(outcome(&out, "MISS", F8_PROMPT_2).1, Some(why), "{out}");
+    outcome(&out, "ok (quiet)", QUIET);
 
     // Example 3: the keywords F8 adds, one at a time. Each add-trigger prints the domain's result (K2, "on every
     // config change"), so the first shows one miss left and the second shows none.
@@ -160,8 +172,9 @@ rules = []
     ok(&h, &["rule", "add", "--domain", "client-work", "--text", text, "--fires-on", "draft tony's morning update", "--quiet-on", "watch the Tony Hawk documentary tonight"]);
     let (code, out, _) = base(&h, &["rule", "test"]);
     assert_eq!(code, 1, "a false fire exits 1: {out}");
-    assert!(
-        out.contains("  FALSE FIRE  \"watch the Tony Hawk documentary tonight\"\n              matched: client-work(keyword: tony)\n"),
+    assert_eq!(
+        outcome(&out, "FALSE FIRE", "watch the Tony Hawk documentary tonight").1,
+        Some("              matched: client-work(keyword: tony)"),
         "{out}"
     );
     assert!(out.contains("1 rule tested, 0 misses, 1 false fire\n"), "{out}");
@@ -470,10 +483,10 @@ fn rule_test_rule_with_matchers_follows_select() {
     let block = |text: &str| out.split(&short("relay", text)).nth(1).unwrap_or_default().split("\nrelay.").next().unwrap_or_default().to_string();
     let t = block(topic);
     assert!(t.contains("  ok (fires)  \"please ping chris when done\""), "{out}");
-    assert!(t.contains("  MISS        \"the relay is slow\"\n              topic score 0.50 under topic_min_score 0.75 (words: relay)"), "{out}");
+    assert_eq!(outcome(&t, "MISS", "the relay is slow").1, Some("              topic score 0.50 under topic_min_score 0.75 (words: relay)"), "{out}");
     assert!(t.contains("  ok (quiet)  \"check the relay board\""), "the domain keyword alone does not serve it:\n{out}");
     let p = block(plain);
-    assert!(p.contains("  FALSE FIRE  \"check the relay board\"\n              matched: relay(keyword: relay)"), "{out}");
+    assert_eq!(outcome(&p, "FALSE FIRE", "check the relay board").1, Some("              matched: relay(keyword: relay)"), "{out}");
 }
 
 #[test]
@@ -503,5 +516,9 @@ fn rule_test_fixture_passes_and_its_control_fails() {
     let control = home(&format!("{fixture}\n[[domain]]\nname = \"control\"\nprompt_keywords = [\"zzz-never\"]\nrules = [{{ text = \"control\", fires_on = [\"nothing matches this\"] }}]\n"), "");
     let (code, out, _) = base(&control, &["rule", "test"]);
     assert_eq!(code, 1, "{out}");
-    assert!(out.contains("  MISS        \"nothing matches this\"\n              matched: always-on(always) · control: no keyword matched"), "{out}");
+    assert_eq!(
+        outcome(&out, "MISS", "nothing matches this").1,
+        Some("              matched: always-on(always) · control: no keyword matched"),
+        "{out}"
+    );
 }

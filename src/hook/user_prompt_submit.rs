@@ -331,7 +331,7 @@ pub fn collect(
         }
     }
     // BM25 (BO-18, K7): this prompt's score for every rule and global decision, and the rules no keyword or path
-    // brought whose score reaches `[match] min_score`, by domain. With no index, or `[match] bm25 = false`, there is no
+    // brought whose score reaches `[match] min_score`, by domain, when one is set. With no index, or `[match] bm25 = false`, there is no
     // scoring and the prompt is served keyword-only, as before.
     let scoring = load_scoring(config, base_dir.as_deref(), &prompt, &mut sink.trace);
     let admitted = scoring
@@ -1006,10 +1006,10 @@ fn bracket_rules_block(config: &BaseConfig, cwd: &Path, session: &mut SessionSta
     )
 }
 
-/// This prompt's BM25 scores (BO-18, K7c) and the `[match] min_score` they are judged against.
+/// This prompt's BM25 scores (BO-18, K7c) and the `[match] min_score` they are judged against, when one is set.
 pub(crate) struct Scoring {
     pub(crate) scores: crate::domain::score_index::Scores,
-    pub(crate) min_score: f32,
+    pub(crate) min_score: Option<f32>,
 }
 
 /// Score the prompt against the index the last sync counted (K7e: loaded here, never counted here). `None` when
@@ -1022,7 +1022,7 @@ fn load_scoring(config: &BaseConfig, base_dir: Option<&Path>, prompt: &str, trac
     let index = base_dir.and_then(crate::domain::score_index::ScoreIndex::load);
     trace.index = Some(if index.is_some() { "ok" } else { "missing" }.to_string());
     let index = index?;
-    trace.min_score = Some(config.matching.min_score);
+    trace.min_score = config.matching.min_score;
     let scores = index.scores(prompt);
     for s in &scores.ranked {
         let id = match s.doc.kind {
@@ -1044,9 +1044,10 @@ struct Admitted<'a> {
     terms: Vec<String>,
 }
 
-/// The rules a keyword or a path did not bring and their score did, grouped by domain, best domain first. A domain
-/// that is always-on, has `auto_inject = false`, matched already, or is vetoed by one of its `exclude` patterns admits
-/// nothing; a rule with matchers of its own is judged by `select` instead.
+/// The rules a keyword or a path did not bring and their score did, grouped by domain, best domain first. None while
+/// `[match] min_score` is unset (lynx's Q7 ruling). A domain that is always-on, has `auto_inject = false`, matched
+/// already, or is vetoed by one of its `exclude` patterns admits nothing; a rule with matchers of its own is judged by
+/// `select` instead.
 fn admitted_by_score<'a>(
     scoring: &Scoring,
     prompt: &str,
@@ -1054,9 +1055,10 @@ fn admitted_by_score<'a>(
     matched: &[crate::domain::matcher::DomainMatch<'_>],
     converted: &HashSet<&str>,
 ) -> Vec<Admitted<'a>> {
+    let Some(min) = scoring.min_score else { return Vec::new() };
     let lower = prompt.to_lowercase();
     let mut out: Vec<Admitted<'a>> = Vec::new();
-    for s in scoring.scores.ranked.iter().filter(|s| s.doc.kind == DocKind::Rule && s.score > 0.0 && s.score >= scoring.min_score) {
+    for s in scoring.scores.ranked.iter().filter(|s| s.doc.kind == DocKind::Rule && s.score > 0.0 && s.score >= min) {
         if converted.contains(s.doc.id.as_str()) {
             continue;
         }

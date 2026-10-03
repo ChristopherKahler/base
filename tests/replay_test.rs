@@ -1853,11 +1853,13 @@ fn replay_tune_pass_on_the_corpus_store() {
 // ── BO-18 (K7, D9): BM25 ──────────────────────────────────────────────────────────────────────────────
 
 /// The corpus once more, with the rule index built first (`base domain sync`, a command that changes prompt matching,
-/// ends by building it), each prompt the first of its own session, at the shipped `[match]` defaults.
+/// ends by building it), each prompt the first of its own session, with `[match] min_score = 6.0` set: `min_score` has
+/// no default (lynx's Q7 ruling), and without one no rule is served on its score, so admission would go unexercised.
+/// The default itself is pinned in `bm25_test::score_admits_near_miss`.
 fn bm25_runs() -> &'static [PromptRun] {
     static RUNS: OnceLock<Vec<PromptRun>> = OnceLock::new();
     RUNS.get_or_init(|| {
-        let s = seed::write(&root("bm25"), &seed::TINY, &fixture("base.toml"));
+        let s = seed::write(&root("bm25"), &seed::TINY, &format!("{}\n[match]\nmin_score = 6.0\n", fixture("base.toml")));
         std::fs::write(s.ws.join(".base").join("domains.toml"), fixture("domains.toml")).expect("domains.toml");
         let (code, out, err) = run_base(&s, &["domain", "sync"]);
         assert_eq!(code, 0, "base domain sync: {out}{err}");

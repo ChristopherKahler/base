@@ -1314,10 +1314,10 @@ pub struct SelectContext<'a> {
     /// Domain name to its `prompt_keywords`, for topic scoring.
     pub keywords: &'a HashMap<String, Vec<String>>,
     pub rules: &'a crate::config::RulesConfig,
-    /// The prompt's BM25 scores and `[match] min_score` (BO-18, K7d): a topic rule is also hit when its score reaches
-    /// the minimum, and topic hits are ranked by it before `topic_max` cuts. `None` (no index, `[match] bm25 = false`, a
-    /// tool call) selects exactly as before.
-    pub bm25: Option<(&'a crate::domain::score_index::Scores, f32)>,
+    /// The prompt's BM25 scores and `[match] min_score` (BO-18, K7d): topic hits are ranked by the score before
+    /// `topic_max` cuts, and, when `min_score` is set, a topic rule is also hit when its score reaches it. `None` (no
+    /// index, `[match] bm25 = false`, a tool call) selects exactly as before.
+    pub bm25: Option<(&'a crate::domain::score_index::Scores, Option<f32>)>,
 }
 
 /// The converted rules this event serves, deduped per rule and capped, recorded as shown (G0 section 3).
@@ -1427,11 +1427,11 @@ fn first_hit(
             let keywords = cx.keywords.get(&c.rule.domain).map(Vec::as_slice).unwrap_or_default();
             let t = topic_match(text, &own, &c.rule.text, keywords);
             let s = t.score;
-            // Its own words or its domain's keywords hit it as before; a BM25 score at `[match] min_score` also does
-            // (K7d), a second way in beside `topic_min_score`, which keeps its meaning.
+            // Its own words or its domain's keywords hit it as before; a BM25 score at `[match] min_score`, when one is
+            // set, also does (K7d), a second way in beside `topic_min_score`, which keeps its meaning.
             let by_score = cx.bm25.is_some_and(|(scores, min)| {
                 let b = scores.get(&c.rule.id);
-                b > 0.0 && b >= min
+                min.is_some_and(|min| b > 0.0 && b >= min)
             });
             (((s > 0.0 && s >= cx.rules.topic_min_score) || by_score).then_some(Why::Topic(s)), Some(t))
         }

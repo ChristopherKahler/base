@@ -96,7 +96,8 @@ fn keyword_hit_always_qualifies() {
 }
 
 /// Example 3: a prompt with no keyword of `ledger`'s shares words with its rule's test prompt and is served on its
-/// score. The knock-out: with `min_score` out of reach, the same prompt serves nothing of `ledger`.
+/// score. The knock-out: with `min_score` out of reach, the same prompt serves nothing of `ledger`; nor with it unset,
+/// the default (lynx's Q7 ruling on BO-18), while its scores are still logged.
 #[test]
 fn score_admits_near_miss() {
     let near = "why does the payroll export not reconcile with the bank feed";
@@ -120,6 +121,19 @@ fn score_admits_near_miss() {
     build_index(&s);
     let out = prompt(&s, near, "near-off-1");
     assert!(!out.contains(PAYROLL), "knock-out: under min_score the near miss is not served:\n{out}");
+
+    let s = seeded("near-default", "");
+    build_index(&s);
+    let out = prompt(&s, near, "near-default-1");
+    assert!(!out.contains(PAYROLL), "min_score unset: no rule is served on its score alone:\n{out}");
+    let r = row(&s, "near-default-1");
+    assert_eq!(r["index"], "ok", "{r}");
+    assert!(r.get("min_score").is_none(), "no threshold in force: {r}");
+    assert!(!r["matched"].as_array().unwrap().iter().any(|m| m["by"] == "score"), "{r}");
+    assert!(
+        r["scores"].as_array().unwrap().iter().any(|x| x["id"] == payroll.as_str() && x["by"] == "bm25"),
+        "the scores are logged all the same: {r}"
+    );
 }
 
 /// K7e: the hook loads the index and never builds it. A term planted in the index file (and nowhere in the store)
