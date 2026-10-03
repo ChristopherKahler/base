@@ -14,7 +14,7 @@ fn a_release_that_adds_a_hook_wires_it_at_session_start_once() {
     std::fs::create_dir_all(home.join(".claude")).unwrap();
     std::fs::create_dir_all(home.join(".base-gbl")).unwrap();
 
-    // An install from before the Stop hook existed: four of the five.
+    // An install with every hook but Stop: five of the six.
     let four: Vec<String> = HOOK_TABLE
         .iter()
         .filter(|(event, _)| *event != "Stop")
@@ -70,7 +70,7 @@ fn no_claude_directory_means_nothing_to_wire() {
 /// The stamp file `ensure_hooks_wired` gates itself on.
 fn stamp_of(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".base-gbl")
-        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")))
+        .join(base::install::hooks_wired_stamp())
 }
 
 #[test]
@@ -123,5 +123,99 @@ fn an_already_wired_home_is_stamped_and_left_byte_identical() {
         assert!(ensure_hooks_wired().is_empty(), "nothing left to add");
         assert_eq!(std::fs::read(&settings).unwrap(), before, "not one byte rewritten");
         assert!(stamp_of(&home).exists(), "a real config WAS reconciled");
+    });
+}
+
+// ─── BO-17: SessionEnd on a home wired before it existed ─────────────────────
+//
+// A home with the user's own hooks beside base's five, written the way Claude Code writes the file, and stamped as
+// wired by a build whose version string never changed. The new hook goes in once, as text, after a backup, and every
+// other byte stays (lynx's G0 ruling on question 5).
+
+#[test]
+fn session_end_is_added_once_and_the_rest_of_settings_stays_byte_for_byte() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_path_buf();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(home.join(".base-gbl")).unwrap();
+    // The old stamp, named by version only: it must not stop the new hook.
+    std::fs::write(home.join(".base-gbl").join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION"))), b"").unwrap();
+    let entry = |cmd: &str| {
+        format!("      {{\n        \"hooks\": [\n          {{\n            \"type\": \"command\",\n            \"command\": \"{cmd}\"\n          }}\n        ]\n      }}")
+    };
+    // The user's own Stop hook first, base's after it, in the one Stop array.
+    let five: Vec<String> = HOOK_TABLE
+        .iter()
+        .filter(|(event, _)| *event != "SessionEnd")
+        .map(|(event, cmd)| {
+            let mine = if *event == "Stop" { format!("{},\n", entry("python ~/.claude/hooks/lint-guard.py")) } else { String::new() };
+            format!("    \"{event}\": [\n{mine}{}\n    ]", entry(cmd))
+        })
+        .collect();
+    let original = format!(
+        "{{\n  \"model\": \"opus\",\n  \"permissions\": {{\n    \"allow\": [\n      \"Bash(git status)\"\n    ],\n    \"deny\": [\n      \"Bash(rm -rf *)\"\n    ]\n  }},\n  \"hooks\": {{\n{}\n  }},\n  \"statusLine\": {{\n    \"type\": \"command\",\n    \"command\": \"bash ~/.claude/status.sh\"\n  }}\n}}\n",
+        five.join(",\n")
+    );
+    let settings = home.join(".claude").join("settings.json");
+    std::fs::write(&settings, &original).unwrap();
+
+    base::home::with_thread_home(&home, || {
+        assert_eq!(ensure_hooks_wired(), vec!["SessionEnd"], "exactly the new hook");
+        let after = std::fs::read_to_string(&settings).unwrap();
+        let at = after.find(",\n    \"SessionEnd\"").expect("added after the last event");
+        assert_eq!(&after[..at], &original[..at], "every byte before it is the original's");
+        assert!(after.ends_with(&original[at..]), "every byte after it is the original's");
+        let v: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(v["hooks"]["SessionEnd"][0]["hooks"][0]["command"], "base hook session-end");
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "python ~/.claude/hooks/lint-guard.py", "the user's own hook kept");
+        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["command"], "base hook stop");
+        // The backup: the file as it was, beside it.
+        let backups: Vec<std::path::PathBuf> = std::fs::read_dir(home.join(".claude"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("settings.json.bak-base-")))
+            .collect();
+        assert_eq!(backups.len(), 1, "one backup");
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original, "the backup is the file before the change");
+
+        // Never twice: the stamp holds it, and with the stamp gone the command in the file does.
+        assert!(ensure_hooks_wired().is_empty());
+        std::fs::remove_file(stamp_of(&home)).unwrap();
+        assert!(ensure_hooks_wired().is_empty(), "already there, so nothing added");
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), after, "and nothing rewritten");
+        assert_eq!(after.matches("base hook session-end").count(), 1);
+    });
+}
+
+/// A settings.json base cannot add to without rewriting it ("hooks" is not an object) is left byte for byte and
+/// unstamped, and the failure is marked: `ensure_hooks_wired` also runs on every base command, which would otherwise
+/// re-read the file and print the error each time. The next try waits a day.
+#[test]
+fn a_file_base_cannot_add_to_is_left_alone_and_retried_a_day_later() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_path_buf();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(home.join(".base-gbl")).unwrap();
+    let settings = home.join(".claude").join("settings.json");
+    let text = "{\"hooks\": [\"not an object\"], \"theme\": \"dark\"}\n";
+    std::fs::write(&settings, text).unwrap();
+    base::home::with_thread_home(&home, || {
+        assert!(ensure_hooks_wired().is_empty());
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), text, "nothing written");
+        let stamp = stamp_of(&home);
+        let failed = stamp.with_file_name(format!("{}.failed", base::install::hooks_wired_stamp()));
+        assert!(!stamp.exists() && failed.exists(), "not stamped, and the failure marked");
+
+        // Fixed by hand within the day: the marker, not the file, decides when base tries again.
+        std::fs::write(&settings, "{}\n").unwrap();
+        assert!(ensure_hooks_wired().is_empty());
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{}\n");
+
+        // A day later it wires every hook, stamps, and drops the marker.
+        let day_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 60 * 60);
+        std::fs::File::options().write(true).open(&failed).unwrap().set_modified(day_ago).unwrap();
+        assert_eq!(ensure_hooks_wired().len(), HOOK_TABLE.len());
+        assert!(stamp.exists() && !failed.exists());
     });
 }

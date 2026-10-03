@@ -1,5 +1,5 @@
 {
-  "about": "BO-15's correction detector cases. Each case is a short session (events, in Claude Code's real transcript shapes via tests/transcripts/mod.rs) and what the detector must find: `expect` maps a turn number (every prompt counts, task notifications too) to the exact signals of that turn as 'LAYER kind'; a turn not listed has none. `checks` lists the turns whose prompt carries the C4 line. Every text is made up. BO-17's backstop adds a case here for each correction the detector missed.",
+  "about": "BO-15's correction detector cases. Each case is a short session (events, in Claude Code's real transcript shapes via tests/transcripts/mod.rs) and what the detector must find: `expect` maps a turn number (every prompt counts, task notifications too) to the exact signals of that turn as 'LAYER kind'; a turn not listed has none. `checks` lists the turns whose prompt carries the C4 line. Every text is made up. A case with `missed` is a correction the detector does not catch yet: `expect` and `checks` are what it finds today, `missed.turn` is the turn that corrects the AI and `missed.why` says how. BO-17's backstop saves such cases from real sessions on the user's machine only; the ones here are made up, modelled on the misses of BO-17's gate 4 (2026-10-02 sessions).",
   "cases": [
     {
       "name": "c1-phrase-flags-a-later-prompt",
@@ -167,6 +167,78 @@
       ],
       "expect": {"2": ["C1 phrase", "C3 UPDATED"]},
       "checks": [2]
+    },
+    {
+      "name": "missed-a-standing-rule-restated",
+      "events": [
+        {"prompt": "set up the deploy check for the docs site"},
+        {"text": "The check is ready. Do you want to merge it, or wait until you set the branch rules?"},
+        {"prompt": "Merging is your part, every time. Finish it yourself."},
+        {"text": "Merging it now."}
+      ],
+      "expect": {},
+      "checks": [],
+      "missed": {"turn": 2, "why": "the user restates a standing rule the AI broke by handing the work back"}
+    },
+    {
+      "name": "missed-a-preference-redirect",
+      "events": [
+        {"prompt": "add a way to export the report"},
+        {"text": "I built a dialog with a form: a file name, a format and an export button."},
+        {"prompt": "I'd rather a one-line command than a dialog"},
+        {"text": "Replacing the dialog with a command."}
+      ],
+      "expect": {},
+      "checks": [],
+      "missed": {"turn": 2, "why": "the user turns down the AI's design for the one they wanted"}
+    },
+    {
+      "name": "missed-no-without-a-comma",
+      "events": [
+        {"prompt": "restart the importer the usual way"},
+        {"text": "Restarting it with a fresh config I wrote just now."},
+        {"prompt": "No we restart it the documented way and keep the old config"},
+        {"text": "Using the documented restart and the old config."}
+      ],
+      "expect": {},
+      "checks": [],
+      "missed": {"turn": 2, "why": "the user overrules the AI's approach; the C1 phrase wants a comma after no"}
+    },
+    {
+      "name": "missed-makes-no-sense",
+      "events": [
+        {"prompt": "why can't the old printer take the large paper"},
+        {"text": "That printer model only takes letter size."},
+        {"prompt": "it prints posters every week, so that answer cannot be right"},
+        {"text": "It does take the large size; sending the poster now."}
+      ],
+      "expect": {},
+      "checks": [],
+      "missed": {"turn": 2, "why": "the user says the AI's claim contradicts a fact they know"}
+    },
+    {
+      "name": "missed-a-corrected-fact-list",
+      "events": [
+        {"prompt": "sort these books onto the shelves by subject"},
+        {"text": "Harbor Lights, Iron Road and Quiet Field look like novels, so they went on the fiction shelf."},
+        {"prompt": "iron road is a railway history and quiet field is a farming guide, the rest are novels"},
+        {"text": "Moving Iron Road to history and Quiet Field to farming."}
+      ],
+      "expect": {},
+      "checks": [],
+      "missed": {"turn": 2, "why": "the user corrects facts the AI guessed, with no correction word at all"}
+    },
+    {
+      "name": "missed-a-redirect-to-the-tool",
+      "events": [
+        {"prompt": "start two more workers on the build server"},
+        {"text": "Please approve the remote start in the dialog that just opened."},
+        {"prompt": "do it from the terminal with the right options instead"},
+        {"text": "Starting them from the command line."}
+      ],
+      "expect": {},
+      "checks": [],
+      "missed": {"turn": 2, "why": "the user redirects the AI to the method it should have used"}
     }
   ]
 }

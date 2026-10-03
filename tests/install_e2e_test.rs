@@ -201,13 +201,13 @@ fn the_session_start_hook_still_announces_what_it_wired() {
     mkdir(home.join(".base-gbl"));
     mkdir(home.join(".claude"));
 
-    // An install from before the Stop hook existed: four of the five.
+    // An install from before the Stop hook existed, so before SessionEnd (BO-17) too: four of the six.
     let four: Vec<String> = base::install::HOOK_TABLE
         .iter()
-        .filter(|(event, _)| *event != "Stop")
+        .filter(|(event, _)| *event != "Stop" && *event != "SessionEnd")
         .map(|(event, cmd)| format!(r#""{event}":[{{"hooks":[{{"type":"command","command":"{cmd}"}}]}}]"#))
         .collect();
-    assert_eq!(four.len(), 4, "seeded four of the five");
+    assert_eq!(four.len(), 4, "seeded four of the six");
     std::fs::write(
         home.join(".claude").join("settings.json"),
         format!("{{\"hooks\":{{{}}}}}", four.join(",")),
@@ -219,7 +219,7 @@ fn the_session_start_hook_still_announces_what_it_wired() {
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     assert!(
-        stdout.contains("[hooks] wired base hook Stop"),
+        stdout.contains("[hooks] wired base hook Stop, SessionEnd"),
         "the session-start notice named nothing.\nstdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -328,7 +328,7 @@ fn skip_hooks_holds_when_claude_code_is_already_installed() {
     let settings = home.join(".claude").join("settings.json");
     let stamp = home
         .join(".base-gbl")
-        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")));
+        .join(base::install::hooks_wired_stamp());
     assert!(!settings.exists(), "the precondition, stated rather than assumed");
     assert!(!stamp.exists(), "and this version is unstamped, which is what arms the seam");
 
@@ -377,7 +377,7 @@ fn uninstall_does_not_create_a_settings_file_on_its_way_to_emptying_one() {
     let settings = home.join(".claude").join("settings.json");
     let stamp = home
         .join(".base-gbl")
-        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")));
+        .join(base::install::hooks_wired_stamp());
     assert!(!settings.exists(), "the precondition, stated rather than assumed");
     assert!(!stamp.exists(), "and this version is unstamped, which is what arms the seam");
 

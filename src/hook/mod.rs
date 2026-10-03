@@ -354,7 +354,10 @@ fn run_event(
             }
             // Corrections (BO-15): C1 on this prompt, C2 and C3 in what the session wrote since the last read (a turn
             // the user interrupted or refused ends with no Stop), and the C4 line first among the blocks of its rank
-            // when one fired. After `collect`, so every return site of the handler gets it.
+            // when one fired. After `collect`, so every return site of the handler gets it. The rule pass's counts
+            // (BO-17) ride the same step, and its `rule pass due` line goes right after the C4 line. No LLM here
+            // (K4c): the line only asks the AI to run `base tune`.
+            let matched_domain = sink.trace.matched.iter().any(|m| m.by != "always");
             let correction = crate::corrections::on_prompt(
                 &config,
                 &cwd,
@@ -362,7 +365,11 @@ fn run_event(
                 session_id.as_deref(),
                 sink.prompt_num,
                 &sink.prompt,
+                matched_domain,
             );
+            if let Some(block) = correction.as_ref().and_then(|c| c.tune_block.clone()) {
+                sink.blocks.push_front(block);
+            }
             if let Some(block) = correction.as_ref().and_then(|c| c.block.clone()) {
                 sink.blocks.push_front(block);
             }
@@ -405,7 +412,8 @@ fn run_event(
             // answered only by a C4 line that printed.
             if let Some(c) = correction {
                 let printed = fitted.kept_blocks().any(|b| b.id == crate::corrections::CHECK_BLOCK);
-                c.commit(printed);
+                let tune_printed = fitted.kept_blocks().any(|b| b.id == crate::corrections::tune::DUE_BLOCK);
+                c.commit(printed, tune_printed);
             }
             if let Some(dir) = dir {
                 let record = crate::emit::record::record_of_prompt(&fitted, "user-prompt-submit", session_id.as_deref());
@@ -443,6 +451,15 @@ fn run_event(
             // No relay delivery at a turn's end (BO-04, F13b: relay content appears at session start and on a prompt
             // only). This arm used to run the task tick and print its block as a `systemMessage` for the operator,
             // and in doing so it recorded a new ping as delivered before any prompt had shown it to the model.
+            Ok(HookEventData { session_id, ..Default::default() })
+        }
+        "session-end" => {
+            // D7d (BO-17): mark the session ended for the next pass, and nothing else: no graph, no match log, no
+            // LLM. A hook must be fast, and most sessions never get here (a closed terminal fires nothing, D5), so the
+            // pass itself runs on evidence, on a turn count and at the next session start's catch-up.
+            if let Err(why) = crate::corrections::tune::mark_ended(stdin_json, session_id.as_deref(), &cwd) {
+                eprintln!("base: the SessionEnd hook could not mark the session ended: {why}");
+            }
             Ok(HookEventData { session_id, ..Default::default() })
         }
         _ => Ok(HookEventData::default()),
