@@ -8,7 +8,7 @@
 //!
 //! THE SORT. Every rule and decision base holds is a candidate. One fits when `--rule` or `--decision` names it, or
 //! when BM25 (`domain::bm25`) over the candidates scores it at [`FIT_MIN_SCORE`] or more with [`FIT_MIN_TERMS`]
-//! shared words; `--new` says none fits. Then:
+//! shared words and [`FIT_MIN_MARGIN`] times the next candidate; `--new` says none fits. Then:
 //! - it fits and was served to this session up to and including that prompt (a `served` entry on one of the session's
 //!   match-log rows; a decision also when the printed part of the session's session start carried it): **rewrite**,
 //!   the AI had it and did it anyway;
@@ -35,10 +35,17 @@ use crate::domain::bm25;
 use crate::domain::transcript;
 use crate::emit::match_log::{self, Row, Signal};
 
-/// The score a candidate needs to fit (with [`FIT_MIN_TERMS`]). Set from BO-15's gate 4 on Chris's store.
+/// The least score a candidate needs to fit (with [`FIT_MIN_TERMS`] and [`FIT_MIN_MARGIN`]): on a store of a few
+/// records it keeps a word or two in common from counting as a fit.
 pub const FIT_MIN_SCORE: f32 = 12.0;
 /// The words a candidate must share with the correction to fit: one shared word is a coincidence.
 pub const FIT_MIN_TERMS: usize = 2;
+/// The best candidate fits only when it scores at least this many times the next one. Set from BO-15's gate 4 on
+/// Chris's store (98 marked corrections against about 1,500 rules and decisions): a long prompt adds points to every
+/// record that shares a few project words, so raw scores ran from 13 to 259 with the clearest misses above 140 and real
+/// fits as low as 36, and no fixed floor told them apart. What a real fit does is stand out: the ones that named the
+/// very ruling the AI broke scored 2.3 to 7 times the next record, and the clear misses at most 1.8 times, but one.
+pub const FIT_MIN_MARGIN: f32 = 2.0;
 /// Added when a `--keywords` phrase of two or more words is in a candidate's text whole.
 const PHRASE_BONUS: f32 = 3.0;
 /// The candidates printed and kept on a proposal.
@@ -644,7 +651,7 @@ fn rank(cands: &mut [Candidate], text: Option<&str>, keywords: &[String], marker
 }
 
 /// The candidate that fits: the one `--rule` or `--decision` names, none with `--new`, else the best when it scores
-/// [`FIT_MIN_SCORE`] with [`FIT_MIN_TERMS`] shared words.
+/// [`FIT_MIN_SCORE`] with [`FIT_MIN_TERMS`] shared words and at least [`FIT_MIN_MARGIN`] times the next candidate.
 fn pick<'a>(args: &Args, cands: &'a [Candidate]) -> Result<Option<&'a Candidate>, String> {
     if args.new {
         return Ok(None);
@@ -679,7 +686,10 @@ fn pick<'a>(args: &Args, cands: &'a [Candidate]) -> Result<Option<&'a Candidate>
             many => Err(format!("'{d}' fits {} decisions; give more of the slug", many.len())),
         };
     }
-    Ok(cands.first().filter(|c| c.score >= FIT_MIN_SCORE && c.matched.len() >= FIT_MIN_TERMS))
+    let next = cands.get(1).map_or(0.0, |c| c.score);
+    Ok(cands
+        .first()
+        .filter(|c| c.score >= FIT_MIN_SCORE && c.matched.len() >= FIT_MIN_TERMS && c.score >= FIT_MIN_MARGIN * next))
 }
 
 /// `id` is in a `served` list of one of `rows`.
@@ -993,7 +1003,10 @@ pub fn render(prop: &Proposal, dry_run: bool) -> String {
         let list: Vec<String> =
             prop.candidates.iter().map(|c| format!("{} {} ({:.1})", c.kind, c.show, c.score)).collect();
         let tail = if prop.kind == Kind::NewRule {
-            format!(" · none fits (a fit scores {FIT_MIN_SCORE:.0} with {FIT_MIN_TERMS} shared words)")
+            format!(
+                " · none fits (a fit scores {FIT_MIN_SCORE:.0} or more, shares {FIT_MIN_TERMS} words, and scores \
+                 {FIT_MIN_MARGIN:.0} times the next)"
+            )
         } else {
             String::new()
         };
@@ -1009,4 +1022,39 @@ pub fn render(prop: &Proposal, dry_run: bool) -> String {
         ));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand(show: &str, score: f32, shared: usize) -> Candidate {
+        Candidate {
+            kind: "decision",
+            id: show.to_string(),
+            show: show.to_string(),
+            domain: "d".to_string(),
+            text: show.to_string(),
+            has_matchers: false,
+            global: false,
+            doc: String::new(),
+            score,
+            matched: (0..shared).map(|i| format!("w{i}")).collect(),
+        }
+    }
+
+    /// The score pairs are gate 4's, on Chris's store: a correction naming the very ruling it broke (112.4 against the
+    /// next record's 39.0) and one whose top two records were both only on its topic (146.2 against 131.2).
+    #[test]
+    fn a_fit_stands_out_from_the_next_candidate() {
+        let args = Args::default();
+        let fit = |c: &[Candidate]| pick(&args, c).expect("no flag names a target").map(|c| c.show.clone());
+        assert_eq!(fit(&[cand("ruling", 112.4, 5), cand("next", 39.0, 3)]), Some("ruling".to_string()));
+        assert_eq!(fit(&[cand("topic", 146.2, 6), cand("next", 131.2, 6)]), None, "a high score that does not stand out");
+        assert_eq!(fit(&[cand("only", 30.0, 3)]), Some("only".to_string()), "nothing beside it");
+        assert_eq!(fit(&[cand("low", 11.0, 3)]), None, "under the floor");
+        assert_eq!(fit(&[cand("one-word", 40.0, 1)]), None, "one shared word");
+        let new = Args { new: true, ..Args::default() };
+        assert!(pick(&new, &[cand("ruling", 112.4, 5)]).unwrap().is_none(), "--new: none fits");
+    }
 }
