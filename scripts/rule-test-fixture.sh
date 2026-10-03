@@ -15,7 +15,20 @@ bin="$target/debug/base"
 [ -f "$bin" ] || bin="$bin.exe"
 [ -f "$bin" ] || { echo "FAIL: no base binary at $target/debug"; exit 1; }
 
-tmp="$(mktemp -d)"
+# The throwaway home must sit where the binary's own write tripwire (src/home.rs, armed whenever BASE_HOME is set)
+# accepts it: inside the system temp folder as the BINARY spells it, or outside the real home. On a GitHub Windows
+# runner `mktemp` spells %TEMP% one way and the binary's temp_dir() another, so the tripwire read the fixture's graph
+# write as a write into the real home (PR #191, run 37113466070). RUNNER_TEMP (D:\a\_temp there) is outside the
+# profile, so on a Windows runner the home goes there. Both spellings are printed, so a log shows which applied.
+if command -v cygpath >/dev/null 2>&1; then
+  echo "temp folder: bash TMP=${TMP:-} · native $(powershell.exe -NoProfile -Command '[IO.Path]::GetTempPath()' 2>/dev/null | tr -d '\r')"
+fi
+if command -v cygpath >/dev/null 2>&1 && [ -n "${RUNNER_TEMP:-}" ]; then
+  tmp="$(mktemp -d -p "$(cygpath -u "$RUNNER_TEMP")")"
+else
+  tmp="$(mktemp -d)"
+fi
+if command -v cygpath >/dev/null 2>&1; then echo "throwaway home under: $(cygpath -w "$tmp")"; fi
 trap 'rm -rf "$tmp"' EXIT
 
 # run <name> <domains.toml>: `base rule test` in a fresh home whose workspace holds that domains.toml.
