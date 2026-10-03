@@ -161,8 +161,20 @@ impl Calls<'_> {
             self.would += 1;
             return None;
         }
+        // Gate 4: about 80 s a call, so a pass can outlast a shell that stops commands after two minutes. Every answer
+        // is cached as it arrives, so the AI that sees this can run the pass again in the background at no cost.
+        if self.made == 0 {
+            eprintln!(
+                "base tune: asking Haiku, about a minute a call, {} at most this pass. If your shell stops commands after a \
+                 few minutes, run base tune in the background: answers are kept, so running it again repeats no call.",
+                self.max
+            );
+        }
         self.made += 1;
-        Some(self.judge.ask(prompt))
+        let started = std::time::Instant::now();
+        let answer = self.judge.ask(prompt);
+        eprintln!("base tune: call {} answered in {} s", self.made, started.elapsed().as_secs());
+        Some(answer)
     }
 }
 
@@ -513,11 +525,18 @@ fn known_domain(domains: &[crate::domain::DomainDef], name: Option<&str>) -> Opt
     domains.iter().find(|d| crate::crud::slugify(&d.name) == want).map(|d| d.name.clone())
 }
 
-/// The judge's keywords that are in `prompt` as whole words, each once.
+/// A keyword a domain could use: one to three words of letters, digits and `-'._/`, as the keywords people write are
+/// ("hook output", "journal entry"). Gate 4: the judge also returned whole clauses ("my 1250 payment was from caddy",
+/// "City of Atlanta (water and trash?"), which no later prompt would ever carry.
+pub(crate) fn usable_keyword(k: &str) -> bool {
+    (1..=3).contains(&k.split_whitespace().count()) && k.chars().all(|c| c.is_alphanumeric() || c.is_whitespace() || "-'._/".contains(c))
+}
+
+/// The judge's keywords that are usable and in `prompt` as whole words, each once.
 fn in_prompt(keywords: &[String], prompt: &str) -> Vec<String> {
     let lower = prompt.to_lowercase();
     let mut out: Vec<String> = Vec::new();
-    for k in keywords.iter().map(|k| k.trim()).filter(|k| !k.is_empty()) {
+    for k in keywords.iter().map(|k| k.trim()).filter(|k| usable_keyword(k)) {
         if crate::domain::matcher::contains_word(&lower, &k.to_lowercase()) && !out.iter().any(|o| o.eq_ignore_ascii_case(k)) {
             out.push(k.to_string());
         }
@@ -1057,4 +1076,23 @@ fn store_line(c: &StoreCheck) -> String {
         s.push_str(&format!(" · {n}"));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gate 4's keywords: a clause and a fragment with brackets are refused, short plain ones kept.
+    #[test]
+    fn keywords_are_one_to_three_plain_words() {
+        for k in ["hook output", "staging proxy", "base-gbl", "don't", "assigned to me"] {
+            assert!(usable_keyword(k), "{k}");
+        }
+        for k in ["my 1250 payment was from caddy", "City of Atlanta (water and trash?", "actual path of the file itself", ""] {
+            assert!(!usable_keyword(k), "{k}");
+        }
+        let prompt = "my 1250 payment was from caddy, but it only lets me choose vintryx";
+        let judged = ["my 1250 payment was from caddy".to_string(), "caddy".to_string(), "vintryx".to_string()];
+        assert_eq!(in_prompt(&judged, prompt), ["caddy", "vintryx"]);
+    }
 }

@@ -72,6 +72,24 @@ fn rows(config: &BaseConfig, cwd: &Path) -> Vec<Row> {
     out
 }
 
+/// Up to `n` of `list`'s prompts for the judge, newest first, no two opening with the same words. Gate 4: a spawned
+/// session's boot prompt is one long template with a different codename in each, and six copies of it were the six
+/// examples of "hook"; the judge should see six different prompts when the keyword has them.
+fn distinct_recent(list: Vec<String>, n: usize) -> Vec<String> {
+    let opening = |t: &str| t.split_whitespace().take(12).collect::<Vec<_>>().join(" ").to_lowercase();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for t in list.into_iter().rev() {
+        if out.len() == n {
+            break;
+        }
+        if seen.insert(opening(&t)) {
+            out.push(t);
+        }
+    }
+    out
+}
+
 fn is_notification(text: &str) -> bool {
     text.trim_start().starts_with("<task-notification>")
 }
@@ -157,9 +175,10 @@ fn candidates(bench: &Bench<'_>, rows: &[Row]) -> Candidates {
         .filter(|(_, list)| list.len() >= KEYWORD_MIN_PROMPTS)
         .map(|((d, k), list)| {
             let n = list.len();
-            let examples = list.into_iter().rev().take(KEYWORD_EXAMPLES).collect();
-            (d, k, n, examples)
+            (d, k, n, distinct_recent(list, KEYWORD_EXAMPLES))
         })
+        // The answer needs three prompts judged; one template seen many times is not three.
+        .filter(|(.., examples)| examples.len() >= KEYWORD_MIN_PROMPTS)
         .collect();
     keywords.sort_by(|x, y| y.2.cmp(&x.2).then(x.1.cmp(&y.1)));
     keywords.truncate(TOP_KEYWORDS);
@@ -400,7 +419,7 @@ pub(crate) fn check(
             let Some((r, served)) = index(&sp.id, 's').and_then(|i| c.split.get(i)) else { continue };
             let parts: Vec<&Part> = sp.parts.iter().filter(|p| !p.text.trim().is_empty()).collect();
             let [first, second] = parts.as_slice() else { continue };
-            let clean = |k: &[String]| k.iter().map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect::<Vec<_>>();
+            let clean = |k: &[String]| k.iter().map(|w| w.trim().to_string()).filter(|w| super::tune_pass::usable_keyword(w)).collect::<Vec<_>>();
             let short = short_ref(&r.domain, &r.id);
             let pp = propose::PatternParts {
                 text: Some(first.text.trim().to_string()),
@@ -426,7 +445,7 @@ pub(crate) fn check(
                 .instead
                 .iter()
                 .map(|w| w.trim().to_string())
-                .filter(|w| !w.is_empty() && !w.eq_ignore_ascii_case(kw))
+                .filter(|w| super::tune_pass::usable_keyword(w) && !w.eq_ignore_ascii_case(kw))
                 .filter(|w| on.iter().any(|p| crate::domain::matcher::contains_word(&p.to_lowercase(), &w.to_lowercase())))
                 .collect();
             let example = on.iter().find(|p| instead.iter().any(|w| crate::domain::matcher::contains_word(&p.to_lowercase(), &w.to_lowercase())));
@@ -470,4 +489,27 @@ pub(crate) fn check(
         let _ = tune::write_json(&p, &Last { at: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false) });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gate 4: a keyword's examples were six copies of one spawn template. They are now its newest prompts with
+    /// different openings, so the template counts once.
+    #[test]
+    fn examples_open_differently() {
+        let boot = |c: &str| format!("FIRST TURN - do these three BEFORE you render anything else, including any list a hook puts. You are {c}.");
+        let list = vec![
+            "fix the hook output order".to_string(),
+            boot("otter"),
+            boot("lynx"),
+            "why did the session start hook stall".to_string(),
+            boot("gecko"),
+        ];
+        assert_eq!(
+            distinct_recent(list, 6),
+            [boot("gecko"), "why did the session start hook stall".to_string(), "fix the hook output order".to_string()]
+        );
+    }
 }
