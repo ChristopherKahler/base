@@ -93,6 +93,11 @@ pub fn render_rule(text: &str, rationale: Option<&str>) -> String {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DomainDef {
     pub name: String,
+    /// Names this domain had before `base project rename` (BO-24, R4). `--domain`, `domain get` and slug lookups
+    /// read one of them as this domain and say so. Not written back when empty, so a file without it round-trips
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     #[serde(default = "default_mode")]
     pub mode: String, // "always" | "triggered"
     /// `auto_inject = false` keeps this domain out of every automatic injection — the
@@ -381,6 +386,7 @@ pub fn add_trigger(
     } else {
         file.domain.push(DomainDef {
             name: domain_name.to_string(),
+            aliases: Vec::new(),
             mode: "triggered".to_string(),
             auto_inject: true,
             root: None,
@@ -566,6 +572,10 @@ pub fn create_domain(
     if file.domain.iter().any(|d| d.name.eq_ignore_ascii_case(domain_name)) {
         anyhow::bail!("Domain '{domain_name}' already exists");
     }
+    // R4: an old name still reads as the renamed domain everywhere, so a new domain under it would never be reached.
+    if let Some(d) = renamed_from(&load_domains(cwd), domain_name) {
+        anyhow::bail!("'{domain_name}' is an old name of domain '{}' (renamed); pick another name", d.name);
+    }
 
     let mut kws = Vec::new();
     if let Some(kw) = keyword { kws.push(kw.to_string()); }
@@ -575,6 +585,7 @@ pub fn create_domain(
 
     file.domain.push(DomainDef {
         name: domain_name.to_string(),
+        aliases: Vec::new(),
         mode: "triggered".to_string(),
         auto_inject: true,
         root: None,
@@ -671,6 +682,157 @@ pub fn remove_trigger(
     Ok(tier::Changed { tier, count: removed })
 }
 
+// ─── Rename (BO-24) ──────────────────────────────────────────
+
+/// The domain `name` is an old name of, among `domains`: one whose `aliases` hold it. `None` while a domain is still
+/// called `name`, so a real name always wins over an alias.
+pub fn renamed_from<'a>(domains: &'a [DomainDef], name: &str) -> Option<&'a DomainDef> {
+    let want = crate::crud::slugify(name);
+    if domains.iter().any(|d| d.name == name || crate::crud::slugify(&d.name) == want) {
+        return None;
+    }
+    domains.iter().find(|d| d.aliases.iter().any(|a| crate::crud::slugify(a) == want))
+}
+
+/// The domain to act on for a name the user typed (R4): the name itself, or, when it is an old name kept as an
+/// alias, the domain's name now, with one line on stderr saying so (`vintrix is now vintryx`). Reads the
+/// domains.toml files `load_domains` reads, never the graph: a file read, not a store load, on every `--domain`.
+pub fn canonical_name(cwd: &Path, name: &str) -> String {
+    match renamed_from(&load_domains(cwd), name) {
+        Some(d) => {
+            crate::crud::alias::notice(name, &d.name);
+            d.name.clone()
+        }
+        None => name.to_string(),
+    }
+}
+
+/// One domains.toml with `old` renamed to `new` (R2).
+#[derive(Debug)]
+pub struct TomlRename {
+    /// The whole file after the rename.
+    pub text: String,
+    /// The rules the renamed domain declares in this file.
+    pub declared_rules: usize,
+}
+
+/// `text` (a domains.toml) with the domain `old` renamed to `new` and `old` added to its `aliases` (R2, R4). Edited
+/// as text, so every other line, the comments and the order stay byte for byte; a file written by base's own
+/// serializer has the `[[domain]]` / `name = "..."` shape this reads. The result is parsed back and compared with
+/// the original domain by domain: anything changed besides that name and that alias list is refused, and nothing
+/// is returned to write. `Ok(None)` when the file holds no domain called `old`.
+pub fn rename_in_text(text: &str, old: &str, new: &str) -> anyhow::Result<Option<TomlRename>> {
+    let before: DomainsFile = toml::from_str(text)?;
+    // By slug, the key its records carry: `project add -n Vintrix` writes `name = "Vintrix"` for `domain/vintrix`.
+    let slug = |d: &DomainDef| crate::crud::slugify(&d.name);
+    let hits: Vec<usize> = (0..before.domain.len()).filter(|i| slug(&before.domain[*i]) == old).collect();
+    let target = match hits.as_slice() {
+        [] => return Ok(None),
+        [one] => *one,
+        many => anyhow::bail!(
+            "{} domains here are '{old}' once slugified ({}); rename them by hand",
+            many.len(),
+            many.iter().map(|i| before.domain[*i].name.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    if before.domain.iter().any(|d| slug(d) == new) {
+        anyhow::bail!("a domain is already called '{new}'");
+    }
+    let mut aliases = before.domain[target].aliases.clone();
+    if !aliases.iter().any(|a| crate::crud::slugify(a) == old) {
+        aliases.push(old.to_string());
+    }
+    aliases.retain(|a| crate::crud::slugify(a) != new);
+
+    // The `name` and `aliases` lines of the target's own table: after its `[[domain]]` header, before the next
+    // header of any kind (a `[[domain.rules.match]]` sub-table holds keys that are not the domain's).
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let (mut seen, mut in_target) = (0usize, false);
+    let (mut name_at, mut aliases_at) = (None, None);
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_target = false;
+            let header: String = t.split('#').next().unwrap_or("").chars().filter(|c| !c.is_whitespace()).collect();
+            if header == "[[domain]]" {
+                in_target = seen == target;
+                seen += 1;
+            }
+            continue;
+        }
+        if !in_target {
+            continue;
+        }
+        match toml_key(t) {
+            Some("name") => name_at = Some(i),
+            Some("aliases") => aliases_at = Some(i),
+            _ => {}
+        }
+    }
+    let unread = || anyhow::anyhow!("could not find domain '{old}' as a `[[domain]]` table with a `name = \"{old}\"` line; rename it by hand");
+    let name_at = name_at.ok_or_else(unread)?;
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let list = toml::Value::Array(aliases.iter().map(|a| toml::Value::String(a.clone())).collect()).to_string();
+
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    out[name_at] = with_value(lines[name_at], &toml::Value::String(new.to_string()).to_string()).ok_or_else(unread)?;
+    match aliases_at {
+        Some(i) => {
+            out[i] = with_value(lines[i], &list)
+                .ok_or_else(|| anyhow::anyhow!("domain '{old}' has an `aliases` list over more than one line; rename it by hand"))?;
+        }
+        None => {
+            let line = lines[name_at];
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let ending = if line.ends_with('\n') { "" } else { nl };
+            out.insert(name_at + 1, format!("{ending}{indent}aliases = {list}{}", if ending.is_empty() { nl } else { "" }));
+        }
+    }
+    let text_after = out.concat();
+
+    // The check that makes "byte for byte elsewhere" a refusal rather than a hope.
+    let after: DomainsFile = toml::from_str(&text_after)?;
+    let mut want = before.domain.clone();
+    want[target].name = new.to_string();
+    want[target].aliases = aliases;
+    let as_json = |d: &[DomainDef]| serde_json::to_value(d).unwrap_or_default();
+    if as_json(&want) != as_json(&after.domain) {
+        anyhow::bail!("renaming '{old}' in the text would change more than its name and aliases; rename it by hand");
+    }
+    Ok(Some(TomlRename { text: text_after, declared_rules: before.domain[target].rules.len() }))
+}
+
+/// The key of a `key = value` line, unquoted; `None` for a comment, a blank line or an array element.
+fn toml_key(line: &str) -> Option<&str> {
+    if line.starts_with('#') {
+        return None;
+    }
+    let (key, _) = line.split_once('=')?;
+    let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
+    (!key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')).then_some(key)
+}
+
+/// `line` (`key = value  # comment`) with its value replaced by `value`, keeping the key, the spacing, the comment
+/// and the line ending. `None` when the value is not a one-line string or array this can bound.
+fn with_value(line: &str, value: &str) -> Option<String> {
+    let eq = line.find('=')?;
+    let rest = &line[eq + 1..];
+    let lead = rest.len() - rest.trim_start().len();
+    let v = &rest[lead..];
+    let end = match v.chars().next()? {
+        q @ ('"' | '\'') => {
+            let close = v[1..].find(q)? + 1;
+            if v[1..close].contains('\\') {
+                return None;
+            }
+            close + 1
+        }
+        '[' => v.find(']')? + 1,
+        _ => return None,
+    };
+    Some(format!("{}{}{}{}", &line[..eq + 1], &rest[..lead], value, &v[end..]))
+}
+
 /// List all domains (for CLI output).
 pub fn list_domains(cwd: &Path, ns: &crate::config::NamespaceConfig) {
     let domains = load_domains(cwd);
@@ -743,9 +905,16 @@ pub fn rules_of(
 /// Show a specific domain's full config (for CLI output).
 pub fn get_domain(cwd: &Path, ns: &crate::config::NamespaceConfig, name: &str) {
     let domains = load_domains(cwd);
-    match domains.iter().find(|d| d.name == name) {
+    // R4: an old name shows the domain it is now, and says so.
+    let found = domains.iter().find(|d| d.name == name).or_else(|| {
+        renamed_from(&domains, name).inspect(|d| crate::crud::alias::notice(name, &d.name))
+    });
+    match found {
         Some(d) => {
             println!("Domain: {}", d.name);
+            if !d.aliases.is_empty() {
+                println!("Aliases: {}", d.aliases.join(", "));
+            }
             println!("Mode: {}", d.mode);
             if !d.prompt_keywords.is_empty() {
                 println!("Prompt Keywords: {}", d.prompt_keywords.join(", "));
@@ -894,6 +1063,43 @@ mod tests {
         assert_eq!(d.role.as_deref(), Some("You are a strategist."));
         assert_eq!(d.output_mode.as_deref(), Some("file"));
         assert_eq!(d.format.as_deref(), Some("Prefer tables."));
+    }
+
+    // ─── BO-24: rename_in_text ───────────────────────────────
+
+    #[test]
+    fn rename_in_text_is_none_for_a_file_without_the_domain() {
+        assert!(rename_in_text("[[domain]]\nname = \"a\"\n", "b", "c").unwrap().is_none());
+    }
+
+    #[test]
+    fn rename_in_text_back_to_an_old_name_swaps_the_alias() {
+        let text = "[[domain]]\nname = \"b\"\naliases = [\"a\"]  # kept\nmode = \"triggered\"\n";
+        let r = rename_in_text(text, "b", "a").unwrap().unwrap();
+        assert_eq!(r.text, "[[domain]]\nname = \"a\"\naliases = [\"b\"]  # kept\nmode = \"triggered\"\n");
+    }
+
+    #[test]
+    fn rename_in_text_handles_a_last_line_with_no_newline() {
+        let r = rename_in_text("[[domain]]\nname = \"a\"", "a", "b").unwrap().unwrap();
+        assert_eq!(r.text, "[[domain]]\nname = \"b\"\naliases = [\"a\"]");
+    }
+
+    #[test]
+    fn rename_in_text_refuses_what_it_cannot_bound() {
+        let multi = "[[domain]]\nname = \"a\"\naliases = [\n  \"z\",\n]\n";
+        let err = rename_in_text(multi, "a", "b").unwrap_err().to_string();
+        assert!(err.contains("more than one line"), "{err}");
+        let taken = "[[domain]]\nname = \"a\"\n\n[[domain]]\nname = \"b\"\n";
+        assert!(rename_in_text(taken, "a", "b").unwrap_err().to_string().contains("already called 'b'"));
+    }
+
+    #[test]
+    fn rename_in_text_reads_only_the_domain_table_not_its_sub_tables() {
+        let text = "[[domain]]\nname = \"a\"\n\n[[domain.rules]]\ntext = \"r\"\n\n[[domain]]\nname = \"c\"\n";
+        let r = rename_in_text(text, "a", "b").unwrap().unwrap();
+        assert_eq!(r.text, "[[domain]]\nname = \"b\"\naliases = [\"a\"]\n\n[[domain.rules]]\ntext = \"r\"\n\n[[domain]]\nname = \"c\"\n");
+        assert_eq!(r.declared_rules, 1);
     }
 
     #[test]

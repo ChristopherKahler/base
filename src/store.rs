@@ -1687,6 +1687,56 @@ fn reap_stale_lock(lock: &Path) -> bool {
     }
 }
 
+/// Take the lock file `lock` WITHOUT waiting, for a command that refuses to run beside another run of itself rather
+/// than queue behind it (`project rename`, BO-24 R7). `Ok(None)` while a live process holds it. A holder that is
+/// gone is reaped at once, whatever the file's age: only that one command takes this file, so a dead pid in it is
+/// a crashed run, never a slow one.
+pub fn try_lock(lock: &Path) -> Result<Option<GraphLockGuard>> {
+    if let Some(parent) = lock.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating directory for lock {}", lock.display()))?;
+    }
+    if HELD_LOCKS.with(|h| h.borrow().iter().any(|p| p == lock)) {
+        return Ok(Some(GraphLockGuard { path: lock.to_path_buf(), reentrant: true }));
+    }
+    for _ in 0..2 {
+        match create_lock_file(lock) {
+            Ok(mut fh) => {
+                // A lock nobody can name is one nobody can reap safely: without its pid it is not taken.
+                if let Err(e) = writeln!(fh, "{}", std::process::id()) {
+                    drop(fh);
+                    let _ = fs::remove_file(lock);
+                    return Err(e).with_context(|| format!("writing this process's id into the lock {}", lock.display()));
+                }
+                HELD_LOCKS.with(|h| h.borrow_mut().push(lock.to_path_buf()));
+                return Ok(Some(GraphLockGuard { path: lock.to_path_buf(), reentrant: false }));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let gone = match lock_pid(lock) {
+                    Some(pid) => !holder_is_alive(pid),
+                    // No pid: a run between its create and its write, or one that died there. Gone once it is older
+                    // than any write takes, the bound the graph lock reaps by.
+                    None => fs::metadata(lock)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                        .is_some_and(|age| age > LOCK_STALE),
+                };
+                if !gone {
+                    return Ok(None);
+                }
+                let _ = fs::remove_file(lock);
+            }
+            Err(e) => return Err(e).with_context(|| format!("taking the lock {}", lock.display())),
+        }
+    }
+    Ok(None)
+}
+
+/// The pid written in a lock file, for a refusal that names who holds it.
+pub fn lock_holder(lock: &Path) -> Option<u32> {
+    lock_pid(lock)
+}
+
 /// Whether this thread currently holds a graph lock. The tripwire reads it.
 pub fn holds_graph_lock() -> bool {
     HELD_LOCKS.with(|h| !h.borrow().is_empty())
@@ -2473,5 +2523,34 @@ mod tests {
         assert_eq!(defs, 1, "is_transient_lock is defined {defs} times");
         // And the predicate still behaves as the family the lock now waits on.
         assert!(crate::changelog::is_transient_lock(&access_denied()));
+    }
+
+    /// BO-24 (`project rename`, R7): the non-waiting lock refuses a live holder, takes the place of a dead one at
+    /// once, and treats a file with no pid as held until it is older than LOCK_STALE, then as gone.
+    #[test]
+    fn try_lock_refuses_a_live_holder_and_reaps_a_gone_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("project-rename.lock");
+        let age = |l: &Path, by: std::time::Duration| {
+            fs::OpenOptions::new().write(true).open(l).unwrap().set_modified(std::time::SystemTime::now() - by).unwrap();
+        };
+
+        // This test's own process is alive.
+        std::fs::write(&lock, format!("{}
+", std::process::id())).unwrap();
+        assert!(try_lock(&lock).unwrap().is_none(), "a live holder is refused");
+
+        // u32::MAX is no running process on either platform.
+        std::fs::write(&lock, format!("{}
+", u32::MAX)).unwrap();
+        let guard = try_lock(&lock).unwrap().expect("a dead holder is reaped at once");
+        assert_eq!(lock_holder(&lock), Some(std::process::id()), "the lock now names this process");
+        drop(guard);
+        assert!(!lock.exists(), "dropping the guard removes the lock");
+
+        std::fs::write(&lock, "").unwrap();
+        assert!(try_lock(&lock).unwrap().is_none(), "a fresh lock with no pid may be a run about to write it");
+        age(&lock, LOCK_STALE * 2);
+        assert!(try_lock(&lock).unwrap().is_some(), "an old lock with no pid is gone");
     }
 }
