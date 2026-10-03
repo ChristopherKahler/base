@@ -358,10 +358,19 @@ pub enum Commands {
         /// Restore the workspace graph from a backup snapshot. Bare `--restore` lists snapshots.
         #[arg(long, num_args = 0..=1)]
         restore: Option<Option<String>>,
+        /// Plan the repair of what doctor reports and change nothing: records of another workspace moved out,
+        /// corrections linked to what they correct or made plain notes, supersession disagreements settled,
+        /// `[signal] max_chars` migrated, each tier compacted and its backups cut to `[graph] keep_backups`.
+        /// `--fix --yes` applies the plan, snapshotting each graph first.
+        #[arg(long, conflicts_with_all = ["repair", "restore"])]
+        fix: bool,
+        /// With `--fix`: apply the plan.
+        #[arg(long, requires = "fix")]
+        yes: bool,
         /// Measure how much hook text the running Claude Code delivers to the model (session start, prompt submit,
         /// pre-tool) with headless `claude -p` calls on a cheap model, then write each hook's budget and
         /// `measured_on` to ~/.base-gbl/base.toml. Up to 12 calls per hook.
-        #[arg(long, conflicts_with_all = ["json", "repair", "restore"])]
+        #[arg(long, conflicts_with_all = ["json", "repair", "restore", "fix"])]
         measure: bool,
         /// Internal: `emit` prints one measure payload. The hooks `--measure` registers run it.
         #[arg(requires = "measure", value_parser = ["emit"], hide = true)]
@@ -422,9 +431,14 @@ pub enum GraphAction {
     /// unhealthy when the hook tried — telling an operator about a problem they
     /// cannot then act on is worse than not telling them. Repair, then run this.
     Migrate {
-        /// Show what would be linked, and by which source, without writing.
+        /// Show what would be linked, and by which source, and the store repair `base doctor --fix` plans, without
+        /// writing.
         #[arg(long)]
         dry_run: bool,
+        /// Also apply the store repair (the one `base doctor --fix --yes` applies). Without it the repair is planned
+        /// and printed, and only the domain links are written.
+        #[arg(long, conflicts_with = "dry_run")]
+        yes: bool,
     },
     /// Apply inbound fact ops (JSON on stdin) into the local graph.
     ///
@@ -2654,7 +2668,16 @@ pub fn run() {
             match action {
                 ForkAction::Create { project, doc, slug } => {
                     let project = domain::canonical_name(standing_cwd, &project);
-                    match crud::handoff::create_fork(&cwd, &config.namespace, &project, &doc, slug.as_deref()) {
+                    let gbl = base::home::home_root();
+                    match crud::handoff::create_fork_in(
+                        gbl.as_deref(),
+                        &cwd,
+                        standing_cwd,
+                        &config.namespace,
+                        &project,
+                        &doc,
+                        slug.as_deref(),
+                    ) {
                         Ok(slug) => println!("Fork '{slug}' registered for '{project}'"),
                         Err(e) => die("Failed", e),
                     }
@@ -4670,7 +4693,7 @@ pub fn run() {
         },
 
         // ─── Doctor ───────────────────────────────────────────
-        Some(Commands::Doctor { json, repair, restore, measure, .. }) => {
+        Some(Commands::Doctor { json, repair, restore, measure, fix, yes, .. }) => {
             if !json {
                 outside_workspace_note(&cwd);
             }
@@ -4763,6 +4786,17 @@ pub fn run() {
                         }
                     }
                 }
+            } else if fix {
+                // --fix: the one repair the upgrade path runs too (F15e). Plans, or with --yes applies.
+                let report = base::fix::run(&cwd, yes);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
+                } else {
+                    print!("{}", base::fix::format_human(&report));
+                }
+                if report.has_errors() {
+                    std::process::exit(1);
+                }
             } else if repair {
                 // --repair: quarantine bad lines + atomic rewrite of the good set.
                 let outcomes = base::doctor::repair(&cwd);
@@ -4833,7 +4867,7 @@ pub fn run() {
                     std::process::exit(1);
                 }
             },
-            GraphAction::Migrate { dry_run } => {
+            GraphAction::Migrate { dry_run, yes } => {
                 if dry_run {
                     print!("{}", base::migrate::format_dry_run(&cwd, &config.namespace));
                 } else {
@@ -4851,6 +4885,12 @@ pub fn run() {
                     } else {
                         print!("{notice}");
                     }
+                }
+                // The store repair, through the one function `base doctor --fix` calls (F15e).
+                let report = base::migrate::upgrade(&cwd, yes);
+                print!("{}", base::fix::format_as(&report, "base graph migrate"));
+                if report.has_errors() {
+                    std::process::exit(1);
                 }
             }
             GraphAction::Purge { stale, apply, days } => {

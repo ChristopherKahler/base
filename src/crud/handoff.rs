@@ -72,20 +72,6 @@ fn mutate_file_if_holds(
     })
 }
 
-/// Load one graph file, run a SPARQL UPDATE, write back atomically.
-fn mutate_file(path: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<()> {
-    let full = format!("{}\n{}", crud::prefixes(ns), sparql);
-    // Locked, load inside: four builders registering inside twelve seconds is
-    // how #71-#74 were filed, and every one of those writes reported success.
-    crate::store::locked_update(
-        path,
-        &full,
-        crate::store::Scope::Target,
-        crate::store::Intent::Knowledge,
-    )
-    .with_context(|| format!("handoff update failed: {full}"))
-}
-
 /// Derive a flow-doc slug from its doc path basename (no extension).
 /// `/abs/path/FORK-COMMAND-SPEC.md` → `FORK-COMMAND-SPEC`. Used VERBATIM (no
 /// slugify/lowercase) so the doc filename and the graph slug are the SAME string
@@ -333,6 +319,70 @@ fn archive_slugs_update(ns: &NamespaceConfig, slugs: &[String], project: &str) -
     )
 }
 
+/// The three clock fields of a handoff or fork, as the lexical `xsd:dateTime` values a copy carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Dates {
+    created: String,
+    resurface: String,
+    last_active: String,
+}
+
+impl Dates {
+    fn now() -> Self {
+        let now = crud::now_iso();
+        Dates { created: now.clone(), resurface: now.clone(), last_active: now }
+    }
+}
+
+/// The dates of `slug`'s copy in a tier other than `written`, when one holds it: the newest copy by `createdAt` when
+/// several do. A create of a slug that only another tier holds is a MOVE (BO-11's re-register path; the F22b sweep's
+/// moves), and a move keeps the record's dates (F22c): before BO-12 every moved record got `now` and jumped to the top
+/// of session start as if it were new.
+///
+/// Reads only the lines whose subject is the record, so a create does not parse the global graph to learn three dates.
+/// A tier that cannot be read gives nothing here; the create's own archive step names it.
+fn dates_elsewhere(gbl_root: Option<&Path>, standing_cwd: &Path, written: &Path, ns: &NamespaceConfig, slug: &str) -> Option<Dates> {
+    let key = |f: &Path| f.canonicalize().unwrap_or_else(|_| f.to_path_buf());
+    let written = key(written);
+    let iri = crud::build_iri(ns, "handoff", slug);
+    let subject = format!("<{iri}> ");
+    let field = |store: &Store, local: &str| -> Option<String> {
+        let s = oxigraph::model::NamedNodeRef::new(&iri).ok()?;
+        let p = format!("{}{local}", ns.uri);
+        let p = oxigraph::model::NamedNodeRef::new(&p).ok()?;
+        store.quads_for_pattern(Some(s.into()), Some(p), None, None).filter_map(|q| q.ok()).find_map(|q| match q.object {
+            oxigraph::model::Term::Literal(l) => Some(l.value().to_string()),
+            _ => None,
+        })
+    };
+    let mut best: Option<Dates> = None;
+    for file in all_tier_files(gbl_root, standing_cwd) {
+        if key(&file) == written {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        let lines: String = text.lines().filter(|l| l.starts_with(&subject)).map(|l| format!("{l}\n")).collect();
+        if lines.is_empty() {
+            continue;
+        }
+        let store = Store::new().ok()?;
+        if store.load_from_reader(oxigraph::io::RdfFormat::NQuads, lines.as_bytes()).is_err() {
+            continue;
+        }
+        let Some(created) = field(&store, "createdAt") else { continue };
+        let found = Dates {
+            resurface: field(&store, "resurfaceAt").unwrap_or_else(|| created.clone()),
+            last_active: field(&store, "lastActive").unwrap_or_else(|| created.clone()),
+            created,
+        };
+        let at = |d: &Dates| chrono::DateTime::parse_from_rfc3339(&d.created).ok();
+        if best.as_ref().is_none_or(|b| at(&found) > at(b)) {
+            best = Some(found);
+        }
+    }
+    best
+}
+
 /// Register a handoff pointing at a resume document, with no lane input beyond
 /// the doc's own `by:` (see [`create_in_lane`]).
 pub fn create(
@@ -369,11 +419,13 @@ pub fn create_in_lane(
     slug: Option<&str>,
     inputs: &LaneInputs,
 ) -> Result<CreateOutcome> {
-    let now = crud::now_iso();
     let slug = resolve_doc_slug(slug, doc_path)?;
     let iri = crud::build_iri(ns, "handoff", &slug);
     let (path, graph) = write_tier(cwd, ns)?;
     let p = &ns.prefix;
+    // F22c: a slug another tier holds and this one does not is being moved here, and keeps its dates. Read before the
+    // lock (three lines of another file); whether THIS tier holds it is decided inside the lock, below.
+    let carried = dates_elsewhere(gbl_root, standing_cwd, &path, ns, &slug);
     let lane = lane_of_new(inputs, doc_path, &slug);
     let lane_name = lane.as_ref().map(|l| l.name.as_str());
     // The project this handoff names, as the IRI its domain hangs off (kite F7b).
@@ -393,21 +445,24 @@ pub fn create_in_lane(
         "DELETE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }}"
     );
 
-    // The new handoff.
-    let insert = format!(
-        "INSERT DATA {{ GRAPH <{graph}> {{\n\
-           <{iri}> rdf:type {p}:Handoff ;\n\
-             {p}:name \"{project}\" ;\n\
-             {p}:project \"{project}\" ;\n\
-             {p}:handoffDoc \"{doc}\" ;\n\
-             {p}:kind \"handoff\" ;\n\
-         {lane_triple}\
-             {p}:status \"open\" ;\n\
-             {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
-             {p}:resurfaceAt \"{now}\"^^xsd:dateTime ;\n\
-             {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
-         }} }}"
-    );
+    // The new handoff, with `now` for its clock unless it is moving here from another tier (F22c).
+    let insert = |d: &Dates| {
+        format!(
+            "INSERT DATA {{ GRAPH <{graph}> {{\n\
+               <{iri}> rdf:type {p}:Handoff ;\n\
+                 {p}:name \"{project}\" ;\n\
+                 {p}:project \"{project}\" ;\n\
+                 {p}:handoffDoc \"{doc}\" ;\n\
+                 {p}:kind \"handoff\" ;\n\
+             {lane_triple}\
+                 {p}:status \"open\" ;\n\
+                 {p}:createdAt \"{}\"^^xsd:dateTime ;\n\
+                 {p}:resurfaceAt \"{}\"^^xsd:dateTime ;\n\
+                 {p}:lastActive \"{}\"^^xsd:dateTime .\n\
+             }} }}",
+            d.created, d.resurface, d.last_active
+        )
+    };
 
     // The handoff takes the domain of the project it names, in the same write.
     let inherit = crate::domain::link::inherit_update(ns, &graph, &iri, &project_iri);
@@ -446,6 +501,12 @@ pub fn create_in_lane(
         let store = crate::store::load_or_empty(&path)?;
         let archive = split(priors_in(&store, ns, project_name, &inputs.titles)?, true);
         let archive_update = archive_slugs_update(ns, &archive, project_name);
+        // Held here already: a re-register re-points it, and surfaces it at the next session start as it always has.
+        let dates = match &carried {
+            Some(d) if !store_holds(&store, ns, &slug) => d.clone(),
+            _ => Dates::now(),
+        };
+        let insert = insert(&dates);
         let statements: Vec<&str> = [archive_update.as_str(), &clean_target, &insert, &inherit]
             .into_iter()
             .filter(|s| !s.is_empty())
@@ -546,11 +607,25 @@ pub fn create_fork(
     doc_path: &str,
     slug: Option<&str>,
 ) -> Result<String> {
-    let now = crud::now_iso();
+    create_fork_in(None, cwd, cwd, ns, project, doc_path, slug)
+}
+
+/// [`create_fork`], looking in every tier found from `standing_cwd` for a copy of the slug: one that only another tier
+/// holds is being moved here and keeps its dates (F22c), the way [`create_in_lane`] does it for a handoff.
+pub fn create_fork_in(
+    gbl_root: Option<&Path>,
+    cwd: &Path,
+    standing_cwd: &Path,
+    ns: &NamespaceConfig,
+    project: &str,
+    doc_path: &str,
+    slug: Option<&str>,
+) -> Result<String> {
     let slug = resolve_doc_slug(slug, doc_path)?;
     let iri = crud::build_iri(ns, "handoff", &slug);
     let (path, graph) = write_tier(cwd, ns)?;
     let p = &ns.prefix;
+    let carried = dates_elsewhere(gbl_root, standing_cwd, &path, ns, &slug);
     // The project this handoff names, as the IRI its domain hangs off (kite F7b).
     let project_iri = crud::build_iri(ns, "project", &crud::slugify(project));
     let project = crud::escape_sparql_literal(project);
@@ -559,24 +634,45 @@ pub fn create_fork(
 
     // Additive: no archive-prior. A re-create of the same slug re-points it
     // (idempotent) by deleting any existing node at this IRI first.
-    let insert = format!(
-        "DELETE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }};\n\
-         INSERT DATA {{ GRAPH <{graph}> {{\n\
-           <{iri}> rdf:type {p}:Handoff ;\n\
-             {p}:name \"{name}\" ;\n\
-             {p}:project \"{project}\" ;\n\
-             {p}:handoffDoc \"{doc}\" ;\n\
-             {p}:kind \"fork\" ;\n\
-             {p}:status \"open\" ;\n\
-             {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
-             {p}:resurfaceAt \"{now}\"^^xsd:dateTime ;\n\
-             {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
-         }} }}"
-    );
+    let insert = |d: &Dates| {
+        format!(
+            "DELETE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }};\n\
+             INSERT DATA {{ GRAPH <{graph}> {{\n\
+               <{iri}> rdf:type {p}:Handoff ;\n\
+                 {p}:name \"{name}\" ;\n\
+                 {p}:project \"{project}\" ;\n\
+                 {p}:handoffDoc \"{doc}\" ;\n\
+                 {p}:kind \"fork\" ;\n\
+                 {p}:status \"open\" ;\n\
+                 {p}:createdAt \"{}\"^^xsd:dateTime ;\n\
+                 {p}:resurfaceAt \"{}\"^^xsd:dateTime ;\n\
+                 {p}:lastActive \"{}\"^^xsd:dateTime .\n\
+             }} }}",
+            d.created, d.resurface, d.last_active
+        )
+    };
 
     // The fork takes the domain of the project it names, in the same write (kite F7b).
     let inherit = crate::domain::link::inherit_update(ns, &graph, &iri, &project_iri);
-    mutate_file(&path, ns, &format!("{insert};\n{inherit}"))?;
+    // Locked, load inside: four builders registering inside twelve seconds is how #71-#74 were filed, and every one of
+    // those writes reported success. Whether this tier already holds the slug decides the dates (F22c), so it is read
+    // from the graph the write replaces.
+    crate::store::with_graph_lock(&path, || {
+        let store = crate::store::load_or_empty(&path)?;
+        let dates = match &carried {
+            Some(d) if !store_holds(&store, ns, &slug) => d.clone(),
+            _ => Dates::now(),
+        };
+        let full = format!("{}\n{};\n{inherit}", crud::prefixes(ns), insert(&dates));
+        crate::store::update_and_write(
+            &store,
+            &path,
+            &full,
+            crate::store::Scope::Target,
+            crate::store::Intent::Knowledge,
+        )
+        .with_context(|| format!("handoff update failed: {full}"))
+    })?;
     Ok(slug)
 }
 

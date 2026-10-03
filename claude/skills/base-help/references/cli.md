@@ -3275,6 +3275,12 @@ Options:
       --restore [<RESTORE>]
           Restore the workspace graph from a backup snapshot. Bare `--restore` lists snapshots
 
+      --fix
+          Plan the repair of what doctor reports and change nothing: records of another workspace moved out, corrections linked to what they correct or made plain notes, supersession disagreements settled, `[signal] max_chars` migrated, each tier compacted and its backups cut to `[graph] keep_backups`. `--fix --yes` applies the plan, snapshotting each graph first
+
+      --yes
+          With `--fix`: apply the plan
+
       --measure
           Measure how much hook text the running Claude Code delivers to the model (session start, prompt submit, pre-tool) with headless `claude -p` calls on a cheap model, then write each hook's budget and `measured_on` to ~/.base-gbl/base.toml. Up to 12 calls per hook
 
@@ -3355,7 +3361,10 @@ Usage: base graph migrate [OPTIONS]
 
 Options:
       --dry-run
-          Show what would be linked, and by which source, without writing
+          Show what would be linked, and by which source, and the store repair `base doctor --fix` plans, without writing
+
+      --yes
+          Also apply the store repair (the one `base doctor --fix --yes` applies). Without it the repair is planned and printed, and only the domain links are written
 
   -h, --help
           Print help (see a summary with '-h')
