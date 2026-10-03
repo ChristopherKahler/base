@@ -87,22 +87,40 @@ pub fn render_block(header: &str, shown: &[(usize, &ServedRule)], total: usize, 
 /// [`render_block`] with its own text after the header, `[FILE MATCH: vintrix (parent of vintryx-dealer-registry)]`
 /// (D13), while the pointer line still names the domain.
 pub fn render_block_as(header: &str, label: &str, shown: &[(usize, &ServedRule)], total: usize, domain: &str) -> String {
-    if shown.is_empty() {
+    let Some(lines) = block_lines(header, label, shown, total, domain) else {
         return String::new();
+    };
+    let mut out = format!("{}\n", lines.header);
+    for line in &lines.rules {
+        out.push_str(&format!("{line}\n"));
     }
-    let mut out = format!("[{header}: {label}]\n");
-    for (i, rule) in shown {
-        out.push_str(&format!("  {i}. {}\n", rule.rendered));
-    }
-    let withheld = total.saturating_sub(shown.len());
-    if withheld > 0 {
-        // F16's shape. One line in place of the rules this session has already been
-        // told, which is the whole point of dedup per rule rather than per block.
-        out.push_str(&format!(
-            "  ({withheld} more {domain} rule(s) already served this session · all: base rule list --domain {domain})\n"
-        ));
+    if let Some(tail) = &lines.tail {
+        out.push_str(&format!("{tail}\n"));
     }
     out
+}
+
+/// [`render_block_as`]'s lines apart, for a ranked block (BO-18) whose rules the prompt budget may withhold one at a
+/// time: the header, one line per rule in `shown`'s order, and the "already served" line when there is one.
+pub struct BlockLines {
+    pub header: String,
+    pub rules: Vec<String>,
+    pub tail: Option<String>,
+}
+
+/// The lines of [`render_block_as`], or `None` when nothing is shown.
+pub fn block_lines(header: &str, label: &str, shown: &[(usize, &ServedRule)], total: usize, domain: &str) -> Option<BlockLines> {
+    if shown.is_empty() {
+        return None;
+    }
+    let rules = shown.iter().map(|(i, rule)| format!("  {i}. {}", rule.rendered)).collect();
+    let withheld = total.saturating_sub(shown.len());
+    // F16's shape. One line in place of the rules this session has already been
+    // told, which is the whole point of dedup per rule rather than per block.
+    let tail = (withheld > 0).then(|| {
+        format!("  ({withheld} more {domain} rule(s) already served this session · all: base rule list --domain {domain})")
+    });
+    Some(BlockLines { header: format!("[{header}: {label}]"), rules, tail })
 }
 
 /// Collapse whitespace so that a reflow of a rule in `domains.toml` is the same rule.
@@ -1296,6 +1314,10 @@ pub struct SelectContext<'a> {
     /// Domain name to its `prompt_keywords`, for topic scoring.
     pub keywords: &'a HashMap<String, Vec<String>>,
     pub rules: &'a crate::config::RulesConfig,
+    /// The prompt's BM25 scores and `[match] min_score` (BO-18, K7d): a topic rule is also hit when its score reaches
+    /// the minimum, and topic hits are ranked by it before `topic_max` cuts. `None` (no index, `[match] bm25 = false`, a
+    /// tool call) selects exactly as before.
+    pub bm25: Option<(&'a crate::domain::score_index::Scores, f32)>,
 }
 
 /// The converted rules this event serves, deduped per rule and capped, recorded as shown (G0 section 3).
@@ -1360,7 +1382,9 @@ pub fn select_unrecorded(
     }
 
     let score = |w: &Why| if let Why::Topic(s) = w { *s } else { 0.0 };
-    topics.sort_by(|a, b| score(&b.1).total_cmp(&score(&a.1)));
+    // BM25 first when the prompt was scored (BO-18), the topic score breaking ties; else the topic score, as before.
+    let bm25 = |i: usize| cx.bm25.map_or(0.0, |(s, _)| s.get(&converted[i].rule.id));
+    topics.sort_by(|a, b| bm25(b.0).total_cmp(&bm25(a.0)).then(score(&b.1).total_cmp(&score(&a.1))));
     let mut topic_withheld: Vec<(String, usize)> = Vec::new();
     for (i, why) in topics.iter().skip(cx.rules.topic_max) {
         let rule = &converted[*i].rule;
@@ -1403,7 +1427,13 @@ fn first_hit(
             let keywords = cx.keywords.get(&c.rule.domain).map(Vec::as_slice).unwrap_or_default();
             let t = topic_match(text, &own, &c.rule.text, keywords);
             let s = t.score;
-            ((s > 0.0 && s >= cx.rules.topic_min_score).then_some(Why::Topic(s)), Some(t))
+            // Its own words or its domain's keywords hit it as before; a BM25 score at `[match] min_score` also does
+            // (K7d), a second way in beside `topic_min_score`, which keeps its meaning.
+            let by_score = cx.bm25.is_some_and(|(scores, min)| {
+                let b = scores.get(&c.rule.id);
+                b > 0.0 && b >= min
+            });
+            (((s > 0.0 && s >= cx.rules.topic_min_score) || by_score).then_some(Why::Topic(s)), Some(t))
         }
         Event::PreTool { tool, paths, .. } => (c.matchers.iter().find_map(|m| match m.kind {
             Kind::Place => m

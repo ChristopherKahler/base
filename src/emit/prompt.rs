@@ -178,6 +178,11 @@ impl PromptBlock {
         !self.parts.is_empty()
     }
 
+    /// Printing it records something: a claim of its own or of one of its parts.
+    pub fn has_claims(&self) -> bool {
+        !self.claims.is_empty() || self.parts.iter().any(|p| !p.claims.is_empty())
+    }
+
     /// This ranked block as printed with only the parts `kept` marks: its head, those parts, its tail, and, when any
     /// part is withheld, [`partial_line`]. With every part kept, its text.
     fn render_kept(&self, kept: &[bool], key: &str, budget_bytes: usize) -> String {

@@ -634,6 +634,19 @@ broad_share = 0.25
 corrections = 3   # flagged corrections that make a rule pass due
 turns = 15        # prompts with no pass before the safety net fires
 
+# ─── [match] — ranking rules against each prompt (BM25) ──────
+# A rule whose domain keyword or touched path matches is always served, as
+# before. Each prompt is also scored against every rule and global decision:
+# shared words count, rare ones more than common ones (BM25). Blocks list their
+# rules best first, so a tight [budget] withholds the weakest first, and a rule
+# no keyword brought is served when its score reaches min_score. The scores are
+# counted at session start and when a rule, keyword or test prompt changes,
+# into .base/bm25-index.json; every score is in .base/match-log.jsonl.
+# bm25 = false serves by keyword only, exactly as before.
+[match]
+bm25 = true
+min_score = 6.0
+
 # ─── [sync] — graph extraction globs ─────────────────────────
 # Which files `base sync` reads to extract metadata/AST into the graph.
 [sync]

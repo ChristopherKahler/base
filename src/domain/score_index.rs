@@ -310,6 +310,8 @@ pub fn refresh_for(config: &BaseConfig, cwd: &Path) {
         return;
     }
     let Some(dir) = index_dir(cwd) else { return };
+    // A keyword or a rule just written to `domains.toml` reaches the graph first, as every hook syncs it.
+    crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
     let domains = crate::domain::load_domains(cwd);
     let store = crate::store::load_merged(cwd);
     if let Err(why) = refresh(store.as_ref(), config, &domains, &dir) {

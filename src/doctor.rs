@@ -445,6 +445,22 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
     }
 }
 
+/// The rule index's line (BO-18), when `[match] bm25` is on and the folder the prompt hook reads it from holds none it
+/// can use: missing, unreadable, or counted by another tokenizer.
+pub fn score_index_advice(cwd: &Path) -> Option<String> {
+    if !crate::config::BaseConfig::load(cwd).matching.bm25 {
+        return None;
+    }
+    let dir = crate::domain::score_index::index_dir(cwd)?;
+    if crate::domain::score_index::ScoreIndex::load(&dir).is_some() {
+        return None;
+    }
+    Some(format!(
+        "rule index: none usable at {}, so prompts are served by keyword only; the next session start builds it, or now: base domain sync",
+        dir.join(crate::domain::score_index::FILE).display()
+    ))
+}
+
 /// Diagnose both graph tiers (global `~/.base-gbl/.base/graph.nq`, then the
 /// nearest workspace `.base/graph.nq`). Mirrors the tier walk in
 /// `hook::session_start::warn_unhealthy_graphs`. NOT unit-tested (reads the real
@@ -494,6 +510,9 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
     }
     // P3: a trigger still written relative works, and is worth writing out.
     warnings.extend(relative_trigger_advice(cwd));
+    // K7e (BO-18): with no rule index the prompt hook serves keyword-only. A warning naming what builds it, never a
+    // health verdict: a fresh install has none until its first session start (lynx's G0 verdict, Q6).
+    warnings.extend(score_index_advice(cwd));
     // Spec A7: what each hook emitted, from the tier dirs the failure trail reads, each dir once (the workspace and the
     // global dir are one path when cwd is the global tier root).
     let mut dirs_read = std::collections::HashSet::new();

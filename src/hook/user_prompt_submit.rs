@@ -8,8 +8,9 @@ use crate::domain;
 use crate::domain::matcher::{match_domains_auto, MatchReason, TriggerContext};
 use crate::domain::query::resolve_and_run_query;
 use crate::domain::session::{rules_hash, Bracket, ReShow, SessionState};
-use crate::emit::match_log::{Cut, Item, Matched, Trace};
-use crate::emit::prompt::{Claim, Fitted, Priority, PromptBlock, PromptBlocks};
+use crate::domain::score_index::DocKind;
+use crate::emit::match_log::{Cut, Item, Matched, Score, Trace};
+use crate::emit::prompt::{BlockPart, Claim, Fitted, Priority, PromptBlock, PromptBlocks};
 
 /// What the prompt hook collects before anything is printed: the context-bracket line, the named blocks, and the
 /// session whose shown-records wait on what is printed.
@@ -231,7 +232,17 @@ pub fn collect(
         let converted = crate::domain::rules::rules_with_matchers(store.as_ref(), config, &domains);
         let prompt_num = session.prompt_count_for(session_id);
         sink.prompt_num = Some(prompt_num);
-        sink.blocks.extend(matcher_blocks(config, &prompt, &session, bracket, &converted, &domains, &mut sink.trace));
+        let scoring = load_scoring(config, base_dir.as_deref(), &prompt, &mut sink.trace);
+        sink.blocks.extend(matcher_blocks(
+            config,
+            &prompt,
+            &session,
+            bracket,
+            &converted,
+            &domains,
+            scoring.as_ref(),
+            &mut sink.trace,
+        ));
         sink.blocks.extend(bracket_block);
         sink.hold(session, base_dir, bracket);
         return Ok(super::HookEventData {
@@ -319,7 +330,21 @@ pub fn collect(
             sink.trace.matched.push(m);
         }
     }
-    if matched.is_empty() {
+    // BM25 (BO-18, K7): this prompt's score for every rule and global decision, and the rules no keyword or path
+    // brought whose score reaches `[match] min_score`, by domain. With no index, or `[match] bm25 = false`, there is no
+    // scoring and the prompt is served keyword-only, as before.
+    let scoring = load_scoring(config, base_dir.as_deref(), &prompt, &mut sink.trace);
+    let admitted = scoring
+        .as_ref()
+        .map(|s| admitted_by_score(s, &prompt, &domains, &matched, &converted_ids))
+        .unwrap_or_default();
+    for a in &admitted {
+        sink.trace.matched.push(Matched::new(&a.domain.name, "score", Some(format!("{:.2}", a.best))));
+        for t in &a.terms {
+            sink.trace.word(t);
+        }
+    }
+    if matched.is_empty() && admitted.is_empty() {
         // N-WALK-DEAD-WITHOUT-A-MATCHED-DOMAIN. The walk resolves what the
         // PROMPT TEXT names, which has nothing to do with whether a domain
         // trigger fired. Returning here without running it left every machine
@@ -357,7 +382,16 @@ pub fn collect(
         let nomatch_prompt_num = session.prompt_count_for(session_id);
         sink.prompt_num = Some(nomatch_prompt_num);
         sink.header = format!("<context-bracket>[{bracket}] (prompt {nomatch_prompt_num})</context-bracket>");
-        sink.blocks.extend(matcher_blocks(config, &prompt, &session, bracket, &converted, &domains, &mut sink.trace));
+        sink.blocks.extend(matcher_blocks(
+            config,
+            &prompt,
+            &session,
+            bracket,
+            &converted,
+            &domains,
+            scoring.as_ref(),
+            &mut sink.trace,
+        ));
         if let Some(ref store) = graph_store {
             let nothing_served = std::collections::HashSet::new();
             let walked =
@@ -385,8 +419,9 @@ pub fn collect(
     // The context bracket tag, always kept and counted first.
     sink.prompt_num = Some(prompt_num);
     sink.header = format!("<context-bracket>[{bracket}] (prompt {prompt_num})</context-bracket>");
-    let matcher = matcher_blocks(config, &prompt, &session, bracket, &converted, &domains, &mut sink.trace);
-    let matcher_served = matcher.iter().any(|b| !b.claims.is_empty());
+    let matcher =
+        matcher_blocks(config, &prompt, &session, bracket, &converted, &domains, scoring.as_ref(), &mut sink.trace);
+    let matcher_served = matcher.iter().any(PromptBlock::has_claims);
     sink.blocks.extend(matcher);
 
     // Determine if we're in lean mode (FRESH, first 2 prompts — rules only, skip neighborhood)
@@ -419,13 +454,17 @@ pub fn collect(
                 .filter(|r| !converted_ids.contains(r.id.as_str()))
                 .collect();
         // Due, not claimed (D15): `commit` records each rule only if this domain's rules block is printed.
-        let fresh: Vec<(usize, &crate::domain::rules::ServedRule)> = rules
+        let mut fresh: Vec<(usize, &crate::domain::rules::ServedRule)> = rules
             .iter()
             .enumerate()
             .filter(|(_, r)| {
                 session.rule_due(&r.id, r.content_hash, bracket, None, ReShow::PerSession { on_tier_change: true }, now)
             })
             .collect();
+        // Best first when the prompt was scored (BO-18, K7d), today's order breaking ties; each rule keeps its number.
+        if let Some(s) = &scoring {
+            fresh.sort_by(|a, b| s.scores.get(&b.1.id).total_cmp(&s.scores.get(&a.1.id)));
+        }
         // What this prompt serves, so the walk still resolves a rule this block held
         // back and does not list again one it serves.
         domain_served.extend(fresh.iter().filter_map(|(_, r)| r.iri.clone()));
@@ -587,15 +626,24 @@ pub fn collect(
         // Recorded whenever the rules block prints, steering lines or not: the domain's own key says it was served.
         let steering_claim =
             with_steering.then(|| Claim::Injected { key: domain_def.name.clone(), hash: steering_hash });
-        let rules_block =
-            PromptBlock::new(format!("{slug}-rules"), rules_priority, &rules_part.join("\n"), fresh.len(), "rule")
+        let rules_block = match (&scoring, crate::domain::rules::block_lines("DOMAIN", &label, &fresh, rules.len(), &domain_def.name)) {
+            // Scored (BO-18): one part per rule, best first, so the budget withholds the weakest first (K7d). The role
+            // line rides with the header, the output-mode and format lines with the tail.
+            (Some(s), Some(lines)) => {
+                let head = lines_of([role_line, Some(lines.header.as_str())]);
+                let tail = lines_of([lines.tail.as_deref(), output_mode_line, format_line]);
+                let parts = fresh.iter().zip(&lines.rules).map(|((_, r), line)| rule_part(line, r, &domain_def.name, s, None)).collect();
+                PromptBlock::ranked(format!("{slug}-rules"), rules_priority, &head, parts, &tail, "rule").with_claims(steering_claim)
+            }
+            _ => PromptBlock::new(format!("{slug}-rules"), rules_priority, &rules_part.join("\n"), fresh.len(), "rule")
                 .with_claims(fresh.iter().map(|(_, r)| Claim::Rule {
                     id: r.id.clone(),
                     content: r.content_hash,
                     scope: None,
                 }))
                 .with_claims(steering_claim)
-                .with_logged(fresh.iter().map(|(_, r)| Item::rule(&r.id, &domain_def.name)));
+                .with_logged(fresh.iter().map(|(_, r)| Item::rule(&r.id, &domain_def.name))),
+        };
         injected_any |= !rules_block.text.is_empty();
         sink.blocks.push(rules_block);
         if context_due {
@@ -605,6 +653,43 @@ pub fn collect(
                     .with_logged(context_decisions),
             );
             injected_any = true;
+        }
+    }
+
+    // K7d (BO-18): the rules no keyword or path brought whose score reached `[match] min_score`, each domain's in its
+    // own `[DOMAIN: …]` block at priority 1, best first. Only the rules: the domain's context, steering lines and linked
+    // modes still need a keyword or a path.
+    if let Some(s) = &scoring {
+        for a in &admitted {
+            let domain_def = a.domain;
+            let rules: Vec<crate::domain::rules::ServedRule> =
+                crate::domain::rules::rules_for_domain(graph_store.as_ref(), config, domain_def)
+                    .into_iter()
+                    .filter(|r| a.ids.contains(&r.id))
+                    .collect();
+            let mut fresh: Vec<(usize, &crate::domain::rules::ServedRule)> = rules
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    session.rule_due(&r.id, r.content_hash, bracket, None, ReShow::PerSession { on_tier_change: true }, now)
+                })
+                .collect();
+            fresh.sort_by(|x, y| s.scores.get(&y.1.id).total_cmp(&s.scores.get(&x.1.id)));
+            domain_served.extend(fresh.iter().filter_map(|(_, r)| r.iri.clone()));
+            let Some(lines) = crate::domain::rules::block_lines("DOMAIN", &domain_def.name, &fresh, rules.len(), &domain_def.name)
+            else {
+                continue;
+            };
+            let parts = fresh
+                .iter()
+                .zip(&lines.rules)
+                .map(|((_, r), line)| rule_part(line, r, &domain_def.name, s, Some("score")))
+                .collect();
+            let slug = crate::crud::slugify(&domain_def.name);
+            let block = PromptBlock::ranked(format!("{slug}-rules"), Priority::Matched, &lines.header, parts, lines.tail.as_deref().unwrap_or(""), "rule");
+            injected_any |= !block.text.is_empty();
+            loaded_domains.push((domain_def.name.clone(), "score".to_string(), fresh.len()));
+            sink.blocks.push(block);
         }
     }
 
@@ -619,14 +704,42 @@ pub fn collect(
     });
     if !listed.is_empty() {
         domain_served.extend(listed.iter().map(|d| d.id.clone()));
-        sink.blocks.push(
-            PromptBlock::new("global-decisions", Priority::Global, &decisions_text, listed.len(), "decision")
-                .with_claims(listed.iter().map(|d| {
-                    let (key, hash) = d.claim_key();
-                    Claim::Injected { key, hash }
-                }))
-                .with_logged(listed.iter().map(|d| Item::decision(&d.id, Some(&d.domain)))),
-        );
+        match &scoring {
+            // Scored (BO-18): ranked like the rules, admitted only by their keywords as before (F5, lynx's G0 Q4). One
+            // block per always-on domain, so each keeps its header over its own decisions.
+            Some(s) => {
+                let mut by_domain: Vec<(&str, Vec<&crate::domain::global_decisions::GlobalDecision>)> = Vec::new();
+                for d in &listed {
+                    match by_domain.iter_mut().find(|(name, _)| *name == d.domain) {
+                        Some((_, list)) => list.push(d),
+                        None => by_domain.push((&d.domain, vec![*d])),
+                    }
+                }
+                for (domain, mut list) in by_domain {
+                    list.sort_by(|a, b| s.scores.get(&b.id).total_cmp(&s.scores.get(&a.id)));
+                    let head = format!("[{domain} CONTEXT · decisions matched by keyword]");
+                    let parts = list
+                        .iter()
+                        .map(|d| {
+                            let score = s.scores.get(&d.id);
+                            let (key, hash) = d.claim_key();
+                            BlockPart::new(&format!("  - Decision: {}", d.name), score)
+                                .with_claims([Claim::Injected { key, hash }])
+                                .with_logged([Item { score: (score > 0.0).then_some(score), ..Item::decision(&d.id, Some(&d.domain)) }])
+                        })
+                        .collect();
+                    sink.blocks.push(PromptBlock::ranked("global-decisions", Priority::Global, &head, parts, "", "decision"));
+                }
+            }
+            None => sink.blocks.push(
+                PromptBlock::new("global-decisions", Priority::Global, &decisions_text, listed.len(), "decision")
+                    .with_claims(listed.iter().map(|d| {
+                        let (key, hash) = d.claim_key();
+                        Claim::Injected { key, hash }
+                    }))
+                    .with_logged(listed.iter().map(|d| Item::decision(&d.id, Some(&d.domain)))),
+            ),
+        }
         injected_any = true;
     }
 
@@ -893,6 +1006,112 @@ fn bracket_rules_block(config: &BaseConfig, cwd: &Path, session: &mut SessionSta
     )
 }
 
+/// This prompt's BM25 scores (BO-18, K7c) and the `[match] min_score` they are judged against.
+pub(crate) struct Scoring {
+    pub(crate) scores: crate::domain::score_index::Scores,
+    pub(crate) min_score: f32,
+}
+
+/// Score the prompt against the index the last sync counted (K7e: loaded here, never counted here). `None` when
+/// `[match] bm25 = false`, or when no index has been built yet; the match log then says `index: missing`. Either way the
+/// prompt is served keyword-only, byte for byte as before BO-18. Every score above zero goes in the match log (K7f).
+fn load_scoring(config: &BaseConfig, base_dir: Option<&Path>, prompt: &str, trace: &mut Trace) -> Option<Scoring> {
+    if !config.matching.bm25 {
+        return None;
+    }
+    let index = base_dir.and_then(crate::domain::score_index::ScoreIndex::load);
+    trace.index = Some(if index.is_some() { "ok" } else { "missing" }.to_string());
+    let index = index?;
+    trace.min_score = Some(config.matching.min_score);
+    let scores = index.scores(prompt);
+    for s in &scores.ranked {
+        let id = match s.doc.kind {
+            DocKind::Rule => s.doc.id.clone(),
+            DocKind::Decision => crate::emit::match_log::decision_id(&s.doc.id),
+        };
+        trace.scores.push(Score { id, domain: s.doc.domain.clone(), score: s.score, by: "bm25".into() });
+    }
+    Some(Scoring { scores, min_score: config.matching.min_score })
+}
+
+/// A domain no keyword or path brought, with its rules whose BM25 score reached `[match] min_score` (K7d).
+struct Admitted<'a> {
+    domain: &'a domain::DomainDef,
+    ids: HashSet<String>,
+    /// Its best rule's score.
+    best: f32,
+    /// The prompt's terms its admitted rules hold, for the match log's `matched` text.
+    terms: Vec<String>,
+}
+
+/// The rules a keyword or a path did not bring and their score did, grouped by domain, best domain first. A domain
+/// that is always-on, has `auto_inject = false`, matched already, or is vetoed by one of its `exclude` patterns admits
+/// nothing; a rule with matchers of its own is judged by `select` instead.
+fn admitted_by_score<'a>(
+    scoring: &Scoring,
+    prompt: &str,
+    domains: &'a [domain::DomainDef],
+    matched: &[crate::domain::matcher::DomainMatch<'_>],
+    converted: &HashSet<&str>,
+) -> Vec<Admitted<'a>> {
+    let lower = prompt.to_lowercase();
+    let mut out: Vec<Admitted<'a>> = Vec::new();
+    for s in scoring.scores.ranked.iter().filter(|s| s.doc.kind == DocKind::Rule && s.score > 0.0 && s.score >= scoring.min_score) {
+        if converted.contains(s.doc.id.as_str()) {
+            continue;
+        }
+        let Some(d) = domains.iter().find(|d| d.name == s.doc.domain) else { continue };
+        if !d.auto_inject
+            || d.is_always()
+            || matched.iter().any(|m| m.domain.name == d.name)
+            || d.exclude.iter().any(|p| lower.contains(&p.to_lowercase()))
+        {
+            continue;
+        }
+        match out.iter_mut().find(|a| a.domain.name == d.name) {
+            Some(a) => {
+                a.ids.insert(s.doc.id.clone());
+                for t in &s.terms {
+                    if !a.terms.contains(t) {
+                        a.terms.push(t.clone());
+                    }
+                }
+            }
+            None => out.push(Admitted {
+                domain: d,
+                ids: HashSet::from([s.doc.id.clone()]),
+                best: s.score,
+                terms: s.terms.clone(),
+            }),
+        }
+    }
+    out
+}
+
+/// One rule as a part of a ranked block (BO-18): its line, its score, its claim (D15) and its match-log item, with
+/// `by` set for a rule admitted by score.
+fn rule_part(
+    line: &str,
+    rule: &crate::domain::rules::ServedRule,
+    domain: &str,
+    scoring: &Scoring,
+    by: Option<&str>,
+) -> BlockPart {
+    let score = scoring.scores.get(&rule.id);
+    BlockPart::new(line, score)
+        .with_claims([Claim::Rule { id: rule.id.clone(), content: rule.content_hash, scope: None }])
+        .with_logged([Item {
+            score: (score > 0.0).then_some(score),
+            by: by.map(String::from),
+            ..Item::rule(&rule.id, domain)
+        }])
+}
+
+/// The lines given, one per line, the empty and missing ones left out.
+fn lines_of<'a>(lines: impl IntoIterator<Item = Option<&'a str>>) -> String {
+    lines.into_iter().flatten().filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
+}
+
 /// Rules that carry matchers of their own, for one prompt (4d): always rules on the session's first prompt and on
 /// each tier change, and topic rules ranked against the prompt and capped at `topic_max`, with F6's pointer line
 /// for what the cap withheld (F6, F7, F8).
@@ -909,6 +1128,7 @@ fn matcher_blocks(
     bracket: Bracket,
     converted: &[crate::domain::rules::Converted],
     domains: &[domain::DomainDef],
+    scoring: Option<&Scoring>,
     trace: &mut Trace,
 ) -> Vec<PromptBlock> {
     if converted.is_empty() {
@@ -923,6 +1143,7 @@ fn matcher_blocks(
         home: home.as_deref(),
         keywords: &keywords,
         rules: &config.rules,
+        bm25: scoring.map(|s| (&s.scores, s.min_score)),
     };
     let event = crate::domain::rules::Event::Prompt { text: prompt };
     let selection = crate::domain::rules::select_unrecorded(converted, &event, session, &cx);
@@ -930,7 +1151,7 @@ fn matcher_blocks(
     // that reached the minimum are words that matched.
     trace.cut.extend(crate::domain::rules::cut_items(&selection));
     for s in &selection.scores {
-        trace.scores.push(crate::emit::match_log::Score { id: s.id.clone(), domain: s.domain.clone(), score: s.score });
+        trace.scores.push(crate::emit::match_log::Score { id: s.id.clone(), domain: s.domain.clone(), score: s.score, by: "topic".into() });
         if s.score >= config.rules.topic_min_score {
             for w in &s.words {
                 trace.word(w);
@@ -955,6 +1176,30 @@ fn matcher_blocks(
             content: s.rule.content_hash,
             scope: s.why.scope().map(String::from),
         });
+        // A topic group of a scored prompt is ranked (BO-18): `select` already put its rules best first.
+        if let (Some(s), Some(domain)) = (scoring, &g.topic_domain) {
+            let head = g.text.lines().next().unwrap_or_default();
+            let tail = selection
+                .topic_withheld
+                .iter()
+                .find(|(d, _)| d == domain)
+                .map(|(d, n)| crate::domain::rules::topic_withheld_line(d, *n))
+                .unwrap_or_default();
+            let items = crate::domain::rules::served_items(&g.served);
+            let parts = g
+                .served
+                .iter()
+                .zip(claims)
+                .zip(items)
+                .map(|((r, claim), item)| {
+                    BlockPart::new(&format!("  - {}", r.rule.rendered), s.scores.get(&r.rule.id))
+                        .with_claims([claim])
+                        .with_logged([item])
+                })
+                .collect();
+            blocks.push(PromptBlock::ranked(id, priority, head, parts, &tail, "rule"));
+            continue;
+        }
         blocks.push(
             PromptBlock::new(id, priority, &text, g.served.len(), "rule")
                 .with_claims(claims)

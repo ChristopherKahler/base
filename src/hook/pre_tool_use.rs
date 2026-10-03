@@ -158,6 +158,7 @@ pub fn handle_traced(
             home: home_str.as_deref(),
             keywords: &keywords,
             rules: &config.rules,
+            bm25: None,
         };
         let rule_event = domain::rules::Event::PreTool { tool, paths: &paths, command };
         let selection = domain::rules::select(&converted, &rule_event, &mut session, &cx);
