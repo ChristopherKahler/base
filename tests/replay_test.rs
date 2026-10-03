@@ -1287,9 +1287,10 @@ fn replay_handoff_lanes_and_tiers_hold_on_the_corpus_store() {
     println!("replay handoff lanes: 2 corpus handoffs on project-15 left open across 2 creates; unarchive undone; a create in the global root's doc folder landed in the home tier");
 }
 
-/// BO-12 (build rule 13), on a corpus store: `base doctor --fix` plans and writes nothing; `--fix --yes` leaves no
-/// correction naming nothing (the corpus writes one note in four as a correction, none naming a record), moves the
-/// seed's legacy `[signal] max_chars`, and cuts the backups to `[graph] keep_backups`. The corpus workspace keeps every
+/// BO-12 (build rule 13), on a corpus store: `base doctor --fix` plans and writes nothing; `--fix --yes` keeps doctor's
+/// count of corrections naming nothing as it was (the corpus writes one note in four as a correction, none naming a
+/// record, and since BO-25 (D18) those stay corrections), moves the seed's legacy `[signal] max_chars`, and cuts the
+/// backups to `[graph] keep_backups`. The corpus workspace keeps every
 /// quad in `graph/ws/seed` under a folder named `ws`, the shape of a renamed workspace, so `--fix` leaves its records in
 /// place rather than moving the whole store out as another workspace's.
 #[test]
@@ -1335,12 +1336,55 @@ fn replay_doctor_fix_holds_on_the_corpus_store() {
 
     run(&["doctor", "--fix", "--yes"]);
     let after = run(&["doctor"]);
-    assert!(!after.contains("name nothing they correct"), "{after}");
+    // BO-25 (D18) replaced "no count line after": corrections `--fix` cannot link stay corrections, so the count holds.
+    let count_lines = |r: &str| -> Vec<String> { r.lines().filter(|l| l.contains("name nothing they correct")).map(String::from).collect() };
+    assert!(!count_lines(&before).is_empty(), "control:\n{before}");
+    assert_eq!(count_lines(&after), count_lines(&before), "{after}");
     assert!(!after.contains("legacy: [signal] max_chars"), "{after}");
     assert!(after.contains("keeps 3 backup(s)") && !after.contains("more than [graph] keep_backups"), "{after}");
     assert!(after.contains("most likely renamed"), "the corpus workspace's records moved:\n{after}");
     assert_eq!(subjects(), records, "a corpus record left the workspace graph");
-    println!("replay doctor --fix: {} corpus records kept in place, corrections and the legacy key repaired, 6 backups cut to 3", records.len());
+    println!("replay doctor --fix: {} corpus records kept in place, corrections kept, the legacy key repaired, 6 backups cut to 3", records.len());
+}
+
+/// BO-25 (build rule 13, D18), on a corpus store: no corpus correction names a record, so doctor's closing line never
+/// offers `--fix` for corrections; `--fix --yes` keeps every one a correction, in both tiers; and its row, the first
+/// time and the second, says there is nothing to do.
+#[test]
+fn replay_doctor_fix_keeps_corrections_on_the_corpus_store() {
+    let case = cases().into_iter().next().expect("a corpus case");
+    let s = write_case_as(&case, "bo25-fix");
+    let run = |args: &[&str]| -> String {
+        let (code, out, err) = run_base(&s, args);
+        assert!(code == 0 || args == ["doctor"], "base {args:?}: {out}{err}");
+        out
+    };
+    // Every subject typed `noteType "correction"`, over both tiers.
+    let corrections = || -> std::collections::BTreeSet<String> {
+        let marker = format!("<{}noteType> \"correction\"", seed::NS);
+        [s.ws.join(".base").join("graph.nq"), s.home.join(".base-gbl").join(".base").join("graph.nq")]
+            .iter()
+            .flat_map(|p| std::fs::read_to_string(p).unwrap_or_default().lines().map(String::from).collect::<Vec<_>>())
+            .filter(|l| l.contains(&marker))
+            .filter_map(|l| l.split('>').next().map(String::from))
+            .collect()
+    };
+    let row = |out: &str| -> Vec<String> {
+        out.lines().filter(|l| l.contains("link corrections to what they correct")).map(String::from).collect()
+    };
+    let before = corrections();
+    assert!(!before.is_empty(), "control: the corpus writes corrections");
+    let doctor = run(&["doctor"]);
+    assert!(doctor.contains("name nothing they correct"), "control:\n{doctor}");
+    assert!(!doctor.contains("corrections to link"), "doctor offers --fix for corrections it will not link:\n{doctor}");
+
+    let done = run(&["doctor", "--fix", "--yes"]);
+    assert!(!row(&done).is_empty() && row(&done).iter().all(|l| l.contains("nothing to do: ")), "{done}");
+    assert!(!done.contains("plain note"), "{done}");
+    assert_eq!(corrections(), before, "a corpus correction stopped being one:\n{done}");
+    let again = run(&["doctor", "--fix"]);
+    assert!(!row(&again).is_empty() && row(&again).iter().all(|l| l.contains("nothing to do: ")), "{again}");
+    println!("replay doctor --fix: {} corpus corrections stay corrections, none offered, nothing to do twice", before.len());
 }
 
 /// BO-14 (K2, D3, F8): the corpus's rule tests pass under `base rule test`, and they agree with the real prompt hook.

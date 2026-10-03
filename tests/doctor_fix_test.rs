@@ -1,5 +1,6 @@
 //! BO-12: `base doctor --fix` repairs what `base doctor` reports (F15, F16, F24), the upgrade path runs the same repair
-//! (F15e), and a move between tiers keeps a record's dates (F22c).
+//! (F15e), and a move between tiers keeps a record's dates (F22c). BO-25 (D18): a correction `--fix` cannot link stays a
+//! correction, and doctor offers `--fix` for corrections only when it would link one.
 //!
 //! Every test drives the real binary on a fake home it builds: a global tier at `<home>/.base-gbl/.base/graph.nq` and a
 //! workspace `ws` beside it, whose own graph is `graph/ws/ws`. Each one states its before in the same run, so what it
@@ -171,6 +172,7 @@ fn fix_prints_plan_without_changing() {
         assert!(doctor_before.contains(want), "control: doctor reports {want:?} before:\n{doctor_before}");
     }
     assert!(doctor_before.contains("`base doctor --fix` plans the repair of"), "doctor points at the repair:\n{doctor_before}");
+    assert!(doctor_before.contains("corrections to link to what they correct"), "the workspace has one to link:\n{doctor_before}");
 
     let plan = ok(&s, &["doctor", "--fix"]);
     for want in [
@@ -179,9 +181,9 @@ fn fix_prints_plan_without_changing() {
         "gone: project/gone-project (1 Project) ->",
         "foreign-gone.nq (no registered workspace named gone)",
         "link corrections to what they correct",
-        "2 found: 1 linked, 1 become plain notes",
+        "2 found: 1 linked, 1 stays a correction (it names no single record)",
         "note/the-hub-port-is-7420 corrects decision/base-config.hub-port",
-        "1 found: 0 linked, 1 become plain notes",
+        "nothing to do: 1 found, it stays a correction (it names no single record)",
         "supersession disagreement",
         "(by the repair's write)",
         "keep 3, remove 3",
@@ -190,6 +192,7 @@ fn fix_prints_plan_without_changing() {
     ] {
         assert!(plan.contains(want), "the plan does not say {want:?}:\n{plan}");
     }
+    assert!(!plan.contains("plain note"), "{plan}");
     assert_eq!(state(&s), before, "a plan wrote:\n{plan}");
 
     let json = ok(&s, &["doctor", "--fix", "--json"]);
@@ -198,10 +201,22 @@ fn fix_prints_plan_without_changing() {
     assert_eq!(state(&s), before, "a JSON plan wrote");
 }
 
-/// F15b, Example 2: the correction naming `base-config.hub-port` gets the edge; the one naming nothing becomes a plain
-/// note with its text kept; one naming two records is not guessed at. Nothing is deleted.
+/// The lines in `text` whose subject is `<NS><subject>`.
+fn lines_about(text: &str, subject: &str) -> std::collections::BTreeSet<String> {
+    let head = format!("<{NS}{subject}> ");
+    text.lines().filter(|l| l.starts_with(&head)).map(String::from).collect()
+}
+
+/// Both tiers' graphs, byte for byte.
+fn graphs(s: &Seed) -> (Vec<u8>, Vec<u8>) {
+    (std::fs::read(ws_graph(s)).unwrap_or_default(), std::fs::read(gbl_graph(s)).unwrap_or_default())
+}
+
+/// F15b under D18 (BO-25), Examples 1 and 2. Replaces BO-12's `fix_links_or_relabels_corrections`: the correction naming
+/// `base-config.hub-port` gets the edge, as before; the one naming nothing and the one naming two records stay exactly as
+/// they were, still corrections, with no line added or removed. Nothing is deleted.
 #[test]
-fn fix_links_or_relabels_corrections() {
+fn fix_links_corrections_and_keeps_the_rest() {
     let s = full_fixture("corrections");
     let mut extra = Quads::ws("ws");
     extra.note("an-insight-a", "insight", "first record", "2026-09-01T09:00:00-05:00");
@@ -210,35 +225,150 @@ fn fix_links_or_relabels_corrections() {
     let graph = ws_graph(&s);
     write(&graph, &(text(&graph) + &extra.out));
     let before = text(&graph);
+    let n = |s: &str| format!("<{NS}{s}>");
+    let kept = ["note/that-was-wrong", "note/two-names"];
+    for k in kept {
+        assert!(
+            lines_about(&before, k).contains(&format!("{} {} \"correction\" <{NS}graph/ws/ws> .", n(k), n("noteType"))),
+            "control: {k} is a correction before:\n{before}"
+        );
+    }
 
     let done = ok(&s, &["doctor", "--fix", "--yes"]);
-    assert!(done.contains("3 found: 1 linked, 2 become plain notes (1 name more than one record)"), "{done}");
+    assert!(done.contains("3 found: 1 linked, 2 stay corrections (they name no single record, 1 of them more than one)"), "{done}");
+    assert!(!done.contains("plain note"), "{done}");
     let after = text(&graph);
     let has = |line: &str| after.lines().any(|l| l.starts_with(line));
-    let n = |s: &str| format!("<{NS}{s}>");
     assert!(has(&format!("{} {} {}", n("note/the-hub-port-is-7420"), n("supersedes"), n("decision/base-config.hub-port"))), "{after}");
     assert!(has(&format!("{} {} {}", n("decision/base-config.hub-port"), n("supersededBy"), n("note/the-hub-port-is-7420"))));
     assert!(has(&format!("{} {} \"superseded\"", n("decision/base-config.hub-port"), n("status"))));
-    for plain in ["note/that-was-wrong", "note/two-names"] {
-        assert!(has(&format!("{} {} \"insight\"", n(plain), n("noteType"))), "{plain} is not a plain note:\n{after}");
-        assert!(has(&format!("{} {} \"correction\"", n(plain), n("formerNoteType"))), "{plain} lost its old label");
-        assert!(!has(&format!("{} {} \"correction\"", n(plain), n("noteType"))), "{plain} is still a correction");
+    for k in kept {
+        assert_eq!(lines_about(&after, k), lines_about(&before, k), "{k} changed:\n{done}");
     }
-    assert!(has(&format!("{} {} \"that was wrong, use the other one\"", n("note/that-was-wrong"), n("noteText"))));
-    // Nothing deleted: every line before is still there, except the two correction labels that were replaced (the
-    // fixture's foreign record moved out, and its document's stray status was cleared, are the other repairs').
+    let gbl = text(&gbl_graph(&s));
+    assert!(!after.contains("formerNoteType") && !gbl.contains("formerNoteType"), "{after}");
+    assert!(gbl.contains(&format!("{} {} \"correction\"", n("note/global-lesson"), n("noteType"))), "{gbl}");
+    // Nothing deleted: every line before is still there, but for the other repairs' (the fixture's foreign record moved
+    // out, its document's stray status cleared).
     let after_lines: std::collections::BTreeSet<&str> = after.lines().collect();
     let gone: Vec<&str> = before
         .lines()
         .filter(|l| !after_lines.contains(l))
         .filter(|l| !l.contains("graph/ws/gone") && !l.contains("document/stale-doc"))
         .collect();
-    assert!(
-        gone.iter().all(|l| l.contains(&format!("{} \"correction\"", n("noteType")))) && gone.len() == 2,
-        "lines lost beyond the two relabelled corrections: {gone:#?}"
-    );
+    assert!(gone.is_empty(), "lines lost: {gone:#?}");
     let report = doctor(&s);
-    assert!(!report.contains("name nothing they correct"), "{report}");
+    assert!(report.contains("2 correction(s) name nothing they correct"), "the count line stays:\n{report}");
+}
+
+/// Example 3 (BO-25, R3): a store whose only corrections name nothing. Doctor keeps its count line for each tier and
+/// does not offer `--fix` for them; `--fix` says there is nothing to do, and `--fix --yes` leaves both graphs byte for
+/// byte with no snapshot taken. Control in the same store: one correction that names a record brings the offer back,
+/// and `--fix` links exactly that one.
+#[test]
+fn doctor_does_not_offer_to_fix_unlinkable_corrections() {
+    let s = home("unlinkable");
+    let mut w = Quads::ws("ws");
+    own_records(&mut w, 3);
+    w.note("read-the-folder-first", "correction", "Stop guessing at file paths; read the folder first.", "2026-09-02T09:00:00-05:00");
+    write(&ws_graph(&s), &w.out);
+    let mut g = Quads::ws("base-gbl");
+    own_records(&mut g, 2);
+    g.note("global-lesson", "correction", "never pipe cargo through head", "2026-09-05T09:00:00-05:00");
+    write(&gbl_graph(&s), &g.out);
+
+    let report = doctor(&s);
+    assert_eq!(report.matches("1 correction(s) name nothing they correct").count(), 2, "the count line, per tier:\n{report}");
+    assert!(!report.contains("`base doctor --fix` plans the repair of"), "doctor offers a repair --fix does not make:\n{report}");
+
+    let before = graphs(&s);
+    let plan = ok(&s, &["doctor", "--fix"]);
+    assert_eq!(plan.matches("nothing to do: 1 found, it stays a correction (it names no single record)").count(), 2, "{plan}");
+    let done = ok(&s, &["doctor", "--fix", "--yes"]);
+    assert_eq!(done.matches("nothing to do: 1 found, it stays a correction (it names no single record)").count(), 2, "{done}");
+    assert!(graphs(&s) == before, "--fix --yes wrote a graph with nothing to do:\n{done}");
+    for p in [ws_graph(&s), gbl_graph(&s)] {
+        assert!(base::store::backups(&p).is_empty(), "a snapshot was taken of {} with nothing to do", p.display());
+    }
+
+    // Control: a correction that names one record by its slug.
+    let mut more = Quads::ws("ws");
+    more.note("own-note-0-was-wrong", "correction", "own-note-0 was wrong (supersedes note/own-note-0)", "2026-09-06T09:00:00-05:00");
+    write(&ws_graph(&s), &(text(&ws_graph(&s)) + &more.out));
+    let report = doctor(&s);
+    assert!(report.contains("2 correction(s) name nothing they correct"), "{report}");
+    assert!(report.contains("`base doctor --fix` plans the repair of: corrections to link to what they correct"), "{report}");
+    let plan = ok(&s, &["doctor", "--fix"]);
+    assert!(plan.contains("2 found: 1 linked, 1 stays a correction (it names no single record)"), "{plan}");
+    assert!(plan.contains("note/own-note-0-was-wrong corrects note/own-note-0"), "{plan}");
+}
+
+/// R3, when the link pass fails (code review, BO-25): doctor says why under its count line instead of reading the failure
+/// as "nothing to link", offers no repair for corrections, and `--fix` reports the same failure. The failure used here is
+/// the one `link_corrections` refuses: a correction whose type sits in no named graph naming one record.
+#[test]
+fn doctor_names_a_link_pass_it_could_not_finish() {
+    let s = home("link-error");
+    let mut w = Quads::ws("ws");
+    own_records(&mut w, 3);
+    w.typ("decision/base-config.hub-port", "Decision")
+        .lit("decision/base-config.hub-port", "name", "the hub port is 7410")
+        .date("decision/base-config.hub-port", "createdAt", "2026-09-01T09:00:00-05:00");
+    let c = format!("<{NS}note/no-graph-fix>");
+    let mut text = w.out;
+    let _ = writeln!(text, "{c} <{RDF_TYPE}> <{NS}Note> .");
+    let _ = writeln!(text, "{c} <{NS}noteType> \"correction\" .");
+    let _ = writeln!(text, "{c} <{NS}noteText> \"the hub port is 7420 (supersedes base-config.hub-port)\" .");
+    let _ = writeln!(text, "{c} <{NS}createdAt> \"2026-09-02T09:00:00-05:00\"^^<{XSD_DATETIME}> .");
+    write(&ws_graph(&s), &text);
+
+    let report = doctor(&s);
+    assert!(report.contains("1 correction(s) name nothing they correct"), "control:\n{report}");
+    assert!(
+        report.contains("⚠ could not work out which of them `base doctor --fix` would link:") && report.contains("in no named graph"),
+        "the failure is not named:\n{report}"
+    );
+    assert!(!report.contains("corrections to link"), "{report}");
+    let (_, out, err) = run_base(&s, &["doctor", "--fix"]);
+    assert!(format!("{out}{err}").contains("in no named graph"), "--fix does not report the same failure:\n{out}{err}");
+}
+
+/// R3: once `--fix --yes` has linked what it can, a second `--fix` has nothing to do for corrections in either tier, and
+/// a second `--fix --yes` leaves both graphs byte for byte.
+#[test]
+fn fix_twice_leaves_corrections_alone() {
+    let s = full_fixture("twice");
+    let first = ok(&s, &["doctor", "--fix", "--yes"]);
+    assert!(first.contains("2 found: 1 linked, 1 stays a correction (it names no single record)"), "{first}");
+    let report = doctor(&s);
+    assert_eq!(report.matches("1 correction(s) name nothing they correct").count(), 2, "{report}");
+    assert!(!report.contains("corrections to link"), "{report}");
+
+    let plan = ok(&s, &["doctor", "--fix"]);
+    assert_eq!(plan.matches("nothing to do: 1 found, it stays a correction (it names no single record)").count(), 2, "{plan}");
+    let before = graphs(&s);
+    let again = ok(&s, &["doctor", "--fix", "--yes"]);
+    assert_eq!(again.matches("nothing to do: 1 found, it stays a correction (it names no single record)").count(), 2, "{again}");
+    assert!(!again.contains("corrects decision/"), "a second run linked again:\n{again}");
+    assert!(graphs(&s) == before, "a second --fix --yes changed a graph:\n{again}");
+}
+
+/// R5: the upgrade path (`base graph migrate --yes`, which runs this same repair) links the correction that names a
+/// record and keeps every other one a correction, in both tiers.
+#[test]
+fn upgrade_keeps_corrections() {
+    let s = full_fixture("upgrade-keeps");
+    let migrated = ok(&s, &["graph", "migrate", "--yes"]);
+    assert!(migrated.contains("base graph migrate --yes\ndone:"), "{migrated}");
+    assert!(migrated.contains("2 found: 1 linked, 1 stays a correction (it names no single record)"), "{migrated}");
+    assert!(migrated.contains("nothing to do: 1 found, it stays a correction (it names no single record)"), "{migrated}");
+    let (ws, gbl) = (text(&ws_graph(&s)), text(&gbl_graph(&s)));
+    let n = |s: &str| format!("<{NS}{s}>");
+    assert!(ws.contains(&format!("{} {} {}", n("note/the-hub-port-is-7420"), n("supersedes"), n("decision/base-config.hub-port"))), "{ws}");
+    assert!(ws.contains(&format!("{} {} \"correction\"", n("note/that-was-wrong"), n("noteType"))), "{ws}");
+    assert!(!ws.contains(&format!("{} {} \"insight\"", n("note/that-was-wrong"), n("noteType"))), "{ws}");
+    assert!(gbl.contains(&format!("{} {} \"correction\"", n("note/global-lesson"), n("noteType"))), "{gbl}");
+    assert!(!ws.contains("formerNoteType") && !gbl.contains("formerNoteType"));
 }
 
 /// F15c: a registered, reachable workspace's records move into its own graph; an unregistered one's go to

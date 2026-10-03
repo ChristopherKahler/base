@@ -257,7 +257,7 @@ base project move <slug> ... [--yes]     # preview unless --yes
 base project rename <old> <new> [--yes]  # project + domain in both tiers; old name stays an alias; preview unless --yes
 base graph compact
 base graph migrate [--yes]               # one-time domain backfill, then the --fix plan; --yes applies the repair too
-base doctor --fix --yes                  # apply the repair: foreign records out, corrections, compaction, backups
+base doctor --fix --yes                  # apply the repair: foreign records out, corrections linked, compaction, backups
 base graph purge --stale [--days N] [--apply]    # dry-run unless --apply
 base graph supersede <old> <new>                 # <new> replaces <old>; refuses a cycle or an ambiguous slug
 base graph move ... [--yes]              # preview unless --yes; backs up both tiers

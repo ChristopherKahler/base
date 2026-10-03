@@ -271,11 +271,6 @@ ops:noteType      rdf:type rdf:Property ;
                   rdfs:range xsd:string ;
                   rdfs:comment "Type: insight, correction, decision, commitment, shift" .
 
-ops:formerNoteType rdf:type rdf:Property ;
-                  rdfs:domain ops:Note ;
-                  rdfs:range xsd:string ;
-                  rdfs:comment "The type a note carried before base doctor --fix relabelled it: a correction that named nothing it corrects became a plain note, its old label kept here" .
-
 ops:relatedTo     rdf:type rdf:Property ;
                   rdfs:domain ops:Note ;
                   rdfs:comment "Edge from Note to any entity (domain, project, person)" .
