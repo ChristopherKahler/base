@@ -173,6 +173,15 @@ pub fn run(target: &Path) -> Result<()> {
         crate::hook::automap::RootPlan::Empty => println!("⊘ (no source files yet — the first session here maps it)"),
     }
 
+    // Step 7 (BO-15, C3 for every user): the line asking the AI to start a corrected reply with CORRECTED:, asked on a
+    // terminal when the user's CLAUDE.md asks for no marker and nobody answered before. Unattended, nothing is written
+    // or printed: session start carries the line instead.
+    use crate::corrections::claude_md::{self as corrections_line, Choice, Offered};
+    let offered = corrections_line::offer(Choice::Ask, corrections_line::ask_on_terminal);
+    if !matches!(offered, Offered::Covered | Offered::AnsweredBefore(_) | Offered::NotAsked) {
+        println!("7. {}", corrections_line::report(&offered));
+    }
+
     println!("\n═══════════════════════════════════════");
     // The banner is a claim about the whole command, so it cannot say ✓ while a
     // step refused. `base scaffold` is the command the #158 reporter actually

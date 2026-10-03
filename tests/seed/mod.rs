@@ -382,6 +382,8 @@ fn run(
         // Claude Code puts the session id in every Bash tool's environment, so a test run from a
         // session would otherwise hand that session to each command it spawns.
         .env_remove("CLAUDE_CODE_SESSION_ID")
+        // And `CLAUDECODE=1`, which makes `base rule add` require keywords and a test prompt (BO-15).
+        .env_remove("CLAUDECODE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -447,6 +449,17 @@ pub fn run_hook(seed: &Seed, event: &str, payload: &serde_json::Value, env: &[(&
     hook_at(seed, &seed.ws, event, &payload.to_string(), env)
 }
 
+/// [`run_hook`] standing in `cwd` instead of the seeded workspace: a session that moved into another folder (BO-15).
+pub fn run_hook_at(
+    seed: &Seed,
+    cwd: &Path,
+    event: &str,
+    payload: &serde_json::Value,
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
+    hook_at(seed, cwd, event, &payload.to_string(), env)
+}
+
 /// One `base hook <event>` process standing in `cwd`, `payload` on stdin, on the scrubbed environment plus `env`: the
 /// one place the hook runners that take extra variables build the process, so the scrub list is written once.
 fn hook_at(seed: &Seed, cwd: &Path, event: &str, payload: &str, env: &[(&str, &str)]) -> (i32, String, String) {
@@ -463,6 +476,7 @@ fn hook_at(seed: &Seed, cwd: &Path, event: &str, payload: &str, env: &[(&str, &s
         .env_remove("BASE_HEADLESS")
         .env_remove("WT_SESSION")
         .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CLAUDECODE")
         .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -577,6 +591,7 @@ pub fn run_base_in_session(seed: &Seed, args: &[&str], session: &str) -> (i32, S
         .env_remove("BASE_HEADLESS")
         .env_remove("WT_SESSION")
         .env("CLAUDE_CODE_SESSION_ID", session)
+        .env_remove("CLAUDECODE")
         .stdin(Stdio::null());
     let out = cmd.output().expect("the base binary runs");
     (

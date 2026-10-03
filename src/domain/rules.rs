@@ -956,7 +956,7 @@ pub const TOPIC_TEXT_WORD: f32 = 0.25;
 pub const TOPIC_TEXT_CAP: f32 = 0.5;
 
 /// Words too common to carry a topic. Kept short: a long list starts deciding what a rule is about.
-const STOPWORDS: &[&str] = &[
+pub(crate) const STOPWORDS: &[&str] = &[
     "and", "are", "but", "can", "does", "for", "from", "get", "has", "have", "how", "its", "not", "that", "the",
     "then", "there", "they", "this", "use", "was", "what", "when", "where", "which", "why", "will", "with", "you",
     "your",

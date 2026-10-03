@@ -58,6 +58,8 @@ fn base(h: &Home, args: &[&str]) -> (i32, String, String) {
         .env_remove("BASE_RELAY_AS")
         .env_remove("BASE_HEADLESS")
         .env_remove("WT_SESSION")
+        // `CLAUDECODE=1` (a run inside Claude Code) makes `rule add` require keywords and a test prompt (BO-15).
+        .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .output()
         .expect("the base binary runs");

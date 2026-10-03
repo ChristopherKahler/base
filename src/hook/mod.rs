@@ -352,6 +352,20 @@ fn run_event(
                     }
                 }
             }
+            // Corrections (BO-15): C1 on this prompt, C2 and C3 in what the session wrote since the last read (a turn
+            // the user interrupted or refused ends with no Stop), and the C4 line first among the blocks of its rank
+            // when one fired. After `collect`, so every return site of the handler gets it.
+            let correction = crate::corrections::on_prompt(
+                &config,
+                &cwd,
+                stdin_json,
+                session_id.as_deref(),
+                sink.prompt_num,
+                &sink.prompt,
+            );
+            if let Some(block) = correction.as_ref().and_then(|c| c.block.clone()) {
+                sink.blocks.push_front(block);
+            }
             // Fitted to `[budget] prompt_bytes` under the key the operator actually wrote; then D15: what will be
             // printed is recorded as shown, and nothing else.
             let (fitted, committed) = sink.fit_and_commit(&config);
@@ -387,6 +401,12 @@ fn run_event(
             // dropping their text on an error would be a regression dressed as a refactor.
             crate::emit::prompt::print(&fitted);
             let _ = std::io::stdout().flush();
+            // The corrections state and its signal rows, after the print and never in the way of it: a C2 signal is
+            // answered only by a C4 line that printed.
+            if let Some(c) = correction {
+                let printed = fitted.kept_blocks().any(|b| b.id == crate::corrections::CHECK_BLOCK);
+                c.commit(printed);
+            }
             if let Some(dir) = dir {
                 let record = crate::emit::record::record_of_prompt(&fitted, "user-prompt-submit", session_id.as_deref());
                 if let Err(why) = crate::emit::record::keep(&dir, &record) {
@@ -416,6 +436,9 @@ fn run_event(
             Ok(data)
         }
         "stop" => {
+            // Corrections (BO-15) first: C3 in what the turn's AI wrote, and the files it wrote, kept for the next
+            // prompt. Fail-open, so the code-map step below always runs.
+            crate::corrections::on_stop(&config, &cwd, stdin_json, session_id.as_deref());
             stop::handle(&config, &cwd)?;
             // No relay delivery at a turn's end (BO-04, F13b: relay content appears at session start and on a prompt
             // only). This arm used to run the task tick and print its block as a `systemMessage` for the operator,

@@ -39,7 +39,7 @@ fn managed_policy() -> Option<PathBuf> {
 ///
 /// A test build ignores `CLAUDE_CONFIG_DIR`, as it ignores the real home: the variable belongs to the machine
 /// running the tests, and a developer who sets it would otherwise feed their own CLAUDE.md into every test.
-fn user_file() -> Option<PathBuf> {
+pub fn user_file() -> Option<PathBuf> {
     if !cfg!(feature = "isolation-guard")
         && let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty())
     {

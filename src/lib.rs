@@ -28,6 +28,7 @@ pub mod changelog;
 pub mod claude_md;
 pub mod command;
 pub mod config;
+pub mod corrections;
 pub mod crud;
 pub mod dashboard;
 pub mod doctor;

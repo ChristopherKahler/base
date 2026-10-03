@@ -157,6 +157,61 @@ pub struct Score {
     pub score: f32,
 }
 
+/// One flag the correction detector raised (BO-15, K3): a row with `event: "signal"` carries the turn's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Signal {
+    /// `C1` (the prompt's wording), `C2` (what the user did) or `C3` (the AI's own marker).
+    pub layer: String,
+    /// C1 `phrase`; C2 `interrupt`, `denial`, `file-edited` or `repeat`; C3 the marker without its colon (`UPDATED`).
+    pub kind: String,
+    /// The phrases matched, the file, the similarity, or the marker line: scrubbed, at most 200 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+impl Signal {
+    pub fn new(layer: &str, kind: &str, value: Option<&str>) -> Self {
+        Self {
+            layer: layer.to_string(),
+            kind: kind.to_string(),
+            value: value.map(|v| clip_chars(&crate::scrub::scrub(v), 200)),
+        }
+    }
+
+    /// `C1 phrase "quit"`, `C2 interrupt`, `C3 UPDATED`: how `base log matches` and `base log corrections` print it.
+    pub fn label(&self) -> String {
+        match (self.layer.as_str(), &self.value) {
+            ("C1", Some(v)) => format!("C1 phrase \"{v}\""),
+            ("C2", Some(v)) if self.kind == "file-edited" => format!("C2 file-edited {}", short_path(v)),
+            _ => format!("{} {}", self.layer, self.kind),
+        }
+    }
+}
+
+/// The first `max` characters of `text`, whole characters only.
+fn clip_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+/// A turn's signals as a row (BO-15): which session, which prompt, and what was flagged.
+pub fn signal_row(session: Option<&str>, prompt_num: Option<u32>, signals: Vec<Signal>) -> Row {
+    Row {
+        ts: now(),
+        session: session.map(String::from),
+        event: "signal".into(),
+        prompt_num,
+        text: None,
+        tool: None,
+        path: None,
+        paths: Vec::new(),
+        matched: Vec::new(),
+        served: Vec::new(),
+        cut: Vec::new(),
+        scores: Vec::new(),
+        signals,
+    }
+}
+
 /// What a hook gathered for its row while it decided what to serve.
 #[derive(Debug, Default)]
 pub struct Trace {
@@ -213,6 +268,10 @@ pub struct Row {
     pub cut: Vec<Cut>,
     #[serde(default)]
     pub scores: Vec<Score>,
+    /// On a `signal` row (BO-15): the turn's correction signals. Absent on every other row, so a row written before
+    /// BO-15 reads the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<Signal>,
 }
 
 fn now() -> String {
@@ -255,6 +314,7 @@ pub fn prompt_row(
         served,
         cut,
         scores: trace.scores,
+        signals: Vec::new(),
     }
 }
 
@@ -287,6 +347,7 @@ pub fn file_row(trace: Trace, session: Option<&str>) -> Option<Row> {
         served: trace.served,
         cut: trace.cut,
         scores: trace.scores,
+        signals: Vec::new(),
     })
 }
 
@@ -594,6 +655,13 @@ pub fn format_rows(rows: &[Row], today: NaiveDate) -> String {
             Ok(t) => t.format("%Y-%m-%d %H:%M:%S").to_string(),
             Err(_) => row.ts.clone(),
         };
+        // A correction signal row (BO-15): which prompt, and what flagged it.
+        if row.event == "signal" {
+            let labels: Vec<String> = row.signals.iter().map(Signal::label).collect();
+            let prompt = row.prompt_num.map(|n| format!("prompt {n}")).unwrap_or_else(|| "prompt ?".to_string());
+            out.push_str(&format!("{time}  {:<6}  {prompt}  {}\n", row.event, labels.join(" · ")));
+            continue;
+        }
         let tail = match row.event.as_str() {
             "prompt" => match &row.text {
                 Some(t) => format!("\"{}\"", clip(t, 40)),
@@ -710,6 +778,7 @@ mod tests {
                 served: vec![Item::rule(&format!("r{i:05}"), "d")],
                 cut: Vec::new(),
                 scores: Vec::new(),
+                signals: Vec::new(),
             };
             format!("{}\n", serde_json::to_string(&r).unwrap())
         };

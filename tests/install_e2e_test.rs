@@ -456,3 +456,63 @@ fn a_second_install_over_the_first_leaves_settings_json_byte_identical() {
         String::from_utf8_lossy(&after)
     );
 }
+
+// ─── BO-15: the CORRECTED line, C3 for every user ───────────
+
+/// Example 5. `base install` offers one line for the user's CLAUDE.md so the AI marks a corrected reply. Yes (here
+/// `--corrections-line`, the unattended answer) puts it just above the BASE CLI section, outside the span a section
+/// refresh rewrites, and a second install leaves one copy. No (`--no-corrections-line`) writes nothing and records the
+/// answer, and session start carries the line instead. With no terminal and no flag nothing is written or recorded. A
+/// CLAUDE.md that already asks for a marker (Chris's T2 holds `UPDATED:`, D10) is never given the line.
+#[test]
+fn install_offers_corrected_line() {
+    const LINE: &str = "When the user corrects you, start that reply with \"CORRECTED: <what you got wrong>\".";
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("unpacked");
+    let binary = unpack_fake_archive(&archive);
+    seed_local_skill(tmp.path());
+    let claude_md = |home: &Path| std::fs::read_to_string(home.join(".claude").join("CLAUDE.md")).unwrap_or_default();
+    let answer = |home: &Path| std::fs::read_to_string(home.join(".base-gbl").join(".corrections-line")).ok();
+    let shown = |out: &std::process::Output| {
+        format!("stdout:\n{}\nstderr:\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+
+    // Yes.
+    let yes = mkdir(tmp.path().join("yes"));
+    let out = run_base(&binary, &archive, &yes, &["install", "--no-starter-commands", "--corrections-line"]);
+    let md = claude_md(&yes);
+    let line_at = md.find(LINE).unwrap_or_else(|| panic!("the line was not written\n{md}\n{}", shown(&out)));
+    let section_at = md.find("## BASE CLI").expect("the BASE CLI section");
+    assert!(line_at < section_at, "the line sits above the section, outside what a refresh rewrites:\n{md}");
+    assert_eq!(answer(&yes).as_deref().map(str::trim), Some("added"));
+    let again = run_base(&binary, &archive, &yes, &["install", "--no-starter-commands", "--corrections-line"]);
+    assert_eq!(claude_md(&yes).matches(LINE).count(), 1, "one copy after a second install\n{}", shown(&again));
+
+    // No: nothing written, the answer kept, and session start carries the line.
+    let no = mkdir(tmp.path().join("no"));
+    let out = run_base(&binary, &archive, &no, &["install", "--no-starter-commands", "--no-corrections-line"]);
+    assert!(!claude_md(&no).contains(LINE), "declined, yet written\n{}", shown(&out));
+    assert_eq!(answer(&no).as_deref().map(str::trim), Some("declined"));
+    let start = run_base(&binary, &mkdir(no.join("work")), &no, &["hook", "session-start"]);
+    assert!(
+        String::from_utf8_lossy(&start.stdout).contains(LINE),
+        "a declined user's session start carries the line\n{}",
+        shown(&start)
+    );
+
+    // No terminal, no flag: nothing written, nothing recorded.
+    let quiet = mkdir(tmp.path().join("quiet"));
+    let out = run_base(&binary, &archive, &quiet, &["install", "--no-starter-commands"]);
+    assert!(!claude_md(&quiet).contains(LINE), "written without an answer\n{}", shown(&out));
+    assert_eq!(answer(&quiet), None, "recorded without an answer");
+
+    // Covered: Chris's T2 asks for UPDATED:, so the line is never added (D10).
+    let t2 = mkdir(tmp.path().join("t2"));
+    mkdir(t2.join(".claude"));
+    std::fs::write(t2.join(".claude").join("CLAUDE.md"), "When you change position, print UPDATED: <why>.\n").unwrap();
+    let out = run_base(&binary, &archive, &t2, &["install", "--no-starter-commands", "--corrections-line"]);
+    assert!(!claude_md(&t2).contains(LINE), "a CLAUDE.md that asks for a marker was given the line\n{}", shown(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("already asks"), "{}", shown(&out));
+    let start = run_base(&binary, &mkdir(t2.join("work")), &t2, &["hook", "session-start"]);
+    assert!(!String::from_utf8_lossy(&start.stdout).contains(LINE), "covered, yet carried\n{}", shown(&start));
+}

@@ -341,6 +341,63 @@ pub struct BaseConfig {
     pub log: LogConfig,
     #[serde(default)]
     pub doctor: DoctorConfig,
+    #[serde(default)]
+    pub corrections: CorrectionsConfig,
+}
+
+// ─── Corrections Config (BO-15: K3, C1 to C4, D4, D10) ───────
+
+/// `[corrections]`: how base notices that the user corrected the AI (K3). No one signal decides (D4): a phrase in the
+/// prompt (C1), what the user did (C2: an interrupt, a refused tool call, a file the AI wrote changed by someone else,
+/// the same request again) and the AI's own marker at the start of a reply line (C3) each flag a turn, and a flagged
+/// prompt carries one line asking the AI to confirm (C4). See `crate::corrections`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorrectionsConfig {
+    /// C1 to C4, the signal rows in the match log and the session-start line for a CLAUDE.md that asks for no marker.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// C1: words and phrases that flag a prompt as a possible correction, matched as whole words with case ignored.
+    /// They only flag; the AI decides (C4).
+    #[serde(default = "default_correction_phrases")]
+    pub phrases: Vec<String>,
+    /// C3: what the AI writes at the start of a reply line when the user corrected it. `UPDATED:` and `CORRECTED:`
+    /// mean it was wrong, `MISREAD:` that it misunderstood the ask, `DEFERRED:` that it held its position (a
+    /// disagreement, never proposed as a rule). A marker added here reads as "wrong".
+    #[serde(default = "default_correction_markers")]
+    pub markers: Vec<String>,
+    /// C2: two human prompts in a row that share at least this share of their content words (Jaccard, both prompts
+    /// four content words or more) are the same request again.
+    #[serde(default = "default_repeat_similarity")]
+    pub repeat_similarity: f32,
+}
+
+/// The default C1 phrases: the scope's list (D12), swearing included.
+pub const DEFAULT_CORRECTION_PHRASES: &[&str] = &[
+    "no,", "wrong", "that's not", "not what i asked", "i told you", "i've said", "i said", "again", "quit",
+    "stop doing", "don't", "never", "why did you", "fuck", "fucking", "fucked", "shit", "bullshit", "damn", "dammit",
+    "goddamn", "wtf", "ffs", "crap",
+];
+
+/// The default C3 markers: base's own for every user (Round 2), then Chris's T2 set (D10).
+pub const DEFAULT_CORRECTION_MARKERS: &[&str] = &["CORRECTED:", "UPDATED:", "MISREAD:", "DEFERRED:"];
+
+fn default_correction_phrases() -> Vec<String> {
+    DEFAULT_CORRECTION_PHRASES.iter().map(|s| (*s).to_string()).collect()
+}
+fn default_correction_markers() -> Vec<String> {
+    DEFAULT_CORRECTION_MARKERS.iter().map(|s| (*s).to_string()).collect()
+}
+fn default_repeat_similarity() -> f32 { 0.5 }
+
+impl Default for CorrectionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            phrases: default_correction_phrases(),
+            markers: default_correction_markers(),
+            repeat_similarity: default_repeat_similarity(),
+        }
+    }
 }
 
 // ─── Doctor Config (F23) ─────────────────────────────────────

@@ -1235,6 +1235,7 @@ fn replay_handoff_lanes_and_tiers_hold_on_the_corpus_store() {
             .env("BASE_AST_NO_SPAWN", "1")
             .env("BASE_RELAY_AS", relay_as)
             .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("CLAUDECODE")
             .env_remove("WT_SESSION")
             .env_remove("BASE_HEADLESS")
             .output()
