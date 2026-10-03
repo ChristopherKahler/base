@@ -465,7 +465,7 @@ fn propose_kinds() {
             "UPDATED: you built and installed it from the 0.16.0 dev tree; --version prints 0.15.2 until release.",
         ),
     ]);
-    let text = "--version prints the dev tree's Cargo.toml version; the build here is unreleased 0.16.0. Never read the version string as the installed release.";
+    let text = "base --version prints the dev tree's Cargo.toml version; the build here is unreleased 0.16.0. Never read the version string as the installed release.";
     let out = ok(
         &["rule", "propose", "--from-turn", "--text", text, "--keywords", "version, installed, 0.15.2"],
         &[("CLAUDE_CODE_SESSION_ID", &c)],
