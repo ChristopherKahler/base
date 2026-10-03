@@ -7,6 +7,7 @@ pub mod query;
 pub mod replay;
 pub mod rule_test;
 pub mod rules;
+pub mod score_index;
 pub mod session;
 pub mod sync;
 pub mod transcript;

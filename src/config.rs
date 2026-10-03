@@ -345,6 +345,34 @@ pub struct BaseConfig {
     pub corrections: CorrectionsConfig,
     #[serde(default)]
     pub tune: TuneConfig,
+    /// `[match]` (BO-18). `match` is a Rust keyword, hence the field's name.
+    #[serde(default, rename = "match")]
+    pub matching: MatchConfig,
+}
+
+// ─── Match Config (BO-18: K7, D9) ────────────────────────────
+
+/// `[match]`: how a prompt is scored against the rules and global decisions it could be served (K7, BM25). A rule a
+/// keyword or a touched path brings is always served, as before; scoring ranks every candidate so a tight budget sheds
+/// the weakest first, and serves a rule no keyword brought when its score reaches `min_score`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchConfig {
+    /// Score and rank with BM25. `false` serves keyword-only, exactly as before BO-18 (a rollback, and BO-20's other
+    /// side).
+    #[serde(default = "default_true")]
+    pub bm25: bool,
+    /// The BM25 score at which a rule no keyword or path brought is served. Another scale from `[rules]
+    /// topic_min_score`, which judges rules with matchers of their own on their phrase weights.
+    #[serde(default = "default_match_min_score")]
+    pub min_score: f32,
+}
+
+fn default_match_min_score() -> f32 { 6.0 }
+
+impl Default for MatchConfig {
+    fn default() -> Self {
+        Self { bm25: default_true(), min_score: default_match_min_score() }
+    }
 }
 
 // ─── Tune Config (BO-16: K6 replay; BO-17 adds its cadence keys, D7) ───

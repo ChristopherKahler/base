@@ -70,7 +70,7 @@ impl PromptSink {
         let pending = self.pending.take();
         let mut session = pending.as_ref().map(|p| SessionState::load(&p.base_dir));
         let now = SessionState::now_secs();
-        for claim in fitted.kept_blocks().flat_map(|b| b.claims.iter()) {
+        for claim in fitted.printed_claims() {
             match claim {
                 Claim::Rule { id, content, scope } => {
                     done.rules += 1;

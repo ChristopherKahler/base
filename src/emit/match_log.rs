@@ -288,11 +288,14 @@ pub fn prompt_row(
     prompt_num: Option<u32>,
     mode: PromptText,
 ) -> Row {
+    // A ranked block's withheld parts are cut for the budget like a dropped block's items (BO-18).
+    let logged = fitted.logged();
     let served: Vec<Item> =
-        fitted.kept_blocks().flat_map(|b| b.logged.iter().map(|i| i.clone().in_block(&b.id))).collect();
-    let mut cut: Vec<Cut> = fitted
-        .dropped_blocks()
-        .flat_map(|b| b.logged.iter().map(|i| Cut::new(i.clone().in_block(&b.id), "budget", key)))
+        logged.iter().filter(|(_, _, printed)| *printed).map(|(b, i, _)| (*i).clone().in_block(&b.id)).collect();
+    let mut cut: Vec<Cut> = logged
+        .iter()
+        .filter(|(_, _, printed)| !*printed)
+        .map(|(b, i, _)| Cut::new((*i).clone().in_block(&b.id), "budget", key))
         .collect();
     cut.extend(trace.cut);
     let text = match mode {
