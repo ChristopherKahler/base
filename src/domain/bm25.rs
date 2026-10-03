@@ -435,18 +435,18 @@ mod tests {
     /// dropped word or a comma, stems on pieces and not on joined terms.
     #[test]
     fn bm25_tokenizer() {
-        let t = terms("Our pre-tool hook is pretty good");
-        for want in ["pre-tool", "pre", "tool", "pre tool", "hook", "pretti", "good", "tool hook"] {
+        let t = terms("Is the pre-tool hook slow or is it fine");
+        for want in ["pre-tool", "pre", "tool", "pre tool", "hook", "tool hook", "slow", "hook slow", "fine"] {
             assert!(has(&t, want), "{want:?} missing from {t:?}");
         }
-        assert!(!has(&t, "our") && !has(&t, "is"), "stopwords dropped: {t:?}");
-        assert!(!has(&t, "hook pretti"), "no bigram across a dropped stopword: {t:?}");
+        assert!(!has(&t, "is") && !has(&t, "the") && !has(&t, "or"), "stopwords dropped: {t:?}");
+        assert!(!has(&t, "slow fine"), "no bigram across a dropped stopword: {t:?}");
 
-        let t = terms("the user prompt submit being cut off");
-        for want in ["user", "prompt", "submit", "user prompt", "prompt submit", "cut", "off", "cut off", "be"] {
+        let t = terms("why is the user prompt submit step slow");
+        for want in ["user", "prompt", "submit", "user prompt", "prompt submit", "submit step", "slow"] {
             assert!(has(&t, want), "{want:?} missing from {t:?}");
         }
-        assert!(!has(&t, "the"), "{t:?}");
+        assert!(!has(&t, "the") && !has(&t, "why"), "{t:?}");
 
         // Joined forms are kept as written; the pieces are stemmed.
         let t = terms("Edit domains.toml under ~/.base-gbl for 0.16.0, then the hooks.");
@@ -463,7 +463,7 @@ mod tests {
 
         // Example 3's near miss meets its test prompt on stems.
         let prompt = terms("the prompt hook is cutting things off");
-        let test = terms("being cut off at a high rate");
+        let test = terms("half the report was cut off again");
         for shared in ["cut", "off"] {
             assert!(has(&prompt, shared) && has(&test, shared), "{shared:?}: {prompt:?} / {test:?}");
         }

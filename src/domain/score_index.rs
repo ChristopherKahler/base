@@ -366,26 +366,25 @@ mod tests {
 
     /// Examples 1 and 4, in invented words of the same shape: a prompt about the prompt-submit hook losing what it
     /// injects ranks the hook rule (its text, its domain's keywords and its test prompts) first and over the default
-    /// `min_score`, and the two unrelated global decisions, one about mirroring desktop profiles and one about browser
-    /// automation, score under it.
+    /// `min_score`, and two unrelated global decisions about other tools score under it.
     #[test]
     fn bm25_ranks_hook_rule_above_profile_decision_for_prompt_3() {
         let hook = rule(
             "tools",
             "The prompt hook trims its output block by block and names every block it withheld.",
             &["hook", "hooks", "session start", "prompt submit", "user prompt submit", "pre-tool", "injection"],
-            &["the user prompt submit hook gets cut off at a high rate", "why do the hook injections lose their context"],
+            &["output from the prompt submit step arrives truncated", "the hook drops whole blocks of injected text"],
         );
         let sources = vec![
             hook.clone(),
             rule("tools", "Name the folder a file is written to.", &["folder"], &[]),
             rule("garden", "Water the tomatoes before noon.", &["garden"], &[]),
-            decision("profiles", "Mirror one desktop profile into another with directory junctions so both share settings.", &["profile", "junction"]),
-            decision("browser", "Page automation uses the headless browser tool, never the browser extension.", &["browser automation"]),
+            decision("invoices", "Invoices are exported as spreadsheet files every Friday afternoon.", &["invoice export"]),
+            decision("staging", "The staging database is reset to its seed every night.", &["staging database"]),
         ];
         let index = ScoreIndex::build(&sources);
-        let prompt = "we keep losing most of what the user prompt submit step injects, it gets cut off; what is going on with \
-                      the hook injections at session start, while the pre-tool side looks fine";
+        let prompt = "lately the prompt submit hook truncates much of the injected text, whole blocks gone; session start \
+                      output arrives complete and so does pre-tool";
         let scores = index.scores(prompt);
         assert_eq!(scores.ranked.first().map(|s| s.doc.id.as_str()), Some(hook.doc.id.as_str()), "{:?}", scores.ranked);
         let min = crate::config::MatchConfig::default().min_score;
