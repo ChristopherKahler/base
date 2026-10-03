@@ -387,8 +387,17 @@ pub fn list_all_tiers(
             println!("  ({label}: none)");
             continue;
         }
+        // A retired rule (BO-17) is listed only under `--include-superseded`, and says which.
+        let tier_cwd = if *label == "workspace" { &ws_cwd } else { &gbl_cwd };
+        let retired = if include_superseded { retired_texts(tier_cwd, ns, domain_name) } else { Default::default() };
         for (pri, text, superseded) in rules {
-            let mark = if *superseded { "  [superseded]" } else { "" };
+            let mark = if retired.contains(text) {
+                "  [retired: base rule unretire brings it back]"
+            } else if *superseded {
+                "  [superseded]"
+            } else {
+                ""
+            };
             println!("  {label:<9} {pri}. [{}] {text}{mark}", rule_ref(domain_name, text));
             if let Some(m) = matchers.get(text) {
                 println!("              match: {}", crate::domain::rules::describe_matchers(m));

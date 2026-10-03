@@ -415,6 +415,10 @@ fn apply_and_store(
             });
         }
     };
+    // A change that took a line out of `domains.toml` (a rewrite, merge, split or retirement moves the rule to the
+    // graph) leaves that line's synced copy in the graph until the next sync; sync now, as every hook would first, so
+    // `rule list` right after says what the hooks will serve.
+    crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
     let verb = if status == "edited" { "edited and applied" } else { "approved" };
     let mut s = format!("{verb} {}: {}\n", p.id, applied.line);
     if let Err(e) = write_fields(config, p, None, &[], &[("appliedTo", applied.to.clone())]) {
@@ -983,8 +987,10 @@ fn graph_of(config: &BaseConfig, tier_cwd: &Path, iri: &str) -> Result<String, S
         Ok(QueryResults::Solutions(mut rows)) => rows
             .next()
             .and_then(Result::ok)
-            .and_then(|r| r.get("g").map(|g| crud::term_display(g.into())))
-            .map(|g| g.trim_start_matches('<').trim_end_matches('>').to_string())
+            .and_then(|r| match r.get("g").map(Into::into) {
+                Some(TermRef::NamedNode(n)) => Some(n.as_str().to_string()),
+                _ => None,
+            })
             .ok_or_else(|| format!("no graph holds {iri} any more")),
         _ => Err(format!("could not read the graph that holds {iri}")),
     }
@@ -1134,7 +1140,12 @@ pub fn unretire(config: &BaseConfig, cwd: &Path, spec: &str) -> Result<String, S
         let Ok(store) = crud::load_workspace_graph(&c) else { continue };
         let Ok(QueryResults::Solutions(rows)) = crate::store::query(&store, &q) else { continue };
         for row in rows.filter_map(Result::ok) {
-            let get = |k: &str| row.get(k).map(|t| crud::term_display(t.into()));
+            // IRIs whole (a display form shortens them), literals by value.
+            let get = |k: &str| match row.get(k).map(Into::into) {
+                Some(TermRef::NamedNode(n)) => Some(n.as_str().to_string()),
+                Some(TermRef::Literal(l)) => Some(l.value().to_string()),
+                _ => None,
+            };
             let (Some(g), Some(rule), Some(text), Some(d)) = (get("g"), get("rule"), get("text"), get("d")) else { continue };
             let d = d.trim_start_matches('<').trim_end_matches('>').to_string();
             let dname = names.get(&d).cloned().unwrap_or_else(|| d.rsplit('/').next().unwrap_or_default().to_string());

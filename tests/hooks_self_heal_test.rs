@@ -125,3 +125,65 @@ fn an_already_wired_home_is_stamped_and_left_byte_identical() {
         assert!(stamp_of(&home).exists(), "a real config WAS reconciled");
     });
 }
+
+// ─── BO-17: SessionEnd on a home wired before it existed ─────────────────────
+//
+// A home like Chris's: his own hooks beside base's five, written the way Claude Code writes the file, and stamped as
+// wired by a build whose version string never changed. The new hook goes in once, as text, after a backup, and every
+// other byte stays (lynx's G0 ruling on question 5).
+
+#[test]
+fn session_end_is_added_once_and_the_rest_of_settings_stays_byte_for_byte() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_path_buf();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(home.join(".base-gbl")).unwrap();
+    // The old stamp, named by version only: it must not stop the new hook.
+    std::fs::write(home.join(".base-gbl").join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION"))), b"").unwrap();
+    let entry = |cmd: &str| {
+        format!("      {{\n        \"hooks\": [\n          {{\n            \"type\": \"command\",\n            \"command\": \"{cmd}\"\n          }}\n        ]\n      }}")
+    };
+    // The user's own Stop hook first, base's after it, in the one Stop array.
+    let five: Vec<String> = HOOK_TABLE
+        .iter()
+        .filter(|(event, _)| *event != "SessionEnd")
+        .map(|(event, cmd)| {
+            let mine = if *event == "Stop" { format!("{},\n", entry("python ~/.claude/hooks/style-guard.py")) } else { String::new() };
+            format!("    \"{event}\": [\n{mine}{}\n    ]", entry(cmd))
+        })
+        .collect();
+    let original = format!(
+        "{{\n  \"model\": \"opus\",\n  \"permissions\": {{\n    \"allow\": [\n      \"Bash(git status)\"\n    ],\n    \"deny\": [\n      \"mcp__claude-in-chrome__*\"\n    ]\n  }},\n  \"hooks\": {{\n{}\n  }},\n  \"statusLine\": {{\n    \"type\": \"command\",\n    \"command\": \"bash ~/.claude/statusline.sh\"\n  }}\n}}\n",
+        five.join(",\n")
+    );
+    let settings = home.join(".claude").join("settings.json");
+    std::fs::write(&settings, &original).unwrap();
+
+    base::home::with_thread_home(&home, || {
+        assert_eq!(ensure_hooks_wired(), vec!["SessionEnd"], "exactly the new hook");
+        let after = std::fs::read_to_string(&settings).unwrap();
+        let at = after.find(",\n    \"SessionEnd\"").expect("added after the last event");
+        assert_eq!(&after[..at], &original[..at], "every byte before it is the original's");
+        assert!(after.ends_with(&original[at..]), "every byte after it is the original's");
+        let v: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(v["hooks"]["SessionEnd"][0]["hooks"][0]["command"], "base hook session-end");
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "python ~/.claude/hooks/style-guard.py", "the user's own hook kept");
+        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["command"], "base hook stop");
+        // The backup: the file as it was, beside it.
+        let backups: Vec<std::path::PathBuf> = std::fs::read_dir(home.join(".claude"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("settings.json.bak-base-")))
+            .collect();
+        assert_eq!(backups.len(), 1, "one backup");
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original, "the backup is the file before the change");
+
+        // Never twice: the stamp holds it, and with the stamp gone the command in the file does.
+        assert!(ensure_hooks_wired().is_empty());
+        std::fs::remove_file(stamp_of(&home)).unwrap();
+        assert!(ensure_hooks_wired().is_empty(), "already there, so nothing added");
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), after, "and nothing rewritten");
+        assert_eq!(after.matches("base hook session-end").count(), 1);
+    });
+}
