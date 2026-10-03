@@ -374,8 +374,14 @@ pub struct MatchConfig {
 impl MatchConfig {
     /// Does a BM25 score of `score` serve a rule no keyword or path brought: only when `min_score` is set and reached.
     pub fn admits(&self, score: f32) -> bool {
-        self.min_score.is_some_and(|min| score > 0.0 && score >= min)
+        reaches(self.min_score, score)
     }
+}
+
+/// A BM25 score above zero that reaches `min`, when there is one: the one threshold test the prompt hook, `select` and
+/// `base rule test` share (BO-18).
+pub fn reaches(min: Option<f32>, score: f32) -> bool {
+    min.is_some_and(|min| score > 0.0 && score >= min)
 }
 
 impl Default for MatchConfig {

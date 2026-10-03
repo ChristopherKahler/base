@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::BaseConfig;
 use crate::domain::bm25;
+use crate::domain::rules::{Converted, ServedRule, StoredTests};
 use crate::domain::DomainDef;
 
 /// The index file, in a tier's `.base`.
@@ -127,28 +128,55 @@ pub fn query_terms(prompt: &str) -> Vec<String> {
     bm25::terms(prompt).into_iter().filter(|t| seen.insert(t.clone())).collect()
 }
 
-impl ScoreIndex {
-    /// Count `sources`.
-    pub fn build(sources: &[Source]) -> Self {
-        Self::build_holding_out(sources, None)
+/// Scoring texts split into terms once, to be counted many times with one `fires_on` prompt held out each time
+/// (`base rule test` judges every `fires_on` prompt so): only the held-out rule's text is split again.
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    /// The sources in the index's order: by kind, then id.
+    sources: Vec<Source>,
+    terms: Vec<Vec<String>>,
+    inputs: String,
+}
+
+impl Prepared {
+    pub fn new(sources: &[Source]) -> Self {
+        let mut sorted: Vec<Source> = sources.to_vec();
+        sorted.sort_by(|a, b| (a.doc.kind, &a.doc.id).cmp(&(b.doc.kind, &b.doc.id)));
+        let terms = sorted.iter().map(|s| s.terms(None)).collect();
+        Prepared { inputs: inputs_hash(&sorted), sources: sorted, terms }
     }
 
-    /// Count `sources` with one `fires_on` prompt left out of one rule's text: `(rule id, prompt)`. A rule test judges a
+    /// The index of every source.
+    pub fn build(&self) -> ScoreIndex {
+        self.build_holding_out(None)
+    }
+
+    /// The index with one `fires_on` prompt left out of one rule's text: `(rule id, prompt)`. A rule test judges a
     /// `fires_on` prompt this way, or the prompt would pass by matching itself (lynx's G0 Q5).
-    pub fn build_holding_out(sources: &[Source], hold_out: Option<(&str, &str)>) -> Self {
-        let mut sorted: Vec<&Source> = sources.iter().collect();
-        sorted.sort_by(|a, b| (a.doc.kind, &a.doc.id).cmp(&(b.doc.kind, &b.doc.id)));
-        let corpus = bm25::Corpus::new(sorted.iter().map(|s| {
-            let held = hold_out.filter(|(id, _)| *id == s.doc.id).map(|(_, p)| p);
-            s.terms(held)
+    pub fn build_holding_out(&self, hold_out: Option<(&str, &str)>) -> ScoreIndex {
+        let corpus = bm25::Corpus::new(self.sources.iter().zip(&self.terms).map(|(s, t)| match hold_out {
+            Some((id, prompt)) if id == s.doc.id => s.terms(Some(prompt)),
+            _ => t.clone(),
         }));
         ScoreIndex {
             format: FORMAT,
             terms_version: bm25::TERMS_VERSION,
-            inputs: inputs_hash(sources),
-            docs: sorted.into_iter().map(|s| s.doc.clone()).collect(),
+            inputs: self.inputs.clone(),
+            docs: self.sources.iter().map(|s| s.doc.clone()).collect(),
             corpus,
         }
+    }
+}
+
+impl ScoreIndex {
+    /// Count `sources`.
+    pub fn build(sources: &[Source]) -> Self {
+        Prepared::new(sources).build()
+    }
+
+    /// Count `sources` with one `fires_on` prompt held out of one rule's text ([`Prepared::build_holding_out`]).
+    pub fn build_holding_out(sources: &[Source], hold_out: Option<(&str, &str)>) -> Self {
+        Prepared::new(sources).build_holding_out(hold_out)
     }
 
     pub fn len(&self) -> usize {
@@ -216,39 +244,68 @@ pub fn inputs_hash(sources: &[Source]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// One rule's scoring text (K7a): its text and rationale, its domain's `prompt_keywords`, its own topic words, and its
+/// `fires_on` prompts from `tests`. The one recipe: the prompt hook's index and `base rule test` both count this.
+pub fn rule_source(rule: &ServedRule, keywords: &[String], own_words: Vec<String>, tests: &HashMap<String, StoredTests>) -> Source {
+    let mut wording = vec![rule.text.clone()];
+    wording.extend(rule.rationale.clone());
+    Source {
+        doc: DocRef { kind: DocKind::Rule, id: rule.id.clone(), domain: rule.domain.clone() },
+        wording,
+        keywords: keywords.to_vec(),
+        own_words,
+        fires_on: tests.get(&rule.id).map(|t| t.tests.fires_on.clone()).unwrap_or_default(),
+    }
+}
+
+/// A rule's own topic words, each once, in the order its topic matchers hold them.
+pub fn own_words(c: &Converted) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in c.matchers.iter().filter(|m| m.kind == crate::domain::rules::Kind::Topic).flat_map(|m| &m.words) {
+        if !out.contains(w) {
+            out.push(w.clone());
+        }
+    }
+    out
+}
+
 /// Every document a prompt can be served, with its scoring text (K7a): each domain's rules as the prompt hook reads
 /// them (`rules::rules_for_domain`, superseded and empty ones gone), the rules that carry matchers of their own
 /// (`rules::rules_with_matchers`), each rule's `fires_on` (`rules::rule_tests`), and the global decisions that have
 /// keywords (`GlobalDecisions`).
 pub fn sources(store: Option<&oxigraph::store::Store>, config: &BaseConfig, domains: &[DomainDef]) -> Vec<Source> {
     let tests = crate::domain::rules::rule_tests(store, config, domains);
+    let lists: Vec<Vec<ServedRule>> = domains.iter().map(|d| crate::domain::rules::rules_for_domain(store, config, d)).collect();
+    let converted = crate::domain::rules::rules_with_matchers(store, config, domains);
+    sources_from(store, config, domains, &lists, &converted, &tests)
+}
+
+/// [`sources`] from what a caller has read already: each domain's rules (`rules_for_domain`, one list per domain),
+/// the rules with matchers and the stored tests; `store` is read only for the global decisions.
+pub fn sources_from(
+    store: Option<&oxigraph::store::Store>,
+    config: &BaseConfig,
+    domains: &[DomainDef],
+    lists: &[Vec<ServedRule>],
+    converted: &[Converted],
+    tests: &HashMap<String, StoredTests>,
+) -> Vec<Source> {
     let keywords: HashMap<&str, &[String]> = domains.iter().map(|d| (d.name.as_str(), d.prompt_keywords.as_slice())).collect();
+    let keywords_of = |domain: &str| keywords.get(domain).copied().unwrap_or_default();
     let mut out: Vec<Source> = Vec::new();
     let mut at: HashMap<String, usize> = HashMap::new();
-    let mut rule = |out: &mut Vec<Source>, r: &crate::domain::rules::ServedRule| -> usize {
-        *at.entry(r.id.clone()).or_insert_with(|| {
-            let mut wording = vec![r.text.clone()];
-            wording.extend(r.rationale.clone());
-            out.push(Source {
-                doc: DocRef { kind: DocKind::Rule, id: r.id.clone(), domain: r.domain.clone() },
-                wording,
-                keywords: keywords.get(r.domain.as_str()).map(|k| k.to_vec()).unwrap_or_default(),
-                own_words: Vec::new(),
-                fires_on: tests.get(&r.id).map(|t| t.tests.fires_on.clone()).unwrap_or_default(),
-            });
+    for r in lists.iter().flatten() {
+        at.entry(r.id.clone()).or_insert_with(|| {
+            out.push(rule_source(r, keywords_of(&r.domain), Vec::new(), tests));
             out.len() - 1
-        })
-    };
-    for d in domains {
-        for r in crate::domain::rules::rules_for_domain(store, config, d) {
-            rule(&mut out, &r);
-        }
+        });
     }
-    for c in crate::domain::rules::rules_with_matchers(store, config, domains) {
-        let i = rule(&mut out, &c.rule);
-        for w in c.matchers.iter().filter(|m| m.kind == crate::domain::rules::Kind::Topic).flat_map(|m| &m.words) {
-            if !out[i].own_words.contains(w) {
-                out[i].own_words.push(w.clone());
+    for c in converted {
+        match at.get(&c.rule.id) {
+            Some(&i) => out[i].own_words = own_words(c),
+            None => {
+                at.insert(c.rule.id.clone(), out.len());
+                out.push(rule_source(&c.rule, keywords_of(&c.rule.domain), own_words(c), tests));
             }
         }
     }
@@ -268,6 +325,13 @@ pub fn sources(store: Option<&oxigraph::store::Store>, config: &BaseConfig, doma
         }
     }
     out
+}
+
+/// Can a prompt serve `domain`'s rules on their score alone (K7d): a domain of `domains.toml` with `auto_inject`, not
+/// always-on, and not vetoed by one of its `exclude` patterns in the prompt (a substring, as the keyword matcher has it).
+/// The prompt hook and `base rule test` both ask this.
+pub fn admits_by_score(domain: &DomainDef, prompt_lower: &str) -> bool {
+    domain.auto_inject && !domain.is_always() && !domain.exclude.iter().any(|p| prompt_lower.contains(&p.to_lowercase()))
 }
 
 /// Where the prompt hook looks for the index from `cwd`: the workspace's `.base`, else the global tier's (the same
@@ -416,8 +480,24 @@ mod tests {
         let other = rule("tools", "Say which tier a write lands in.", &[], &[]);
         let all = ScoreIndex::build(&[r.clone(), other.clone()]);
         assert!(all.scores("zebra quartz").get(&r.doc.id) > 0.0, "control: the test prompt is in the text");
-        let held = ScoreIndex::build_holding_out(&[r.clone(), other], Some((&r.doc.id, "the zebra quartz file went missing")));
+        let held = ScoreIndex::build_holding_out(&[r.clone(), other.clone()], Some((&r.doc.id, "the zebra quartz file went missing")));
         assert_eq!(held.scores("zebra quartz").get(&r.doc.id), 0.0, "held out, it scores nothing");
+
+        // `Prepared` splits every text once and splits again only the held-out rule's: the index it counts is the one a
+        // fresh count of the texts without that prompt gives, score for score.
+        let second = rule("tools", "Name the folder you write to.", &[], &["the zebra quartz file went missing", "which folder holds the notes"]);
+        let prepared = Prepared::new(&[second.clone(), other.clone()]);
+        let mut without = second.clone();
+        without.fires_on.remove(0);
+        let fresh = ScoreIndex::build(&[without, other.clone()]);
+        for prompt in ["zebra quartz", "which folder holds the notes", "write the tier"] {
+            let got = prepared.build_holding_out(Some((&r.doc.id, "the zebra quartz file went missing"))).scores(prompt);
+            let want = fresh.scores(prompt);
+            for id in [&r.doc.id, &other.doc.id] {
+                assert_eq!(got.get(id), want.get(id), "{prompt:?} {id}");
+            }
+        }
+        assert_eq!(prepared.build().inputs, ScoreIndex::build(&[second, other]).inputs, "the same key as a direct count");
     }
 
     #[test]

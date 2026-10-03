@@ -1055,19 +1055,17 @@ fn admitted_by_score<'a>(
     matched: &[crate::domain::matcher::DomainMatch<'_>],
     converted: &HashSet<&str>,
 ) -> Vec<Admitted<'a>> {
-    let Some(min) = scoring.min_score else { return Vec::new() };
+    if scoring.min_score.is_none() {
+        return Vec::new();
+    }
     let lower = prompt.to_lowercase();
     let mut out: Vec<Admitted<'a>> = Vec::new();
-    for s in scoring.scores.ranked.iter().filter(|s| s.doc.kind == DocKind::Rule && s.score > 0.0 && s.score >= min) {
+    for s in scoring.scores.ranked.iter().filter(|s| s.doc.kind == DocKind::Rule && crate::config::reaches(scoring.min_score, s.score)) {
         if converted.contains(s.doc.id.as_str()) {
             continue;
         }
         let Some(d) = domains.iter().find(|d| d.name == s.doc.domain) else { continue };
-        if !d.auto_inject
-            || d.is_always()
-            || matched.iter().any(|m| m.domain.name == d.name)
-            || d.exclude.iter().any(|p| lower.contains(&p.to_lowercase()))
-        {
+        if !crate::domain::score_index::admits_by_score(d, &lower) || matched.iter().any(|m| m.domain.name == d.name) {
             continue;
         }
         match out.iter_mut().find(|a| a.domain.name == d.name) {

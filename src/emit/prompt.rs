@@ -512,17 +512,48 @@ pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -
         let full_text = render(&state);
         let mut text = full_text.clone();
         if text.len() > budget_bytes {
-            for &u in &units {
-                if text.len() <= budget_bytes {
-                    break;
+            // A rule withheld from a ranked block costs the line that names it (or, its last, the block's pointer
+            // line), which can be longer than the rule. Withheld alone it would grow the output and push out a block of
+            // a higher priority (F2). So, as a block no longer than its pointer line is never dropped, a rule is
+            // withheld only in a run that shortens the output: it and, while the output is no shorter, the next rules
+            // of the same priority, lowest score first (two short rules of one block go together, and the block leaves
+            // its pointer line). A run that never gets shorter is put back and the next rule tried.
+            let mut k = 0;
+            while k < units.len() && text.len() > budget_bytes {
+                let u = units[k];
+                k += 1;
+                match u {
+                    Unit::Block(i) if blocks[i].bytes() <= pointers[i].len() => {}
+                    Unit::Block(_) => {
+                        state.set(u, false);
+                        text = render(&state);
+                    }
+                    Unit::Part(b, _) => {
+                        let priority = blocks[b].priority;
+                        let mut run = vec![u];
+                        state.set(u, false);
+                        let mut trial = render(&state);
+                        let mut next = k;
+                        while trial.len() >= text.len() {
+                            let Some(&Unit::Part(nb, nj)) = units.get(next) else { break };
+                            if blocks[nb].priority != priority {
+                                break;
+                            }
+                            state.set(Unit::Part(nb, nj), false);
+                            run.push(Unit::Part(nb, nj));
+                            trial = render(&state);
+                            next += 1;
+                        }
+                        if trial.len() < text.len() {
+                            text = trial;
+                            k = next;
+                        } else {
+                            for x in run {
+                                state.set(x, true);
+                            }
+                        }
+                    }
                 }
-                if let Unit::Block(i) = u
-                    && blocks[i].bytes() <= pointers[i].len()
-                {
-                    continue;
-                }
-                state.set(u, false);
-                text = render(&state);
             }
             if text.len() <= budget_bytes {
                 readmit(&mut state, &mut text, &render);
@@ -1117,6 +1148,44 @@ mod tests {
         assert_eq!(printed_rule_ids(&f), ["tools-rules-0", "tools-rules-1"], "{}", f.text);
         assert_eq!(dropped_ids(&f), ["global-rules"], "every part withheld: dropped whole, with its pointer line");
         assert!(f.text.contains("[base: withheld global-rules (2 rules, "), "{}", f.text);
+    }
+
+    /// A short rule whose withholding would cost more than it saves (the block's pointer line is longer than the block)
+    /// is not withheld, so the fit drops the next block instead of a higher-priority one (F2). Before this guard the
+    /// fit withheld it, dropped the middle block, still did not fit, dropped the top block, and the readmission could
+    /// not put the top block back while the lower ones printed.
+    #[test]
+    fn a_rule_shorter_than_its_pointer_line_is_not_withheld_over_a_higher_block() {
+        let top = block("top-rules", Priority::Matched, 1000);
+        let mid = block("mid-context", Priority::Context, 400);
+        let low = ranked("low-rules", Priority::Relay, &[1.0], 30);
+        let full = fit(HEADER, blocks(vec![top.clone(), mid.clone(), low.clone()]), usize::MAX, KEY).full_text.len();
+        let over = 266;
+        let budget = full - over;
+        let mid_saves = mid.bytes() - pointer_line(&mid, KEY, budget).len();
+        let low_costs = pointer_line(&low, KEY, budget).len() - low.bytes();
+        assert!(over > mid_saves - low_costs && over < mid_saves, "control: {mid_saves} saved, {low_costs} cost, {over} over");
+        let f = fit(HEADER, blocks(vec![top, mid, low]), budget, KEY);
+        assert!(f.text.len() <= budget, "{} bytes:\n{}", f.text.len(), f.text);
+        assert_eq!(kept_ids(&f), ["top-rules", "low-rules"], "{}", f.text);
+        assert_eq!(dropped_ids(&f), ["mid-context"]);
+        assert_eq!(printed_rule_ids(&f), ["low-rules-0"]);
+    }
+
+    /// Two rules each shorter than the line naming a withheld rule: withheld one at a time neither shortens the output,
+    /// withheld together their block leaves its pointer line, which does. They go together, and the higher priority's
+    /// block stays whole (a guard that judged each rule alone kept both and cut the higher block instead).
+    #[test]
+    fn short_rules_of_one_block_are_withheld_together() {
+        let top = ranked("top-rules", Priority::Matched, &[2.0, 1.0], 400);
+        let low = ranked("low-rules", Priority::Global, &[2.0, 1.0], 70);
+        let full = fit(HEADER, blocks(vec![top.clone(), low.clone()]), usize::MAX, KEY).full_text.len();
+        let budget = full - (low.bytes() - pointer_line(&low, KEY, full).len());
+        assert!(low.parts.iter().all(|p| p.bytes() < 110), "control: each low rule is shorter than a withheld-rules line");
+        let f = fit(HEADER, blocks(vec![top, low]), budget, KEY);
+        assert!(f.text.len() <= budget, "{} bytes:\n{}", f.text.len(), f.text);
+        assert_eq!(dropped_ids(&f), ["low-rules"], "{}", f.text);
+        assert_eq!(printed_rule_ids(&f), ["top-rules-0", "top-rules-1"], "the higher block whole:\n{}", f.text);
     }
 
     /// Readmission puts the best withheld rule back first: dropping a large low rule makes room a better one fills.

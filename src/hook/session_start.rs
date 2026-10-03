@@ -346,7 +346,11 @@ fn refresh_score_index(graph: Option<&oxigraph::store::Store>, cwd: &Path, confi
     }
     let Some(dir) = crate::domain::score_index::index_dir(cwd) else { return };
     let domains = crate::domain::load_domains(cwd);
-    if let Err(why) = crate::domain::score_index::refresh(graph, config, &domains, &dir) {
+    // Session start's own load is strict and gives nothing on one bad line; the index is then counted from the lenient
+    // load the commands use (`store::load_merged`), never from no graph at all, or it would lose every graph rule and
+    // decision until the next command rebuilt it.
+    let lenient = graph.is_none().then(|| crate::store::load_merged(cwd)).flatten();
+    if let Err(why) = crate::domain::score_index::refresh(graph.or(lenient.as_ref()), config, &domains, &dir) {
         eprintln!("base: could not build the rule index in {}: {why}", dir.display());
     }
 }

@@ -1429,10 +1429,7 @@ fn first_hit(
             let s = t.score;
             // Its own words or its domain's keywords hit it as before; a BM25 score at `[match] min_score`, when one is
             // set, also does (K7d), a second way in beside `topic_min_score`, which keeps its meaning.
-            let by_score = cx.bm25.is_some_and(|(scores, min)| {
-                let b = scores.get(&c.rule.id);
-                min.is_some_and(|min| b > 0.0 && b >= min)
-            });
+            let by_score = cx.bm25.is_some_and(|(scores, min)| crate::config::reaches(min, scores.get(&c.rule.id)));
             (((s > 0.0 && s >= cx.rules.topic_min_score) || by_score).then_some(Why::Topic(s)), Some(t))
         }
         Event::PreTool { tool, paths, .. } => (c.matchers.iter().find_map(|m| match m.kind {

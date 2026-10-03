@@ -1967,9 +1967,11 @@ fn tier_cwd(cwd: &std::path::Path, global: bool) -> std::path::PathBuf {
     }
 }
 
-/// The commands that change a rule, a domain's keywords, a rule's test prompts or a global decision's keywords: each
-/// rebuilds the rule index (BO-18, K7e). Reading commands do not, and neither does `decision log` without
-/// `--supersedes`, since a new decision has no keywords and so no scoring text.
+/// The commands that change a rule, a domain's keywords, a rule's test prompts or a global decision's keywords, or that
+/// replace or move the graph holding them: each rebuilds the rule index (BO-18, K7e). Reading commands do not, nor a
+/// preview, nor `decision log` without `--supersedes` (a new decision has no keywords, so no scoring text), nor
+/// `base sync --ast` or `--repair`, which the hooks run after every turn and which touch no rule. The index is the cwd's
+/// tier's; another workspace's is rebuilt at its next session start.
 fn changes_prompt_matching(command: &Option<Commands>) -> bool {
     match command {
         Some(Commands::Rule { action, .. }) => matches!(
@@ -1995,10 +1997,22 @@ fn changes_prompt_matching(command: &Option<Commands>) -> bool {
         ),
         Some(Commands::Graph { action }) => matches!(
             action,
-            GraphAction::Supersede { .. } | GraphAction::ApplyOps { .. } | GraphAction::Purge { .. } | GraphAction::Migrate { .. }
+            GraphAction::Supersede { .. }
+                | GraphAction::ApplyOps { .. }
+                | GraphAction::Purge { .. }
+                | GraphAction::Migrate { .. }
+                | GraphAction::Move { yes: true, dry_run: false, .. }
         ),
-        Some(Commands::Project { action: ProjectAction::Rename { yes: true, .. } }) => true,
-        Some(Commands::Doctor { fix: true, yes: true, .. }) | Some(Commands::Sync { .. }) => true,
+        Some(Commands::Project { action }) => matches!(
+            action,
+            ProjectAction::Rename { yes: true, .. }
+                | ProjectAction::Move { yes: true, dry_run: false, .. }
+                | ProjectAction::Delete { yes: true, .. }
+        ),
+        Some(Commands::Doctor { fix: true, yes: true, .. })
+        | Some(Commands::Doctor { repair: true, .. })
+        | Some(Commands::Doctor { restore: Some(Some(_)), .. })
+        | Some(Commands::Sync { ast: false, repair: false, .. }) => true,
         _ => false,
     }
 }
@@ -5568,5 +5582,50 @@ pub fn run() {
         Some(Commands::External(args)) => base::plugin::dispatch(&args, &cwd),
 
         None => eprintln!("No command provided. Run `base --help` for usage."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn rebuilds_index(args: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(std::iter::once("base").chain(args.iter().copied())).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        changes_prompt_matching(&cli.command)
+    }
+
+    /// K7e (BO-18): the commands that change what a prompt can be served, or replace or move the graph holding it,
+    /// rebuild the rule index when they end; previews, reads, and the AST and edge syncs the hooks run after every turn
+    /// do not.
+    #[test]
+    fn the_rule_index_is_rebuilt_by_matching_changes_only() {
+        for args in [
+            &["sync"][..],
+            &["sync", "--incremental"],
+            &["domain", "sync"],
+            &["rule", "add", "--domain", "tools", "--text", "Name the folder."],
+            &["doctor", "--repair"],
+            &["doctor", "--restore", "graph.nq.bak-1"],
+            &["doctor", "--fix", "--yes"],
+            &["graph", "move", "--select", "domain:tools", "--to", "other", "--yes"],
+            &["project", "move", "tools", "--to", "other", "--yes"],
+            &["project", "delete", "tools", "--yes"],
+        ] {
+            assert!(rebuilds_index(args), "{args:?} changes prompt matching");
+        }
+        for args in [
+            &["sync", "--ast", "--yes", "--target", "."][..],
+            &["sync", "--repair"],
+            &["doctor"],
+            &["doctor", "--restore"],
+            &["doctor", "--fix"],
+            &["graph", "move", "--select", "domain:tools", "--to", "other"],
+            &["graph", "move", "--select", "domain:tools", "--to", "other", "--yes", "--dry-run"],
+            &["project", "delete", "tools"],
+            &["rule", "list", "--domain", "tools"],
+        ] {
+            assert!(!rebuilds_index(args), "{args:?} changes nothing a prompt is served");
+        }
     }
 }

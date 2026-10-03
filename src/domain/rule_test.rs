@@ -27,7 +27,7 @@ use crate::command::CommandDef;
 use crate::config::BaseConfig;
 use crate::domain::matcher::{self, MatchReason, TriggerContext};
 use crate::domain::rules::{self, Converted, CutReason, Event, RuleTests, SelectContext, StoredTests, Why};
-use crate::domain::score_index::{self, DocKind, DocRef, ScoreIndex, Scores, Source};
+use crate::domain::score_index::{self, DocKind, Prepared, ScoreIndex, Scores, Source};
 use crate::domain::session::{Bracket, SessionState};
 use crate::domain::DomainDef;
 
@@ -53,23 +53,14 @@ pub fn short_ref(domain: &str, id: &str) -> String {
     format!("{domain}.{}", &id[..id.len().min(8)])
 }
 
-/// One rule's scoring text (K7a) from what a bench holds: its text and rationale, its domain's keywords, its own words
-/// and its `fires_on` prompts.
-fn source_of(
-    rule: &rules::ServedRule,
-    keywords: Option<&[String]>,
-    own_words: Vec<String>,
-    tests: &HashMap<String, StoredTests>,
-) -> Source {
-    let mut wording = vec![rule.text.clone()];
-    wording.extend(rule.rationale.clone());
-    Source {
-        doc: DocRef { kind: DocKind::Rule, id: rule.id.clone(), domain: rule.domain.clone() },
-        wording,
-        keywords: keywords.map(<[String]>::to_vec).unwrap_or_default(),
-        own_words,
-        fires_on: tests.get(&rule.id).map(|t| t.tests.fires_on.clone()).unwrap_or_default(),
-    }
+/// What a [`Bench`] is made of, before its scoring texts are counted.
+struct Parts {
+    domains: Vec<DomainDef>,
+    converted: Vec<Converted>,
+    commands: Vec<CommandDef>,
+    ctx: TriggerContext,
+    by_domain: Vec<(String, Vec<RuleRef>)>,
+    tests: HashMap<String, StoredTests>,
 }
 
 /// Everything the prompt hook's matching reads, loaded once for a whole run.
@@ -87,8 +78,9 @@ pub struct Bench<'a> {
     keywords: HashMap<String, Vec<String>>,
     /// Every rule's and global decision's scoring text (BO-18, K7a), as the prompt hook's index counts them.
     pub sources: Vec<Source>,
-    /// Those texts counted, when `[match] bm25` is on: counted here from the store this bench loaded, never read from
-    /// the index file, so a test never runs against a stale index.
+    /// Those texts split into terms once and counted, when `[match] bm25` is on: counted here from the store this bench
+    /// loaded, never read from the index file, so a test never runs against a stale index.
+    prepared: Option<Prepared>,
     index: Option<ScoreIndex>,
 }
 
@@ -114,21 +106,21 @@ impl<'a> Bench<'a> {
                 .map(|s| crate::domain::registered_projects(s, &config.namespace, cwd))
                 .unwrap_or_default(),
         };
+        let lists: Vec<Vec<rules::ServedRule>> =
+            domains.iter().map(|d| rules::rules_for_domain(store.as_ref(), config, d)).collect();
         let by_domain = domains
             .iter()
-            .map(|d| {
-                let rules = rules::rules_for_domain(store.as_ref(), config, d)
-                    .into_iter()
-                    .map(|r| RuleRef { id: r.id, domain: r.domain, text: r.text })
-                    .collect();
+            .zip(&lists)
+            .map(|(d, list)| {
+                let rules = list.iter().map(|r| RuleRef { id: r.id.clone(), domain: r.domain.clone(), text: r.text.clone() }).collect();
                 (d.name.clone(), rules)
             })
             .collect();
         let tests = rules::rule_tests(store.as_ref(), config, &domains);
-        let sources = score_index::sources(store.as_ref(), config, &domains);
-        let bench = Self::from_parts(config, domains, converted, crate::command::load_commands(cwd), ctx, by_domain, tests)
-            .with_sources(sources);
-        (bench, store)
+        // The index's own recipe (BO-18), from what this load has read already.
+        let sources = score_index::sources_from(store.as_ref(), config, &domains, &lists, &converted, &tests);
+        let parts = Parts { domains, converted, commands: crate::command::load_commands(cwd), ctx, by_domain, tests };
+        (Self::assemble(config, parts, sources), store)
     }
 
     /// This bench with its domains and its rules with matchers replaced (K6 replay, BO-16): the same commands,
@@ -136,62 +128,44 @@ impl<'a> Bench<'a> {
     /// scoring as it would in the hook. The scoring texts follow (BO-18): each rule's keywords and own words are read
     /// again, and a new rule with matchers gets a text of its own.
     pub fn changed(&self, domains: Vec<DomainDef>, converted: Vec<Converted>) -> Bench<'a> {
-        let keywords: HashMap<&str, &Vec<String>> = domains.iter().map(|d| (d.name.as_str(), &d.prompt_keywords)).collect();
-        let own = |id: &str| -> Vec<String> {
-            converted
-                .iter()
-                .filter(|c| c.rule.id == id)
-                .flat_map(|c| c.matchers.iter().filter(|m| m.kind == rules::Kind::Topic).flat_map(|m| m.words.clone()))
-                .collect()
-        };
+        let keywords: HashMap<&str, &[String]> = domains.iter().map(|d| (d.name.as_str(), d.prompt_keywords.as_slice())).collect();
+        let keywords_of = |domain: &str| keywords.get(domain).copied().unwrap_or_default();
+        let own: HashMap<&str, Vec<String>> = converted.iter().map(|c| (c.rule.id.as_str(), score_index::own_words(c))).collect();
         let mut sources = self.sources.clone();
         for s in sources.iter_mut().filter(|s| s.doc.kind == DocKind::Rule) {
-            s.keywords = keywords.get(s.doc.domain.as_str()).map(|k| k.to_vec()).unwrap_or_default();
-            s.own_words = own(&s.doc.id);
+            s.keywords = keywords_of(&s.doc.domain).to_vec();
+            s.own_words = own.get(s.doc.id.as_str()).cloned().unwrap_or_default();
         }
         for c in &converted {
             if !sources.iter().any(|s| s.doc.id == c.rule.id) {
-                sources.push(source_of(&c.rule, keywords.get(c.rule.domain.as_str()).map(|k| k.as_slice()), own(&c.rule.id), &self.tests));
+                sources.push(score_index::rule_source(&c.rule, keywords_of(&c.rule.domain), score_index::own_words(c), &self.tests));
             }
         }
-        Self::from_parts(
-            self.config,
+        let parts = Parts {
             domains,
             converted,
-            self.commands.clone(),
-            self.ctx.clone(),
-            self.by_domain.clone(),
-            self.tests.clone(),
-        )
-        .with_sources(sources)
-    }
-
-    /// This bench scoring with `sources` (BO-18): counted now, when `[match] bm25` is on.
-    pub fn with_sources(mut self, sources: Vec<Source>) -> Self {
-        self.index = self.config.matching.bm25.then(|| ScoreIndex::build(&sources));
-        self.sources = sources;
-        self
+            commands: self.commands.clone(),
+            ctx: self.ctx.clone(),
+            by_domain: self.by_domain.clone(),
+            tests: self.tests.clone(),
+        };
+        Self::assemble(self.config, parts, sources)
     }
 
     /// The prompt's BM25 scores, with `hold_out` (a rule id and one of its `fires_on` prompts) left out of that rule's
     /// text (lynx's G0 Q5). `None` when `[match] bm25` is off.
     fn scores(&self, prompt: &str, hold_out: Option<(&str, &str)>) -> Option<Scores> {
         let index = self.index.as_ref()?;
-        Some(match hold_out {
-            Some(h) => ScoreIndex::build_holding_out(&self.sources, Some(h)).scores(prompt),
-            None => index.scores(prompt),
+        Some(match (hold_out, &self.prepared) {
+            (Some(h), Some(prepared)) => prepared.build_holding_out(Some(h)).scores(prompt),
+            _ => index.scores(prompt),
         })
     }
 
-    /// Can a prompt serve `domain`'s rules on their score alone, as the prompt hook admits them: a configured domain,
-    /// `auto_inject`, not always-on, not vetoed by an `exclude` pattern in the prompt.
+    /// Can a prompt serve `domain`'s rules on their score alone, as the prompt hook admits them
+    /// ([`score_index::admits_by_score`]).
     fn admits_by_score(&self, domain: &str, prompt_lower: &str) -> bool {
-        self.domains.iter().any(|d| {
-            d.name == domain
-                && d.auto_inject
-                && !d.is_always()
-                && !d.exclude.iter().any(|p| prompt_lower.contains(&p.to_lowercase()))
-        })
+        self.domains.iter().any(|d| d.name == domain && score_index::admits_by_score(d, prompt_lower))
     }
 
     /// The star commands in `prompt` that the hook would act on (`*name`), which pass every rule and decision by.
@@ -216,10 +190,10 @@ impl<'a> Bench<'a> {
             .filter(|m| !matches!(m.reason, MatchReason::Always))
             .map(|m| m.domain.name.clone())
             .collect();
-        if let (Some(scores), Some(min)) = (self.scores(prompt, None), self.config.matching.min_score) {
+        if let Some(scores) = self.scores(prompt, None).filter(|_| self.config.matching.min_score.is_some()) {
             let lower = prompt.to_lowercase();
             let converted: HashSet<&str> = self.converted.iter().map(|c| c.rule.id.as_str()).collect();
-            for s in scores.ranked.iter().filter(|s| s.doc.kind == DocKind::Rule && s.score > 0.0 && s.score >= min) {
+            for s in scores.ranked.iter().filter(|s| s.doc.kind == DocKind::Rule && self.config.matching.admits(s.score)) {
                 if !converted.contains(s.doc.id.as_str())
                     && !out.contains(&s.doc.domain)
                     && self.admits_by_score(&s.doc.domain, &lower)
@@ -241,29 +215,23 @@ impl<'a> Bench<'a> {
         by_domain: Vec<(String, Vec<RuleRef>)>,
         tests: HashMap<String, StoredTests>,
     ) -> Self {
+        // The scoring texts the parts carry (no rationales, no decisions), by the index's own recipe.
+        let lists: Vec<Vec<rules::ServedRule>> = by_domain
+            .iter()
+            .map(|(domain, list)| list.iter().map(|r| rules::build(domain, r.text.clone(), None, None)).collect())
+            .collect();
+        let sources = score_index::sources_from(None, config, &domains, &lists, &converted, &tests);
+        Self::assemble(config, Parts { domains, converted, commands, ctx, by_domain, tests }, sources)
+    }
+
+    /// A bench of `parts` scoring with `sources`, counted once here when `[match] bm25` is on.
+    fn assemble(config: &'a BaseConfig, parts: Parts, sources: Vec<Source>) -> Self {
+        let Parts { domains, converted, commands, ctx, by_domain, tests } = parts;
         let keywords: HashMap<String, Vec<String>> =
             domains.iter().map(|d| (d.name.clone(), d.prompt_keywords.clone())).collect();
-        // The scoring texts the parts carry (no rationales, no decisions): `load_with_store` replaces them with the
-        // store's own through `with_sources`.
-        let mut sources: Vec<Source> = Vec::new();
-        for (domain, list) in &by_domain {
-            for r in list {
-                if !sources.iter().any(|s| s.doc.id == r.id) {
-                    let rule = rules::build(domain, r.text.clone(), None, None);
-                    sources.push(source_of(&rule, keywords.get(domain).map(Vec::as_slice), Vec::new(), &tests));
-                }
-            }
-        }
-        for c in &converted {
-            let own: Vec<String> =
-                c.matchers.iter().filter(|m| m.kind == rules::Kind::Topic).flat_map(|m| m.words.clone()).collect();
-            match sources.iter_mut().find(|s| s.doc.id == c.rule.id) {
-                Some(s) => s.own_words = own,
-                None => sources.push(source_of(&c.rule, keywords.get(&c.rule.domain).map(Vec::as_slice), own, &tests)),
-            }
-        }
-        Bench { config, domains, converted, commands, ctx, by_domain, tests, keywords, sources: Vec::new(), index: None }
-            .with_sources(sources)
+        let prepared = config.matching.bm25.then(|| Prepared::new(&sources));
+        let index = prepared.as_ref().map(Prepared::build);
+        Bench { config, domains, converted, commands, ctx, by_domain, tests, keywords, sources, prepared, index }
     }
 
     /// Every rule a prompt could serve, each once, in domain order: each domain's rules, the rules with matchers of
