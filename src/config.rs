@@ -804,10 +804,17 @@ pub struct GraphConfig {
     /// nobody straggles; off is for an operator who wants to run it by hand.
     #[serde(default = "default_true")]
     pub auto_migrate: bool,
+    /// Backup snapshots kept per tier, newest first (F24b). Every snapshot rotates the oldest out past this number,
+    /// and `base doctor --fix` removes the rest. Read as at least 1, so the snapshot just taken always survives.
+    #[serde(default = "default_keep_backups")]
+    pub keep_backups: usize,
 }
 
 fn default_compact_threshold_mb() -> u64 { 12 }
 fn default_compact_cooldown_hours() -> i64 { 24 }
+/// F24b's default. Before 0.16.0 every tier kept ten (`store::BACKUP_KEEP`): 708 MB on the measured machine.
+pub const DEFAULT_KEEP_BACKUPS: usize = 3;
+fn default_keep_backups() -> usize { DEFAULT_KEEP_BACKUPS }
 
 impl Default for GraphConfig {
     fn default() -> Self {
@@ -816,6 +823,7 @@ impl Default for GraphConfig {
             compact_threshold_mb: default_compact_threshold_mb(),
             compact_cooldown_hours: default_compact_cooldown_hours(),
             auto_migrate: true,
+            keep_backups: default_keep_backups(),
         }
     }
 }

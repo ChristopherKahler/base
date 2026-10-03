@@ -1229,13 +1229,78 @@ fn dump_and_validate<W: Write>(
     Ok(())
 }
 
-/// Max backup snapshots to retain per graph file before rotating out the oldest.
-const BACKUP_KEEP: usize = 10;
+/// How many backup snapshots a graph file keeps: `[graph] keep_backups` as the file's own tier reads it
+/// (`<root>/.base/graph.nq` reads `<root>`'s config, the global tier `~/.base-gbl`'s), at least 1 so the snapshot just
+/// taken always survives (F24b). It was a fixed 10 until 0.16.0, and doctor then told the operator to prune by hand.
+pub fn keep_backups_for(path: &Path) -> usize {
+    let root = path.parent().and_then(Path::parent).unwrap_or(path);
+    crate::config::BaseConfig::load(root).graph.keep_backups.max(1)
+}
+
+/// One `{fname}.bak*` snapshot beside a graph file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backup {
+    pub path: PathBuf,
+    pub modified: std::time::SystemTime,
+    pub bytes: u64,
+}
+
+/// Every `{fname}.bak*` snapshot beside `path`, newest first: by modification time, then by name, so a tie under a
+/// coarse clock orders the same way on every run. Only base's own lowercase `.bak` names count; a copy an operator made
+/// by hand under another name (`graph.nq.BAK-…`, `graph.nq.torn-…`) is not base's to rotate.
+pub fn backups(path: &Path) -> Vec<Backup> {
+    let (Some(parent), Some(fname)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return Vec::new();
+    };
+    let prefix = format!("{fname}.bak");
+    let Ok(rd) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Backup> = rd
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)))
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            Some(Backup { path: e.path(), modified: meta.modified().ok()?, bytes: meta.len() })
+        })
+        .collect();
+    out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| b.path.cmp(&a.path)));
+    out
+}
+
+/// The snapshots [`prune_backups`] would remove: all but the newest `keep`, with `protect` (a snapshot just taken)
+/// counted among the kept whatever its time says.
+pub fn backups_past(path: &Path, keep: usize, protect: Option<&Path>) -> Vec<Backup> {
+    let mut all = backups(path);
+    if let Some(p) = protect
+        && let Some(i) = all.iter().position(|b| b.path == p)
+    {
+        let b = all.remove(i);
+        all.insert(0, b);
+    }
+    all.into_iter().skip(keep.max(1)).collect()
+}
+
+/// Remove every snapshot past the newest `keep` (see [`backups_past`]). Returns the ones removed; one that cannot be
+/// removed is logged to stderr and left, never an error, because a backup that survives costs disk and nothing else.
+pub fn prune_backups(path: &Path, keep: usize, protect: Option<&Path>) -> Vec<Backup> {
+    backups_past(path, keep, protect)
+        .into_iter()
+        .filter(|b| match fs::remove_file(&b.path) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("graph: failed to rotate out backup {}: {e}", b.path.display());
+                false
+            }
+        })
+        .collect()
+}
 
 /// Snapshot `path` to a sibling `{fname}.bak-{op}-{stamp}` before a mutating op,
-/// then prune the oldest `{fname}.bak*` snapshots beyond [`BACKUP_KEEP`]. This moves
-/// the hand-run `cp` backup convention into the binary (GRAPH-DURABILITY.md §4 Layer 1)
-/// and is the single backup path for repair / restore / compact / purge.
+/// then prune the oldest `{fname}.bak*` snapshots past `[graph] keep_backups`
+/// ([`keep_backups_for`]). This moves the hand-run `cp` backup convention into the
+/// binary (GRAPH-DURABILITY.md §4 Layer 1) and is the single backup path for
+/// repair / restore / compact / purge / fix.
 /// Returns the new snapshot path. Err only if the copy fails; rotation failure is
 /// non-fatal (logged to stderr, snapshot still returned Ok).
 pub fn snapshot(path: &Path, op: &str) -> Result<PathBuf> {
@@ -1249,58 +1314,11 @@ pub fn snapshot(path: &Path, op: &str) -> Result<PathBuf> {
         format!("failed to snapshot {} → {}", path.display(), backup.display())
     })?;
 
-    rotate_backups(path, fname, &backup);
+    // The just-written snapshot always counts among the kept, whatever its time says: mtime ties are routine under
+    // coarse FS granularity and rapid auto-compaction snapshots, and losing the freshest backup is the worst failure
+    // mode for a durability layer.
+    prune_backups(path, keep_backups_for(path), Some(&backup));
     Ok(backup)
-}
-
-/// Keep the newest [`BACKUP_KEEP`] `{fname}.bak*` snapshots; delete the rest.
-/// `just_written` (the snapshot the caller just created) always ranks newest so
-/// rotation can never prune it — mtime ties are routine under coarse FS granularity
-/// and rapid auto-compaction snapshots, and losing the freshest backup is the worst
-/// failure mode for a durability layer. Non-fatal: any IO error is logged and skipped.
-fn rotate_backups(path: &Path, fname: &str, just_written: &Path) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    let prefix = format!("{fname}.bak");
-    let Ok(rd) = fs::read_dir(parent) else {
-        return;
-    };
-
-    let mut baks: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    for entry in rd.flatten() {
-        let p = entry.path();
-        let is_bak = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with(&prefix))
-            .unwrap_or(false);
-        if !is_bak {
-            continue;
-        }
-        if let Some(mt) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
-            baks.push((mt, p));
-        }
-    }
-
-    if baks.len() <= BACKUP_KEEP {
-        return;
-    }
-    // Newest first. The just-written snapshot is forced to the front so it survives
-    // rotation regardless of mtime; filename is a deterministic tiebreak for the rest.
-    baks.sort_by(|a, b| {
-        let a_new = a.1 == just_written;
-        let b_new = b.1 == just_written;
-        b_new
-            .cmp(&a_new)
-            .then(b.0.cmp(&a.0))
-            .then(b.1.cmp(&a.1))
-    });
-    for (_, p) in baks.into_iter().skip(BACKUP_KEEP) {
-        if let Err(e) = fs::remove_file(&p) {
-            eprintln!("graph: failed to rotate out backup {}: {e}", p.display());
-        }
-    }
 }
 
 // ─── Write serialization ─────────────────────────────────────
@@ -2070,24 +2088,37 @@ mod tests {
     fn snapshot_rotates_to_keep_limit() {
         let dir = tempfile::tempdir().unwrap();
         let p = write_file(dir.path(), "graph.nq", "<http://x/s> <http://x/p> <http://x/o> .\n");
-        // 12 pre-existing backups → snapshot adds a 13th, rotation prunes to 10.
+        // 12 pre-existing backups → snapshot adds a 13th, rotation prunes to `[graph] keep_backups`, which this loose
+        // file's tier reads as the default (a test build resolves no real home).
         for i in 0..12 {
             write_file(dir.path(), &format!("graph.nq.bak-old-{i:02}"), "x\n");
         }
         let new_bak = snapshot(&p, "test").unwrap();
         assert!(new_bak.exists(), "new snapshot written");
+        let left = backups(&p);
+        assert_eq!(left.len(), crate::config::DEFAULT_KEEP_BACKUPS, "rotation keeps exactly keep_backups snapshots");
+        assert!(left.iter().any(|b| b.path == new_bak), "the snapshot just taken survives its own rotation");
+    }
 
-        let count = fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .map(|n| n.starts_with("graph.nq.bak"))
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(count, 10, "rotation keeps exactly BACKUP_KEEP snapshots");
+    /// F24b: the number comes from the tier's own config. A workspace `.base/base.toml` overlays the global one, so it
+    /// decides here whatever the home says.
+    #[test]
+    fn snapshot_keeps_the_tiers_configured_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("ws").join(".base");
+        fs::create_dir_all(&base).unwrap();
+        write_file(&base, "base.toml", "[graph]\nkeep_backups = 5\n");
+        let p = write_file(&base, "graph.nq", "<http://x/s> <http://x/p> <http://x/o> .\n");
+        for i in 0..8 {
+            write_file(&base, &format!("graph.nq.bak-old-{i:02}"), "x\n");
+        }
+        // Hand-made copies under other names are not base's backups and are never rotated.
+        write_file(&base, "graph.nq.BAK-by-hand", "x\n");
+        write_file(&base, "graph.nq.torn-20260921", "x\n");
+        assert_eq!(keep_backups_for(&p), 5);
+        snapshot(&p, "test").unwrap();
+        assert_eq!(backups(&p).len(), 5);
+        assert!(base.join("graph.nq.BAK-by-hand").exists() && base.join("graph.nq.torn-20260921").exists());
     }
 
     #[test]

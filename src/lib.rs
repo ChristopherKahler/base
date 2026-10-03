@@ -38,6 +38,7 @@ pub mod extension;
 pub mod graph;
 pub mod home;
 pub mod extract;
+pub mod fix;
 pub mod first_run;
 pub mod hook;
 pub mod install;

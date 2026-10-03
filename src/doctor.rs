@@ -88,6 +88,14 @@ pub struct TierReport {
     /// over data it fetched correctly. **Advisory.**
     pub unrecognised_graphs: Vec<(String, usize)>,
     pub latest_backup: Option<BackupCompare>,
+    /// Quads the tier holds, when it parses. Fewer quads than lines means duplicate lines, which is what compaction
+    /// removes: the size advisory names `base graph compact` only then (F24), so it never sends an operator to the
+    /// compaction `base doctor --fix` just ran.
+    pub quad_count: Option<usize>,
+    /// The tier's `{graph}.bak*` snapshots and their bytes, against `[graph] keep_backups` (F24b).
+    pub backups: usize,
+    pub backup_bytes: u64,
+    pub keep_backups: usize,
 }
 
 /// Full doctor report across all resolved tiers.
@@ -196,7 +204,7 @@ enum GraphOrigin {
 /// failure this feature can have — which is why
 /// `tier_own_slug_agrees_with_crud_workspace_slug` pins them together rather than
 /// leaving the equivalence as an assumption inside a larger test.
-fn tier_own_slug(path: &Path) -> String {
+pub(crate) fn tier_own_slug(path: &Path) -> String {
     path.parent()
         .and_then(Path::parent)
         .and_then(Path::file_name)
@@ -210,20 +218,30 @@ fn classify_graph(graph: &str, ns_uri: &str, own_slug: &str) -> GraphOrigin {
     if graph == crate::apply_ops::LEDGER_GRAPH {
         return GraphOrigin::Unscoped;
     }
-    let Some(rest) = graph.strip_prefix(ns_uri).and_then(|r| r.strip_prefix("graph/")) else {
-        return GraphOrigin::Unrecognised;
-    };
-    // `ws/{slug}` and `semantic/{ws}/{doc}` both carry the owning workspace, in
-    // different positions. Any other shape under `graph/` is one this build does
-    // not know: say so rather than inventing an owner for it.
-    let owner = if let Some(slug) = rest.strip_prefix("ws/") {
-        slug
-    } else if let Some(tail) = rest.strip_prefix("semantic/") {
-        tail.split('/').next().unwrap_or("")
+    match graph_owner(graph, ns_uri) {
+        Some(owner) if owner == own_slug => GraphOrigin::Own,
+        Some(_) => GraphOrigin::Foreign,
+        None => GraphOrigin::Unrecognised,
+    }
+}
+
+/// The workspace a named graph belongs to, by its shape: `{ns}graph/ws/{slug}` and `{ns}graph/semantic/{ws}/{doc}`
+/// both carry it, in different positions. `None` for any other shape, which this build does not attribute rather than
+/// inventing an owner for it. [`classify_graph`] and `base doctor --fix`'s move (F15c) read the owner from here, so the
+/// graphs doctor names as foreign are exactly the ones the fix moves.
+pub(crate) fn graph_owner<'a>(graph: &'a str, ns_uri: &str) -> Option<&'a str> {
+    let rest = graph.strip_prefix(ns_uri)?.strip_prefix("graph/")?;
+    if let Some(slug) = rest.strip_prefix("ws/") {
+        Some(slug)
     } else {
-        return GraphOrigin::Unrecognised;
-    };
-    if owner == own_slug { GraphOrigin::Own } else { GraphOrigin::Foreign }
+        rest.strip_prefix("semantic/").map(|tail| tail.split('/').next().unwrap_or(""))
+    }
+}
+
+/// True when `graph` belongs to another workspace than the tier whose own slug is `own_slug`: the one origin that
+/// counts against `healthy` (#142) and the one `base doctor --fix` moves out (F15c).
+pub(crate) fn is_foreign(graph: &str, ns_uri: &str, own_slug: &str) -> bool {
+    classify_graph(graph, ns_uri, own_slug) == GraphOrigin::Foreign
 }
 
 /// Every quad in `store` bucketed by the origin of its graph, each bucket
@@ -299,6 +317,9 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
     // A lingering write_back temp means a write was interrupted. Matches both the
     // legacy shared `graph.nq.tmp` and per-writer `graph.nq.tmp.<pid>` temps.
     let stale_tmp = stale_temp_count(path) > 0;
+    let snapshots = store::backups(path);
+    let (backups, backup_bytes) = (snapshots.len(), snapshots.iter().map(|b| b.bytes).sum::<u64>());
+    let keep_backups = store::keep_backups_for(path);
 
     if status == "missing" {
         return TierReport {
@@ -321,6 +342,10 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
             unrecognised_graphs: Vec::new(),
             latest_backup: None,
             supersede_audit: crate::supersede::Audit::default(),
+            quad_count: None,
+            backups,
+            backup_bytes,
+            keep_backups,
         };
     }
 
@@ -337,7 +362,7 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
     // Namespace from THIS tier's own base.toml (`<root>/.base/graph.nq` → `<root>`),
     // so a workspace with a custom prefix is read with its own vocabulary rather
     // than the default. Keeps `diagnose_tier` path-scoped — the test-isolation seam.
-    let (schema_version, domain_orphans, supersede_audit, provenance) = if status == "healthy" {
+    let (schema_version, domain_orphans, supersede_audit, provenance, quad_count) = if status == "healthy" {
         let root = path.parent().and_then(Path::parent).unwrap_or(path);
         let ns = crate::config::BaseConfig::load(root).namespace;
         match store::load_graph(path) {
@@ -348,18 +373,19 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
                 // #142. Same already-loaded store, so this costs one more pass
                 // over memory and no I/O at all.
                 graph_provenance(&s, &ns.uri, &tier_own_slug(path)),
+                s.len().ok(),
             ),
-            Err(_) => (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default()),
+            Err(_) => (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default(), None),
         }
     } else {
         // An unparseable tier is already `unhealthy` for a stated reason with a
         // bad line number. Claiming a provenance verdict from a store that never
         // loaded would put a confident zero where the honest answer is "could not
         // look" — the failure this whole lane exists to remove.
-        (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default())
+        (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default(), None)
     };
 
-    let latest_backup = newest_backup(path).map(|bpath| {
+    let latest_backup = snapshots.first().map(|b| b.path.clone()).map(|bpath| {
         let backup_line_count = count_lines(&bpath);
         BackupCompare {
             path: bpath.display().to_string(),
@@ -386,6 +412,10 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
         unscoped_graphs: provenance.unscoped,
         unrecognised_graphs: provenance.unrecognised,
         latest_backup,
+        quad_count,
+        backups,
+        backup_bytes,
+        keep_backups,
     }
 }
 
@@ -822,6 +852,14 @@ pub fn format_human(report: &DoctorReport) -> String {
                 ));
             }
         }
+        if t.status != "missing" {
+            out.push_str(&format!(
+                "   keeps {} backup(s) ({} MB) · [graph] keep_backups = {}\n",
+                t.backups,
+                t.backup_bytes / (1024 * 1024),
+                t.keep_backups
+            ));
+        }
     }
 
     push_hook_output(&mut out, &report.hook_output, &report.measured_on);
@@ -849,12 +887,47 @@ pub fn format_human(report: &DoctorReport) -> String {
         }
     }
 
+    let fixable = fixable(report);
+    if !fixable.is_empty() {
+        out.push_str(&format!(
+            "\n`base doctor --fix` plans the repair of: {} (`--fix --yes` applies it)\n",
+            fixable.join(", ")
+        ));
+    }
+
     let verdict = if report.healthy {
         "Verdict: HEALTHY ✓"
     } else {
         "Verdict: UNHEALTHY ⚠ — repair before relying on recall / learn / sync"
     };
     out.push_str(&format!("\n{verdict}\n"));
+    out
+}
+
+/// What in this report `base doctor --fix` repairs (BO-12), named in the order it repairs them. Doctor used to end
+/// UNHEALTHY and offer no repair at all.
+fn fixable(report: &DoctorReport) -> Vec<&'static str> {
+    let any = |f: &dyn Fn(&TierReport) -> bool| report.tiers.iter().any(f);
+    let mut out = Vec::new();
+    if any(&|t| !t.foreign_graphs.is_empty()) {
+        out.push("records of another workspace");
+    }
+    if any(&|t| t.supersede_audit.corrections_naming_nothing > 0) {
+        out.push("corrections that name nothing");
+    }
+    if any(&|t| t.supersede_audit.status_without_edge + t.supersede_audit.edge_without_status > 0) {
+        out.push("the supersession disagreement");
+    }
+    if any(&|t| t.quad_count.is_some_and(|q| t.line_count > q)) {
+        out.push("duplicate lines (compaction)");
+    }
+    if any(&|t| t.backups > t.keep_backups) {
+        out.push("backups past [graph] keep_backups");
+    }
+    // `LegacyKey::sentence` is the only writer of this advisory.
+    if report.warnings.iter().any(|w| w.starts_with("legacy: [signal] max_chars ")) {
+        out.push("legacy [signal] max_chars");
+    }
     out
 }
 
@@ -1232,33 +1305,6 @@ fn term_count(term: &Term) -> Option<usize> {
     }
 }
 
-/// Newest sibling backup file matching `{graph-name}.bak*`, if any.
-fn newest_backup(path: &Path) -> Option<PathBuf> {
-    let parent = path.parent()?;
-    let fname = path.file_name()?.to_str()?;
-    let prefix = format!("{fname}.bak");
-
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in fs::read_dir(parent).ok()?.flatten() {
-        let p = entry.path();
-        let is_bak = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with(&prefix))
-            .unwrap_or(false);
-        if !is_bak {
-            continue;
-        }
-        if let Some(mt) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
-            match &newest {
-                Some((best, _)) if *best >= mt => {}
-                _ => newest = Some((mt, p)),
-            }
-        }
-    }
-    newest.map(|(_, p)| p)
-}
-
 /// Filesystem-safe local timestamp for backup/quarantine filenames.
 fn stamp() -> String {
     chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string()
@@ -1341,33 +1387,6 @@ fn stale_temp_count(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Count + total bytes of `{name}.bak*` sibling backups.
-fn backup_footprint(path: &Path) -> (usize, u64) {
-    let (Some(parent), Some(fname)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
-    else {
-        return (0, 0);
-    };
-    let prefix = format!("{fname}.bak");
-    let mut count = 0usize;
-    let mut bytes = 0u64;
-    if let Ok(rd) = fs::read_dir(parent) {
-        for e in rd.flatten() {
-            if e
-                .file_name()
-                .to_str()
-                .map(|n| n.starts_with(&prefix))
-                .unwrap_or(false)
-            {
-                count += 1;
-                bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
-            }
-        }
-    }
-    (count, bytes)
-}
-
-/// Advisory size/backup bloat warnings for a tier. Never affect `healthy` — a big
-/// graph is a smell (slow writes widen the write-race window), not a failure.
 /// Open handoffs/forks sitting in the GLOBAL tier are almost always leaks from
 /// the pre-#8 fallback, which wrote them there whenever a session ran outside a
 /// workspace — and a global handoff then resurfaces at the start of every
@@ -1414,29 +1433,36 @@ fn leaked_handoffs_in(gbl: &Path) -> Vec<String> {
     )]
 }
 
+/// Advisory size/backup bloat warnings for a tier. Never affect `healthy` — a big
+/// graph is a smell (slow writes widen the write-race window), not a failure.
+///
+/// Each one names the repair that changes it, and only when that repair would (F24): compaction removes duplicate lines
+/// and nothing else, so a big graph whose every line is a distinct quad is not sent to `base graph compact` (it was,
+/// right after `base doctor --fix` had compacted it); and backups past `[graph] keep_backups` are what `--fix` removes.
+/// The old fixed limits (5 backups, 50 MB of them) fired on three backups of any graph over 17 MB.
 fn bloat_warnings(tier: &TierReport) -> Vec<String> {
     const BLOAT_GRAPH_BYTES: u64 = 20 * 1024 * 1024;
-    const BLOAT_BACKUP_COUNT: usize = 5;
-    const BLOAT_BACKUP_BYTES: u64 = 50 * 1024 * 1024;
     let mut w = Vec::new();
     if tier.status == "missing" {
         return w;
     }
-    if tier.size_bytes > BLOAT_GRAPH_BYTES {
+    let duplicates = tier.quad_count.map(|q| tier.line_count.saturating_sub(q)).unwrap_or(0);
+    if tier.size_bytes > BLOAT_GRAPH_BYTES && duplicates > 0 {
         w.push(format!(
-            "{} graph is {} MB / {} lines — consider `base graph compact`",
+            "{} graph is {} MB / {} lines, {duplicates} of them duplicates — consider `base graph compact`",
             tier.tier,
             tier.size_bytes / (1024 * 1024),
             tier.line_count
         ));
     }
-    let (count, bytes) = backup_footprint(Path::new(&tier.path));
-    if count > BLOAT_BACKUP_COUNT || bytes > BLOAT_BACKUP_BYTES {
+    if tier.backups > tier.keep_backups {
         w.push(format!(
-            "{} tier keeps {} backups ({} MB) — prune old .bak files",
+            "{} tier keeps {} backups ({} MB), more than [graph] keep_backups = {} — `base doctor --fix` removes the oldest {}",
             tier.tier,
-            count,
-            bytes / (1024 * 1024)
+            tier.backups,
+            tier.backup_bytes / (1024 * 1024),
+            tier.keep_backups,
+            tier.backups - tier.keep_backups
         ));
     }
     w
@@ -1611,35 +1637,15 @@ pub fn format_repair_human(outcomes: &[RepairOutcome]) -> String {
 // ─── Restore (Phase 35) ────────────────────────────────────────────────────
 
 /// Backup snapshots for a tier: sibling `{fname}.bak*` files with line counts,
-/// newest first.
+/// newest first, in the order [`store::backups`] keeps and rotates them.
 pub fn list_backups(path: &Path) -> Vec<(PathBuf, usize)> {
-    let (parent, prefix) = match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
-        (Some(p), Some(f)) => (p, format!("{f}.bak")),
-        _ => return Vec::new(),
-    };
-    let mut baks: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    let Ok(rd) = fs::read_dir(parent) else {
-        return Vec::new();
-    };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        let is_bak = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with(&prefix))
-            .unwrap_or(false);
-        if !is_bak {
-            continue;
-        }
-        if let Some(mt) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
-            baks.push((mt, p));
-        }
-    }
-    baks.sort_by_key(|b| std::cmp::Reverse(b.0)); // newest first
-    baks.into_iter().map(|(_, p)| {
-        let n = count_lines(&p);
-        (p, n)
-    }).collect()
+    store::backups(path)
+        .into_iter()
+        .map(|b| {
+            let n = count_lines(&b.path);
+            (b.path, n)
+        })
+        .collect()
 }
 
 /// Restore `path` from `backup`. Snapshots the CURRENT file first (so a wrong
@@ -1662,8 +1668,9 @@ pub fn restore_tier(path: &Path, backup: &Path) -> Result<()> {
 }
 
 /// Resolve the (tier, graph.nq path) pairs the same way [`diagnose`] walks them:
-/// global first, then the nearest workspace, deduped by canonical path.
-fn tier_paths(cwd: &Path) -> Vec<(String, PathBuf)> {
+/// global first, then the nearest workspace, deduped by canonical path. `base doctor --fix`
+/// repairs exactly these, so it never touches a tier doctor did not report.
+pub(crate) fn tier_paths(cwd: &Path) -> Vec<(String, PathBuf)> {
     let mut tiers = Vec::new();
     let mut seen = std::collections::HashSet::new();
 

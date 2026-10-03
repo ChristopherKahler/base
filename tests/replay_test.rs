@@ -1237,3 +1237,59 @@ fn replay_handoff_lanes_and_tiers_hold_on_the_corpus_store() {
     assert!(std::fs::read(&gbl).expect("global graph") == gbl_before, "the global graph was written");
     println!("replay handoff lanes: 2 corpus handoffs on project-15 left open across 2 creates; unarchive undone; a create in the global root's doc folder landed in the home tier");
 }
+
+/// BO-12 (build rule 13), on a corpus store: `base doctor --fix` plans and writes nothing; `--fix --yes` leaves no
+/// correction naming nothing (the corpus writes one note in four as a correction, none naming a record), moves the
+/// seed's legacy `[signal] max_chars`, and cuts the backups to `[graph] keep_backups`. The corpus workspace keeps every
+/// quad in `graph/ws/seed` under a folder named `ws`, the shape of a renamed workspace, so `--fix` leaves its records in
+/// place rather than moving the whole store out as another workspace's.
+#[test]
+fn replay_doctor_fix_holds_on_the_corpus_store() {
+    let case = cases().into_iter().next().expect("a corpus case");
+    let s = write_case_as(&case, "bo12-fix");
+    let run = |args: &[&str]| -> String {
+        let (code, out, err) = run_base(&s, args);
+        assert!(code == 0 || args == ["doctor"], "base {args:?}: {out}{err}");
+        out
+    };
+    let (ws, gbl, toml) = (
+        s.ws.join(".base").join("graph.nq"),
+        s.home.join(".base-gbl").join(".base").join("graph.nq"),
+        s.home.join(".base-gbl").join("base.toml"),
+    );
+    for i in 0..6u64 {
+        let b = s.ws.join(".base").join(format!("graph.nq.bak-compact-2026-09-2{i}-080000"));
+        std::fs::write(&b, "<http://x/s> <http://x/p> <http://x/o> .\n").expect("backup");
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs((10 - i) * 86_400);
+        std::fs::File::options().write(true).open(&b).and_then(|f| f.set_modified(when)).expect("backup age");
+    }
+    let bytes = |p: &Path| std::fs::read(p).unwrap_or_default();
+    let subjects = || -> std::collections::BTreeSet<String> {
+        let g = format!("<{}graph/ws/seed> .", seed::NS);
+        std::fs::read_to_string(&ws)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.ends_with(&g))
+            .filter_map(|l| l.split('>').next().map(String::from))
+            .collect()
+    };
+    let before = run(&["doctor"]);
+    for want in ["correction(s) name nothing", "legacy: [signal] max_chars", "most likely renamed", "keeps 6 backups"] {
+        assert!(before.contains(want), "control: doctor reports {want:?} on the corpus:\n{before}");
+    }
+    let records = subjects();
+    let files = [bytes(&ws), bytes(&gbl), bytes(&toml)];
+
+    let plan = run(&["doctor", "--fix"]);
+    assert!(plan.contains("plan (nothing changed yet") && plan.contains("left in place"), "{plan}");
+    assert_eq!([bytes(&ws), bytes(&gbl), bytes(&toml)], files, "the plan wrote");
+
+    run(&["doctor", "--fix", "--yes"]);
+    let after = run(&["doctor"]);
+    assert!(!after.contains("name nothing they correct"), "{after}");
+    assert!(!after.contains("legacy: [signal] max_chars"), "{after}");
+    assert!(after.contains("keeps 3 backup(s)") && !after.contains("more than [graph] keep_backups"), "{after}");
+    assert!(after.contains("most likely renamed"), "the corpus workspace's records moved:\n{after}");
+    assert_eq!(subjects(), records, "a corpus record left the workspace graph");
+    println!("replay doctor --fix: {} corpus records kept in place, corrections and the legacy key repaired, 6 backups cut to 3", records.len());
+}
