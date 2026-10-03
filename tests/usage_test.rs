@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use base::usage::{self, Current, Key};
+use base::usage::{self, Current, Key, Reading};
 use chrono::{Duration, Local, SecondsFormat};
 use serde_json::{json, Value};
 
@@ -199,14 +199,8 @@ fn lines_of(section: &str) -> Vec<&str> {
 
 // ─── K8a ─────────────────────────────────────────────────────────────────────
 
-/// K8a on a fixture log: served in the window and in all, printed only; last served; corrected after in the same or
-/// the next turn, by C1, C2, C3 UPDATED or CORRECTED, and not by MISREAD, DEFERRED or a signal two turns on; a file
-/// row's serving joins the session's latest prompt.
-#[test]
-fn usage_counts_from_match_log() {
-    let dir = std::env::temp_dir().join(format!("base-bo19-scan-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+/// K8a's log: rules a to h and one decision, served, cut, scored and corrected as `usage_counts_from_match_log` says.
+fn k8a_log() -> Log {
     let (a, b, c, d, e, f) = ("rule-a", "rule-b", "rule-c", "rule-d", "rule-e", "rule-f");
     let mut log = Log::default();
     // rule-a: served 40 days ago (outside the window), then twice inside it. Cut and scored on other prompts: neither
@@ -249,6 +243,19 @@ fn usage_counts_from_match_log() {
     log.prompt(ago(3, 0), "s5", 1, "where do memos go", &[], &[("decision", "global.memo-folder")], &[]);
     log.signal(ago(3, 0), "s5", 2, &[("C1", "phrase")]);
     log.prompt(ago(1, 0), "s6", 1, "where do memos go now", &[], &[("decision", "global.memo-folder")], &[]);
+    log
+}
+
+/// K8a on a fixture log: served in the window and in all, printed only; last served; corrected after in the same or
+/// the next turn, by C1, C2, C3 UPDATED or CORRECTED, and not by MISREAD, DEFERRED or a signal two turns on; a file
+/// row's serving joins the session's latest prompt.
+#[test]
+fn usage_counts_from_match_log() {
+    let dir = std::env::temp_dir().join(format!("base-bo19-scan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (a, b, c, d, e, f) = ("rule-a", "rule-b", "rule-c", "rule-d", "rule-e", "rule-f");
+    let log = k8a_log();
     std::fs::write(dir.join("match-log.jsonl"), log.text()).unwrap();
 
     let today = Local::now().date_naive();
@@ -279,6 +286,59 @@ fn usage_counts_from_match_log() {
     let after = scan.counts_since(&dk, Some(since));
     assert_eq!((after.served_all, after.corrected_after), (1, 0), "a decision's update starts it again");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The reader cuts each file into blocks of whole lines and each block into one piece per thread, then applies the rows
+/// in file order: the counts are the same at any thread count and block size, over an archive file, the live file, a
+/// line longer than a block, lines that are blank or not UTF-8, and a second tier.
+#[test]
+fn usage_scan_is_the_same_at_any_thread_count() {
+    let root = std::env::temp_dir().join(format!("base-bo19-threads-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (own, global) = (root.join("ws"), root.join("gbl"));
+    std::fs::create_dir_all(own.join("match-log")).unwrap();
+    std::fs::create_dir_all(&global).unwrap();
+
+    let mut log = k8a_log();
+    log.prompt(ago(2, 5), "s7", 1, "the lint memo", &[("tools", "keyword", Some("lint")), ("tools", "path", Some("C:/work/tools"))], &[("rule", "rule-a")], &[]);
+    log.prompt(ago(2, 4), "s7", 2, "<task-notification>done</task-notification>", &[], &[], &[]);
+    let mut textless = log.rows.last().unwrap().clone();
+    textless.as_object_mut().unwrap().remove("text");
+    textless["prompt_num"] = json!(3);
+    log.rows.push(textless);
+    log.prompt(ago(2, 3), "s7", 4, &"a long prompt about the depot ".repeat(200), &[], &[("rule", "rule-b")], &[]);
+    let text = log.text();
+    let lines: Vec<&str> = text.lines().collect();
+    let (older, newer) = lines.split_at(lines.len() / 2);
+    let quiet = json!({"ts": ago(45, 0), "session": "s9", "event": "file", "tool": "Read", "path": "C:/work/a.txt",
+        "matched": [], "served": [], "cut": [], "scores": []});
+    std::fs::write(own.join("match-log").join("2026-01-01T23-59-59.jsonl"), format!("{quiet}\n{}\n", older.join("\n"))).unwrap();
+    let mut live = newer.join("\n").into_bytes();
+    live.extend_from_slice(b"\n\n\xff\xfe not text\n\n");
+    std::fs::write(own.join("match-log.jsonl"), live).unwrap();
+    let mut other = Log::default();
+    other.prompt(ago(1, 1), "s1", 9, "lint it from home", &[], &[("rule", "rule-a")], &[]);
+    std::fs::write(global.join("match-log.jsonl"), other.text()).unwrap();
+
+    let current = Current {
+        keywords: [("tools".to_string(), vec!["hook".to_string(), "lint".to_string()])].into(),
+        aliases: Default::default(),
+        decisions: vec![("global.memo-folder".to_string(), vec!["memo".to_string()])],
+    };
+    let dirs = [own, global];
+    let today = Local::now().date_naive();
+    let one = usage::scan_with(&dirs, today, 30, &current, Reading { threads: 1, block: Reading::BLOCK });
+    assert_eq!((one.typed, one.machine, one.textless), (17, 1, 1), "K8a's 14, two more typed here and one in the other tier");
+    assert_eq!(one.days_covered(), 46, "the quiet row 45 days ago in the archive file");
+    assert_eq!(one.counts(&Key::Rule("rule-a".into())).served_all, 5);
+    assert_eq!(one.counts(&Key::Rule("rule-b".into())).served_all, 2, "K8a's one and the long line's");
+    assert_eq!(one.keyword_prompts.get("tools"), Some(&1));
+    assert!(one.decision_reach.get("global.memo-folder").is_some_and(|n| *n >= 1));
+    for (threads, block) in [(8, Reading::BLOCK), (3, 4096), (2, 97), (5, 1)] {
+        let many = usage::scan_with(&dirs, today, 30, &current, Reading { threads, block });
+        assert_eq!(many, one, "{threads} threads, blocks of {block} bytes");
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 // ─── K8b ─────────────────────────────────────────────────────────────────────

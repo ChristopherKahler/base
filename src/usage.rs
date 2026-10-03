@@ -31,11 +31,12 @@
 //! ADVICE ONLY. Nothing here is one of the conjuncts of `DoctorReport::healthy`: a user who updates must not see doctor
 //! go UNHEALTHY because of usage counts (Chris, 2026-10-03).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::BufRead;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Local, NaiveDate};
+use chrono::{DateTime, FixedOffset, Local, NaiveDate, Offset};
 use oxigraph::store::Store;
 use serde::{Deserialize, Serialize};
 
@@ -67,76 +68,160 @@ pub enum Key {
 
 // ─── Reading the log ─────────────────────────────────────────────────────────
 
-/// A row as this reader needs it. No `scores` field: serde skips a prompt row's BM25 scores (a median of 76 per row
-/// since BO-18) without building them.
+/// How the log is read. Each file is read in blocks of whole lines; a block is cut into one piece per thread, the
+/// pieces are parsed at once, and their rows are then applied in file order on one thread, so the counts are the same
+/// at any thread count (`usage_scan_is_the_same_at_any_thread_count`). No more than one block of one file is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reading {
+    pub threads: usize,
+    /// Bytes read at a time; a block runs on to the end of its last line.
+    pub block: usize,
+}
+
+impl Reading {
+    /// 32 MB: about two days of a heavy user's log (the operator's live log wrote about 17 MB a day on 2026-10-03).
+    pub const BLOCK: usize = 32 << 20;
+    /// The most threads used, whatever the machine has (lynx's ruling at gate 4).
+    pub const MAX_THREADS: usize = 8;
+    /// Set to a number, the threads to use instead: for timing (gate 4 ran it at 2) and tests.
+    pub const THREADS_ENV: &str = "BASE_USAGE_THREADS";
+
+    /// [`Reading::THREADS_ENV`] when it holds a number from 1 to 64, else the machine's parallelism, at most
+    /// [`Reading::MAX_THREADS`].
+    pub fn from_env() -> Self {
+        let set = std::env::var(Self::THREADS_ENV).ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| (1..=64).contains(n));
+        let threads =
+            set.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(Self::MAX_THREADS));
+        Reading { threads, block: Self::BLOCK }
+    }
+}
+
+/// A row as this reader needs it, its plain strings borrowed from the block where the JSON holds no escape. No
+/// `scores` field: serde passes over a prompt row's BM25 scores (a median of 76 per row since BO-18) without building
+/// them.
 #[derive(Deserialize)]
-struct LeanRow {
-    ts: String,
-    #[serde(default)]
-    session: Option<String>,
-    event: String,
+struct LeanRow<'a> {
+    #[serde(borrow)]
+    ts: Cow<'a, str>,
+    #[serde(default, borrow, deserialize_with = "opt_str")]
+    session: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    event: Cow<'a, str>,
     #[serde(default)]
     prompt_num: Option<u32>,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    matched: Vec<LeanMatched>,
-    #[serde(default)]
-    served: Vec<LeanItem>,
-    #[serde(default)]
-    cut: Vec<LeanItem>,
-    #[serde(default)]
-    signals: Vec<LeanSignal>,
+    #[serde(default, borrow, deserialize_with = "opt_str")]
+    text: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    matched: Vec<LeanMatched<'a>>,
+    #[serde(default, borrow)]
+    served: Vec<LeanItem<'a>>,
+    #[serde(default, borrow)]
+    cut: Vec<LeanItem<'a>>,
+    #[serde(default, borrow)]
+    signals: Vec<LeanSignal<'a>>,
 }
 
 #[derive(Deserialize)]
-struct LeanMatched {
-    domain: String,
-    by: String,
-    #[serde(default)]
-    value: Option<String>,
+struct LeanMatched<'a> {
+    #[serde(borrow)]
+    domain: Cow<'a, str>,
+    #[serde(borrow)]
+    by: Cow<'a, str>,
+    #[serde(default, borrow, deserialize_with = "opt_str")]
+    value: Option<Cow<'a, str>>,
 }
 
 /// A served item, or a cut one (its `reason` then set).
 #[derive(Deserialize)]
-struct LeanItem {
-    id: String,
-    kind: String,
+struct LeanItem<'a> {
+    #[serde(borrow)]
+    id: Cow<'a, str>,
+    #[serde(borrow)]
+    kind: Cow<'a, str>,
     /// The prompt block that carried it, as `base hooks show` names it.
-    #[serde(default)]
-    block: Option<String>,
-    #[serde(default)]
-    reason: Option<String>,
+    #[serde(default, borrow, deserialize_with = "opt_str")]
+    block: Option<Cow<'a, str>>,
+    #[serde(default, borrow, deserialize_with = "opt_str")]
+    reason: Option<Cow<'a, str>>,
 }
 
 #[derive(Deserialize)]
-struct LeanSignal {
-    layer: String,
-    kind: String,
+struct LeanSignal<'a> {
+    #[serde(borrow)]
+    layer: Cow<'a, str>,
+    #[serde(borrow)]
+    kind: Cow<'a, str>,
 }
 
-impl LeanItem {
-    fn key(&self) -> Option<Key> {
-        match self.kind.as_str() {
-            "rule" => Some(Key::Rule(self.id.clone())),
-            "decision" => Some(Key::Decision(self.id.clone())),
-            _ => None,
-        }
-    }
+/// An optional string, borrowed from the block where its JSON holds no escape (serde's `Option<Cow<str>>` always
+/// copies). `null` is `None`, as a missing field is.
+fn opt_str<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Cow<'de, str>>, D::Error> {
+    #[derive(Deserialize)]
+    struct Borrowed<'a>(#[serde(borrow)] Cow<'a, str>);
+    Ok(Option::<Borrowed>::deserialize(d)?.map(|b| b.0))
 }
 
 /// The reply a signal logged on prompt `n` says was wrong, when it says one was: C1, the C2 repeat and a C3 `UPDATED`
 /// or `CORRECTED` answer the reply before their prompt; a C2 interrupt, refusal or edited file is about its own turn.
 fn about(s: &LeanSignal, n: u32) -> Option<u32> {
-    match (s.layer.as_str(), s.kind.as_str()) {
+    match (&*s.layer, &*s.kind) {
         ("C1", _) | ("C2", "repeat") | ("C3", "UPDATED" | "CORRECTED") => n.checked_sub(1),
         ("C2", _) => Some(n),
         _ => None,
     }
 }
 
+/// Every rule and decision a row named, by kind and then id, so a row's item is found from its borrowed id without
+/// building a [`Key`].
+#[derive(Debug, Default, PartialEq)]
+struct Items {
+    rules: HashMap<String, ItemLog>,
+    decisions: HashMap<String, ItemLog>,
+}
+
+/// What the log says of one rule or decision.
+#[derive(Debug, Default, PartialEq)]
+struct ItemLog {
+    servings: Vec<Serving>,
+    /// Cut for the budget in the window: it was due and not printed.
+    withheld: usize,
+    /// The block it was last withheld from.
+    withheld_from: Option<String>,
+    /// The oldest day a row named it, served or cut.
+    first_named: Option<NaiveDate>,
+}
+
+impl Items {
+    fn get(&self, key: &Key) -> Option<&ItemLog> {
+        match key {
+            Key::Rule(id) => self.rules.get(id),
+            Key::Decision(slug) => self.decisions.get(slug),
+        }
+    }
+
+    /// The log of a logged item of kind `rule` or `decision`, made the first time it is named; `None` for any other
+    /// kind (a bracket rule, a check).
+    fn named(&mut self, kind: &str, id: &str) -> Option<&mut ItemLog> {
+        let map = match kind {
+            "rule" => &mut self.rules,
+            "decision" => &mut self.decisions,
+            _ => return None,
+        };
+        if !map.contains_key(id) {
+            map.insert(id.to_string(), ItemLog::default());
+        }
+        map.get_mut(id)
+    }
+}
+
+impl ItemLog {
+    fn named_on(&mut self, day: NaiveDate) {
+        self.first_named = Some(self.first_named.map_or(day, |d| d.min(day)));
+    }
+}
+
 /// One time an item was served.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Serving {
     day: NaiveDate,
     /// Seconds since the epoch, for a decision whose servings count only after its last update.
@@ -147,7 +232,7 @@ struct Serving {
 }
 
 /// What the match log says, over every file of it in the tiers read.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Scan {
     pub today: NaiveDate,
     pub window_days: u64,
@@ -157,15 +242,10 @@ pub struct Scan {
     pub typed: usize,
     pub machine: usize,
     pub textless: usize,
-    servings: HashMap<Key, Vec<Serving>>,
+    /// Every rule and decision a row named, served or cut.
+    items: Items,
     /// (session, reply) pairs a correcting signal is about.
     signals: HashSet<(u32, u32)>,
-    /// Cut for the budget in the window: the item was due and not printed.
-    withheld: HashMap<Key, usize>,
-    /// The block it was last withheld from.
-    withheld_from: HashMap<Key, String>,
-    /// The oldest day a row named the item, served or cut.
-    first_named: HashMap<Key, NaiveDate>,
     /// Rows in the window that matched each domain (by slug) by anything but `always`.
     pub domain_matched: HashMap<String, usize>,
     /// Typed prompts in the window that matched each domain (by slug) by a keyword it still has.
@@ -217,7 +297,7 @@ impl Current {
 impl Scan {
     /// The first day of the window.
     pub fn window_start(&self) -> NaiveDate {
-        self.today.checked_sub_days(chrono::Days::new(self.window_days.max(1) - 1)).unwrap_or(NaiveDate::MIN)
+        window_start(self.today, self.window_days)
     }
 
     fn in_window(&self, day: NaiveDate) -> bool {
@@ -248,13 +328,14 @@ impl Scan {
     /// The counts of one item, counting servings at or after `since` (seconds since the epoch) for `served_all` and
     /// `corrected_after`: a decision reworded with `base decision update` starts again.
     pub fn counts_since(&self, key: &Key, since: Option<i64>) -> Counts {
+        let log = self.items.get(key);
         let mut c = Counts {
-            withheld_window: self.withheld.get(key).copied().unwrap_or(0),
-            withheld_from: self.withheld_from.get(key).cloned(),
-            first_named: self.first_named.get(key).copied(),
+            withheld_window: log.map_or(0, |l| l.withheld),
+            withheld_from: log.and_then(|l| l.withheld_from.clone()),
+            first_named: log.and_then(|l| l.first_named),
             ..Counts::default()
         };
-        for s in self.servings.get(key).into_iter().flatten() {
+        for s in log.into_iter().flat_map(|l| &l.servings) {
             if self.in_window(s.day) {
                 c.served_window += 1;
             }
@@ -276,8 +357,8 @@ impl Scan {
     /// were. Their share is the average an ignored rule is measured against.
     pub fn average(&self) -> (usize, usize) {
         let (mut corrected, mut all) = (0, 0);
-        for list in self.servings.values() {
-            for s in list {
+        for log in self.items.rules.values().chain(self.items.decisions.values()) {
+            for s in &log.servings {
                 all += 1;
                 if let (Some(sess), Some(n)) = (s.session, s.turn)
                     && (self.signals.contains(&(sess, n)) || self.signals.contains(&(sess, n + 1)))
@@ -291,11 +372,13 @@ impl Scan {
 
     /// Every decision the log shows served, by slug.
     pub fn decisions(&self) -> impl Iterator<Item = &str> {
-        self.servings.keys().filter_map(|k| match k {
-            Key::Decision(s) => Some(s.as_str()),
-            Key::Rule(_) => None,
-        })
+        self.items.decisions.iter().filter(|(_, l)| !l.servings.is_empty()).map(|(slug, _)| slug.as_str())
     }
+}
+
+/// The first day of a window of `days` days ending `today`.
+fn window_start(today: NaiveDate, days: u64) -> NaiveDate {
+    today.checked_sub_days(chrono::Days::new(days.max(1) - 1)).unwrap_or(NaiveDate::MIN)
 }
 
 /// One item's numbers.
@@ -312,67 +395,338 @@ pub struct Counts {
     pub first_named: Option<NaiveDate>,
 }
 
-/// The local day of a row's time, and its seconds since the epoch.
-fn when(ts: &str) -> Option<(NaiveDate, i64)> {
-    let t = DateTime::parse_from_rfc3339(ts).ok()?;
-    Some((t.with_timezone(&Local).date_naive(), t.timestamp()))
+/// Rows' local days, looking the local offset up once per quarter hour of time. On Windows chrono asks the system for
+/// the time zone (`GetTimeZoneInformationForYear`) on every conversion to local time. A zone's offset changes only on a
+/// quarter hour (every offset is whole quarter hours, and clocks change on a whole or half hour of local time), so the
+/// offset at any instant of a quarter hour is the offset of that quarter hour.
+#[derive(Default)]
+struct Clock {
+    quarter: i64,
+    offset: Option<FixedOffset>,
 }
 
-/// Read every file of the log in `dirs` (each tier's `.base`, the cwd's own first), oldest file first, as of `today`.
+impl Clock {
+    /// The local day of a row's time, and its seconds since the epoch.
+    fn when(&mut self, ts: &str) -> Option<(NaiveDate, i64)> {
+        let t = DateTime::parse_from_rfc3339(ts).ok()?;
+        let at = t.timestamp();
+        let quarter = at.div_euclid(900);
+        let offset = match self.offset {
+            Some(o) if self.quarter == quarter => o,
+            _ => {
+                let o = t.with_timezone(&Local).offset().fix();
+                (self.quarter, self.offset) = (quarter, Some(o));
+                o
+            }
+        };
+        Some((t.with_timezone(&offset).date_naive(), at))
+    }
+}
+
+/// Read every file of the log in `dirs` (each tier's `.base`, the cwd's own first), oldest file first, as of `today`,
+/// with the threads [`Reading::from_env`] gives.
 pub fn scan(dirs: &[PathBuf], today: NaiveDate, window_days: u64, current: &Current) -> Scan {
+    scan_with(dirs, today, window_days, current, Reading::from_env())
+}
+
+/// [`scan`], read as `reading` says.
+pub fn scan_with(dirs: &[PathBuf], today: NaiveDate, window_days: u64, current: &Current, reading: Reading) -> Scan {
     let mut out = Scan { today, window_days: window_days.max(1), ..Scan::default() };
-    let mut sessions: HashMap<String, u32> = HashMap::new();
-    let mut last_prompt: HashMap<u32, u32> = HashMap::new();
+    let mut walk = Walk::default();
+    let mut buf = Vec::new();
     for (i, dir) in dirs.iter().enumerate() {
-        let own = i == 0;
+        let ctx = Ctx { current, start: out.window_start(), own: i == 0 };
         for path in match_log::files(dir) {
-            let Ok(file) = std::fs::File::open(&path) else { continue };
-            for line in std::io::BufReader::new(file).split(b'\n').map_while(Result::ok) {
-                let Ok(text) = std::str::from_utf8(&line) else { continue };
-                let text = text.trim();
-                if text.is_empty() {
-                    continue;
-                }
-                // Most rows are tool calls that matched, served and cut nothing: passed over before any parse.
-                if text.contains("\"event\":\"file\"")
-                    && text.contains("\"matched\":[]")
-                    && text.contains("\"served\":[]")
-                    && text.contains("\"cut\":[]")
-                {
-                    if own && let Some(day) = ts_day(text) {
+            each_block(&path, &mut buf, reading.block, |block| {
+                for piece in parse_block(block, &ctx, reading.threads) {
+                    if let Some(day) = piece.quiet_oldest {
                         out.oldest = Some(out.oldest.map_or(day, |o| o.min(day)));
                     }
-                    continue;
+                    out.merge_cuts(piece.cuts);
+                    for row in piece.rows {
+                        take(&mut out, row, ctx.own, current, &mut walk);
+                    }
                 }
-                let Ok(row) = serde_json::from_str::<LeanRow>(text) else { continue };
-                take(&mut out, row, own, current, &mut sessions, &mut last_prompt);
+            });
+        }
+    }
+    out
+}
+
+/// Each block of `path`, in order: about `size` bytes, on to the end of a line, so no line is split between two. A
+/// line longer than `size` makes a longer block. A read error ends the file, as an unreadable line did before. No file
+/// is no block.
+fn each_block(path: &Path, buf: &mut Vec<u8>, size: usize, mut each: impl FnMut(&[u8])) {
+    let Ok(mut file) = std::fs::File::open(path) else { return };
+    // A small file needs no 32 MB block; one that grows while it is read is read on.
+    let len = file.metadata().map_or(u64::MAX, |m| m.len());
+    let size = size.min(usize::try_from(len.saturating_add(1)).unwrap_or(usize::MAX)).max(1);
+    // The start of a line carried over from the last block, at the front of `buf`.
+    let mut kept = 0;
+    loop {
+        // `buf` is zeroed only where it grows, so once per scan, not once per block.
+        if buf.len() < kept + size {
+            buf.resize(kept + size, 0);
+        }
+        let (mut filled, end) = (kept, kept + size);
+        let mut done = false;
+        while filled < end {
+            match file.read(&mut buf[filled..end]) {
+                Ok(0) => {
+                    done = true;
+                    break;
+                }
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    done = true;
+                    break;
+                }
             }
+        }
+        if done {
+            if filled > 0 {
+                each(&buf[..filled]);
+            }
+            return;
+        }
+        // Whole lines only; the rest starts the next block. No line end in what was just read: read on.
+        let Some(nl) = buf[kept..filled].iter().rposition(|&b| b == b'\n') else {
+            kept = filled;
+            continue;
+        };
+        let cut = kept + nl + 1;
+        each(&buf[..cut]);
+        buf.copy_within(cut..filled, 0);
+        kept = filled - cut;
+    }
+}
+
+/// `block` cut into at most `n` pieces of whole lines, about equal in size, in order.
+fn pieces(block: &[u8], n: usize) -> Vec<&[u8]> {
+    let mut out = Vec::with_capacity(n);
+    let mut from = 0;
+    for k in 1..n {
+        let target = (block.len() * k / n).max(from);
+        let Some(nl) = block[target..].iter().position(|&b| b == b'\n') else { break };
+        out.push(&block[from..target + nl + 1]);
+        from = target + nl + 1;
+    }
+    if from < block.len() {
+        out.push(&block[from..]);
+    }
+    out
+}
+
+/// What every worker reads a block against.
+struct Ctx<'c> {
+    current: &'c Current,
+    /// The window's first day.
+    start: NaiveDate,
+    /// The cwd's own tier: its rows say how old the log is.
+    own: bool,
+}
+
+/// One piece of a block as a worker read it.
+#[derive(Default)]
+struct Piece<'a> {
+    rows: Vec<Parsed<'a>>,
+    /// The oldest day of the tool calls that matched, served and cut nothing, in the cwd's own tier.
+    quiet_oldest: Option<NaiveDate>,
+    /// The piece's cut entries, folded per rule (`true`) or decision and id. A prompt row can log dozens of decisions
+    /// withheld by the budget (68,425 cut entries against 2,645 servings in one day of the operator's log), so they
+    /// are counted here, on the worker, and the rows applied in order carry none.
+    cuts: HashMap<(bool, Cow<'a, str>), CutFold<'a>>,
+}
+
+/// One item's cut entries in a piece.
+struct CutFold<'a> {
+    /// The oldest day of them.
+    first: NaiveDate,
+    /// How many were for the budget in the window.
+    withheld: usize,
+    /// The block the last of those named.
+    block: Option<Cow<'a, str>>,
+}
+
+impl Scan {
+    /// A piece's cut entries, merged in piece order so the block an item was last withheld from is the last in the log.
+    fn merge_cuts(&mut self, cuts: HashMap<(bool, Cow<'_, str>), CutFold<'_>>) {
+        for ((rule, id), fold) in cuts {
+            let Some(log) = self.items.named(if rule { "rule" } else { "decision" }, &id) else { continue };
+            log.named_on(fold.first);
+            log.withheld += fold.withheld;
+            if let Some(block) = fold.block
+                && log.withheld_from.as_deref() != Some(&*block)
+            {
+                log.withheld_from = Some(block.into_owned());
+            }
+        }
+    }
+}
+
+/// A row and what its worker worked out from it.
+struct Parsed<'a> {
+    row: LeanRow<'a>,
+    day: NaiveDate,
+    at: i64,
+    prompt: PromptKind,
+}
+
+/// A prompt row in the window: whose text it is.
+enum PromptKind {
+    /// Not a prompt row, or outside the window.
+    Not,
+    /// Kept with no text (`[log] prompt_text`).
+    Textless,
+    /// A task notification and the like (`transcript::machine_prompt`).
+    Machine,
+    /// Typed by a person: each global decision whose keywords the text holds (its index in [`Current::decisions`]),
+    /// with those keywords, lowercased.
+    Typed(Vec<(usize, Vec<String>)>),
+}
+
+/// The pieces of `block`, parsed at once on up to `threads` threads, in order.
+fn parse_block<'a>(block: &'a [u8], ctx: &Ctx, threads: usize) -> Vec<Piece<'a>> {
+    let parts = pieces(block, threads.max(1));
+    if parts.len() <= 1 {
+        return vec![parse_piece(block, ctx)];
+    }
+    std::thread::scope(|s| {
+        let workers: Vec<_> = parts.into_iter().map(|p| s.spawn(move || parse_piece(p, ctx))).collect();
+        workers.into_iter().map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
+    })
+}
+
+/// A tool call that matched, served and cut nothing: most rows of a log. Passed over before any parse.
+fn quiet(text: &str) -> bool {
+    text.contains("\"event\":\"file\"")
+        && text.contains("\"matched\":[]")
+        && text.contains("\"served\":[]")
+        && text.contains("\"cut\":[]")
+}
+
+fn parse_piece<'a>(piece: &'a [u8], ctx: &Ctx) -> Piece<'a> {
+    let mut out = Piece::default();
+    let mut clock = Clock::default();
+    for line in piece.split(|&b| b == b'\n') {
+        let Ok(text) = std::str::from_utf8(line) else { continue };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if quiet(text) {
+            if ctx.own && let Some(day) = ts_day(text, &mut clock) {
+                out.quiet_oldest = Some(out.quiet_oldest.map_or(day, |o| o.min(day)));
+            }
+            continue;
+        }
+        let Ok(mut row) = serde_json::from_str::<LeanRow>(text) else { continue };
+        let Some((day, at)) = clock.when(&row.ts) else { continue };
+        let window = day >= ctx.start;
+        for item in row.cut.drain(..) {
+            let rule = match &*item.kind {
+                "rule" => true,
+                "decision" => false,
+                _ => continue,
+            };
+            let fold = out.cuts.entry((rule, item.id)).or_insert(CutFold { first: day, withheld: 0, block: None });
+            fold.first = fold.first.min(day);
+            if window && item.reason.as_deref() == Some("budget") {
+                fold.withheld += 1;
+                if item.block.is_some() {
+                    fold.block = item.block;
+                }
+            }
+        }
+        let prompt = if row.event == "prompt" && window {
+            match row.text.take() {
+                None => PromptKind::Textless,
+                Some(t) if crate::domain::transcript::machine_prompt(&t) => PromptKind::Machine,
+                Some(t) => PromptKind::Typed(decision_hits(&t, &row, ctx.current)),
+            }
+        } else {
+            row.text = None;
+            PromptKind::Not
+        };
+        out.rows.push(Parsed { row, day, at, prompt });
+    }
+    out
+}
+
+/// The global decisions whose keywords a typed prompt holds, as BO-16's replay judges one: a star command passes every
+/// rule by. The prompt is lowercased once, as `global_decisions::keyword_hit` would for each keyword.
+fn decision_hits(text: &str, row: &LeanRow, current: &Current) -> Vec<(usize, Vec<String>)> {
+    if current.decisions.is_empty() || row.matched.iter().any(|m| m.by == "command") {
+        return Vec::new();
+    }
+    let lower = text.to_lowercase();
+    let mut out = Vec::new();
+    for (i, (_, kws)) in current.decisions.iter().enumerate() {
+        let hit: Vec<String> = kws
+            .iter()
+            .map(|k| k.trim().to_lowercase())
+            .filter(|k| crate::domain::matcher::contains_word(&lower, k))
+            .collect();
+        if !hit.is_empty() {
+            out.push((i, hit));
         }
     }
     out
 }
 
 /// A row's day from its `ts` field, without parsing the rest.
-fn ts_day(text: &str) -> Option<NaiveDate> {
+fn ts_day(text: &str, clock: &mut Clock) -> Option<NaiveDate> {
     let at = text.find("\"ts\":\"")? + 6;
     let end = text[at..].find('"')? + at;
-    when(&text[at..end]).map(|(d, _)| d)
+    clock.when(&text[at..end]).map(|(d, _)| d)
 }
 
-fn take(
-    out: &mut Scan,
-    row: LeanRow,
-    own: bool,
-    current: &Current,
-    sessions: &mut HashMap<String, u32>,
-    last_prompt: &mut HashMap<u32, u32>,
-) {
-    let Some((day, at)) = when(&row.ts) else { return };
+/// What applying rows in order carries from one row to the next.
+#[derive(Default)]
+struct Walk {
+    /// Session ids, numbered as first seen.
+    sessions: HashMap<String, u32>,
+    /// Each session's latest prompt read so far.
+    last_prompt: HashMap<u32, u32>,
+    /// Logged domain names to their slug now.
+    slugs: HashMap<String, String>,
+}
+
+impl Walk {
+    fn session(&mut self, id: &str) -> u32 {
+        if let Some(&n) = self.sessions.get(id) {
+            return n;
+        }
+        let n = self.sessions.len() as u32;
+        self.sessions.insert(id.to_string(), n);
+        n
+    }
+
+    fn slug(&mut self, current: &Current, logged: &str) -> &str {
+        if !self.slugs.contains_key(logged) {
+            self.slugs.insert(logged.to_string(), current.slug(logged));
+        }
+        &self.slugs[logged]
+    }
+}
+
+/// One more for `key`, its String made only the first time.
+fn bump(map: &mut HashMap<String, usize>, key: &str) {
+    match map.get_mut(key) {
+        Some(n) => *n += 1,
+        None => {
+            map.insert(key.to_string(), 1);
+        }
+    }
+}
+
+fn take(out: &mut Scan, parsed: Parsed, own: bool, current: &Current, walk: &mut Walk) {
+    let Parsed { row, day, at, prompt } = parsed;
     if own {
         out.oldest = Some(out.oldest.map_or(day, |o| o.min(day)));
     }
-    let next = sessions.len() as u32;
-    let session = row.session.as_ref().map(|s| *sessions.entry(s.clone()).or_insert(next));
+    let session = row.session.as_deref().map(|s| walk.session(s));
     let window = out.in_window(day);
 
     if row.event == "signal" {
@@ -383,88 +737,64 @@ fn take(
         }
         return;
     }
-    let turn = match row.event.as_str() {
+    let turn = match &*row.event {
         "prompt" => {
             if let (Some(s), Some(n)) = (session, row.prompt_num) {
-                last_prompt.insert(s, n);
+                walk.last_prompt.insert(s, n);
             }
             row.prompt_num
         }
-        _ => session.and_then(|s| last_prompt.get(&s).copied()),
+        _ => session.and_then(|s| walk.last_prompt.get(&s).copied()),
     };
 
     for item in &row.served {
-        let Some(key) = item.key() else { continue };
-        out.first_named.entry(key.clone()).and_modify(|d| *d = (*d).min(day)).or_insert(day);
-        out.servings.entry(key).or_default().push(Serving { day, at, session, turn });
-    }
-    for item in &row.cut {
-        let Some(key) = item.key() else { continue };
-        out.first_named.entry(key.clone()).and_modify(|d| *d = (*d).min(day)).or_insert(day);
-        if window && item.reason.as_deref() == Some("budget") {
-            *out.withheld.entry(key.clone()).or_default() += 1;
-            if let Some(block) = &item.block {
-                out.withheld_from.insert(key, block.clone());
-            }
-        }
+        let Some(log) = out.items.named(&item.kind, &item.id) else { continue };
+        log.named_on(day);
+        log.servings.push(Serving { day, at, session, turn });
     }
     if !window {
         return;
     }
     for m in row.matched.iter().filter(|m| m.by != "always") {
-        *out.domain_matched.entry(current.slug(&m.domain)).or_default() += 1;
+        bump(&mut out.domain_matched, walk.slug(current, &m.domain));
     }
-    if row.event != "prompt" {
-        return;
-    }
-    let text = match &row.text {
-        None => {
+    let hits = match prompt {
+        PromptKind::Not => return,
+        PromptKind::Textless => {
             out.textless += 1;
             return;
         }
-        Some(t) if crate::domain::transcript::machine_prompt(t) => {
+        PromptKind::Machine => {
             out.machine += 1;
             return;
         }
-        Some(t) => t,
+        PromptKind::Typed(hits) => hits,
     };
     out.typed += 1;
     // Keyword breadth: each domain once per prompt, each keyword once per prompt, only keywords the domain still has.
     let mut domains: HashSet<String> = HashSet::new();
-    let mut hits: HashSet<(String, String)> = HashSet::new();
+    let mut kws: HashSet<(String, String)> = HashSet::new();
     for m in row.matched.iter().filter(|m| m.by == "keyword") {
-        let slug = current.slug(&m.domain);
+        let slug = walk.slug(current, &m.domain);
         let Some(kw) = m.value.as_deref().map(str::trim) else { continue };
-        let still = current.keywords.get(&slug).is_some_and(|list| list.iter().any(|k| k.trim().eq_ignore_ascii_case(kw)));
+        let still = current.keywords.get(slug).is_some_and(|list| list.iter().any(|k| k.trim().eq_ignore_ascii_case(kw)));
         if still {
-            hits.insert((slug.clone(), kw.to_lowercase()));
-            domains.insert(slug);
+            kws.insert((slug.to_string(), kw.to_lowercase()));
+            domains.insert(slug.to_string());
         }
     }
     for d in domains {
         *out.keyword_prompts.entry(d).or_default() += 1;
     }
-    for (d, kw) in hits {
+    for (d, kw) in kws {
         *out.keyword_hits.entry(d).or_default().entry(kw).or_default() += 1;
     }
-    // A global decision on its own keywords, as BO-16's replay judges one: a star command passes every rule by. The
-    // prompt is lowercased once, as `global_decisions::keyword_hit` would for each keyword.
-    if !current.decisions.is_empty() && !row.matched.iter().any(|m| m.by == "command") {
-        let lower = text.to_lowercase();
-        for (slug, kws) in &current.decisions {
-            let hit: Vec<String> = kws
-                .iter()
-                .map(|k| k.trim().to_lowercase())
-                .filter(|k| crate::domain::matcher::contains_word(&lower, k))
-                .collect();
-            if hit.is_empty() {
-                continue;
-            }
-            *out.decision_reach.entry(slug.clone()).or_default() += 1;
-            let per = out.decision_hits.entry(slug.clone()).or_default();
-            for k in hit {
-                *per.entry(k).or_default() += 1;
-            }
+    for (i, hit) in hits {
+        let slug = &current.decisions[i].0;
+        bump(&mut out.decision_reach, slug);
+        let per = out.decision_hits.entry(slug.clone()).or_default();
+        for k in hit {
+            *per.entry(k).or_default() += 1;
         }
     }
 }

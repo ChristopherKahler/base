@@ -497,6 +497,11 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
             "rules: {unconverted} rules with no matcher of their own, served by their domain's triggers (base rule list)"
         ));
     }
+    // BO-19: advice from the match log. Not one of the conjuncts below, on purpose. Built here so the merged store is
+    // dropped before the checks below: held to the end of `diagnose` it overlapped them, and doctor's peak memory on
+    // gate 4's fake homes went from 191 MB to 311 MB (198 MB with it dropped here).
+    let usage = crate::usage::section_for(cwd, &config, &domains, store.as_ref());
+    drop(store);
     // #20: a failed hook is invisible everywhere else (fail-open by design); doctor names it.
     // The cwd PARAM, not the process cwd: `diagnose` is called with a path and
     // shadowing it with `std::env::current_dir()` made this section untestable and
@@ -531,8 +536,6 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         .collect();
     let config_errors = crate::command::check_command_files(cwd);
     let trigger_faults = trigger_faults(cwd);
-    // BO-19: advice from the match log. Not one of the conjuncts below, on purpose.
-    let usage = crate::usage::section_for(cwd, &config, &domains, store.as_ref());
     // FIVE conjuncts. Keep the doc comment on `DoctorReport::healthy` in step
     // with this expression — it undercounted for four releases (#142).
     let healthy = tiers.iter().all(|t| t.status != "unhealthy")
