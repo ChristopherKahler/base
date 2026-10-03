@@ -118,11 +118,13 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base learn`
 - `base recall`
 - `base changes`
+- `base tune`
 - `base rule`
 - `base rule add`
 - `base rule propose`
 - `base rule replay`
 - `base rule review`
+- `base rule unretire`
 - `base rule update`
 - `base rule test`
 - `base rule list`
@@ -211,6 +213,7 @@ Commands:
   learn            Graph-backed structured memory
   recall           Search notes by keyword, domain, or slug
   changes          Read the graph change log — every successful graph write, as JSON
+  tune             The rule pass: read the sessions since the last pass and write rule proposals for base rule review (keyword gap, rewrite, new rule, drop keyword, merge, split, retire). Nothing is applied. Uses headless Claude on Haiku
   rule             Manage rules in the graph (add, list, remove)
   install          Install base globally: build, symlink, create ~/.base-gbl, wire hooks, write manifest
   getting-started  What to read once base is installed: workspaces, relay, star commands, CARL
@@ -2550,6 +2553,35 @@ Options:
           Print help (see a summary with '-h')
 ```
 
+## base tune
+
+```text
+The rule pass: read the sessions since the last pass and write rule proposals for base rule review (keyword gap, rewrite, new rule, drop keyword, merge, split, retire). Nothing is applied. Uses headless Claude on Haiku
+
+Usage: base tune [OPTIONS]
+
+Options:
+      --dry-run
+          Show what it would read and how many Haiku calls it would make; call nothing, write nothing
+
+      --session <SESSION>
+          Read this session instead of the ones due (repeatable)
+
+      --transcript <TRANSCRIPT>
+          Read this transcript as a session instead of the ones due (repeatable)
+
+      --store
+          Run the store check (merge, split, drop keyword, retire) even when it ran in the last day
+
+      --max-calls <MAX_CALLS>
+          Haiku calls this pass makes at most; sessions past it wait for the next pass
+          
+          [default: 10]
+
+  -h, --help
+          Print help
+```
+
 ## base rule
 
 ```text
@@ -2558,15 +2590,16 @@ Manage rules in the graph (add, list, remove)
 Usage: base rule [OPTIONS] <COMMAND>
 
 Commands:
-  add      Add a rule to a domain in the graph
-  propose  Turn a correction into a pending rule proposal: read the turn (the prompt, the AI's marker, the signals) and sort it as a keyword gap, a rewrite or a new rule
-  replay   Run a rule change over your recent prompts in the match log before it is approved: the prompts that would start or stop serving it, and its share of all of them (TOO BROAD above [tune] broad_share)
-  review   Review the pending rule proposals, each with the prompts behind it and its replay: one key each on a terminal (a approve, e edit, r reject, s skip, q stop), or one of the flags
-  update   Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
-  test     Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
-  list     List rules for a domain from the graph
-  remove   Remove a rule by index from a domain
-  help     Print this message or the help of the given subcommand(s)
+  add       Add a rule to a domain in the graph
+  propose   Turn a correction into a pending rule proposal: read the turn (the prompt, the AI's marker, the signals) and sort it as a keyword gap, a rewrite or a new rule
+  replay    Run a rule change over your recent prompts in the match log before it is approved: the prompts that would start or stop serving it, and its share of all of them (TOO BROAD above [tune] broad_share)
+  review    Review the pending rule proposals, each with the prompts behind it and its replay: one key each on a terminal (a approve, e edit, r reject, s skip, q stop), or one of the flags
+  unretire  Serve a retired rule again: clear the retirement an approved retire proposal made
+  update    Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
+  test      Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
+  list      List rules for a domain from the graph
+  remove    Remove a rule by index from a domain
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -g, --global
@@ -2753,6 +2786,27 @@ Options:
 
       --broad-ok
           With --approve or --edit: apply a change its replay flags TOO BROAD (show the user the replay first)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule unretire
+
+```text
+Serve a retired rule again: clear the retirement an approved retire proposal made
+
+Usage: base rule unretire [OPTIONS] <RULE>
+
+Arguments:
+  <RULE>
+          The rule, as `base rule list --include-superseded` prints it: <domain>.<id>
+
+Options:
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
 
   -h, --help
           Print help (see a summary with '-h')

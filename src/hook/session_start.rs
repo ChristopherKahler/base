@@ -203,7 +203,7 @@ pub fn handle(
     let queries_shown = render_adhoc_queries(graph.as_ref(), cwd, config, out);
     push_global_decisions(graph.as_ref(), cwd, config, out);
     push_rule_proposals(graph.as_ref(), config, out);
-    push_rule_pass(session_id, out);
+    push_rule_pass(session_id, config, out);
 
     if let Ok(signal_result) = crate::signal::run_signals(cwd, config, "session-start") {
         diagnostics.extend(signal_result.diagnostics.iter().cloned());
@@ -364,11 +364,14 @@ fn push_rule_proposals(graph: Option<&oxigraph::store::Store>, config: &BaseConf
 
 /// D7e (BO-17): earlier sessions that ended, or sat untouched for a day, with corrections no rule pass has read. One
 /// line, and nothing when there are none. It only counts: the pass is the AI's to run (`base tune`), never a hook's.
-fn push_rule_pass(session_id: Option<&str>, out: &mut SessionOutput) {
+/// `[corrections] enabled = false` turns it off with the counts it reads (G0 question 12).
+fn push_rule_pass(session_id: Option<&str>, config: &BaseConfig, out: &mut SessionOutput) {
+    if !config.corrections.enabled {
+        return;
+    }
     let n = crate::corrections::tune::catch_up(session_id);
     if n > 0 {
-        out.push(crate::corrections::tune::CATCH_UP_BLOCK, &format!("{}
-", crate::corrections::tune::catch_up_line(n)), n);
+        out.push(crate::corrections::tune::CATCH_UP_BLOCK, &format!("{}\n", crate::corrections::tune::catch_up_line(n)), n);
     }
 }
 

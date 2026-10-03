@@ -878,8 +878,7 @@ pub const HOOK_TABLE: [(&str, &str); 6] = [
 /// version, and a home stamped for that version would never get the new hook).
 pub fn hook_table_hash() -> String {
     use sha2::{Digest, Sha256};
-    let text: String = HOOK_TABLE.iter().map(|(e, c)| format!("{e}={c}
-")).collect();
+    let text: String = HOOK_TABLE.iter().map(|(e, c)| format!("{e}={c}\n")).collect();
     Sha256::digest(text.as_bytes())[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -1030,8 +1029,7 @@ pub fn wire_hooks_quiet(settings_path: &Path) -> Result<Vec<&'static str>> {
     let created = !settings_path.exists();
     if created {
         match settings_path.parent() {
-            Some(dir) if dir.is_dir() => std::fs::write(settings_path, "{}
-")
+            Some(dir) if dir.is_dir() => std::fs::write(settings_path, "{}\n")
                 .with_context(|| format!("creating {}", settings_path.display()))?,
             _ => return Ok(Vec::new()),
         }
