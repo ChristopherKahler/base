@@ -490,8 +490,9 @@ pub fn matchers_from_flags(
 
 // ─── Test prompts (K2, BO-14) ────────────────────────────────────────────────
 
-/// The predicates a rule's test prompts are stored under, as local names under the namespace prefix: flat literals on
-/// the rule, beside its matchers, so a rule reads back the same from `domains.toml` (through sync) and from the graph.
+/// The predicates a CLI rule's test prompts are stored under, as local names under the namespace prefix: flat literals
+/// on the rule, beside its matchers. A `domains.toml` rule keeps its tests in the file (`fires_on`, `quiet_on`) and sync
+/// does not copy them, since a synced copy can go stale.
 pub const TEST_PREDICATES: [&str; 2] = ["firesOn", "quietOn"];
 
 /// At most this many prompts that must serve a rule (K2a: "2 to 3").
@@ -530,10 +531,20 @@ impl RuleTests {
         self.quiet_on.sort();
         self
     }
+
+    /// Add every prompt of `other`, skipping repeats.
+    pub fn merge(&mut self, other: &RuleTests) {
+        for p in &other.fires_on {
+            self.add("firesOn", p);
+        }
+        for p in &other.quiet_on {
+            self.add("quietOn", p);
+        }
+    }
 }
 
-/// A rule's test prompts as `(predicate, value)` pairs: the shape `base domain sync`, `base rule add` and
-/// `base rule update` write. Blank prompts and repeats are left out.
+/// A rule's test prompts as `(predicate, value)` pairs: the shape `base rule add` and `base rule update` write on a
+/// CLI rule. Blank prompts and repeats are left out.
 pub fn test_literals(fires_on: &[String], quiet_on: &[String]) -> Vec<(&'static str, String)> {
     let mut t = RuleTests::default();
     for p in fires_on {
@@ -561,9 +572,11 @@ pub struct StoredTests {
 /// Every rule's test prompts, by [`rule_id`], across both tiers' graphs and the `domains.toml` files `domains` came
 /// from.
 ///
-/// The graph holds a CLI rule's tests (they live nowhere else) and a synced copy of every `domains.toml` rule's tests;
-/// the files are read as well, so a store that was never synced still has them. A rule declared in two places is one
-/// rule (the id is the text) and carries the tests of both. Superseded rules are left out: no prompt serves them.
+/// Each kind of rule is read from where its tests live, and only there: a CLI rule's from its graph record (a rule with
+/// no `source`), a `domains.toml` rule's from the file. A synced copy is never read, so a copy left stale (the
+/// workspace graph holds copies of global-tier rules and is re-synced only when the workspace file changes) cannot
+/// bring back prompts the operator cleared. A rule declared in two places is one rule (the id is the text) and
+/// carries the tests of both. Superseded rules are left out: no prompt serves them.
 pub fn rule_tests(store: Option<&Store>, config: &BaseConfig, domains: &[DomainDef]) -> HashMap<String, StoredTests> {
     let mut out: HashMap<String, StoredTests> = HashMap::new();
     let mut put = |domain: &str, text: &str, pred: &str, value: &str| {
@@ -588,6 +601,7 @@ pub fn rule_tests(store: Option<&Store>, config: &BaseConfig, domains: &[DomainD
                  ?rule {p}:ruleText ?text .\n\
                  ?rule ?tp ?tv .\n\
                  FILTER(?tp IN ({p}:firesOn, {p}:quietOn))\n\
+                 FILTER NOT EXISTS {{ ?rule {p}:source ?source }}\n\
                  {no_superseded}\
                }}\n\
              }}"

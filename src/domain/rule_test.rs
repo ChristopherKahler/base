@@ -480,6 +480,9 @@ pub fn after_change_line(config: &BaseConfig, cwd: &Path, domain: &str) -> Optio
 
 /// [`after_change_line`] for several domains over one load, one line per domain that has tests.
 pub fn after_change_lines(config: &BaseConfig, cwd: &Path, domains: &[String]) -> Vec<String> {
+    if !any_tests(cwd) {
+        return Vec::new();
+    }
     let bench = Bench::load(config, cwd);
     let mut out = Vec::new();
     for domain in domains {
@@ -498,8 +501,12 @@ pub fn tests_line(t: &RuleTests) -> String {
     format!("{} fires-on · {} quiet-on", t.fires_on.len(), t.quiet_on.len())
 }
 
-/// Refuse a test list over K2a's caps (3 `fires_on`, 2 `quiet_on`), naming the rule and how to start over.
+/// Refuse a test list over K2a's caps (3 `fires_on`, 2 `quiet_on`), naming the rule and how to start over, and a
+/// prompt in both lists, which no config can ever pass.
 pub fn check_caps(rule: &str, tests: &RuleTests) -> Result<(), String> {
+    if let Some(p) = tests.fires_on.iter().find(|p| tests.quiet_on.contains(p)) {
+        return Err(format!("{rule}: \"{p}\" cannot be both a --fires-on and a --quiet-on prompt"));
+    }
     let over = |n: usize, max: usize, what: &str| {
         (n > max).then(|| format!("{rule} would hold {n} {what} prompts; a rule holds at most {max}"))
     };
@@ -509,6 +516,28 @@ pub fn check_caps(rule: &str, tests: &RuleTests) -> Result<(), String> {
         Some(msg) => Err(format!("{msg} (--clear-tests starts the lists over)")),
         None => Ok(()),
     }
+}
+
+/// Whether any rule anywhere carries test prompts: a domains.toml rule with `fires_on` or `quiet_on`, or a test literal
+/// in either tier's graph file. File reads and a byte search only, no store load and no sync, so a command that changed
+/// a domain pays for [`Bench::load`] only when there are tests to run. It can say yes when the only literals left are
+/// on a rule that was removed; the full run then finds nothing and prints nothing.
+pub fn any_tests(cwd: &Path) -> bool {
+    if crate::domain::load_domains(cwd).iter().flat_map(|d| &d.rules).any(|r| {
+        let (f, q) = r.tests();
+        !f.is_empty() || !q.is_empty()
+    }) {
+        return true;
+    }
+    let graphs = [
+        crate::config::find_workspace_base(cwd).map(|b| b.join("graph.nq")),
+        crate::home::home_root().map(|h| h.join(".base-gbl").join(".base").join("graph.nq")),
+    ];
+    // The predicate IRI's tail, `firesOn>`, under whatever namespace the store uses. A literal that happens to contain
+    // it costs one full load and nothing else.
+    graphs.into_iter().flatten().any(|g| {
+        std::fs::read_to_string(&g).is_ok_and(|text| rules::TEST_PREDICATES.iter().any(|p| text.contains(&format!("{p}>"))))
+    })
 }
 
 #[cfg(test)]
@@ -613,5 +642,7 @@ mod tests {
         assert!(check_caps("base.1234", &t(0, 0)).is_ok(), "no minimum");
         assert!(check_caps("base.1234", &t(4, 0)).unwrap_err().contains("at most 3"));
         assert!(check_caps("base.1234", &t(1, 3)).unwrap_err().contains("at most 2"));
+        let both = RuleTests { fires_on: vec!["same".into()], quiet_on: vec!["same".into()] };
+        assert!(check_caps("base.1234", &both).unwrap_err().contains("cannot be both"));
     }
 }

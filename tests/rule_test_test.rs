@@ -186,6 +186,10 @@ fn rule_test_exit_codes() {
     ok(&h, &["domain", "add-trigger", "--domain", "base", "--keyword", "pre-tool"]);
     ok(&h, &["rule", "test", "--rule", &id]);
     ok(&h, &["rule", "test", "--rule", &id[5..]]);
+    // --domain narrows a bare id, and a <domain>.<id> of another domain is refused (code review, finding 6).
+    ok(&h, &["rule", "test", "--domain", "base", "--rule", &id[5..]]);
+    assert_eq!(base(&h, &["rule", "test", "--domain", "GLOBAL", "--rule", &id[5..]]).0, 2, "no GLOBAL rule has that id");
+    assert_eq!(base(&h, &["rule", "test", "--domain", "GLOBAL", "--rule", &id]).0, 2, "two domains named");
     ok(&h, &["rule", "test"]);
     // A keyword that also fires on the quiet prompt: a false fire.
     ok(&h, &["domain", "add-trigger", "--domain", "base", "--keyword", "reminders"]);
@@ -295,14 +299,77 @@ fn rule_tests_stored_with_rule() {
     }
     let listing = ok(&h, &["rule", "list", "--domain", "probe"]);
     assert_eq!(listing.matches("tests: 1 fires-on · 1 quiet-on").count(), 2, "{listing}");
+    // The CLI rule's literals are in the graph once; the domains.toml rule's are in its file only, never on its synced
+    // copy, which can go stale.
     let graph = read(&h.ws_graph());
-    assert_eq!(graph.matches("firesOn").count(), 2, "one per rule after two syncs, never doubled:\n{graph}");
+    assert_eq!(graph.matches("firesOn").count(), 1, "the CLI rule's, once, after two syncs:\n{graph}");
+    assert!(!graph.contains("quoted"), "a synced copy carries no tests:\n{graph}");
 
     // Cleared, the entry is a plain string again and the file is what it was.
     ok(&h, &["rule", "update", &short("probe", "second rule"), "--clear-tests"]);
     assert_eq!(read(&h.ws_toml()), before);
-    ok(&h, &["domain", "sync"]);
-    assert_eq!(read(&h.ws_graph()).matches("firesOn").count(), 1, "the synced copy's tests went with the file's");
+    let after_clear = ok(&h, &["rule", "test"]);
+    assert!(after_clear.contains("1 rule tested, 0 misses, 0 false fires"), "{after_clear}");
+}
+
+#[test]
+fn rule_tests_cleared_in_one_tier_stay_cleared() {
+    // The workspace graph holds a synced copy of every global-tier rule, and is re-synced only when the WORKSPACE file
+    // changes. Clearing a global rule's tests rewrites the global file only, so a reader that trusted the synced copy
+    // would keep running the cleared prompts (code review, finding 1).
+    let h = home(
+        "[[domain]]\nname = \"local\"\nprompt_keywords = [\"local\"]\nrules = []\n",
+        "[[domain]]\nname = \"gdom\"\nprompt_keywords = [\"gdom\"]\nrules = [{ text = \"a global rule\", fires_on = [\"gdom please\"] }]\n",
+    );
+    let first = ok(&h, &["rule", "test"]);
+    assert!(first.contains("1 rule tested, 0 misses, 0 false fires"), "{first}");
+    assert!(read(&h.ws_graph()).contains("a global rule"), "control: the workspace graph holds the synced copy");
+    ok(&h, &["rule", "-g", "update", &short("gdom", "a global rule"), "--clear-tests"]);
+    let after = ok(&h, &["rule", "test"]);
+    assert!(after.starts_with("0 rules tested, 0 misses, 0 false fires"), "the cleared prompts stay cleared:\n{after}");
+}
+
+#[test]
+fn rule_update_writes_one_tier() {
+    // The same rule in both tiers' domains.toml is one rule, and `rule update` writes one tier: the workspace's, or the
+    // global one's with -g. One tier's prompts never land in the other, and the cap counts the tier written (code
+    // review, findings 3 and 4).
+    let both = "[[domain]]\nname = \"twin\"\nprompt_keywords = [\"twin\"]\nrules = [\"shared rule\"]\n";
+    let h = home(both, both);
+    let id = short("twin", "shared rule");
+    ok(&h, &["rule", "update", &id, "--fires-on", "twin one", "--fires-on", "twin two", "--fires-on", "twin three"]);
+    assert!(read(&h.ws_toml()).contains("twin three"), "{}", read(&h.ws_toml()));
+    assert_eq!(read(&h.gbl_toml()), both, "without -g the global file is untouched");
+    let out = ok(&h, &["rule", "-g", "update", &id, "--fires-on", "twin global"]);
+    assert!(out.contains("(in domains.toml (global tier))"), "{out}");
+    let gbl = read(&h.gbl_toml());
+    assert!(gbl.contains("twin global") && !gbl.contains("twin one"), "{gbl}");
+    assert!(!read(&h.ws_toml()).contains("twin global"), "with -g the workspace file is untouched");
+
+    // -g on a rule only the workspace holds.
+    let ws_only = home("[[domain]]\nname = \"solo\"\nrules = [\"only here\"]\n", "");
+    let (code, _, err) = base(&ws_only, &["rule", "-g", "update", &short("solo", "only here"), "--fires-on", "x"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("is not in the global tier, only in the workspace; run it without -g"), "{err}");
+}
+
+#[test]
+fn store_tests_reports_nothing_stored_when_the_rule_changed_after_it_was_read() {
+    // `find` reads, then `store_tests` writes; a file edited in between holds no such rule, and the caller must hear
+    // that nothing was stored rather than print success (code review, finding 7).
+    let h = home(PROBE_DOMAINS, "");
+    let ns = base::config::NamespaceConfig::default();
+    base::home::with_thread_home(&h.home, || {
+        let id = rule_id("probe", "second rule");
+        let found = base::crud::rule::find(&h.ws, &ns, Some("probe"), &id[..8]).unwrap();
+        assert_eq!(found.len(), 1);
+        std::fs::write(h.ws_toml(), PROBE_DOMAINS.replace("second rule", "second rule, reworded")).unwrap();
+        let homes: Vec<&base::crud::rule::TestHome> = found[0].homes.iter().map(|(home, _)| home).collect();
+        let tests = base::domain::rules::RuleTests { fires_on: vec!["probe it".into()], quiet_on: Vec::new() };
+        let wrote = base::crud::rule::store_tests(&ns, &found[0], &homes, &tests).unwrap();
+        assert!(wrote.is_empty(), "{wrote:?}");
+        assert!(!read(&h.ws_toml()).contains("probe it"));
+    });
 }
 
 #[test]
@@ -345,6 +412,8 @@ fn rule_update_refusals() {
     refused(&["rule", "update", &id], "give --fires-on, --quiet-on or --clear-tests");
     refused(&["rule", "update", "probe.ffffffff", "--fires-on", "x"], "no rule 'probe.ffffffff'");
     refused(&["rule", "update", "probe.xyz", "--fires-on", "x"], "is not a rule id");
+    // A prompt in both lists can never pass (code review, finding 9).
+    refused(&["rule", "update", &id, "--clear-tests", "--fires-on", "both", "--quiet-on", "both"], "cannot be both a --fires-on and a --quiet-on prompt");
     // A repeat is not a new prompt: the cap counts what would be stored.
     ok(&h, &["rule", "update", &id, "--fires-on", "one"]);
 
@@ -382,7 +451,7 @@ fn rule_update_refusals() {
     std::fs::write(stale.ws_toml(), PROBE_DOMAINS.replace("\"third rule\"", "\"a new third\"")).unwrap();
     let (code, _, err) = base(&stale, &["rule", "update", &short("probe", "third rule"), "--fires-on", "x"]);
     assert_eq!(code, 1);
-    assert!(err.contains("is only a synced copy whose domains.toml line is gone; run base domain sync"), "{err}");
+    assert!(err.contains("is a synced copy of a domains.toml line that is no longer there, so it has nowhere to keep tests"), "{err}");
 }
 
 #[test]

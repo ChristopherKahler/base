@@ -289,8 +289,10 @@ pub fn list(
     }
 
     println!("[{domain_name}] {} rules:", rules.len());
-    let matchers = matchers_by_text(cwd, ns, domain_name);
-    let tests = tests_by_text(cwd, ns, domain_name);
+    let (matchers, mut tests) = by_text(cwd, ns, domain_name);
+    for (text, t) in toml_tests_by_text(cwd, domain_name) {
+        tests.entry(text).or_default().merge(&t);
+    }
     for (pri, text, superseded) in &rules {
         // The marker appears only under `--include-superseded`, so the default output
         // of a store that never superseded a rule stays byte-identical.
@@ -349,18 +351,12 @@ pub fn list_all_tiers(
     }
 
     println!("[{domain_name}] {total} rules across both tiers:");
-    let mut matchers = matchers_by_text(&ws_cwd, ns, domain_name);
-    matchers.extend(matchers_by_text(&gbl_cwd, ns, domain_name));
-    // A rule in both tiers is one rule (its id is its text): it carries the tests of both.
-    let mut tests = tests_by_text(&ws_cwd, ns, domain_name);
-    for (text, t) in tests_by_text(&gbl_cwd, ns, domain_name) {
-        let e = tests.entry(text).or_default();
-        for p in &t.fires_on {
-            e.add("firesOn", p);
-        }
-        for p in &t.quiet_on {
-            e.add("quietOn", p);
-        }
+    let (mut matchers, mut tests) = by_text(&ws_cwd, ns, domain_name);
+    let (gbl_matchers, gbl_tests) = by_text(&gbl_cwd, ns, domain_name);
+    matchers.extend(gbl_matchers);
+    // A rule in both tiers, or in a graph and a file, is one rule (its id is its text): it carries the tests of all.
+    for (text, t) in gbl_tests.into_iter().chain(toml_tests_by_text(cwd, domain_name)) {
+        tests.entry(text).or_default().merge(&t);
     }
     for (label, rules) in &shown {
         if rules.is_empty() {
@@ -536,66 +532,94 @@ pub fn matchers_by_text(
     ns: &NamespaceConfig,
     domain_name: &str,
 ) -> std::collections::HashMap<String, Vec<crate::domain::rules::Matcher>> {
+    by_text(cwd, ns, domain_name).0
+}
+
+/// Each rule's matchers and its CLI test prompts in THIS tier, by its text, over one load of the tier's graph (F11,
+/// K2b): what `rule list` prints under each rule. A synced copy's test literals are not read: a `domains.toml` rule's
+/// tests come from the file ([`toml_tests_by_text`]).
+fn by_text(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    domain_name: &str,
+) -> (std::collections::HashMap<String, Vec<crate::domain::rules::Matcher>>, std::collections::HashMap<String, RuleTests>) {
     let p = &ns.prefix;
     let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(domain_name));
-    let sparql = format!(
-        "SELECT ?text ?mp ?mv WHERE {{\n\
+    let matchers_sparql = format!(
+        "{}\nSELECT ?text ?mp ?mv WHERE {{\n\
            GRAPH ?g {{\n\
              <{domain_iri}> {p}:hasRule ?rule .\n\
              ?rule {p}:ruleText ?text ; ?mp ?mv .\n\
              FILTER(?mp IN ({p}:matchKind, {p}:matchPlace, {p}:matchTool, {p}:matchCommand, {p}:matchWord))\n\
            }}\n\
-         }}"
+         }}",
+        crud::prefixes(ns)
+    );
+    let tests_sparql = format!(
+        "{}\nSELECT ?text ?tp ?tv WHERE {{\n\
+           GRAPH ?g {{\n\
+             <{domain_iri}> {p}:hasRule ?rule .\n\
+             ?rule {p}:ruleText ?text ; ?tp ?tv .\n\
+             FILTER(?tp IN ({p}:firesOn, {p}:quietOn))\n\
+             FILTER NOT EXISTS {{ ?rule {p}:source ?source }}\n\
+           }}\n\
+         }}",
+        crud::prefixes(ns)
     );
     let mut pairs: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
-    if let Ok(QueryResults::Solutions(rows)) = crud::load_and_query(cwd, ns, &sparql) {
-        for row in rows.filter_map(|r| r.ok()) {
-            let (Some(t), Some(mp), Some(mv)) = (row.get("text"), row.get("mp"), row.get("mv")) else {
-                continue;
-            };
-            let pred_full = crud::term_display(mp.into());
-            let pred = pred_full.trim_end_matches('>').rsplit(['#', '/']).next().unwrap_or_default().to_string();
-            pairs.entry(crud::term_display(t.into())).or_default().push((pred, crud::term_display(mv.into())));
+    let mut tests: std::collections::HashMap<String, RuleTests> = std::collections::HashMap::new();
+    if let Ok(store) = crud::load_workspace_graph(cwd) {
+        if let Ok(QueryResults::Solutions(rows)) = crate::store::query(&store, &matchers_sparql) {
+            for row in rows.filter_map(|r| r.ok()) {
+                let (Some(t), Some(mp), Some(mv)) = (row.get("text"), row.get("mp"), row.get("mv")) else {
+                    continue;
+                };
+                let pred_full = crud::term_display(mp.into());
+                let pred = pred_full.trim_end_matches('>').rsplit(['#', '/']).next().unwrap_or_default().to_string();
+                pairs.entry(crud::term_display(t.into())).or_default().push((pred, crud::term_display(mv.into())));
+            }
+        }
+        if let Ok(QueryResults::Solutions(rows)) = crate::store::query(&store, &tests_sparql) {
+            for row in rows.filter_map(|r| r.ok()) {
+                let (Some(t), Some(tp), Some(tv)) = (row.get("text"), row.get("tp"), row.get("tv")) else {
+                    continue;
+                };
+                tests
+                    .entry(crud::term_display(t.into()))
+                    .or_default()
+                    .add(&crud::term_display(tp.into()), &crud::term_display(tv.into()));
+            }
         }
     }
-    pairs
+    let matchers = pairs
         .into_iter()
         .map(|(text, ps)| {
             let m = crate::domain::rules::matchers_from_literals(ps.iter().map(|(p, v)| (p.as_str(), v.as_str())));
             (text, m)
         })
         .filter(|(_, m)| !m.is_empty())
-        .collect()
+        .collect();
+    (matchers, tests)
 }
 
 // ─── Test prompts (K2b, BO-14) ───────────────────────────────────────────────
 
-/// Each rule's test prompts in THIS tier, by its text, for `base rule list`'s `tests:` line. Keyed on text for the
-/// reason [`matchers_by_text`] gives; a rule with none is absent.
-pub fn tests_by_text(cwd: &Path, ns: &NamespaceConfig, domain_name: &str) -> std::collections::HashMap<String, RuleTests> {
-    let p = &ns.prefix;
-    let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(domain_name));
-    let sparql = format!(
-        "SELECT ?text ?tp ?tv WHERE {{\n\
-           GRAPH ?g {{\n\
-             <{domain_iri}> {p}:hasRule ?rule .\n\
-             ?rule {p}:ruleText ?text ; ?tp ?tv .\n\
-             FILTER(?tp IN ({p}:firesOn, {p}:quietOn))\n\
-           }}\n\
-         }}"
-    );
+/// The test prompts each of `domain_name`'s `domains.toml` rules carries, by its text, as `load_domains` reads the
+/// files from `cwd`. A file read, no graph.
+fn toml_tests_by_text(cwd: &Path, domain_name: &str) -> std::collections::HashMap<String, RuleTests> {
+    let want = crud::slugify(domain_name);
     let mut out: std::collections::HashMap<String, RuleTests> = std::collections::HashMap::new();
-    if let Ok(QueryResults::Solutions(rows)) = crud::load_and_query(cwd, ns, &sparql) {
-        for row in rows.filter_map(|r| r.ok()) {
-            let (Some(t), Some(tp), Some(tv)) = (row.get("text"), row.get("tp"), row.get("tv")) else {
+    for d in crate::domain::load_domains(cwd).into_iter().filter(|d| crud::slugify(&d.name) == want) {
+        for r in &d.rules {
+            let (fires_on, quiet_on) = r.tests();
+            if fires_on.is_empty() && quiet_on.is_empty() {
                 continue;
-            };
-            out.entry(crud::term_display(t.into()))
-                .or_default()
-                .add(&crud::term_display(tp.into()), &crud::term_display(tv.into()));
+            }
+            let t = RuleTests { fires_on: fires_on.to_vec(), quiet_on: quiet_on.to_vec() };
+            out.entry(r.text().to_string()).or_default().merge(&t);
         }
     }
-    out.into_iter().map(|(k, v)| (k, v.sorted())).collect()
+    out
 }
 
 /// One place a rule's test prompts are stored (K2a): its entry in a `domains.toml`, or the rule `base rule add` wrote
@@ -614,21 +638,39 @@ impl TestHome {
             TestHome::Graph { tier, .. } => format!("graph ({} tier)", tier.label()),
         }
     }
+
+    pub fn tier(&self) -> Tier {
+        match self {
+            TestHome::Toml { tier, .. } | TestHome::Graph { tier, .. } => *tier,
+        }
+    }
 }
 
-/// A rule [`find`] matched: its id, where its tests can be stored, and the tests stored there now.
+/// A rule [`find`] matched: its id, and each place its tests can be stored with the tests stored there now.
 #[derive(Debug, Clone)]
 pub struct FoundRule {
     /// The full [`crate::domain::rules::rule_id`].
     pub id: String,
     pub domain: String,
     pub text: String,
-    pub homes: Vec<TestHome>,
+    pub homes: Vec<(TestHome, RuleTests)>,
     /// The `source` of each synced copy seen: `domains.toml`, or `ext:<name>` for an extension's rule. A rule seen
     /// only as copies has no home: its line is in an extension, or gone from `domains.toml`.
     pub copies: Vec<String>,
-    /// What its homes hold now, together.
-    pub tests: RuleTests,
+}
+
+impl FoundRule {
+    /// The homes `base rule update` writes: one tier, never both, so one tier's prompts never land in the other. With
+    /// `-g` the global tier's; otherwise the workspace tier's, or the global tier's when the workspace holds none. Empty
+    /// when `-g` is given and only the workspace holds the rule.
+    pub fn homes_for(&self, global: bool) -> Vec<&(TestHome, RuleTests)> {
+        let of = |t: Tier| self.homes.iter().filter(|(h, _)| h.tier() == t).collect::<Vec<_>>();
+        if global {
+            return of(Tier::Global);
+        }
+        let ws = of(Tier::Workspace);
+        if ws.is_empty() { of(Tier::Global) } else { ws }
+    }
 }
 
 /// `base rule update`'s and `base rule test --rule`'s argument: `<domain>.<id>`, or a bare `<id>`, where the id is a
@@ -688,24 +730,27 @@ pub fn find(cwd: &Path, ns: &NamespaceConfig, domain: Option<&str>, id: &str) ->
                     text: text.to_string(),
                     homes: Vec::new(),
                     copies: Vec::new(),
-                    tests: RuleTests::default(),
                 });
                 found.len() - 1
             }
         };
         let f = &mut found[i];
-        if let Some(h) = home
-            && !f.homes.contains(&h)
-        {
-            f.homes.push(h);
+        if let Some(h) = home {
+            let j = match f.homes.iter().position(|(x, _)| *x == h) {
+                Some(j) => j,
+                None => {
+                    f.homes.push((h, RuleTests::default()));
+                    f.homes.len() - 1
+                }
+            };
+            for (pred, v) in tests {
+                f.homes[j].1.add(pred, v);
+            }
         }
         if let Some(c) = copy
             && !f.copies.contains(&c)
         {
             f.copies.push(c);
-        }
-        for (pred, v) in tests {
-            f.tests.add(pred, v);
         }
     };
 
@@ -780,17 +825,20 @@ pub fn find(cwd: &Path, ns: &NamespaceConfig, domain: Option<&str>, id: &str) ->
         }
     }
     for f in &mut found {
-        f.tests = std::mem::take(&mut f.tests).sorted();
+        for (_, t) in &mut f.homes {
+            *t = std::mem::take(t).sorted();
+        }
     }
     Ok(found)
 }
 
-/// Write `tests` as the whole test list of `rule`, in every place it lives, and say where. A `domains.toml` entry is
-/// rewritten in place ([`crate::domain::set_rule_tests`]); a CLI rule's literals are replaced in its own tier's graph,
-/// under that tier's lock, in each named graph that holds the rule.
-pub fn store_tests(ns: &NamespaceConfig, rule: &FoundRule, tests: &RuleTests) -> Result<Vec<String>> {
+/// Write `tests` as the whole test list of `rule` in each of `homes`, and say where. A `domains.toml` entry is rewritten
+/// ([`crate::domain::set_rule_tests`]); a CLI rule's literals are replaced in its own tier's graph, under that tier's
+/// lock, in each named graph that holds the rule. A home that no longer holds the rule (it changed after [`find`]
+/// read it) is left out of what this returns, so an empty result means nothing was stored.
+pub fn store_tests(ns: &NamespaceConfig, rule: &FoundRule, homes: &[&TestHome], tests: &RuleTests) -> Result<Vec<String>> {
     let mut wrote: Vec<String> = Vec::new();
-    for home in &rule.homes {
+    for home in homes.iter().copied() {
         match home {
             TestHome::Toml { file, .. } => {
                 if crate::domain::set_rule_tests(file, &rule.domain, &rule.id, tests)? {
@@ -814,6 +862,10 @@ pub fn store_tests(ns: &NamespaceConfig, rule: &FoundRule, tests: &RuleTests) ->
                     ));
                 }
                 let (store, trig_path, _lock) = crud::lock_and_load(cwd)?;
+                let ask = format!("{}\nASK {{ GRAPH ?g {{ <{iri}> {p}:ruleText ?text }} }}", crud::prefixes(ns));
+                if !matches!(crate::store::query(&store, &ask)?, QueryResults::Boolean(true)) {
+                    continue;
+                }
                 // Wide, as `remove` takes it: `GRAPH ?g` names no single target graph.
                 crate::store::update_and_write(
                     &store,

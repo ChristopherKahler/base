@@ -521,9 +521,14 @@ pub fn set_paths(toml_path: &Path, entries: &[(String, Vec<String>, bool)]) -> a
 }
 
 /// Set one rule's test prompts in the domains.toml at `toml_path` (K2a, `base rule update`): the rule of `domain` whose
-/// [`rules::rule_id`] is `id`. One read, one atomic write, and only that entry changes. A plain-string rule becomes a
-/// table to hold them; a table left with nothing but its text goes back to a plain string, so clearing a rule's tests
-/// leaves the file as it was before they were added. `Ok(false)` when the file has no such rule; nothing is written.
+/// [`rules::rule_id`] is `id`. One read, one atomic write. A plain-string rule becomes an inline table to hold them; a
+/// table left with nothing but its text goes back to a plain string.
+///
+/// The file is written back the way `add_trigger`, `remove_trigger` and `set_paths` write it, through
+/// `toml::to_string_pretty`: in a file base wrote, only that entry's line changes, and clearing the tests restores it
+/// byte for byte (both pinned by `rule_tests_stored_with_rule`). A file written by hand loses its comments and its own
+/// layout on the first write, as it does under every other domains.toml writer. `Ok(false)` when the file has no such
+/// rule; nothing is written.
 pub fn set_rule_tests(toml_path: &Path, domain: &str, id: &str, tests: &rules::RuleTests) -> anyhow::Result<bool> {
     let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(toml_path)?)?;
     let want = crate::crud::slugify(domain);

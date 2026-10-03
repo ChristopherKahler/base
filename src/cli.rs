@@ -3821,11 +3821,22 @@ pub fn run() {
                     if found.homes.is_empty() {
                         let why = match found.copies.iter().find(|c| c.starts_with("ext:")) {
                             Some(ext) => format!("{short} comes from the extension {ext}, so its tests cannot be stored with it"),
-                            None => format!("{short} is only a synced copy whose domains.toml line is gone; run base domain sync"),
+                            None => format!("{short} is a synced copy of a domains.toml line that is no longer there, so it has nowhere to keep tests"),
                         };
                         die("Error", why);
                     }
-                    let mut tests = if clear_tests { domain::rules::RuleTests::default() } else { found.tests.clone() };
+                    // One tier, never both: the workspace's (the global tier's when the workspace holds none), or the
+                    // global tier's with -g, so one tier's prompts never land in the other.
+                    let homes = found.homes_for(global);
+                    if homes.is_empty() {
+                        die("Error", format!("{short} is not in the global tier, only in the workspace; run it without -g"));
+                    }
+                    let mut tests = domain::rules::RuleTests::default();
+                    if !clear_tests {
+                        for (_, t) in &homes {
+                            tests.merge(t);
+                        }
+                    }
                     for p in &fires_on {
                         tests.add("firesOn", p);
                     }
@@ -3836,7 +3847,11 @@ pub fn run() {
                     if let Err(msg) = domain::rule_test::check_caps(&short, &tests) {
                         die("Error", msg);
                     }
-                    match crud::rule::store_tests(&config.namespace, found, &tests) {
+                    let targets: Vec<&crud::rule::TestHome> = homes.iter().map(|(h, _)| h).collect();
+                    match crud::rule::store_tests(&config.namespace, found, &targets, &tests) {
+                        Ok(wrote) if wrote.is_empty() => {
+                            die("Error", format!("{short} changed after it was read, and nothing was stored; run the command again"))
+                        }
                         Ok(wrote) => {
                             println!("Rule {short} tests: {} (in {})", domain::rule_test::tests_line(&tests), wrote.join(", "));
                             if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &found.domain) {
@@ -3849,8 +3864,19 @@ pub fn run() {
                 RuleAction::Test { domain: want_domain, rule } => {
                     use domain::rule_test::Filter;
                     let filter = match (want_domain, rule) {
-                        (_, Some(r)) => match crud::rule::parse_rule_ref(&r) {
-                            Ok((d, id)) => Filter::Rule { domain: d.map(|d| domain::canonical_name(&cwd, &d)), id },
+                        (d_flag, Some(r)) => match crud::rule::parse_rule_ref(&r) {
+                            Ok((d_ref, id)) => {
+                                // `--domain` narrows a bare id; a <domain>.<id> naming another domain is a mistake, not a choice.
+                                let d_flag = d_flag.map(|d| domain::canonical_name(&cwd, &d));
+                                let d_ref = d_ref.map(|d| domain::canonical_name(&cwd, &d));
+                                if let (Some(a), Some(b)) = (&d_flag, &d_ref)
+                                    && base::crud::slugify(a) != base::crud::slugify(b)
+                                {
+                                    eprintln!("Error: --domain {a} and --rule {r} name different domains");
+                                    std::process::exit(2);
+                                }
+                                Filter::Rule { domain: d_ref.or(d_flag), id }
+                            }
                             Err(msg) => {
                                 eprintln!("Error: {msg}");
                                 std::process::exit(2);
