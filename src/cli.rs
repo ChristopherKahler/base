@@ -5651,13 +5651,24 @@ mod tests {
         }
     }
 
-    /// A command line split as a shell splits it: on spaces, a double-quoted run kept whole, `\"` inside it a quote.
+    /// A command line split as bash splits it: on spaces; a double-quoted run kept whole, `\"` inside it a quote; a
+    /// single-quoted run kept whole and as written; a backslash outside quotes keeps the character after it.
     fn shell_words(line: &str) -> Vec<String> {
-        let (mut out, mut word, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+        let (mut out, mut word, mut quoted, mut single, mut any) = (Vec::new(), String::new(), false, false, false);
         let mut chars = line.chars().peekable();
         while let Some(c) = chars.next() {
             match c {
+                '\'' if !quoted => {
+                    single = !single;
+                    any = true;
+                }
+                c if single => word.push(c),
                 '\\' if quoted && chars.peek() == Some(&'"') => word.push(chars.next().unwrap_or('"')),
+                '\\' if !quoted => {
+                    if let Some(next) = chars.next() {
+                        word.push(next);
+                    }
+                }
                 '"' => {
                     quoted = !quoted;
                     any = true;
@@ -5682,12 +5693,22 @@ mod tests {
     #[test]
     fn every_usage_next_step_parses() {
         assert_eq!(shell_words("a \"b c\" d"), ["a", "b c", "d"]);
+        assert_eq!(shell_words("x '$HOME it'\\''s' y"), ["x", "$HOME it's", "y"]);
+        let mut keywords = Vec::new();
         for line in base::usage::next_step_examples() {
             let words = shell_words(&line);
             assert_eq!(words[0], "base", "{line}");
-            if let Err(e) = Cli::try_parse_from(&words) {
-                panic!("{line} does not parse: {e}");
+            match Cli::try_parse_from(&words) {
+                Err(e) => panic!("{line} does not parse: {e}"),
+                Ok(Cli { command: Some(Commands::Rule { action: RuleAction::Replay { drop_keyword, .. }, .. }), .. }) => {
+                    keywords.extend(drop_keyword)
+                }
+                Ok(_) => {}
             }
+        }
+        // A keyword a shell would act on reaches the command as written.
+        for kw in ["user prompt submit", "a&b|*.rs", "$HOME it's"] {
+            assert!(keywords.iter().any(|k| k == kw), "{kw:?} not read back: {keywords:?}");
         }
     }
 }

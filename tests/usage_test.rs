@@ -147,12 +147,12 @@ impl Log {
         text: &str,
         matched: &[(&str, &str, Option<&str>)],
         served: &[(&str, &str)],
-        cut: &[(&str, &str, &str)],
+        cut: &[(&str, &str, &str, &str)],
     ) {
         let matched: Vec<Value> =
             matched.iter().map(|(d, by, v)| json!({"domain": d, "by": by, "value": v})).collect();
         let cut: Vec<Value> =
-            cut.iter().map(|(kind, id, reason)| json!({"id": id, "kind": kind, "reason": reason, "limit": "prompt_bytes"})).collect();
+            cut.iter().map(|(kind, id, reason, block)| json!({"id": id, "kind": kind, "reason": reason, "block": block, "limit": "prompt_bytes"})).collect();
         self.rows.push(json!({
             "ts": ts, "session": session, "event": "prompt", "prompt_num": n, "text": text,
             "matched": matched, "served": items(served), "cut": cut, "scores": [],
@@ -212,16 +212,19 @@ fn usage_counts_from_match_log() {
     // rule-a: served 40 days ago (outside the window), then twice inside it. Cut and scored on other prompts: neither
     // counts.
     log.prompt(ago(40, 0), "s1", 1, "set up the lint step", &[], &[("rule", a)], &[]);
-    log.prompt(ago(2, 0), "s2", 1, "lint the parser", &[], &[("rule", a)], &[("rule", b, "budget")]);
+    log.prompt(ago(2, 0), "s2", 1, "lint the parser", &[], &[("rule", a)], &[("rule", b, "budget", "tools-rules"), ("rule", b, "topic limit", "tools-topic-rules")]);
     log.prompt(ago(1, 0), "s3", 1, "lint the parser again", &[], &[("rule", a)], &[]);
     let mut scored = log.rows.last().unwrap().clone();
     scored["prompt_num"] = json!(2);
     scored["served"] = json!([]);
     scored["scores"] = json!([{"id": b, "domain": "tools", "score": 9.5, "by": "bm25"}, {"not": "a score at all"}]);
     log.rows.push(scored);
-    // s4: rule-b on 3, C1 on 4 (the next turn): corrected. rule-c on 5, C2 interrupt on 5 (the same turn): corrected.
-    // rule-d on 7, C3 UPDATED on 8: corrected. rule-e on 9: MISREAD on 10 and DEFERRED on 9: not. rule-f on 11, C1 on
-    // 13: two turns on, not.
+    // s4. Each signal is about one reply: C1, the repeat and a C3 marker logged on prompt N answer reply N - 1; an
+    // interrupt or a refusal logged on N is about reply N. A rule served on N counts a signal about reply N or N + 1.
+    // rule-b on 3, C1 on 4 (about reply 3): corrected. rule-c on 5, C2 interrupt on 5: corrected. rule-d on 7, C3
+    // UPDATED on 8 (about 7): corrected. rule-e on 9: MISREAD on 10 and DEFERRED on 9: not. rule-f on 11, C1 on 14
+    // (about 13, two replies on): not. rule-g on 20 with C1 and C3 on 20 itself (about reply 19, before rule-g was
+    // seen): not. rule-h on 22, a refusal on 23 (the next reply): corrected.
     log.prompt(ago(1, 50), "s4", 3, "tidy the hook", &[], &[("rule", b)], &[]);
     log.prompt(ago(1, 49), "s4", 4, "no, not that file", &[], &[], &[]);
     log.signal(ago(1, 49), "s4", 4, &[("C1", "phrase")]);
@@ -233,11 +236,15 @@ fn usage_counts_from_match_log() {
     log.signal(ago(1, 43), "s4", 9, &[("C3", "DEFERRED")]);
     log.signal(ago(1, 43), "s4", 10, &[("C3", "MISREAD")]);
     log.prompt(ago(1, 42), "s4", 11, "list the hooks", &[], &[("rule", f)], &[]);
-    log.signal(ago(1, 41), "s4", 13, &[("C1", "phrase")]);
-    // A file row after prompt 14 serves rule-f; C1 on 15: it joins prompt 14, so it is corrected.
+    log.signal(ago(1, 41), "s4", 14, &[("C1", "phrase")]);
+    // A file row after prompt 14 serves rule-f; C1 on 15 (about reply 14): it joins prompt 14, so it is corrected.
     log.prompt(ago(1, 40), "s4", 14, "edit the lint config", &[], &[], &[]);
     log.file(ago(1, 39), "s4", &[("rule", f)]);
     log.signal(ago(1, 38), "s4", 15, &[("C1", "phrase")]);
+    log.prompt(ago(1, 30), "s4", 20, "no, the lint rule again", &[], &[("rule", "rule-g")], &[]);
+    log.signal(ago(1, 30), "s4", 20, &[("C1", "phrase"), ("C3", "UPDATED")]);
+    log.prompt(ago(1, 28), "s4", 22, "run the hook", &[], &[("rule", "rule-h")], &[]);
+    log.signal(ago(1, 27), "s4", 23, &[("C2", "denial")]);
     // A decision served twice, the first time before its update.
     log.prompt(ago(3, 0), "s5", 1, "where do memos go", &[], &[("decision", "global.memo-folder")], &[]);
     log.signal(ago(3, 0), "s5", 2, &[("C1", "phrase")]);
@@ -252,15 +259,18 @@ fn usage_counts_from_match_log() {
     assert_eq!((ca.served_window, ca.served_all), (2, 3), "served 30d and all, printed only");
     assert_eq!(ca.last_served.map(|d| d.format("%Y-%m-%d").to_string()), Some(day_ago(1)));
     assert_eq!(scan.counts(&k(b)).served_all, 1, "the cut and the score of rule-b do not count as served");
-    assert_eq!(scan.counts(&k(b)).withheld_window, 1, "its cut for the budget is withheld");
+    assert_eq!(scan.counts(&k(b)).withheld_window, 1, "its cut for the budget is withheld; its topic-limit cut is not the budget");
+    assert_eq!(scan.counts(&k(b)).withheld_from.as_deref(), Some("tools-rules"), "the block it was withheld from");
     assert_eq!(scan.counts(&k(b)).corrected_after, 1, "C1 on the next turn");
     assert_eq!(scan.counts(&k(c)).corrected_after, 1, "C2 on the same turn");
     assert_eq!(scan.counts(&k(d)).corrected_after, 1, "C3 UPDATED on the next turn");
     assert_eq!(scan.counts(&k(e)).corrected_after, 0, "MISREAD and DEFERRED are not corrections of a rule");
     let cf = scan.counts(&k(f));
     assert_eq!(cf.served_all, 2, "a prompt row and a file row");
-    assert_eq!(cf.corrected_after, 1, "the file row joins prompt 14 and C1 on 15 follows it; C1 on 13 is two turns on");
-    assert_eq!(scan.typed, 12, "typed prompts in the window: the one 40 days ago is outside it");
+    assert_eq!(cf.corrected_after, 1, "the file row joins prompt 14 and C1 on 15 is about reply 14; C1 on 14 is two replies after 11");
+    assert_eq!(scan.counts(&k("rule-g")).corrected_after, 0, "a phrase on the prompt that brought the rule in is about the reply before it");
+    assert_eq!(scan.counts(&k("rule-h")).corrected_after, 1, "a refusal in the next turn");
+    assert_eq!(scan.typed, 14, "typed prompts in the window: the one 40 days ago is outside it, and the row whose scores hold a malformed entry still counts (scores are not built)");
     assert_eq!(scan.days_covered(), 41);
 
     let dk = Key::Decision("global.memo-folder".into());
@@ -301,7 +311,7 @@ fn listing_fixture(tag: &str, base_toml: &str) -> Fixture {
             matched.push(("tools", "path", Some("C:/work/tools")));
         }
         let served: Vec<(&str, &str)> = if i < 30 && n == 1 { vec![("rule", lint.as_str())] } else { vec![] };
-        let cut: Vec<(&str, &str, &str)> = if i % 30 == 0 { vec![("rule", plain.as_str(), "budget")] } else { vec![] };
+        let cut: Vec<(&str, &str, &str, &str)> = if i % 30 == 0 { vec![("rule", plain.as_str(), "budget", "global-rules")] } else { vec![] };
         let text = format!("typed prompt number {i} about the work");
         log.prompt(ts, &session, n, &text, &matched, &served, &cut);
     }
@@ -428,14 +438,17 @@ fn detector_health_line() {
     let old = json!({"ts": ago(40, 0), "sessions": 3, "calls": 4, "cached": 0, "detector": record});
     let pass = json!({"ts": ago(2, 0), "sessions": 5, "calls": 6, "cached": 0, "detector": record});
     let rerun = json!({"ts": ago(2, -1), "sessions": 5, "calls": 0, "cached": 6, "detector": record});
+    // A first run stopped before it logged leaves only its rerun's record, answered from the cache: that one counts.
+    let lone = json!({"ts": ago(1, 0), "sessions": 2, "calls": 0, "cached": 3,
+                      "detector": {"judged": 10, "flagged": 4, "corrections": 4, "misses": 1, "hits": {"C1": 3}, "false_flags": {}}});
     let path = dir.join("log.jsonl");
-    std::fs::write(&path, format!("{old}\n{pass}\n{rerun}\n")).unwrap();
+    std::fs::write(&path, format!("{old}\n{pass}\n{rerun}\n{lone}\n")).unwrap();
 
     let since = (Local::now() - Duration::days(29)).date_naive();
     let d = base::corrections::tune_pass::detector_totals_in(&path, Some(since));
-    assert_eq!((d.judged, d.corrections, d.misses), (120, 26, 11), "the old pass is outside the window, the rerun is not counted twice");
+    assert_eq!((d.judged, d.corrections, d.misses), (130, 30, 12), "the old pass is outside the window, the rerun is not counted twice, the lone cached pass is");
     let all = base::corrections::tune_pass::detector_totals_in(&path, None);
-    assert_eq!((all.corrections, all.misses), (52, 22), "with no window both passes count, the rerun still does not");
+    assert_eq!((all.corrections, all.misses), (56, 23), "with no window both full passes count, the rerun still does not");
 
     let line = |judged, corrections, misses| {
         let s = usage::Section {
@@ -525,6 +538,18 @@ fn thresholds_from_config() {
     has("   review (served 3+ times, unchanged 5+ days): 1");
     has("     global.keep-notes-short \"Keep notes short\"   served 3 · unchanged 6 days ·");
 
+    // [log] prompt_text = "matched": a row keeps only matched words, so noisy is not judged and the first line says why.
+    let matched = Fixture::new("matched", "[log]\nprompt_text = \"matched\"\n");
+    let mut log = Log::default();
+    for i in 0..120 {
+        log.prompt(ago(1, i), &format!("m{i}"), 1, "lint", &[("tools", "keyword", Some("lint"))], &[], &[]);
+    }
+    matched.log(&log);
+    let (_, section, _) = matched.section();
+    let lines = lines_of(&section);
+    assert_eq!(lines[1], format!("   match log: 2 days (since {}) · 120 prompts · [log] prompt_text = \"matched\"", day_ago(1)), "{section}");
+    assert_eq!(lines[3], "   noisy: not judged · [log] prompt_text = \"matched\" keeps too little of a prompt to tell yours from a task notification", "{section}");
+
     // No [doctor] keys: the defaults.
     let defaults = Fixture::new("defaults", "[doctor]\nstale_next_days = 14\n");
     let cfg = base::config::BaseConfig::load(&defaults.ws);
@@ -541,6 +566,10 @@ fn thresholds_from_config() {
 #[test]
 fn doctor_usage_young_log() {
     let fx = Fixture::new("young", "");
+    // The global tier's log is 40 days old; the workspace's own log, which says how old the log is, has no row yet.
+    let mut global = Log::default();
+    global.file(ago(40, 0), "elsewhere", &[("rule", "rule-elsewhere")]);
+    std::fs::write(fx.home.join(".base-gbl").join(".base").join("match-log.jsonl"), global.text()).unwrap();
     let (_, section, _) = fx.section();
     assert_eq!(
         section.trim_end(),

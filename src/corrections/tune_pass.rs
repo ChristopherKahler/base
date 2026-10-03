@@ -1022,16 +1022,24 @@ pub fn detector_totals(since: Option<chrono::NaiveDate>) -> Detector {
 
 /// [`detector_totals`] on one log file.
 ///
-/// A PASS THAT MADE NO CALL AND ANSWERED FROM THE CACHE IS NOT COUNTED (BO-19, lynx's G0 ruling on question 6). The
-/// judge's cache is keyed by the turns it read, so a pass answered wholly from it re-judged sessions an earlier pass
-/// judged, and that pass logged the same record: BO-17's gate 4 ran a pass and then, its marks removed, the same pass
-/// again, and the log holds two identical records that a plain sum counts twice. The rows carry how many sessions a
-/// pass read, not which, so the newest record per session cannot be kept. A pass only partly answered from the cache
-/// still counts its cached sessions again: named in BO-19's FINAL STATE.
+/// A RERUN IS NOT COUNTED TWICE (BO-19, lynx's G0 ruling on question 6). The judge's cache is keyed by the turns it
+/// read, so a pass that made no call and answered wholly from the cache re-judged turns a pass judged before: BO-17's
+/// gate 4 ran a pass and then, its marks removed, the same pass again, and the log holds two identical records that a
+/// plain sum counts twice. Such a pass is passed over when a pass logged before it read as many sessions and found the
+/// same record. It is counted when none did: a first run stopped before it logged (the shell's time limit `base tune`
+/// warns of) leaves its answers in the cache and no record, and the rerun's record is the only one. The rows carry how
+/// many sessions a pass read, not which, so a pass only partly answered from the cache still counts its cached sessions
+/// again: named in BO-19's FINAL STATE.
 pub fn detector_totals_in(path: &Path, since: Option<chrono::NaiveDate>) -> Detector {
     let mut out = Detector::default();
+    let mut logged: HashSet<String> = HashSet::new();
     for line in std::fs::read_to_string(path).unwrap_or_default().lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let record = format!("{}|{}", v["sessions"], v["detector"]);
+        let rerun = v["calls"].as_u64() == Some(0) && v["cached"].as_u64().is_some_and(|c| c > 0);
+        if !logged.insert(record) && rerun {
+            continue;
+        }
         if let Some(day) = since {
             let when = v["ts"]
                 .as_str()
@@ -1040,9 +1048,6 @@ pub fn detector_totals_in(path: &Path, since: Option<chrono::NaiveDate>) -> Dete
             if when.is_none_or(|d| d < day) {
                 continue;
             }
-        }
-        if v["calls"].as_u64() == Some(0) && v["cached"].as_u64().is_some_and(|c| c > 0) {
-            continue;
         }
         let d = &v["detector"];
         let n = |k: &str| d[k].as_u64().unwrap_or(0) as usize;

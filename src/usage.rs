@@ -13,16 +13,23 @@
 //! prompt row's `matched` list names the domain and the keyword whatever the dedup did afterwards. Only a keyword the
 //! domain still has counts, so narrowing a keyword clears the line at once rather than 30 days later. Path matches are
 //! not keyword breadth (D1: a session in a project folder matches it on every prompt by design; doctor's trigger
-//! faults judge paths). Task notifications are left out: on that same log they were 646 of 707 prompt rows.
+//! faults judge paths). Task notifications are left out: on that same log they were 646 of 707 prompt rows. A rule
+//! with matchers of its own is not judged noisy: it too is logged once per session, and its per-prompt topic score
+//! sits in `scores`, which this reader does not build.
 //!
-//! CORRECTED AFTER: the same or the next turn. A serving on prompt N of a session counts when a signal row of that
-//! session with `prompt_num` N or N + 1 carries C1, C2, or a C3 `UPDATED` or `CORRECTED` (`MISREAD` is a
-//! misunderstanding and `DEFERRED` a disagreement, neither a rule the AI ignored). The hooks log C1 and the repeat
-//! check on the prompt that carries them, an interrupt, a refusal or an edited file on the turn they happened in, and
-//! a marker on the turn whose reply carried it (`corrections::on_prompt`, `on_stop`), so N and N + 1 catch each.
+//! CORRECTED AFTER: the reply the rule was served for, or the next one. Each signal is about one reply. The hooks log
+//! C1 (a phrase), the C2 repeat check and a C3 marker (`UPDATED`, `CORRECTED`) on the prompt that answers a reply, so
+//! they are about the reply before it (`prompt_num` - 1); they log a C2 interrupt, refusal or edited file on the turn
+//! it happened in, so it is about that turn's reply (`corrections::on_prompt`, `on_stop`). A rule served on prompt N
+//! counts as corrected after when a signal is about reply N or N + 1. A phrase on the very prompt that brought the
+//! rule in is about the reply before the rule was seen, and does not count. `MISREAD` (a misunderstanding) and
+//! `DEFERRED` (a disagreement) never count.
 //!
-//! ADVICE ONLY. Nothing here is one of the conjuncts of `DoctorReport::healthy`: a user who updates must not see
-//! doctor go UNHEALTHY because of usage counts (Chris, 2026-10-03).
+//! WHOSE LOG SAYS HOW OLD IT IS. Rows are read from the cwd's tier and the global one, but how many days the log covers
+//! is the cwd tier's own log: a workspace first used yesterday is one day old, whatever the global log holds.
+//!
+//! ADVICE ONLY. Nothing here is one of the conjuncts of `DoctorReport::healthy`: a user who updates must not see doctor
+//! go UNHEALTHY because of usage counts (Chris, 2026-10-03).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufRead;
@@ -34,6 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::BaseConfig;
 use crate::crud;
+use crate::domain::global_decisions::GlobalDecisions;
 use crate::domain::DomainDef;
 use crate::emit::match_log;
 
@@ -88,6 +96,9 @@ struct LeanMatched {
 struct LeanItem {
     id: String,
     kind: String,
+    /// The prompt block that carried it, as `base hooks show` names it.
+    #[serde(default)]
+    block: Option<String>,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -108,12 +119,13 @@ impl LeanItem {
     }
 }
 
-/// A signal that says the user corrected the AI: C1, C2, or C3 `UPDATED` / `CORRECTED`.
-fn corrects(s: &LeanSignal) -> bool {
-    match s.layer.as_str() {
-        "C1" | "C2" => true,
-        "C3" => matches!(s.kind.as_str(), "UPDATED" | "CORRECTED"),
-        _ => false,
+/// The reply a signal logged on prompt `n` says was wrong, when it says one was: C1, the C2 repeat and a C3 `UPDATED`
+/// or `CORRECTED` answer the reply before their prompt; a C2 interrupt, refusal or edited file is about its own turn.
+fn about(s: &LeanSignal, n: u32) -> Option<u32> {
+    match (s.layer.as_str(), s.kind.as_str()) {
+        ("C1", _) | ("C2", "repeat") | ("C3", "UPDATED" | "CORRECTED") => n.checked_sub(1),
+        ("C2", _) => Some(n),
+        _ => None,
     }
 }
 
@@ -133,17 +145,19 @@ struct Serving {
 pub struct Scan {
     pub today: NaiveDate,
     pub window_days: u64,
-    /// The oldest row's local date. `None`: no row at all.
+    /// The oldest row's local date in the first tier read (the cwd's own). `None`: it holds no row.
     pub oldest: Option<NaiveDate>,
     /// Prompt rows in the window: typed by a person, a machine's (task notifications and the like), kept with no text.
     pub typed: usize,
     pub machine: usize,
     pub textless: usize,
     servings: HashMap<Key, Vec<Serving>>,
-    /// (session, turn) pairs a correcting signal was logged on.
+    /// (session, reply) pairs a correcting signal is about.
     signals: HashSet<(u32, u32)>,
-    /// Cut entries in the window, any reason but `not matched`: the item was in reach and not printed.
+    /// Cut for the budget in the window: the item was due and not printed.
     withheld: HashMap<Key, usize>,
+    /// The block it was last withheld from.
+    withheld_from: HashMap<Key, String>,
     /// The oldest day a row named the item, served or cut.
     first_named: HashMap<Key, NaiveDate>,
     /// Rows in the window that matched each domain (by slug) by anything but `always`.
@@ -152,8 +166,6 @@ pub struct Scan {
     pub keyword_prompts: HashMap<String, usize>,
     /// The same, per keyword.
     pub keyword_hits: HashMap<String, BTreeMap<String, usize>>,
-    /// Typed prompts in the window that served or withheld each rule (by id).
-    pub rule_reach: HashMap<String, usize>,
     /// Typed prompts in the window, star commands aside, whose text holds one of a global decision's keywords.
     pub decision_reach: HashMap<String, usize>,
     /// The same, per keyword.
@@ -178,8 +190,8 @@ impl Current {
         self.aliases.get(&s).cloned().unwrap_or(s)
     }
 
-    /// Read from the domains and the store, as the prompt hook would.
-    pub fn from(domains: &[DomainDef], store: Option<&Store>, config: &BaseConfig) -> Self {
+    /// Read from the domains and the global decisions, as the prompt hook would.
+    pub fn from(domains: &[DomainDef], global: Option<&GlobalDecisions>) -> Self {
         let mut out = Current::default();
         for d in domains {
             let slug = crud::slugify(&d.name);
@@ -188,8 +200,7 @@ impl Current {
             }
             out.keywords.insert(slug, d.prompt_keywords.clone());
         }
-        if let Some(store) = store {
-            let global = crate::domain::global_decisions::GlobalDecisions::load(store, config, domains);
+        if let Some(global) = global {
             out.decisions =
                 global.all().filter(|d| !d.keywords.is_empty()).map(|d| (d.slug.clone(), d.keywords.clone())).collect();
         }
@@ -200,16 +211,27 @@ impl Current {
 impl Scan {
     /// The first day of the window.
     pub fn window_start(&self) -> NaiveDate {
-        self.today - chrono::Days::new(self.window_days.max(1) - 1)
+        self.today.checked_sub_days(chrono::Days::new(self.window_days.max(1) - 1)).unwrap_or(NaiveDate::MIN)
     }
 
     fn in_window(&self, day: NaiveDate) -> bool {
         day >= self.window_start()
     }
 
-    /// Days the log covers: today minus the oldest row's day, plus one. 0 with no row.
+    /// Days the cwd tier's log covers: today minus its oldest row's day, plus one. 0 with no row.
     pub fn days_covered(&self) -> u64 {
         self.oldest.map(|o| (self.today - o).num_days().max(0) as u64 + 1).unwrap_or(0)
+    }
+
+    /// How much the log covers, as the section's first line and `rule stats` say it. `None`: no row yet.
+    pub fn log_span(&self) -> Option<LogSpan> {
+        self.oldest.map(|o| LogSpan {
+            days: self.days_covered(),
+            since: o.format("%Y-%m-%d").to_string(),
+            typed: self.typed,
+            machine: self.machine,
+            textless: self.textless,
+        })
     }
 
     /// The counts of one item, every serving counted.
@@ -222,6 +244,7 @@ impl Scan {
     pub fn counts_since(&self, key: &Key, since: Option<i64>) -> Counts {
         let mut c = Counts {
             withheld_window: self.withheld.get(key).copied().unwrap_or(0),
+            withheld_from: self.withheld_from.get(key).cloned(),
             first_named: self.first_named.get(key).copied(),
             ..Counts::default()
         };
@@ -259,8 +282,10 @@ pub struct Counts {
     pub served_all: usize,
     pub corrected_after: usize,
     pub last_served: Option<NaiveDate>,
-    /// Cut in the window for any reason but `not matched`.
+    /// Cut for the budget in the window.
     pub withheld_window: usize,
+    /// The block it was last withheld from.
+    pub withheld_from: Option<String>,
     pub first_named: Option<NaiveDate>,
 }
 
@@ -270,12 +295,13 @@ fn when(ts: &str) -> Option<(NaiveDate, i64)> {
     Some((t.with_timezone(&Local).date_naive(), t.timestamp()))
 }
 
-/// Read every file of the log in `dirs` (each tier's `.base`), oldest file first, as of `today`.
+/// Read every file of the log in `dirs` (each tier's `.base`, the cwd's own first), oldest file first, as of `today`.
 pub fn scan(dirs: &[PathBuf], today: NaiveDate, window_days: u64, current: &Current) -> Scan {
     let mut out = Scan { today, window_days: window_days.max(1), ..Scan::default() };
     let mut sessions: HashMap<String, u32> = HashMap::new();
     let mut last_prompt: HashMap<u32, u32> = HashMap::new();
-    for dir in dirs {
+    for (i, dir) in dirs.iter().enumerate() {
+        let own = i == 0;
         for path in match_log::files(dir) {
             let Ok(file) = std::fs::File::open(&path) else { continue };
             for line in std::io::BufReader::new(file).split(b'\n').map_while(Result::ok) {
@@ -284,15 +310,19 @@ pub fn scan(dirs: &[PathBuf], today: NaiveDate, window_days: u64, current: &Curr
                 if text.is_empty() {
                     continue;
                 }
-                // Most rows are tool calls that served nothing: passed over before any parse.
-                if text.contains("\"event\":\"file\"") && text.contains("\"served\":[]") && !text.contains("\"matched\":[{") {
-                    if let Some(day) = ts_day(text) {
+                // Most rows are tool calls that matched, served and cut nothing: passed over before any parse.
+                if text.contains("\"event\":\"file\"")
+                    && text.contains("\"matched\":[]")
+                    && text.contains("\"served\":[]")
+                    && text.contains("\"cut\":[]")
+                {
+                    if own && let Some(day) = ts_day(text) {
                         out.oldest = Some(out.oldest.map_or(day, |o| o.min(day)));
                     }
                     continue;
                 }
                 let Ok(row) = serde_json::from_str::<LeanRow>(text) else { continue };
-                take(&mut out, row, current, &mut sessions, &mut last_prompt);
+                take(&mut out, row, own, current, &mut sessions, &mut last_prompt);
             }
         }
     }
@@ -306,18 +336,27 @@ fn ts_day(text: &str) -> Option<NaiveDate> {
     when(&text[at..end]).map(|(d, _)| d)
 }
 
-fn take(out: &mut Scan, row: LeanRow, current: &Current, sessions: &mut HashMap<String, u32>, last_prompt: &mut HashMap<u32, u32>) {
+fn take(
+    out: &mut Scan,
+    row: LeanRow,
+    own: bool,
+    current: &Current,
+    sessions: &mut HashMap<String, u32>,
+    last_prompt: &mut HashMap<u32, u32>,
+) {
     let Some((day, at)) = when(&row.ts) else { return };
-    out.oldest = Some(out.oldest.map_or(day, |o| o.min(day)));
+    if own {
+        out.oldest = Some(out.oldest.map_or(day, |o| o.min(day)));
+    }
     let next = sessions.len() as u32;
     let session = row.session.as_ref().map(|s| *sessions.entry(s.clone()).or_insert(next));
     let window = out.in_window(day);
 
     if row.event == "signal" {
-        if let (Some(s), Some(n)) = (session, row.prompt_num)
-            && row.signals.iter().any(corrects)
-        {
-            out.signals.insert((s, n));
+        if let (Some(s), Some(n)) = (session, row.prompt_num) {
+            for reply in row.signals.iter().filter_map(|sig| about(sig, n)) {
+                out.signals.insert((s, reply));
+            }
         }
         return;
     }
@@ -339,8 +378,11 @@ fn take(out: &mut Scan, row: LeanRow, current: &Current, sessions: &mut HashMap<
     for item in &row.cut {
         let Some(key) = item.key() else { continue };
         out.first_named.entry(key.clone()).and_modify(|d| *d = (*d).min(day)).or_insert(day);
-        if window && item.reason.as_deref() != Some("not matched") {
-            *out.withheld.entry(key).or_default() += 1;
+        if window && item.reason.as_deref() == Some("budget") {
+            *out.withheld.entry(key.clone()).or_default() += 1;
+            if let Some(block) = &item.block {
+                out.withheld_from.insert(key, block.clone());
+            }
         }
     }
     if !window {
@@ -382,29 +424,23 @@ fn take(out: &mut Scan, row: LeanRow, current: &Current, sessions: &mut HashMap<
     for (d, kw) in hits {
         *out.keyword_hits.entry(d).or_default().entry(kw).or_default() += 1;
     }
-    // A rule in reach on this prompt: served, or cut by anything but its matchers not firing.
-    let reach: HashSet<&str> = row
-        .served
-        .iter()
-        .chain(row.cut.iter().filter(|c| c.reason.as_deref() != Some("not matched")))
-        .filter(|i| i.kind == "rule")
-        .map(|i| i.id.as_str())
-        .collect();
-    for id in reach {
-        *out.rule_reach.entry(id.to_string()).or_default() += 1;
-    }
-    // A global decision on its own keywords, as BO-16's replay judges one: a star command passes every rule by.
-    if !row.matched.iter().any(|m| m.by == "command") {
+    // A global decision on its own keywords, as BO-16's replay judges one: a star command passes every rule by. The
+    // prompt is lowercased once, as `global_decisions::keyword_hit` would for each keyword.
+    if !current.decisions.is_empty() && !row.matched.iter().any(|m| m.by == "command") {
+        let lower = text.to_lowercase();
         for (slug, kws) in &current.decisions {
-            let hit: Vec<&String> =
-                kws.iter().filter(|k| crate::domain::global_decisions::keyword_hit(std::slice::from_ref(*k), text)).collect();
+            let hit: Vec<String> = kws
+                .iter()
+                .map(|k| k.trim().to_lowercase())
+                .filter(|k| crate::domain::matcher::contains_word(&lower, k))
+                .collect();
             if hit.is_empty() {
                 continue;
             }
             *out.decision_reach.entry(slug.clone()).or_default() += 1;
             let per = out.decision_hits.entry(slug.clone()).or_default();
             for k in hit {
-                *per.entry(k.trim().to_lowercase()).or_default() += 1;
+                *per.entry(k).or_default() += 1;
             }
         }
     }
@@ -529,7 +565,9 @@ pub enum Dead {
         domain: String,
         text: String,
         last_served: Option<String>,
+        /// Times cut for the budget in the window, and the block it was last cut from.
         withheld: usize,
+        block: Option<String>,
         own_matchers: bool,
     },
 }
@@ -538,7 +576,6 @@ pub enum Dead {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Noisy {
     Domain { domain: String, prompts: usize, of: usize, keywords: Vec<(String, usize)>, rules: usize },
-    Rule { rule: String, text: String, prompts: usize, of: usize },
     Decision { decision: String, name: String, prompts: usize, of: usize, keywords: Vec<(String, usize)> },
 }
 
@@ -579,19 +616,30 @@ pub struct Limits {
     pub review_served: usize,
     pub review_days: i64,
     pub noisy_min_prompts: usize,
+    /// `[log] prompt_text` when it is not `full`: then a row keeps too little text to tell a person's prompt from a
+    /// task notification, and noisy is not judged.
+    pub prompt_text: Option<String>,
+}
+
+impl Limits {
+    pub fn from_config(config: &BaseConfig) -> Self {
+        let dc = &config.doctor;
+        let mode = crate::emit::match_log::PromptText::parse(&config.log.prompt_text);
+        Limits {
+            dead_days: dc.dead_days.max(1),
+            broad_share: config.tune.broad_share,
+            ignored_after: dc.ignored_after.max(1),
+            review_served: dc.review_served.max(1),
+            review_days: dc.review_days,
+            noisy_min_prompts: NOISY_MIN_PROMPTS,
+            prompt_text: (mode != crate::emit::match_log::PromptText::Full).then(|| config.log.prompt_text.trim().to_string()),
+        }
+    }
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        let dc = crate::config::DoctorConfig::default();
-        Limits {
-            dead_days: dc.dead_days,
-            broad_share: crate::config::TuneConfig::default().broad_share,
-            ignored_after: dc.ignored_after,
-            review_served: dc.review_served,
-            review_days: dc.review_days,
-            noisy_min_prompts: NOISY_MIN_PROMPTS,
-        }
+        Limits::from_config(&BaseConfig::default())
     }
 }
 
@@ -605,7 +653,7 @@ pub struct Section {
     pub dead: Option<Vec<Dead>>,
     /// Rules not served and never named in the log: they did not exist when their domain last matched.
     pub too_new: usize,
-    /// `None`: not judged, fewer typed prompts in the window than [`NOISY_MIN_PROMPTS`].
+    /// `None`: not judged (too few typed prompts in the window, or no prompt text kept).
     pub noisy: Option<Vec<Noisy>>,
     pub ignored: Vec<Ignored>,
     pub review: Vec<Review>,
@@ -618,12 +666,13 @@ pub struct Inputs<'a> {
     pub config: &'a BaseConfig,
     pub domains: &'a [DomainDef],
     pub store: Option<&'a Store>,
+    pub global: Option<&'a GlobalDecisions>,
     pub scan: &'a Scan,
     pub detector: crate::corrections::tune_pass::Detector,
     pub now: DateTime<Local>,
 }
 
-/// The tiers whose logs a cwd's sessions write to: its own and the global one.
+/// The tiers whose logs a cwd's sessions write to: its own first, then the global one.
 pub fn log_dirs(cwd: &Path) -> Vec<PathBuf> {
     crate::corrections::propose::row_dirs(cwd)
 }
@@ -631,34 +680,19 @@ pub fn log_dirs(cwd: &Path) -> Vec<PathBuf> {
 /// Scan `cwd`'s logs and build the section. Read only: the store is the caller's, loaded with `store::load_merged`.
 pub fn section_for(cwd: &Path, config: &BaseConfig, domains: &[DomainDef], store: Option<&Store>) -> Section {
     let now = Local::now();
-    let current = Current::from(domains, store, config);
+    let global = store.map(|s| GlobalDecisions::load(s, config, domains));
+    let current = Current::from(domains, global.as_ref());
     let scan = scan(&log_dirs(cwd), now.date_naive(), config.doctor.dead_days, &current);
-    let since = scan.window_start();
-    let detector = crate::corrections::tune_pass::detector_totals(Some(since));
-    build(&Inputs { config, domains, store, scan: &scan, detector, now })
+    let detector = crate::corrections::tune_pass::detector_totals(Some(scan.window_start()));
+    build(&Inputs { config, domains, store, global: global.as_ref(), scan: &scan, detector, now })
 }
 
 pub fn build(i: &Inputs) -> Section {
-    let dc = &i.config.doctor;
-    let limits = Limits {
-        dead_days: dc.dead_days.max(1),
-        broad_share: i.config.tune.broad_share,
-        ignored_after: dc.ignored_after.max(1),
-        review_served: dc.review_served.max(1),
-        review_days: dc.review_days,
-        noisy_min_prompts: NOISY_MIN_PROMPTS,
-    };
+    let limits = Limits::from_config(i.config);
     let scan = i.scan;
     let detector = DetectorLine { judged: i.detector.judged, corrections: i.detector.corrections, misses: i.detector.misses };
-    let Some(oldest) = scan.oldest else {
-        return Section { log: None, dead: None, too_new: 0, noisy: None, ignored: Vec::new(), review: Vec::new(), detector, limits };
-    };
-    let log = LogSpan {
-        days: scan.days_covered(),
-        since: oldest.format("%Y-%m-%d").to_string(),
-        typed: scan.typed,
-        machine: scan.machine,
-        textless: scan.textless,
+    let Some(log) = scan.log_span() else {
+        return Section { detector, limits, ..Section::default() };
     };
     let rules = rules_now(i.domains, i.store, i.config);
     let start = scan.window_start();
@@ -691,6 +725,7 @@ pub fn build(i: &Inputs) -> Section {
                     text: r.text.clone(),
                     last_served: c.last_served.map(|d| d.format("%Y-%m-%d").to_string()),
                     withheld: c.withheld_window,
+                    block: c.withheld_from.clone(),
                     own_matchers: r.own_matchers,
                 });
             } else {
@@ -702,10 +737,15 @@ pub fn build(i: &Inputs) -> Section {
         (Some(dead), too_new)
     };
 
-    // Noisy: judged once the window holds enough typed prompts.
+    // Noisy: judged once the window holds enough typed prompts, and only when rows keep the prompt's text.
     let of = scan.typed;
     let over = |n: usize| of > 0 && n as f32 / of as f32 > limits.broad_share;
-    let noisy = (of >= NOISY_MIN_PROMPTS).then(|| {
+    let sorted = |m: Option<&BTreeMap<String, usize>>| -> Vec<(String, usize)> {
+        let mut v: Vec<(String, usize)> = m.map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect()).unwrap_or_default();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    };
+    let noisy = (of >= NOISY_MIN_PROMPTS && limits.prompt_text.is_none()).then(|| {
         let mut out: Vec<Noisy> = Vec::new();
         for d in i.domains.iter().filter(|d| d.auto_inject && !d.is_always()) {
             let slug = crud::slugify(&d.name);
@@ -713,29 +753,13 @@ pub fn build(i: &Inputs) -> Section {
             if !over(n) {
                 continue;
             }
-            let mut keywords: Vec<(String, usize)> =
-                scan.keyword_hits.get(&slug).map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect()).unwrap_or_default();
-            keywords.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             let count = rules.iter().filter(|r| crud::slugify(&r.domain) == slug && !r.own_matchers).count();
-            out.push(Noisy::Domain { domain: d.name.clone(), prompts: n, of, keywords, rules: count });
+            out.push(Noisy::Domain { domain: d.name.clone(), prompts: n, of, keywords: sorted(scan.keyword_hits.get(&slug)), rules: count });
         }
-        for r in rules.iter().filter(|r| r.own_matchers && r.injects) {
-            let n = scan.rule_reach.get(&r.id).copied().unwrap_or(0);
-            if over(n) {
-                out.push(Noisy::Rule { rule: r.short(), text: r.text.clone(), prompts: n, of });
-            }
-        }
-        let global = i.store.map(|s| crate::domain::global_decisions::GlobalDecisions::load(s, i.config, i.domains));
         for (slug, n) in &scan.decision_reach {
             if over(*n) {
-                let name = global.as_ref().and_then(|g| g.by_slug(slug)).map(|d| d.name.clone()).unwrap_or_default();
-                let mut keywords: Vec<(String, usize)> = scan
-                    .decision_hits
-                    .get(slug)
-                    .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
-                    .unwrap_or_default();
-                keywords.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                out.push(Noisy::Decision { decision: slug.clone(), name, prompts: *n, of, keywords });
+                let name = i.global.and_then(|g| g.by_slug(slug)).map(|d| d.name.clone()).unwrap_or_default();
+                out.push(Noisy::Decision { decision: slug.clone(), name, prompts: *n, of, keywords: sorted(scan.decision_hits.get(slug)) });
             }
         }
         out.sort_by(|a, b| noisy_n(b).cmp(&noisy_n(a)).then_with(|| noisy_name(a).cmp(noisy_name(b))));
@@ -787,26 +811,32 @@ pub fn build(i: &Inputs) -> Section {
 
 fn noisy_n(n: &Noisy) -> usize {
     match n {
-        Noisy::Domain { prompts, .. } | Noisy::Rule { prompts, .. } | Noisy::Decision { prompts, .. } => *prompts,
+        Noisy::Domain { prompts, .. } | Noisy::Decision { prompts, .. } => *prompts,
     }
 }
 
 fn noisy_name(n: &Noisy) -> &str {
     match n {
         Noisy::Domain { domain, .. } => domain,
-        Noisy::Rule { rule, .. } => rule,
         Noisy::Decision { decision, .. } => decision,
     }
 }
 
 // ─── The next steps the section prints ───────────────────────────────────────
 
-/// A command-line argument as a shell reads it back: double-quoted when it holds a space or a quote.
+/// A command-line argument as bash, PowerShell and cmd read it back. Left bare when it holds only characters no shell
+/// gives a meaning to; double-quoted when it holds a space or another character a shell would act on bare; single-quoted
+/// when it holds one a shell still acts on inside double quotes (`$`, a backtick, `"`, `\`, `!`), a quote inside
+/// written `'\''` as bash reads it.
 fn arg(s: &str) -> String {
-    if !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'') {
+    let bare = |c: char| c.is_alphanumeric() || "._-/:@%+=,".contains(c);
+    if !s.is_empty() && s.chars().all(bare) {
         return s.to_string();
     }
-    format!("\"{}\"", s.replace('"', "\\\""))
+    if s.chars().any(|c| "$`\"\\!".contains(c)) {
+        return format!("'{}'", s.replace('\'', "'\\''"));
+    }
+    format!("\"{s}\"")
 }
 
 /// What a list past its first lines points to.
@@ -847,8 +877,9 @@ pub fn cmd_decision_supersede(slug: &str) -> String {
     format!("base decision log --domain {} --decision \"...\" --rationale \"...\" --supersedes {}", arg(domain), arg(slug))
 }
 
-/// One of each next step the section and `base rule stats` print, built by the functions above on invented names: the
-/// CLI's own parser reads each in the binary's tests (lynx's G0 condition).
+/// One of each next step the section and `base rule stats` print, built by the functions above on invented names, a
+/// keyword with a space and ones a shell would act on among them: the CLI's own parser reads each in the binary's tests
+/// (lynx's G0 condition).
 pub fn next_step_examples() -> Vec<String> {
     vec![
         cmd_test_domain("tools"),
@@ -857,6 +888,8 @@ pub fn next_step_examples() -> Vec<String> {
         cmd_hooks_show("tools-rules"),
         cmd_replay_drop("tools", "hook"),
         cmd_replay_drop("tools", "user prompt submit"),
+        cmd_replay_drop("tools", "a&b|*.rs"),
+        cmd_replay_drop("tools", "$HOME it's"),
         cmd_replay_decision_drop("global.keep-notes-short", "notes"),
         cmd_propose_rewrite("tools.1a2b3c4d"),
         cmd_decision_update("global.keep-notes-short"),
@@ -906,17 +939,21 @@ pub fn render(s: &Section) -> String {
         out.push_str("   no match log yet: base writes it from the next prompt on, and this section fills in as it grows\n");
         return out;
     };
-    out.push_str(&format!(
-        "   match log: {} {} (since {}) · {} typed {}, {} task {} · {} with no text\n",
-        log.days,
-        plural(log.days as usize, "day", "days"),
-        log.since,
-        thousands(log.typed),
-        plural(log.typed, "prompt", "prompts"),
-        thousands(log.machine),
-        plural(log.machine, "notification", "notifications"),
-        thousands(log.textless),
-    ));
+    let days = format!("{} {} (since {})", log.days, plural(log.days as usize, "day", "days"), log.since);
+    match &l.prompt_text {
+        None => out.push_str(&format!(
+            "   match log: {days} · {} typed {}, {} task {} · {} with no text\n",
+            thousands(log.typed),
+            plural(log.typed, "prompt", "prompts"),
+            thousands(log.machine),
+            plural(log.machine, "notification", "notifications"),
+            thousands(log.textless),
+        )),
+        Some(mode) => {
+            let n = log.typed + log.machine + log.textless;
+            out.push_str(&format!("   match log: {days} · {} {} · [log] prompt_text = \"{mode}\"\n", thousands(n), plural(n, "prompt", "prompts")));
+        }
+    }
 
     match &s.dead {
         None => out.push_str(&format!(
@@ -936,15 +973,18 @@ pub fn render(s: &Section) -> String {
         }
     }
 
-    match &s.noisy {
-        None => out.push_str(&format!(
+    match (&s.noisy, &l.prompt_text) {
+        (None, Some(mode)) => out.push_str(&format!(
+            "   noisy: not judged · [log] prompt_text = \"{mode}\" keeps too little of a prompt to tell yours from a task notification\n"
+        )),
+        (None, None) => out.push_str(&format!(
             "   noisy: not judged yet · {} typed {} in the last {} days, fewer than {}\n",
             thousands(log.typed),
             plural(log.typed, "prompt", "prompts"),
             l.dead_days,
             l.noisy_min_prompts
         )),
-        Some(noisy) => {
+        (Some(noisy), _) => {
             out.push_str(&format!(
                 "   noisy (matched by keyword on more than {:.0}% of typed prompts, last {} days): {}\n",
                 l.broad_share * 100.0,
@@ -1002,19 +1042,16 @@ fn dead_line(d: &Dead, days: u64) -> String {
             plural(*rules, "rule", "rules"),
             cmd_test_domain(domain)
         ),
-        Dead::Rule { rule, domain, text, last_served, withheld, own_matchers } => {
+        Dead::Rule { rule, domain, text, last_served, withheld, block, own_matchers } => {
             let last = match last_served {
                 Some(d) => format!("last {d}"),
                 None => "never served in the log".to_string(),
             };
             let next = if *withheld > 0 {
-                format!(
-                    "withheld {withheld} {} by the budget: {}",
-                    plural(*withheld, "time", "times"),
-                    cmd_hooks_show(&format!("{}-rules", crud::slugify(domain)))
-                )
+                let block = block.clone().unwrap_or_else(|| format!("{}-rules", crud::slugify(domain)));
+                format!("withheld {withheld} {} by the budget: {}", plural(*withheld, "time", "times"), cmd_hooks_show(&block))
             } else if *own_matchers {
-                format!("its own matchers did not fire: {}", cmd_test_rule(rule))
+                format!("its own matchers did not serve it: {}", cmd_test_rule(rule))
             } else {
                 format!("check its triggers: {}", cmd_test_domain(domain))
             };
@@ -1024,9 +1061,11 @@ fn dead_line(d: &Dead, days: u64) -> String {
 }
 
 fn noisy_line(n: &Noisy) -> String {
+    let by = |keywords: &[(String, usize)], of: usize| -> String {
+        keywords.iter().take(3).map(|(k, c)| format!("{k} {}", percent(*c, of))).collect::<Vec<_>>().join(", ")
+    };
     match n {
         Noisy::Domain { domain, prompts, of, keywords, rules } => {
-            let by: Vec<String> = keywords.iter().take(3).map(|(k, c)| format!("{k} {}", percent(*c, *of))).collect();
             let next = match keywords.first() {
                 Some((k, _)) => format!("narrow its keywords: {}", cmd_replay_drop(domain, k)),
                 None => format!("check its triggers: {}", cmd_test_domain(domain)),
@@ -1036,20 +1075,11 @@ fn noisy_line(n: &Noisy) -> String {
                 percent(*prompts, *of),
                 thousands(*prompts),
                 thousands(*of),
-                by.join(", "),
+                by(keywords, *of),
                 plural(*rules, "rule", "rules")
             )
         }
-        Noisy::Rule { rule, text, prompts, of } => format!(
-            "     {rule} \"{}\"   {} ({} of {}) · narrow its words: {}\n",
-            clip(text, 40),
-            percent(*prompts, *of),
-            thousands(*prompts),
-            thousands(*of),
-            cmd_test_rule(rule)
-        ),
         Noisy::Decision { decision, name, prompts, of, keywords } => {
-            let by: Vec<String> = keywords.iter().take(3).map(|(k, c)| format!("{k} {}", percent(*c, *of))).collect();
             let next = match keywords.first() {
                 Some((k, _)) => format!(" · narrow its keywords: {}", cmd_replay_decision_drop(decision, k)),
                 None => String::new(),
@@ -1060,7 +1090,7 @@ fn noisy_line(n: &Noisy) -> String {
                 percent(*prompts, *of),
                 thousands(*prompts),
                 thousands(*of),
-                by.join(", ")
+                by(keywords, *of)
             )
         }
     }
@@ -1109,7 +1139,7 @@ pub struct Stats {
     pub rules: Vec<StatsRow>,
 }
 
-/// `base rule stats`: every rule of every domain `domains` holds (or only `domain`'s), with its numbers.
+/// `base rule stats`: every rule in `rules` (or only `domain`'s), with its numbers.
 pub fn stats(scan: &Scan, rules: &[RuleNow], domain: Option<&str>) -> Stats {
     let want = domain.map(crud::slugify);
     let rows = rules
@@ -1129,14 +1159,7 @@ pub fn stats(scan: &Scan, rules: &[RuleNow], domain: Option<&str>) -> Stats {
             }
         })
         .collect();
-    let log = scan.oldest.map(|o| LogSpan {
-        days: scan.days_covered(),
-        since: o.format("%Y-%m-%d").to_string(),
-        typed: scan.typed,
-        machine: scan.machine,
-        textless: scan.textless,
-    });
-    Stats { log, window_days: scan.window_days, rules: rows }
+    Stats { log: scan.log_span(), window_days: scan.window_days, rules: rows }
 }
 
 /// Example 2's table, with one line above it saying what the log covers.
@@ -1185,7 +1208,7 @@ pub fn render_stats(s: &Stats) -> String {
 pub fn stats_for(cwd: &Path, config: &BaseConfig, domain: Option<&str>) -> Stats {
     let domains = crate::domain::load_domains(cwd);
     let store = crate::store::load_merged(cwd);
-    let current = Current::from(&domains, store.as_ref(), config);
+    let current = Current::from(&domains, None);
     let scan = scan(&log_dirs(cwd), Local::now().date_naive(), config.doctor.dead_days, &current);
     let rules = rules_now(&domains, store.as_ref(), config);
     stats(&scan, &rules, domain)
@@ -1198,7 +1221,10 @@ mod tests {
     #[test]
     fn args_are_quoted_only_when_a_shell_needs_it() {
         assert_eq!(arg("tools"), "tools");
+        assert_eq!(arg("tools.1a2b-c_d/e:f"), "tools.1a2b-c_d/e:f");
         assert_eq!(arg("user prompt submit"), "\"user prompt submit\"");
+        assert_eq!(arg("a&b|*.rs"), "\"a&b|*.rs\"");
+        assert_eq!(arg("$HOME it's"), "'$HOME it'\\''s'");
         assert_eq!(cmd_replay_drop("tools", "a b"), "base rule replay --domain tools --drop-keyword \"a b\"");
     }
 
@@ -1210,5 +1236,7 @@ mod tests {
         assert_eq!(s.window_start(), NaiveDate::from_ymd_opt(2026, 9, 4).unwrap());
         let none = Scan { today, window_days: 30, ..Scan::default() };
         assert_eq!(none.days_covered(), 0);
+        let huge = Scan { today, window_days: u64::MAX, ..Scan::default() };
+        assert_eq!(huge.window_start(), NaiveDate::MIN, "a window past the calendar's start is the whole log, not a panic");
     }
 }
