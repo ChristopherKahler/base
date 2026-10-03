@@ -65,6 +65,10 @@ pub struct TierReport {
     /// names, counted by `--fix`'s own link pass ([`crate::fix::corrections_to_link`]). The rest stay corrections
     /// (D18), so doctor names corrections among what `--fix` repairs only when this is above zero (BO-25).
     pub corrections_to_link: usize,
+    /// Why that count could not be made, when the link pass failed. Doctor prints it under the count line rather than
+    /// let a failure read as "nothing to link" (code review, BO-25).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corrections_to_link_error: Option<String>,
     /// Named graphs in this tier that belong to ANOTHER workspace, quad count,
     /// highest first (#142). Empty on a clean tier, so a store with nothing
     /// foreign in it serialises and prints exactly as it did before.
@@ -347,6 +351,7 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
             latest_backup: None,
             supersede_audit: crate::supersede::Audit::default(),
             corrections_to_link: 0,
+            corrections_to_link_error: None,
             quad_count: None,
             backups,
             backup_bytes,
@@ -367,7 +372,7 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
     // Namespace from THIS tier's own base.toml (`<root>/.base/graph.nq` → `<root>`),
     // so a workspace with a custom prefix is read with its own vocabulary rather
     // than the default. Keeps `diagnose_tier` path-scoped — the test-isolation seam.
-    let (schema_version, domain_orphans, supersede_audit, provenance, quad_count, corrections_to_link) = if status == "healthy" {
+    let (schema_version, domain_orphans, supersede_audit, provenance, quad_count, to_link) = if status == "healthy" {
         let root = path.parent().and_then(Path::parent).unwrap_or(path);
         let ns = crate::config::BaseConfig::load(root).namespace;
         match store::load_graph(path) {
@@ -381,24 +386,27 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
                 let quads = s.len().ok();
                 // BO-25 (D18): last, because it takes the store and changes it in
                 // memory. `--fix`'s own link pass says how many of the corrections
-                // naming nothing it would link. A pass that fails counts none, so
-                // doctor offers no repair it cannot vouch for; `--fix` reports the
-                // failure itself.
+                // naming nothing it would link. A pass that fails offers no repair
+                // and says why, under the count line.
                 let to_link = if audit.corrections_naming_nothing > 0 {
-                    crate::fix::corrections_to_link(&ns, s, path).unwrap_or(0)
+                    crate::fix::corrections_to_link(&ns, s, path).map_err(|e| format!("{e:#}"))
                 } else {
-                    0
+                    Ok(0)
                 };
                 (stamp, orphans, audit, provenance, quads, to_link)
             }
-            Err(_) => (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default(), None, 0),
+            Err(_) => (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default(), None, Ok(0)),
         }
     } else {
         // An unparseable tier is already `unhealthy` for a stated reason with a
         // bad line number. Claiming a provenance verdict from a store that never
         // loaded would put a confident zero where the honest answer is "could not
         // look" — the failure this whole lane exists to remove.
-        (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default(), None, 0)
+        (None, Vec::new(), crate::supersede::Audit::default(), GraphProvenance::default(), None, Ok(0))
+    };
+    let (corrections_to_link, corrections_to_link_error) = match to_link {
+        Ok(n) => (n, None),
+        Err(e) => (0, Some(e)),
     };
 
     let latest_backup = snapshots.first().map(|b| b.path.clone()).map(|bpath| {
@@ -423,6 +431,7 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
         entity_composition,
         supersede_audit,
         corrections_to_link,
+        corrections_to_link_error,
         schema_version,
         domain_orphans,
         foreign_graphs: provenance.foreign,
@@ -811,6 +820,11 @@ pub fn format_human(report: &DoctorReport) -> String {
                         "   {} correction(s) name nothing they correct\n",
                         a.corrections_naming_nothing
                     ));
+                    if let Some(e) = &t.corrections_to_link_error {
+                        out.push_str(&format!(
+                            "   ⚠ could not work out which of them `base doctor --fix` would link: {e}\n"
+                        ));
+                    }
                 }
                 if a.status_without_edge > 0 || a.edge_without_status > 0 {
                     // Two numbers, not one: status-without-edge is a pre-0.14.0

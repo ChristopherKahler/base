@@ -235,7 +235,7 @@ fn fix_links_corrections_and_keeps_the_rest() {
     }
 
     let done = ok(&s, &["doctor", "--fix", "--yes"]);
-    assert!(done.contains("3 found: 1 linked, 2 stay corrections (they name no single record; 1 names more than one)"), "{done}");
+    assert!(done.contains("3 found: 1 linked, 2 stay corrections (they name no single record, 1 of them more than one)"), "{done}");
     assert!(!done.contains("plain note"), "{done}");
     let after = text(&graph);
     let has = |line: &str| after.lines().any(|l| l.starts_with(line));
@@ -301,6 +301,36 @@ fn doctor_does_not_offer_to_fix_unlinkable_corrections() {
     let plan = ok(&s, &["doctor", "--fix"]);
     assert!(plan.contains("2 found: 1 linked, 1 stays a correction (it names no single record)"), "{plan}");
     assert!(plan.contains("note/own-note-0-was-wrong corrects note/own-note-0"), "{plan}");
+}
+
+/// R3, when the link pass fails (code review, BO-25): doctor says why under its count line instead of reading the failure
+/// as "nothing to link", offers no repair for corrections, and `--fix` reports the same failure. The failure used here is
+/// the one `link_corrections` refuses: a correction whose type sits in no named graph naming one record.
+#[test]
+fn doctor_names_a_link_pass_it_could_not_finish() {
+    let s = home("link-error");
+    let mut w = Quads::ws("ws");
+    own_records(&mut w, 3);
+    w.typ("decision/base-config.hub-port", "Decision")
+        .lit("decision/base-config.hub-port", "name", "the hub port is 7410")
+        .date("decision/base-config.hub-port", "createdAt", "2026-09-01T09:00:00-05:00");
+    let c = format!("<{NS}note/no-graph-fix>");
+    let mut text = w.out;
+    let _ = writeln!(text, "{c} <{RDF_TYPE}> <{NS}Note> .");
+    let _ = writeln!(text, "{c} <{NS}noteType> \"correction\" .");
+    let _ = writeln!(text, "{c} <{NS}noteText> \"the hub port is 7420 (supersedes base-config.hub-port)\" .");
+    let _ = writeln!(text, "{c} <{NS}createdAt> \"2026-09-02T09:00:00-05:00\"^^<{XSD_DATETIME}> .");
+    write(&ws_graph(&s), &text);
+
+    let report = doctor(&s);
+    assert!(report.contains("1 correction(s) name nothing they correct"), "control:\n{report}");
+    assert!(
+        report.contains("⚠ could not work out which of them `base doctor --fix` would link:") && report.contains("in no named graph"),
+        "the failure is not named:\n{report}"
+    );
+    assert!(!report.contains("corrections to link"), "{report}");
+    let (_, out, err) = run_base(&s, &["doctor", "--fix"]);
+    assert!(format!("{out}{err}").contains("in no named graph"), "--fix does not report the same failure:\n{out}{err}");
 }
 
 /// R3: once `--fix --yes` has linked what it can, a second `--fix` has nothing to do for corrections in either tier, and

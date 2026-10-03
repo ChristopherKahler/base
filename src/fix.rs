@@ -974,23 +974,28 @@ fn row(out: &mut String, label: &str, value: &str) {
     out.push_str(&format!("    {label} {} {value}\n", ".".repeat(dots)));
 }
 
-/// Why the corrections `--fix` does not link stay as they are: `they name no single record` (none, or more than one),
-/// or the split when some name one record that cannot take the edge, each of those listed below the row with why.
+/// Why the corrections `--fix` does not link stay as they are: `they name no single record` (none, or more than one;
+/// how many of them name more than one is said inside that clause, so no correction is counted twice), or the split
+/// when some name one record that cannot take the edge, each of those listed below the row with why.
 fn stay_reasons(c: &Corrections) -> String {
-    let name = |n: usize| if n == 1 { "names" } else { "name" };
-    let unnamed = c.stay.len() - c.refused.len();
     let refused = c.refused.len();
-    let mut why = if refused == 0 {
-        if unnamed == 1 { "it names no single record".to_string() } else { "they name no single record".to_string() }
-    } else if unnamed == 0 {
-        format!("{refused} {} one that cannot take the edge", name(refused))
-    } else {
-        format!("{unnamed} {} no single record, {refused} {} one that cannot take the edge", name(unnamed), name(refused))
+    let unnamed = c.stay.len() - refused;
+    let verb = |n: usize| if n == 1 { "names" } else { "name" };
+    // The corrections that name no single record, as `<subject> <verb> ...`.
+    let unnamed_clause = |subject: &str, v: &str| -> String {
+        match c.several {
+            0 => format!("{subject} {v} no single record"),
+            n if n == unnamed => format!("{subject} {v} more than one record"),
+            n => format!("{subject} {v} no single record, {n} of them more than one"),
+        }
     };
-    if c.several > 0 {
-        why.push_str(&format!("; {} {} more than one", c.several, name(c.several)));
+    if refused == 0 {
+        if unnamed == 1 { unnamed_clause("it", "names") } else { unnamed_clause("they", "name") }
+    } else if unnamed == 0 {
+        format!("{refused} {} one that cannot take the edge", verb(refused))
+    } else {
+        format!("{}, {refused} {} one that cannot take the edge", unnamed_clause(&unnamed.to_string(), verb(unnamed)), verb(refused))
     }
-    why
 }
 
 fn names(list: &[String], max: usize) -> String {

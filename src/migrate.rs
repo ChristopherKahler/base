@@ -455,7 +455,8 @@ pub fn migrate_tiers(cwd: &Path, ns: &NamespaceConfig, trigger: Trigger) -> Vec<
 }
 
 /// The upgrade path's store repair (BO-12, F15e). A store upgraded from 0.15 carries what `base doctor` reports on one
-/// that never left 0.16: corrections that name nothing, another workspace's records, a supersession disagreement,
+/// that never left 0.16: corrections with no link to the one record their text names (every other correction stays a
+/// correction, D18), another workspace's records, a supersession disagreement,
 /// legacy `[signal] max_chars`, graphs never compacted and ten backups a tier. The repair is [`crate::fix::run`], the
 /// function `base doctor --fix` calls, and nothing else, so the two cannot drift: `base graph migrate` plans it and
 /// `base graph migrate --yes` applies it. Whether an upgrade applies it unasked is the 0.16.0 migration walkthrough's
