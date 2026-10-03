@@ -155,6 +155,18 @@ impl PromptBlocks {
         }
     }
 
+    /// [`PromptBlocks::push`], first among the blocks of its priority: the fit keeps push order within a priority, so
+    /// this block prints before the others of its rank (BO-15's correction check reads before the rules it is about).
+    pub fn push_front(&mut self, block: PromptBlock) {
+        let before = self.blocks.len();
+        self.push(block);
+        if self.blocks.len() > before
+            && let Some(b) = self.blocks.pop()
+        {
+            self.blocks.insert(0, b);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }

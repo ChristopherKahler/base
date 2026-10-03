@@ -95,6 +95,10 @@ ops:PaulProject   rdf:type rdfs:Class ;
                   rdfs:label "PaulProject" ;
                   rdfs:comment "A PAUL-managed project indexed read-only from paul.json" .
 
+ops:RuleProposal  rdf:type rdfs:Class ;
+                  rdfs:label "RuleProposal" ;
+                  rdfs:comment "A change to the rules proposed from a user's correction (base rule propose, BO-15), pending review: a keyword gap, a rewrite or a new rule" .
+
 ops:Note          rdf:type rdfs:Class ;
                   rdfs:label "Note" ;
                   rdfs:comment "A structured memory entry with relational edges (base learn)" .
@@ -476,3 +480,81 @@ ops:tasksCompleted rdf:type rdf:Property ;
 
 ops:filesModified rdf:type rdf:Property ;
                   rdfs:comment "Files a PAUL plan modifies" .
+
+# ─── Rule proposals (BO-15, K3) ───────────────────────────
+# One correction, sorted, waiting for review: ops:proposal/p-NNNN.
+
+ops:proposalId    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The proposal's id, p-NNNN" .
+
+ops:proposalKind  rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "keyword-gap, rewrite or new-rule" .
+
+ops:meaning       rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "What the AI's marker said: wrong, misread, unmarked or manual" .
+
+ops:targetKind    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "What the proposal changes: domain, rule or decision" .
+
+ops:targetId      rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The domain's name, <domain>.<id> for a rule, a decision's slug" .
+
+ops:targetDomain  rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The domain the target belongs to" .
+
+ops:targetText    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "What the target says now" .
+
+ops:proposedText  rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "A new rule's wording, or a rewrite's" .
+
+ops:proposedKeyword rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "One keyword the proposal adds" .
+
+ops:firesOn       rdf:type rdf:Property ;
+                  rdfs:comment "A prompt that must serve the rule (BO-14), or a proposal's first such test" .
+
+ops:triggerPrompt rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The prompt that corrected the AI, secrets scrubbed" .
+
+ops:markerLine    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The line the AI's reply started with its marker (UPDATED:, CORRECTED:, MISREAD:)" .
+
+ops:signal        rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "One correction signal that fired, as printed: C1 phrase, C2 interrupt, C3 UPDATED" .
+
+ops:fromSession   rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The session the correction came from" .
+
+ops:fromTitle     rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "That session's relay codename, when it had one" .
+
+ops:fromTurn      rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The prompt number of the correcting turn" .
+
+ops:candidate     rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "A rule or decision the sort considered, with its score" .
+
+ops:fingerprint   rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "Kind, target and change, hashed: a rejected proposal is never offered again (BO-16)" .
+
+ops:turnKey       rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "Session and prompt, hashed: one proposal per turn" .

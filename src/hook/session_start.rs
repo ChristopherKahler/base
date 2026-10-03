@@ -130,6 +130,14 @@ pub fn handle(
         _ => {}
     }
 
+    // BO-15, C3 for every user (Round 2): when no CLAUDE.md this session loads asks the AI to mark a corrected reply,
+    // session start carries the line instead, once per session. Chris's T2 asks for UPDATED:, so his sessions never
+    // carry it (D10). And the correction detector's cursor files past `[log] prompt_days` go.
+    if let Some(line) = crate::corrections::claude_md::session_start_line(config, cwd) {
+        out.push("corrections", &format!("{line}\n"), 1);
+    }
+    crate::corrections::prune_state(config.log.prompt_days);
+
     // Every app gets a code map the first time a session opens in it — a
     // marked repo, or a bare folder of source files nobody has `git init`ed
     // yet — and a refresh when it has one (Chris, 2026-09-01: "anytime a dev
@@ -344,7 +352,7 @@ fn push_global_decisions(graph: Option<&oxigraph::store::Store>, cwd: &Path, con
 /// pulse last, and the relay wake contract outlasts the operator profile and the notices. A kind
 /// missing from this table sorts after all of it, and `every_pushed_kind_has_a_place_in_the_layout`
 /// fails the build when one does.
-pub const LAYOUT: [(&str, Rank); 33] = [
+pub const LAYOUT: [(&str, Rank); 34] = [
     ("instructions", Rank::Pinned),
     ("graph-unhealthy", Rank::DueNow),
     ("reminders", Rank::DueNow),
@@ -375,6 +383,8 @@ pub const LAYOUT: [(&str, Rank); 33] = [
     ("extensions", Rank::Tail),
     ("queries", Rank::Tail),
     ("flow-protocol", Rank::Tail),
+    // BO-15: the CORRECTED line for a CLAUDE.md that asks for no correction marker, beside the other behaviour rules.
+    ("corrections", Rank::Tail),
     ("auto-compact", Rank::Tail),
     ("migrate", Rank::Tail),
     ("hooks-wired", Rank::Tail),

@@ -25,6 +25,7 @@ pub fn run(
     skip_hooks: bool,
     full: bool,
     starter: StarterCommands,
+    corrections: crate::corrections::claude_md::Choice,
 ) -> Result<()> {
     let home = crate::home::home_root().context("Cannot determine home directory")?;
     let binary_path = std::env::current_exe().context("Cannot determine binary path")?;
@@ -97,6 +98,12 @@ pub fn run(
     // Step 8: Append BASE CLI section to ~/.claude/CLAUDE.md
     let claude_md = home.join(".claude").join("CLAUDE.md");
     append_claude_md(&claude_md)?;
+
+    // Step 8b (BO-15, C3 for every user): one line asking the AI to start a corrected reply with CORRECTED:, offered
+    // when the user's CLAUDE.md asks for no marker. Declined, or no terminal to ask on: session start carries it.
+    let offered =
+        crate::corrections::claude_md::offer(&claude_md, corrections, crate::corrections::claude_md::ask_on_terminal);
+    println!("{}\n", crate::corrections::claude_md::report(&offered));
 
     // #93: step 3 could not wire because ~/.claude did not exist yet. Steps 7
     // and 8 have since created it — for base's own bundled skill, then for
@@ -325,10 +332,19 @@ fn remove_claude_md_section(claude_md_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(claude_md_path)?;
+    let original = std::fs::read_to_string(claude_md_path)?;
+    // The corrections line base offered at install (BO-15) goes with the section.
+    let content = crate::corrections::claude_md::remove_line(&original);
 
     if !content.contains("## BASE CLI") {
-        println!("not present — skipped");
+        if content != original {
+            let tmp = claude_md_path.with_extension("md.tmp");
+            std::fs::write(&tmp, &content)?;
+            std::fs::rename(&tmp, claude_md_path)?;
+            println!("✓ removed the corrections line (no BASE CLI section)");
+        } else {
+            println!("not present — skipped");
+        }
         return Ok(());
     }
 
@@ -582,6 +598,25 @@ prompt_text = "full"
 # are flagged as undated.
 [doctor]
 stale_next_days = 14
+
+# ─── [corrections] — noticing when you correct the AI ────────
+# No one signal decides. A phrase in your prompt (phrases), what you did (an
+# interrupt, a refused tool call, a file the AI wrote changed after its turn,
+# the same request again) and the AI's own marker at the start of a reply line
+# (markers) each flag a turn; the next prompt then asks the AI, in one line,
+# to run `base rule propose --from-turn` if it was a correction. Every flag is
+# a row in .base/match-log.jsonl (`base log corrections`).
+# markers: UPDATED and CORRECTED mean the AI was wrong, MISREAD that it
+# misunderstood, DEFERRED that it held its position (logged, never proposed).
+# repeat_similarity: the share of words two prompts in a row must share to
+# count as the same request again.
+[corrections]
+enabled = true
+phrases = ["no,", "wrong", "that's not", "not what i asked", "i told you", "i've said", "i said", "again", "quit",
+           "stop doing", "don't", "never", "why did you", "fuck", "fucking", "fucked", "shit", "bullshit", "damn",
+           "dammit", "goddamn", "wtf", "ffs", "crap"]
+markers = ["CORRECTED:", "UPDATED:", "MISREAD:", "DEFERRED:"]
+repeat_similarity = 0.5
 
 # ─── [sync] — graph extraction globs ─────────────────────────
 # Which files `base sync` reads to extract metadata/AST into the graph.
@@ -1622,7 +1657,7 @@ The `base` binary is on PATH. Use these commands proactively during sessions —
 | Discover which apps have a code map | `base ast list` |
 | A decision is made (architectural, process, tooling) | `base decision log --domain X --decision "..." --rationale "..."` |
 | An insight, correction, or lesson emerges | `base learn --text "..." --domain X --type insight\|correction\|decision` |
-| User defines or refines a behavioral rule | `base rule add --domain X --text "..."` |
+| User defines or refines a behavioral rule | `base rule add --domain X --text "..." --keywords "a, b" --fires-on "<the user's prompt>"` |
 | Before making assumptions about prior context | `base recall --keyword "..."` or `base recall --domain X` |
 | User asks to scaffold a new workspace | `base scaffold [path]` |
 
@@ -1680,7 +1715,7 @@ Config: `[defer] enabled` (off unless set), `mode` (`"asset"` or `"global"`), `g
 - `base recall --keyword "..." [--domain X]` — graph-backed relational search
 - `base decision log --domain X --decision "..." --rationale "..."` — log a decision
 - `base decision search --keyword "..."` — find prior decisions
-- `base rule add --domain X --text "..."` — add a rule to a domain
+- `base rule add --domain X --text "..." --keywords "a, b" --fires-on "<prompt>"` — add a rule to a domain; inside a session it needs the words from the prompt that should bring it back and that prompt as its first test (a rule for file work also takes `--path`)
 
 ### Sync & dashboard
 

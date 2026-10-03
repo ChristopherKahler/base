@@ -13,6 +13,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base hooks show`
 - `base log`
 - `base log matches`
+- `base log corrections`
 - `base ast` (alias: a)
 - `base ast query` (alias: q)
 - `base ast list` (alias: l)
@@ -119,6 +120,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base changes`
 - `base rule`
 - `base rule add`
+- `base rule propose`
 - `base rule update`
 - `base rule test`
 - `base rule list`
@@ -314,8 +316,9 @@ Read base's own logs: `base log matches` shows what prompts and file touches mat
 Usage: base log <COMMAND>
 
 Commands:
-  matches  What each prompt and file touch matched, by what, and what was served and cut: the last rows of .base/match-log.jsonl, oldest first
-  help     Print this message or the help of the given subcommand(s)
+  matches      What each prompt and file touch matched, by what, and what was served and cut: the last rows of .base/match-log.jsonl, oldest first
+  corrections  What base noticed as possible corrections: a session's signal rows, or a transcript read turn by turn as the hooks read it
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -343,6 +346,27 @@ Options:
 
       --json
           Print the rows as JSON, one per line
+
+  -h, --help
+          Print help
+```
+
+## base log corrections
+
+```text
+What base noticed as possible corrections: a session's signal rows, or a transcript read turn by turn as the hooks read it
+
+Usage: base log corrections [OPTIONS]
+
+Options:
+      --session <SESSION>
+          This session's rows (an id, or the start of one); the default is the session running the command
+
+      --transcript <TRANSCRIPT>
+          Read this transcript turn by turn instead of the logged rows
+
+      --json
+          Print JSON, one object per line
 
   -h, --help
           Print help
@@ -2532,12 +2556,13 @@ Manage rules in the graph (add, list, remove)
 Usage: base rule [OPTIONS] <COMMAND>
 
 Commands:
-  add     Add a rule to a domain in the graph
-  update  Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
-  test    Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
-  list    List rules for a domain from the graph
-  remove  Remove a rule by index from a domain
-  help    Print this message or the help of the given subcommand(s)
+  add      Add a rule to a domain in the graph
+  propose  Turn a correction into a pending rule proposal: read the turn (the prompt, the AI's marker, the signals) and sort it as a keyword gap, a rewrite or a new rule
+  update   Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
+  test     Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
+  list     List rules for a domain from the graph
+  remove   Remove a rule by index from a domain
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
   -g, --global
@@ -2592,11 +2617,64 @@ Options:
       --words <WORDS>
           Topic words and phrases, comma-separated: "ping chris, relay ping". Makes it a topic rule
 
+      --keywords <KEYWORDS>
+          Words from the user's prompt that should bring this rule back, comma-separated: the rule's own topic words, as --words. Required with --fires-on inside a Claude Code session (CLAUDECODE=1). A rule with words of its own is served on them, and on the paths it names with --path, never through its domain's keywords or folder: for a rule about file work, give --path as well
+
       --fires-on <FIRES_ON>
           A prompt that must serve this rule (repeatable, at most 3); `base rule test` checks it
 
       --quiet-on <QUIET_ON>
           A prompt that must not serve this rule (repeatable, at most 2); `base rule test` checks it
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule propose
+
+```text
+Turn a correction into a pending rule proposal: read the turn (the prompt, the AI's marker, the signals) and sort it as a keyword gap, a rewrite or a new rule
+
+Usage: base rule propose [OPTIONS]
+
+Options:
+      --from-turn
+          Read the correction from this session's turn: its last prompt typed by a person, and the reply after it
+
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+      --text <TEXT>
+          The rule's wording: required for a new rule, the new wording for a rewrite
+
+      --keywords <KEYWORDS>
+          Words from the prompt that should bring the rule back, comma-separated (suggested from the prompt when left out)
+
+      --example <EXAMPLE>
+          The prompt the change must serve on, its first fires_on test (default: the turn's prompt)
+
+      --rule <RULE>
+          The rule the correction is about, as `base rule list` prints it: <domain>.<id>
+
+      --decision <DECISION>
+          The decision the correction is about: its slug
+
+      --new
+          No rule or decision base holds fits: propose a new rule
+
+      --domain <DOMAIN>
+          The domain a new rule goes into (default: one the prompt matched, else the closest record's)
+
+      --dry-run
+          Print the proposal and write nothing
+
+      --transcript <TRANSCRIPT>
+          Read this transcript instead of this session's
+
+      --prompt <PROMPT>
+          The n-th prompt typed by a person in the transcript, instead of the last
 
   -h, --help
           Print help (see a summary with '-h')
@@ -2723,6 +2801,12 @@ Options:
 
       --no-starter-commands
           Skip the starter star commands without asking
+
+      --corrections-line
+          Add the line that asks the AI to start a corrected reply with CORRECTED: to ~/.claude/CLAUDE.md, without asking
+
+      --no-corrections-line
+          Leave CLAUDE.md without that line, without asking; session start carries it instead
 
   -h, --help
           Print help

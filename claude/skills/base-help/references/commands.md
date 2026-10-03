@@ -31,6 +31,7 @@ base changes [-g] [--since <offset>] [--cursor]   # graph write log as JSON; --c
 base hooks manifest                      # base's hook wiring as JSON, for an installer outside base
 base hooks show [<block>] [--session <id>]   # one block of this session's last prompt-hook output; no block: list them
 base log matches [--last <n>] [--session <id>] [--rule <id>] [--json]   # what each prompt and file touch matched, by what, and what was served and cut
+base log corrections [--session <id>] [--transcript <path>] [--json]   # what base flagged as possible corrections: this session's signal rows, or a whole transcript read turn by turn as the hooks read it
 ```
 
 Projects, milestones, tasks (read side):
@@ -113,6 +114,8 @@ base decision update <slug> [--name "..."] [--rationale "..."] [--recall "..."] 
 base rule add --domain X --text "..."    # global tier: -g goes on `rule`, BEFORE the verb (base rule -g add ...)
 base rule add --domain X --text "..." --fires-on "<prompt>" --quiet-on "<prompt>"   # with test prompts (at most 3 and 2)
 base rule update <domain>.<id> --fires-on "<prompt>" --quiet-on "<prompt>" [--clear-tests]   # add test prompts where the rule lives; the id is in `base rule list`
+base rule add --domain X --text "..." --keywords "a, b" --fires-on "<prompt>"   # inside a Claude Code session both are required; the keywords become the rule's own words
+base rule propose --from-turn [--text "..."] [--keywords "a, b"] [--example "<prompt>"] [--rule <domain>.<id>] [--decision <slug>] [--new] [--domain X] [--dry-run]   # this turn's correction as a pending proposal: keyword gap, rewrite or new rule
 base rule remove --domain X --index <N>   # by INDEX, not by text; get N from `base rule list --domain X`
 ```
 

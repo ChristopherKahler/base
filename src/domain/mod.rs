@@ -1,3 +1,4 @@
+pub mod bm25;
 pub mod global_decisions;
 pub mod link;
 pub mod matcher;

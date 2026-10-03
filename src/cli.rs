@@ -55,6 +55,19 @@ pub enum LogAction {
         #[arg(long)]
         json: bool,
     },
+    /// What base noticed as possible corrections: a session's signal rows, or a transcript read turn by turn as the
+    /// hooks read it
+    Corrections {
+        /// This session's rows (an id, or the start of one); the default is the session running the command
+        #[arg(long)]
+        session: Option<String>,
+        /// Read this transcript turn by turn instead of the logged rows
+        #[arg(long, conflicts_with = "session")]
+        transcript: Option<String>,
+        /// Print JSON, one object per line
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -282,6 +295,12 @@ pub enum Commands {
         /// Skip the starter star commands without asking
         #[arg(long, conflicts_with = "starter_commands")]
         no_starter_commands: bool,
+        /// Add the line that asks the AI to start a corrected reply with CORRECTED: to ~/.claude/CLAUDE.md, without asking
+        #[arg(long)]
+        corrections_line: bool,
+        /// Leave CLAUDE.md without that line, without asking; session start carries it instead
+        #[arg(long, conflicts_with = "corrections_line")]
+        no_corrections_line: bool,
     },
     /// What to read once base is installed: workspaces, relay, star commands, CARL
     #[command(long_about = base::first_run::GETTING_STARTED)]
@@ -1396,12 +1415,55 @@ pub enum RuleAction {
         /// Topic words and phrases, comma-separated: "ping chris, relay ping". Makes it a topic rule
         #[arg(long)]
         words: Option<String>,
+        /// Words from the user's prompt that should bring this rule back, comma-separated: the rule's own topic
+        /// words, as --words. Required with --fires-on inside a Claude Code session (CLAUDECODE=1). A rule with words
+        /// of its own is served on them, and on the paths it names with --path, never through its domain's keywords
+        /// or folder: for a rule about file work, give --path as well
+        #[arg(long)]
+        keywords: Option<String>,
         /// A prompt that must serve this rule (repeatable, at most 3); `base rule test` checks it
         #[arg(long)]
         fires_on: Vec<String>,
         /// A prompt that must not serve this rule (repeatable, at most 2); `base rule test` checks it
         #[arg(long)]
         quiet_on: Vec<String>,
+    },
+    /// Turn a correction into a pending rule proposal: read the turn (the prompt, the AI's marker, the signals) and
+    /// sort it as a keyword gap, a rewrite or a new rule
+    Propose {
+        /// Read the correction from this session's turn: its last prompt typed by a person, and the reply after it
+        #[arg(long)]
+        from_turn: bool,
+        /// The rule's wording: required for a new rule, the new wording for a rewrite
+        #[arg(long)]
+        text: Option<String>,
+        /// Words from the prompt that should bring the rule back, comma-separated (suggested from the prompt when left out)
+        #[arg(long)]
+        keywords: Option<String>,
+        /// The prompt the change must serve on, its first fires_on test (default: the turn's prompt)
+        #[arg(long)]
+        example: Option<String>,
+        /// The rule the correction is about, as `base rule list` prints it: <domain>.<id>
+        #[arg(long, conflicts_with_all = ["decision", "new"])]
+        rule: Option<String>,
+        /// The decision the correction is about: its slug
+        #[arg(long, conflicts_with = "new")]
+        decision: Option<String>,
+        /// No rule or decision base holds fits: propose a new rule
+        #[arg(long)]
+        new: bool,
+        /// The domain a new rule goes into (default: one the prompt matched, else the closest record's)
+        #[arg(long)]
+        domain: Option<String>,
+        /// Print the proposal and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Read this transcript instead of this session's
+        #[arg(long, requires = "from_turn")]
+        transcript: Option<String>,
+        /// The n-th prompt typed by a person in the transcript, instead of the last
+        #[arg(long, requires = "from_turn")]
+        prompt: Option<u32>,
     },
     /// Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
     Update {
@@ -1993,6 +2055,40 @@ pub fn run() {
                     Err(why) => {
                         eprintln!("base log matches: {why}");
                         std::process::exit(1);
+                    }
+                }
+            }
+            // BO-15: the correction signals, logged by the hooks or read from a transcript the same way.
+            LogAction::Corrections { session, transcript, json } => {
+                if let Some(path) = transcript {
+                    let events = match base::domain::transcript::read_all(std::path::Path::new(&path)) {
+                        Ok(e) => e,
+                        Err(e) => die("base log corrections", format!("{path}: {e}")),
+                    };
+                    let turns = base::corrections::turns(events, &config.corrections);
+                    if json {
+                        for t in &turns {
+                            println!("{}", base::corrections::turn_json(t));
+                        }
+                    } else {
+                        print!("{}", base::corrections::render_turns(&turns, &path));
+                    }
+                } else {
+                    let Some(sid) = session.or_else(base::relay::env_session_id) else {
+                        die("base log corrections", "no session: give --session <id> or --transcript <path>");
+                    };
+                    let rows: Vec<base::emit::match_log::Row> = base::corrections::propose::session_rows(&cwd, &sid)
+                        .into_iter()
+                        .filter(|r| r.event == "signal")
+                        .collect();
+                    if rows.is_empty() {
+                        eprintln!("base log corrections: no signal rows for session {sid}");
+                    } else if json {
+                        for row in &rows {
+                            println!("{}", serde_json::to_string(row).unwrap_or_default());
+                        }
+                    } else {
+                        print!("{}", base::emit::match_log::format_rows(&rows, chrono::Local::now().date_naive()));
                     }
                 }
             }
@@ -3759,7 +3855,28 @@ pub fn run() {
         Some(Commands::Rule { global, action }) => {
             let rule_cwd = tier_cwd(&cwd, global);
             match action {
-                RuleAction::Add { domain: name, text, rationale, supersedes, kind, place, path, tool, command, words, fires_on, quiet_on } => {
+                RuleAction::Add { domain: name, text, rationale, supersedes, kind, place, path, tool, command, words, keywords, fires_on, quiet_on } => {
+                    // K3 (BO-15): a rule the AI adds inside a Claude Code session arrives with triggers and a test.
+                    // `--words` is the same list as `--keywords`, so either one carries the triggers.
+                    let no_words = |w: &Option<String>| w.as_deref().is_none_or(|k| k.trim().is_empty());
+                    if std::env::var("CLAUDECODE").is_ok_and(|v| v == "1")
+                        && ((no_words(&keywords) && no_words(&words)) || fires_on.is_empty())
+                    {
+                        die(
+                            "Error",
+                            "base rule add inside a Claude Code session (CLAUDECODE=1) needs --keywords \"a, b\" (words \
+                             from the user's prompt that should bring this rule back) and --fires-on \"<that prompt>\" \
+                             (its first test), so every rule an AI adds arrives with triggers and a test. A rule with \
+                             words of its own is served on them and on the paths it names with --path, never through \
+                             its domain's keywords or folder: for a rule about file work, give --path <file or folder> \
+                             as well. Nothing was written.",
+                        );
+                    }
+                    // `--keywords` is the same list `--words` takes; both given, both count.
+                    let words = match (words, keywords) {
+                        (Some(w), Some(k)) => Some(format!("{w}, {k}")),
+                        (w, k) => w.or(k),
+                    };
                     let name = domain::canonical_name(&cwd, &name);
                     // P7: a --path is a place written as its full path, checked to lie inside the domain's project.
                     let mut place = place;
@@ -3800,6 +3917,27 @@ pub fn run() {
                             }
                         }
                         Err(e) => die("Failed", e),
+                    }
+                }
+                RuleAction::Propose { from_turn, text, keywords, example, rule, decision, new, domain, dry_run, transcript, prompt } => {
+                    // K3 (BO-15): one correction, sorted, kept for review. Read and written from where the session
+                    // stands; `-g` does not move it.
+                    let args = base::corrections::propose::Args {
+                        from_turn,
+                        text,
+                        keywords,
+                        example,
+                        rule,
+                        decision,
+                        new,
+                        domain,
+                        dry_run,
+                        transcript,
+                        prompt,
+                    };
+                    match base::corrections::propose::run(&config, &cwd, &args) {
+                        Ok(p) => print!("{}", base::corrections::propose::render(&p, dry_run)),
+                        Err(msg) => die("Error", msg),
                     }
                 }
                 RuleAction::Update { rule, fires_on, quiet_on, clear_tests } => {
@@ -4099,14 +4237,19 @@ pub fn run() {
         }
 
         // ─── Install ─────────────────────────────────────────
-        Some(Commands::Install { carl, skip_hooks, full, starter_commands, no_starter_commands }) => {
+        Some(Commands::Install { carl, skip_hooks, full, starter_commands, no_starter_commands, corrections_line, no_corrections_line }) => {
             let carl_path = carl.as_ref().map(std::path::Path::new);
             let starter = match (starter_commands, no_starter_commands) {
                 (true, _) => base::install::StarterCommands::Yes,
                 (_, true) => base::install::StarterCommands::No,
                 _ => base::install::StarterCommands::Ask,
             };
-            if let Err(e) = base::install::run(carl_path, skip_hooks, full, starter) {
+            let corrections = match (corrections_line, no_corrections_line) {
+                (true, _) => base::corrections::claude_md::Choice::Yes,
+                (_, true) => base::corrections::claude_md::Choice::No,
+                _ => base::corrections::claude_md::Choice::Ask,
+            };
+            if let Err(e) = base::install::run(carl_path, skip_hooks, full, starter, corrections) {
                 eprintln!("Install failed: {e}");
             }
         }

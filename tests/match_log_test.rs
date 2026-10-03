@@ -48,6 +48,8 @@ impl Home {
             .env("BASE_AST_NO_SPAWN", "1")
             .env("BASE_NO_WAKE_NUDGE", "1")
             .env("BASE_NO_AUTONAME", "1")
+            // `CLAUDECODE=1` (a run inside Claude Code) makes `rule add` require keywords and a test prompt (BO-15).
+            .env_remove("CLAUDECODE")
             .env_remove("BASE_RELAY_AS")
             .env_remove("BASE_HEADLESS")
             .env_remove("WT_SESSION")

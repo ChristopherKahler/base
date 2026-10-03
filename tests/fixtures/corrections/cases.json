@@ -1,0 +1,172 @@
+{
+  "about": "BO-15's correction detector cases. Each case is a short session (events, in Claude Code's real transcript shapes via tests/transcripts/mod.rs) and what the detector must find: `expect` maps a turn number (every prompt counts, task notifications too) to the exact signals of that turn as 'LAYER kind'; a turn not listed has none. `checks` lists the turns whose prompt carries the C4 line. Every text is made up. BO-17's backstop adds a case here for each correction the detector missed.",
+  "cases": [
+    {
+      "name": "c1-phrase-flags-a-later-prompt",
+      "events": [
+        {"prompt": "set up the release notes for the dashboard"},
+        {"text": "Here is a first draft of the release notes."},
+        {"prompt": "no, that's not what I asked for"},
+        {"text": "Rewriting them as a changelog."}
+      ],
+      "expect": {"2": ["C1 phrase"]},
+      "checks": [2]
+    },
+    {
+      "name": "c1-skips-a-sessions-first-prompt",
+      "events": [
+        {"prompt": "never commit to main and don't force push; set up the branch"},
+        {"text": "Branch made."}
+      ],
+      "expect": {},
+      "checks": []
+    },
+    {
+      "name": "c1-skips-a-task-notification",
+      "events": [
+        {"prompt": "start the build"},
+        {"text": "Started."},
+        {"notification": "build ping: that's wrong, the step failed again"},
+        {"text": "Noted."}
+      ],
+      "expect": {},
+      "checks": []
+    },
+    {
+      "name": "example-4-interrupt-then-a-plain-correction",
+      "events": [
+        {"prompt": "add the retry to the loader"},
+        {"edit": "C:/work/src/loader.rs"},
+        "interrupt_tool_use",
+        {"prompt": "use the other file"},
+        {"text": "Moving the retry to src/fetch.rs."}
+      ],
+      "expect": {"1": ["C2 interrupt"]},
+      "checks": [2]
+    },
+    {
+      "name": "a-plain-interrupt",
+      "events": [
+        {"prompt": "summarise the open tickets"},
+        {"text": "There are twelve open tickets"},
+        "interrupt",
+        {"prompt": "only the ones assigned to me"}
+      ],
+      "expect": {"1": ["C2 interrupt"]},
+      "checks": [2]
+    },
+    {
+      "name": "a-user-denial",
+      "events": [
+        {"prompt": "clean the build folder"},
+        "denial",
+        {"prompt": "do it with the cleanup script instead"},
+        {"text": "Running the script."}
+      ],
+      "expect": {"1": ["C2 denial"]},
+      "checks": [2]
+    },
+    {
+      "name": "a-rule-denial-is-not-the-user",
+      "events": [
+        {"prompt": "clean the build folder"},
+        "rule_denial",
+        {"text": "A project rule blocked that; using the script."},
+        {"prompt": "carry on"}
+      ],
+      "expect": {},
+      "checks": []
+    },
+    {
+      "name": "a-read-of-a-document-holding-the-strings",
+      "events": [
+        {"prompt": "read the detector notes"},
+        {"read": {"file": "C:/work/notes/detector.md", "content": "[Request interrupted by user]\nThe user doesn't want to proceed with this tool use.\nUPDATED: an example of a marker line"}},
+        {"text": "The notes describe three signals."},
+        {"prompt": "next step"}
+      ],
+      "expect": {},
+      "checks": []
+    },
+    {
+      "name": "t2-rule-text-in-injected-context-is-not-a-marker",
+      "events": [
+        {"instructions": "### T2: position changes are audited\n\nWhen you change a stated position, print exactly one of:\n\nUPDATED: <the new argument>\nMISREAD: <what I took you to mean>\nDEFERRED: <claim> held\n"},
+        {"prompt": "is the cache still warm"},
+        {"hook_context": "[BRACKET RULES]\nUPDATED: <the evidence that moved me>\nMISREAD: <what I misread>"},
+        {"reminder": "UPDATED: a reminder that quotes the rule"},
+        {"read": {"file": "C:/work/CLAUDE.md", "content": "UPDATED: <the new argument>"}},
+        {"text": "Yes. Your rules make me print `UPDATED:` or `MISREAD:` when I change position, and none applies here."},
+        {"text": "```\nUPDATED: what a marked reply would look like\n```\nNo marker is needed."},
+        {"prompt": "thanks"}
+      ],
+      "expect": {},
+      "checks": []
+    },
+    {
+      "name": "thinking-and-a-subagent-are-not-the-reply",
+      "events": [
+        {"prompt": "check the migration"},
+        {"thinking": "UPDATED: thinking about whether I was wrong"},
+        {"sidechain_text": "UPDATED: a subagent's own note"},
+        {"text": "The migration ran."},
+        {"prompt": "good"}
+      ],
+      "expect": {},
+      "checks": []
+    },
+    {
+      "name": "each-marker-in-its-own-turn",
+      "events": [
+        {"prompt": "which port does the server use"},
+        {"text": "It uses 8080."},
+        {"prompt": "check the config, it changed last week"},
+        {"text": "UPDATED: the config now sets 8443, so the server uses 8443."},
+        {"prompt": "and the proxy"},
+        {"text": "**CORRECTED:** the proxy forwards to 8443 as well."},
+        {"prompt": "I meant the staging proxy"},
+        {"text": "MISREAD: I read that as production. Staging forwards to 9000."},
+        {"prompt": "are you sure it is 9000"},
+        {"text": "DEFERRED: 9000 stands; the staging file was read today, no new evidence."}
+      ],
+      "expect": {"2": ["C3 UPDATED"], "3": ["C3 CORRECTED"], "4": ["C3 MISREAD"], "5": ["C3 DEFERRED"]},
+      "checks": []
+    },
+    {
+      "name": "the-same-request-again",
+      "events": [
+        {"prompt": "you can close down all of the infra for this, off for the weekend"},
+        {"text": "Closing down"},
+        "interrupt",
+        {"prompt": "close down all infra, off for weekend"},
+        {"text": "All of it is stopped."}
+      ],
+      "expect": {"1": ["C2 interrupt"], "2": ["C2 repeat"]},
+      "checks": [2]
+    },
+    {
+      "name": "a-file-the-ai-wrote-changed-before-the-next-reply",
+      "events": [
+        {"prompt": "write the plan for the import"},
+        {"write": "C:/work/notes/plan.md"},
+        {"text": "The plan is in notes/plan.md."},
+        {"prompt": "look at the plan once more"},
+        {"file_changed": "C:/work/notes/plan.md"},
+        {"text": "You moved step 3 first; following that order."}
+      ],
+      "expect": {"1": ["C2 file-edited"]},
+      "checks": [2]
+    },
+    {
+      "name": "example-1-shape",
+      "events": [
+        {"prompt": "what version is installed"},
+        {"text": "The installed release is 0.15.2."},
+        {"prompt": "The installed version is not 0.15.2. It is a local dev build of 0.16.0. Now, quit trying to correct me."},
+        {"text": "UPDATED: you built and installed base from your 0.16.0 dev tree; --version prints 0.15.2 only because the version is bumped at release."}
+      ],
+      "expect": {"2": ["C1 phrase", "C3 UPDATED"]},
+      "checks": [2]
+    }
+  ]
+}

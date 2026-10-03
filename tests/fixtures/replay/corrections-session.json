@@ -1,0 +1,57 @@
+{
+  "about": "BO-15's replay corpus session (tests/replay_test.rs, replay_corrections_from_a_transcript): one session in the event language of tests/transcripts/mod.rs (Claude Code 2.1.288 line shapes), fed turn by turn through the real prompt and Stop hooks. Every prompt counts as a turn, the task notification too. `{ws}` is the seeded workspace. A `file_changed` event says the user changed that file between the turn before and this prompt: the test changes it there, and Claude Code's own note of it is the event. A turn that ends with an interrupt or a refusal gets no Stop hook, as in Claude Code. T2's rule text arrives in CLAUDE.md, hook output, a reminder, a Read result, a thinking block and a subagent's text, each with markers at line starts, and never counts. `expect` is every turn's signals as 'LAYER kind' (a turn not listed has none); `checks` the prompts that carry the C4 line. Synthetic; no real names.",
+  "session": "b015b015-0000-4000-8000-000000000150",
+  "events": [
+    {"instructions": "# Working rules\n\nWhen you change position after pushback, print exactly one of:\n\nUPDATED: <the new argument or evidence that moved me>\nMISREAD: <what I originally took you to mean>\nDEFERRED: <claim>, was N/5, now M/5, no new evidence. Original position stands.\n\nCORRECTED: <what you got wrong>"},
+    {"prompt": "don't touch main; write the staging proxy config"},
+    {"hook_context": "[BRACKET RULES]\nUPDATED: <the new argument> is printed when a position changes.\nMISREAD: <what was misread>"},
+    {"write": "{ws}/proxy.toml"},
+    {"text": "The staging proxy config is written, listening on 8080."},
+
+    {"prompt": "no, that's wrong: the staging proxy listens on 9000, I changed the file"},
+    {"file_changed": "{ws}/proxy.toml"},
+    {"reminder": "UPDATED: <evidence> is the marker for a changed position.\nDEFERRED: <claim> when the position stands."},
+    {"text": "UPDATED: the staging proxy listens on 9000; I had the old port from the template."},
+
+    {"prompt": "now clear out the old build folder"},
+    "denial",
+    "interrupt_tool_use",
+
+    {"prompt": "keep the build folder, clear only the temp files"},
+    {"thinking": "UPDATED: the build folder stays."},
+    {"sidechain_text": "MISREAD: a subagent's own note."},
+    {"text": "Your rules make me print `UPDATED:` or `MISREAD:` when I change position, and neither applies here.\n```\nUPDATED: an example of the marker\n```\nClearing the temp files only."},
+
+    {"prompt": "summarise the open tickets"},
+    {"text": "There are twelve open tickets"},
+    "interrupt",
+
+    {"notification": "build finished"},
+    {"text": "The build finished."},
+
+    {"prompt": "only the ones assigned to me"},
+    {"write": "{ws}/mine.md"},
+    {"text": "MISREAD: I read open tickets as the whole team's; you meant yours. Three are assigned to you."},
+
+    {"prompt": "are you sure the staging port is 9000?"},
+    {"text": "DEFERRED: 9000 stands, was 5/5, now 5/5, no new evidence. Original position stands."},
+
+    {"prompt": "close down the staging proxy and the database for the weekend"},
+    {"read": {"file": "{ws}/notes.md", "content": "Marker notes\nUPDATED: <the new argument>\nThe user doesn't want to proceed with this tool use.\n[Request interrupted by user]"}},
+    "rule_denial",
+    {"text": "Closing down the staging proxy and the database."},
+
+    {"prompt": "close down staging proxy and database for weekend"},
+    {"text": "Both are already closed down."}
+  ],
+  "expect": {
+    "1": ["C2 file-edited"],
+    "2": ["C1 phrase", "C3 UPDATED"],
+    "3": ["C2 denial", "C2 interrupt"],
+    "5": ["C2 interrupt"],
+    "7": ["C3 MISREAD"],
+    "8": ["C3 DEFERRED"],
+    "10": ["C2 repeat"]
+  },
+  "checks": [2, 4, 7, 10]
+}
