@@ -15,12 +15,15 @@
 //! | `xoxb-`, `xoxp-` (and `xoxa-`, `xoxr-`, `xoxs-`) and 10 or more | `slack-token` |
 //! | `Bearer` and a token of 16 or more characters (the token only) | `bearer-token` |
 //! | `password` or `passwd`, then `=` or `:`, then the value (the value only) | `password` |
-//! | an assignment `NAME=value` whose name ends in `_key`, `_token`, `_secret`, `_password` (or is `api_key`, `apikey`, `token`, `secret`) | `credential` |
+//! | the password in a URL, `scheme://user:<password>@host` (the password only) | `password` |
+//! | a credential's name, then `=`, then the value (the value only): a name ending in `_key`, `_token`, `_secret`, `_password`, `_passwd` (or `-key` ...), or `api_key`, `apikey`, `token`, `secret`. `:` counts too when the name is quoted (`"client_secret": "..."`) or has a `_` or `-` in it (`aws_secret_access_key: ...`) | `credential` |
 //! | `-----BEGIN ... PRIVATE KEY-----` through its `-----END ...-----` line, or to the end when there is none | `private-key` |
 //! | `eyJ...` `.` `...` `.` `...` (a JWT's three base64url parts) | `jwt` |
 //!
-//! A shape must start at a word boundary, so `task-...` never reads as `sk-...`. Where two shapes cover the same span
-//! the more specific one, earlier in the table, names it.
+//! A key shape must start where no key character (letter, digit, `-`, `_`) comes before it, so `task-...` never reads
+//! as `sk-...`. A password or a credential's name only needs no letter, digit or `_` before it, so `--password=x` and
+//! `db-password=x` are caught. Where two spans overlap they become one, named by the one that starts first, so no part
+//! of either is left.
 
 /// `text` with every secret replaced by `[SECRET:<kind>]`.
 pub fn scrub(text: &str) -> String {
@@ -50,6 +53,16 @@ fn find(text: &str) -> Vec<(usize, usize, &'static str)> {
     let mut spans: Vec<(usize, usize, &'static str)> = Vec::new();
     private_keys(text, &mut spans);
     for i in 0..b.len() {
+        if let Some((s, e)) = url_password(b, i) {
+            spans.push((s, e, "password"));
+        }
+        if word_start(b, i) {
+            if let Some((s, e)) = assigned(b, i, &[b"password", b"passwd"], true) {
+                spans.push((s, e, "password"));
+            } else if let Some((s, e)) = credential(b, i) {
+                spans.push((s, e, "credential"));
+            }
+        }
         if !boundary_before(b, i) {
             continue;
         }
@@ -62,22 +75,18 @@ fn find(text: &str) -> Vec<(usize, usize, &'static str)> {
             .or_else(|| jwt(b, i).map(|e| (e, "jwt")));
         if let Some((end, kind)) = found {
             spans.push((i, end, kind));
-            continue;
-        }
-        if let Some((s, e)) = bearer(b, i) {
+        } else if let Some((s, e)) = bearer(b, i) {
             spans.push((s, e, "bearer-token"));
-        } else if let Some((s, e)) = assigned(b, i, &[b"password", b"passwd"], true) {
-            spans.push((s, e, "password"));
-        } else if let Some((s, e)) = credential(b, i) {
-            spans.push((s, e, "credential"));
         }
     }
-    // Earliest first; at one start the first found (the more specific shape) wins; nothing overlaps what is kept.
+    // Earliest first, and at one start the first found. Overlapping spans merge, so a secret that starts inside
+    // another (a key block after `TOKEN=abc`) is covered to its own end.
     spans.sort_by_key(|(s, _, _)| *s);
     let mut kept: Vec<(usize, usize, &'static str)> = Vec::new();
     for span in spans {
-        if kept.last().is_none_or(|last| span.0 >= last.1) {
-            kept.push(span);
+        match kept.last_mut() {
+            Some(last) if span.0 < last.1 => last.1 = last.1.max(span.1),
+            _ => kept.push(span),
         }
     }
     kept
@@ -91,6 +100,11 @@ fn is_key(c: u8) -> bool {
 /// Nothing that could be part of the same key or word sits right before `i`.
 fn boundary_before(b: &[u8], i: usize) -> bool {
     i == 0 || !is_key(b[i - 1])
+}
+
+/// No letter, digit or `_` right before `i`: the start of a word, which may follow a `-` (`--password`).
+fn word_start(b: &[u8], i: usize) -> bool {
+    i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')
 }
 
 /// How many bytes from `i` satisfy `ok`.
@@ -219,20 +233,40 @@ fn value_after(b: &[u8], mut at: usize, colon: bool) -> Option<(usize, usize)> {
     (end > start).then_some((start, end))
 }
 
-/// `NAME=value` where the name is a credential's: ends in `_key`, `_token`, `_secret`, `_password`, `_passwd`, or is
-/// `api_key`, `apikey`, `token`, `secret`. Only `=`: a colon after such a word is ordinary prose far too often.
+/// `NAME=value` where the name is a credential's: ends in `_key`, `_token`, `_secret`, `_password`, `_passwd` (or the
+/// same after `-`), or is `api_key`, `apikey`, `token`, `secret`. A colon also counts when the name is quoted or has a
+/// `_` or `-` in it: `"client_secret": "..."`, `aws_secret_access_key: ...`. After a bare word (`token: ...`) a colon
+/// is ordinary prose far too often.
 fn credential(b: &[u8], i: usize) -> Option<(usize, usize)> {
-    let n = run(b, i, |c| c.is_ascii_alphanumeric() || c == b'_');
-    if n == 0 {
+    if !b.get(i).is_some_and(u8::is_ascii_alphanumeric) {
         return None;
     }
+    let n = run(b, i, is_key);
     let name = b[i..i + n].to_ascii_lowercase();
-    let whole = [b"api_key".as_slice(), b"apikey", b"token", b"secret"];
-    let tails = [b"_key".as_slice(), b"_token", b"_secret", b"_password", b"_passwd"];
-    if !(whole.contains(&name.as_slice()) || tails.iter().any(|t| name.len() > t.len() && name.ends_with(t))) {
+    let whole = [b"api_key".as_slice(), b"apikey", b"api-key", b"token", b"secret"];
+    let tails = [b"key".as_slice(), b"token", b"secret", b"password", b"passwd"];
+    let tailed = tails.iter().any(|t| {
+        name.len() > t.len() + 1 && name.ends_with(t) && matches!(name[name.len() - t.len() - 1], b'_' | b'-')
+    });
+    if !(whole.contains(&name.as_slice()) || tailed) {
         return None;
     }
-    value_after(b, i + n, false)
+    let quote = i.checked_sub(1).map(|q| b[q]).filter(|q| matches!(q, b'"' | b'\'') && b.get(i + n) == Some(q));
+    let colon = quote.is_some() || name.contains(&b'_') || name.contains(&b'-');
+    value_after(b, i + n + usize::from(quote.is_some()), colon)
+}
+
+/// `scheme://user:password@host`: the password's span, when `i` is at the `://`.
+fn url_password(b: &[u8], i: usize) -> Option<(usize, usize)> {
+    if !starts(b, i, b"://") {
+        return None;
+    }
+    let from = i + 3;
+    let len = run(b, from, |c| !c.is_ascii_whitespace() && !b"/?#\"'<>".contains(&c));
+    let authority = &b[from..from + len];
+    let at = authority.iter().rposition(|c| *c == b'@')?;
+    let colon = authority[..at].iter().position(|c| *c == b':')?;
+    (colon + 1 < at).then_some((from + colon + 1, from + at))
 }
 
 /// `-----BEGIN ... PRIVATE KEY...-----` through the matching `-----END ...-----`, or to the end of the text.
@@ -272,9 +306,23 @@ mod tests {
             "sk-learn-tutorial-notes-for-the-team",
             "AKIAN is not a key",
             "Here is a header: eyJ.short.x",
-            "my_key: value",
+            "my key: value",
         ] {
             assert_eq!(scrub(t), t, "{t}");
+        }
+    }
+
+    #[test]
+    fn review_cases_are_caught() {
+        assert_eq!(scrub("mysql -u root --password=hunter2"), "mysql -u root --password=[SECRET:password]");
+        assert_eq!(scrub("set db-password=hunter2 and"), "set db-password=[SECRET:credential] and");
+        assert_eq!(scrub("curl --client-secret=abc123 x"), "curl --client-secret=[SECRET:credential] x");
+        assert_eq!(scrub("{\"client_secret\": \"9f8e7d\"}"), "{\"client_secret\": \"[SECRET:credential]\"}");
+        assert_eq!(scrub("aws_secret_access_key: wJalr/K7MDENG"), "aws_secret_access_key: [SECRET:credential]");
+        assert_eq!(scrub("postgres://admin:S3cretPass@db/x"), "postgres://admin:[SECRET:password]@db/x");
+        assert_eq!(scrub("TOKEN=abc-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY----- ok"), "TOKEN=[SECRET:credential] ok");
+        for plain in ["token: the thing we pass", "secret: keep it", "see https://example.com/a:b@c", "http://host:8080/x"] {
+            assert_eq!(scrub(plain), plain, "{plain}");
         }
     }
 

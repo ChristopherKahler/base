@@ -108,9 +108,19 @@ impl Home {
         self.run(&["hook", "session-start"], Some(&payload.to_string()))
     }
 
+    /// Every row of the log, oldest first: the archive's files, then the log being appended to.
     fn rows(&self) -> Vec<serde_json::Value> {
-        let text = std::fs::read_to_string(self.log_path()).unwrap_or_default();
-        text.lines().map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not a row: {e}: {l}"))).collect()
+        let mut out = Vec::new();
+        for file in base::emit::match_log::files(&self.root.join(".base")) {
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            out.extend(text.lines().map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not a row: {e}: {l}"))));
+        }
+        out
+    }
+
+    fn archive(&self) -> Vec<PathBuf> {
+        let all = base::emit::match_log::files(&self.root.join(".base"));
+        all[..all.len() - 1].to_vec()
     }
 
     fn only_row(&self) -> serde_json::Value {
@@ -184,6 +194,19 @@ fn match_log_row_for_prompt() {
     assert_eq!(row["cut"], serde_json::json!([]));
     assert_eq!(row["scores"], serde_json::json!([]));
     assert!(row.get("tool").is_none() && row.get("path").is_none(), "{row}");
+    assert_owner_only(&h.log_path());
+}
+
+/// The log holds what prompts said: on Unix only its owner can read it, as with the secret store.
+fn assert_owner_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{}: mode {mode:o}", path.display());
+    }
+    #[cfg(not(unix))]
+    assert!(path.is_file(), "{}", path.display());
 }
 
 /// Example 2: a file in a child project that says `nested = true` brings the child by its folder and the parent as
@@ -287,7 +310,7 @@ fn match_log_records_topic_cuts_and_scores() {
     let row = h.only_row();
     let (first, second, third) =
         (rule_id("topics", "First topic rule"), rule_id("topics", "Second topic rule"), rule_id("topics", "Watch the inbox folder"));
-    assert_eq!(ids(&row["served"]), [first.clone()]);
+    assert_eq!(ids(&row["served"]), std::slice::from_ref(&first));
     assert_eq!(row["served"][0]["by"], "topic");
     assert_eq!(row["served"][0]["score"], 2.0);
     let cut = row["cut"].as_array().unwrap();
@@ -384,7 +407,9 @@ fn prompt_text_setting() {
 }
 
 /// K1e: session start removes rows dated more than `[log] prompt_days` calendar days ago, keeps the rest in order,
-/// and drops a line that is not a row. With the first row young it leaves the file alone.
+/// and drops a line that is not a row. The log being appended to is never rewritten: a log whose first row is from an
+/// earlier day is moved to `.base/match-log/`, an archive file whose rows have all aged out is deleted whole, and one
+/// that straddles the cut-off keeps its younger rows. A log of today's rows stays where it is.
 #[test]
 fn match_log_retention() {
     let row = |days: i64, tag: &str| {
@@ -400,22 +425,41 @@ fn match_log_retention() {
     };
 
     let h = Home::new("", "");
-    write(&h, &[row(120, "d120"), row(91, "d91"), "not a row".into(), row(89, "d89"), row(0, "today")]);
+    write(&h, &[row(120, "d120"), row(91, "d91"), "not a row".into(), row(89, "d89"), row(1, "yesterday")]);
     let (code, stdout, stderr) = h.session_start("bo13-retention");
     assert_eq!(code, 0, "{stderr}");
     assert!(!stdout.is_empty(), "control: session start printed");
-    assert_eq!(sessions(&h), ["d89", "today"], "the default keeps 90 days");
+    assert!(!h.log_path().exists(), "the log of earlier days was moved aside, not rewritten");
+    assert_eq!(h.archive().len(), 1, "{:?}", h.archive());
+    assert_eq!(sessions(&h), ["d89", "yesterday"], "the default keeps 90 days");
+    assert_owner_only(&h.archive()[0]);
 
-    // The setting is read: 30 days removes the 89-day row too.
-    let h = Home::new("[log]\nprompt_days = 30\n", "");
-    write(&h, &[row(89, "d89"), row(31, "d31"), row(29, "d29"), row(0, "today")]);
-    assert_eq!(h.session_start("bo13-retention-30").0, 0);
-    assert_eq!(sessions(&h), ["d29", "today"]);
+    // The next row starts a new log; the reader reads both, oldest first.
+    h.prompt("a prompt after the move", "bo13-retention");
+    assert_eq!(sessions(&h), ["d89", "yesterday", "bo13-retention"]);
+    let out = h.base(&["log", "matches", "--last", "3"]);
+    assert_eq!(out.lines().count(), 3, "{out}");
+    assert!(out.lines().last().unwrap().contains("\"a prompt after the move\""), "{out}");
 
-    // Nothing old first: nothing is rewritten, byte for byte.
-    let before = std::fs::read(h.log_path()).unwrap();
+    // Today's log stays put, byte for byte; nothing in the archive is past 90 days.
+    let live = std::fs::read(h.log_path()).unwrap();
+    let archived = std::fs::read(&h.archive()[0]).unwrap();
     assert_eq!(h.session_start("bo13-retention-again").0, 0);
-    assert_eq!(std::fs::read(h.log_path()).unwrap(), before);
+    assert_eq!(std::fs::read(h.log_path()).unwrap(), live);
+    assert_eq!(h.archive().len(), 1);
+    assert_eq!(std::fs::read(&h.archive()[0]).unwrap(), archived);
+
+    // The setting is read: 30 days. An archive file of old rows only goes whole; one that straddles keeps its young
+    // rows; the log of an earlier day is moved aside and then judged the same way.
+    let h = Home::new("[log]\nprompt_days = 30\n", "");
+    let dir = h.root.join(".base").join("match-log");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("2026-01-01T00-00-00.jsonl"), format!("{}\n{}\n", row(60, "d60"), row(45, "d45"))).unwrap();
+    std::fs::write(dir.join("2026-01-02T00-00-00.jsonl"), format!("{}\n{}\n", row(40, "d40"), row(20, "d20"))).unwrap();
+    write(&h, &[row(31, "d31"), row(29, "d29"), row(2, "d2")]);
+    assert_eq!(h.session_start("bo13-retention-30").0, 0);
+    assert_eq!(sessions(&h), ["d20", "d29", "d2"]);
+    assert_eq!(h.archive().len(), 2, "one file went whole: {:?}", h.archive());
 }
 
 /// K1g: a row that cannot be written changes nothing the hook prints and never fails it; the reason goes to stderr.

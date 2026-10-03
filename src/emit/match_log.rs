@@ -25,11 +25,12 @@
 //! rule; `off` keeps no text. A value base does not know reads as `off`, the setting that keeps the least.
 //!
 //! RETENTION (K1e, D14). Session start removes rows older than `[log] prompt_days` (90), counted in calendar days:
-//! a row from day D goes on day D + prompt_days + 1. Counting whole days means the file is rewritten at most once a
-//! day, at the first session start that finds an old row first in the file, and never on the other session starts.
+//! a row from day D goes on day D + prompt_days + 1. The file being appended to is never rewritten: once a day
+//! session start moves it to `match-log/<when>.jsonl` and deletes the archive files whose rows have all aged out
+//! ([`retain`] says why). [`files`] lists every file of the log, oldest first.
 
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
@@ -237,7 +238,8 @@ pub fn prompt_row(
     cut.extend(trace.cut);
     let text = match mode {
         PromptText::Full => Some(crate::scrub::scrub(prompt)),
-        PromptText::Matched => Some(crate::scrub::scrub(&trace.words.join(" "))),
+        // No word matched: no text, rather than an empty one a reader would take for an empty prompt.
+        PromptText::Matched => (!trace.words.is_empty()).then(|| crate::scrub::scrub(&trace.words.join(" "))),
         PromptText::Off => None,
     };
     Row {
@@ -249,11 +251,21 @@ pub fn prompt_row(
         tool: None,
         path: None,
         paths: Vec::new(),
-        matched: trace.matched,
+        matched: scrubbed(trace.matched),
         served,
         cut,
         scores: trace.scores,
     }
+}
+
+/// The matched entries with their paths and values scrubbed too: a touched path or a folder is written as carefully as
+/// the prompt.
+fn scrubbed(mut matched: Vec<Matched>) -> Vec<Matched> {
+    for m in &mut matched {
+        m.value = m.value.as_deref().map(crate::scrub::scrub);
+        m.path = m.path.as_deref().map(crate::scrub::scrub);
+    }
+    matched
 }
 
 /// A tool call's row, or `None` when it touched no path and served nothing: such a call is not a file touch.
@@ -271,7 +283,7 @@ pub fn file_row(trace: Trace, session: Option<&str>) -> Option<Row> {
         tool: trace.tool,
         path: paths.first().cloned(),
         paths: if paths.len() > 1 { paths } else { Vec::new() },
-        matched: trace.matched,
+        matched: scrubbed(trace.matched),
         served: trace.served,
         cut: trace.cut,
         scores: trace.scores,
@@ -281,14 +293,39 @@ pub fn file_row(trace: Trace, session: Option<&str>) -> Option<Row> {
 /// Append `row` to `dir`'s [`FILE`] as one line in one write. A failure comes back naming the path; never a panic.
 pub fn append(dir: &Path, row: &Row) -> Result<(), String> {
     let path = dir.join(FILE);
+    let err = |e: std::io::Error| format!("{}: {e}", path.display());
     let mut line = serde_json::to_string(row).map_err(|e| format!("{}: {e}", path.display()))?;
     line.push('\n');
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .and_then(|mut f| f.write_all(line.as_bytes()))
-        .map_err(|e| format!("{}: {e}", path.display()))
+    let mut file = private(std::fs::OpenOptions::new().create(true).append(true)).open(&path).map_err(err)?;
+    owner_only(&file);
+    file.write_all(line.as_bytes()).map_err(err)
+}
+
+/// The log holds what prompts said, so on Unix a file it creates is readable by its owner only (0600), as the secret
+/// store is. Windows files inherit the folder's access list, which is the user's own under their profile.
+fn private(opts: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts
+}
+
+/// [`private`]'s mode applies only to a file it creates. A log another build created readable by others is made the
+/// owner's only here. Best effort: a file this user cannot change is not this user's to keep private.
+fn owner_only(file: &std::fs::File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = file.metadata()
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
 }
 
 /// The local calendar day of a row's `ts`.
@@ -301,64 +338,200 @@ fn row_day(line: &str) -> Option<NaiveDate> {
     DateTime::parse_from_rfc3339(&ts.ts).ok().map(|t| t.with_timezone(&Local).date_naive())
 }
 
-/// Remove the rows of `dir`'s [`FILE`] dated more than `days` calendar days before `today` (K1e; `days` read as at
-/// least 1), and any line that is not a row. Returns how many lines went.
+/// Earlier days' rows, in `<tier>/.base/match-log/`: one file per day the log was moved aside, named by when.
+pub const ARCHIVE: &str = "match-log";
+/// Held while session start moves the log aside and expires old files, so two session starts never both do.
+const LOCK: &str = "match-log.lock";
+
+/// What [`retain`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Retained {
+    /// Where [`FILE`] went, when its first row was from an earlier day.
+    pub moved_to: Option<PathBuf>,
+    /// Archive files removed whole: none of their rows was young enough to keep.
+    pub files_removed: usize,
+    /// Lines removed from an archive file whose rows straddled the cut-off.
+    pub rows_removed: usize,
+}
+
+/// Session start's retention pass (K1e, D14): rows dated more than `days` calendar days before `now` go (`days` read
+/// as at least 1).
 ///
-/// The first line decides whether anything is done: rows are appended in time order, so when the first is young
-/// every row is, and the file is not read further. Otherwise the young rows go to a temp file and replace the log. A
-/// row appended while that happens is carried over: the log's length is read again just before the rename, and any
-/// bytes past what was read go on the end of the temp file. Fail-open: an error comes back as a value, and the log
-/// is left as it was.
-pub fn prune(dir: &Path, days: u64, today: NaiveDate) -> Result<usize, String> {
-    let path = dir.join(FILE);
-    let err = |e: std::io::Error| format!("{}: {e}", path.display());
-    let file = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(err(e)),
-    };
-    let cutoff = today - chrono::Days::new(days.max(1));
-    let mut first = String::new();
-    std::io::BufReader::new(&file).read_line(&mut first).map_err(err)?;
-    if first.is_empty() || row_day(&first).is_some_and(|d| d >= cutoff) {
-        return Ok(0);
+/// THE LOG BEING WRITTEN IS NEVER REWRITTEN. Measured on the operator's machine, a day is about 650 prompts and 3,500
+/// tool calls, and a prompt row averages 2.5 KB (BO-13 replay), so 90 days of one file is a few hundred MB. Rewriting
+/// that at every session start would hold the hook for seconds, and a row another hook appended during the rewrite
+/// would be lost. So:
+///
+/// 1. When the first row of [`FILE`] is from an earlier day than `now`, or is not a row, the file is renamed to
+///    `match-log/<now>.jsonl`, and the next row starts a new log: one rename, at most once a day. A hook that opened
+///    the log in the instant before the rename writes into the moved file, so its row is kept.
+/// 2. An archive file whose rows are all past the cut-off is deleted. One whose first row is past it and whose last
+///    is not keeps its younger rows, through a temp file; nothing appends to an archive file, except such a hook in
+///    that instant, and bytes it adds before the rename are carried over.
+///
+/// Under a lock no second session start can take at the same time (`try_lock`): a second one does nothing. Rows are
+/// still appended while it runs; appends take no lock. Fail-open: an error comes back as a value.
+pub fn retain(dir: &Path, days: u64, now: DateTime<Local>) -> Result<Retained, String> {
+    let at = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    let lock_path = dir.join(LOCK);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| at(&lock_path, e))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(Retained::default()),
+        Err(std::fs::TryLockError::Error(e)) => return Err(at(&lock_path, e)),
     }
-    let mut bytes = Vec::new();
-    (&file).seek(SeekFrom::Start(0)).map_err(err)?;
-    (&file).read_to_end(&mut bytes).map_err(err)?;
-    drop(file);
-    // Whole lines only. A torn last line (a writer mid-append) is not judged here: it is carried over below.
-    let read_to = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |p| p + 1);
-    let text = String::from_utf8_lossy(&bytes[..read_to]);
-    let mut kept = String::with_capacity(text.len());
-    let mut removed = 0usize;
-    for line in text.split_inclusive('\n') {
-        if row_day(line).is_some_and(|d| d >= cutoff) {
-            kept.push_str(line);
+    let mut done = Retained::default();
+    let live = dir.join(FILE);
+    if let Some(first) = first_line(&live).map_err(|e| at(&live, e))?
+        && row_day(&first).is_none_or(|d| d < now.date_naive())
+    {
+        let archive = dir.join(ARCHIVE);
+        std::fs::create_dir_all(&archive).map_err(|e| at(&archive, e))?;
+        let to = archive.join(format!("{}.jsonl", now.format("%Y-%m-%dT%H-%M-%S")));
+        crate::store::rename_with_retry(&live, &to).map_err(|e| at(&live, e))?;
+        done.moved_to = Some(to);
+    }
+    let cutoff = now.date_naive() - chrono::Days::new(days.max(1));
+    for file in archive_files(dir) {
+        // Rows are in time order: a young first row means a young file, and nothing past the first line is read.
+        let first = first_line(&file).map_err(|e| at(&file, e))?;
+        if first.as_deref().and_then(row_day).is_some_and(|d| d >= cutoff) {
+            continue;
+        }
+        let mut last = None;
+        rev_lines(&file, |line| {
+            last = std::str::from_utf8(line).ok().and_then(row_day);
+            last.is_none()
+        })
+        .map_err(|e| at(&file, e))?;
+        if last.is_none_or(|d| d < cutoff) {
+            std::fs::remove_file(&file).map_err(|e| at(&file, e))?;
+            done.files_removed += 1;
         } else {
-            removed += 1;
+            done.rows_removed += keep_young(&file, cutoff).map_err(|e| at(&file, e))?;
         }
     }
-    let tmp = path.with_extension(format!("jsonl.{}.tmp", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
-        std::fs::write(&tmp, kept.as_bytes())?;
-        // Whatever arrived after the read, the torn line included, goes on the end.
-        let mut now = std::fs::File::open(&path)?;
-        let len = now.metadata()?.len() as usize;
-        if len > read_to {
-            now.seek(SeekFrom::Start(read_to as u64))?;
-            let mut tail = Vec::new();
-            now.read_to_end(&mut tail)?;
-            std::fs::OpenOptions::new().append(true).open(&tmp)?.write_all(&tail)?;
+    drop(lock);
+    Ok(done)
+}
+
+/// Rewrite one archive file with only its rows dated on or after `cutoff`; any line that is not a row goes too. A line
+/// still being written (no newline yet) and anything added after the read are carried over whole. Returns how many
+/// lines went.
+fn keep_young(file: &Path, cutoff: NaiveDate) -> std::io::Result<usize> {
+    let tmp = file.with_extension(format!("jsonl.{}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<usize> {
+        let mut out = std::io::BufWriter::new(
+            private(std::fs::OpenOptions::new().write(true).create(true).truncate(true)).open(&tmp)?,
+        );
+        let mut reader = std::io::BufReader::new(std::fs::File::open(file)?);
+        let (mut read_to, mut removed) = (0u64, 0usize);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 || line.last() != Some(&b'\n') {
+                break;
+            }
+            read_to += n as u64;
+            if std::str::from_utf8(&line).ok().and_then(row_day).is_some_and(|d| d >= cutoff) {
+                out.write_all(&line)?;
+            } else {
+                removed += 1;
+            }
+        }
+        drop(reader);
+        let mut now = std::fs::File::open(file)?;
+        if now.metadata()?.len() > read_to {
+            now.seek(SeekFrom::Start(read_to))?;
+            std::io::copy(&mut now, &mut out)?;
         }
         drop(now);
-        crate::store::rename_with_retry(&tmp, &path)
+        out.flush()?;
+        drop(out);
+        crate::store::rename_with_retry(&tmp, file)?;
+        Ok(removed)
     })();
-    if let Err(e) = result {
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(err(e));
     }
-    Ok(removed)
+    result
+}
+
+/// The first line of `path`, without its newline. `None` when there is no file or it is empty.
+fn first_line(path: &Path) -> std::io::Result<Option<String>> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut line = Vec::new();
+    std::io::BufReader::new(file).read_until(b'\n', &mut line)?;
+    Ok((!line.is_empty()).then(|| String::from_utf8_lossy(&line).trim_end().to_string()))
+}
+
+/// The archive files, oldest first: their names are the times they were moved aside.
+fn archive_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir.join(ARCHIVE))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "jsonl"))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every file of the log, oldest first: the archive's, then [`FILE`]. For the readers of the log (BO-14 on).
+pub fn files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = archive_files(dir);
+    out.push(dir.join(FILE));
+    out
+}
+
+/// Each non-empty line of `path`, last first, until `each` returns false. Read from the end in blocks, so stopping
+/// early costs only what was read. No file is no lines.
+fn rev_lines(path: &Path, mut each: impl FnMut(&[u8]) -> bool) -> std::io::Result<()> {
+    const BLOCK: u64 = 64 * 1024;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut pos = file.metadata()?.len();
+    // Bytes read but not yet split into whole lines: the start of the earliest line seen so far.
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        if pos == 0 {
+            if !carry.is_empty() {
+                each(&carry);
+            }
+            return Ok(());
+        }
+        let step = pos.min(BLOCK);
+        pos -= step;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut block = vec![0u8; step as usize];
+        file.read_exact(&mut block)?;
+        block.extend_from_slice(&carry);
+        // Every line after the first newline in the block is whole; the part before it may continue further back.
+        let Some(first_nl) = block.iter().position(|b| *b == b'\n') else {
+            carry = block;
+            continue;
+        };
+        for line in block[first_nl + 1..].split(|b| *b == b'\n').rev() {
+            if !line.is_empty() && !each(line) {
+                return Ok(());
+            }
+        }
+        carry = block[..first_nl].to_vec();
+    }
 }
 
 /// What `base log matches` keeps.
@@ -383,44 +556,19 @@ impl Filter {
     }
 }
 
-/// The last `n` rows of `dir`'s [`FILE`] that `filter` keeps, oldest first. Read from the end in blocks, so a long
-/// log costs only the rows it returns. A line that is not a row is passed over. No file is no rows.
+/// The last `n` rows of the log that `filter` keeps, oldest first: [`FILE`], then the archive, newest first, each read
+/// from its end, so a long log costs only the rows it returns. A line that is not a row is passed over.
 pub fn last_rows(dir: &Path, n: usize, filter: &Filter) -> Result<Vec<Row>, String> {
-    const BLOCK: u64 = 64 * 1024;
-    let path = dir.join(FILE);
-    let err = |e: std::io::Error| format!("{}: {e}", path.display());
-    let mut file = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(err(e)),
-    };
-    let mut pos = file.metadata().map_err(err)?.len();
     let mut out: Vec<Row> = Vec::new();
-    // Bytes read but not yet split into whole lines: the start of the earliest line seen so far.
-    let mut carry: Vec<u8> = Vec::new();
-    while out.len() < n {
-        if pos == 0 {
-            take_line(&carry, filter, &mut out);
+    for path in files(dir).iter().rev() {
+        if out.len() >= n {
             break;
         }
-        let step = pos.min(BLOCK);
-        pos -= step;
-        file.seek(SeekFrom::Start(pos)).map_err(err)?;
-        let mut block = vec![0u8; step as usize];
-        file.read_exact(&mut block).map_err(err)?;
-        block.extend_from_slice(&carry);
-        // Every line after the first newline in the block is whole; the part before it may continue further back.
-        let Some(first_nl) = block.iter().position(|b| *b == b'\n') else {
-            carry = block;
-            continue;
-        };
-        for line in block[first_nl + 1..].split(|b| *b == b'\n').rev() {
-            if out.len() >= n {
-                break;
-            }
+        rev_lines(path, |line| {
             take_line(line, filter, &mut out);
-        }
-        carry = block[..first_nl].to_vec();
+            out.len() < n
+        })
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     out.reverse();
     Ok(out)
@@ -449,7 +597,7 @@ pub fn format_rows(rows: &[Row], today: NaiveDate) -> String {
         let tail = match row.event.as_str() {
             "prompt" => match &row.text {
                 Some(t) => format!("\"{}\"", clip(t, 40)),
-                None => "(prompt text off)".to_string(),
+                None => "(no prompt text)".to_string(),
             },
             _ => row.path.as_deref().map(short_path).unwrap_or_default(),
         };
@@ -541,6 +689,45 @@ mod tests {
         assert_eq!(decision_id("<http://ops-sys.local/ontology#decision/global.mirror-profile-a>"), "global.mirror-profile-a");
         assert!(is_decision("<http://ops-sys.local/ontology#decision/global.x>"));
         assert!(!is_decision("<http://ops-sys.local/ontology#project/x>"));
+    }
+
+    /// The reader walks back across 64 KB blocks and across files: lines split by a block edge come out whole, and a
+    /// filter that matches only the oldest row reads back to it.
+    #[test]
+    fn last_rows_reads_back_across_blocks_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = |i: usize| {
+            let r = Row {
+                ts: "2026-10-01T10:00:00-05:00".into(),
+                session: Some(format!("s{i:05}")),
+                event: "prompt".into(),
+                prompt_num: None,
+                text: Some("x".repeat(i % 300)),
+                tool: None,
+                path: None,
+                paths: Vec::new(),
+                matched: Vec::new(),
+                served: vec![Item::rule(&format!("r{i:05}"), "d")],
+                cut: Vec::new(),
+                scores: Vec::new(),
+            };
+            format!("{}\n", serde_json::to_string(&r).unwrap())
+        };
+        let archive = dir.path().join(ARCHIVE);
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::write(archive.join("2026-10-01T00-00-00.jsonl"), (0..1500).map(row).collect::<String>()).unwrap();
+        std::fs::write(dir.path().join(FILE), (1500..3000).map(row).collect::<String>()).unwrap();
+        assert!(std::fs::metadata(dir.path().join(FILE)).unwrap().len() > 3 * 64 * 1024, "control: several blocks");
+
+        let last = last_rows(dir.path(), 5, &Filter::default()).unwrap();
+        let ids: Vec<&str> = last.iter().map(|r| r.served[0].id.as_str()).collect();
+        assert_eq!(ids, ["r02995", "r02996", "r02997", "r02998", "r02999"]);
+        let all = last_rows(dir.path(), 10_000, &Filter::default()).unwrap();
+        assert_eq!(all.len(), 3000, "every row, none split");
+        assert!(all.windows(2).all(|w| w[0].served[0].id < w[1].served[0].id), "oldest first");
+        let first = last_rows(dir.path(), 5, &Filter { rule: Some("r00000".into()), ..Filter::default() }).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].session.as_deref(), Some("s00000"));
     }
 
     #[test]

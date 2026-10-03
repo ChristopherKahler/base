@@ -206,11 +206,12 @@ fn run_event(
                 }
             }
             print!("{}", rendered.text);
-            // The match log's retention (K1e), after the print: a rewrite of the log never holds up the first screen.
+            // The match log's retention (K1e), after the print. The hook still exits only after it, so it is kept cheap:
+            // at most one rename a day and the deletion of archive files past `[log] prompt_days`; the log being
+            // appended to is never rewritten (see `match_log::retain`).
             let _ = std::io::stdout().flush();
             if let Some(dir) = crate::crud::handoff_show::session_start_dir(&cwd)
-                && let Err(why) =
-                    crate::emit::match_log::prune(&dir, config.log.prompt_days, chrono::Local::now().date_naive())
+                && let Err(why) = crate::emit::match_log::retain(&dir, config.log.prompt_days, chrono::Local::now())
             {
                 eprintln!("base: session start could not prune the match log: {why}");
             }
