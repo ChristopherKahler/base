@@ -4,9 +4,10 @@
 //! command in its turn ([`super::tune_pass`]). Everything in this file is what a hook may do: read and write a few small
 //! files under `~/.base-gbl/corrections/`.
 //!
-//! THE COUNTS live in the session's cursor file (BO-15's [`super::State`], its `tune` part), written only by the hooks,
-//! where the correction signals are found: the prompt hook (C1, and the C2 of a turn that ended with no Stop) and the
-//! Stop hook (C3). A flagged turn is one with any C1, C2 or C3 signal, a C3 `DEFERRED` alone excepted.
+//! THE COUNTS live in the session's cursor file (BO-15's [`super::State`], its `tune` part), written only by the hooks.
+//! A flagged turn is one the pass would call flagged reading the transcript: its prompt got the C4 line (a C1 phrase, or
+//! the C2 signals it answers) or its reply carried a correction marker (C3, `DEFERRED` alone excepted). So one
+//! correction is one flagged turn: an interrupt and the "no, not that" typed after it count once, on the prompt.
 //!
 //! THE PASS'S MARK is `<session>.tuned`, written only by `base tune` for each session it read: when, and how far. The
 //! hooks read it on each prompt (one small file, or none) and start their counts again when a new pass read the session.
@@ -167,10 +168,10 @@ impl Marks {
     }
 }
 
-/// A turn's signals flag it as a possible correction: any C1, C2 or C3 signal, a C3 `DEFERRED` alone excepted (the AI
-/// held its position: a disagreement, not a missing rule).
-pub fn flags(signals: &[Signal]) -> bool {
-    signals.iter().any(|s| !(s.layer == "C3" && s.kind == "DEFERRED"))
+/// A reply's signals carry a correction marker: a C3 signal other than `DEFERRED` (the AI held its position: a
+/// disagreement, not a missing rule).
+pub fn marked(signals: &[Signal]) -> bool {
+    signals.iter().any(|s| s.layer == "C3" && s.kind != "DEFERRED")
 }
 
 /// `rule pass due: 3 corrections since the last one · run base tune`.
@@ -362,11 +363,11 @@ mod tests {
     }
 
     #[test]
-    fn deferred_alone_is_not_a_flag() {
+    fn deferred_alone_is_not_a_marker() {
         let s = |l: &str, k: &str| Signal { layer: l.into(), kind: k.into(), value: None };
-        assert!(!flags(&[s("C3", "DEFERRED")]));
-        assert!(flags(&[s("C3", "DEFERRED"), s("C1", "phrase")]));
-        assert!(flags(&[s("C2", "interrupt")]));
-        assert!(!flags(&[]));
+        assert!(!marked(&[s("C3", "DEFERRED")]));
+        assert!(marked(&[s("C3", "DEFERRED"), s("C3", "MISREAD")]));
+        assert!(!marked(&[s("C2", "interrupt"), s("C1", "phrase")]), "C1 and C2 flag through the C4 line, not here");
+        assert!(!marked(&[]));
     }
 }

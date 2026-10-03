@@ -220,6 +220,9 @@ pub struct PromptCheck {
     row_dir: Option<PathBuf>,
     /// What `tune.shown_at` becomes when the due line prints.
     shown_at: Option<u32>,
+    /// This prompt's number, and whether it drew a C1 phrase: the rule pass's flag (BO-17).
+    num: u32,
+    c1: bool,
 }
 
 impl PromptCheck {
@@ -230,6 +233,11 @@ impl PromptCheck {
         self.state.pending = if printed && self.block.is_some() { Vec::new() } else { std::mem::take(&mut self.pending) };
         if tune_printed && self.tune_block.is_some() {
             self.state.tune.shown_at = self.shown_at;
+        }
+        // The rule pass's count (BO-17): this prompt is a flagged turn when its C4 line printed, or its C1 phrase fired
+        // and the line was cut (a C1 is not kept for the next prompt; a cut C2 is, and counts when its line prints).
+        if self.block.is_some() && (printed || self.c1) {
+            self.state.tune.flag(self.num);
         }
         if let Err(why) = save_state(&self.path, &self.state) {
             eprintln!("base: the prompt hook could not keep its corrections state: {why}");
@@ -296,11 +304,13 @@ pub fn on_prompt(
     state.turn_writes.clear();
 
     // The rule pass (BO-17): the counts start again once a pass has read this session; the turn before is flagged
-    // when what this read found flags it; and the due line is decided before this prompt's own C1 counts, so it goes
-    // on the prompt after the count is reached (Example 1).
+    // when this read found a correction marker in its reply (its Stop ran before those lines were on disk, or never
+    // ran); and the due line is decided before this prompt's own flag counts, so it goes on the prompt after the count
+    // is reached (Example 1). A C2 signal does not flag the turn it was found in: the prompt that answers it gets the
+    // C4 line, and that prompt is flagged in `commit`, so an interrupt and the "no, not that" after it count once.
     let human = !transcript::machine_prompt(prompt);
     state.tune.sync_with_pass(session);
-    if tune::flags(&prev_signals) && num > 1 {
+    if tune::marked(&prev_signals) && num > 1 {
         state.tune.flag(prev);
     }
     let due = if human { state.tune.line_due(&config.tune) } else { None };
@@ -345,9 +355,6 @@ pub fn on_prompt(
     let block = (human && (c1 || !pending.is_empty())).then(|| {
         PromptBlock::new(CHECK_BLOCK, Priority::Matched, CHECK_LINE, 1, "line").with_logged([Item::of_kind(CHECK_BLOCK, "check")])
     });
-    if tune::flags(&now_signals) {
-        state.tune.flag(num);
-    }
     let mut rows = Vec::new();
     if !prev_signals.is_empty() {
         rows.push(match_log::signal_row(Some(session), Some(prev), prev_signals));
@@ -365,6 +372,8 @@ pub fn on_prompt(
         pending,
         row_dir: crate::crud::handoff_show::session_start_dir(cwd),
         shown_at,
+        num,
+        c1,
     })
 }
 
@@ -413,9 +422,10 @@ pub fn on_stop(config: &BaseConfig, cwd: &Path, event: &serde_json::Value, sessi
     for s in signals.iter().filter(|s| s.layer == "C2") {
         push_once(&mut state.pending, s.clone());
     }
-    // The rule pass's count (BO-17): this turn is flagged when its reply carried a marker or the turn a C2.
+    // The rule pass's count (BO-17): this turn is flagged when its reply carried a correction marker. A C2 here waits
+    // for the next prompt, which gets the C4 line and is flagged then.
     state.tune.sync_with_pass(session);
-    if tune::flags(&signals) {
+    if tune::marked(&signals) {
         state.tune.flag(num);
     }
     // As the turn leaves them: a later Stop in the same turn (a Stop hook that blocked) records them again.
