@@ -1465,6 +1465,53 @@ pub enum RuleAction {
         #[arg(long, requires = "from_turn")]
         prompt: Option<u32>,
     },
+    /// Run a rule change over your recent prompts in the match log before it is approved: the prompts that would
+    /// start or stop serving it, and its share of all of them (TOO BROAD above [tune] broad_share)
+    Replay {
+        /// A proposal's id, p-0007
+        #[arg(conflicts_with_all = ["domain", "rule", "decision", "add_keyword", "drop_keyword"])]
+        proposal: Option<String>,
+        /// Change this domain's prompt keywords
+        #[arg(long, conflicts_with_all = ["rule", "decision"])]
+        domain: Option<String>,
+        /// Change this rule's own topic words: <domain>.<id>, as `base rule list` prints it
+        #[arg(long, conflicts_with = "decision")]
+        rule: Option<String>,
+        /// Change this decision's own keywords: its slug
+        #[arg(long)]
+        decision: Option<String>,
+        /// A keyword to add (repeatable, or a comma list)
+        #[arg(long)]
+        add_keyword: Vec<String>,
+        /// A keyword to drop (repeatable, or a comma list)
+        #[arg(long)]
+        drop_keyword: Vec<String>,
+    },
+    /// Review the pending rule proposals, each with the prompts behind it and its replay: one key each on a terminal
+    /// (a approve, e edit, r reject, s skip, q stop), or one of the flags
+    Review {
+        /// Apply this proposal and mark it approved
+        #[arg(long, conflicts_with_all = ["reject", "edit"])]
+        approve: Option<String>,
+        /// Mark this proposal rejected: the same change is never proposed again
+        #[arg(long, conflicts_with = "edit")]
+        reject: Option<String>,
+        /// With --reject: why
+        #[arg(long, requires = "reject")]
+        reason: Option<String>,
+        /// Apply this proposal with your changes (--text, --keywords) and mark it edited
+        #[arg(long)]
+        edit: Option<String>,
+        /// With --edit: the new wording
+        #[arg(long, requires = "edit")]
+        text: Option<String>,
+        /// With --edit: the keywords, comma-separated, replacing the proposed ones
+        #[arg(long, requires = "edit")]
+        keywords: Option<String>,
+        /// With --approve or --edit: apply a change its replay flags TOO BROAD (show the user the replay first)
+        #[arg(long)]
+        broad_ok: bool,
+    },
     /// Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
     Update {
         /// The rule, as `base rule list` prints it: <domain>.<id> (the id, or its first 4 or more characters)
@@ -3938,6 +3985,58 @@ pub fn run() {
                     match base::corrections::propose::run(&config, &cwd, &args) {
                         Ok(p) => print!("{}", base::corrections::propose::render(&p, dry_run)),
                         Err(msg) => die("Error", msg),
+                    }
+                }
+                RuleAction::Replay { proposal, domain: dom, rule, decision, add_keyword, drop_keyword } => {
+                    // K6 (BO-16): a change, from a proposal or from the flags, run over the match log's recent prompts.
+                    use base::domain::replay::{self, Change, Target};
+                    let split = |v: &[String]| -> Vec<String> {
+                        v.iter().flat_map(|k| base::domain::global_decisions::parse_keywords(k)).collect()
+                    };
+                    let (header, change) = match proposal {
+                        Some(id) => {
+                            let want = base::corrections::review::normalize_id(&id);
+                            let Some(p) = base::corrections::review::load(&config, &rule_cwd).into_iter().find(|p| p.id == want) else {
+                                die("Error", format!("no proposal {want} in this workspace or the global tier (base rule review lists them)"))
+                            };
+                            let change = p.change().unwrap_or_else(|e| die("Error", e));
+                            (format!("proposal {} · {} · {}", p.id, p.kind_label(), change.describe()), change)
+                        }
+                        None => {
+                            let target = match (dom, rule, decision) {
+                                (Some(d), _, _) => Target::Domain(domain::canonical_name(&cwd, &d)),
+                                (_, Some(r), _) => Target::Rule(r),
+                                (_, _, Some(s)) => Target::Decision(s),
+                                _ => die("Error", "give a proposal id, or --domain, --rule or --decision with --add-keyword or --drop-keyword"),
+                            };
+                            let change = Change { target, add: split(&add_keyword), drop: split(&drop_keyword), text: None };
+                            if change.add.is_empty() && change.drop.is_empty() {
+                                die("Error", "give --add-keyword \"...\" or --drop-keyword \"...\"");
+                            }
+                            (change.describe(), change)
+                        }
+                    };
+                    match replay::run(&config, &rule_cwd, &change) {
+                        Ok(o) => print!("{}", replay::render(&header, &o)),
+                        Err(msg) => die("Error", msg),
+                    }
+                }
+                RuleAction::Review { approve, reject, reason, edit, text, keywords, broad_ok } => {
+                    // K5 (BO-16): the queue. One key per proposal on a terminal; one flag for the AI or a script.
+                    use base::corrections::review::{self, Action};
+                    let action = match (approve, reject, edit) {
+                        (Some(id), _, _) => Action::Approve { id, broad_ok },
+                        (_, Some(id), _) => Action::Reject { id, reason },
+                        (_, _, Some(id)) => Action::Edit { id, text, keywords, broad_ok },
+                        _ => Action::List,
+                    };
+                    if matches!(action, Action::List) && review::on_terminal() {
+                        review::interactive(&config, &rule_cwd);
+                    } else {
+                        match review::run(&config, &rule_cwd, &action) {
+                            Ok(out) => print!("{out}"),
+                            Err(msg) => die("Error", msg),
+                        }
                     }
                 }
                 RuleAction::Update { rule, fires_on, quiet_on, clear_tests } => {

@@ -618,6 +618,15 @@ phrases = ["no,", "wrong", "that's not", "not what i asked", "i told you", "i've
 markers = ["CORRECTED:", "UPDATED:", "MISREAD:", "DEFERRED:"]
 repeat_similarity = 0.5
 
+# ─── [tune] — checking a rule change before it is approved ───
+# `base rule replay` and `base rule review` run a proposed change over your
+# last replay_prompts prompts in .base/match-log.jsonl and say which prompts
+# would start or stop serving the rule. A change served on more than
+# broad_share of them (0.25 = 25%) is flagged TOO BROAD.
+[tune]
+replay_prompts = 500
+broad_share = 0.25
+
 # ─── [sync] — graph extraction globs ─────────────────────────
 # Which files `base sync` reads to extract metadata/AST into the graph.
 [sync]

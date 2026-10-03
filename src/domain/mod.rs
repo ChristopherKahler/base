@@ -4,6 +4,7 @@ pub mod link;
 pub mod matcher;
 pub mod paths;
 pub mod query;
+pub mod replay;
 pub mod rule_test;
 pub mod rules;
 pub mod session;
@@ -554,6 +555,58 @@ pub fn set_rule_tests(toml_path: &Path, domain: &str, id: &str, tests: &rules::R
         }
         other => other,
     };
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, toml_path)?;
+    Ok(true)
+}
+
+/// Set one rule's matchers in the domains.toml at `toml_path` (BO-16, an approved keyword gap on a rule with words of
+/// its own): the rule of `domain` whose [`rules::rule_id`] is `id`. Written as [`set_rule_tests`] writes; a table left
+/// with nothing but its text goes back to a plain string. `Ok(false)` when the file has no such rule.
+pub fn set_rule_matchers(toml_path: &Path, domain: &str, id: &str, matchers: &[rules::Matcher]) -> anyhow::Result<bool> {
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(toml_path)?)?;
+    let want = crate::crud::slugify(domain);
+    let Some(d) = file.domain.iter_mut().find(|d| crate::crud::slugify(&d.name) == want) else {
+        return Ok(false);
+    };
+    let name = d.name.clone();
+    let Some(r) = d.rules.iter_mut().find(|r| rules::rule_id(&name, r.text()) == id) else {
+        return Ok(false);
+    };
+    let matchers = matchers.to_vec();
+    let next = match std::mem::replace(r, RuleEntry::Bare(String::new())) {
+        RuleEntry::Bare(text) => RuleEntry::Detailed { text, rationale: None, matchers, fires_on: Vec::new(), quiet_on: Vec::new() },
+        RuleEntry::Detailed { text, rationale, fires_on, quiet_on, .. } => RuleEntry::Detailed { text, rationale, matchers, fires_on, quiet_on },
+    };
+    *r = match next {
+        RuleEntry::Detailed { text, rationale: None, matchers, fires_on, quiet_on }
+            if matchers.is_empty() && fires_on.is_empty() && quiet_on.is_empty() =>
+        {
+            RuleEntry::Bare(text)
+        }
+        other => other,
+    };
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, toml_path)?;
+    Ok(true)
+}
+
+/// Remove one rule of `domain` from the domains.toml at `toml_path`, by its [`rules::rule_id`] (BO-16: a rewritten file
+/// rule moves to the graph, where the old wording is kept superseded). `Ok(false)` when the file has no such rule.
+pub fn remove_rule(toml_path: &Path, domain: &str, id: &str) -> anyhow::Result<bool> {
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(toml_path)?)?;
+    let want = crate::crud::slugify(domain);
+    let Some(d) = file.domain.iter_mut().find(|d| crate::crud::slugify(&d.name) == want) else {
+        return Ok(false);
+    };
+    let name = d.name.clone();
+    let before = d.rules.len();
+    d.rules.retain(|r| rules::rule_id(&name, r.text()) != id);
+    if d.rules.len() == before {
+        return Ok(false);
+    }
     let tmp = toml_path.with_extension("toml.tmp");
     std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
     std::fs::rename(&tmp, toml_path)?;

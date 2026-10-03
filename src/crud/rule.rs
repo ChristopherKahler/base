@@ -693,7 +693,7 @@ pub fn parse_rule_ref(spec: &str) -> std::result::Result<(Option<String>, String
 
 /// The tiers to search, each as a working directory, never the same graph twice: standing inside `~/.base-gbl` with
 /// no other workspace, both tiers are one file.
-fn tier_cwds(cwd: &Path) -> Vec<(Tier, std::path::PathBuf)> {
+pub(crate) fn tier_cwds(cwd: &Path) -> Vec<(Tier, std::path::PathBuf)> {
     let mut out: Vec<(Tier, std::path::PathBuf)> = vec![(Tier::Workspace, cwd.to_path_buf())];
     if let Some(h) = crate::home::home_root() {
         out.push((Tier::Global, h.join(".base-gbl")));

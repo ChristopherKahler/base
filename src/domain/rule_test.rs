@@ -72,6 +72,12 @@ impl<'a> Bench<'a> {
     /// `base context` do, then the domains, the merged store, the rules with matchers, the star commands, the
     /// registered projects and the stored tests.
     pub fn load(config: &'a BaseConfig, cwd: &Path) -> Self {
+        Self::load_with_store(config, cwd).0
+    }
+
+    /// [`Bench::load`], and the merged store it read, for a caller that reads more from it (replay reads the global
+    /// decisions) without a second load.
+    pub fn load_with_store(config: &'a BaseConfig, cwd: &Path) -> (Self, Option<oxigraph::store::Store>) {
         crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
         let domains = crate::domain::load_domains(cwd);
         let store = crate::store::load_merged(cwd);
@@ -94,7 +100,36 @@ impl<'a> Bench<'a> {
             })
             .collect();
         let tests = rules::rule_tests(store.as_ref(), config, &domains);
-        Self::from_parts(config, domains, converted, crate::command::load_commands(cwd), ctx, by_domain, tests)
+        let bench = Self::from_parts(config, domains, converted, crate::command::load_commands(cwd), ctx, by_domain, tests);
+        (bench, store)
+    }
+
+    /// This bench with its domains and its rules with matchers replaced (K6 replay, BO-16): the same commands,
+    /// projects and tests, and the domains' keywords read again from `domains`, so a keyword change reaches topic
+    /// scoring as it would in the hook.
+    pub fn changed(&self, domains: Vec<DomainDef>, converted: Vec<Converted>) -> Bench<'a> {
+        Self::from_parts(
+            self.config,
+            domains,
+            converted,
+            self.commands.clone(),
+            self.ctx.clone(),
+            self.by_domain.clone(),
+            self.tests.clone(),
+        )
+    }
+
+    /// The star commands in `prompt` that the hook would act on (`*name`), which pass every rule and decision by.
+    /// None with no domains: the hook serves matcher rules before it looks for star commands then.
+    pub fn star_commands(&self, prompt: &str) -> Vec<String> {
+        if self.domains.is_empty() {
+            return Vec::new();
+        }
+        crate::command::match_commands(prompt, &self.commands)
+            .into_iter()
+            .filter(|c| !crate::command::format_command_output(c).is_empty())
+            .map(|c| format!("*{}", c.name))
+            .collect()
     }
 
     /// A bench from parts already loaded: the seam the unit tests drive.
@@ -145,15 +180,9 @@ impl<'a> Bench<'a> {
     pub fn judge(&self, rule: &RuleRef, prompt: &str) -> Verdict {
         // The hook's order (`user_prompt_submit::collect`): with no domains it serves matcher rules only, before it
         // looks for star commands; with domains, a star command returns before anything is matched.
-        if !self.domains.is_empty() {
-            let stars: Vec<String> = crate::command::match_commands(prompt, &self.commands)
-                .into_iter()
-                .filter(|c| !crate::command::format_command_output(c).is_empty())
-                .map(|c| format!("*{}", c.name))
-                .collect();
-            if !stars.is_empty() {
-                return Verdict { served: false, why: format!("star command {} passes every rule by", stars.join(" ")) };
-            }
+        let stars = self.star_commands(prompt);
+        if !stars.is_empty() {
+            return Verdict { served: false, why: format!("star command {} passes every rule by", stars.join(" ")) };
         }
         match self.converted.iter().find(|c| c.rule.id == rule.id) {
             Some(c) => self.judge_matchers(c, prompt),

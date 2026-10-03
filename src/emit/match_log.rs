@@ -635,6 +635,33 @@ pub fn last_rows(dir: &Path, n: usize, filter: &Filter) -> Result<Vec<Row>, Stri
     Ok(out)
 }
 
+/// The last `n` prompt rows of the log, oldest first, read as [`last_rows`] reads (K6 replay, BO-16): tool-call and
+/// signal rows are passed over without counting, so `n` is `n` prompts however many tool calls came between them.
+pub fn last_prompt_rows(dir: &Path, n: usize) -> Result<Vec<Row>, String> {
+    let mut out: Vec<Row> = Vec::new();
+    for path in files(dir).iter().rev() {
+        if out.len() >= n {
+            break;
+        }
+        rev_lines(path, |line| {
+            // A substring test before the JSON parse: most rows are tool calls.
+            let has = |needle: &[u8]| line.windows(needle.len()).any(|w| w == needle);
+            if has(b"\"event\":\"prompt\"") || has(b"\"event\": \"prompt\"") {
+                let Ok(text) = std::str::from_utf8(line) else { return true };
+                if let Ok(row) = serde_json::from_str::<Row>(text.trim())
+                    && row.event == "prompt"
+                {
+                    out.push(row);
+                }
+            }
+            out.len() < n
+        })
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    out.reverse();
+    Ok(out)
+}
+
 fn take_line(line: &[u8], filter: &Filter, out: &mut Vec<Row>) {
     let Ok(text) = std::str::from_utf8(line) else { return };
     if let Ok(row) = serde_json::from_str::<Row>(text.trim())

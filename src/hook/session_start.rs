@@ -201,6 +201,7 @@ pub fn handle(
     let graph = load_session_graph(cwd, config);
     let queries_shown = render_adhoc_queries(graph.as_ref(), cwd, config, out);
     push_global_decisions(graph.as_ref(), cwd, config, out);
+    push_rule_proposals(graph.as_ref(), config, out);
 
     if let Ok(signal_result) = crate::signal::run_signals(cwd, config, "session-start") {
         diagnostics.extend(signal_result.diagnostics.iter().cloned());
@@ -347,17 +348,32 @@ fn push_global_decisions(graph: Option<&oxigraph::store::Store>, cwd: &Path, con
     }
 }
 
+/// K5b (BO-16, D8): the rule proposals waiting for review, left from earlier sessions (BO-15 writes them), counted in
+/// the graph already loaded. One line, and nothing when none is pending.
+fn push_rule_proposals(graph: Option<&oxigraph::store::Store>, config: &BaseConfig, out: &mut SessionOutput) {
+    let Some(graph) = graph else {
+        return;
+    };
+    let pending = crate::corrections::review::pending_count(graph, &config.namespace);
+    if pending > 0 {
+        out.push("rule-proposals", &format!("{}\n", crate::corrections::review::session_start_line(pending)), pending);
+    }
+}
+
 /// Spec B1: every block's rank, and inside its rank its place. The trimmer takes the bottom of the
 /// lowest rank first, so the `Tail` order is B1 row 8's list read upward: diagnostics shrink first,
 /// pulse last, and the relay wake contract outlasts the operator profile and the notices. A kind
 /// missing from this table sorts after all of it, and `every_pushed_kind_has_a_place_in_the_layout`
 /// fails the build when one does.
-pub const LAYOUT: [(&str, Rank); 34] = [
+pub const LAYOUT: [(&str, Rank); 35] = [
     ("instructions", Rank::Pinned),
     ("graph-unhealthy", Rank::DueNow),
     ("reminders", Rank::DueNow),
     ("relay-inbox", Rank::DueNow),
     ("handoffs", Rank::Primary),
+    // BO-16, K5b: the rule proposals left from earlier sessions, one line, AFTER the handoffs so it never pushes
+    // DUE NOW or HANDOFFS down, and at Primary so it is never inside the first screen's measure (header, Pinned, DueNow).
+    ("rule-proposals", Rank::Primary),
     ("forks", Rank::Secondary),
     // BEFORE the working-set blocks it qualifies, deliberately. The trimmer takes the
     // bottom of a rank first, so a scope clause placed after the rows would be trimmed
@@ -434,6 +450,7 @@ pub fn command_for(kind: &str) -> Option<&'static str> {
         "graph-unhealthy" | "hooks-health" => Some("base doctor"),
         "operator" => Some("base operator show"),
         "handoffs" => Some("base handoff list"),
+        "rule-proposals" => Some("base rule review"),
         "reminders" => Some("base reminder list"),
         "forks" => Some("base fork list"),
         "projects" => Some("base project list --all"),

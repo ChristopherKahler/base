@@ -343,6 +343,31 @@ pub struct BaseConfig {
     pub doctor: DoctorConfig,
     #[serde(default)]
     pub corrections: CorrectionsConfig,
+    #[serde(default)]
+    pub tune: TuneConfig,
+}
+
+// ─── Tune Config (BO-16: K6 replay; BO-17 adds its cadence keys, D7) ───
+
+/// `[tune]`: how a proposed rule change is checked before anyone approves it (K6). `base rule replay` and
+/// `base rule review` run the change over the user's own recent prompts and say which would start or stop serving it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuneConfig {
+    /// How many of the match log's most recent prompts a replay runs over.
+    #[serde(default = "default_replay_prompts")]
+    pub replay_prompts: usize,
+    /// A change whose rule would be served on more than this share of the replayed prompts is flagged TOO BROAD.
+    #[serde(default = "default_broad_share")]
+    pub broad_share: f32,
+}
+
+fn default_replay_prompts() -> usize { 500 }
+fn default_broad_share() -> f32 { 0.25 }
+
+impl Default for TuneConfig {
+    fn default() -> Self {
+        Self { replay_prompts: default_replay_prompts(), broad_share: default_broad_share() }
+    }
 }
 
 // ─── Corrections Config (BO-15: K3, C1 to C4, D4, D10) ───────

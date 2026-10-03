@@ -267,6 +267,10 @@ pub fn run(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Proposal, Str
     }
     let session = ev.session.clone();
     let fingerprint = fingerprint(kind, &target, &keywords, text.as_deref());
+    // K5e (BO-16): a proposal the user rejected is never offered again, in either tier.
+    if let Some((id, when)) = store.as_ref().and_then(|s| super::review::rejected(s, &config.namespace, &fingerprint)) {
+        return Err(format!("rejected on {when} as {id}: this proposal is not offered again. Nothing was written."));
+    }
     let turn_key = turn_key(session.as_deref(), &ev, &fingerprint);
     let mut proposal = Proposal {
         id: None,
@@ -404,7 +408,7 @@ fn transcript_for(cwd: &Path, given: Option<&str>, session: Option<&str>) -> Res
 }
 
 /// The tier folders a session's rows can be in: the cwd's, then the global tier's.
-fn row_dirs(cwd: &Path) -> Vec<PathBuf> {
+pub(crate) fn row_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for d in [crate::crud::handoff_show::session_start_dir(cwd), crate::config::global_base_dir().filter(|d| d.is_dir())]
         .into_iter()
@@ -1033,8 +1037,8 @@ pub fn render(prop: &Proposal, dry_run: bool) -> String {
     } else {
         let replaced = if prop.replaced { "; it replaces this turn's earlier proposal" } else { "" };
         s.push_str(&format!(
-            "  pending review ({id}){replaced}. Wrong kind or target? Run it again with --rule <domain>.<id>, \
-             --decision <slug> or --new: this turn's proposal is replaced.\n"
+            "  pending review: base rule review ({id}){replaced}. Wrong kind or target? Run it again with --rule \
+             <domain>.<id>, --decision <slug> or --new: this turn's proposal is replaced.\n"
         ));
     }
     s
