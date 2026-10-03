@@ -52,6 +52,7 @@ pub mod protocol;
 pub mod relay;
 pub mod scaffold;
 pub mod scope;
+pub mod scrub;
 pub mod secret;
 pub mod shell;
 pub mod signal;

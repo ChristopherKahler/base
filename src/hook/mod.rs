@@ -9,7 +9,7 @@ pub mod stop;
 pub mod user_prompt_submit;
 pub mod walk;
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::BaseConfig;
@@ -206,11 +206,20 @@ fn run_event(
                 }
             }
             print!("{}", rendered.text);
+            // The match log's retention (K1e), after the print. The hook still exits only after it, so it is kept cheap:
+            // at most one rename a day and the deletion of archive files past `[log] prompt_days`; the log being
+            // appended to is never rewritten (see `match_log::retain`).
+            let _ = std::io::stdout().flush();
+            if let Some(dir) = crate::crud::handoff_show::session_start_dir(&cwd)
+                && let Err(why) = crate::emit::match_log::retain(&dir, config.log.prompt_days, chrono::Local::now())
+            {
+                eprintln!("base: session start could not prune the match log: {why}");
+            }
             handled?;
             Ok(HookEventData { session_id, ..Default::default() })
         }
         "pre-tool-use" => {
-            let (mut data, mut context) = pre_tool_use::handle(&config, &cwd, stdin_json)?;
+            let (mut data, mut context, trace) = pre_tool_use::handle_traced(&config, &cwd, stdin_json)?;
             let (tool_name, file_path) = extract_tool_context(stdin_json);
             data.tool_name = tool_name;
             data.file_path = file_path;
@@ -247,6 +256,14 @@ fn run_event(
                     }
                 });
                 println!("{envelope}");
+            }
+            // The match log's row (K1), after the print, never in the way of it (K1g).
+            let _ = std::io::stdout().flush();
+            if let Some(row) = crate::emit::match_log::file_row(trace, session_id.as_deref())
+                && let Some(dir) = crate::crud::handoff_show::session_start_dir(&cwd)
+                && let Err(why) = crate::emit::match_log::append(&dir, &row)
+            {
+                eprintln!("base: the tool hook could not write its match log row: {why}");
             }
             data.session_id = session_id;
             Ok(data)
@@ -369,10 +386,27 @@ fn run_event(
             // the sites this replaced had already printed by the time an error could be seen, so
             // dropping their text on an error would be a regression dressed as a refactor.
             crate::emit::prompt::print(&fitted);
+            let _ = std::io::stdout().flush();
             if let Some(dir) = dir {
                 let record = crate::emit::record::record_of_prompt(&fitted, "user-prompt-submit", session_id.as_deref());
                 if let Err(why) = crate::emit::record::keep(&dir, &record) {
                     eprintln!("base: the prompt hook could not keep its output record: {why}");
+                }
+                // The match log's row (K1): what matched, what the printed blocks served, what the budget, the topic
+                // cap and the walk cut. Written after the print and never in the way of it (K1g).
+                if !sink.prompt.is_empty() {
+                    let row = crate::emit::match_log::prompt_row(
+                        std::mem::take(&mut sink.trace),
+                        &fitted,
+                        config.budget.key_as_written("prompt_bytes"),
+                        session_id.as_deref(),
+                        &sink.prompt,
+                        sink.prompt_num,
+                        config.log.prompt_text_mode(),
+                    );
+                    if let Err(why) = crate::emit::match_log::append(&dir, &row) {
+                        eprintln!("base: the prompt hook could not write its match log row: {why}");
+                    }
                 }
             }
             let mut data = handled?;

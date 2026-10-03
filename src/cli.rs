@@ -38,6 +38,26 @@ pub enum HooksAction {
 }
 
 #[derive(Subcommand)]
+pub enum LogAction {
+    /// What each prompt and file touch matched, by what, and what was served and cut: the last rows of
+    /// .base/match-log.jsonl, oldest first
+    Matches {
+        /// How many rows
+        #[arg(long, default_value_t = 20)]
+        last: usize,
+        /// Only this session's rows (an id, or the start of one)
+        #[arg(long)]
+        session: Option<String>,
+        /// Only rows that served or cut this rule or decision (its id, or the start of one, as --json shows it)
+        #[arg(long)]
+        rule: Option<String>,
+        /// Print the rows as JSON, one per line
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum Commands {
     /// Handle Claude Code hook events (session-start, post-tool-use, user-prompt-submit)
     Hook {
@@ -48,6 +68,11 @@ pub enum Commands {
     Hooks {
         #[command(subcommand)]
         action: HooksAction,
+    },
+    /// Read base's own logs: `base log matches` shows what prompts and file touches matched
+    Log {
+        #[command(subcommand)]
+        action: LogAction,
     },
     /// Query AST codebase graph (entities, calls, imports)
     #[command(visible_alias = "a")]
@@ -1906,6 +1931,38 @@ pub fn run() {
                     }
                     Err(why) => {
                         eprintln!("base hooks show: {why}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
+
+        // The match log's reader (K1f, BO-13). It reads the tier the hooks write for this folder: the workspace's
+        // .base, else the global one.
+        Some(Commands::Log { action }) => match action {
+            LogAction::Matches { last, session, rule, json } => {
+                let Some(dir) = base::crud::handoff_show::session_start_dir(&cwd) else {
+                    eprintln!("base log matches: no .base here or in the global tier");
+                    std::process::exit(1);
+                };
+                let filter = base::emit::match_log::Filter { session, rule };
+                match base::emit::match_log::last_rows(&dir, last, &filter) {
+                    Ok(rows) if rows.is_empty() => {
+                        eprintln!(
+                            "base log matches: no rows in {}",
+                            dir.join(base::emit::match_log::FILE).display()
+                        );
+                    }
+                    Ok(rows) if json => {
+                        for row in &rows {
+                            println!("{}", serde_json::to_string(row).unwrap_or_default());
+                        }
+                    }
+                    Ok(rows) => {
+                        print!("{}", base::emit::match_log::format_rows(&rows, chrono::Local::now().date_naive()));
+                    }
+                    Err(why) => {
+                        eprintln!("base log matches: {why}");
                         std::process::exit(1);
                     }
                 }

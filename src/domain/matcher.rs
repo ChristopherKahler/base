@@ -34,6 +34,10 @@ pub struct DomainMatch<'a> {
     /// `nested = true` (D13): the project it came with. Such a match is ordered after every other one, so a tight
     /// budget drops the parent's rules before the child's.
     pub parent_of: Option<String>,
+    /// The prompt keywords that hit, as `domains.toml` writes them (K1: "by what").
+    pub keywords: Vec<String>,
+    /// For a path match, what held the path: the owning project's folder, or the trigger as resolved (K1).
+    pub held_by: Option<String>,
 }
 
 /// What the path rules need beyond the domain itself (F29, D1, D13).
@@ -126,12 +130,13 @@ pub fn match_domains<'a>(
         .enumerate()
         .filter_map(|(i, d)| {
             let hit = hits.iter().find(|h| h.domain == i);
-            let (reason, path) = is_matched(d, &prompt_lower, hit.map(|h| h.path.as_str()))?;
+            let (reason, path, keywords) = is_matched(d, &prompt_lower, hit.map(|h| h.path.as_str()))?;
             let parent_of = match (&reason, hit.map(|h| &h.via)) {
                 (MatchReason::Filepath, Some(PathVia::Parent(child))) => Some(child.clone()),
                 _ => None,
             };
-            Some(DomainMatch { domain: d, reason, path, parent_of })
+            let held_by = path.as_ref().and(hit).map(|h| h.value.clone());
+            Some(DomainMatch { domain: d, reason, path, parent_of, keywords, held_by })
         })
         .collect();
     // Stable: the rest keep their order, and the parents keep theirs behind them.
@@ -156,12 +161,13 @@ pub fn match_domains_auto<'a>(
 }
 
 /// Determine if a domain matches the current context. `path_hit` is the touched path that brought the domain in,
-/// when one did ([`path_hits`]). Returns Some(reason) on match, None on no match.
+/// when one did ([`path_hits`]). Returns Some(reason, the touched path, the keywords that hit) on match, None on no
+/// match.
 fn is_matched(
     domain: &DomainDef,
     prompt_lower: &str,
     path_hit: Option<&str>,
-) -> Option<(MatchReason, Option<String>)> {
+) -> Option<(MatchReason, Option<String>, Vec<String>)> {
     // Exclude patterns are checked first — any match vetoes the domain, an always-on
     // one included. Until 0.14.0 `always` returned before this loop, so an exclude on
     // an always-on domain was dead configuration (F29).
@@ -173,24 +179,27 @@ fn is_matched(
 
     // Always-on domains match everything else
     if domain.is_always() {
-        return Some((MatchReason::Always, None));
+        return Some((MatchReason::Always, None, Vec::new()));
     }
 
     // Keyword match: a prompt keyword as whole words in the prompt text. A substring
     // test stood here until 0.14.0 and fired `base` on `database` (F29). Excludes keep
     // the substring test on purpose: a veto that fires too often errs toward silence.
-    let keyword_hit = domain
+    // Every keyword that hits, not only the first: the match log says which (K1).
+    let keywords: Vec<String> = domain
         .prompt_keywords
         .iter()
-        .any(|kw| contains_word(prompt_lower, &kw.to_lowercase()));
+        .filter(|kw| contains_word(prompt_lower, &kw.to_lowercase()))
+        .cloned()
+        .collect();
 
-    let reason = match (keyword_hit, path_hit.is_some()) {
+    let reason = match (!keywords.is_empty(), path_hit.is_some()) {
         (true, true) => MatchReason::KeywordAndFilepath,
         (true, false) => MatchReason::Keyword,
         (false, true) => MatchReason::Filepath,
         (false, false) => return None,
     };
-    Some((reason, path_hit.map(String::from)))
+    Some((reason, path_hit.map(String::from), keywords))
 }
 
 /// Does `needle` occur in `text` as whole words? The characters on either side of an
@@ -240,6 +249,9 @@ pub struct PathHit {
     /// The touched path that brought it.
     pub path: String,
     pub via: PathVia,
+    /// What held the path (K1): the owning project's folder for an owner, the trigger as resolved for a trigger, the
+    /// parent project's folder (empty when it has none) for a parent.
+    pub value: String,
 }
 
 /// Every domain the touched `paths` bring in, each once, at its first reason (D1, P2, D13).
@@ -272,20 +284,20 @@ pub fn path_hits(domains: &[DomainDef], paths: &[String], ctx: &TriggerContext) 
             if let Some(&i) = by_slug.get(&o.slug)
                 && seen.insert(i)
             {
-                direct.push(PathHit { domain: i, path: path.clone(), via: PathVia::Owner });
+                direct.push(PathHit { domain: i, path: path.clone(), via: PathVia::Owner, value: o.path.clone() });
             }
         }
         for (i, d) in domains.iter().enumerate() {
             if d.is_always() || seen.contains(&i) {
                 continue;
             }
-            let holds = d.paths.iter().any(|t| {
+            let held = d.paths.iter().find_map(|t| {
                 live_trigger(t, d.root.as_deref(), ctx)
-                    .is_some_and(|t| path_under(path, &t) && floor.is_none_or(|f| path_under(&t, f)))
+                    .filter(|t| path_under(path, t) && floor.is_none_or(|f| path_under(t, f)))
             });
-            if holds {
+            if let Some(trigger) = held {
                 seen.insert(i);
-                direct.push(PathHit { domain: i, path: path.clone(), via: PathVia::Trigger });
+                direct.push(PathHit { domain: i, path: path.clone(), via: PathVia::Trigger, value: trigger });
             }
         }
         for o in &owned {
@@ -296,7 +308,12 @@ pub fn path_hits(domains: &[DomainDef], paths: &[String], ctx: &TriggerContext) 
                 {
                     // Named as the child's own block is headed: its domain's name, else the project's.
                     let child_name = by_slug.get(&child.slug).map_or_else(|| child.name.clone(), |&c| domains[c].name.clone());
-                    parents.push(PathHit { domain: i, path: path.clone(), via: PathVia::Parent(child_name) });
+                    parents.push(PathHit {
+                        domain: i,
+                        path: path.clone(),
+                        via: PathVia::Parent(child_name),
+                        value: parent.path.clone(),
+                    });
                 }
             }
         }

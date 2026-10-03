@@ -370,15 +370,31 @@ pub struct LogConfig {
     /// Days a session's own hook-output folder (`.base/hook-output/<session id>/`: its full session start, its last
     /// prompt's output, its letters) is kept after it was last written. Session start removes older ones (BO-06,
     /// F11e). Read as at least 1, so a session start never removes the folder of a session still running today.
+    ///
+    /// The match log's rows (`.base/match-log.jsonl`, K1) are kept as long: session start removes rows dated more than
+    /// this many calendar days ago (BO-13, K1e).
     #[serde(default = "default_prompt_days")]
     pub prompt_days: u64,
+    /// How much of each prompt a match-log row keeps (K1c): `full` (the default: the prompt, secrets scrubbed),
+    /// `matched` (only the words that matched a keyword or a topic rule) or `off` (no text). Any other value reads as
+    /// `off`. See [`LogConfig::prompt_text_mode`].
+    #[serde(default = "default_prompt_text")]
+    pub prompt_text: String,
 }
 
 fn default_prompt_days() -> u64 { 90 }
+fn default_prompt_text() -> String { "full".to_string() }
 
 impl Default for LogConfig {
     fn default() -> Self {
-        Self { prompt_days: default_prompt_days() }
+        Self { prompt_days: default_prompt_days(), prompt_text: default_prompt_text() }
+    }
+}
+
+impl LogConfig {
+    /// `prompt_text` as the match log reads it.
+    pub fn prompt_text_mode(&self) -> crate::emit::match_log::PromptText {
+        crate::emit::match_log::PromptText::parse(&self.prompt_text)
     }
 }
 

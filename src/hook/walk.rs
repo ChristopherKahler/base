@@ -393,10 +393,18 @@ fn label_of(nodes: &HashMap<String, Node>, id: &str) -> String {
 /// records the budget dropped, so devmode can say what was cut rather than
 /// letting it vanish.
 pub fn render(walked: &[(Resolved, Vec<Record>)], budget: usize) -> (String, usize) {
+    let (out, dropped, _) = render_counted(walked, budget);
+    (out, dropped)
+}
+
+/// [`render`], and how many records of each name it wrote, in `walked` order: the records past that count were
+/// dropped by the budget. The prompt hook's match log names both (K1, BO-13).
+pub fn render_counted(walked: &[(Resolved, Vec<Record>)], budget: usize) -> (String, usize, Vec<usize>) {
     let mut out = String::new();
     let mut dropped = 0usize;
+    let mut written: Vec<usize> = vec![0; walked.len()];
 
-    for (r, records) in walked {
+    for (j, (r, records)) in walked.iter().enumerate() {
         if records.is_empty() {
             continue;
         }
@@ -423,10 +431,11 @@ pub fn render(walked: &[(Resolved, Vec<Record>)], budget: usize) -> (String, usi
         if wrote == 0 {
             continue;
         }
+        written[j] = wrote;
         block.push_str("</base-context>\n");
         out.push_str(&block);
     }
-    (out, dropped)
+    (out, dropped, written)
 }
 
 #[cfg(test)]
