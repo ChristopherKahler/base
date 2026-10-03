@@ -3468,7 +3468,7 @@ Options:
           Restore the workspace graph from a backup snapshot. Bare `--restore` lists snapshots
 
       --fix
-          Plan the repair of what doctor reports and change nothing: records of another workspace moved out, corrections linked to what they correct or made plain notes, supersession disagreements settled, `[signal] max_chars` migrated, each tier compacted and its backups cut to `[graph] keep_backups`. `--fix --yes` applies the plan, snapshotting each graph first
+          Plan the repair of what doctor reports and change nothing: records of another workspace moved out, corrections linked to the one record they name (the rest stay corrections), supersession disagreements settled, `[signal] max_chars` migrated, each tier compacted and its backups cut to `[graph] keep_backups`. `--fix --yes` applies the plan, snapshotting each graph first
 
       --yes
           With `--fix`: apply the plan

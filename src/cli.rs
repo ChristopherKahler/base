@@ -403,8 +403,8 @@ pub enum Commands {
         #[arg(long, num_args = 0..=1)]
         restore: Option<Option<String>>,
         /// Plan the repair of what doctor reports and change nothing: records of another workspace moved out,
-        /// corrections linked to what they correct or made plain notes, supersession disagreements settled,
-        /// `[signal] max_chars` migrated, each tier compacted and its backups cut to `[graph] keep_backups`.
+        /// corrections linked to the one record they name (the rest stay corrections), supersession disagreements
+        /// settled, `[signal] max_chars` migrated, each tier compacted and its backups cut to `[graph] keep_backups`.
         /// `--fix --yes` applies the plan, snapshotting each graph first.
         #[arg(long, conflicts_with_all = ["repair", "restore"])]
         fix: bool,

@@ -2,5 +2,5 @@
 # `cargo test --no-fail-fast` run, as CI measures it. CI fails on any difference, either way
 # (scripts/ci_guards.py test-count). A PR that adds tests raises the number in the same diff; a PR
 # that removes tests lowers it and names the removed tests in its body (build rule 14).
-linux 1567
-windows 1561
+linux 1571
+windows 1565

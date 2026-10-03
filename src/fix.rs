@@ -16,10 +16,11 @@
 //!    refusal rather than a repair: a "foreign" graph holding at least as many quads as the tier's own is the shape of
 //!    THIS workspace under an earlier folder name (doctor's "most likely renamed" line), and moving it out would empty
 //!    the workspace. It is left in place and said so.
-//! 2. **Corrections that name nothing they correct (F15b).** A correction whose text names exactly one record, by its
-//!    slug, by quoted text, or by a decision's title, gets the supersession edge to it. Every other one keeps its text
-//!    and becomes a plain note (`noteType "insight"`, the type `base learn` writes by default), with
-//!    `ops:formerNoteType "correction"` beside it, so the label it lost is still on record. Nothing is deleted.
+//! 2. **Corrections that name nothing they correct (F15b, D18).** A correction whose text names exactly one record, by
+//!    its slug, by quoted text, or by a decision's title, gets the supersession edge to it. Every other one is left
+//!    exactly as it is: still a correction, with nothing added and nothing removed, so it keeps its place at the top of
+//!    the memory block. Doctor names corrections among what `--fix` repairs only when one would link
+//!    ([`corrections_to_link`]).
 //! 3. **Supersession disagreement (F15d).** A record with status `superseded` and no edge gets the edge when a record
 //!    already says it supersedes it; otherwise the status is cleared (`active` when no other status is left). A record
 //!    with the edge and no status gets the status: the edge is the truth (`crate::supersede`).
@@ -45,12 +46,6 @@ use crate::store::{self, GraphHealth};
 use crate::supersede;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-
-/// The note type a relabelled correction gets: the one `base learn` writes when no `--type` is given.
-pub const PLAIN_NOTE_TYPE: &str = "insight";
-
-/// Beside a relabelled correction: the type it carried before `--fix` (F15b, nothing deleted).
-pub const PRED_FORMER_NOTE_TYPE: &str = "formerNoteType";
 
 // ─── What a run plans or did ─────────────────────────────────────────────────
 
@@ -111,7 +106,6 @@ impl TierFix {
     pub fn changes_graph(&self) -> bool {
         self.foreign.iter().any(|f| !matches!(f.dest, Dest::Left { .. }))
             || !self.corrections.linked.is_empty()
-            || !self.corrections.relabeled.is_empty()
             || !self.supersession.is_empty()
     }
 }
@@ -123,11 +117,11 @@ pub struct Corrections {
     pub found: usize,
     /// `(correction, the record it corrects)`: each now carries the supersession edge.
     pub linked: Vec<(String, String)>,
-    /// Corrections that become plain notes.
-    pub relabeled: Vec<String>,
-    /// Of `relabeled`: how many named more than one record, so naming the one they correct would be a guess.
+    /// Every correction not linked, left exactly as it is: still a correction (D18).
+    pub stay: Vec<String>,
+    /// Of `stay`: how many named more than one record, so naming the one they correct would be a guess.
     pub several: usize,
-    /// Of `relabeled`: those that named exactly one record that cannot take the edge, as `(correction, record, why)`.
+    /// Of `stay`: those that named exactly one record that cannot take the edge, as `(correction, record, why)`.
     pub refused: Vec<(String, String, String)>,
 }
 
@@ -382,22 +376,39 @@ fn repair_store(ctx: &Ctx<'_>, path: &Path, store: &Store, fix: &mut TierFix) ->
 
 // ─── F15c: records of another workspace ──────────────────────────────────────
 
-fn move_foreign(ctx: &Ctx<'_>, path: &Path, store: &Store, fix: &mut TierFix) -> Result<Vec<(Dest, Vec<Quad>)>> {
+/// The graphs in the tier at `path` that belong to another workspace, each with its quads, highest count first, and how
+/// many quads the tier's own graphs hold. [`move_foreign`] moves each one out unless [`left_in_place`]; doctor's
+/// [`corrections_to_link`] drops the same ones before it counts, so the two read one rule.
+fn foreign_graphs(ns: &NamespaceConfig, store: &Store, path: &Path) -> Result<(GraphQuads, usize)> {
     let own_slug = crate::doctor::tier_own_slug(path);
     let mut by_graph: BTreeMap<String, Vec<Quad>> = BTreeMap::new();
     let mut own = 0usize;
     for quad in store.iter() {
         let quad = quad?;
         let GraphName::NamedNode(g) = &quad.graph_name else { continue };
-        if crate::doctor::is_foreign(g.as_str(), &ctx.ns.uri, &own_slug) {
+        if crate::doctor::is_foreign(g.as_str(), &ns.uri, &own_slug) {
             by_graph.entry(g.as_str().to_string()).or_default().push(quad);
-        } else if crate::doctor::graph_owner(g.as_str(), &ctx.ns.uri) == Some(own_slug.as_str()) {
+        } else if crate::doctor::graph_owner(g.as_str(), &ns.uri) == Some(own_slug.as_str()) {
             own += 1;
         }
     }
     // Highest count first, as doctor lists them.
-    let mut graphs: Vec<(String, Vec<Quad>)> = by_graph.into_iter().collect();
+    let mut graphs: GraphQuads = by_graph.into_iter().collect();
     graphs.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    Ok((graphs, own))
+}
+
+/// Named graphs, each with its quads.
+type GraphQuads = Vec<(String, Vec<Quad>)>;
+
+/// F15c's one refusal: a "foreign" graph holding at least as many quads as the tier's own is this workspace under an
+/// earlier folder name, and moving it out would empty the workspace. It stays where it is.
+fn left_in_place(quads: usize, own: usize) -> bool {
+    quads >= own
+}
+
+fn move_foreign(ctx: &Ctx<'_>, path: &Path, store: &Store, fix: &mut TierFix) -> Result<Vec<(Dest, Vec<Quad>)>> {
+    let (graphs, own) = foreign_graphs(ctx.ns, store, path)?;
 
     // Quads per subject over the whole tier, once: what a foreign graph's records still have elsewhere in it.
     let mut per_subject: HashMap<String, usize> = HashMap::new();
@@ -422,7 +433,7 @@ fn move_foreign(ctx: &Ctx<'_>, path: &Path, store: &Store, fix: &mut TierFix) ->
         kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let left_behind = subjects.iter().map(|s| per_subject.get(s).copied().unwrap_or(0)).sum::<usize>()
             - quads.iter().filter(|q| subject_iri(&q.subject).is_some()).count();
-        let dest = if quads.len() >= own {
+        let dest = if left_in_place(quads.len(), own) {
             Dest::Left {
                 why: format!(
                     "{} quads, at least this workspace's own {own}: the shape of this workspace under an earlier folder \
@@ -555,7 +566,26 @@ fn write_destination(dest: &Dest, quads: &[Quad]) -> Result<()> {
 
 // ─── F15b: corrections that name nothing they correct ────────────────────────
 
-/// Link each correction that names exactly one record to it; make every other one a plain note.
+/// How many corrections `base doctor --fix` would link in the tier whose graph is `path`, counted on `store`, a copy of
+/// that graph doctor loaded and is done with (BO-25, D18). It runs `--fix`'s own steps up to the link, in memory: the
+/// foreign graphs `--fix` moves out go first, as [`move_foreign`] removes them, then [`link_corrections`] runs on what is
+/// left. Doctor then names corrections among what `--fix` repairs exactly when `--fix` would link one. Nothing is
+/// written: `store` is changed in memory and dropped.
+pub fn corrections_to_link(ns: &NamespaceConfig, store: Store, path: &Path) -> Result<usize> {
+    let (graphs, own) = foreign_graphs(ns, &store, path)?;
+    for (_, quads) in graphs.iter().filter(|(_, quads)| !left_in_place(quads.len(), own)) {
+        for q in quads {
+            store.remove(q)?;
+        }
+    }
+    let mut corrections = Corrections::default();
+    link_corrections(ns, &store, &mut corrections)?;
+    Ok(corrections.linked.len())
+}
+
+/// Link each correction that names exactly one record to it. Every other one is left exactly as it is, a correction
+/// (D18). Each edge goes into `store` as its correction is decided, so a later correction naming the same record finds
+/// it already superseded and is refused.
 fn link_corrections(ns: &NamespaceConfig, store: &Store, out: &mut Corrections) -> Result<()> {
     let p = |local: &str| format!("{}{local}", ns.uri);
     let iris = [p("noteType"), p("noteText"), p(supersede::PRED_SUPERSEDES), p(supersede::PRED_SUPERSEDED_BY), p("createdAt")];
@@ -588,8 +618,6 @@ fn link_corrections(ns: &NamespaceConfig, store: &Store, out: &mut Corrections) 
             _ => None,
         })
     };
-    let former_iri = p(PRED_FORMER_NOTE_TYPE);
-    let former = node(&former_iri)?;
 
     for (correction, type_quads) in &corrections {
         let text = literal(correction, note_text).unwrap_or_default();
@@ -641,14 +669,7 @@ fn link_corrections(ns: &NamespaceConfig, store: &Store, out: &mut Corrections) 
                 if let (Some(t), Some(why)) = (target, refusal) {
                     out.refused.push((local(correction, &ns.uri), local(&t, &ns.uri), why));
                 }
-                for q in type_quads {
-                    store.remove(q)?;
-                    let g = q.graph_name.as_ref();
-                    let s = q.subject.as_ref();
-                    store.insert(QuadRef::new(s, note_type, LiteralRef::new_simple_literal(PLAIN_NOTE_TYPE), g))?;
-                    store.insert(QuadRef::new(s, former, LiteralRef::new_simple_literal("correction"), g))?;
-                }
-                out.relabeled.push(local(correction, &ns.uri));
+                out.stay.push(local(correction, &ns.uri));
             }
         }
     }
@@ -953,6 +974,25 @@ fn row(out: &mut String, label: &str, value: &str) {
     out.push_str(&format!("    {label} {} {value}\n", ".".repeat(dots)));
 }
 
+/// Why the corrections `--fix` does not link stay as they are: `they name no single record` (none, or more than one),
+/// or the split when some name one record that cannot take the edge, each of those listed below the row with why.
+fn stay_reasons(c: &Corrections) -> String {
+    let name = |n: usize| if n == 1 { "names" } else { "name" };
+    let unnamed = c.stay.len() - c.refused.len();
+    let refused = c.refused.len();
+    let mut why = if refused == 0 {
+        if unnamed == 1 { "it names no single record".to_string() } else { "they name no single record".to_string() }
+    } else if unnamed == 0 {
+        format!("{refused} {} one that cannot take the edge", name(refused))
+    } else {
+        format!("{unnamed} {} no single record, {refused} {} one that cannot take the edge", name(unnamed), name(refused))
+    };
+    if c.several > 0 {
+        why.push_str(&format!("; {} {} more than one", c.several, name(c.several)));
+    }
+    why
+}
+
 fn names(list: &[String], max: usize) -> String {
     let shown: Vec<&str> = list.iter().take(max).map(String::as_str).collect();
     let more = list.len().saturating_sub(shown.len());
@@ -1035,15 +1075,17 @@ fn format_tier(out: &mut String, t: &TierFix, applied: bool) {
     }
     let c = &t.corrections;
     if c.found > 0 {
-        let mut value = format!(
-            "{} found: {} linked, {} become plain notes",
-            c.found,
-            c.linked.len(),
-            c.relabeled.len()
-        );
-        if c.several > 0 {
-            value.push_str(&format!(" ({} name more than one record)", c.several));
-        }
+        // D18: the corrections not linked stay corrections, and the row says so. With none to link it says there is
+        // nothing to do, which is what a second `--fix` prints.
+        let value = if c.linked.is_empty() {
+            let they = if c.stay.len() == 1 { "it stays a correction" } else { "they stay corrections" };
+            format!("nothing to do: {} found, {they} ({})", c.found, stay_reasons(c))
+        } else if c.stay.is_empty() {
+            format!("{} found: {} linked", c.found, c.linked.len())
+        } else {
+            let stay = if c.stay.len() == 1 { "1 stays a correction".to_string() } else { format!("{} stay corrections", c.stay.len()) };
+            format!("{} found: {} linked, {stay} ({})", c.found, c.linked.len(), stay_reasons(c))
+        };
         row(out, "link corrections to what they correct", &value);
         for (from, to) in &c.linked {
             out.push_str(&format!("        {from} corrects {to}\n"));
