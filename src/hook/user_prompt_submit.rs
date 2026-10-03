@@ -1121,6 +1121,7 @@ fn lines_of<'a>(lines: impl IntoIterator<Item = Option<&'a str>>) -> String {
 ///
 /// Three callers in `handle`, one per return site that is not a star command: no domains at all, no domain matched,
 /// and the main path. A star command is an explicit invocation and passes rules by, as it passes domains by.
+#[allow(clippy::too_many_arguments)] // the hook's own state, passed through from its three callers
 fn matcher_blocks(
     config: &BaseConfig,
     prompt: &str,
