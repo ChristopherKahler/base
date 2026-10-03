@@ -635,6 +635,13 @@ pub struct PromptRow {
     pub bytes: usize,
     pub printed: bool,
     pub text: String,
+    /// A ranked block printed with some rules withheld (BO-18): how many, their bytes, and the text as printed.
+    #[serde(default)]
+    pub withheld_items: Option<usize>,
+    #[serde(default)]
+    pub withheld_bytes: Option<usize>,
+    #[serde(default)]
+    pub printed_text: Option<String>,
 }
 
 /// A session's prompt blocks file: every block the prompt hook built on the session's last prompt.
@@ -662,8 +669,32 @@ pub fn pointer_line(row: &PromptRow, budget: usize) -> String {
     )
 }
 
+/// The text a partly printed ranked block printed (BO-18), checked against its full text rather than trusted: some of
+/// the full text's lines, in their order, then one line in the pointer line's shape naming how many of its rules it
+/// withheld out of how many, and their bytes (lynx's G0 verdict on BO-18, Q1 condition 1).
+pub fn partial_text(row: &PromptRow, budget: usize) -> String {
+    let (Some(n), Some(bytes), Some(printed)) = (row.withheld_items, row.withheld_bytes, row.printed_text.as_ref()) else {
+        panic!("{}: a partly printed block without its withheld count, bytes and printed text", row.id);
+    };
+    let line = format!(
+        "[base: withheld {n} of {} {} ({} bytes) over [budget] prompt_bytes = {budget} · full text: base hooks show {}]",
+        row.items,
+        row.id,
+        base::emit::prompt::thousands(bytes),
+        row.id
+    );
+    let body = printed.strip_suffix(&line).unwrap_or_else(|| panic!("{}: does not end with {line:?}:
+{printed}", row.id));
+    let mut full = row.text.lines();
+    for l in body.lines() {
+        assert!(full.any(|f| f == l), "{}: printed line {l:?} is not a line of its full text, in order", row.id);
+    }
+    printed.clone()
+}
+
 /// What the prompt hook must have printed, rebuilt from its blocks file: the `<context-bracket>` line when `stdout`
-/// starts with one, then every block whole or its pointer line, a blank line between, one newline at the end.
+/// starts with one, then every block whole, or as printed with rules withheld ([`partial_text`], BO-18), or its pointer
+/// line, a blank line between, one newline at the end.
 pub fn rebuilt_prompt_output(stdout: &str, file: &PromptBlocksFile) -> String {
     let header = stdout.lines().next().filter(|l| l.starts_with("<context-bracket>")).unwrap_or("");
     let mut parts: Vec<String> = Vec::new();
@@ -671,7 +702,11 @@ pub fn rebuilt_prompt_output(stdout: &str, file: &PromptBlocksFile) -> String {
         parts.push(header.to_string());
     }
     for row in &file.blocks {
-        parts.push(if row.printed { row.text.clone() } else { pointer_line(row, file.budget_bytes) });
+        parts.push(match (row.printed, row.withheld_items) {
+            (true, Some(_)) => partial_text(row, file.budget_bytes),
+            (true, None) => row.text.clone(),
+            (false, _) => pointer_line(row, file.budget_bytes),
+        });
     }
     if parts.is_empty() {
         return String::new();

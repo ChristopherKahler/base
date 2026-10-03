@@ -1998,7 +1998,7 @@ fn changes_prompt_matching(command: &Option<Commands>) -> bool {
             GraphAction::Supersede { .. } | GraphAction::ApplyOps { .. } | GraphAction::Purge { .. } | GraphAction::Migrate { .. }
         ),
         Some(Commands::Project { action: ProjectAction::Rename { yes: true, .. } }) => true,
-        Some(Commands::Doctor { fix: true, .. }) | Some(Commands::Sync { .. }) => true,
+        Some(Commands::Doctor { fix: true, yes: true, .. }) | Some(Commands::Sync { .. }) => true,
         _ => false,
     }
 }

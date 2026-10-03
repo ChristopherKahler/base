@@ -310,8 +310,9 @@ pub fn refresh_for(config: &BaseConfig, cwd: &Path) {
         return;
     }
     let Some(dir) = index_dir(cwd) else { return };
-    // A keyword or a rule just written to `domains.toml` reaches the graph first, as every hook syncs it.
-    crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
+    // No domain sync here: a command that only reads (a `doctor --fix` plan, a review listing) must write nothing but
+    // this file. Keywords are read from `domains.toml` itself, and a domain whose graph holds no rules yet is read from
+    // the file too (`rules::rules_for_domain`), so what this reads is current.
     let domains = crate::domain::load_domains(cwd);
     let store = crate::store::load_merged(cwd);
     if let Err(why) = refresh(store.as_ref(), config, &domains, &dir) {
@@ -330,6 +331,68 @@ mod tests {
             keywords: keywords.iter().map(|s| s.to_string()).collect(),
             own_words: Vec::new(),
             fires_on: fires_on.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn decision(id: &str, name: &str, keywords: &[&str]) -> Source {
+        Source {
+            doc: DocRef { kind: DocKind::Decision, id: format!("<http://x/decision/{id}>"), domain: "GLOBAL".into() },
+            wording: vec![name.into()],
+            keywords: keywords.iter().map(|s| s.to_string()).collect(),
+            own_words: Vec::new(),
+            fires_on: Vec::new(),
+        }
+    }
+
+    /// Example 2: a word most documents hold adds little, a word one document holds adds a lot (BM25's IDF), so a
+    /// prompt sharing the rare word ranks that document above one sharing only the common word.
+    #[test]
+    fn bm25_rare_terms_weigh_more() {
+        let sources = vec![
+            rule("tools", "The base graph keeps one record per decision.", &[], &[]),
+            rule("tools", "The base workspace tier holds the session file.", &[], &[]),
+            rule("tools", "The base relay names each session by its title.", &[], &[]),
+            rule("tools", "The base sync reads every markdown file.", &[], &[]),
+            rule("tools", "An injection over the budget is named, never cut.", &[], &[]),
+            rule("tools", "The base doctor names a broken trigger.", &[], &[]),
+        ];
+        let index = ScoreIndex::build(&sources);
+        assert!(index.corpus.idf(&bm25::stem("injection")) > 2.0 * index.corpus.idf("base"), "rare outweighs common");
+        let scores = index.scores("what does base do with an injection");
+        assert_eq!(scores.ranked[0].doc.id, sources[4].doc.id, "the one document with the rare word first: {:?}", scores.ranked);
+        let base_only = scores.get(&sources[0].doc.id);
+        assert!(scores.ranked[0].score > 2.0 * base_only, "{} against {base_only}", scores.ranked[0].score);
+    }
+
+    /// Examples 1 and 4, in invented words of the same shape: a prompt about the prompt-submit hook losing what it
+    /// injects ranks the hook rule (its text, its domain's keywords and its test prompts) first and over the default
+    /// `min_score`, and the two unrelated global decisions, one about mirroring desktop profiles and one about browser
+    /// automation, score under it.
+    #[test]
+    fn bm25_ranks_hook_rule_above_profile_decision_for_prompt_3() {
+        let hook = rule(
+            "tools",
+            "The prompt hook trims its output block by block and names every block it withheld.",
+            &["hook", "hooks", "session start", "prompt submit", "user prompt submit", "pre-tool", "injection"],
+            &["the user prompt submit hook gets cut off at a high rate", "why do the hook injections lose their context"],
+        );
+        let sources = vec![
+            hook.clone(),
+            rule("tools", "Name the folder a file is written to.", &["folder"], &[]),
+            rule("garden", "Water the tomatoes before noon.", &["garden"], &[]),
+            decision("profiles", "Mirror one desktop profile into another with directory junctions so both share settings.", &["profile", "junction"]),
+            decision("browser", "Page automation uses the headless browser tool, never the browser extension.", &["browser automation"]),
+        ];
+        let index = ScoreIndex::build(&sources);
+        let prompt = "we keep losing most of what the user prompt submit step injects, it gets cut off; what is going on with \
+                      the hook injections at session start, while the pre-tool side looks fine";
+        let scores = index.scores(prompt);
+        assert_eq!(scores.ranked.first().map(|s| s.doc.id.as_str()), Some(hook.doc.id.as_str()), "{:?}", scores.ranked);
+        let min = crate::config::MatchConfig::default().min_score;
+        assert!(scores.get(&hook.doc.id) >= min, "the hook rule passes min_score {min}: {}", scores.get(&hook.doc.id));
+        for d in &sources[3..] {
+            assert!(scores.get(&d.doc.id) < min, "{} under min_score: {}", d.doc.id, scores.get(&d.doc.id));
+            assert!(scores.get(&d.doc.id) < scores.get(&hook.doc.id));
         }
     }
 
