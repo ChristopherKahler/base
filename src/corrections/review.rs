@@ -65,6 +65,17 @@ pub struct Stored {
     pub fingerprint: Option<String>,
     pub created: Option<String>,
     pub reviewed: Option<String>,
+    /// `correction` or `tune` (BO-17); empty on a proposal written before BO-17 (a correction's).
+    pub origin: String,
+    /// What the rule pass saw behind it.
+    pub evidence: Vec<String>,
+    /// A drop-keyword proposal's keywords to take away.
+    pub dropped: Vec<String>,
+    /// A merge's second rule.
+    pub merge_target: Option<String>,
+    /// A split's second part.
+    pub second_text: Option<String>,
+    pub second_keywords: Vec<String>,
 }
 
 impl Stored {
@@ -81,28 +92,45 @@ impl Stored {
             "decision" => Ok(Target::Decision(id.to_string())),
             other => Err(format!("{}: a target of kind '{other}' is not one this build applies", self.id)),
         };
+        let rule_only = |what: &str| -> Result<Target, String> {
+            match self.target_kind.as_str() {
+                "rule" => Ok(Target::Rule(self.target_id.clone())),
+                k => Err(format!("{}: a {what} applies to a rule, not a {k}", self.id)),
+            }
+        };
+        let wording = || self.text.clone().filter(|t| !t.trim().is_empty()).ok_or_else(no_wording);
         match self.kind.as_str() {
-            "keyword-gap" => Ok(Change {
-                target: target(&self.target_kind, &self.target_id)?,
-                add: self.keywords.clone(),
-                drop: Vec::new(),
-                text: None,
-            }),
-            "new-rule" => Ok(Change {
-                target: Target::NewRule {
+            "keyword-gap" => Ok(Change::keywords(target(&self.target_kind, &self.target_id)?, self.keywords.clone(), Vec::new())),
+            "new-rule" => Ok(Change::keywords(
+                Target::NewRule {
                     domain: self.target_id.clone(),
                     text: self.text.clone().ok_or_else(|| format!("{}: a new rule with no wording", self.id))?,
                 },
-                add: self.keywords.clone(),
-                drop: Vec::new(),
-                text: None,
-            }),
-            "rewrite" => Ok(Change {
-                target: target(&self.target_kind, &self.target_id)?,
-                add: Vec::new(),
-                drop: Vec::new(),
-                text: Some(self.text.clone().filter(|t| !t.trim().is_empty()).ok_or_else(no_wording)?),
-            }),
+                self.keywords.clone(),
+                Vec::new(),
+            )),
+            "rewrite" => Ok(Change { text: Some(wording()?), ..Change::keywords(target(&self.target_kind, &self.target_id)?, Vec::new(), Vec::new()) }),
+            // BO-17's kinds. A drop-keyword proposal takes its keywords away and adds the narrower ones it carries.
+            "drop-keyword" => {
+                if self.dropped.is_empty() {
+                    return Err(format!("{}: a drop-keyword proposal with no keyword to drop", self.id));
+                }
+                Ok(Change::keywords(target(&self.target_kind, &self.target_id)?, self.keywords.clone(), self.dropped.clone()))
+            }
+            "merge" => {
+                let other = self.merge_target.clone().ok_or_else(|| format!("{}: a merge with no second rule", self.id))?;
+                Ok(Change { text: Some(wording()?), merge: Some(other), ..Change::keywords(rule_only("merge")?, Vec::new(), Vec::new()) })
+            }
+            "split" => {
+                let second = self.second_text.clone().filter(|t| !t.trim().is_empty());
+                let second = second.ok_or_else(|| format!("{}: a split with no second part", self.id))?;
+                Ok(Change {
+                    text: Some(wording()?),
+                    second: Some((second, self.second_keywords.clone())),
+                    ..Change::keywords(rule_only("split")?, self.keywords.clone(), Vec::new())
+                })
+            }
+            "retire" => Ok(Change { retire: true, ..Change::keywords(rule_only("retirement")?, Vec::new(), Vec::new()) }),
             other => Err(format!("{}: proposal kind '{other}' is not one this build applies", self.id)),
         }
     }
@@ -110,11 +138,15 @@ impl Stored {
     /// The change with the user's edits: new wording and keywords, each only when given.
     pub fn edited(&self, text: Option<&str>, keywords: Option<&[String]>) -> Result<Change, String> {
         // Refused rather than dropped: the edit is stored as what the user changed.
-        if self.kind == "keyword-gap" && text.is_some_and(|t| !t.trim().is_empty()) {
-            return Err(format!("{} is a keyword gap: it changes keywords, not wording; give --keywords", self.id));
+        let has_text = text.is_some_and(|t| !t.trim().is_empty());
+        if matches!(self.kind.as_str(), "keyword-gap" | "drop-keyword") && has_text {
+            return Err(format!("{} is a {}: it changes keywords, not wording; give --keywords", self.id, self.kind_label()));
         }
-        if self.kind == "rewrite" && keywords.is_some() {
-            return Err(format!("{} is a rewrite: it changes the wording, not keywords; give --text", self.id));
+        if matches!(self.kind.as_str(), "rewrite" | "merge") && keywords.is_some() {
+            return Err(format!("{} is a {}: it changes the wording, not keywords; give --text", self.id, self.kind_label()));
+        }
+        if self.kind == "retire" && (has_text || keywords.is_some()) {
+            return Err(format!("{} retires a rule: there is nothing to edit; approve or reject it", self.id));
         }
         let mut p = self.clone();
         if let Some(t) = text.map(str::trim).filter(|t| !t.is_empty()) {
@@ -188,12 +220,21 @@ pub fn load(config: &BaseConfig, cwd: &Path) -> Vec<Stored> {
                 "fingerprint" => s.fingerprint = Some(v),
                 "createdAt" => s.created = Some(v),
                 "reviewedAt" => s.reviewed = Some(v),
+                "proposalOrigin" => s.origin = v,
+                "evidence" => s.evidence.push(v),
+                "droppedKeyword" => s.dropped.push(v),
+                "mergeTarget" => s.merge_target = Some(v),
+                "secondText" => s.second_text = Some(v),
+                "secondKeyword" => s.second_keywords.push(v),
                 _ => {}
             }
         }
         for mut s in by.into_values().filter(|s| !s.id.is_empty()) {
             s.keywords.sort();
             s.signals.sort();
+            s.dropped.sort();
+            s.second_keywords.sort();
+            s.evidence.sort();
             out.push(s);
         }
     }
@@ -230,6 +271,24 @@ pub fn rejected(store: &oxigraph::store::Store, ns: &crate::config::NamespaceCon
         _ => None,
     };
     Some((lit("id")?, lit("when").map(|w| w.chars().take(10).collect()).unwrap_or_else(|| "an earlier review".to_string())))
+}
+
+/// A proposal with this fingerprint in `store`, in any status, with its id and status (BO-17: the rule pass never
+/// writes the same proposal twice, and never one the user rejected, K5e).
+pub fn fingerprint_known(store: &oxigraph::store::Store, ns: &crate::config::NamespaceConfig, fingerprint: &str) -> Option<(String, String)> {
+    let q = format!(
+        "{}\nSELECT ?id ?st WHERE {{ GRAPH ?g {{ ?x a {p}:RuleProposal ; {p}:fingerprint \"{fp}\" ; {p}:proposalId ?id ; {p}:status ?st }} }}",
+        crud::prefixes(ns),
+        p = ns.prefix,
+        fp = crud::escape_sparql_literal(fingerprint)
+    );
+    let Ok(QueryResults::Solutions(mut rows)) = crate::store::query(store, &q) else { return None };
+    let row = rows.next()?.ok()?;
+    let lit = |k: &str| match row.get(k).map(Into::into) {
+        Some(TermRef::Literal(l)) => Some(l.value().to_string()),
+        _ => None,
+    };
+    Some((lit("id")?, lit("st")?))
 }
 
 /// The count session start shows (K5b): pending proposals in `store`.
@@ -471,6 +530,18 @@ fn cwd_of(cwd: &Path, tier: Tier) -> PathBuf {
 
 fn apply(config: &BaseConfig, cwd: &Path, p: &Stored, change: &Change) -> Result<Applied, String> {
     let ns = &config.namespace;
+    // BO-17's kinds first: each names a rule, and a retirement changes no wording or keyword.
+    if let Target::Rule(r) = &change.target {
+        if change.retire {
+            return retire_rule(config, cwd, r);
+        }
+        if let (Some(other), Some(text)) = (change.merge.as_deref(), change.text.as_deref()) {
+            return merge_rules(config, cwd, r, other, text);
+        }
+        if let (Some((second, words)), Some(text)) = (&change.second, change.text.as_deref()) {
+            return split_rule(config, cwd, r, text, &change.add, second, words);
+        }
+    }
     if change.text.is_none() && change.add.is_empty() && change.drop.is_empty() && !matches!(change.target, Target::NewRule { .. }) {
         return Err(format!("{}: no keyword to add or drop and no new wording; nothing to change", p.id));
     }
@@ -818,6 +889,279 @@ fn rewrite_decision(config: &BaseConfig, cwd: &Path, p: &Stored, slug: &str, tex
     })
 }
 
+// ─── BO-17's kinds: merge, split, retire ─────────────────────────────────────
+
+/// A rule as a graph record, where a supersede edge or a retirement mark lasts. A `domains.toml` rule is copied to the
+/// graph of its file's tier first, its rationale, matchers and tests kept, and its line leaves the file: its graph copy
+/// is rebuilt on every sync, so nothing written on that copy would last (BO-16's G0 question 2).
+struct GraphRule {
+    domain: String,
+    short: String,
+    tier_cwd: PathBuf,
+    tier: Tier,
+    /// `<domain>/cli-N`.
+    slug: String,
+    iri: String,
+    rationale: Option<String>,
+    matchers: Vec<Matcher>,
+    tests: RuleTests,
+    /// Where the rule moved from, when it was a `domains.toml` line.
+    moved: Option<String>,
+}
+
+fn as_graph_rule(config: &BaseConfig, cwd: &Path, spec: &str) -> Result<GraphRule, String> {
+    let ns = &config.namespace;
+    let rule = found_rule(config, cwd, spec)?;
+    let short = crate::domain::rule_test::short_ref(&rule.domain, &rule.id);
+    let Some((home, tests)) = rule.homes_for(false).into_iter().next().cloned() else {
+        return Err(format!("{short} has no home base can write (an extension's rule, or a synced copy of a line that is gone)"));
+    };
+    match &home {
+        crud::rule::TestHome::Graph { cwd: tier_cwd, tier, iri } => {
+            let iri = iri.trim_start_matches('<').trim_end_matches('>').to_string();
+            let (rationale, matchers) = graph_rule_parts(config, tier_cwd, &iri);
+            let slug = iri.strip_prefix(&crud::build_iri(ns, "rule", "")).unwrap_or_default().to_string();
+            if slug.is_empty() {
+                return Err(format!("{short}: its graph record has no rule IRI"));
+            }
+            Ok(GraphRule {
+                domain: rule.domain.clone(),
+                short,
+                tier_cwd: tier_cwd.clone(),
+                tier: *tier,
+                slug,
+                iri,
+                rationale,
+                matchers,
+                tests,
+                moved: None,
+            })
+        }
+        crud::rule::TestHome::Toml { file, tier } => {
+            let entry = crate::domain::load_domains_file(file, None)
+                .into_iter()
+                .filter(|d| crud::slugify(&d.name) == crud::slugify(&rule.domain))
+                .flat_map(|d| d.rules)
+                .find(|r| rules::rule_id(&rule.domain, r.text()) == rule.id)
+                .ok_or_else(|| format!("{short} changed after it was read; nothing was written"))?;
+            let tier_cwd = cwd_of(cwd, *tier);
+            let rationale = entry.rationale().map(String::from);
+            let matchers = entry.matchers().to_vec();
+            let index = crud::rule::add_with_tests(&tier_cwd, ns, &rule.domain, &rule.text, rationale.as_deref(), None, &matchers, &tests)
+                .map_err(|e| format!("{e:#}"))?;
+            let slug = format!("{}/cli-{index}", crud::slugify(&rule.domain));
+            let moved = match crate::domain::remove_rule(file, &rule.domain, &rule.id) {
+                Ok(true) => format!("the rule moved from {} to the graph ({} tier)", file.display(), tier.label()),
+                Ok(false) | Err(_) => format!(
+                    "the rule was copied to the graph ({} tier), but its line is still in {}: remove it from that file by hand",
+                    tier.label(),
+                    file.display()
+                ),
+            };
+            Ok(GraphRule {
+                domain: rule.domain.clone(),
+                short,
+                iri: crud::build_iri(ns, "rule", &slug),
+                tier_cwd,
+                tier: *tier,
+                slug,
+                rationale,
+                matchers,
+                tests,
+                moved: Some(moved),
+            })
+        }
+    }
+}
+
+/// The graph that holds `iri` in `tier_cwd`'s tier.
+fn graph_of(config: &BaseConfig, tier_cwd: &Path, iri: &str) -> Result<String, String> {
+    let ns = &config.namespace;
+    let q = format!("{}\nSELECT ?g WHERE {{ GRAPH ?g {{ <{iri}> {}:ruleText ?t }} }} LIMIT 1", crud::prefixes(ns), ns.prefix);
+    let store = crud::load_workspace_graph(tier_cwd).map_err(|e| format!("{e:#}"))?;
+    match crate::store::query(&store, &q) {
+        Ok(QueryResults::Solutions(mut rows)) => rows
+            .next()
+            .and_then(Result::ok)
+            .and_then(|r| r.get("g").map(|g| crud::term_display(g.into())))
+            .map(|g| g.trim_start_matches('<').trim_end_matches('>').to_string())
+            .ok_or_else(|| format!("no graph holds {iri} any more")),
+        _ => Err(format!("could not read the graph that holds {iri}")),
+    }
+}
+
+/// Retire a rule (BO-17, lynx's G0 ruling on question 3): never deleted. It gets `retiredAt` and `status "retired"`,
+/// no hook and no `select` serves it (`supersede::sparql_exclude_superseded` leaves it out), `base rule list
+/// --include-superseded` still lists it, and `base rule unretire` brings it back.
+fn retire_rule(config: &BaseConfig, cwd: &Path, spec: &str) -> Result<Applied, String> {
+    let ns = &config.namespace;
+    let g = as_graph_rule(config, cwd, spec)?;
+    let graph = graph_of(config, &g.tier_cwd, &g.iri)?;
+    let p = &ns.prefix;
+    let sparql = format!(
+        "{}\nINSERT DATA {{ GRAPH <{graph}> {{\n  <{iri}> {p}:{at} \"{now}\"^^xsd:dateTime .\n  <{iri}> {p}:status \"{st}\" .\n}} }}",
+        crud::prefixes(ns),
+        iri = g.iri,
+        at = crate::supersede::PRED_RETIRED_AT,
+        now = crud::now_iso(),
+        st = crate::supersede::STATUS_RETIRED,
+    );
+    let (store, trig_path, _lock) = crud::lock_and_load(&g.tier_cwd).map_err(|e| format!("{e:#}"))?;
+    crate::store::update_and_write(&store, &trig_path, &sparql, crate::store::Scope::Wide, crate::store::Intent::Knowledge)
+        .map_err(|e| format!("{e:#}"))?;
+    let to = format!("graph ({} tier)", g.tier.label());
+    Ok(Applied {
+        line: format!(
+            "rule {} retired, in {to}: no hook serves it now; it stays listed (base rule list --domain {} --include-superseded) \
+             and base rule unretire {} brings it back",
+            g.short, g.domain, g.short
+        ),
+        notes: g.moved.into_iter().collect(),
+        to,
+        domain: Some(g.domain),
+    })
+}
+
+/// Merge two rules (BO-17): one new graph rule of the merged wording, in the first rule's domain and tier, carrying
+/// both rules' matchers and tests, superseding both. Both must be in one tier (a supersede edge never crosses tiers).
+fn merge_rules(config: &BaseConfig, cwd: &Path, spec: &str, other: &str, text: &str) -> Result<Applied, String> {
+    let ns = &config.namespace;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(no_wording());
+    }
+    let a = as_graph_rule(config, cwd, spec)?;
+    let b = as_graph_rule(config, cwd, other)?;
+    if a.tier != b.tier {
+        return Err(format!(
+            "{} is in the {} tier and {} in the {} tier: a merge supersedes both, and a supersede edge never crosses tiers",
+            a.short,
+            a.tier.label(),
+            b.short,
+            b.tier.label()
+        ));
+    }
+    let matchers = crate::domain::replay::union_matchers(&a.matchers, &b.matchers);
+    let mut tests = a.tests.clone();
+    for f in &b.tests.fires_on {
+        tests.add("firesOn", f);
+    }
+    for q in &b.tests.quiet_on {
+        tests.add("quietOn", q);
+    }
+    tests.fires_on.truncate(3);
+    tests.quiet_on.truncate(2);
+    let rationale = match (&a.rationale, &b.rationale) {
+        (Some(x), Some(y)) if x != y => Some(format!("{x} {y}")),
+        (Some(x), _) | (None, Some(x)) => Some(x.clone()),
+        _ => None,
+    };
+    let index = crud::rule::add_with_tests(&a.tier_cwd, ns, &a.domain, text, rationale.as_deref(), Some(&a.slug), &matchers, &tests)
+        .map_err(|e| format!("{e:#}"))?;
+    let new_iri = crud::build_iri(ns, "rule", &format!("{}/cli-{index}", crud::slugify(&a.domain)));
+    let graph = crud::workspace_graph_iri(ns, &crud::workspace_slug(&a.tier_cwd));
+    let tier_label = crud::tier_label(&a.tier_cwd);
+    let b_slug = b.slug.clone();
+    crud::load_read_then_mutate(&a.tier_cwd, ns, |store| {
+        let old = crud::supersede::resolve_slug(store, ns, &b_slug, &tier_label)?;
+        crud::supersede::link_statement(store, ns, &graph, &old, &new_iri)
+    })
+    .map_err(|e| format!("{e:#}; the merged rule is written and supersedes {}, but not {}", a.short, b.short))?;
+    let new_short = crate::domain::rule_test::short_ref(&a.domain, &rules::rule_id(&a.domain, text));
+    let to = format!("graph ({} tier)", a.tier.label());
+    Ok(Applied {
+        line: format!("rules {} and {} merged as {new_short}, in {to}; both old ones are superseded, not deleted", a.short, b.short),
+        notes: a.moved.into_iter().chain(b.moved).collect(),
+        to,
+        domain: Some(a.domain),
+    })
+}
+
+/// Split a rule (BO-17): the first part rewrites it (the supersede edge pair, as a rewrite), the second is a new rule
+/// beside it, on its own keywords. A record with two successors is a defect (`supersede::resolve_head`), so only the
+/// first part supersedes the old wording.
+fn split_rule(
+    config: &BaseConfig,
+    cwd: &Path,
+    spec: &str,
+    text: &str,
+    first_words: &[String],
+    second: &str,
+    second_words: &[String],
+) -> Result<Applied, String> {
+    let ns = &config.namespace;
+    let rule = found_rule(config, cwd, spec)?;
+    let mut applied = rewrite_rule(config, cwd, spec, text)?;
+    let tier = match rule.homes_for(false).into_iter().next().map(|(h, _)| h.tier()) {
+        Some(t) => t,
+        None => Tier::Workspace,
+    };
+    let tier_cwd = cwd_of(cwd, tier);
+    let first = crate::domain::rule_test::short_ref(&rule.domain, &rules::rule_id(&rule.domain, text.trim()));
+    if !first_words.is_empty() {
+        let more = apply_rule_words(config, cwd, &first, first_words, &[])?;
+        applied.notes.push(more.line);
+    }
+    let matchers = if second_words.is_empty() { Vec::new() } else { vec![Matcher::for_topic(second_words.to_vec())] };
+    crud::rule::add_with_tests(&tier_cwd, ns, &rule.domain, second.trim(), Some(&format!("split from {first}")), None, &matchers, &RuleTests::default())
+        .map_err(|e| format!("{e:#}; the first part is written ({first}), the second is not"))?;
+    let second_short = crate::domain::rule_test::short_ref(&rule.domain, &rules::rule_id(&rule.domain, second.trim()));
+    let words = if second_words.is_empty() { String::new() } else { format!(" · its words {}", quoted(second_words)) };
+    applied.line = format!(
+        "rule {} split: the first part is {first} (it supersedes the old wording), the second is {second_short}{words}, in {}",
+        crate::domain::rule_test::short_ref(&rule.domain, &rule.id),
+        applied.to
+    );
+    Ok(applied)
+}
+
+/// `base rule unretire <domain>.<id>`: clear a retirement, so the rule is served again (BO-17).
+pub fn unretire(config: &BaseConfig, cwd: &Path, spec: &str) -> Result<String, String> {
+    let ns = &config.namespace;
+    let p = &ns.prefix;
+    let (domain, id) = crud::rule::parse_rule_ref(spec)?;
+    let q = format!(
+        "{}\nSELECT ?g ?rule ?text ?d WHERE {{ GRAPH ?g {{ ?rule {p}:{at} ?when ; {p}:ruleText ?text . ?d {p}:hasRule ?rule }} }}",
+        crud::prefixes(ns),
+        at = crate::supersede::PRED_RETIRED_AT
+    );
+    let names: HashMap<String, String> = crate::domain::load_domains(cwd)
+        .into_iter()
+        .map(|d| (crud::build_iri(ns, "domain", &crud::slugify(&d.name)), d.name))
+        .collect();
+    let mut found: Vec<(Tier, PathBuf, String, String, String)> = Vec::new();
+    for (tier, c) in tier_cwds(cwd) {
+        let Ok(store) = crud::load_workspace_graph(&c) else { continue };
+        let Ok(QueryResults::Solutions(rows)) = crate::store::query(&store, &q) else { continue };
+        for row in rows.filter_map(Result::ok) {
+            let get = |k: &str| row.get(k).map(|t| crud::term_display(t.into()));
+            let (Some(g), Some(rule), Some(text), Some(d)) = (get("g"), get("rule"), get("text"), get("d")) else { continue };
+            let d = d.trim_start_matches('<').trim_end_matches('>').to_string();
+            let dname = names.get(&d).cloned().unwrap_or_else(|| d.rsplit('/').next().unwrap_or_default().to_string());
+            let rid = rules::rule_id(&dname, &text);
+            if rid.starts_with(&id) && domain.as_deref().is_none_or(|w| crud::slugify(w) == crud::slugify(&dname)) {
+                let strip = |s: String| s.trim_start_matches('<').trim_end_matches('>').to_string();
+                found.push((tier, c.clone(), strip(g), strip(rule), crate::domain::rule_test::short_ref(&dname, &rid)));
+            }
+        }
+    }
+    let (tier, c, graph, iri, short) = match found.as_slice() {
+        [one] => one.clone(),
+        [] => return Err(format!("no retired rule '{spec}' in either tier")),
+        many => return Err(format!("'{spec}' fits {} retired rules; give more of the id", many.len())),
+    };
+    let sparql = format!(
+        "{}\nDELETE WHERE {{ GRAPH <{graph}> {{ <{iri}> {p}:{at} ?w }} }} ;\nDELETE DATA {{ GRAPH <{graph}> {{ <{iri}> {p}:status \"{st}\" }} }}",
+        crud::prefixes(ns),
+        at = crate::supersede::PRED_RETIRED_AT,
+        st = crate::supersede::STATUS_RETIRED,
+    );
+    let (store, trig_path, _lock) = crud::lock_and_load(&c).map_err(|e| format!("{e:#}"))?;
+    crate::store::update_and_write(&store, &trig_path, &sparql, crate::store::Scope::Wide, crate::store::Intent::Knowledge)
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(format!("rule {short} is served again (its retirement cleared, in the graph, {} tier)\n", tier.label()))
+}
+
 fn no_wording() -> String {
     "a rewrite needs its new wording: e (edit) in base rule review, or base rule review --edit <id> --text \"...\"".to_string()
 }
@@ -837,6 +1181,21 @@ pub fn render_one(p: &Stored, at: usize, of: usize, outcome: Result<&Outcome, &S
             Some(t) => format!("new wording \"{}\"", replay::clip(t, 60)),
             None => "no new wording yet".to_string(),
         },
+        "drop-keyword" => {
+            let add = if p.keywords.is_empty() { String::new() } else { format!(" · add {}", quoted(&p.keywords)) };
+            format!("drop {}{add}", quoted(&p.dropped))
+        }
+        "merge" => format!(
+            "with rule {} · \"{}\"",
+            p.merge_target.as_deref().unwrap_or("?"),
+            replay::clip(p.text.as_deref().unwrap_or(""), 60)
+        ),
+        "split" => format!(
+            "into \"{}\" and \"{}\"",
+            replay::clip(p.text.as_deref().unwrap_or(""), 40),
+            replay::clip(p.second_text.as_deref().unwrap_or(""), 40)
+        ),
+        "retire" => "retire it".to_string(),
         _ => String::new(),
     };
     let target = match p.target_kind.as_str() {
@@ -849,7 +1208,13 @@ pub fn render_one(p: &Stored, at: usize, of: usize, outcome: Result<&Outcome, &S
     };
     let date = p.created.as_deref().map(|c| c.chars().take(10).collect::<String>()).unwrap_or_default();
     let who = p.title.clone().or_else(|| p.session.as_deref().map(|s| s.chars().take(8).collect())).unwrap_or_default();
-    let from = if p.meaning == "manual" { "given by hand".to_string() } else { "from a correction".to_string() };
+    let from = match (p.meaning.as_str(), p.origin.as_str()) {
+        ("manual", _) => "given by hand",
+        ("pattern", _) => "from the rule pass",
+        (_, "tune") => "from a correction the rule pass found",
+        _ => "from a correction",
+    }
+    .to_string();
     let ctx = [date, who].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ");
     let ctx = if ctx.is_empty() { String::new() } else { format!(" ({ctx})") };
     let mut s = format!("[{at}/{of}] {} {} · {target} · {what} · {replay} · {from}{ctx}\n", p.id, p.kind_label());
@@ -865,6 +1230,9 @@ pub fn render_one(p: &Stored, at: usize, of: usize, outcome: Result<&Outcome, &S
     }
     if !p.signals.is_empty() {
         s.push_str(&format!("{pad}signals: {}\n", p.signals.join(" · ")));
+    }
+    for e in &p.evidence {
+        s.push_str(&format!("{pad}evidence: {}\n", replay::clip(e, 160)));
     }
     match outcome {
         Ok(o) => {
@@ -1043,7 +1411,7 @@ pub fn interactive(config: &BaseConfig, cwd: &Path) {
 fn edit_here(config: &BaseConfig, cwd: &Path, p: &Stored, replayer: &replay::Replayer<'_>) -> Result<Option<String>, String> {
     let mut extra: Vec<(&str, String)> = Vec::new();
     let mut text: Option<String> = None;
-    if p.kind != "keyword-gap" {
+    if !matches!(p.kind.as_str(), "keyword-gap" | "drop-keyword" | "retire") {
         let now = p.text.as_deref().unwrap_or("");
         let t = ask(&format!("      wording (Enter keeps \"{}\"): ", replay::clip(now, 60))).unwrap_or_default();
         if !t.trim().is_empty() {
@@ -1052,7 +1420,7 @@ fn edit_here(config: &BaseConfig, cwd: &Path, p: &Stored, replayer: &replay::Rep
         }
     }
     let mut keywords: Option<Vec<String>> = None;
-    if p.kind != "rewrite" {
+    if !matches!(p.kind.as_str(), "rewrite" | "merge" | "retire") {
         let k = ask(&format!("      keywords (Enter keeps {}): ", quoted(&p.keywords))).unwrap_or_default();
         if !k.trim().is_empty() {
             let list = crate::domain::global_decisions::parse_keywords(&k);

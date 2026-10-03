@@ -349,8 +349,9 @@ pub struct BaseConfig {
 
 // ─── Tune Config (BO-16: K6 replay; BO-17 adds its cadence keys, D7) ───
 
-/// `[tune]`: how a proposed rule change is checked before anyone approves it (K6). `base rule replay` and
-/// `base rule review` run the change over the user's own recent prompts and say which would start or stop serving it.
+/// `[tune]`: how a proposed rule change is checked before anyone approves it (K6), and when the rule pass
+/// (`base tune`, BO-17) is due (D7). `base rule replay` and `base rule review` run a change over the user's own recent
+/// prompts and say which would start or stop serving it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuneConfig {
     /// How many of the match log's most recent prompts a replay runs over.
@@ -359,14 +360,29 @@ pub struct TuneConfig {
     /// A change whose rule would be served on more than this share of the replayed prompts is flagged TOO BROAD.
     #[serde(default = "default_broad_share")]
     pub broad_share: f32,
+    /// D7a: flagged corrections since the last pass that make a rule pass due. The next typed prompt carries one line
+    /// asking the AI to run `base tune`.
+    #[serde(default = "default_tune_corrections")]
+    pub corrections: u32,
+    /// D7b: typed prompts with no pass before the safety net fires, when at least one correction or one prompt that
+    /// matched no domain was logged since.
+    #[serde(default = "default_tune_turns")]
+    pub turns: u32,
 }
 
 fn default_replay_prompts() -> usize { 500 }
 fn default_broad_share() -> f32 { 0.25 }
+fn default_tune_corrections() -> u32 { 3 }
+fn default_tune_turns() -> u32 { 15 }
 
 impl Default for TuneConfig {
     fn default() -> Self {
-        Self { replay_prompts: default_replay_prompts(), broad_share: default_broad_share() }
+        Self {
+            replay_prompts: default_replay_prompts(),
+            broad_share: default_broad_share(),
+            corrections: default_tune_corrections(),
+            turns: default_tune_turns(),
+        }
     }
 }
 

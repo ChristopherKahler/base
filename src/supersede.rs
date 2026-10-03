@@ -67,8 +67,23 @@ pub fn sparql_exclude_superseded(ns: &NamespaceConfig, var: &str) -> String {
     let p = &ns.prefix;
     // Trailing newline, matching `ontology::transient::sparql_exclude`, so the two
     // interpolate identically inside an arm: `{no_transient}{no_superseded}`.
-    format!("FILTER NOT EXISTS {{ ?{var} {p}:{PRED_SUPERSEDED_BY} ?{var}_supersededBy }}\n")
+    //
+    // A RETIRED RULE IS NOT LIVE EITHER (BO-17, lynx's G0 ruling on question 3). A rule the rule pass found dead is
+    // retired, never deleted: it carries `retiredAt`, and every reader that serves only the live version leaves it out
+    // here, beside the superseded ones, so no hook and no `select` serves it while `--include-superseded` still lists it.
+    // Only rules are ever retired, so the second filter excludes nothing else.
+    format!(
+        "FILTER NOT EXISTS {{ ?{var} {p}:{PRED_SUPERSEDED_BY} ?{var}_supersededBy }}\n\
+         FILTER NOT EXISTS {{ ?{var} {p}:{PRED_RETIRED_AT} ?{var}_retiredAt }}\n"
+    )
 }
+
+/// `rule ops:retiredAt <when>`: the rule pass retired it (BO-17). The edge every reader keys on; the writer also sets
+/// `ops:status "retired"` as a label, as a supersession sets `"superseded"`.
+pub const PRED_RETIRED_AT: &str = "retiredAt";
+
+/// The status label a retired rule carries.
+pub const STATUS_RETIRED: &str = "retired";
 
 /// The live end of `iri`'s supersession chain, or `iri` itself when nothing
 /// supersedes it.
@@ -339,7 +354,11 @@ mod tests {
     #[test]
     fn the_exclusion_filter_binds_a_variable_derived_from_its_subject() {
         let f = sparql_exclude_superseded(&ns(), "n");
-        assert_eq!(f, "FILTER NOT EXISTS { ?n ops:supersededBy ?n_supersededBy }\n");
+        // BO-17: a retired rule is left out beside a superseded record, by its own edge.
+        assert_eq!(
+            f,
+            "FILTER NOT EXISTS { ?n ops:supersededBy ?n_supersededBy }\nFILTER NOT EXISTS { ?n ops:retiredAt ?n_retiredAt }\n"
+        );
         assert!(
             !f.contains("GRAPH"),
             "the filter carries no GRAPH group of its own — the caller must place it \

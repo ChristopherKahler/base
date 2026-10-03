@@ -618,14 +618,21 @@ phrases = ["no,", "wrong", "that's not", "not what i asked", "i told you", "i've
 markers = ["CORRECTED:", "UPDATED:", "MISREAD:", "DEFERRED:"]
 repeat_similarity = 0.5
 
-# ─── [tune] — checking a rule change before it is approved ───
+# ─── [tune] — checking rule changes, and when the rule pass runs ───
 # `base rule replay` and `base rule review` run a proposed change over your
 # last replay_prompts prompts in .base/match-log.jsonl and say which prompts
 # would start or stop serving the rule. A change served on more than
 # broad_share of them (0.25 = 25%) is flagged TOO BROAD.
+# `base tune` reads your recent sessions and writes rule proposals for review.
+# Your next prompt asks the AI to run it once `corrections` flagged
+# corrections have piled up since the last pass, or after `turns` prompts
+# with no pass when one correction or one prompt that matched no domain was
+# logged since. A hook never runs it: hooks only count.
 [tune]
 replay_prompts = 500
 broad_share = 0.25
+corrections = 3   # flagged corrections that make a rule pass due
+turns = 15        # prompts with no pass before the safety net fires
 
 # ─── [sync] — graph extraction globs ─────────────────────────
 # Which files `base sync` reads to extract metadata/AST into the graph.
@@ -856,13 +863,25 @@ description = "One-line description of what this extension does"  # Required.
 /// thing. A second hand-maintained copy is the whole failure this constant
 /// exists to prevent: it would drift, and the drift would surface as hooks that
 /// look installed and never fire.
-pub const HOOK_TABLE: [(&str, &str); 5] = [
+pub const HOOK_TABLE: [(&str, &str); 6] = [
     ("SessionStart", "base hook session-start"),
     ("UserPromptSubmit", "base hook user-prompt-submit"),
     ("PreToolUse", "base hook pre-tool-use"),
     ("PostToolUse", "base hook post-tool-use"),
     ("Stop", "base hook stop"),
+    // BO-17, D7d: marks the session ended for the next rule pass, and nothing else.
+    ("SessionEnd", "base hook session-end"),
 ];
+
+/// [`HOOK_TABLE`], hashed: the first 8 hex characters of its SHA-256. Part of the wired stamp, so a build that adds a hook
+/// wires it at the next session start even when the version string did not change (BO-17: dev builds keep Cargo.toml's
+/// version, and a home stamped for that version would never get the new hook).
+pub fn hook_table_hash() -> String {
+    use sha2::{Digest, Sha256};
+    let text: String = HOOK_TABLE.iter().map(|(e, c)| format!("{e}={c}
+")).collect();
+    Sha256::digest(text.as_bytes())[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// The object base pushes into `settings.hooks[event]` for one hook.
 ///
@@ -954,6 +973,11 @@ fn wire_hooks(settings_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// The file under `~/.base-gbl` that says this build's hooks are wired: `.hooks-wired-<version>-<table hash>`.
+pub fn hooks_wired_stamp() -> String {
+    format!(".hooks-wired-{}-{}", env!("CARGO_PKG_VERSION"), hook_table_hash())
+}
+
 /// Session start: wire any hook this release added that the host's
 /// settings.json lacks, once per version. The auto-update swaps the binary and
 /// touches nothing else, so without this a release that adds a hook ships a
@@ -964,9 +988,7 @@ pub fn ensure_hooks_wired() -> Vec<&'static str> {
     let Some(home) = crate::home::home_root() else {
         return Vec::new();
     };
-    let stamp = home
-        .join(".base-gbl")
-        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")));
+    let stamp = home.join(".base-gbl").join(hooks_wired_stamp());
     if stamp.exists() {
         return Vec::new();
     }
@@ -980,9 +1002,18 @@ pub fn ensure_hooks_wired() -> Vec<&'static str> {
     if !claude_config_tier(&settings) {
         return Vec::new();
     }
-    let added = wire_hooks_quiet(&settings).unwrap_or_default();
-    let _ = std::fs::write(&stamp, b"");
-    added
+    // A file base could not add to without rewriting it (BO-17) is left unstamped, so the next session tries again,
+    // and the error goes to stderr rather than vanishing.
+    match wire_hooks_quiet(&settings) {
+        Ok(added) => {
+            let _ = std::fs::write(&stamp, b"");
+            added
+        }
+        Err(e) => {
+            eprintln!("base: could not wire hooks into {}: {e:#}", settings.display());
+            Vec::new()
+        }
+    }
 }
 
 /// Merge every hook in [`HOOK_TABLE`] that `settings_path` lacks and return
@@ -990,69 +1021,57 @@ pub fn ensure_hooks_wired() -> Vec<&'static str> {
 /// does not — a fresh Claude Code install has `~/.claude/` before it has a
 /// settings.json — and left alone when the directory is missing too.
 /// Append-only: entries base did not write are never touched.
+///
+/// AS TEXT, AND BACKED UP FIRST (BO-17, lynx's G0 ruling). The file is the user's: their own hooks, permissions and
+/// settings. The new entries are inserted as text ([`crate::settings_json::add_hook_entries`]) so every other byte stays
+/// as it was, and the old file is copied to `settings.json.bak-base-<when>` before the one write. A file that cannot be
+/// changed that way is not written at all: the error says what to add by hand.
 pub fn wire_hooks_quiet(settings_path: &Path) -> Result<Vec<&'static str>> {
-    if !settings_path.exists() {
+    let created = !settings_path.exists();
+    if created {
         match settings_path.parent() {
-            Some(dir) if dir.is_dir() => std::fs::write(settings_path, "{}\n")
+            Some(dir) if dir.is_dir() => std::fs::write(settings_path, "{}
+")
                 .with_context(|| format!("creating {}", settings_path.display()))?,
             _ => return Ok(Vec::new()),
         }
     }
 
     let content = std::fs::read_to_string(settings_path)?;
-    let mut settings: serde_json::Value = serde_json::from_str(&content)
+    let settings: serde_json::Value = serde_json::from_str(&content)
         .context("Failed to parse settings.json")?;
 
-    let hook_entries = HOOK_TABLE;
-
-    // Check if already fully wired
-    let all_present = hook_entries.iter().all(|(_, cmd)| content.contains(cmd));
-    if all_present {
+    // A command already in the file, anywhere, is never added again: the same text test the earlier releases used,
+    // and an entry the user moved or wrapped still counts as wired.
+    let missing: Vec<(&'static str, &'static str)> =
+        HOOK_TABLE.iter().copied().filter(|(_, cmd)| !content.contains(cmd)).collect();
+    if missing.is_empty() {
         return Ok(Vec::new());
     }
-
-    let hooks = settings
-        .as_object_mut()
-        .context("settings.json is not an object")?
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let hooks_obj = hooks
-        .as_object_mut()
-        .context("hooks is not an object")?;
-
-    let mut added = Vec::new();
-
-    for (event, command) in &hook_entries {
-        // Skip if this specific hook is already present
-        if content.contains(command) {
-            continue;
-        }
-
-        let event_hooks = hooks_obj
-            .entry(*event)
-            .or_insert_with(|| serde_json::json!([]));
-
-        if !event_hooks.is_array() {
-            *event_hooks = serde_json::json!([]);
-        }
-
-        let arr = event_hooks.as_array_mut().unwrap();
-
-        // The manifest publishes this exact value; build it in one place so an
-        // external installer cannot merge something base would not have written.
-        arr.push(hook_entry(command));
-
-        added.push(*event);
+    if !settings.is_object() {
+        anyhow::bail!("{} is not a JSON object", settings_path.display());
     }
+    let entries: Vec<(&str, serde_json::Value)> = missing.iter().map(|(e, c)| (*e, hook_entry(c))).collect();
+    let Some(updated) = crate::settings_json::add_hook_entries(&content, &entries) else {
+        let wanted: Vec<String> = missing.iter().map(|(e, c)| format!("{e}: {c}")).collect();
+        anyhow::bail!(
+            "{} could not take base's hook entries without rewriting the rest of it, so nothing was written; add these              under \"hooks\" by hand: {}",
+            settings_path.display(),
+            wanted.join("; ")
+        );
+    };
 
-    // Write back atomically
+    if !created {
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let backup = settings_path.with_extension(format!("json.bak-base-{stamp}"));
+        std::fs::copy(settings_path, &backup)
+            .with_context(|| format!("backing up {} to {}", settings_path.display(), backup.display()))?;
+    }
     let tmp_path = settings_path.with_extension("json.tmp");
-    let formatted = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&tmp_path, &formatted)?;
+    std::fs::write(&tmp_path, &updated)?;
     std::fs::rename(&tmp_path, settings_path)?;
 
-    Ok(added)
+    Ok(missing.into_iter().map(|(e, _)| e).collect())
 }
 
 // ─── Step 4: Migrate CARL ───────────────────────────────────

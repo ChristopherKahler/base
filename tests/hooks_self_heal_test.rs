@@ -70,7 +70,7 @@ fn no_claude_directory_means_nothing_to_wire() {
 /// The stamp file `ensure_hooks_wired` gates itself on.
 fn stamp_of(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".base-gbl")
-        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")))
+        .join(base::install::hooks_wired_stamp())
 }
 
 #[test]

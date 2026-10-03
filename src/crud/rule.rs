@@ -293,10 +293,18 @@ pub fn list(
     for (text, t) in toml_tests_by_text(cwd, domain_name) {
         tests.entry(text).or_default().merge(&t);
     }
+    // A retired rule (BO-17) is listed only under `--include-superseded`, as a superseded one is, and says which.
+    let retired = if include_superseded { retired_texts(cwd, ns, domain_name) } else { Default::default() };
     for (pri, text, superseded) in &rules {
         // The marker appears only under `--include-superseded`, so the default output
         // of a store that never superseded a rule stays byte-identical.
-        let mark = if *superseded { "  [superseded]" } else { "" };
+        let mark = if retired.contains(text) {
+            "  [retired: base rule unretire brings it back]"
+        } else if *superseded {
+            "  [superseded]"
+        } else {
+            ""
+        };
         // K2b: the id `base rule update` and `base rule test --rule` take.
         println!("  {pri}. [{}] {text}{mark}", rule_ref(domain_name, text));
         // F11: the listing shows each rule's kinds and matchers, and only for a rule that has some, so a store
@@ -309,6 +317,22 @@ pub fn list(
         }
     }
     Ok(())
+}
+
+/// The wording of `domain_name`'s retired rules in `cwd`'s tier (BO-17).
+fn retired_texts(cwd: &Path, ns: &NamespaceConfig, domain_name: &str) -> std::collections::HashSet<String> {
+    let p = &ns.prefix;
+    let domain_iri = crud::build_iri(ns, "domain", &crud::slugify(domain_name));
+    let sparql = format!(
+        "SELECT ?text WHERE {{ GRAPH ?g {{ <{domain_iri}> {p}:hasRule ?rule . ?rule {p}:ruleText ?text ; {p}:{} ?when }} }}",
+        crate::supersede::PRED_RETIRED_AT
+    );
+    match crud::load_and_query(cwd, ns, &sparql) {
+        Ok(QueryResults::Solutions(rows)) => {
+            rows.filter_map(|r| r.ok()).filter_map(|r| r.get("text").map(|t| crud::term_display(t.into()))).collect()
+        }
+        _ => Default::default(),
+    }
 }
 
 /// `base.9f2c1a7b`: a rule's domain and the start of its id, as `base rule update` takes it.

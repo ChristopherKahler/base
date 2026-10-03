@@ -328,7 +328,7 @@ fn skip_hooks_holds_when_claude_code_is_already_installed() {
     let settings = home.join(".claude").join("settings.json");
     let stamp = home
         .join(".base-gbl")
-        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")));
+        .join(base::install::hooks_wired_stamp());
     assert!(!settings.exists(), "the precondition, stated rather than assumed");
     assert!(!stamp.exists(), "and this version is unstamped, which is what arms the seam");
 
@@ -377,7 +377,7 @@ fn uninstall_does_not_create_a_settings_file_on_its_way_to_emptying_one() {
     let settings = home.join(".claude").join("settings.json");
     let stamp = home
         .join(".base-gbl")
-        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")));
+        .join(base::install::hooks_wired_stamp());
     assert!(!settings.exists(), "the precondition, stated rather than assumed");
     assert!(!stamp.exists(), "and this version is unstamped, which is what arms the seam");
 
