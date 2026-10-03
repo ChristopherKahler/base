@@ -177,7 +177,10 @@ pub fn run(target: &Path) -> Result<()> {
     // terminal when the user's CLAUDE.md asks for no marker and nobody answered before. Unattended, nothing is written
     // or printed: session start carries the line instead.
     use crate::corrections::claude_md::{self as corrections_line, Choice, Offered};
-    let offered = corrections_line::offer(Choice::Ask, corrections_line::ask_on_terminal);
+    let offered = match crate::home::home_root() {
+        Some(home) => corrections_line::offer(&home.join(".claude").join("CLAUDE.md"), Choice::Ask, corrections_line::ask_on_terminal),
+        None => Offered::Failed("no home folder to find CLAUDE.md in".to_string()),
+    };
     if !matches!(offered, Offered::Covered | Offered::AnsweredBefore(_) | Offered::NotAsked) {
         println!("7. {}", corrections_line::report(&offered));
     }

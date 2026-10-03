@@ -101,7 +101,8 @@ pub fn run(
 
     // Step 8b (BO-15, C3 for every user): one line asking the AI to start a corrected reply with CORRECTED:, offered
     // when the user's CLAUDE.md asks for no marker. Declined, or no terminal to ask on: session start carries it.
-    let offered = crate::corrections::claude_md::offer(corrections, crate::corrections::claude_md::ask_on_terminal);
+    let offered =
+        crate::corrections::claude_md::offer(&claude_md, corrections, crate::corrections::claude_md::ask_on_terminal);
     println!("{}\n", crate::corrections::claude_md::report(&offered));
 
     // #93: step 3 could not wire because ~/.claude did not exist yet. Steps 7
@@ -1656,7 +1657,7 @@ The `base` binary is on PATH. Use these commands proactively during sessions —
 | Discover which apps have a code map | `base ast list` |
 | A decision is made (architectural, process, tooling) | `base decision log --domain X --decision "..." --rationale "..."` |
 | An insight, correction, or lesson emerges | `base learn --text "..." --domain X --type insight\|correction\|decision` |
-| User defines or refines a behavioral rule | `base rule add --domain X --text "..."` |
+| User defines or refines a behavioral rule | `base rule add --domain X --text "..." --keywords "a, b" --fires-on "<the user's prompt>"` |
 | Before making assumptions about prior context | `base recall --keyword "..."` or `base recall --domain X` |
 | User asks to scaffold a new workspace | `base scaffold [path]` |
 
@@ -1714,7 +1715,7 @@ Config: `[defer] enabled` (off unless set), `mode` (`"asset"` or `"global"`), `g
 - `base recall --keyword "..." [--domain X]` — graph-backed relational search
 - `base decision log --domain X --decision "..." --rationale "..."` — log a decision
 - `base decision search --keyword "..."` — find prior decisions
-- `base rule add --domain X --text "..."` — add a rule to a domain
+- `base rule add --domain X --text "..." --keywords "a, b" --fires-on "<prompt>"` — add a rule to a domain; inside a session it needs the words from the prompt that should bring it back and that prompt as its first test (a rule for file work also takes `--path`)
 
 ### Sync & dashboard
 

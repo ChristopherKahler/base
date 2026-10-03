@@ -527,9 +527,99 @@ fn rule_add_in_session_requires_keywords_and_example() {
     assert!(graph.contains("matchWord> \"release notes\""), "the keywords are the rule's own words");
     assert!(graph.contains("firesOn> \"when do the release notes ship\""), "the prompt is its test");
 
+    // `--words` is the same list as `--keywords`, so it carries the triggers too.
+    let (code, out, err) = base_env(
+        &s,
+        &["rule", "add", "--domain", "release", "--text", "Notes go out after the tag.", "--words", "release tag", "--fires-on", "when do we tag the release"],
+        &in_session,
+    );
+    assert_eq!(code, 0, "--words carries the triggers: {err}");
+    assert!(out.contains("added to domain 'release'"), "{out}");
+
     let (code, out, err) = base_env(&s, &["rule", "add", "--domain", "release", "--text", "Tag every release."], &[]);
     assert_eq!(code, 0, "outside a session nothing changed: {err}");
     assert!(out.contains("added to domain 'release'"), "{out}");
+}
+
+// ─── A session that upgrades half way through ────────────────────────────────
+
+/// A session already under way when base gains the detector reads none of its history: its old interrupt, refusal and
+/// markers are not charged to the turn before the prompt that finds them, and that prompt carries no C4 line. From
+/// there on it reads as any session does.
+#[test]
+fn a_session_that_upgrades_midway_reads_none_of_its_history() {
+    let s = home("upgrade");
+    let session = sid(80);
+    let t = transcript_in(&s, &session);
+    // An hour of work before the upgrade: an interrupt, a refusal, two marked corrections.
+    transcripts::append(&t, &session, &[
+        Ev::Prompt("set up the nightly import".into()),
+        Ev::Text("Setting it up".into()),
+        Ev::Interrupt,
+        Ev::Prompt("use the staging bucket".into()),
+        Ev::Denial,
+        Ev::InterruptToolUse,
+        Ev::Prompt("the bucket is import-staging".into()),
+        Ev::Text("UPDATED: the bucket is import-staging, not imports.".into()),
+        Ev::Prompt("and the schedule is 02:00".into()),
+        Ev::Text("MISREAD: I read the schedule as UTC.".into()),
+    ]);
+    let now = "add a retry to the import job";
+    transcripts::append(&t, &session, &[Ev::Prompt(now.into())]);
+    let out = prompt_hook(&s, &s.ws, &session, &t, now);
+    assert!(!out.contains(CHECK_LINE), "nothing in the history is this turn's:\n{out}");
+    assert!(signal_rows(&s.ws).is_empty(), "no row for the history: {:?}", signal_rows(&s.ws));
+    // From here on, the session reads as any other.
+    transcripts::append(&t, &session, &[Ev::Text("UPDATED: the job retries three times.".into())]);
+    stop_hook(&s, &s.ws, &session, &t, "UPDATED: the job retries three times.");
+    let rows = signal_rows(&s.ws);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1, vec!["C3 UPDATED".to_string()], "{rows:?}");
+}
+
+// ─── base rule propose: one proposal per turn ────────────────────────────────
+
+/// The same words sent on two prompts are two turns, and each keeps its own proposal. The turn before's repeat is that
+/// turn's evidence, not the next one's. A new rule given no wording is refused with the records closest to it, so the
+/// AI can name one with --rule or --decision instead.
+#[test]
+fn propose_keys_each_turn_and_names_the_closest_records() {
+    let s = home("propose-turns");
+    let session = sid(90);
+    let t = transcript_in(&s, &session);
+    let fix = "no, leave the database running and close only the proxy";
+    transcripts::write(&t, &session, &[
+        Ev::Prompt("close down the staging proxy and the database for the weekend".into()),
+        Ev::Text("Closing both.".into()),
+        Ev::Prompt("close down staging proxy and database for weekend".into()),
+        Ev::Text("Both are closing.".into()),
+        Ev::Prompt(fix.into()),
+        Ev::Text("UPDATED: the database stays up; only the proxy closes.".into()),
+        Ev::Prompt(fix.into()),
+        Ev::Text("UPDATED: the database is up again and the proxy is closed.".into()),
+    ]);
+    let tp = t.display().to_string();
+    let propose = |n: &str| {
+        let (code, out, err) = base_env(
+            &s,
+            &["rule", "propose", "--from-turn", "--transcript", &tp, "--prompt", n, "--text", "Weekend close-down stops only the proxy.", "--new", "--domain", "infra"],
+            &[],
+        );
+        assert_eq!(code, 0, "prompt {n}: {err}");
+        out
+    };
+    let third = propose("3");
+    assert!(third.starts_with("proposal p-0001 · new rule"), "{third}");
+    assert!(third.contains("C3 UPDATED") && !third.contains("C2 repeat"), "the second prompt's repeat is not the third's:\n{third}");
+    let fourth = propose("4");
+    assert!(fourth.starts_with("proposal p-0002 · new rule"), "the same words on another prompt are another turn:\n{fourth}");
+    assert!(fourth.contains("C2 repeat"), "the fourth prompt repeats the third: {fourth}");
+    assert_eq!(proposals(&s), 2, "both kept");
+
+    let (code, _, err) = base_env(&s, &["rule", "propose", "--from-turn", "--transcript", &tp, "--prompt", "3", "--new"], &[]);
+    assert_eq!(code, 1, "a new rule needs its wording: {err}");
+    assert!(err.contains("--text") && err.contains("--decision") && err.contains("Closest:"), "{err}");
+    assert_eq!(proposals(&s), 2, "the refused one wrote nothing");
 }
 
 // ─── The CORRECTED line at session start ─────────────────────────────────────

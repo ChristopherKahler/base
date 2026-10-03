@@ -79,10 +79,6 @@ const DENIAL_TEXT: &str = "The user doesn't want to proceed with this tool use."
 /// The start of the user line Claude Code writes when the user stops a turn.
 const INTERRUPT_TEXT: &str = "[Request interrupted by user";
 
-/// A session with no reading yet starts this far from the end of a longer transcript: a session that upgrades base
-/// half way through does not read its own history as new.
-pub const FIRST_READ_MAX: u64 = 4 * 1024 * 1024;
-
 /// One thing a transcript line says, as the correction detector reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -232,14 +228,14 @@ fn assistant_events(v: &serde_json::Value) -> Vec<Event> {
 }
 
 /// Read the whole lines of `path` from byte `from` to the end, and their events. A line still being written (no
-/// newline yet) is not read; `next` stops before it. A start inside a line (a first read [`FIRST_READ_MAX`] from the
-/// end) goes on to the next line start. An offset past the end (a file that was replaced) starts again
-/// [`FIRST_READ_MAX`] from the end.
+/// newline yet) is not read; `next` stops before it. A start inside a line (a first read taken while Claude Code was
+/// writing one) goes on to the next line start. An offset past the end (a file that was replaced) starts again at the
+/// end: nothing before it is known to be new.
 pub fn read_events(path: &Path, from: u64) -> std::io::Result<Stretch> {
     use std::io::BufRead;
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
-    let start = if from > len { len.saturating_sub(FIRST_READ_MAX) } else { from };
+    let start = from.min(len);
     let mut skip_partial = false;
     if start > 0 {
         file.seek(SeekFrom::Start(start - 1))?;
@@ -268,10 +264,11 @@ pub fn read_events(path: &Path, from: u64) -> std::io::Result<Stretch> {
     Ok(Stretch { events, next: at })
 }
 
-/// Where a session's first read starts: the beginning, or [`FIRST_READ_MAX`] from the end of a longer transcript.
-/// [`read_events`] reads from the first line start at or after it.
-pub fn first_offset(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0).saturating_sub(FIRST_READ_MAX)
+/// Where a session's first read starts: the transcript's end as it stands, or 0 when it is not written yet. A session
+/// that upgrades base half way through reads none of its history as new, so an interrupt or a marker from hours ago is
+/// never charged to the turn before this prompt. [`read_events`] reads from the first line start at or after it.
+pub fn end_offset(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 /// Every event of a whole transcript, in order.

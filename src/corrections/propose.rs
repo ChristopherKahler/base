@@ -33,6 +33,7 @@ use crate::config::BaseConfig;
 use crate::crud;
 use crate::domain::bm25;
 use crate::domain::transcript;
+use super::clip;
 use crate::emit::match_log::{self, Row, Signal};
 
 /// The least score a candidate needs to fit (with [`FIT_MIN_TERMS`] and [`FIT_MIN_MARGIN`]): on a store of a few
@@ -197,7 +198,10 @@ pub fn run(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Proposal, Str
     let text = args.text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(String::from);
 
     let domains = crate::domain::load_domains(cwd);
-    let mut candidates = load_candidates(config, cwd, &domains);
+    // Domains synced first, as every hook does, then both tiers loaded once: the candidates and the next id read it.
+    crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
+    let store = crate::store::load_merged(cwd);
+    let mut candidates = load_candidates(config, store.as_ref(), &domains);
     rank(&mut candidates, text.as_deref(), &given_keywords, marker.as_deref(), &ev.prompt);
     let fit = pick(args, &candidates)?;
 
@@ -238,15 +242,20 @@ pub fn run(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Proposal, Str
             }
         }
         None => {
+            // Asked first: the AI that runs the command bare usually lands here, and the records closest to the
+            // correction are what it needs to choose between --text and naming one.
+            if text.is_none() {
+                return Err(format!(
+                    "no rule or decision base holds stands out as the one this correction is about, so this is a new \
+                     rule and needs its wording: give --text \"...\". If it is about one of these, name it instead \
+                     with --rule <domain>.<id> or --decision <slug>. Closest: {}",
+                    closest(&candidates)
+                ));
+            }
             let (domain, why) = new_rule_domain(args, cwd, trigger, &candidates, &domains)?;
             (Kind::NewRule, Target { kind: "domain", id: domain.clone(), domain, what: String::new() }, why)
         }
     };
-    if kind == Kind::NewRule && text.is_none() {
-        return Err("a new rule needs its wording: give --text \"...\" (or name the rule it is about with --rule, \
-                    --decision)"
-            .to_string());
-    }
 
     let mut warnings = Vec::new();
     let lower = example.to_lowercase();
@@ -257,13 +266,15 @@ pub fn run(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Proposal, Str
         warnings.push("none of the keywords is in the example, so its fires_on test would miss".to_string());
     }
     let session = ev.session.clone();
+    let fingerprint = fingerprint(kind, &target, &keywords, text.as_deref());
+    let turn_key = turn_key(session.as_deref(), &ev, &fingerprint);
     let mut proposal = Proposal {
         id: None,
         kind,
         meaning,
         why,
-        fingerprint: fingerprint(kind, &target, &keywords, text.as_deref()),
-        turn_key: turn_key(session.as_deref(), &ev.prompt),
+        fingerprint,
+        turn_key,
         target,
         text,
         keywords,
@@ -281,7 +292,8 @@ pub fn run(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Proposal, Str
         replaced: false,
     };
     if !args.dry_run {
-        write(config, cwd, &mut proposal)?;
+        let highest = store.as_ref().map(|s| max_id(s, &config.namespace)).unwrap_or(0);
+        write(config, cwd, highest, &mut proposal)?;
     }
     Ok(proposal)
 }
@@ -324,10 +336,11 @@ fn evidence(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Evidence, St
     };
     let t = &turns[at];
     let mut signals = t.signals.clone();
-    // The turn before: an interrupt or a refusal ends a turn with no Stop, and its C2 is what this prompt answers.
+    // The turn before: an interrupt or a refusal ends a turn with no Stop, and a file it wrote that changed before this
+    // prompt is the user's own fix; that is what this prompt answers. Its repeat was about the prompt before it.
     if at > 0 {
-        for s in turns[at - 1].signals.iter().filter(|s| s.layer == "C2") {
-            add_signal(&mut signals, s.clone());
+        for s in turns[at - 1].signals.iter().filter(|s| carried_over(s)) {
+            super::push_once(&mut signals, s.clone());
         }
     }
     // The prompt number the hooks counted: the session's state knows it when its last prompt is this one.
@@ -347,8 +360,8 @@ fn evidence(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Evidence, St
         for row in session_rows(cwd, sid).iter().filter(|r| r.event == "signal") {
             let this_turn = row.prompt_num == Some(turn);
             if this_turn || row.prompt_num.is_some_and(|n| n + 1 == turn) {
-                for s in row.signals.iter().filter(|s| this_turn || s.layer == "C2") {
-                    add_signal(&mut signals, s.clone());
+                for s in row.signals.iter().filter(|s| this_turn || carried_over(s)) {
+                    super::push_once(&mut signals, s.clone());
                 }
             }
         }
@@ -356,11 +369,9 @@ fn evidence(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Evidence, St
     Ok(Evidence { prompt: t.prompt.clone(), signals, session, turn: Some(turn), manual: false })
 }
 
-/// Add `s` unless a signal of its layer and kind is there.
-fn add_signal(list: &mut Vec<Signal>, s: Signal) {
-    if !list.iter().any(|x| x.layer == s.layer && x.kind == s.kind) {
-        list.push(s);
-    }
+/// A signal of the turn before that belongs to this turn's correction: a C2 other than the turn's own repeat.
+fn carried_over(s: &Signal) -> bool {
+    s.layer == "C2" && s.kind != "repeat"
 }
 
 /// The session's transcript: `--transcript`, else the one the hooks recorded, else
@@ -447,8 +458,11 @@ fn recent_prompts(cwd: &Path) -> Vec<String> {
 
 /// Every rule and decision in both tiers, superseded ones left out: rules from the graph (synced from `domains.toml`
 /// first, as every hook does), and any `domains.toml` rule the graph does not hold yet.
-fn load_candidates(config: &BaseConfig, cwd: &Path, domains: &[crate::domain::DomainDef]) -> Vec<Candidate> {
-    crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
+fn load_candidates(
+    config: &BaseConfig,
+    store: Option<&oxigraph::store::Store>,
+    domains: &[crate::domain::DomainDef],
+) -> Vec<Candidate> {
     let ns = &config.namespace;
     let p = &ns.prefix;
     let pfx = crud::prefixes(ns);
@@ -460,8 +474,7 @@ fn load_candidates(config: &BaseConfig, cwd: &Path, domains: &[crate::domain::Do
         domains.iter().filter(|d| d.is_always()).map(|d| crud::slugify(&d.name)).collect();
     let domain_name = |iri: &str| names.get(iri).cloned().unwrap_or_else(|| iri.rsplit('/').next().unwrap_or_default().to_string());
     let mut out: Vec<Candidate> = Vec::new();
-    let store = crate::store::load_merged(cwd);
-    if let Some(store) = &store {
+    if let Some(store) = store {
         // Rules: text, rationale, matchers. One row per matcher value, folded per rule.
         let no_superseded = crate::supersede::sparql_exclude_superseded(ns, "rule");
         let sparql = format!(
@@ -818,9 +831,16 @@ fn fingerprint(kind: Kind, target: &Target, keywords: &[String], text: Option<&s
     hex16(&format!("{}|{}:{}|{}|{}", kind.slug(), target.kind, target.id.to_lowercase(), kw.join(","), text))
 }
 
-/// The session and the prompt, hashed: one proposal per turn, replaced when the command runs again for it.
-fn turn_key(session: Option<&str>, prompt: &str) -> String {
-    hex16(&format!("{}|{}", session.unwrap_or("-"), super::phrases::text_hash(prompt)))
+/// The turn, hashed: one proposal per turn, replaced when the command runs again for it. A turn read from the
+/// transcript is its session, its prompt number and its text, so the same words sent again on a later prompt (the C2
+/// repeat) are a turn of their own. A manual proposal has no turn: it is keyed on what it proposes, so the same one run
+/// again replaces itself and a different one is added beside it.
+fn turn_key(session: Option<&str>, ev: &Evidence, fingerprint: &str) -> String {
+    let s = session.unwrap_or("-");
+    if ev.manual {
+        return hex16(&format!("{s}|manual|{fingerprint}"));
+    }
+    hex16(&format!("{s}|{}|{}", ev.turn.unwrap_or(0), super::phrases::text_hash(&ev.prompt)))
 }
 
 /// The highest `p-NNNN` number in `store`.
@@ -841,8 +861,9 @@ fn max_id(store: &oxigraph::store::Store, ns: &crate::config::NamespaceConfig) -
 }
 
 /// Write `prop` into the cwd's tier (the global tier outside every workspace), status `pending`. A pending proposal
-/// for the same turn in that graph is replaced and keeps its id; otherwise the id is the highest in either tier plus one.
-fn write(config: &BaseConfig, cwd: &Path, prop: &mut Proposal) -> Result<(), String> {
+/// for the same turn in that graph is replaced and keeps its id; otherwise the id is the highest in either tier
+/// (`highest`, read from the merged store, and the write tier as it is now) plus one.
+fn write(config: &BaseConfig, cwd: &Path, highest: u32, prop: &mut Proposal) -> Result<(), String> {
     let ns = &config.namespace;
     let p = ns.prefix.clone();
     let write_cwd = match crate::config::find_workspace_base(cwd) {
@@ -851,7 +872,6 @@ fn write(config: &BaseConfig, cwd: &Path, prop: &mut Proposal) -> Result<(), Str
             .map(|h| h.join(".base-gbl"))
             .ok_or_else(|| "no workspace here and no home folder for the global tier".to_string())?,
     };
-    let other_max = crate::store::load_merged(cwd).as_ref().map(|s| max_id(s, ns)).unwrap_or(0);
     let graph = crud::workspace_graph_iri(ns, &crud::workspace_slug(&write_cwd));
     let key = prop.turn_key.clone();
     let mut chosen = String::new();
@@ -875,7 +895,7 @@ fn write(config: &BaseConfig, cwd: &Path, prop: &mut Proposal) -> Result<(), Str
                 replaced = true;
                 id
             }
-            None => format!("p-{:04}", other_max.max(max_id(store, ns)) + 1),
+            None => format!("p-{:04}", highest.max(max_id(store, ns)) + 1),
         };
         chosen = id.clone();
         let iri = crud::build_iri(ns, "proposal", &id);
@@ -941,13 +961,11 @@ fn triples(prop: &Proposal, id: &str, iri: &str, p: &str) -> String {
     s
 }
 
-/// The first `max` characters of `text` on one line, and `...` when there were more.
-fn clip(text: &str, max: usize) -> String {
-    let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one.chars().count() <= max {
-        return one;
-    }
-    format!("{}...", one.chars().take(max).collect::<String>().trim_end())
+/// The three best candidates as the output prints them: `decision x (98.9) · rule base.9f2c1a7b (87.6) · ...`.
+fn closest(cands: &[Candidate]) -> String {
+    let list: Vec<String> =
+        cands.iter().take(SHOWN_CANDIDATES).map(|c| format!("{} {} ({:.1})", c.kind, c.show, c.score)).collect();
+    if list.is_empty() { "none".to_string() } else { list.join(" · ") }
 }
 
 /// What `base rule propose` prints.
@@ -1000,8 +1018,6 @@ pub fn render(prop: &Proposal, dry_run: bool) -> String {
         s.push_str(&format!("  warning: {w}\n"));
     }
     if !prop.candidates.is_empty() {
-        let list: Vec<String> =
-            prop.candidates.iter().map(|c| format!("{} {} ({:.1})", c.kind, c.show, c.score)).collect();
         let tail = if prop.kind == Kind::NewRule {
             format!(
                 " · none fits (a fit scores {FIT_MIN_SCORE:.0} or more, shares {FIT_MIN_TERMS} words, and scores \
@@ -1010,7 +1026,7 @@ pub fn render(prop: &Proposal, dry_run: bool) -> String {
         } else {
             String::new()
         };
-        s.push_str(&format!("  closest: {}{tail}\n", list.join(" · ")));
+        s.push_str(&format!("  closest: {}{tail}\n", closest(&prop.candidates)));
     }
     if dry_run {
         s.push_str("  dry run: nothing written\n");

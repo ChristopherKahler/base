@@ -20,7 +20,8 @@
 //! line is read once, by whichever comes first, and what the prompt hook reads belongs to the turn before it.
 //!
 //! THE CURSOR BELONGS TO THE SESSION, NOT A TIER: `~/.base-gbl/corrections/<session>.json`. A session that changes its
-//! cwd into another workspace keeps one cursor and never reads a line twice.
+//! cwd into another workspace keeps one cursor and never reads a line twice. A session's first read starts at the
+//! transcript's end as it stands, so a session that upgrades base half way through reads none of its history as new.
 
 pub mod claude_md;
 pub mod markers;
@@ -174,9 +175,27 @@ pub fn prune_state(days: u64) -> usize {
 }
 
 /// Push `signal` unless one of the same layer and kind is there.
-fn push_once(list: &mut Vec<Signal>, signal: Signal) {
+pub(crate) fn push_once(list: &mut Vec<Signal>, signal: Signal) {
     if !list.iter().any(|s| s.layer == signal.layer && s.kind == signal.kind) {
         list.push(signal);
+    }
+}
+
+/// What one transcript event adds to a turn's signals: C2 for the user stopping the turn or refusing a tool call (once
+/// per kind), C3 for a marker at a line start of the AI's own text when `fresh` says its kind is new to the turn. The
+/// one place the hooks and the whole-transcript reader turn events into signals, so the two cannot drift apart.
+fn event_signals(e: &Event, cc: &CorrectionsConfig, out: &mut Vec<Signal>, mut fresh: impl FnMut(&str) -> bool) {
+    match e {
+        Event::Interrupt => push_once(out, Signal::new("C2", "interrupt", None)),
+        Event::Denial => push_once(out, Signal::new("C2", "denial", None)),
+        Event::Text(t) => {
+            for f in markers::find(t, &cc.markers) {
+                if fresh(&f.kind) {
+                    out.push(Signal::new("C3", &f.kind, Some(&f.line)));
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -237,23 +256,17 @@ pub fn on_prompt(
         .map(String::from)
         .or_else(|| state.transcript.clone());
     if let Some(tp) = transcript_path {
-        let from = state.offset.unwrap_or_else(|| transcript::first_offset(Path::new(&tp)));
-        if let Ok(stretch) = transcript::read_events(Path::new(&tp), from) {
-            state.offset = Some(stretch.next);
-            for e in &stretch.events {
-                match e {
-                    Event::Interrupt => push_once(&mut prev_signals, Signal::new("C2", "interrupt", None)),
-                    Event::Denial => push_once(&mut prev_signals, Signal::new("C2", "denial", None)),
-                    Event::Text(t) => {
-                        for f in markers::find(t, &cc.markers) {
-                            if state.c3_new(prev, &f.kind) {
-                                prev_signals.push(Signal::new("C3", &f.kind, Some(&f.line)));
-                            }
-                        }
-                    }
-                    _ => {}
+        let from = state.offset.unwrap_or_else(|| transcript::end_offset(Path::new(&tp)));
+        match transcript::read_events(Path::new(&tp), from) {
+            Ok(stretch) => {
+                state.offset = Some(stretch.next);
+                for e in &stretch.events {
+                    event_signals(e, cc, &mut prev_signals, |kind| state.c3_new(prev, kind));
                 }
             }
+            // Not written yet: whatever it holds later is new.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => state.offset = state.offset.or(Some(0)),
+            Err(_) => {}
         }
         state.transcript = Some(tp);
     }
@@ -286,9 +299,10 @@ pub fn on_prompt(
         state.last_human = Some(LastHuman { num, words, text_hash: phrases::text_hash(prompt) });
     }
 
+    // One waiting signal per kind: the list only decides whether the next typed prompt carries the line.
     let mut pending = std::mem::take(&mut state.pending);
     for s in prev_signals.iter().chain(now_signals.iter()).filter(|s| s.layer == "C2") {
-        pending.push(s.clone());
+        push_once(&mut pending, s.clone());
     }
     // A task notification never carries the line: it is not the user, and the signals wait for the user's next prompt.
     let block = (human && (c1 || !pending.is_empty())).then(|| {
@@ -324,42 +338,31 @@ pub fn on_stop(config: &BaseConfig, cwd: &Path, event: &serde_json::Value, sessi
         .map(String::from)
         .or_else(|| state.transcript.clone());
     if let Some(tp) = transcript_path {
-        let from = state.offset.unwrap_or_else(|| transcript::first_offset(Path::new(&tp)));
+        let from = state.offset.unwrap_or_else(|| transcript::end_offset(Path::new(&tp)));
         match transcript::read_events(Path::new(&tp), from) {
             Ok(stretch) => {
                 state.offset = Some(stretch.next);
-                for e in stretch.events {
-                    match e {
-                        Event::Interrupt => push_once(&mut signals, Signal::new("C2", "interrupt", None)),
-                        Event::Denial => push_once(&mut signals, Signal::new("C2", "denial", None)),
-                        Event::Text(t) => {
-                            for f in markers::find(&t, &cc.markers) {
-                                if state.c3_new(num, &f.kind) {
-                                    signals.push(Signal::new("C3", &f.kind, Some(&f.line)));
-                                }
-                            }
-                        }
-                        Event::Wrote(f) if !state.turn_writes.contains(&f) && state.turn_writes.len() < MAX_WRITTEN => {
-                            state.turn_writes.push(f);
-                        }
-                        _ => {}
+                for e in &stretch.events {
+                    if let Event::Wrote(f) = e
+                        && !state.turn_writes.contains(f)
+                        && state.turn_writes.len() < MAX_WRITTEN
+                    {
+                        state.turn_writes.push(f.clone());
                     }
+                    event_signals(e, cc, &mut signals, |kind| state.c3_new(num, kind));
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => state.offset = state.offset.or(Some(0)),
             Err(e) => eprintln!("base: the Stop hook could not read the transcript {tp}: {e}"),
         }
         state.transcript = Some(tp);
     }
     // The payload's last reply: the transcript can trail the hook by its last lines.
     if let Some(last) = event.get("last_assistant_message").and_then(serde_json::Value::as_str) {
-        for f in markers::find(last, &cc.markers) {
-            if state.c3_new(num, &f.kind) {
-                signals.push(Signal::new("C3", &f.kind, Some(&f.line)));
-            }
-        }
+        event_signals(&Event::Text(last.to_string()), cc, &mut signals, |kind| state.c3_new(num, kind));
     }
     for s in signals.iter().filter(|s| s.layer == "C2") {
-        state.pending.push(s.clone());
+        push_once(&mut state.pending, s.clone());
     }
     // As the turn leaves them: a later Stop in the same turn (a Stop hook that blocked) records them again.
     state.written = state.turn_writes.iter().map(|f| Written::now(f)).collect();
@@ -452,19 +455,15 @@ pub fn turns(events: Vec<Event>, cc: &CorrectionsConfig) -> Vec<Turn> {
             }
             last_human_words = Some(words);
         }
+        let mut c3_seen: Vec<String> = Vec::new();
         for e in &out[i].events {
-            match e {
-                Event::Interrupt => push_once(&mut signals, Signal::new("C2", "interrupt", None)),
-                Event::Denial => push_once(&mut signals, Signal::new("C2", "denial", None)),
-                Event::Text(t) => {
-                    for f in markers::find(t, &cc.markers) {
-                        if !signals.iter().any(|s| s.layer == "C3" && s.kind == f.kind) {
-                            signals.push(Signal::new("C3", &f.kind, Some(&f.line)));
-                        }
-                    }
+            event_signals(e, cc, &mut signals, |kind| {
+                let new = !c3_seen.iter().any(|k| k == kind);
+                if new {
+                    c3_seen.push(kind.to_string());
                 }
-                _ => {}
-            }
+                new
+            });
         }
         // A file the turn before wrote, changed between that turn and this one's first reply.
         if i > 0 {
@@ -534,7 +533,8 @@ pub fn turn_json(t: &Turn) -> serde_json::Value {
     })
 }
 
-fn clip(text: &str, max: usize) -> String {
+/// The first `max` characters of `text` on one line, and `...` when there were more.
+pub(crate) fn clip(text: &str, max: usize) -> String {
     let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if one.chars().count() <= max {
         return one;

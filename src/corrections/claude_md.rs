@@ -151,12 +151,11 @@ pub enum Offered {
     Failed(String),
 }
 
-/// Offer the line for the user's CLAUDE.md (`$CLAUDE_CONFIG_DIR/CLAUDE.md` or `~/.claude/CLAUDE.md`), as `choice` says.
+/// Offer the line for the CLAUDE.md at `path`, as `choice` says: the file `base install` writes the BASE CLI section
+/// into (`~/.claude/CLAUDE.md`), so the line sits above that section and `base uninstall` finds it there.
 /// `ask` asks the question and returns the answer; the caller passes one that reads the terminal.
-pub fn offer(choice: Choice, ask: impl FnOnce(&Path) -> bool) -> Offered {
-    let Some(path) = crate::claude_md::user_file() else {
-        return Offered::Failed("no home folder to find CLAUDE.md in".to_string());
-    };
+pub fn offer(path: &Path, choice: Choice, ask: impl FnOnce(&Path) -> bool) -> Offered {
+    let path = path.to_path_buf();
     if covered(&std::fs::read_to_string(&path).unwrap_or_default()) {
         return Offered::Covered;
     }

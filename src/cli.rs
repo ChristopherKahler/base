@@ -3857,8 +3857,10 @@ pub fn run() {
             match action {
                 RuleAction::Add { domain: name, text, rationale, supersedes, kind, place, path, tool, command, words, keywords, fires_on, quiet_on } => {
                     // K3 (BO-15): a rule the AI adds inside a Claude Code session arrives with triggers and a test.
+                    // `--words` is the same list as `--keywords`, so either one carries the triggers.
+                    let no_words = |w: &Option<String>| w.as_deref().is_none_or(|k| k.trim().is_empty());
                     if std::env::var("CLAUDECODE").is_ok_and(|v| v == "1")
-                        && (keywords.as_deref().is_none_or(|k| k.trim().is_empty()) || fires_on.is_empty())
+                        && ((no_words(&keywords) && no_words(&words)) || fires_on.is_empty())
                     {
                         die(
                             "Error",
