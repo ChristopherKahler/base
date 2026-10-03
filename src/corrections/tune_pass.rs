@@ -606,6 +606,16 @@ pub fn run(config: &BaseConfig, cwd: &Path, args: &Args, judge: &mut dyn Judge, 
             .map(|t| t.num)
             .collect();
         let flagged_n = typed.iter().filter(|i| flagged(&r.turns, **i)).count();
+        // Nothing a judge could find: the only typed turn is the session's first (a spawned session's boot prompt,
+        // whose later turns are task notifications), so no reply came before it to correct; nothing flagged it; and
+        // it matched a domain. Read with no call. On Chris's day of 2026-10-02 this was 9 of 19 sessions (gate 4).
+        if typed.iter().all(|i| *i == 0) && flagged_n == 0 && unmatched.is_empty() {
+            report.sessions.push((r.short(), typed.len(), 0, 0));
+            if !args.dry_run {
+                marks.push((r.picked.session.clone(), mark));
+            }
+            continue;
+        }
         let prompts = session_prompts(&r, &dblock, &unmatched);
         if !calls.can(&prompts) {
             report.notes.push(format!("{}: left for the next pass ({} calls at most per pass)", r.short(), calls.max));

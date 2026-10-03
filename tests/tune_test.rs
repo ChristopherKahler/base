@@ -505,6 +505,30 @@ fn tune_never_applies_changes() {
     assert_eq!(served_state(&s), before, "what base serves is unchanged");
 }
 
+/// A session whose only typed prompt is its first (a spawned session's boot prompt; the rest are task notifications)
+/// and matched a domain holds nothing a judge could find: no reply came before it, so it is no correction, and it is no
+/// keyword gap. The pass reads it and makes no call (gate 4: 9 of the 19 sessions of 2026-10-02). The control: a second
+/// typed prompt in the same session is judged, one call.
+#[test]
+fn a_session_with_nothing_to_judge_costs_no_call() {
+    let s = home("nothing-to-judge");
+    let l = Live::new(&s, 7);
+    l.start();
+    l.turn(&plain(0, true), "Done.");
+    let tp = l.transcript.display().to_string();
+    let log = s.ws.join("calls.jsonl");
+    let env = [("BASE_LLM_FAKE", "fail"), ("BASE_LLM_FAKE_LOG", log.to_str().unwrap())];
+    let out = ok(&s, &["tune", "--transcript", &tp], &env);
+    assert!(out.starts_with("read: 1 session (b017b017), 1 prompt, 0 flagged corrections"), "{out}");
+    assert!(out.contains("haiku: 0 calls (cached: 0)\n") && !out.contains("note:"), "{out}");
+    assert!(!log.exists(), "no call was made");
+
+    l.turn(&plain(1, true), "Done again.");
+    let out = ok(&s, &["tune", "--transcript", &tp, "--dry-run"], &[]);
+    assert!(out.starts_with("would read: 1 session (b017b017), 1 prompt, "), "only the new turn:\n{out}");
+    assert!(out.contains("haiku: would make 1 call (0 cached)\n"), "the second prompt is judged:\n{out}");
+}
+
 // ─── C5: the backstop ────────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
