@@ -140,10 +140,11 @@ base reminder remove <slug>
 Handoffs and forks:
 
 ```bash
-base handoff create --project "<p>" --doc "<abs-path>" [--slug "<title>"]
+base handoff create --project "<p>" --doc "<abs-path>" [--slug "<title>"] [--lane "<lane>"]   # archives only the same project and lane's earlier one
 base fork    create --project "<p>" --doc "<abs-path>" [--slug "<title>"]
 base handoff archive <slug>
-base handoff snooze <slug> <days>        # fork has the same verbs: base fork archive|snooze
+base handoff unarchive <slug>            # undo an archive, in the tier that holds it
+base handoff snooze <slug> <days>        # fork has the same verbs: base fork archive|unarchive|snooze
 base fork show <title|project|words|D-key>   # prints the doc; revives a deferred fork it finds
 ```
 

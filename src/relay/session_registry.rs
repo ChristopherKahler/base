@@ -179,6 +179,14 @@ pub fn list() -> Vec<SessionEntry> {
     load().sessions.into_values().collect()
 }
 
+/// The title this session goes by: one it registered rather than one auto-assigned, the newest first. `None` when
+/// the session holds no title. A handoff's default lane is this name when nothing nearer names its author (BO-11).
+pub fn title_of(session_id: &str) -> Option<String> {
+    let mut held: Vec<SessionEntry> = list().into_iter().filter(|e| e.session_id == session_id).collect();
+    held.sort_by(|a, b| a.auto.cmp(&b.auto).then_with(|| b.registered_at.cmp(&a.registered_at)));
+    held.into_iter().next().map(|e| e.title)
+}
+
 // ─── Title history (BO-05, F12e) ─────────────────────────────
 //
 // `sessions.json` holds who has a title NOW. This file holds who had it before: one line each time a title binds to

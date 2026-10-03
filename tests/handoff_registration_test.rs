@@ -3,7 +3,8 @@
 //! "RANK 08").
 //!
 //! `base handoff create` archives the project's prior open or deferred continuity handoff in EVERY tier, never a fork
-//! in any tier, and prints what it archived with its tier. The new slug is left out only in the tier being written,
+//! in any tier, and prints what it archived with its tier. Since BO-11 (F18a) only the prior handoff in the new one's
+//! lane is archived; every create in this file is in one lane, and `handoff_scope_test.rs` covers lanes. The new slug is left out only in the tier being written,
 //! where the create re-points it; in the other tier the same slug is an older copy and is archived (ruling D1). An
 //! unreadable other tier does not stop the registration: the handoff is written, then create fails naming the tier
 //! file it could not read (ruling D5). At
@@ -48,6 +49,9 @@ fn run_in(rig: &Rig, cwd: &Path, args: &[&str]) -> (i32, String, String) {
         .current_dir(cwd)
         .env("BASE_HOME", &rig.home)
         .env("BASE_NO_AUTO_UPDATE", "1")
+        // Every create here is one session's, in one lane (BO-11): no relay identity from the shell running the suite.
+        .env_remove("BASE_RELAY_AS")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -138,7 +142,7 @@ fn workspace_then_global_the_global_create_archives_the_workspace_handoff() {
     let out = create(&r, true, "2026-09-14-gbl-base");
     assert_eq!(status(&r, "handoff", "2026-09-14-gbl-base").as_deref(), Some("open"), "control: the new one is open");
     assert_eq!(status(&r, "handoff", "2026-09-14-ws-base").as_deref(), Some("archived"), "every tier: {out}");
-    assert!(out.contains("archived prior handoff: 2026-09-14-ws-base (workspace tier)"), "named with its tier: {out}");
+    assert!(out.contains("archived: 2026-09-14-ws-base (workspace tier)"), "named with its tier: {out}");
 }
 
 #[test]
@@ -148,7 +152,7 @@ fn global_then_workspace_the_workspace_create_archives_the_global_handoff() {
     let out = create(&r, false, "2026-09-14-wsecond-base");
     assert_eq!(status(&r, "handoff", "2026-09-14-wsecond-base").as_deref(), Some("open"), "control: the new one is open");
     assert_eq!(status(&r, "handoff", "2026-09-14-gfirst-base").as_deref(), Some("archived"), "every tier: {out}");
-    assert!(out.contains("archived prior handoff: 2026-09-14-gfirst-base (global tier)"), "named with its tier: {out}");
+    assert!(out.contains("archived: 2026-09-14-gfirst-base (global tier)"), "named with its tier: {out}");
 }
 
 #[test]
@@ -162,7 +166,7 @@ fn the_same_doc_registered_into_the_other_tier_leaves_one_open_record() {
     let workspace = graph_statuses(&r.ws.join(".base").join("graph.nq"), "2026-09-14-moved-base");
     assert_eq!(global, ["open"], "control: the tier written holds the new record, open: {out}");
     assert_eq!(workspace, ["archived"], "the other tier's copy of the same slug is archived: {out}");
-    assert!(out.contains("archived prior handoff: 2026-09-14-moved-base (workspace tier)"), "named with its tier: {out}");
+    assert!(out.contains("archived: 2026-09-14-moved-base (workspace tier)"), "named with its tier: {out}");
 }
 
 #[test]

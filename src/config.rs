@@ -46,16 +46,51 @@ fn global_tier_root() -> Option<PathBuf> {
 /// The workspace tier keeps the walk and keeps refusing when it finds nothing:
 /// there, no known correct location exists, which is the whole reason
 /// `crud::require_base_for_write` never auto-creates (issue #8).
+///
+/// The walk never stops at the global tier's own `.base` (BO-11, F22a). A shell
+/// parked in `~/.base-gbl/handoffs` or `~/.base-gbl/forks`, where the handoff and
+/// fork docs live, found `~/.base-gbl/.base` first and wrote the global tier while
+/// the operator was inside the workspace at `~`: 59 open handoffs and forks leaked
+/// that way on Chris's machine, every one stamped `graph/ws/base-gbl`. Now the walk
+/// passes it and finds the workspace around it. Only a folder inside the global
+/// root that no workspace encloses still resolves the global tier, as before:
+/// outside every workspace, that is the tier it is in.
 pub fn find_workspace_base(cwd: &Path) -> Option<PathBuf> {
-    if let Some(root) = global_tier_root()
+    let root = global_tier_root();
+    if let Some(root) = &root
         && cwd == root
     {
         return global_base_dir();
     }
-    walk_up(cwd, |dir| {
+    let global = global_base_dir();
+    let found = walk_up(cwd, |dir| {
         let base = dir.join(".base");
-        base.is_dir().then_some(base)
-    })
+        (base.is_dir() && global.as_deref() != Some(base.as_path())).then_some(base)
+    });
+    if found.is_none()
+        && let Some(root) = &root
+        && cwd.starts_with(root)
+    {
+        return global;
+    }
+    found
+}
+
+/// The workspace that encloses the global tier's root folder, if any.
+///
+/// Standing in `~/.base-gbl` itself is not asking for the global tier; `-g` is. But
+/// that folder is also the path `-g` swaps cwd for, which [`find_workspace_base`]
+/// answers with the global tier. So `cli::tier_cwd` routes a cwd that IS the
+/// global root, without `-g`, through this: the folder above it, when a workspace
+/// holds it (BO-11, F22a). `None` when no workspace encloses the root, where the
+/// global tier is the right answer.
+pub fn workspace_around_global_root(cwd: &Path) -> Option<PathBuf> {
+    let root = global_tier_root()?;
+    if cwd != root {
+        return None;
+    }
+    let parent = root.parent()?;
+    find_workspace_base(parent).map(|_| parent.to_path_buf())
 }
 
 /// Walk up from `start` (inclusive), returning the first ancestor for which
@@ -1838,6 +1873,43 @@ mod tests {
             std::fs::create_dir_all(&deep).unwrap();
 
             assert_eq!(find_workspace_base(&deep), Some(ws.join(".base")));
+        });
+    }
+
+    /// BO-11 (F22a): a folder inside the global root, where the handoff and fork docs live, is inside the workspace
+    /// at home when home is one, and the walk passes the global tier's own `.base` to find it. The root itself stays
+    /// the global tier: it is the path `-g` swaps cwd for, and `workspace_around_global_root` is what routes a plain
+    /// cwd there to the workspace.
+    #[test]
+    fn a_folder_inside_the_global_root_resolves_the_workspace_around_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let root = tmp.path().join(".base-gbl");
+            let docs = root.join("handoffs");
+            std::fs::create_dir_all(root.join(".base")).unwrap();
+            std::fs::create_dir_all(&docs).unwrap();
+            std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+
+            assert_eq!(find_workspace_base(&docs), Some(tmp.path().join(".base")));
+            assert_eq!(find_workspace_base(&root), Some(root.join(".base")), "the -g path is still the global tier");
+            assert_eq!(workspace_around_global_root(&root), Some(tmp.path().to_path_buf()));
+            assert_eq!(workspace_around_global_root(&docs), None, "only the root itself is rerouted");
+        });
+    }
+
+    /// With no workspace around it, a folder inside the global root resolves the global tier, as it always did:
+    /// outside every workspace, that is the tier it is in.
+    #[test]
+    fn a_folder_inside_the_global_root_with_no_workspace_around_it_is_the_global_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let root = tmp.path().join(".base-gbl");
+            let docs = root.join("forks");
+            std::fs::create_dir_all(root.join(".base")).unwrap();
+            std::fs::create_dir_all(&docs).unwrap();
+
+            assert_eq!(find_workspace_base(&docs), Some(root.join(".base")));
+            assert_eq!(workspace_around_global_root(&root), None);
         });
     }
 

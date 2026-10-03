@@ -367,11 +367,15 @@ ops:handoffDoc    rdf:type rdf:Property ;
 
 ops:project       rdf:type rdf:Property ;
                   rdfs:range xsd:string ;
-                  rdfs:comment "Project name a handoff belongs to (one open handoff per project)" .
+                  rdfs:comment "Project name a handoff belongs to (one open handoff per project and lane)" .
 
 ops:kind          rdf:type rdf:Property ;
                   rdfs:range xsd:string ;
                   rdfs:comment "Flow-doc kind: \"handoff\" (continuity, archive-prior) or \"fork\" (parallel side-work, additive)" .
+
+ops:lane          rdf:type rdf:Property ;
+                  rdfs:range xsd:string ;
+                  rdfs:comment "Handoff lane: --lane, else the author's codename. A new handoff archives only the earlier one in its project and lane" .
 
 ops:action        rdf:type rdf:Property ;
                   rdfs:comment "LedgerEntry action (plan, apply, unify)" .

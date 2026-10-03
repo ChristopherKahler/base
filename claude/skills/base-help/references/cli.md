@@ -71,6 +71,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base handoff deferred`
 - `base handoff snooze`
 - `base handoff archive`
+- `base handoff unarchive`
 - `base fork`
 - `base fork create`
 - `base fork list`
@@ -78,6 +79,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base fork deferred`
 - `base fork snooze`
 - `base fork archive`
+- `base fork unarchive`
 - `base sync`
 - `base domain`
 - `base domain add-trigger`
@@ -1419,13 +1421,14 @@ Manage session handoffs (resume docs surfaced at session start)
 Usage: base handoff [OPTIONS] <COMMAND>
 
 Commands:
-  create    Register a handoff doc (archives the project's prior open or deferred handoff in every tier)
-  list      List handoffs across global + workspace tiers
-  show      Find one open or deferred handoff and print its doc path. Takes a letter from the last session start (A-J), a key from `base handoff deferred` (D1, D2, ...), a slug, a project name, or a few words. A deferred match comes back to open, the only write it makes. Several matches are listed and none is picked (exit 2); no match exits 1
-  deferred  List deferred handoffs: open but paused, so session start does not list them. Each line carries a key (D1, D2, ...) that `base handoff show` takes, and the command that brings it back
-  snooze    Snooze a handoff for N days (hide until then)
-  archive   Archive a handoff (stop resurfacing)
-  help      Print this message or the help of the given subcommand(s)
+  create     Register a handoff doc (archives the earlier open or deferred handoff in the same project and lane, in every tier; other lanes' handoffs stay open)
+  list       List handoffs across global + workspace tiers
+  show       Find one open or deferred handoff and print its doc path. Takes a letter from the last session start (A-J), a key from `base handoff deferred` (D1, D2, ...), a slug, a project name, or a few words. A deferred match comes back to open, the only write it makes. Several matches are listed and none is picked (exit 2); no match exits 1
+  deferred   List deferred handoffs: open but paused, so session start does not list them. Each line carries a key (D1, D2, ...) that `base handoff show` takes, and the command that brings it back
+  snooze     Snooze a handoff for N days (hide until then)
+  archive    Archive a handoff (stop resurfacing; `unarchive` undoes it)
+  unarchive  Undo an archive: set an archived handoff back to open, in the tier that holds it
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -g, --global
@@ -1438,7 +1441,7 @@ Options:
 ## base handoff create
 
 ```text
-Register a handoff doc (archives the project's prior open or deferred handoff in every tier)
+Register a handoff doc (archives the earlier open or deferred handoff in the same project and lane, in every tier; other lanes' handoffs stay open)
 
 Usage: base handoff create [OPTIONS] --project <PROJECT> --doc <DOC>
 
@@ -1451,6 +1454,9 @@ Options:
 
       --slug <SLUG>
           Graph slug / title to summon it by (default: doc basename)
+
+      --lane <LANE>
+          The lane this handoff continues, for a lane several sessions hand back and forth. Default: the author's codename (the doc's by:, else the codename in a <date>-<codename>-<project> slug, else this session's relay title)
 
   -h, --help
           Print help
@@ -1518,9 +1524,25 @@ Options:
 ## base handoff archive
 
 ```text
-Archive a handoff (stop resurfacing)
+Archive a handoff (stop resurfacing; `unarchive` undoes it)
 
 Usage: base handoff archive <SLUG>
+
+Arguments:
+  <SLUG>
+          
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base handoff unarchive
+
+```text
+Undo an archive: set an archived handoff back to open, in the tier that holds it
+
+Usage: base handoff unarchive <SLUG>
 
 Arguments:
   <SLUG>
@@ -1539,13 +1561,14 @@ Manage parallel side-work forks (build-specs surfaced at session start)
 Usage: base fork [OPTIONS] <COMMAND>
 
 Commands:
-  create    Register a fork build-spec (additive — does not archive sibling forks)
-  list      List forks across global + workspace tiers
-  show      Find one fork by its title, project or a few words and print its doc path. A deferred fork it finds comes back to open. Several matches are listed and none is picked (exit 2); no match exits 1
-  deferred  List deferred forks: open but paused. Each line carries a key `base fork show` takes
-  snooze    Snooze a fork for N days (hide until then)
-  archive   Archive a fork (stop resurfacing)
-  help      Print this message or the help of the given subcommand(s)
+  create     Register a fork build-spec (additive — does not archive sibling forks)
+  list       List forks across global + workspace tiers
+  show       Find one fork by its title, project or a few words and print its doc path. A deferred fork it finds comes back to open. Several matches are listed and none is picked (exit 2); no match exits 1
+  deferred   List deferred forks: open but paused. Each line carries a key `base fork show` takes
+  snooze     Snooze a fork for N days (hide until then)
+  archive    Archive a fork (stop resurfacing; `unarchive` undoes it)
+  unarchive  Undo an archive: set an archived fork back to open, in the tier that holds it
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -g, --global
@@ -1638,9 +1661,25 @@ Options:
 ## base fork archive
 
 ```text
-Archive a fork (stop resurfacing)
+Archive a fork (stop resurfacing; `unarchive` undoes it)
 
 Usage: base fork archive <SLUG>
+
+Arguments:
+  <SLUG>
+          
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base fork unarchive
+
+```text
+Undo an archive: set an archived fork back to open, in the tier that holds it
+
+Usage: base fork unarchive <SLUG>
 
 Arguments:
   <SLUG>

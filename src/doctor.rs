@@ -1406,8 +1406,9 @@ fn leaked_handoffs_in(gbl: &Path) -> Vec<String> {
     }
     vec![format!(
         "{} open handoff/fork(s) in the GLOBAL tier — these resurface in every project. \
-         Likely leaks from writes made outside a workspace. Review with `base handoff list` \
-         and stop each with `base handoff archive <slug>`: {}",
+         Likely leaks from writes made outside a workspace, or, before 0.16.0, from a folder inside \
+         ~/.base-gbl. Review with `base handoff list` and stop each with `base handoff archive <slug>` \
+         (`base handoff unarchive <slug>` undoes it): {}",
         slugs.len(),
         slugs.join(", ")
     )]
