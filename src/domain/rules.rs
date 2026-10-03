@@ -137,7 +137,7 @@ pub fn content_hash(rendered: &str) -> u64 {
     u64::from_be_bytes(b)
 }
 
-fn build(domain: &str, text: String, rationale: Option<String>, iri: Option<String>) -> ServedRule {
+pub(crate) fn build(domain: &str, text: String, rationale: Option<String>, iri: Option<String>) -> ServedRule {
     let rendered = domain::render_rule(&text, rationale.as_deref());
     ServedRule {
         id: rule_id(domain, &text),

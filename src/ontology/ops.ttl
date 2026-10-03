@@ -553,3 +553,26 @@ ops:fingerprint   rdf:type rdf:Property ;
 ops:turnKey       rdf:type rdf:Property ;
                   rdfs:domain ops:RuleProposal ;
                   rdfs:comment "Session and prompt, hashed: one proposal per turn" .
+
+# ─── Rule proposal review (BO-16, K5) ─────────────────────
+# base rule review: status pending -> approved, rejected or edited.
+
+ops:reviewedAt    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "When the proposal was approved, rejected or edited" .
+
+ops:rejectReason  rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "Why the user rejected it (base rule review --reject <id> --reason)" .
+
+ops:editedText    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The wording the user applied instead of the proposed one" .
+
+ops:editedKeyword rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "One keyword the user applied instead of the proposed ones" .
+
+ops:appliedTo     rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "Where the approved change was written: domains.toml or the graph, and its tier" .

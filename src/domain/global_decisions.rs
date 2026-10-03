@@ -194,6 +194,11 @@ impl GlobalDecisions {
         self.by_id.get(id)
     }
 
+    /// The global decision `base decision update` addresses as `slug`.
+    pub fn by_slug(&self, slug: &str) -> Option<&GlobalDecision> {
+        self.by_id.values().find(|d| d.slug == slug)
+    }
+
     /// True when `id` is a global decision filed only under always-on domains and a prompt with this text does
     /// NOT receive it: it has no keywords, or none of them is in the text. False for every other record, so the
     /// walk can ask it about anything it is about to list.

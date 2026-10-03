@@ -441,7 +441,8 @@ fn propose_kinds() {
     let out = ok(&["rule", "propose", "--from-turn", "--keywords", "release notes"], &[("CLAUDE_CODE_SESSION_ID", &a)]);
     assert!(out.starts_with("proposal p-0001 · rewrite · rule release."), "{out}");
     assert!(out.contains("evidence: session b015b015 prompt 2") && out.contains("C3 UPDATED") && out.contains("C1 phrase"), "{out}");
-    assert!(out.contains("pending review (p-0001)") && !out.contains("base rule review"), "no command BO-16 has not built:\n{out}");
+    // BO-16 built the review, so the proposal now names it (lynx's G0 addition 3 to BO-15).
+    assert!(out.contains("pending review: base rule review (p-0001)"), "the review command, named:\n{out}");
 
     // Keyword gap: the decision fits and nothing served it to this session.
     let b = sid(61);

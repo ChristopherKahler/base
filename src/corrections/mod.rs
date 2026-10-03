@@ -27,6 +27,7 @@ pub mod claude_md;
 pub mod markers;
 pub mod phrases;
 pub mod propose;
+pub mod review;
 
 use std::path::{Path, PathBuf};
 
