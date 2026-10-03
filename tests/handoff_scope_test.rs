@@ -301,7 +301,7 @@ fn handoff_and_fork_unarchive() {
     // A second unarchive changes nothing and fails, naming the status it found; an unknown slug fails too.
     let (rc, out, err) = base(&r, None, &["handoff", "unarchive", "2026-09-14-1306-petrel-base-0160"]);
     assert_ne!(rc, 0, "a no-op is not a success: {out}{err}");
-    assert!(out.contains("status open, not archived") && err.contains("not archived in any tier"), "{out}{err}");
+    assert!(out.contains("status open, not archived") && err.contains("nothing changed"), "{out}{err}");
     let (rc, out, err) = base(&r, None, &["handoff", "unarchive", "2026-01-01-nobody"]);
     assert_ne!(rc, 0, "{out}{err}");
     assert!(err.contains("no handoff '2026-01-01-nobody' in either tier"), "{err}");
@@ -385,4 +385,93 @@ fn global_flag_still_writes_global() {
             assert!(!ws.contains(what.as_str()), "{what} (-g, standing in {}) went to the workspace", cwd.display());
         }
     }
+}
+
+/// N-Quads for one handoff record in named graph `graph` of a tier file, with each `(predicate, literal)` given.
+fn record(graph: &str, slug: &str, fields: &[(&str, &str)]) -> String {
+    let p = "http://ops-sys.local/ontology#";
+    let (s, g) = (format!("<{p}handoff/{slug}>"), format!("<{p}graph/ws/{graph}>"));
+    let mut out = format!("{s} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{p}Handoff> {g} .\n");
+    for (pred, lit) in fields {
+        out.push_str(&format!("{s} <{p}{pred}> \"{lit}\" {g} .\n"));
+    }
+    out
+}
+
+#[test]
+fn an_archive_never_reaches_another_graph_or_project_at_the_same_iri() {
+    // Review finding 2: one tier file can hold another workspace's named graph, and the archive names records by IRI.
+    // auk's handoff on `kit` sits in this workspace's graph; another graph in the same file holds a record at the same
+    // IRI for another project, and a fork. Only auk's is archived.
+    let r = rig();
+    let slug = "2026-09-20-1000-auk-kit";
+    let lane = [("project", "kit"), ("kind", "handoff"), ("status", "open"), ("lane", "auk")];
+    let mut quads = record("ws", slug, &lane);
+    quads.push_str(&record("other", slug, &[("project", "other-project"), ("kind", "handoff"), ("status", "open"), ("lane", "auk")]));
+    quads.push_str(&record("forks", slug, &[("project", "kit"), ("kind", "fork"), ("status", "open")]));
+    std::fs::write(workspace_graph(&r), quads).unwrap();
+
+    let out = create(&r, Some("auk"), "kit", "2026-09-21-1000-auk-kit", &[]);
+    assert!(out.contains(&format!("archived: {slug} (workspace tier)")), "{out}");
+    let text = read(&workspace_graph(&r));
+    let status_in = |graph: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| l.contains(&format!("/{slug}> ")) && l.contains("#status> \"") && l.ends_with(&format!("graph/ws/{graph}> .")))
+            .filter_map(|l| l.split("#status> \"").nth(1)?.split('"').next().map(String::from))
+            .collect()
+    };
+    assert_eq!(status_in("ws"), ["archived"], "control: auk's own record is archived");
+    assert_eq!(status_in("other"), ["open"], "another project's record at the same IRI stays open");
+    assert_eq!(status_in("forks"), ["open"], "a fork at the same IRI stays open");
+}
+
+#[test]
+fn unarchive_reopens_only_the_newest_copy_and_never_a_second_open_one() {
+    // Review finding 3: registered in the global tier, then again in the workspace, the global copy is archived as the
+    // older one (ruling D1). After the workspace copy is archived too, unarchive reopens the workspace copy only. While
+    // a copy is open anywhere, unarchive reopens nothing.
+    let r = rig();
+    let slug = "2026-09-20-1200-heron-kit";
+    let path = doc(&r, slug, None);
+    let (rc, out, err) = base(&r, Some("heron"), &["handoff", "-g", "create", "--project", "kit", "--doc", path.as_str()]);
+    assert_eq!(rc, 0, "{out}{err}");
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // createdAt has whole seconds
+    let out = create(&r, Some("heron"), "kit", slug, &[]);
+    assert!(out.contains(&format!("archived: {slug} (global tier)")), "control: D1 archived the older copy: {out}");
+
+    // Open in the workspace, archived in the global tier: nothing to reopen.
+    let (rc, out, err) = base(&r, None, &["handoff", "unarchive", slug]);
+    assert_ne!(rc, 0, "{out}{err}");
+    assert!(out.contains(&format!("left {slug} (global tier): still archived")), "{out}");
+    assert!(out.contains(&format!("left {slug} (workspace tier): status open, not archived")), "{out}");
+    assert!(err.contains("nothing changed"), "{err}");
+    assert_eq!(graph_statuses(&global_graph(&r), slug), ["archived"], "the global copy was not reopened");
+
+    let (rc, out, err) = base(&r, None, &["handoff", "archive", slug]);
+    assert_eq!(rc, 0, "{out}{err}");
+    let (rc, out, err) = base(&r, None, &["handoff", "unarchive", slug]);
+    assert_eq!(rc, 0, "{out}{err}");
+    assert!(out.contains(&format!("unarchived {slug} (workspace tier): status archived -> open")), "{out}");
+    assert!(out.contains(&format!("left {slug} (global tier): still archived")), "{out}");
+    assert_eq!(graph_statuses(&workspace_graph(&r), slug), ["open"]);
+    assert_eq!(graph_statuses(&global_graph(&r), slug), ["archived"], "one open copy, not two");
+}
+
+#[test]
+fn unarchive_clears_the_deferral_an_archived_handoff_kept() {
+    // Review finding 6: a deferred handoff archived by a create keeps its deferral fields; unarchive drops them with
+    // the archive, as reviving a deferred handoff does.
+    let r = rig();
+    let slug = "2026-09-01-0900-wren-kit";
+    std::fs::write(
+        workspace_graph(&r),
+        record("ws", slug, &[("project", "kit"), ("kind", "handoff"), ("status", "archived"), ("deferredReason", "auto: cold 12d"), ("deferredAt", "2026-09-13")]),
+    )
+    .unwrap();
+    let (rc, out, err) = base(&r, None, &["handoff", "unarchive", slug]);
+    assert_eq!(rc, 0, "{out}{err}");
+    let text = read(&workspace_graph(&r));
+    assert_eq!(graph_statuses(&workspace_graph(&r), slug), ["open"], "{out}");
+    assert!(!text.contains("#deferredReason>") && !text.contains("#deferredAt>"), "deferral fields left behind:\n{text}");
+    assert!(text.contains(&format!("/{slug}> <http://ops-sys.local/ontology#lastActive>")), "lastActive set");
 }

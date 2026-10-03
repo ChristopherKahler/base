@@ -307,12 +307,16 @@ fn priors_in(store: &Store, ns: &NamespaceConfig, project: &str, titles: &[Strin
 }
 
 /// The UPDATE that archives exactly `slugs`, wherever in the file they are still
-/// open or deferred. Empty when there is nothing to archive.
-fn archive_slugs_update(ns: &NamespaceConfig, slugs: &[String]) -> String {
+/// open or deferred continuity handoffs of `project`. Empty when there is nothing
+/// to archive. The project and fork checks are the ones `priors_in` chose by, so a
+/// record at the same IRI in another named graph of the file (another workspace's,
+/// for another project, or a fork) is never caught by the IRI alone.
+fn archive_slugs_update(ns: &NamespaceConfig, slugs: &[String], project: &str) -> String {
     if slugs.is_empty() {
         return String::new();
     }
     let p = &ns.prefix;
+    let esc = crud::escape_sparql_literal(project);
     let iris: Vec<String> = slugs
         .iter()
         .map(|slug| format!("<{}>", crud::build_iri(ns, "handoff", slug)))
@@ -320,8 +324,10 @@ fn archive_slugs_update(ns: &NamespaceConfig, slugs: &[String]) -> String {
     format!(
         "DELETE {{ GRAPH ?g {{ ?h {p}:status ?s }} }}\n\
          INSERT {{ GRAPH ?g {{ ?h {p}:status \"archived\" }} }}\n\
-         WHERE  {{ GRAPH ?g {{ ?h a {p}:Handoff ; {p}:status ?s .\n\
+         WHERE  {{ GRAPH ?g {{ ?h a {p}:Handoff ; {p}:project \"{esc}\" ; {p}:status ?s .\n\
            FILTER(?s IN (\"open\", \"deferred\"))\n\
+           OPTIONAL {{ ?h {p}:kind ?kind }}\n\
+           FILTER(!BOUND(?kind) || ?kind != \"fork\")\n\
            FILTER(?h IN ({})) }} }}",
         iris.join(", ")
     )
@@ -439,7 +445,7 @@ pub fn create_in_lane(
     let archived_here = crate::store::with_graph_lock(&path, || {
         let store = crate::store::load_or_empty(&path)?;
         let archive = split(priors_in(&store, ns, project_name, &inputs.titles)?, true);
-        let archive_update = archive_slugs_update(ns, &archive);
+        let archive_update = archive_slugs_update(ns, &archive, project_name);
         let statements: Vec<&str> = [archive_update.as_str(), &clean_target, &insert, &inherit]
             .into_iter()
             .filter(|s| !s.is_empty())
@@ -478,18 +484,30 @@ pub fn create_in_lane(
             continue;
         }
         let label = tier_label_of_file(&file, gbl_root);
-        let outcome = crate::store::with_graph_lock(&file, || {
-            let store = match crate::store::load_or_empty(&file) {
-                Ok(store) => store,
-                Err(e) => return Ok(Err(e)),
-            };
-            let priors = match priors_in(&store, ns, project_name, &inputs.titles) {
-                Ok(priors) => priors,
-                Err(e) => return Ok(Err(e)),
-            };
-            let archive = split(priors, false);
+        // Look without the lock first: most creates find nothing to archive in another tier, and the global graph's
+        // lock is shared by every live session.
+        let priors = match crate::store::load_or_empty(&file)
+            .and_then(|store| priors_in(&store, ns, project_name, &inputs.titles))
+        {
+            Ok(priors) => priors,
+            Err(e) => {
+                unreadable.push(format!(
+                    "could not read the {label} at {} to look for a prior handoff there: {e:#}",
+                    file.display()
+                ));
+                continue;
+            }
+        };
+        if split(priors, false).is_empty() {
+            continue;
+        }
+        // Something to archive: decide again from the graph loaded inside the lock, so the names printed are the
+        // names archived.
+        let archive = crate::store::with_graph_lock(&file, || {
+            let store = crate::store::load_or_empty(&file)?;
+            let archive = split(priors_in(&store, ns, project_name, &inputs.titles)?, false);
             if !archive.is_empty() {
-                let full = format!("{}\n{}", crud::prefixes(ns), archive_slugs_update(ns, &archive));
+                let full = format!("{}\n{}", crud::prefixes(ns), archive_slugs_update(ns, &archive, project_name));
                 crate::store::update_and_write(
                     &store,
                     &file,
@@ -498,16 +516,10 @@ pub fn create_in_lane(
                     crate::store::Intent::Knowledge,
                 )?;
             }
-            Ok(Ok(archive))
+            Ok(archive)
         })
         .with_context(|| format!("{registered}, but archiving the prior handoff in the {label} failed"))?;
-        match outcome {
-            Ok(archive) => archived.extend(archive.into_iter().map(|prior| (prior, label.to_string()))),
-            Err(e) => unreadable.push(format!(
-                "could not read the {label} at {} to look for a prior handoff there: {e:#}",
-                file.display()
-            )),
-        }
+        archived.extend(archive.into_iter().map(|prior| (prior, label.to_string())));
     }
     if !unreadable.is_empty() {
         anyhow::bail!("{registered}, but {}", unreadable.join("; and "));
@@ -712,16 +724,33 @@ pub fn archive(
 pub struct Unarchived {
     /// "workspace tier" or "global tier".
     pub tier: String,
-    /// The status the record had there before. Only `archived` was changed.
+    /// The status the record had there before.
     pub before: String,
-    /// True when this tier's record went from archived to open.
-    pub changed: bool,
+    pub outcome: UnarchiveOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnarchiveOutcome {
+    /// Archived, and now open again.
+    Reopened,
+    /// Archived, and left so: another tier holds the same slug open, or holds a newer copy. Two tiers can hold one
+    /// slug when it was registered in one and then the other, and `create` archives the older copy (ruling D1).
+    LeftArchived,
+    /// Not archived here (open, deferred), so there was nothing to undo.
+    NotArchived,
 }
 
 /// Undo an archive (BO-11, F18c): set an archived handoff or fork back to `open`,
-/// in each tier that holds it archived, and mark it active now so the defer pass
-/// does not park it again on the spot. A tier that holds it with another status is
-/// reported and left alone. An empty vec means no tier holds the slug at all.
+/// in the tier that holds it, and mark it active now so the defer pass does not park
+/// it again on the spot (the deferral fields an archived deferred handoff kept go
+/// too, as `deferred::revive_handoff` clears them). An empty vec means no tier holds
+/// the slug at all.
+///
+/// When two tiers hold the slug, only the newest copy (by `createdAt`, else the
+/// tier `cwd` writes to) is reopened, and nothing is while any tier holds it open:
+/// the other is the older copy `create` archived as a duplicate, and reopening it
+/// would make the handoff open twice, once in the global tier where every project
+/// sees it.
 ///
 /// Until this existed an archive could not be undone, so a handoff archived by
 /// another session's create was lost for good (F18).
@@ -734,49 +763,86 @@ pub fn unarchive(
     let iri = crud::build_iri(ns, "handoff", slug);
     let p = &ns.prefix;
     let now = crud::now_iso();
-    let statuses_q = format!(
-        "{}\nSELECT DISTINCT ?s WHERE {{ GRAPH ?g {{ <{iri}> a {p}:Handoff ; {p}:status ?s }} }}",
+    let held_q = format!(
+        "{}\nSELECT ?s ?created WHERE {{ GRAPH ?g {{ <{iri}> a {p}:Handoff ; {p}:status ?s .\n\
+           OPTIONAL {{ <{iri}> {p}:createdAt ?created }} }} }}",
         crud::prefixes(ns)
     );
     let reopen = format!(
-        "{}\nDELETE {{ GRAPH ?g {{ <{iri}> {p}:status \"archived\" . <{iri}> {p}:lastActive ?la }} }}\n\
+        "{}\nDELETE {{ GRAPH ?g {{ <{iri}> {p}:status \"archived\" . <{iri}> {p}:lastActive ?la .\n\
+                                <{iri}> {p}:deferredReason ?why . <{iri}> {p}:deferredAt ?at }} }}\n\
          INSERT {{ GRAPH ?g {{ <{iri}> {p}:status \"open\" . <{iri}> {p}:lastActive \"{now}\"^^xsd:dateTime }} }}\n\
          WHERE  {{ GRAPH ?g {{ <{iri}> a {p}:Handoff ; {p}:status \"archived\" }}\n\
-           OPTIONAL {{ GRAPH ?g {{ <{iri}> {p}:lastActive ?la }} }} }}",
+           OPTIONAL {{ GRAPH ?g {{ <{iri}> {p}:lastActive ?la }} }}\n\
+           OPTIONAL {{ GRAPH ?g {{ <{iri}> {p}:deferredReason ?why }} }}\n\
+           OPTIONAL {{ GRAPH ?g {{ <{iri}> {p}:deferredAt ?at }} }} }}",
         crud::prefixes(ns)
     );
-    let mut found = Vec::new();
+    // (statuses, newest createdAt) of the slug in one loaded graph; `None` when it does not hold it.
+    let held = |store: &Store| -> Result<Option<(Vec<String>, String)>> {
+        let QueryResults::Solutions(solutions) = crate::store::query(store, &held_q)? else {
+            return Ok(None);
+        };
+        let (mut statuses, mut created) = (Vec::new(), String::new());
+        for sol in solutions.filter_map(|sol| sol.ok()) {
+            if let Some(s) = sol.get("s").map(|t| crud::term_display(t.as_ref())) {
+                statuses.push(s);
+            }
+            if let Some(c) = sol.get("created").map(|t| crud::term_display(t.as_ref())) {
+                created = created.max(c);
+            }
+        }
+        statuses.sort();
+        statuses.dedup();
+        Ok((!statuses.is_empty()).then_some((statuses, created)))
+    };
+
+    // Read every tier first, without its lock; only the tier written is locked.
+    let target_tier = crate::config::find_workspace_base(cwd).map(|b| b.join("graph.nq"));
+    let mut seen: Vec<(PathBuf, String, Vec<String>, String)> = Vec::new();
     for file in all_tier_files(gbl_root, cwd) {
         let tier = tier_label_of_file(&file, gbl_root).to_string();
-        let seen = crate::store::with_graph_lock(&file, || {
-            let store = crate::store::load_or_empty(&file)?;
-            let QueryResults::Solutions(solutions) = crate::store::query(&store, &statuses_q)? else {
-                return Ok(None);
-            };
-            let mut statuses: Vec<String> = solutions
-                .filter_map(|sol| sol.ok())
-                .filter_map(|sol| sol.get("s").map(|t| crud::term_display(t.as_ref())))
-                .collect();
-            statuses.sort();
-            if statuses.is_empty() {
-                return Ok(None);
-            }
-            let changed = statuses.iter().any(|s| s == "archived");
-            if changed {
-                crate::store::update_and_write(
-                    &store,
-                    &file,
-                    &reopen,
-                    crate::store::Scope::Target,
-                    crate::store::Intent::Knowledge,
-                )
-                .with_context(|| format!("unarchive failed in the {tier}: {reopen}"))?;
-            }
-            Ok(Some((statuses.join(", "), changed)))
-        })?;
-        if let Some((before, changed)) = seen {
-            found.push(Unarchived { tier, before, changed });
+        let store = crate::store::load_or_empty(&file)?;
+        if let Some((statuses, created)) = held(&store)? {
+            seen.push((file, tier, statuses, created));
         }
+    }
+    // The newest copy: latest createdAt, a tie going to the tier `cwd` writes to.
+    let newest = seen
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            a.3.cmp(&b.3).then_with(|| (target_tier.as_ref() == Some(&a.0)).cmp(&(target_tier.as_ref() == Some(&b.0))))
+        })
+        .map(|(i, _)| i);
+    let open_somewhere = seen.iter().any(|(_, _, statuses, _)| statuses.iter().any(|s| s != "archived"));
+    let mut found = Vec::new();
+    for (i, (file, tier, statuses, _)) in seen.iter().enumerate() {
+        let archived = statuses.iter().any(|s| s == "archived");
+        let outcome = if !archived {
+            UnarchiveOutcome::NotArchived
+        } else if open_somewhere || Some(i) != newest {
+            UnarchiveOutcome::LeftArchived
+        } else {
+            // Decide again inside the lock, from the graph the write is made to.
+            let reopened = crate::store::with_graph_lock(file, || {
+                let store = crate::store::load_or_empty(file)?;
+                let still = held(&store)?.is_some_and(|(s, _)| s.iter().any(|s| s == "archived"));
+                if still {
+                    crate::store::update_and_write(
+                        &store,
+                        file,
+                        &reopen,
+                        crate::store::Scope::Target,
+                        crate::store::Intent::Knowledge,
+                    )
+                    .with_context(|| format!("unarchive failed in the {tier}: {reopen}"))?;
+                }
+                Ok(still)
+            })?;
+            if reopened { UnarchiveOutcome::Reopened } else { UnarchiveOutcome::NotArchived }
+        };
+        found.push(Unarchived { tier: tier.clone(), before: statuses.join(", "), outcome });
     }
     Ok(found)
 }

@@ -1718,10 +1718,6 @@ fn no_global_config() -> ! {
     )
 }
 
-/// Which tier a write targets: `-g/--global` swaps cwd for `~/.base-gbl`, so
-/// the global tier is something you opt into rather than something you land in
-/// (issue #8). Without the flag, tier-bound writes resolve from cwd and fail
-/// loudly outside a workspace instead of silently discarding.
 /// `base handoff unarchive` and `base fork unarchive` (BO-11, F18c): one line per tier that held the slug, and a
 /// failure when nothing was archived, so a no-op never reads as success (#72).
 fn unarchive_cli(noun: &str, cwd: &std::path::Path, ns: &base::config::NamespaceConfig, slug: &str) {
@@ -1739,18 +1735,26 @@ fn unarchive_cli(noun: &str, cwd: &std::path::Path, ns: &base::config::Namespace
             ),
         );
     }
+    use crud::handoff::UnarchiveOutcome;
     for t in &found {
-        if t.changed {
-            println!("unarchived {slug} ({}): status archived -> open", t.tier);
-        } else {
-            println!("left {slug} ({}): status {}, not archived", t.tier, t.before);
+        match t.outcome {
+            UnarchiveOutcome::Reopened => println!("unarchived {slug} ({}): status archived -> open", t.tier),
+            UnarchiveOutcome::LeftArchived => println!(
+                "left {slug} ({}): still archived; another tier holds it open or holds a newer copy",
+                t.tier
+            ),
+            UnarchiveOutcome::NotArchived => println!("left {slug} ({}): status {}, not archived", t.tier, t.before),
         }
     }
-    if !found.iter().any(|t| t.changed) {
-        die("Failed", format!("{noun} '{slug}' is not archived in any tier; nothing changed"));
+    if !found.iter().any(|t| t.outcome == UnarchiveOutcome::Reopened) {
+        die("Failed", format!("{noun} '{slug}' was not unarchived in any tier; nothing changed"));
     }
 }
 
+/// Which tier a write targets: `-g/--global` swaps cwd for `~/.base-gbl`, so
+/// the global tier is something you opt into rather than something you land in
+/// (issue #8). Without the flag, tier-bound writes resolve from cwd and fail
+/// loudly outside a workspace instead of silently discarding.
 fn tier_cwd(cwd: &std::path::Path, global: bool) -> std::path::PathBuf {
     if !global {
         // Standing in `~/.base-gbl` without `-g` writes the workspace around it, not the global tier (BO-11, F22a).
