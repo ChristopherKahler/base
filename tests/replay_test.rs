@@ -18,6 +18,7 @@
 //! corpus needs its reason in the PR body (build rule 14).
 
 mod seed;
+mod transcripts;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -1393,4 +1394,188 @@ fn replay_rule_tests_agree_with_the_prompt_hook() {
     let want = format!("{tested} rules tested, 0 misses, 0 false fires\n");
     assert!(out.contains(&want), "want {want:?}:\n{out}");
     println!("replay rule tests: {tested} corpus rules, {checked} prompts, base rule test and the prompt hook agree on every one");
+}
+
+// ── BO-15 (K3, C1 to C4, D4, D10) ────────────────────────────────────────────────────────────────────────────
+
+/// The C4 line, word for word as BO-15's scope gives it.
+const CORRECTION_CHECK_LINE: &str = "This may be a correction. If it is, run base rule propose --from-turn after answering.";
+
+/// `corrections-session.json`: one session, what the detector must flag in each turn, and the prompts that carry the
+/// C4 line.
+#[derive(serde::Deserialize)]
+struct CorrectionsCorpus {
+    session: String,
+    events: Vec<transcripts::Ev>,
+    expect: std::collections::BTreeMap<String, Vec<String>>,
+    checks: Vec<u32>,
+}
+
+/// Signals as `LAYER kind`, per turn, each turn's sorted.
+type TurnSignals = std::collections::BTreeMap<u32, Vec<String>>;
+
+fn signal_labels(signals: &serde_json::Value) -> Vec<String> {
+    signals
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|s| format!("{} {}", s["layer"].as_str().unwrap_or_default(), s["kind"].as_str().unwrap_or_default()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// BO-15 (K3, C1 to C4, D4, D10). The corpus session, fed turn by turn through the real prompt and Stop hooks as Claude
+/// Code drives them (no Stop after an interrupt or a refusal; the task notification through the prompt hook too),
+/// flags exactly the turns that hold corrections: the signal rows, the C4 line once on each flagged prompt and never on
+/// the task notification, and nothing for T2's rule text in CLAUDE.md, hook output, a reminder, a Read, a thinking
+/// block or a subagent. `base log corrections --transcript`, the seam BO-17 and BO-19 read, finds the same turns and
+/// the same lines in the finished transcript, and `base rule propose` reads the UPDATED turn with its evidence and
+/// refuses the DEFERRED one. Before BO-15 nothing noticed a correction.
+#[test]
+fn replay_corrections_from_a_transcript() {
+    use transcripts::Ev;
+    let s = seed::write(&root("bo15-corrections"), &seed::TINY, &fixture("base.toml"));
+    let ws = s.ws.display().to_string().replace('\\', "/");
+    let corpus: CorrectionsCorpus =
+        serde_json::from_str(&fixture("corrections-session.json").replace("{ws}", &ws)).expect("the corrections corpus");
+    let want: TurnSignals = corpus
+        .expect
+        .iter()
+        .map(|(k, v)| {
+            let mut v = v.clone();
+            v.sort();
+            (k.parse().expect("a turn number"), v)
+        })
+        .collect();
+
+    // The events before the first prompt, then one list per prompt, the prompt first.
+    let mut lead: Vec<Ev> = Vec::new();
+    let mut turns: Vec<Vec<Ev>> = Vec::new();
+    for e in corpus.events {
+        match e {
+            Ev::Prompt(_) | Ev::Notification(_) => turns.push(vec![e]),
+            other => match turns.last_mut() {
+                Some(t) => t.push(other),
+                None => lead.push(other),
+            },
+        }
+    }
+    assert_eq!(turns.len(), 10, "control: the corpus session has its ten prompts");
+    let session = corpus.session.as_str();
+    let transcript = s.home.join(".claude").join("projects").join("replay").join(format!("{session}.jsonl"));
+    let tp = transcript.display().to_string();
+    transcripts::append(&transcript, session, &lead);
+
+    let mut printed: Vec<u32> = Vec::new();
+    for (i, turn) in turns.iter().enumerate() {
+        let num = i as u32 + 1;
+        // The user changes a file the AI wrote last turn, before typing this prompt.
+        for e in turn {
+            if let Ev::FileChanged(f) = e {
+                std::fs::write(f, "port = 9000\n# changed by hand between turns\n").expect("the user's change");
+            }
+        }
+        transcripts::append(&transcript, session, &turn[..1]);
+        let last_line = std::fs::read_to_string(&transcript).expect("the transcript").lines().last().unwrap_or_default().to_string();
+        let line: serde_json::Value = serde_json::from_str(&last_line).expect("the prompt line");
+        let prompt = line["message"]["content"].as_str().expect("the prompt's text").to_string();
+        let payload = serde_json::json!({
+            "cwd": s.ws.display().to_string(),
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": prompt,
+            "session_id": session,
+            "transcript_path": tp,
+        });
+        let (code, out, err) = seed::run_hook_at(&s, &s.ws, "user-prompt-submit", &payload, &[]);
+        assert_eq!(code, 0, "prompt {num}: the prompt hook failed: {err}");
+        let lines = out.matches(CORRECTION_CHECK_LINE).count();
+        assert!(lines <= 1, "prompt {num}: the C4 line {lines} times:\n{out}");
+        if lines == 1 {
+            printed.push(num);
+        }
+        // The AI's turn: the files it writes, then its lines in the transcript.
+        for e in &turn[1..] {
+            if let Ev::Write(f) | Ev::Edit(f) = e {
+                std::fs::write(f, "port = 8080\n").expect("the AI's write");
+            }
+        }
+        transcripts::append(&transcript, session, &turn[1..]);
+        if matches!(turn.last(), Some(Ev::Interrupt | Ev::InterruptToolUse | Ev::Denial)) {
+            continue;
+        }
+        let reply = turn.iter().rev().find_map(|e| match e {
+            Ev::Text(t) => Some(t.clone()),
+            _ => None,
+        });
+        let payload = serde_json::json!({
+            "cwd": s.ws.display().to_string(),
+            "hook_event_name": "Stop",
+            "session_id": session,
+            "transcript_path": tp,
+            "stop_hook_active": false,
+            "last_assistant_message": reply.unwrap_or_default(),
+        });
+        let (code, _, err) = seed::run_hook_at(&s, &s.ws, "stop", &payload, &[]);
+        assert_eq!(code, 0, "turn {num}: the Stop hook failed: {err}");
+    }
+
+    // What the hooks logged: one signal row per hook run that flagged something, merged per turn.
+    let log = std::fs::read_to_string(s.ws.join(".base").join("match-log.jsonl")).expect("the match log");
+    let mut logged = TurnSignals::new();
+    for v in log.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
+        if v["event"] == "signal" && v["session"] == session {
+            let n = v["prompt_num"].as_u64().expect("a signal row names its prompt") as u32;
+            logged.entry(n).or_default().extend(signal_labels(&v["signals"]));
+        }
+    }
+    logged.values_mut().for_each(|v| v.sort());
+    assert_eq!(logged, want, "the hooks' signal rows, per turn");
+    assert_eq!(printed, corpus.checks, "the prompts that carried the C4 line");
+    assert!(
+        !printed.contains(&6) && printed.contains(&7),
+        "control: the task notification (prompt 6) carried no line, and the interrupt before it waited for prompt 7"
+    );
+
+    // The finished transcript read as the hooks read it: the same turns, the same lines.
+    let (code, out, err) = run_base(&s, &["log", "corrections", "--transcript", &tp, "--json"]);
+    assert_eq!(code, 0, "base log corrections --transcript: {err}");
+    let mut read = TurnSignals::new();
+    let mut checks: Vec<u32> = Vec::new();
+    for v in out.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).expect("one turn per line")) {
+        let n = v["turn"].as_u64().expect("a turn number") as u32;
+        let mut labels = signal_labels(&v["signals"]);
+        if !labels.is_empty() {
+            labels.sort();
+            read.insert(n, labels);
+        }
+        if v["check"] == true {
+            checks.push(n);
+        }
+    }
+    assert_eq!(read, want, "base log corrections --transcript, per turn");
+    assert_eq!(checks, corpus.checks, "base log corrections --transcript: the prompts with the C4 line");
+
+    // `base rule propose` on the UPDATED turn (the second prompt typed) carries that turn's evidence, the file the user
+    // changed before it included; the DEFERRED turn (the seventh) is refused, though the turn before it was a MISREAD.
+    let (code, out, err) = run_base(
+        &s,
+        &[
+            "rule", "propose", "--from-turn", "--transcript", &tp, "--prompt", "2",
+            "--text", "The staging proxy listens on 9000.", "--new", "--domain", "staging", "--dry-run",
+        ],
+    );
+    assert_eq!(code, 0, "base rule propose on the UPDATED turn: {err}");
+    for want in ["C1 phrase", "C3 UPDATED", "C2 file-edited", "marker: UPDATED: the staging proxy listens on 9000", "dry run: nothing written"] {
+        assert!(out.contains(want), "base rule propose on the UPDATED turn: no {want:?}:\n{out}");
+    }
+    let (code, _, err) = run_base(&s, &["rule", "propose", "--from-turn", "--transcript", &tp, "--prompt", "7", "--dry-run"]);
+    assert_eq!(code, 1, "the DEFERRED turn is never proposed: {err}");
+    assert!(err.contains("DEFERRED"), "{err}");
+    println!(
+        "replay corrections: {} prompts, {} flagged turns, the C4 line on prompts {:?}; the transcript read agrees",
+        turns.len(),
+        want.len(),
+        corpus.checks
+    );
 }

@@ -333,12 +333,14 @@ fn evidence(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Evidence, St
         Some(last) if last.text_hash == hash => last.num,
         _ => t.num,
     };
-    // The session's own signal rows for this turn and the one before: a file changed after the AI wrote it is known
-    // only there.
+    // The session's own signal rows: this turn's, and the C2 of the turn before (as from the transcript above). A file
+    // changed after the AI wrote it is known only there. The turn before's own phrase or marker is not this turn's: a
+    // DEFERRED reply right after a MISREAD one is still only a disagreement.
     if let Some(sid) = session.as_deref() {
         for row in session_rows(cwd, sid).iter().filter(|r| r.event == "signal") {
-            if row.prompt_num.is_some_and(|n| n == turn || n + 1 == turn) {
-                for s in &row.signals {
+            let this_turn = row.prompt_num == Some(turn);
+            if this_turn || row.prompt_num.is_some_and(|n| n + 1 == turn) {
+                for s in row.signals.iter().filter(|s| this_turn || s.layer == "C2") {
                     add_signal(&mut signals, s.clone());
                 }
             }
