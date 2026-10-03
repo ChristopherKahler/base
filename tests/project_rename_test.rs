@@ -122,8 +122,14 @@ fn rename_preview_writes_nothing() {
     studio(&s);
     let files = [ws_graph(&s), gbl_graph(&s), ws_toml(&s)];
     let before: Vec<Vec<u8>> = files.iter().map(|f| std::fs::read(f).unwrap_or_default()).collect();
+    // A preview writes nothing, so it takes no lock: it runs while a rename holds one (this test's own, live,
+    // process), and leaves that lock as it was.
+    let lock = s.home.join(".base-gbl").join(".base").join("project-rename.lock");
+    std::fs::write(&lock, format!("{}\n", std::process::id())).expect("lock");
 
     let (out, _) = ok(&s, &["project", "rename", "studio", "atelier"]);
+    assert_eq!(read(&lock), format!("{}\n", std::process::id()), "the preview touched another rename's lock");
+    std::fs::remove_file(&lock).expect("unlock");
     assert!(out.starts_with("PREVIEW (nothing written; add --yes to rename)"), "{out}");
     assert!(out.contains("project   studio -> atelier  (workspace graph)"), "{out}");
     assert!(out.contains("domain    studio -> atelier  ("), "{out}");
@@ -208,8 +214,8 @@ fn rename_keeps_domains_toml_byte_for_byte_elsewhere() {
                         name = \"alpha\"   # first\r\n\
                         prompt_keywords = [\"a1\", \"a2\"]\r\n\
                         \r\n\
-                        [[domain]]\r\n\
-                        name = \"studio\"  # the one to rename\r\n\
+                        [[ domain ]]\r\n\
+                        name = \"Studio\"  # display spelling, as `project add -n Studio` writes it\r\n\
                         mode = \"triggered\"\r\n\
                         prompt_keywords = [\r\n    \"studio\",\r\n    \"studyo\",\r\n]\r\n\
                         rules = [{ text = \"name = \\\"studio\\\" inside a rule stays\" }]\r\n\
@@ -223,8 +229,8 @@ fn rename_keeps_domains_toml_byte_for_byte_elsewhere() {
     ok(&s, &["project", "rename", "studio", "atelier", "--yes"]);
     let after = read(&ws_toml(&s));
     let want = hand_written.replace(
-        "name = \"studio\"  # the one to rename\r\n",
-        "name = \"atelier\"  # the one to rename\r\naliases = [\"studio\"]\r\n",
+        "name = \"Studio\"  # display spelling, as `project add -n Studio` writes it\r\n",
+        "name = \"atelier\"  # display spelling, as `project add -n Studio` writes it\r\naliases = [\"studio\"]\r\n",
     );
     assert_eq!(after, want, "only the name line and one alias line change");
 }
@@ -276,6 +282,11 @@ fn old_name_resolves_as_alias() {
     assert!(out.contains("domain: atelier"), "{out}");
     assert!(err.contains(notice), "{err}");
 
+    let (_, err) = ok(&s, &["learn", "--text", "Atelier keeps a supply list", "--domain", "atelier", "--project", "studio"]);
+    assert!(err.contains(notice), "{err}");
+    assert!(read(&ws_graph(&s)).contains(&format!("<{NS}relatedTo> <{NS}project/atelier>")), "the note links the renamed project");
+    assert!(!read(&ws_graph(&s)).contains(&format!("<{NS}project/studio>")), "an edge to the old project ID came back");
+
     let (out, err) = ok(&s, &["task", "get", "studio.ship-the-site"]);
     assert!(out.contains("atelier.ship-the-site"), "{out}");
     assert!(err.contains(notice), "{err}");
@@ -297,7 +308,8 @@ fn old_name_resolves_as_alias() {
 fn rename_refuses_taken_or_bad_names() {
     let (_tmp, s) = fixture();
     studio(&s);
-    ok(&s, &["domain", "create", "--name", "taken-domain"]);
+    // Written with capitals and never synced: only its slug says it is `domain/taken-domain`.
+    ok(&s, &["domain", "create", "--name", "Taken-Domain"]);
     let files = [ws_graph(&s), gbl_graph(&s), ws_toml(&s)];
     let before: Vec<Vec<u8>> = files.iter().map(|f| std::fs::read(f).unwrap_or_default()).collect();
 
@@ -413,4 +425,26 @@ fn run_doctor(s: &Seed) -> (String, String) {
     let (_, json, _) = run_base(s, &["doctor", "--json"]);
     let (_, text, _) = run_base(s, &["doctor"]);
     (json, text)
+}
+
+/// A workspace with no global tier: the rename works, and creates no global tier on the way (a preview least of all).
+#[test]
+fn rename_without_a_global_tier_creates_none() {
+    let tmp = tempfile::Builder::new().prefix("bo24-").tempdir().expect("temp dir");
+    let s = Seed { home: tmp.path().join("home"), ws: tmp.path().join("ws") };
+    std::fs::create_dir_all(s.ws.join(".base")).expect("workspace tier");
+    std::fs::create_dir_all(&s.home).expect("home");
+    std::fs::create_dir_all(s.ws.join("Documents").join("Studio")).expect("folder");
+    ok(&s, &["project", "add", "-n", "studio", "-p", "Documents/Studio"]);
+    ok(&s, &["decision", "log", "--domain", "studio", "--decision", "Use the blue logo", "--rationale", "brand"]);
+    let global = s.home.join(".base-gbl").join(".base");
+    assert!(!global.exists(), "control: the fixture has no global tier");
+
+    let (out, _) = ok(&s, &["project", "rename", "studio", "atelier"]);
+    assert!(out.contains("project   studio -> atelier  (workspace graph)") && !out.contains("global graph"), "{out}");
+    assert!(!global.exists(), "the preview created a global tier");
+    ok(&s, &["project", "rename", "studio", "atelier", "--yes"]);
+    assert!(!global.exists(), "the rename created a global tier");
+    assert!(read(&ws_graph(&s)).contains(&format!("{NS}decision/atelier.use-the-blue-logo>")));
+    assert!(!s.ws.join(".base").join("project-rename.lock").exists(), "the rename lock was left behind");
 }

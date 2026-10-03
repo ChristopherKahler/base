@@ -2129,7 +2129,7 @@ pub fn run() {
                 }
             }
             ProjectAction::Rename { old, new, yes } => {
-                let plan = match crud::rename::plan(&cwd, &config.namespace, &old, &new) {
+                let plan = match crud::rename::plan(&cwd, &config.namespace, &old, &new, yes) {
                     Ok(p) => p,
                     Err(e) => die(project_error_prefix(&e), e),
                 };
@@ -2399,6 +2399,7 @@ pub fn run() {
         Some(Commands::Entity { action }) => match action {
             EntityAction::Add { name, entity_type, domain, project } => {
                 let domain = domain::canonical_name(&cwd, &domain);
+                let project = project.map(|p| domain::canonical_name(&cwd, &p));
                 match crud::entity::add(&cwd, &config.namespace, &name, &entity_type, &domain, project.as_deref()) {
                     Ok(slug) => println!("Entity '{name}' created (slug: {slug}, domain: {domain})"),
                     Err(e) => die("Failed", e),
@@ -3616,8 +3617,9 @@ pub fn run() {
 
         // ─── Learn ────────────────────────────────────────
         Some(Commands::Learn { global, text, r#type, domain, project, entity, supersedes, mention, context, remove, update, list }) => {
-            // An old domain name reads as the renamed domain, judged from where the operator stands (BO-24).
+            // An old domain or project name reads as the renamed one, judged from where the operator stands (BO-24).
             let domain = domain.map(|d| base::domain::canonical_name(&cwd, &d));
+            let project = project.map(|p| base::domain::canonical_name(&cwd, &p));
             let cwd = tier_cwd(&cwd, global);
             if list {
                 if let Err(e) = crud::note::list_notes(&cwd, &config.namespace, if r#type != "insight" { Some(&r#type) } else { None }, domain.as_deref()) {

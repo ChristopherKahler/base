@@ -26,6 +26,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base project paths`
 - `base project move`
 - `base project delete`
+- `base project rename`
 - `base milestone` (alias: m)
 - `base milestone add` (alias: a)
 - `base milestone deferred`
@@ -45,6 +46,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base decision` (alias: d)
 - `base decision log`
 - `base decision search`
+- `base decision show`
 - `base decision delete`
 - `base decision update` (alias: u)
 - `base entity` (alias: e)
@@ -394,6 +396,7 @@ Commands:
   paths     Find each project's real folder: --suggest proposes one, with the evidence, for every project whose folder is missing, not a folder, too broad or contradicted by its own docs; --apply writes a reviewed list
   move      Re-home a project to another workspace graph (node + tasks + domain + decisions/rules/notes). AST regenerates at the destination. PREVIEW unless --yes
   delete    Delete a project. Refuses a non-empty project unless --force (which cascade- deletes tasks/milestones/decisions/rules). PREVIEW unless --yes
+  rename    Rename a project and its same-named domain in every tier (records, rules, decisions, tasks, domains.toml). The old name stays an alias: commands that name it still reach the project. PREVIEW unless --yes
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -637,6 +640,28 @@ Options:
 
       --yes
           Apply the delete (without it, prints the plan and writes nothing)
+
+  -h, --help
+          Print help
+```
+
+## base project rename
+
+```text
+Rename a project and its same-named domain in every tier (records, rules, decisions, tasks, domains.toml). The old name stays an alias: commands that name it still reach the project. PREVIEW unless --yes
+
+Usage: base project rename [OPTIONS] <OLD> <NEW>
+
+Arguments:
+  <OLD>
+          The project's slug or display name now
+
+  <NEW>
+          The new name: lowercase letters, digits and dashes
+
+Options:
+      --yes
+          Apply the rename (without it, prints the plan and writes nothing)
 
   -h, --help
           Print help
@@ -988,6 +1013,7 @@ Usage: base decision [OPTIONS] <COMMAND>
 Commands:
   log     Log a new decision
   search  Search decisions by keyword
+  show    Show one decision by its {domain}.{decision} slug
   delete  Delete decisions matching a keyword
   update  Update a decision in place, addressed by its stable {domain}.{decision} slug [aliases: u]
   help    Print this message or the help of the given subcommand(s)
@@ -1040,6 +1066,25 @@ Options:
 
       --json
           Emit JSON (stable dashboard contract) instead of a table
+
+  -h, --help
+          Print help
+```
+
+## base decision show
+
+```text
+Show one decision by its {domain}.{decision} slug
+
+Usage: base decision show [OPTIONS] <SLUG>
+
+Arguments:
+  <SLUG>
+          Decision slug ({domain}.{decision})
+
+Options:
+      --json
+          Emit JSON instead of the human field list
 
   -h, --help
           Print help

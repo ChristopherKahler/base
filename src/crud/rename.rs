@@ -62,8 +62,25 @@ pub struct RenamePlan {
     pub tomls: Vec<TomlPlan>,
     /// Each file the rename writes, and the backup it takes first.
     pub backups: Vec<(PathBuf, PathBuf)>,
-    locked: Vec<LockedGraph>,
-    _rename_lock: crate::store::GraphLockGuard,
+    held: Vec<Held>,
+    /// `Some` only for a plan made to be written: a preview takes no lock.
+    rename_lock: Option<crate::store::GraphLockGuard>,
+}
+
+/// A tier's graph as the plan read it: inside its graph lock for a rename that will write, or plainly read for a
+/// preview, which writes nothing and must not make other writers wait.
+enum Held {
+    Locked(LockedGraph),
+    Read(oxigraph::store::Store),
+}
+
+impl Held {
+    fn store(&self) -> &oxigraph::store::Store {
+        match self {
+            Held::Locked(g) => g.store(),
+            Held::Read(s) => s,
+        }
+    }
 }
 
 impl RenamePlan {
@@ -100,10 +117,12 @@ fn tiers(cwd: &Path) -> Vec<(&'static str, PathBuf, PathBuf)> {
     out
 }
 
-/// Where the rename's own lock lives: beside the global tier's graph, which every rename writes or reads.
+/// Where the rename's own lock lives: beside the global tier's graph when that tier exists, else beside the
+/// workspace's. Never a folder the rename would have to create.
 fn rename_lock_file(cwd: &Path) -> Option<PathBuf> {
     crate::config::global_base_dir()
-        .or_else(|| crate::config::find_workspace_base(cwd))
+        .filter(|g| g.is_dir())
+        .or_else(|| crate::config::find_workspace_base(cwd).filter(|w| w.is_dir()))
         .map(|b| b.join("project-rename.lock"))
 }
 
@@ -233,6 +252,17 @@ fn plan_graph(store: &oxigraph::store::Store, ns: &NamespaceConfig, names: &Name
         let g = if graph.is_empty() { GraphName::DefaultGraph } else { named(&graph)?.into() };
         delta.added.push(Quad::new(named(&to)?, named(&pred_alias)?, Literal::new_simple_literal(names.old), g));
     }
+    // A moved quad the store already holds (a note linked to both spellings, a handoff whose project was written
+    // twice) is no addition: kept out, so putting the rename back never deletes a quad that was there before it.
+    let removed: HashSet<&Quad> = delta.removed.iter().collect();
+    let mut seen: HashSet<Quad> = HashSet::new();
+    let mut added = Vec::with_capacity(delta.added.len());
+    for q in std::mem::take(&mut delta.added) {
+        if (removed.contains(&q) || !store.contains(&q)?) && seen.insert(q.clone()) {
+            added.push(q);
+        }
+    }
+    delta.added = added;
 
     Ok(GraphPlan {
         tier: "",
@@ -288,9 +318,9 @@ fn backup_path(file: &Path, old: &str) -> PathBuf {
 
 /// Work out the rename, refusing it (R7) before anything is written: an unknown old name, a new name that is not a
 /// slug or is already a project, a domain or an old name of another one, an ID it would merge into an existing
-/// record, or another rename running. The plan holds the rename lock and every graph lock until it is dropped or
-/// applied, so what it previews is what `apply` writes.
-pub fn plan(cwd: &Path, ns: &NamespaceConfig, old_input: &str, new: &str) -> Result<RenamePlan> {
+/// record, or (with `write`) another rename running. A plan made to be written holds the rename lock and every graph
+/// lock until it is dropped or applied, so what it shows is what `apply` writes; a preview reads without locking.
+pub fn plan(cwd: &Path, ns: &NamespaceConfig, old_input: &str, new: &str, write: bool) -> Result<RenamePlan> {
     let refuse = |msg: String| -> anyhow::Error { Refused(msg).into() };
     if new.is_empty() || crud::slugify(new) != new {
         let hint = crud::slugify(new);
@@ -303,17 +333,27 @@ pub fn plan(cwd: &Path, ns: &NamespaceConfig, old_input: &str, new: &str) -> Res
     let Some(lock_file) = rename_lock_file(cwd) else {
         anyhow::bail!("no base tier here: run it from a workspace, or set up the global tier with `base scaffold`");
     };
-    let Some(rename_lock) = crate::store::try_lock(&lock_file)? else {
-        let who = crate::store::lock_holder(&lock_file).map(|p| format!(" (pid {p})")).unwrap_or_default();
-        return Err(refuse(format!(
-            "another `base project rename` is running{who}; nothing was written. Run this again when it is done."
-        )));
+    let rename_lock = if write {
+        let Some(guard) = crate::store::try_lock(&lock_file)? else {
+            let who = crate::store::lock_holder(&lock_file).map(|p| format!(" (pid {p})")).unwrap_or_default();
+            return Err(refuse(format!(
+                "another `base project rename` is running{who}; nothing was written. Run this again when it is done."
+            )));
+        };
+        Some(guard)
+    } else {
+        None
     };
 
-    let mut locked: Vec<(&'static str, LockedGraph, PathBuf)> = Vec::new();
-    for (tier, graph, toml) in tiers(cwd) {
+    let mut locked: Vec<(&'static str, Held, PathBuf)> = Vec::new();
+    for (tier, graph, _) in tiers(cwd) {
         if graph.exists() {
-            locked.push((tier, crate::store::lock_and_load_graph(&graph)?, toml));
+            let held = if write {
+                Held::Locked(crate::store::lock_and_load_graph(&graph)?)
+            } else {
+                Held::Read(crate::store::load_graph(&graph)?)
+            };
+            locked.push((tier, held, graph));
         }
     }
 
@@ -366,8 +406,9 @@ pub fn plan(cwd: &Path, ns: &NamespaceConfig, old_input: &str, new: &str) -> Res
             return Err(refuse(format!("'{new}' is already a {kind}")));
         }
     }
+    // By the slug a domain's records are keyed by: a domain written `Vintryx` and never synced is `domain/vintryx`.
     let domains = crate::domain::load_domains(cwd);
-    if domains.iter().any(|d| d.name == new) {
+    if domains.iter().any(|d| crud::slugify(&d.name) == new) {
         return Err(refuse(format!("'{new}' is already a domain")));
     }
     if let Some(d) = crate::domain::renamed_from(&domains, new)
@@ -385,7 +426,7 @@ pub fn plan(cwd: &Path, ns: &NamespaceConfig, old_input: &str, new: &str) -> Res
 
     let names = Names { uri: &ns.uri, old: &old, new };
     let mut graphs = Vec::new();
-    for (tier, g, _) in &locked {
+    for (tier, g, file) in &locked {
         let mut gp = plan_graph(g.store(), ns, &names)?;
         let hit = collisions(g.store(), &gp)?;
         if !hit.is_empty() {
@@ -397,7 +438,7 @@ pub fn plan(cwd: &Path, ns: &NamespaceConfig, old_input: &str, new: &str) -> Res
             )));
         }
         gp.tier = tier;
-        gp.file = g.path().to_path_buf();
+        gp.file = file.clone();
         graphs.push(gp);
     }
 
@@ -431,8 +472,8 @@ pub fn plan(cwd: &Path, ns: &NamespaceConfig, old_input: &str, new: &str) -> Res
         graphs,
         tomls,
         backups,
-        locked: locked.into_iter().map(|(_, g, _)| g).collect(),
-        _rename_lock: rename_lock,
+        held: locked.into_iter().map(|(_, g, _)| g).collect(),
+        rename_lock,
     })
 }
 
@@ -446,6 +487,17 @@ enum Written {
 /// domains.toml once. On a failure the files already written are put back; the error says which, or, when putting
 /// one back fails too, names the backup to restore it from.
 pub fn apply(plan: &RenamePlan) -> Result<()> {
+    let locked: Vec<&LockedGraph> = plan
+        .held
+        .iter()
+        .filter_map(|h| match h {
+            Held::Locked(g) => Some(g),
+            Held::Read(_) => None,
+        })
+        .collect();
+    if plan.rename_lock.is_none() || locked.len() != plan.held.len() {
+        anyhow::bail!("this plan was made as a preview: it holds no locks, so it is never written");
+    }
     for (file, backup) in &plan.backups {
         std::fs::copy(file, backup).with_context(|| format!("backing up {} to {}", file.display(), backup.display()))?;
     }
@@ -456,7 +508,7 @@ pub fn apply(plan: &RenamePlan) -> Result<()> {
         if g.delta.is_empty() {
             continue;
         }
-        let locked = &plan.locked[i];
+        let locked = locked[i];
         let store = locked.store();
         let step = (|| -> Result<()> {
             for q in &g.delta.removed {
@@ -495,7 +547,7 @@ pub fn apply(plan: &RenamePlan) -> Result<()> {
         let (file, result) = match w {
             Written::Graph(i) => {
                 let g = &plan.graphs[*i];
-                let locked = &plan.locked[*i];
+                let locked = locked[*i];
                 let store = locked.store();
                 let back = GraphDelta { added: g.delta.removed.clone(), removed: g.delta.added.clone() };
                 let r = (|| -> Result<()> {
@@ -625,5 +677,54 @@ mod tests {
             assert_eq!(to(kept), None, "{kept} keeps its ID");
         }
         assert_eq!(names.rekey("urn:other#project/vintrix"), None, "another namespace is never touched");
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+
+    /// R6, review finding 7: a quad the rename would add that the store already holds is not an addition, so putting
+    /// the rename back (removing what was added, restoring what was removed) leaves the store exactly as it was.
+    #[test]
+    fn putting_a_rename_back_restores_every_quad_that_was_there() {
+        let ns = NamespaceConfig::default();
+        let u = &ns.uri;
+        let g = format!("{u}graph/ws/t");
+        let t = RDF_TYPE;
+        let nq = format!(
+            "<{u}domain/old> <{t}> <{u}Domain> <{g}> .\n\
+             <{u}note/n1> <{u}hasDomain> <{u}domain/old> <{g}> .\n\
+             <{u}note/n1> <{u}hasDomain> <{u}domain/new> <{g}> .\n\
+             <{u}handoff/h> <{t}> <{u}Handoff> <{g}> .\n\
+             <{u}handoff/h> <{u}project> \"old\" <{g}> .\n\
+             <{u}handoff/h> <{u}project> \"Old\" <{g}> .\n"
+        );
+        let store = oxigraph::store::Store::new().unwrap();
+        store.load_from_reader(oxigraph::io::RdfFormat::NQuads, nq.as_bytes()).unwrap();
+        let before: HashSet<Quad> = store.iter().map(|q| q.unwrap()).collect();
+
+        let names = Names { uri: u, old: "old", new: "new" };
+        let plan = plan_graph(&store, &ns, &names).unwrap();
+        let note_new = format!("<{u}note/n1> <{u}hasDomain> <{u}domain/new>");
+        assert!(!plan.delta.added.iter().any(|q| q.to_string().starts_with(&note_new)), "a quad already held was added");
+        let projects = plan.delta.added.iter().filter(|q| q.predicate.as_str() == format!("{u}project")).count();
+        assert_eq!(projects, 1, "two spellings of the old name become one field, added once");
+
+        for q in &plan.delta.removed {
+            store.remove(q).unwrap();
+        }
+        for q in &plan.delta.added {
+            store.insert(q).unwrap();
+        }
+        assert!(store.contains(&Quad::new(named(&format!("{u}note/n1")).unwrap(), named(&format!("{u}hasDomain")).unwrap(), named(&format!("{u}domain/new")).unwrap(), named(&g).unwrap())).unwrap());
+        for q in &plan.delta.added {
+            store.remove(q).unwrap();
+        }
+        for q in &plan.delta.removed {
+            store.insert(q).unwrap();
+        }
+        let after: HashSet<Quad> = store.iter().map(|q| q.unwrap()).collect();
+        assert_eq!(after, before, "the store after a rename and its rollback");
     }
 }

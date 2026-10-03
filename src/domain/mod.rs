@@ -723,17 +723,26 @@ pub struct TomlRename {
 /// is returned to write. `Ok(None)` when the file holds no domain called `old`.
 pub fn rename_in_text(text: &str, old: &str, new: &str) -> anyhow::Result<Option<TomlRename>> {
     let before: DomainsFile = toml::from_str(text)?;
-    let Some(target) = before.domain.iter().position(|d| d.name == old) else {
-        return Ok(None);
+    // By slug, the key its records carry: `project add -n Vintrix` writes `name = "Vintrix"` for `domain/vintrix`.
+    let slug = |d: &DomainDef| crate::crud::slugify(&d.name);
+    let hits: Vec<usize> = (0..before.domain.len()).filter(|i| slug(&before.domain[*i]) == old).collect();
+    let target = match hits.as_slice() {
+        [] => return Ok(None),
+        [one] => *one,
+        many => anyhow::bail!(
+            "{} domains here are '{old}' once slugified ({}); rename them by hand",
+            many.len(),
+            many.iter().map(|i| before.domain[*i].name.as_str()).collect::<Vec<_>>().join(", ")
+        ),
     };
-    if before.domain.iter().any(|d| d.name == new) {
+    if before.domain.iter().any(|d| slug(d) == new) {
         anyhow::bail!("a domain is already called '{new}'");
     }
     let mut aliases = before.domain[target].aliases.clone();
-    if !aliases.iter().any(|a| a == old) {
+    if !aliases.iter().any(|a| crate::crud::slugify(a) == old) {
         aliases.push(old.to_string());
     }
-    aliases.retain(|a| a != new);
+    aliases.retain(|a| crate::crud::slugify(a) != new);
 
     // The `name` and `aliases` lines of the target's own table: after its `[[domain]]` header, before the next
     // header of any kind (a `[[domain.rules.match]]` sub-table holds keys that are not the domain's).
@@ -744,7 +753,8 @@ pub fn rename_in_text(text: &str, old: &str, new: &str) -> anyhow::Result<Option
         let t = line.trim();
         if t.starts_with('[') {
             in_target = false;
-            if t.split('#').next().map(str::trim) == Some("[[domain]]") {
+            let header: String = t.split('#').next().unwrap_or("").chars().filter(|c| !c.is_whitespace()).collect();
+            if header == "[[domain]]" {
                 in_target = seen == target;
                 seen += 1;
             }

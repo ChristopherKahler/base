@@ -16,6 +16,7 @@ base commands list                       # all star commands
 base commands show <name>                # full rules text for one
 base recall --keyword "<term>"           # search notes  (--domain, --slug)
 base decision search --keyword "<term>"  # search past decisions (--json for machine output)
+base decision show <slug>                # one decision by its {domain}.{decision} slug (--json)
 base memory list                         # graph-backed memory entries
 base handoff list                        # open handoffs (shows tier per entry)
 base handoff deferred                    # deferred handoffs, keyed D1, D2... for base handoff show
@@ -244,6 +245,7 @@ base project delete <slug> [--force] [--yes]     # --force cascades tasks/milest
 base milestone delete <slug> [--force]           # without --force, detaches tasks instead of deleting
 base task delete <slug> [--yes]
 base project move <slug> ... [--yes]     # preview unless --yes
+base project rename <old> <new> [--yes]  # project + domain in both tiers; old name stays an alias; preview unless --yes
 base graph compact
 base graph migrate                       # one-time domain backfill; snapshots, then atomic rewrite
 base graph purge --stale [--days N] [--apply]    # dry-run unless --apply
