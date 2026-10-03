@@ -1623,3 +1623,45 @@ fn replay_corrections_from_a_transcript() {
         corpus.checks
     );
 }
+
+/// BO-16 (K6, K5): on the corpus store, the corpus prompts go through the real prompt hook into the match log; a new
+/// rule proposed for the `ledger` domain replays as served on exactly the two ledger prompts, under the TOO BROAD limit;
+/// session start counts it; approved, the prompt hook serves it on a ledger prompt; and the queue is empty after.
+#[test]
+fn replay_rule_review_on_the_corpus_store() {
+    let s = seed::write(&root("bo16-review"), &seed::TINY, &fixture("base.toml"));
+    std::fs::write(s.ws.join(".base").join("domains.toml"), fixture("domains.toml")).expect("domains.toml");
+    let corpus = prompts();
+    for p in &corpus {
+        let (code, _, err) = run_prompt_submit(&s, p, Some("b016b016-0000-4000-8000-00000000c0a1"));
+        assert_eq!(code, 0, "{err}");
+    }
+    let ledger: Vec<&String> = corpus.iter().filter(|p| p.split(|c: char| !c.is_alphanumeric()).any(|w| w == "ledger")).collect();
+    assert_eq!(ledger.len(), 2, "control: two corpus prompts name the ledger: {ledger:?}");
+
+    let text = "Reconcile against the bank feed, never against an export.";
+    let (code, out, err) = run_base(&s, &[
+        "rule", "propose", "--new", "--domain", "ledger", "--text", text, "--keywords", "ledger",
+        "--example", "reconcile the ledger for the third quarter before the close",
+    ]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.starts_with("proposal p-0001 · new rule · domain ledger"), "{out}");
+
+    let (code, out, err) = run_base(&s, &["rule", "replay", "p-0001"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(&format!("replayed {} prompts", corpus.len())), "every corpus prompt replayed:\n{out}");
+    assert!(out.contains("  newly served on 2 prompts, e.g.:") && out.contains("  stops serving on 0"), "{out}");
+    assert!(!out.contains("TOO BROAD"), "{out}");
+
+    let (_, start, _) = run_session_start(&s, Some("b016b016-0000-4000-8000-00000000c0a2"));
+    assert!(start.contains("rule proposals: 1 pending · base rule review"), "{start}");
+
+    let (code, out, err) = run_base(&s, &["rule", "review", "--approve", "p-0001"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.starts_with("approved p-0001: new rule ledger."), "{out}");
+    let (code, served, err) = run_prompt_submit(&s, "the ledger is off by forty dollars again", Some("b016b016-0000-4000-8000-00000000c0a3"));
+    assert_eq!(code, 0, "{err}");
+    assert!(served.contains(text), "the approved rule is served on a ledger prompt:\n{served}");
+    let (_, listed, _) = run_base(&s, &["rule", "review"]);
+    assert_eq!(listed, "no rule proposals pending\n");
+}

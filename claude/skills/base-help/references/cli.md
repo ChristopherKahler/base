@@ -121,6 +121,8 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base rule`
 - `base rule add`
 - `base rule propose`
+- `base rule replay`
+- `base rule review`
 - `base rule update`
 - `base rule test`
 - `base rule list`
@@ -2558,6 +2560,8 @@ Usage: base rule [OPTIONS] <COMMAND>
 Commands:
   add      Add a rule to a domain in the graph
   propose  Turn a correction into a pending rule proposal: read the turn (the prompt, the AI's marker, the signals) and sort it as a keyword gap, a rewrite or a new rule
+  replay   Run a rule change over your recent prompts in the match log before it is approved: the prompts that would start or stop serving it, and its share of all of them (TOO BROAD above [tune] broad_share)
+  review   Review the pending rule proposals, each with the prompts behind it and its replay: one key each on a terminal (a approve, e edit, r reject, s skip, q stop), or one of the flags
   update   Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
   test     Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
   list     List rules for a domain from the graph
@@ -2675,6 +2679,80 @@ Options:
 
       --prompt <PROMPT>
           The n-th prompt typed by a person in the transcript, instead of the last
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule replay
+
+```text
+Run a rule change over your recent prompts in the match log before it is approved: the prompts that would start or stop serving it, and its share of all of them (TOO BROAD above [tune] broad_share)
+
+Usage: base rule replay [OPTIONS] [PROPOSAL]
+
+Arguments:
+  [PROPOSAL]
+          A proposal's id, p-0007
+
+Options:
+      --domain <DOMAIN>
+          Change this domain's prompt keywords
+
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+      --rule <RULE>
+          Change this rule's own topic words: <domain>.<id>, as `base rule list` prints it
+
+      --decision <DECISION>
+          Change this decision's own keywords: its slug
+
+      --add-keyword <ADD_KEYWORD>
+          A keyword to add (repeatable, or a comma list)
+
+      --drop-keyword <DROP_KEYWORD>
+          A keyword to drop (repeatable, or a comma list)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule review
+
+```text
+Review the pending rule proposals, each with the prompts behind it and its replay: one key each on a terminal (a approve, e edit, r reject, s skip, q stop), or one of the flags
+
+Usage: base rule review [OPTIONS]
+
+Options:
+      --approve <APPROVE>
+          Apply this proposal and mark it approved
+
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+      --reject <REJECT>
+          Mark this proposal rejected: the same change is never proposed again
+
+      --reason <REASON>
+          With --reject: why
+
+      --edit <EDIT>
+          Apply this proposal with your changes (--text, --keywords) and mark it edited
+
+      --text <TEXT>
+          With --edit: the new wording
+
+      --keywords <KEYWORDS>
+          With --edit: the keywords, comma-separated, replacing the proposed ones
+
+      --broad-ok
+          With --approve or --edit: apply a change its replay flags TOO BROAD (show the user the replay first)
 
   -h, --help
           Print help (see a summary with '-h')

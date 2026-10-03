@@ -116,6 +116,8 @@ base rule add --domain X --text "..." --fires-on "<prompt>" --quiet-on "<prompt>
 base rule update <domain>.<id> --fires-on "<prompt>" --quiet-on "<prompt>" [--clear-tests]   # add test prompts where the rule lives; the id is in `base rule list`
 base rule add --domain X --text "..." --keywords "a, b" --fires-on "<prompt>"   # inside a Claude Code session both are required; the keywords become the rule's own words
 base rule propose --from-turn [--text "..."] [--keywords "a, b"] [--example "<prompt>"] [--rule <domain>.<id>] [--decision <slug>] [--new] [--domain X] [--dry-run]   # this turn's correction as a pending proposal: keyword gap, rewrite or new rule
+base rule replay <p-NNNN> | --domain X | --rule <domain>.<id> | --decision <slug> [--add-keyword "..."] [--drop-keyword "..."]   # run a change over your recent prompts: which start or stop serving it, its share, TOO BROAD over [tune] broad_share
+base rule review [--approve <id> [--broad-ok]] [--reject <id> [--reason "..."]] [--edit <id> --text "..." --keywords "a, b"]   # the pending proposals with their replays; one key each on a terminal (a, e, r, s, q), or one flag
 base rule remove --domain X --index <N>   # by INDEX, not by text; get N from `base rule list --domain X`
 ```
 

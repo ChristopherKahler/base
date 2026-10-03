@@ -481,7 +481,7 @@ mod tests {
         let place = Matcher::for_place("C:/x");
         let got = edit_topic_words(&[place.clone(), Matcher::for_topic(w(&["a"]))], &[], &w(&["a"]));
         assert_eq!(got, vec![place.clone()], "the topic matcher emptied by the drop goes");
-        let got = edit_topic_words(&[place.clone()], &w(&["b"]), &[]);
+        let got = edit_topic_words(std::slice::from_ref(&place), &w(&["b"]), &[]);
         assert_eq!(got, vec![place, Matcher::for_topic(w(&["b"]))], "a rule with no topic matcher gets one");
     }
 
