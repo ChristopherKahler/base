@@ -2499,7 +2499,7 @@ pub fn run() {
                     let inputs = crud::handoff::LaneInputs {
                         flag: lane,
                         relay_title,
-                        titles: base::relay::session_registry::list().into_iter().map(|e| e.title).collect(),
+                        titles: base::relay::known_titles(standing_cwd),
                     };
                     match crud::handoff::create_in_lane(
                         gbl.as_deref(),

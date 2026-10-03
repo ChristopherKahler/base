@@ -283,6 +283,11 @@ fn read_history(path: &Path) -> Vec<Holder> {
 }
 
 /// Every recorded holder of `title`, oldest first.
+/// Every title the history has a line for, whoever holds it now.
+pub fn history_titles() -> Vec<String> {
+    history_path().map(|p| read_history(&p)).unwrap_or_default().into_iter().map(|h| h.title).collect()
+}
+
 pub fn holders(title: &str) -> Vec<Holder> {
     let mut out: Vec<Holder> =
         history_path().map(|p| read_history(&p)).unwrap_or_default().into_iter().filter(|h| h.title == title).collect();

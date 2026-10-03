@@ -644,6 +644,24 @@ pub fn resolve_store(cwd: &Path, project: Option<&str>) -> Result<RelayStore> {
     }
 }
 
+/// Every relay title this machine knows: the global session registry, its title history, and the registry of each
+/// relay store found from `cwd`. A codename in a handoff slug is matched against these (BO-11). The global registry
+/// alone is not enough: on Chris's machine it held 42 titles while the workspace's store held 291, and most old
+/// handoffs were written by sessions only the store still names.
+pub fn known_titles(cwd: &Path) -> Vec<String> {
+    let mut titles: Vec<String> = session_registry::list().into_iter().map(|e| e.title).collect();
+    titles.extend(session_registry::history_titles());
+    if let Some(root) = relay_root(cwd) {
+        for project in list_projects(&root) {
+            let store = RelayStore { root: root.join(&project), project };
+            titles.extend(store.load_registry().sessions.into_values().map(|e| e.title));
+        }
+    }
+    titles.sort();
+    titles.dedup();
+    titles
+}
+
 pub fn list_projects(relay_root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(relay_root) else {
         return Vec::new();

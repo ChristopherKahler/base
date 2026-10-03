@@ -224,12 +224,16 @@ fn a_handoff_from_before_lanes_reads_its_lane_from_by_or_the_slug() {
     // from its doc's `by:`, else from the codename in its slug, matched against the relay's titles; one with
     // neither has no lane, and a create in a named lane never archives it.
     let r = rig();
-    let registry = serde_json::json!({ "sessions": {
-        "auk": { "title": "auk", "session_id": "s-auk", "registered_at": "2026-09-01T00:00:00Z", "last_heartbeat": "2026-09-01T00:00:00Z" },
-        "otter-bo11": { "title": "otter-bo11", "session_id": "s-ob", "registered_at": "2026-09-01T00:00:00Z", "last_heartbeat": "2026-09-01T00:00:00Z" },
-        "otter": { "title": "otter", "session_id": "s-o", "registered_at": "2026-09-01T00:00:00Z", "last_heartbeat": "2026-09-01T00:00:00Z" },
-    }});
+    let entry = |title: &str| {
+        serde_json::json!({ "title": title, "session_id": format!("s-{title}"), "registered_at": "2026-09-01T00:00:00Z", "last_heartbeat": "2026-09-01T00:00:00Z" })
+    };
+    let registry = serde_json::json!({ "sessions": { "otter-bo11": entry("otter-bo11"), "otter": entry("otter") } });
     std::fs::write(r.home.join(".base-gbl").join(".base").join("sessions.json"), registry.to_string()).unwrap();
+    // auk is named only by the workspace's relay store, as on Chris's machine, where the global registry had dropped
+    // most old titles (42 there, 291 in the store).
+    let store = r.ws.join(".base").join("relay").join("team");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("registry.json"), serde_json::json!({ "sessions": { "auk": entry("auk") } }).to_string()).unwrap();
 
     // Four legacy handoffs: auk's by slug, finch's by `by:` alone, otter's by slug, and one with neither.
     let legacy = [
