@@ -119,6 +119,8 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base changes`
 - `base rule`
 - `base rule add`
+- `base rule update`
+- `base rule test`
 - `base rule list`
 - `base rule remove`
 - `base install`
@@ -2531,6 +2533,8 @@ Usage: base rule [OPTIONS] <COMMAND>
 
 Commands:
   add     Add a rule to a domain in the graph
+  update  Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
+  test    Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
   list    List rules for a domain from the graph
   remove  Remove a rule by index from a domain
   help    Print this message or the help of the given subcommand(s)
@@ -2587,6 +2591,65 @@ Options:
 
       --words <WORDS>
           Topic words and phrases, comma-separated: "ping chris, relay ping". Makes it a topic rule
+
+      --fires-on <FIRES_ON>
+          A prompt that must serve this rule (repeatable, at most 3); `base rule test` checks it
+
+      --quiet-on <QUIET_ON>
+          A prompt that must not serve this rule (repeatable, at most 2); `base rule test` checks it
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule update
+
+```text
+Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
+
+Usage: base rule update [OPTIONS] <RULE>
+
+Arguments:
+  <RULE>
+          The rule, as `base rule list` prints it: <domain>.<id> (the id, or its first 4 or more characters)
+
+Options:
+      --fires-on <FIRES_ON>
+          A prompt that must serve this rule (repeatable; a rule holds at most 3)
+
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+      --quiet-on <QUIET_ON>
+          A prompt that must not serve this rule (repeatable; a rule holds at most 2)
+
+      --clear-tests
+          Empty both test lists first, then add what is given
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule test
+
+```text
+Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
+
+Usage: base rule test [OPTIONS]
+
+Options:
+      --domain <DOMAIN>
+          Only this domain's rules
+
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+      --rule <RULE>
+          Only this rule: <domain>.<id> or <id>
 
   -h, --help
           Print help (see a summary with '-h')

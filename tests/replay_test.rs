@@ -1340,3 +1340,56 @@ fn replay_doctor_fix_holds_on_the_corpus_store() {
     assert_eq!(subjects(), records, "a corpus record left the workspace graph");
     println!("replay doctor --fix: {} corpus records kept in place, corrections and the legacy key repaired, 6 backups cut to 3", records.len());
 }
+
+/// BO-14 (K2, D3, F8): the corpus's rule tests pass under `base rule test`, and they agree with the real prompt hook.
+/// For every rule in the corpus that carries tests, the hook printed the rule for each of its `fires_on` prompts and
+/// did not for any of its `quiet_on` prompts, each run as the first prompt of its own session (`prompt_runs`). A rule
+/// test that passed while the hook said otherwise would make every later tuning pass (BO-15 to BO-20) argue from a
+/// wrong signal.
+#[test]
+fn replay_rule_tests_agree_with_the_prompt_hook() {
+    #[derive(serde::Deserialize)]
+    struct File {
+        domain: Vec<base::domain::DomainDef>,
+    }
+    let file: File = toml::from_str(&fixture("domains.toml")).expect("the corpus domains.toml");
+    let runs = prompt_runs();
+    let mut tested = 0usize;
+    let mut checked = 0usize;
+    for d in &file.domain {
+        for r in &d.rules {
+            let (fires_on, quiet_on) = r.tests();
+            if fires_on.is_empty() && quiet_on.is_empty() {
+                continue;
+            }
+            tested += 1;
+            for (prompt, expect) in fires_on.iter().map(|p| (p, true)).chain(quiet_on.iter().map(|p| (p, false))) {
+                let run = runs
+                    .iter()
+                    .find(|run| run.prompt == *prompt)
+                    .unwrap_or_else(|| panic!("a corpus test prompt must be a corpus prompt: {prompt:?}"));
+                assert_eq!(
+                    run.stdout.contains(r.text()),
+                    expect,
+                    "{}: the prompt hook {} the rule {:?} on {prompt:?}, and its test says it {}:\n{}",
+                    d.name,
+                    if expect { "did not print" } else { "printed" },
+                    r.text(),
+                    if expect { "must" } else { "must not" },
+                    run.stdout
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(tested >= 5 && checked >= 12, "control: the corpus carries tests: {tested} rules, {checked} prompts");
+
+    // The same tests through `base rule test`, on a seed of its own so the shared run's store is never touched.
+    let s = seed::write(&root("rule-tests"), &seed::TINY, &fixture("base.toml"));
+    std::fs::write(s.ws.join(".base").join("domains.toml"), fixture("domains.toml")).expect("domains.toml");
+    let (code, out, err) = run_base(&s, &["rule", "test"]);
+    assert_eq!(code, 0, "base rule test on the corpus:\n{out}{err}");
+    let want = format!("{tested} rules tested, 0 misses, 0 false fires\n");
+    assert!(out.contains(&want), "want {want:?}:\n{out}");
+    println!("replay rule tests: {tested} corpus rules, {checked} prompts, base rule test and the prompt hook agree on every one");
+}

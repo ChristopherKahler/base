@@ -55,6 +55,7 @@ Domains, rules, standards (read side):
 
 ```bash
 base rule list --domain X                # rules for a domain (global tier: base rule -g list ...)
+base rule test [--domain X] [--rule <domain>.<id>]   # replay each rule's test prompts through the prompt hook's matching; exit 1 on a miss or a false fire
 base domain list                         # all domains
 base domain get <name>                   # one domain's triggers and config
 base standards list                      # standards with trigger/annotation counts
@@ -110,6 +111,8 @@ base learn --text "..." --domain X --type insight|correction|decision|commitment
 base decision log --domain X --decision "..." --rationale "..." [--recall]
 base decision update <slug> [--name "..."] [--rationale "..."] [--recall "..."] [-s <status>] [--keywords "a, b"]   # --keywords replaces the list; "" clears it
 base rule add --domain X --text "..."    # global tier: -g goes on `rule`, BEFORE the verb (base rule -g add ...)
+base rule add --domain X --text "..." --fires-on "<prompt>" --quiet-on "<prompt>"   # with test prompts (at most 3 and 2)
+base rule update <domain>.<id> --fires-on "<prompt>" --quiet-on "<prompt>" [--clear-tests]   # add test prompts where the rule lives; the id is in `base rule list`
 base rule remove --domain X --index <N>   # by INDEX, not by text; get N from `base rule list --domain X`
 ```
 

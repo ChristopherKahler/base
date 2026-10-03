@@ -201,6 +201,9 @@ fn sync_domain_list(
                 .iter()
                 .map(|(pred, v)| format!("                       {p}:{pred} \"{}\" ;\n", crud::escape_sparql_literal(v)))
                 .collect();
+            // Its test prompts (K2a, BO-14) are NOT copied here: the file is their only home. A synced copy can go
+            // stale (this workspace graph holds copies of global-tier rules and is re-synced only when the workspace
+            // file changes), and a stale copy of a test list would bring back prompts the operator cleared.
             let rule_insert = format!(
                 "{pfx}\n\
                  INSERT DATA {{\n\

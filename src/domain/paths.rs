@@ -528,6 +528,16 @@ pub fn apply_cmd(cwd: &Path, file: &Path, dry_run: bool, json: bool) -> Result<(
         println!("{}", serde_json::to_string_pretty(&planned)?);
     } else {
         println!("{} domain(s) set.", planned.len());
+        // K2, "on every config change": a domain whose auto_inject moved now comes in on different prompts. One line
+        // per such domain that has rule tests; none for a config without tests.
+        let moved: Vec<String> =
+            planned.iter().filter(|p| p.auto_inject_before != p.auto_inject_after).map(|p| p.domain.clone()).collect();
+        if !moved.is_empty() {
+            let config = crate::config::BaseConfig::load(cwd);
+            for line in crate::domain::rule_test::after_change_lines(&config, cwd, &moved) {
+                println!("{line}");
+            }
+        }
     }
     Ok(())
 }

@@ -3,6 +3,7 @@ pub mod link;
 pub mod matcher;
 pub mod paths;
 pub mod query;
+pub mod rule_test;
 pub mod rules;
 pub mod session;
 pub mod sync;
@@ -32,6 +33,12 @@ pub enum RuleEntry {
         /// matchers round-trips unchanged.
         #[serde(default, rename = "match", skip_serializing_if = "Vec::is_empty")]
         matchers: Vec<crate::domain::rules::Matcher>,
+        /// Prompts that must serve this rule, and prompts that must not (K2a, `base rule test`). Not written back when
+        /// empty, so a file with no tests round-trips unchanged.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fires_on: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        quiet_on: Vec<String>,
     },
 }
 
@@ -65,6 +72,14 @@ impl RuleEntry {
         match self {
             RuleEntry::Bare(_) => &[],
             RuleEntry::Detailed { matchers, .. } => matchers,
+        }
+    }
+
+    /// The rule's test prompts (K2a): those that must serve it, and those that must not. Empty for a bare string.
+    pub fn tests(&self) -> (&[String], &[String]) {
+        match self {
+            RuleEntry::Bare(_) => (&[], &[]),
+            RuleEntry::Detailed { fires_on, quiet_on, .. } => (fires_on, quiet_on),
         }
     }
 }
@@ -503,6 +518,45 @@ pub fn set_paths(toml_path: &Path, entries: &[(String, Vec<String>, bool)]) -> a
     std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
     std::fs::rename(&tmp, toml_path)?;
     Ok(())
+}
+
+/// Set one rule's test prompts in the domains.toml at `toml_path` (K2a, `base rule update`): the rule of `domain` whose
+/// [`rules::rule_id`] is `id`. One read, one atomic write. A plain-string rule becomes an inline table to hold them; a
+/// table left with nothing but its text goes back to a plain string.
+///
+/// The file is written back the way `add_trigger`, `remove_trigger` and `set_paths` write it, through
+/// `toml::to_string_pretty`: in a file base wrote, only that entry's line changes, and clearing the tests restores it
+/// byte for byte (both pinned by `rule_tests_stored_with_rule`). A file written by hand loses its comments and its own
+/// layout on the first write, as it does under every other domains.toml writer. `Ok(false)` when the file has no such
+/// rule; nothing is written.
+pub fn set_rule_tests(toml_path: &Path, domain: &str, id: &str, tests: &rules::RuleTests) -> anyhow::Result<bool> {
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(toml_path)?)?;
+    let want = crate::crud::slugify(domain);
+    let Some(d) = file.domain.iter_mut().find(|d| crate::crud::slugify(&d.name) == want) else {
+        return Ok(false);
+    };
+    let name = d.name.clone();
+    let Some(r) = d.rules.iter_mut().find(|r| rules::rule_id(&name, r.text()) == id) else {
+        return Ok(false);
+    };
+    let (fires_on, quiet_on) = (tests.fires_on.clone(), tests.quiet_on.clone());
+    let next = match std::mem::replace(r, RuleEntry::Bare(String::new())) {
+        RuleEntry::Bare(text) => RuleEntry::Detailed { text, rationale: None, matchers: Vec::new(), fires_on, quiet_on },
+        RuleEntry::Detailed { text, rationale, matchers, .. } => RuleEntry::Detailed { text, rationale, matchers, fires_on, quiet_on },
+    };
+    // Nothing but its text left: a plain string again.
+    *r = match next {
+        RuleEntry::Detailed { text, rationale: None, matchers, fires_on, quiet_on }
+            if matchers.is_empty() && fires_on.is_empty() && quiet_on.is_empty() =>
+        {
+            RuleEntry::Bare(text)
+        }
+        other => other,
+    };
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, toml_path)?;
+    Ok(true)
 }
 
 /// Swap a path trigger on a domain: drop `old` (if present), add `new`. Used by

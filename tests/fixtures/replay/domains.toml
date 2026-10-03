@@ -2,12 +2,15 @@
 # Synthetic. The always-on domain and the keyword domains reproduce what fills the prompt hook on a
 # real machine: long always-on rules, and rules that match words the corpus prompts use. Loud enough
 # that some prompts overflow the prompt budget, so the budget check is not vacuous.
+#
+# BO-14 (K2): five rules carry test prompts, every one of them a corpus prompt, so
+# `replay_rule_tests_agree_with_the_prompt_hook` can hold `base rule test` to what the prompt hook printed for it.
 
 [[domain]]
 name = "global"
 mode = "always"
 rules = [
-  "Never give time estimates on projects or features unless the operator asks and real grounding exists: measured velocity on comparable work, a scoped task list, or actual history. Describe scope, dependencies and external calendar gates instead.",
+  { text = "Never give time estimates on projects or features unless the operator asks and real grounding exists: measured velocity on comparable work, a scoped task list, or actual history. Describe scope, dependencies and external calendar gates instead.", fires_on = ["show me handoff C"] },
   "Never publish a hosted page unless the operator literally asks for one. Deliverables are regular files on disk, and their paths go in the report.",
   "Relay pings stay under about 800 characters; longer ones write to the inbox file but never render on the operator's card. Split into numbered pings.",
   "Read before reasoning. Never state anything about this machine, its code, config or prior decisions from inference. Name the file read or the command run for every claim. If a fact the answer depends on cannot be checked, ask before proceeding.",
@@ -18,7 +21,7 @@ name = "hooks"
 prompt_keywords = ["hook", "injections", "session start", "first screen", "hook output"]
 rules = [
   "Session start's first screen is the header, the instruction block and DUE NOW, and it must fit 2,000 UTF-16 units. Anything that grows it is paid for there.",
-  "The prompt hook cuts at its byte budget and names the full-output file in its notice. A cut is reported, never silent.",
+  { text = "The prompt hook cuts at its byte budget and names the full-output file in its notice. A cut is reported, never silent.", fires_on = ["we're having issues with the user prompt submit hook being cut off at a high rate; how are the injections doing", "why did the first screen overflow on session start"], quiet_on = ["what reminders do i need"] },
   "Measure hook output on a copy of the real store in a fake home, never on the live store.",
 ]
 
@@ -26,7 +29,7 @@ rules = [
 name = "reminders"
 prompt_keywords = ["reminder", "reminders", "due now", "snooze", "archive"]
 rules = [
-  "A handled reminder is archived, never removed: archive keeps it, remove deletes it.",
+  { text = "A handled reminder is archived, never removed: archive keeps it, remove deletes it.", fires_on = ["what reminders do i need", "archive the reminder about the invoice"], quiet_on = ["draft the morning update for Client A on ProjectV"] },
   "DUE NOW numbers its lines; base reminder archive and snooze take that number from the last session start.",
 ]
 
@@ -34,7 +37,7 @@ rules = [
 name = "client-work"
 prompt_keywords = ["client", "owner", "morning update", "projectv", "projectr", "dealer"]
 rules = [
-  "Client-owner updates lead with what the owner sees, then why. Asks for other people go to them; the owner gets a notice.",
+  { text = "Client-owner updates lead with what the owner sees, then why. Asks for other people go to them; the owner gets a notice.", fires_on = ["draft the morning update for Client A on ProjectV", "how do I tell the client owner the export is late"], quiet_on = ["what reminders do i need"] },
   "The client's technical decisions belong to the builder. The client is asked only for business information and access.",
   "Every document for a client owner is written for any reader and never addressed to them.",
   "Client data never leaves this machine. Scrub names before anything goes into a public repository.",
@@ -44,7 +47,7 @@ rules = [
 name = "build-process"
 prompt_keywords = ["PR", "CI", "test suite", "build order", "orchestrator", "decision", "counts"]
 rules = [
-  "One bounded item per session. A session builds exactly its build order and does not start the next one.",
+  { text = "One bounded item per session. A session builds exactly its build order and does not start the next one.", fires_on = ["review the PR for the session start hook and check CI on both platforms"], quiet_on = ["snooze B 3d"] },
   "The gate is the PR's CI run on both platforms, every number with its denominator, every excluded or ignored test named.",
   "No install, tag, release or merge without the operator's word. Pushing the branch and opening a PR is part of finishing.",
   "Guards are not edited to make a PR pass. A change to a guard file needs its reason in the PR body.",
