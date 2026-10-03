@@ -228,7 +228,7 @@ pub fn add_hook_entries(text: &str, entries: &[(&str, Value)]) -> Option<String>
         }
     }
     // Applied from the end, so earlier offsets stay true.
-    inserts.sort_by(|a, b| b.at.cmp(&a.at));
+    inserts.sort_by_key(|i| std::cmp::Reverse(i.at));
     let mut out = text.to_string();
     for ins in inserts {
         out.insert_str(ins.at, &ins.text);

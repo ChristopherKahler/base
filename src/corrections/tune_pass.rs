@@ -741,7 +741,7 @@ pub fn run(config: &BaseConfig, cwd: &Path, args: &Args, judge: &mut dyn Judge, 
                     }
                 }
             }
-            counts.sort_by(|a, b| b.1.cmp(&a.1));
+            counts.sort_by_key(|c| std::cmp::Reverse(c.1));
             let own: Vec<&str> = list.iter().map(|(p, _)| p.as_str()).collect();
             let kw = keep_carried(counts.into_iter().take(5).map(|(k, _)| k).collect(), &recent, &own);
             let mut evidence = vec![format!("{} {} matched no domain; the judge put {} in {domain}", list.len(), plural(list.len(), "prompt", "prompts"), if list.len() == 1 { "it" } else { "them" })];
