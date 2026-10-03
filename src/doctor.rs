@@ -150,6 +150,10 @@ pub struct DoctorReport {
     /// line each with the command that rewrites the step (F23b, F23c). **Advisory, never counted against
     /// `healthy`:** an old plan is worth a look, not a broken store.
     pub next_steps: Vec<String>,
+    /// The rules and decisions that need attention, from the match log (BO-19, K8, F14c): dead, noisy and ignored
+    /// rules, decisions to review, the correction detector's record. **Advice only, never counted against
+    /// `healthy`:** a user who updates must not see doctor go UNHEALTHY because of usage counts (Chris, 2026-10-03).
+    pub usage: crate::usage::Section,
     /// The write seam this binary was built with, [`store::LOCK_SEAM_MARKER`].
     ///
     /// Not diagnostic information for an operator — it is here so a verification
@@ -481,9 +485,13 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         .collect();
     warnings.extend(leaked_global_handoffs());
     warnings.extend(coach_drift());
+    // Read once for the rule count and the usage section (BO-19): a merged store load costs about a second.
+    let config = crate::config::BaseConfig::load(cwd);
+    let domains = crate::domain::load_domains(cwd);
+    let store = store::load_merged(cwd);
     // `auk`'s HARD RULE (2026-09-14): a rule with no matcher of its own is served by its domain's triggers exactly as
     // before, never dropped, and counted here (F11's DETAIL, K4).
-    let unconverted = unconverted_rule_count(cwd);
+    let unconverted = unconverted_rule_count(&config, &domains, store.as_ref());
     if unconverted > 0 {
         warnings.push(format!(
             "rules: {unconverted} rules with no matcher of their own, served by their domain's triggers (base rule list)"
@@ -523,6 +531,8 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         .collect();
     let config_errors = crate::command::check_command_files(cwd);
     let trigger_faults = trigger_faults(cwd);
+    // BO-19: advice from the match log. Not one of the conjuncts below, on purpose.
+    let usage = crate::usage::section_for(cwd, &config, &domains, store.as_ref());
     // FIVE conjuncts. Keep the doc comment on `DoctorReport::healthy` in step
     // with this expression — it undercounted for four releases (#142).
     let healthy = tiers.iter().all(|t| t.status != "unhealthy")
@@ -561,9 +571,10 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
         config_errors,
         trigger_faults,
         // One subprocess per `diagnose`, not one per render: both call sites below read this.
-        measured_on: check_measured_on(&crate::config::BaseConfig::load(cwd).budget),
+        measured_on: check_measured_on(&config.budget),
         hook_output,
         next_steps: stale_next_steps(cwd),
+        usage,
         seam: store::LOCK_SEAM_MARKER,
     }
 }
@@ -616,18 +627,19 @@ fn push_next_steps(out: &mut String, next_steps: &[String]) {
 
 /// Live rules, in every domain that injects, that carry no matcher of their own (F11's DETAIL: "`base doctor` lists
 /// rules with no matcher of their own"). Read-only: no domain sync, so doctor never writes the graph.
-fn unconverted_rule_count(cwd: &Path) -> usize {
-    let config = crate::config::BaseConfig::load(cwd);
-    let domains = crate::domain::load_domains(cwd);
-    let store = store::load_merged(cwd);
+fn unconverted_rule_count(
+    config: &crate::config::BaseConfig,
+    domains: &[crate::domain::DomainDef],
+    store: Option<&oxigraph::store::Store>,
+) -> usize {
     let converted: std::collections::HashSet<String> =
-        crate::domain::rules::rules_with_matchers(store.as_ref(), &config, &domains)
+        crate::domain::rules::rules_with_matchers(store, config, domains)
             .into_iter()
             .map(|c| c.rule.id)
             .collect();
     let mut unconverted: std::collections::HashSet<String> = std::collections::HashSet::new();
     for domain_def in domains.iter().filter(|d| d.auto_inject) {
-        for rule in crate::domain::rules::rules_for_domain(store.as_ref(), &config, domain_def) {
+        for rule in crate::domain::rules::rules_for_domain(store, config, domain_def) {
             if !converted.contains(&rule.id) {
                 unconverted.insert(rule.id);
             }
@@ -913,6 +925,8 @@ pub fn format_human(report: &DoctorReport) -> String {
     }
 
     push_hook_output(&mut out, &report.hook_output, &report.measured_on);
+    // BO-19: after the hook output section, as the build order places it. Advice only.
+    out.push_str(&crate::usage::render(&report.usage));
 
     if !report.config_errors.is_empty() {
         out.push_str("\n─── config faults ────────────────────\n");
@@ -2008,6 +2022,7 @@ mod tests {
             trigger_faults: Vec::new(),
             hook_output: Vec::new(),
             next_steps: Vec::new(),
+            usage: Default::default(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human = format_human(&report);
@@ -2028,6 +2043,7 @@ mod tests {
             trigger_faults: Vec::new(),
             hook_output: Vec::new(),
             next_steps: Vec::new(),
+            usage: Default::default(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human2 = format_human(&report2);
@@ -2233,6 +2249,7 @@ mod coach_drift_tests {
             trigger_faults: vec![],
             hook_output: vec![],
             next_steps: Vec::new(),
+            usage: Default::default(),
             seam: store::LOCK_SEAM_MARKER,
         };
         assert!(report.healthy, "an advisory must not flip the verdict");
@@ -2444,6 +2461,7 @@ mod hook_output_tests {
                 },
             ],
             next_steps: Vec::new(),
+            usage: Default::default(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human = format_human(&report);
@@ -2520,6 +2538,7 @@ mod hook_output_tests {
                 events: vec![prompt],
             }],
             next_steps: Vec::new(),
+            usage: Default::default(),
             seam: store::LOCK_SEAM_MARKER,
         };
         let human = format_human(&report);

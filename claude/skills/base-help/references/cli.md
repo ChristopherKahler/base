@@ -127,6 +127,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base rule unretire`
 - `base rule update`
 - `base rule test`
+- `base rule stats`
 - `base rule list`
 - `base rule remove`
 - `base install`
@@ -2597,6 +2598,7 @@ Commands:
   unretire  Serve a retired rule again: clear the retirement an approved retire proposal made
   update    Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
   test      Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
+  stats     Each rule's numbers from the match log: times served in the last [doctor] dead_days days and in all, times a correction followed in the same or the next turn, and the day it was last served. Read only
   list      List rules for a domain from the graph
   remove    Remove a rule by index from a domain
   help      Print this message or the help of the given subcommand(s)
@@ -2860,6 +2862,29 @@ Options:
 
       --rule <RULE>
           Only this rule: <domain>.<id> or <id>
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule stats
+
+```text
+Each rule's numbers from the match log: times served in the last [doctor] dead_days days and in all, times a correction followed in the same or the next turn, and the day it was last served. Read only
+
+Usage: base rule stats [OPTIONS]
+
+Options:
+      --domain <DOMAIN>
+          Only this domain's rules
+
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+      --json
+          Emit JSON instead of the table
 
   -h, --help
           Print help (see a summary with '-h')

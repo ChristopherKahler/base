@@ -58,6 +58,7 @@ Domains, rules, standards (read side):
 ```bash
 base rule list --domain X                # rules for a domain (global tier: base rule -g list ...)
 base rule test [--domain X] [--rule <domain>.<id>]   # replay each rule's test prompts through the prompt hook's matching; exit 1 on a miss or a false fire
+base rule stats [--domain X] [--json]   # each rule's numbers from the match log: served in the last [doctor] dead_days days and in all, corrected after, last served
 base domain list                         # all domains
 base domain get <name>                   # one domain's triggers and config
 base standards list                      # standards with trigger/annotation counts

@@ -596,8 +596,17 @@ prompt_text = "full"
 # A project's next step older than this many days is flagged, with the
 # command that rewrites it. Steps written before 0.16.0 carry no date and
 # are flagged as undated.
+# From the match log, doctor also lists the rules no prompt served in
+# dead_days days, the rules and decisions served and then corrected at least
+# ignored_after times, and the decisions served review_served times with no
+# update in review_days days ("still true?"). Advice only: none of it changes
+# the verdict. Noisy domains use [tune] broad_share.
 [doctor]
 stale_next_days = 14
+dead_days = 30
+ignored_after = 3
+review_served = 20
+review_days = 60
 
 # ─── [corrections] — noticing when you correct the AI ────────
 # No one signal decides. A phrase in your prompt (phrases), what you did (an
