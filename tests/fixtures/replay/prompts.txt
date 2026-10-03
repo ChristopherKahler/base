@@ -35,3 +35,5 @@ the reminder numbers changed after a new session start; which one is 2
 summarize the last three session starts and what they withheld
 reconcile the ledger for the third quarter before the close
 the ledger and the payroll pay run disagree; reconcile them and check the hook output
+# BO-18: a near miss of the hooks rule's test prompt, holding none of the hooks domain's keywords.
+high rate of cut off output from the user prompt submit step; what are the issues

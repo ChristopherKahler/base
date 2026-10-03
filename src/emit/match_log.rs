@@ -149,12 +149,20 @@ impl Cut {
     }
 }
 
-/// A score `select` computed for a topic rule, above zero, whether or not the rule was served.
+/// A score above zero the prompt hook computed, whether or not what it scored was served: a topic rule's (`select`, A5's
+/// phrase weights) or a rule's or decision's BM25 score against the prompt (BO-18, K7f).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Score {
     pub id: String,
     pub domain: String,
     pub score: f32,
+    /// `topic` or `bm25`. A row written before BO-18 has none, and its scores were topic scores.
+    #[serde(default = "topic_by")]
+    pub by: String,
+}
+
+fn topic_by() -> String {
+    "topic".to_string()
 }
 
 /// One flag the correction detector raised (BO-15, K3): a row with `event: "signal"` carries the turn's.
@@ -209,6 +217,8 @@ pub fn signal_row(session: Option<&str>, prompt_num: Option<u32>, signals: Vec<S
         cut: Vec::new(),
         scores: Vec::new(),
         signals,
+        index: None,
+        min_score: None,
     }
 }
 
@@ -226,6 +236,11 @@ pub struct Trace {
     /// A tool call: its name and every path it touched.
     pub tool: Option<String>,
     pub paths: Vec<String>,
+    /// A prompt scored with BM25 (BO-18): `ok`, or `missing` when no index was built yet and the prompt was served
+    /// keyword-only. `None` when `[match] bm25 = false`.
+    pub index: Option<String>,
+    /// The `[match] min_score` in force when the prompt was scored.
+    pub min_score: Option<f32>,
 }
 
 impl Trace {
@@ -272,6 +287,12 @@ pub struct Row {
     /// BO-15 reads the same.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signals: Vec<Signal>,
+    /// On a prompt row scored with BM25 (BO-18): `ok` or `missing` (no index yet, so served keyword-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+    /// On a prompt row scored with BM25: the `[match] min_score` in force, so a later tune knows the threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_score: Option<f32>,
 }
 
 fn now() -> String {
@@ -288,11 +309,14 @@ pub fn prompt_row(
     prompt_num: Option<u32>,
     mode: PromptText,
 ) -> Row {
+    // A ranked block's withheld parts are cut for the budget like a dropped block's items (BO-18).
+    let logged = fitted.logged();
     let served: Vec<Item> =
-        fitted.kept_blocks().flat_map(|b| b.logged.iter().map(|i| i.clone().in_block(&b.id))).collect();
-    let mut cut: Vec<Cut> = fitted
-        .dropped_blocks()
-        .flat_map(|b| b.logged.iter().map(|i| Cut::new(i.clone().in_block(&b.id), "budget", key)))
+        logged.iter().filter(|(_, _, printed)| *printed).map(|(b, i, _)| (*i).clone().in_block(&b.id)).collect();
+    let mut cut: Vec<Cut> = logged
+        .iter()
+        .filter(|(_, _, printed)| !*printed)
+        .map(|(b, i, _)| Cut::new((*i).clone().in_block(&b.id), "budget", key))
         .collect();
     cut.extend(trace.cut);
     let text = match mode {
@@ -315,6 +339,8 @@ pub fn prompt_row(
         cut,
         scores: trace.scores,
         signals: Vec::new(),
+        index: trace.index,
+        min_score: trace.min_score,
     }
 }
 
@@ -348,6 +374,8 @@ pub fn file_row(trace: Trace, session: Option<&str>) -> Option<Row> {
         cut: trace.cut,
         scores: trace.scores,
         signals: Vec::new(),
+        index: None,
+        min_score: None,
     })
 }
 
@@ -806,6 +834,8 @@ mod tests {
                 cut: Vec::new(),
                 scores: Vec::new(),
                 signals: Vec::new(),
+                index: None,
+                min_score: None,
             };
             format!("{}\n", serde_json::to_string(&r).unwrap())
         };

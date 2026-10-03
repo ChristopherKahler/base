@@ -345,6 +345,49 @@ pub struct BaseConfig {
     pub corrections: CorrectionsConfig,
     #[serde(default)]
     pub tune: TuneConfig,
+    /// `[match]` (BO-18). `match` is a Rust keyword, hence the field's name.
+    #[serde(default, rename = "match")]
+    pub matching: MatchConfig,
+}
+
+// ─── Match Config (BO-18: K7, D9) ────────────────────────────
+
+/// `[match]`: how a prompt is scored against the rules and global decisions it could be served (K7, BM25). A rule a
+/// keyword or a touched path brings is always served, as before; scoring ranks every candidate so a tight budget sheds
+/// the weakest first, and, when `min_score` is set, serves a rule no keyword brought whose score reaches it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchConfig {
+    /// Score and rank with BM25. `false` serves keyword-only, exactly as before BO-18 (a rollback, and BO-20's other
+    /// side).
+    #[serde(default = "default_true")]
+    pub bm25: bool,
+    /// The BM25 score at which a rule no keyword or path brought is served. Another scale from `[rules]
+    /// topic_min_score`, which judges rules with matchers of their own on their phrase weights.
+    ///
+    /// NO DEFAULT (lynx's Q7 ruling on BO-18): unset, no rule is served on its score alone. On a real store no threshold
+    /// separated the rules a prompt was about from the rest: the scores grow with the prompt's length, and the rules
+    /// they admitted shared only common words with it. BO-20 measures what would.
+    #[serde(default)]
+    pub min_score: Option<f32>,
+}
+
+impl MatchConfig {
+    /// Does a BM25 score of `score` serve a rule no keyword or path brought: only when `min_score` is set and reached.
+    pub fn admits(&self, score: f32) -> bool {
+        reaches(self.min_score, score)
+    }
+}
+
+/// A BM25 score above zero that reaches `min`, when there is one: the one threshold test the prompt hook, `select` and
+/// `base rule test` share (BO-18).
+pub fn reaches(min: Option<f32>, score: f32) -> bool {
+    min.is_some_and(|min| score > 0.0 && score >= min)
+}
+
+impl Default for MatchConfig {
+    fn default() -> Self {
+        Self { bm25: default_true(), min_score: None }
+    }
 }
 
 // ─── Tune Config (BO-16: K6 replay; BO-17 adds its cadence keys, D7) ───

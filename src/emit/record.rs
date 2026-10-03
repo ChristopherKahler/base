@@ -68,7 +68,7 @@ pub fn record_of(r: &Rendered, hook: &str, session_id: Option<&str>) -> serde_js
 /// is also true for output still over the budget after every drop. No first-screen fields: this hook has no first
 /// screen, and a value would read as a measurement.
 pub fn record_of_prompt(f: &super::prompt::Fitted, hook: &str, session_id: Option<&str>) -> serde_json::Value {
-    let withheld: Vec<serde_json::Value> = f
+    let mut withheld: Vec<serde_json::Value> = f
         .dropped_blocks()
         .map(|b| {
             serde_json::json!({
@@ -79,6 +79,16 @@ pub fn record_of_prompt(f: &super::prompt::Fitted, hook: &str, session_id: Optio
             })
         })
         .collect();
+    // A ranked block printed in part (BO-18): a row for what it withheld, `items` of `of`.
+    withheld.extend(f.partial_blocks().map(|(b, n, bytes)| {
+        serde_json::json!({
+            "block": b.id,
+            "items": n,
+            "of": b.items,
+            "bytes": bytes,
+            "reason": Reason::Budget.as_str(),
+        })
+    }));
     serde_json::json!({
         "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
         "hook": hook,

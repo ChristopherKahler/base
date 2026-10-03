@@ -1967,6 +1967,68 @@ fn tier_cwd(cwd: &std::path::Path, global: bool) -> std::path::PathBuf {
     }
 }
 
+/// The commands that change a rule, a domain's keywords, a rule's test prompts or a global decision's keywords, or that
+/// replace or move the graph holding them: each rebuilds the rule index (BO-18, K7e). Reading commands do not, nor a
+/// preview, nor `decision log` without `--supersedes` (a new decision has no keywords, so no scoring text), nor
+/// `base sync --ast` or `--repair`, which the hooks run after every turn and which touch no rule. The index is the cwd's
+/// tier's; another workspace's is rebuilt at its next session start.
+fn changes_prompt_matching(command: &Option<Commands>) -> bool {
+    match command {
+        Some(Commands::Rule { action, .. }) => matches!(
+            action,
+            RuleAction::Add { .. }
+                | RuleAction::Update { .. }
+                | RuleAction::Remove { .. }
+                | RuleAction::Unretire { .. }
+                | RuleAction::Review { .. }
+        ),
+        Some(Commands::Decision { action, .. }) => matches!(
+            action,
+            DecisionAction::Log { supersedes: Some(_), .. } | DecisionAction::Update { .. } | DecisionAction::Delete { .. }
+        ),
+        Some(Commands::Domain { action, .. }) => matches!(
+            action,
+            DomainAction::AddTrigger { .. }
+                | DomainAction::Sync { .. }
+                | DomainAction::Create { .. }
+                | DomainAction::Remove { .. }
+                | DomainAction::RemoveTrigger { .. }
+                | DomainAction::Paths { .. }
+        ),
+        Some(Commands::Graph { action }) => matches!(
+            action,
+            GraphAction::Supersede { .. }
+                | GraphAction::ApplyOps { .. }
+                | GraphAction::Purge { .. }
+                | GraphAction::Migrate { .. }
+                | GraphAction::Move { yes: true, dry_run: false, .. }
+        ),
+        Some(Commands::Project { action }) => matches!(
+            action,
+            ProjectAction::Rename { yes: true, .. }
+                | ProjectAction::Move { yes: true, dry_run: false, .. }
+                | ProjectAction::Delete { yes: true, .. }
+        ),
+        Some(Commands::Doctor { fix: true, yes: true, .. })
+        | Some(Commands::Doctor { repair: true, .. })
+        | Some(Commands::Doctor { restore: Some(Some(_)), .. })
+        | Some(Commands::Sync { ast: false, repair: false, .. }) => true,
+        _ => false,
+    }
+}
+
+/// Rebuilds the rule index when the command that holds it ends (see [`changes_prompt_matching`]).
+struct RefreshIndexOnExit {
+    config: BaseConfig,
+    cwd: std::path::PathBuf,
+}
+
+impl Drop for RefreshIndexOnExit {
+    fn drop(&mut self) {
+        base::domain::score_index::refresh_for(&self.config, &self.cwd);
+    }
+}
+
 pub fn run() {
     let cli = Cli::parse();
 
@@ -2057,6 +2119,10 @@ pub fn run() {
         return;
     }
     let config = BaseConfig::load(&cwd);
+
+    // K7e (BO-18): a command that changes what a prompt can be served, or how it scores, rebuilds the rule index the
+    // prompt hook ranks by when it ends, early returns included (`die` exits before it, on a failure).
+    let _refresh_index = changes_prompt_matching(&cli.command).then(|| RefreshIndexOnExit { config: config.clone(), cwd: cwd.clone() });
 
     match cli.command {
         // Dispatched above, before the config load. Reaching this arm means that early return moved, and every base hook
@@ -5516,5 +5582,50 @@ pub fn run() {
         Some(Commands::External(args)) => base::plugin::dispatch(&args, &cwd),
 
         None => eprintln!("No command provided. Run `base --help` for usage."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn rebuilds_index(args: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(std::iter::once("base").chain(args.iter().copied())).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        changes_prompt_matching(&cli.command)
+    }
+
+    /// K7e (BO-18): the commands that change what a prompt can be served, or replace or move the graph holding it,
+    /// rebuild the rule index when they end; previews, reads, and the AST and edge syncs the hooks run after every turn
+    /// do not.
+    #[test]
+    fn the_rule_index_is_rebuilt_by_matching_changes_only() {
+        for args in [
+            &["sync"][..],
+            &["sync", "--incremental"],
+            &["domain", "sync"],
+            &["rule", "add", "--domain", "tools", "--text", "Name the folder."],
+            &["doctor", "--repair"],
+            &["doctor", "--restore", "graph.nq.bak-1"],
+            &["doctor", "--fix", "--yes"],
+            &["graph", "move", "--select", "domain:tools", "--to", "other", "--yes"],
+            &["project", "move", "tools", "--to", "other", "--yes"],
+            &["project", "delete", "tools", "--yes"],
+        ] {
+            assert!(rebuilds_index(args), "{args:?} changes prompt matching");
+        }
+        for args in [
+            &["sync", "--ast", "--yes", "--target", "."][..],
+            &["sync", "--repair"],
+            &["doctor"],
+            &["doctor", "--restore"],
+            &["doctor", "--fix"],
+            &["graph", "move", "--select", "domain:tools", "--to", "other"],
+            &["graph", "move", "--select", "domain:tools", "--to", "other", "--yes", "--dry-run"],
+            &["project", "delete", "tools"],
+            &["rule", "list", "--domain", "tools"],
+        ] {
+            assert!(!rebuilds_index(args), "{args:?} changes nothing a prompt is served");
+        }
     }
 }

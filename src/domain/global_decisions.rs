@@ -194,6 +194,11 @@ impl GlobalDecisions {
         self.by_id.get(id)
     }
 
+    /// Every one of them, in no set order.
+    pub fn all(&self) -> impl Iterator<Item = &GlobalDecision> {
+        self.by_id.values()
+    }
+
     /// The global decision `base decision update` addresses as `slug`.
     pub fn by_slug(&self, slug: &str) -> Option<&GlobalDecision> {
         self.by_id.values().find(|d| d.slug == slug)

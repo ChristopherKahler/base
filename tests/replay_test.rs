@@ -413,25 +413,37 @@ fn replay_output_within_budget() {
 #[test]
 fn replay_prompt_output_is_whole_blocks_in_priority_order() {
     let mut cut = 0;
-    for run in prompt_runs() {
+    // BO-18: the corpus with the rule index built runs through the same check, where a ranked block may print in part.
+    for run in prompt_runs().iter().chain(bm25_runs()) {
         let p = &run.prompt;
         let file = seed::prompt_blocks(&run.ws, &run.session);
         assert_eq!(run.stdout, seed::rebuilt_prompt_output(&run.stdout, &file), "{p:?}: not whole blocks and pointer lines");
         let order: Vec<u8> = file.blocks.iter().map(|b| b.priority).collect();
         assert!(order.windows(2).all(|w| w[0] <= w[1]), "{p:?}: blocks out of priority order: {order:?}");
-        let dropped: Vec<serde_json::Value> = file
+        let mut dropped: Vec<serde_json::Value> = file
             .blocks
             .iter()
             .filter(|b| !b.printed)
             .map(|b| serde_json::json!({"block": b.id, "items": b.items, "bytes": b.bytes, "reason": "budget"}))
             .collect();
+        // BO-18: a block printed with some rules withheld has a row of its own, `items` of `of`.
+        let partial: Vec<serde_json::Value> = file
+            .blocks
+            .iter()
+            .filter(|b| b.printed && b.withheld_items.is_some())
+            .map(|b| {
+                serde_json::json!({"block": b.id, "items": b.withheld_items, "of": b.items, "bytes": b.withheld_bytes, "reason": "budget"})
+            })
+            .collect();
+        dropped.extend(partial);
         assert_eq!(run.record["withheld"], serde_json::Value::Array(dropped.clone()), "{p:?}: the record's rows");
-        let sum: usize = file.blocks.iter().filter(|b| !b.printed).map(|b| b.bytes).sum();
+        let sum: usize = file.blocks.iter().filter(|b| !b.printed).map(|b| b.bytes).sum::<usize>()
+            + file.blocks.iter().filter(|b| b.printed).filter_map(|b| b.withheld_bytes).sum::<usize>();
         assert_eq!(number(&run.record, "withheld_bytes"), sum, "{p:?}: withheld_bytes is the sum of the rows");
         cut += usize::from(!dropped.is_empty());
     }
     assert!(cut > 0, "control: no prompt in the corpus dropped a block, so nothing here was exercised");
-    println!("replay: {} prompts, {cut} with blocks dropped whole", prompt_runs().len());
+    println!("replay: {} prompts, {cut} with blocks dropped whole or in part", prompt_runs().len() + bm25_runs().len());
 }
 
 /// BO-13 (K1, D2). Every corpus prompt writes one match-log row for its session, and the row agrees with what the hook
@@ -1836,4 +1848,89 @@ fn replay_tune_pass_on_the_corpus_store() {
     assert!(!start.contains("rule pass due"), "{start}");
     let again = tune(&["tune", "--dry-run"], &[]);
     assert!(again.starts_with("would read: 0 sessions, 0 prompts"), "{again}");
+}
+
+// ── BO-18 (K7, D9): BM25 ──────────────────────────────────────────────────────────────────────────────
+
+/// The corpus once more, with the rule index built first (`base domain sync`, a command that changes prompt matching,
+/// ends by building it), each prompt the first of its own session, with `[match] min_score = 6.0` set: `min_score` has
+/// no default (lynx's Q7 ruling), and without one no rule is served on its score, so admission would go unexercised.
+/// The default itself is pinned in `bm25_test::score_admits_near_miss`.
+fn bm25_runs() -> &'static [PromptRun] {
+    static RUNS: OnceLock<Vec<PromptRun>> = OnceLock::new();
+    RUNS.get_or_init(|| {
+        let s = seed::write(&root("bm25"), &seed::TINY, &format!("{}\n[match]\nmin_score = 6.0\n", fixture("base.toml")));
+        std::fs::write(s.ws.join(".base").join("domains.toml"), fixture("domains.toml")).expect("domains.toml");
+        let (code, out, err) = run_base(&s, &["domain", "sync"]);
+        assert_eq!(code, 0, "base domain sync: {out}{err}");
+        assert!(s.ws.join(".base").join("bm25-index.json").exists(), "control: the sync built the rule index");
+        prompts()
+            .into_iter()
+            .enumerate()
+            .map(|(i, prompt)| {
+                let session = format!("bm25-{i:02}");
+                let (code, stdout, stderr) = run_prompt_submit(&s, &prompt, Some(&session));
+                assert_eq!(code, 0, "{prompt:?}: the prompt hook failed: {stderr}");
+                let record = last_record(&s, "user-prompt-submit");
+                PromptRun { prompt, stdout, record, session, ws: s.ws.clone() }
+            })
+            .collect()
+    })
+}
+
+/// BO-18 (K7c, K7d). With the index built: (1) a prompt holding none of a domain's keywords is served that domain's
+/// rule on its score, under `[DOMAIN: …]`, logged `by: score`; (2) the output is still whole rules, a partly printed
+/// block keeping some of its own lines in order and ending with the pointer-shaped line that names what it withheld;
+/// (3) in every partly printed block, each rule printed scored at least as high as each rule withheld, as the match log
+/// records them. Before BO-18 a domain no keyword named served nothing, and a block over the budget was dropped whole.
+#[test]
+fn replay_bm25_admits_and_ranks_on_the_corpus() {
+    let runs = bm25_runs();
+    let log = runs[0].ws.join(".base").join("match-log.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap_or_else(|e| panic!("{}: {e}", log.display()));
+    let rows: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).expect("a row")).collect();
+    let (mut admitted, mut partial) = (0usize, 0usize);
+    for run in runs {
+        let p = &run.prompt;
+        let file = seed::prompt_blocks(&run.ws, &run.session);
+        assert_eq!(run.stdout, seed::rebuilt_prompt_output(&run.stdout, &file), "{p:?}: not whole rules and pointer lines");
+        let row = rows.iter().find(|r| r["session"] == run.session.as_str()).unwrap_or_else(|| panic!("{p:?}: no row"));
+        assert_eq!(row["index"], "ok", "{p:?}: {row}");
+        let matched = row["matched"].as_array().expect("matched");
+        let score = |i: &serde_json::Value| i["score"].as_f64().unwrap_or(0.0);
+        for m in matched.iter().filter(|m| m["by"] == "score") {
+            let domain = m["domain"].as_str().unwrap_or_default();
+            assert!(
+                !matched.iter().any(|k| k["domain"] == domain && k["by"] == "keyword"),
+                "{p:?}: {domain} matched by keyword and by score: {row}"
+            );
+            let block = format!("{}-rules", base::crud::slugify(domain));
+            let served: Vec<&serde_json::Value> =
+                row["served"].as_array().expect("served").iter().filter(|i| i["block"] == block.as_str()).collect();
+            assert!(served.iter().all(|i| i["by"] == "score"), "{p:?}: every rule of {block} came by score: {row}");
+            if !served.is_empty() {
+                assert!(run.stdout.contains(&format!("[DOMAIN: {domain}]")), "{p:?}: {block} printed:\n{}", run.stdout);
+                admitted += 1;
+            }
+        }
+        for b in file.blocks.iter().filter(|b| b.withheld_items.is_some()) {
+            let printed: Vec<f64> =
+                row["served"].as_array().expect("served").iter().filter(|i| i["block"] == b.id.as_str()).map(score).collect();
+            let withheld: Vec<f64> = row["cut"]
+                .as_array()
+                .expect("cut")
+                .iter()
+                .filter(|c| c["block"] == b.id.as_str() && c["reason"] == "budget")
+                .map(score)
+                .collect();
+            assert_eq!(withheld.len(), b.withheld_items.unwrap_or_default(), "{p:?}: {} withheld as logged", b.id);
+            let low = printed.iter().copied().fold(f64::INFINITY, f64::min);
+            let high = withheld.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            assert!(low >= high, "{p:?}: {} printed a rule scoring {low} and withheld one scoring {high}", b.id);
+            partial += 1;
+        }
+    }
+    assert!(admitted > 0, "control: no corpus prompt was served a rule on its score alone");
+    assert!(partial > 0, "control: no block printed in part, so the ranking under the budget was not exercised");
+    println!("replay bm25: {} prompts, {admitted} served a domain's rules by score, {partial} blocks printed in part", runs.len());
 }

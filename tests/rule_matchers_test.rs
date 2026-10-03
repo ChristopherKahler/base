@@ -63,7 +63,7 @@ fn converted(domain: &str, text: &str, matchers: Vec<Matcher>) -> Converted {
 }
 
 fn cx<'a>(bracket: Bracket, now: u64, keywords: &'a HashMap<String, Vec<String>>, cfg: &'a RulesConfig) -> SelectContext<'a> {
-    SelectContext { bracket, now, home: None, keywords, rules: cfg }
+    SelectContext { bracket, now, home: None, keywords, rules: cfg, bm25: None }
 }
 
 fn session() -> SessionState {

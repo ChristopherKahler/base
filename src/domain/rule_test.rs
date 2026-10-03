@@ -27,6 +27,7 @@ use crate::command::CommandDef;
 use crate::config::BaseConfig;
 use crate::domain::matcher::{self, MatchReason, TriggerContext};
 use crate::domain::rules::{self, Converted, CutReason, Event, RuleTests, SelectContext, StoredTests, Why};
+use crate::domain::score_index::{self, DocKind, Prepared, ScoreIndex, Scores, Source};
 use crate::domain::session::{Bracket, SessionState};
 use crate::domain::DomainDef;
 
@@ -52,6 +53,16 @@ pub fn short_ref(domain: &str, id: &str) -> String {
     format!("{domain}.{}", &id[..id.len().min(8)])
 }
 
+/// What a [`Bench`] is made of, before its scoring texts are counted.
+struct Parts {
+    domains: Vec<DomainDef>,
+    converted: Vec<Converted>,
+    commands: Vec<CommandDef>,
+    ctx: TriggerContext,
+    by_domain: Vec<(String, Vec<RuleRef>)>,
+    tests: HashMap<String, StoredTests>,
+}
+
 /// Everything the prompt hook's matching reads, loaded once for a whole run.
 pub struct Bench<'a> {
     pub config: &'a BaseConfig,
@@ -65,6 +76,12 @@ pub struct Bench<'a> {
     /// Every stored test, by rule id.
     pub tests: HashMap<String, StoredTests>,
     keywords: HashMap<String, Vec<String>>,
+    /// Every rule's and global decision's scoring text (BO-18, K7a), as the prompt hook's index counts them.
+    pub sources: Vec<Source>,
+    /// Those texts split into terms once and counted, when `[match] bm25` is on: counted here from the store this bench
+    /// loaded, never read from the index file, so a test never runs against a stale index.
+    prepared: Option<Prepared>,
+    index: Option<ScoreIndex>,
 }
 
 impl<'a> Bench<'a> {
@@ -89,34 +106,66 @@ impl<'a> Bench<'a> {
                 .map(|s| crate::domain::registered_projects(s, &config.namespace, cwd))
                 .unwrap_or_default(),
         };
+        let lists: Vec<Vec<rules::ServedRule>> =
+            domains.iter().map(|d| rules::rules_for_domain(store.as_ref(), config, d)).collect();
         let by_domain = domains
             .iter()
-            .map(|d| {
-                let rules = rules::rules_for_domain(store.as_ref(), config, d)
-                    .into_iter()
-                    .map(|r| RuleRef { id: r.id, domain: r.domain, text: r.text })
-                    .collect();
+            .zip(&lists)
+            .map(|(d, list)| {
+                let rules = list.iter().map(|r| RuleRef { id: r.id.clone(), domain: r.domain.clone(), text: r.text.clone() }).collect();
                 (d.name.clone(), rules)
             })
             .collect();
         let tests = rules::rule_tests(store.as_ref(), config, &domains);
-        let bench = Self::from_parts(config, domains, converted, crate::command::load_commands(cwd), ctx, by_domain, tests);
-        (bench, store)
+        // The index's own recipe (BO-18), from what this load has read already.
+        let sources = score_index::sources_from(store.as_ref(), config, &domains, &lists, &converted, &tests);
+        let parts = Parts { domains, converted, commands: crate::command::load_commands(cwd), ctx, by_domain, tests };
+        (Self::assemble(config, parts, sources), store)
     }
 
     /// This bench with its domains and its rules with matchers replaced (K6 replay, BO-16): the same commands,
     /// projects and tests, and the domains' keywords read again from `domains`, so a keyword change reaches topic
-    /// scoring as it would in the hook.
+    /// scoring as it would in the hook. The scoring texts follow (BO-18): each rule's keywords and own words are read
+    /// again, and a new rule with matchers gets a text of its own.
     pub fn changed(&self, domains: Vec<DomainDef>, converted: Vec<Converted>) -> Bench<'a> {
-        Self::from_parts(
-            self.config,
+        let keywords: HashMap<&str, &[String]> = domains.iter().map(|d| (d.name.as_str(), d.prompt_keywords.as_slice())).collect();
+        let keywords_of = |domain: &str| keywords.get(domain).copied().unwrap_or_default();
+        let own: HashMap<&str, Vec<String>> = converted.iter().map(|c| (c.rule.id.as_str(), score_index::own_words(c))).collect();
+        let mut sources = self.sources.clone();
+        for s in sources.iter_mut().filter(|s| s.doc.kind == DocKind::Rule) {
+            s.keywords = keywords_of(&s.doc.domain).to_vec();
+            s.own_words = own.get(s.doc.id.as_str()).cloned().unwrap_or_default();
+        }
+        for c in &converted {
+            if !sources.iter().any(|s| s.doc.id == c.rule.id) {
+                sources.push(score_index::rule_source(&c.rule, keywords_of(&c.rule.domain), score_index::own_words(c), &self.tests));
+            }
+        }
+        let parts = Parts {
             domains,
             converted,
-            self.commands.clone(),
-            self.ctx.clone(),
-            self.by_domain.clone(),
-            self.tests.clone(),
-        )
+            commands: self.commands.clone(),
+            ctx: self.ctx.clone(),
+            by_domain: self.by_domain.clone(),
+            tests: self.tests.clone(),
+        };
+        Self::assemble(self.config, parts, sources)
+    }
+
+    /// The prompt's BM25 scores, with `hold_out` (a rule id and one of its `fires_on` prompts) left out of that rule's
+    /// text (lynx's G0 Q5). `None` when `[match] bm25` is off.
+    fn scores(&self, prompt: &str, hold_out: Option<(&str, &str)>) -> Option<Scores> {
+        let index = self.index.as_ref()?;
+        Some(match (hold_out, &self.prepared) {
+            (Some(h), Some(prepared)) => prepared.build_holding_out(Some(h)).scores(prompt),
+            _ => index.scores(prompt),
+        })
+    }
+
+    /// Can a prompt serve `domain`'s rules on their score alone, as the prompt hook admits them
+    /// ([`score_index::admits_by_score`]).
+    fn admits_by_score(&self, domain: &str, prompt_lower: &str) -> bool {
+        self.domains.iter().any(|d| d.name == domain && score_index::admits_by_score(d, prompt_lower))
     }
 
     /// The star commands in `prompt` that the hook would act on (`*name`), which pass every rule and decision by.
@@ -133,13 +182,27 @@ impl<'a> Bench<'a> {
     }
 
     /// The domains `prompt` brings in by keyword or path, as the prompt hook matches a fresh session's first prompt,
-    /// the always-on ones left out: they match every prompt (BO-17, "a prompt with no domain match").
+    /// the always-on ones left out: they match every prompt (BO-17, "a prompt with no domain match"). With BM25 on and
+    /// `[match] min_score` set, a domain whose rule scores at it is brought in too, as the prompt hook admits it (BO-18).
     pub fn matched_domains(&self, prompt: &str) -> Vec<String> {
-        matcher::match_domains_auto(prompt, &self.domains, &[], &self.ctx)
+        let mut out: Vec<String> = matcher::match_domains_auto(prompt, &self.domains, &[], &self.ctx)
             .into_iter()
             .filter(|m| !matches!(m.reason, MatchReason::Always))
             .map(|m| m.domain.name.clone())
-            .collect()
+            .collect();
+        if let Some(scores) = self.scores(prompt, None).filter(|_| self.config.matching.min_score.is_some()) {
+            let lower = prompt.to_lowercase();
+            let converted: HashSet<&str> = self.converted.iter().map(|c| c.rule.id.as_str()).collect();
+            for s in scores.ranked.iter().filter(|s| s.doc.kind == DocKind::Rule && self.config.matching.admits(s.score)) {
+                if !converted.contains(s.doc.id.as_str())
+                    && !out.contains(&s.doc.domain)
+                    && self.admits_by_score(&s.doc.domain, &lower)
+                {
+                    out.push(s.doc.domain.clone());
+                }
+            }
+        }
+        out
     }
 
     /// A bench from parts already loaded: the seam the unit tests drive.
@@ -152,8 +215,23 @@ impl<'a> Bench<'a> {
         by_domain: Vec<(String, Vec<RuleRef>)>,
         tests: HashMap<String, StoredTests>,
     ) -> Self {
-        let keywords = domains.iter().map(|d| (d.name.clone(), d.prompt_keywords.clone())).collect();
-        Bench { config, domains, converted, commands, ctx, by_domain, tests, keywords }
+        // The scoring texts the parts carry (no rationales, no decisions), by the index's own recipe.
+        let lists: Vec<Vec<rules::ServedRule>> = by_domain
+            .iter()
+            .map(|(domain, list)| list.iter().map(|r| rules::build(domain, r.text.clone(), None, None)).collect())
+            .collect();
+        let sources = score_index::sources_from(None, config, &domains, &lists, &converted, &tests);
+        Self::assemble(config, Parts { domains, converted, commands, ctx, by_domain, tests }, sources)
+    }
+
+    /// A bench of `parts` scoring with `sources`, counted once here when `[match] bm25` is on.
+    fn assemble(config: &'a BaseConfig, parts: Parts, sources: Vec<Source>) -> Self {
+        let Parts { domains, converted, commands, ctx, by_domain, tests } = parts;
+        let keywords: HashMap<String, Vec<String>> =
+            domains.iter().map(|d| (d.name.clone(), d.prompt_keywords.clone())).collect();
+        let prepared = config.matching.bm25.then(|| Prepared::new(&sources));
+        let index = prepared.as_ref().map(Prepared::build);
+        Bench { config, domains, converted, commands, ctx, by_domain, tests, keywords, sources, prepared, index }
     }
 
     /// Every rule a prompt could serve, each once, in domain order: each domain's rules, the rules with matchers of
@@ -188,37 +266,62 @@ impl<'a> Bench<'a> {
 
     /// Would the prompt hook serve `rule` on `prompt`, as the first prompt of a fresh session, and why.
     pub fn judge(&self, rule: &RuleRef, prompt: &str) -> Verdict {
+        self.judge_with(rule, prompt, false)
+    }
+
+    /// [`Bench::judge`] for one of `rule`'s own `fires_on` prompts: scored with that prompt held out of the rule's text,
+    /// or every such test would pass by matching itself (BO-18, lynx's G0 Q5).
+    pub fn judge_held_out(&self, rule: &RuleRef, prompt: &str) -> Verdict {
+        self.judge_with(rule, prompt, true)
+    }
+
+    fn judge_with(&self, rule: &RuleRef, prompt: &str, hold_out: bool) -> Verdict {
         // The hook's order (`user_prompt_submit::collect`): with no domains it serves matcher rules only, before it
         // looks for star commands; with domains, a star command returns before anything is matched.
         let stars = self.star_commands(prompt);
         if !stars.is_empty() {
-            return Verdict { served: false, why: format!("star command {} passes every rule by", stars.join(" ")) };
+            return Verdict { served: false, why: format!("star command {} passes every rule by", stars.join(" ")), score: None };
         }
-        match self.converted.iter().find(|c| c.rule.id == rule.id) {
-            Some(c) => self.judge_matchers(c, prompt),
-            None => self.judge_domain(rule, prompt),
-        }
+        let scores = self.scores(prompt, hold_out.then_some((rule.id.as_str(), prompt)));
+        let mut verdict = match self.converted.iter().find(|c| c.rule.id == rule.id) {
+            Some(c) => self.judge_matchers(c, prompt, scores.as_ref()),
+            None => self.judge_domain(rule, prompt, scores.as_ref()),
+        };
+        verdict.score = scores.as_ref().map(|s| s.get(&rule.id));
+        verdict
+    }
+
+    /// `score 7.12 >= min_score 6.00 (terms: hook, prompt submit)`, or `... under min_score ...`: a rule's BM25 verdict
+    /// against a set `[match] min_score`; `None` while it is unset, since then no score serves a rule.
+    fn score_clause(&self, scores: &Scores, id: &str) -> Option<String> {
+        let min = self.config.matching.min_score?;
+        let (score, terms) = scores.scored(id).map_or((0.0, String::new()), |s| (s.score, s.terms.join(", ")));
+        let cmp = if self.config.matching.admits(score) { ">=" } else { "under" };
+        Some(format!("score {score:.2} {cmp} min_score {min:.2} (terms: {terms})"))
     }
 
     /// A rule with matchers of its own: [`rules::select_unrecorded`], as `matcher_blocks` calls it.
-    fn judge_matchers(&self, c: &Converted, prompt: &str) -> Verdict {
+    fn judge_matchers(&self, c: &Converted, prompt: &str, scores: Option<&Scores>) -> Verdict {
         let cx = SelectContext {
             bracket: Bracket::Fresh,
             now: SessionState::now_secs(),
             home: self.ctx.home.as_deref(),
             keywords: &self.keywords,
             rules: &self.config.rules,
+            bm25: scores.map(|s| (s, self.config.matching.min_score)),
         };
         let selection =
             rules::select_unrecorded(&self.converted, &Event::Prompt { text: prompt }, &SessionState::default(), &cx);
         let score = selection.scores.iter().find(|s| s.id == c.rule.id);
         let words = score.map(|s| s.words.join(", ")).unwrap_or_default();
         if let Some(served) = selection.served.iter().find(|s| s.rule.id == c.rule.id) {
-            let why = match &served.why {
-                Why::Topic(s) => format!("topic score {s:.2} (words: {words})"),
-                other => format!("served: {}", other.label()),
+            let why = match (&served.why, scores.and_then(|sc| self.score_clause(sc, &c.rule.id))) {
+                // Under its topic minimum and still served: its BM25 score did it (BO-18).
+                (Why::Topic(t), Some(clause)) if *t < self.config.rules.topic_min_score => clause,
+                (Why::Topic(s), _) => format!("topic score {s:.2} (words: {words})"),
+                (other, _) => format!("served: {}", other.label()),
             };
-            return Verdict { served: true, why };
+            return Verdict { served: true, why, score: None };
         }
         let min = self.config.rules.topic_min_score;
         let why = match selection.cut.iter().find(|x| x.id == c.rule.id) {
@@ -231,13 +334,14 @@ impl<'a> Bench<'a> {
             }
             None => format!("topic score 0: no word of its own, of its text or of its domain's keywords is in the prompt (minimum {min:.2})"),
         };
-        Verdict { served: false, why }
+        Verdict { served: false, why, score: None }
     }
 
-    /// Any other rule: its domain, through [`matcher::match_domains_auto`] with no touched paths.
-    fn judge_domain(&self, rule: &RuleRef, prompt: &str) -> Verdict {
+    /// Any other rule: its domain, through [`matcher::match_domains_auto`] with no touched paths, or, with BM25 on and
+    /// `[match] min_score` set, its own score at that minimum when its domain admits rules by score (BO-18, K7d).
+    fn judge_domain(&self, rule: &RuleRef, prompt: &str, scores: Option<&Scores>) -> Verdict {
         let matched = matcher::match_domains_auto(prompt, &self.domains, &[], &self.ctx);
-        let served = matched.iter().any(|m| m.domain.name == rule.domain);
+        let by_keyword = matched.iter().any(|m| m.domain.name == rule.domain);
         let list: Vec<String> = matched
             .iter()
             .map(|m| match m.reason {
@@ -246,10 +350,22 @@ impl<'a> Bench<'a> {
             })
             .collect();
         let mut why = format!("matched: {}", if list.is_empty() { "nothing".to_string() } else { list.join(", ") });
-        if !served {
-            why.push_str(&format!(" · {}", self.why_not(&rule.domain, &prompt.to_lowercase())));
+        if by_keyword {
+            return Verdict { served: true, why, score: None };
         }
-        Verdict { served, why }
+        let lower = prompt.to_lowercase();
+        let clause = scores.and_then(|sc| self.score_clause(sc, &rule.id));
+        if let (Some(sc), Some(clause)) = (scores, &clause)
+            && self.config.matching.admits(sc.get(&rule.id))
+            && self.admits_by_score(&rule.domain, &lower)
+        {
+            return Verdict { served: true, why: clause.clone(), score: None };
+        }
+        why.push_str(&format!(" · {}", self.why_not(&rule.domain, &lower)));
+        if let Some(clause) = clause {
+            why.push_str(&format!(" · {clause}"));
+        }
+        Verdict { served: false, why, score: None }
     }
 
     /// Why `domain` did not come in on a prompt, in the order `is_matched` decides.
@@ -305,7 +421,11 @@ impl<'a> Bench<'a> {
             let mut outcomes: Vec<Outcome> = Vec::new();
             for (list, expect) in [(&stored.tests.fires_on, Expect::Fires), (&stored.tests.quiet_on, Expect::Quiet)] {
                 for prompt in list {
-                    outcomes.push(Outcome { prompt: prompt.clone(), expect, verdict: self.judge(r, prompt) });
+                    let verdict = match expect {
+                        Expect::Fires => self.judge_held_out(r, prompt),
+                        Expect::Quiet => self.judge(r, prompt),
+                    };
+                    outcomes.push(Outcome { prompt: prompt.clone(), expect, verdict });
                 }
             }
             tested.push(Tested { rule: (*r).clone(), outcomes });
@@ -328,7 +448,13 @@ impl<'a> Bench<'a> {
         {
             coverage.push(Coverage { domain: d.clone(), untested: 0, total: 0 });
         }
-        Ok(Report { tested, coverage, per_domain: matches!(filter, Filter::All) })
+        Ok(Report {
+            tested,
+            coverage,
+            per_domain: matches!(filter, Filter::All),
+            scored: self.index.is_some(),
+            min_score: self.config.matching.min_score,
+        })
     }
 }
 
@@ -356,6 +482,9 @@ pub enum Filter {
 pub struct Verdict {
     pub served: bool,
     pub why: String,
+    /// The rule's BM25 score for the prompt (BO-18), a `fires_on` prompt held out of the rule's own text; `None` when
+    /// `[match] bm25` is off or a star command passed the rule by.
+    pub score: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,6 +538,10 @@ pub struct Report {
     pub coverage: Vec<Coverage>,
     /// Every domain was run: the coverage prints as a list, one line per domain.
     pub per_domain: bool,
+    /// The prompts were scored with BM25 (BO-18): each outcome carries its score.
+    pub scored: bool,
+    /// `[match] min_score`: unset, no rule is served on its score and the tests are judged by keyword only.
+    pub min_score: Option<f32>,
 }
 
 impl Report {
@@ -442,10 +575,25 @@ impl Report {
         )
     }
 
+    /// The line that says what the scores are (BO-18), printed above the summary when any were: BM25, a `fires_on`
+    /// prompt held out of its own rule, and whether a score can serve a rule (lynx's Q7 ruling).
+    pub fn scores_line(&self) -> Option<String> {
+        if !self.scored || self.tested.is_empty() {
+            return None;
+        }
+        let judged = match self.min_score {
+            Some(min) => format!("a rule no keyword brings is served at [match] min_score {min:.2}"),
+            None => "[match] min_score is unset, so the tests are judged by keyword only".to_string(),
+        };
+        Some(format!("scores: BM25, each fires-on prompt held out of its own rule; {judged}"))
+    }
+
     /// What `base rule test` prints: each tested rule (one line when it passes, every prompt when it does not, with
-    /// the reason under each failure), then the summary and K2d's count of rules without tests.
+    /// the reason under each failure), each with its BM25 scores when there are any, then the summary and K2d's count
+    /// of rules without tests.
     pub fn render(&self) -> String {
         let mut out = String::new();
+        let score = |o: &Outcome| o.verdict.score.map(|s| format!("{s:.2}"));
         for t in &self.tested {
             let ok = |e: Expect| t.outcomes.iter().filter(|o| o.expect == e && o.passed()).count();
             let has = |e: Expect| t.outcomes.iter().any(|o| o.expect == e);
@@ -457,16 +605,33 @@ impl Report {
                 if has(Expect::Quiet) {
                     parts.push(format!("ok {} quiet", ok(Expect::Quiet)));
                 }
-                out.push_str(&format!("{}   {}   \"{}\"\n", t.rule.short(), parts.join(" · "), clip(&t.rule.text, 60)));
+                let scores = |e: Expect| -> Vec<String> { t.outcomes.iter().filter(|o| o.expect == e).filter_map(score).collect() };
+                let mut line = format!("{}   {}   \"{}\"", t.rule.short(), parts.join(" · "), clip(&t.rule.text, 60));
+                let (fires, quiet) = (scores(Expect::Fires), scores(Expect::Quiet));
+                if !fires.is_empty() || !quiet.is_empty() {
+                    let mut s: Vec<String> = Vec::new();
+                    if !fires.is_empty() {
+                        s.push(format!("fires {}", fires.join(", ")));
+                    }
+                    if !quiet.is_empty() {
+                        s.push(format!("quiet {}", quiet.join(", ")));
+                    }
+                    line.push_str(&format!("   scores: {}", s.join(" · ")));
+                }
+                out.push_str(&format!("{line}\n"));
                 continue;
             }
             out.push_str(&format!("{}   \"{}\"\n", t.rule.short(), clip(&t.rule.text, 60)));
             for o in &t.outcomes {
-                out.push_str(&format!("  {:<12}\"{}\"\n", o.label(), clip(&o.prompt, 100)));
+                let s = score(o).map(|s| format!("   score {s}")).unwrap_or_default();
+                out.push_str(&format!("  {:<12}\"{}\"{s}\n", o.label(), clip(&o.prompt, 100)));
                 if !o.passed() {
                     out.push_str(&format!("              {}\n", o.verdict.why));
                 }
             }
+        }
+        if let Some(line) = self.scores_line() {
+            out.push_str(&format!("{line}\n"));
         }
         out.push_str(&self.summary());
         if self.per_domain {
@@ -626,12 +791,27 @@ mod tests {
         let tests: HashMap<_, _> =
             [stored(&r, &["the user prompt submit is cut off"], &["what reminders do i need"])].into_iter().collect();
         let by_domain = vec![("GLOBAL".to_string(), Vec::new()), ("base".to_string(), vec![r.clone()])];
-        let without = vec![domain("GLOBAL", "always", &[]), domain("base", "triggered", &[])];
-        let bench = Bench::from_parts(&config, without, Vec::new(), Vec::new(), TriggerContext::default(), by_domain.clone(), tests.clone());
+        let without = || vec![domain("GLOBAL", "always", &[]), domain("base", "triggered", &[])];
+        let bench = Bench::from_parts(&config, without(), Vec::new(), Vec::new(), TriggerContext::default(), by_domain.clone(), tests.clone());
         let report = bench.run(&Filter::Domain("base".into())).unwrap();
         assert_eq!((report.misses(), report.false_fires()), (1, 0), "{report:?}");
+        let miss = &report.tested[0].outcomes[0].verdict;
+        // BO-18, `[match] min_score` unset (lynx's Q7 ruling): judged by keyword only, the reason as before, and the held-out
+        // score shown beside it and named in one line.
+        assert_eq!(miss.why, "matched: GLOBAL(always) · base: has no prompt keywords");
+        assert!(miss.score.is_some_and(|s| s > 0.0), "the test prompt shares `cut` with the rule's text: {miss:?}");
+        let text = report.render();
+        assert!(text.contains("scores: BM25, each fires-on prompt held out of its own rule; [match] min_score is unset, so the tests are judged by keyword only\n"), "{text}");
+        assert!(text.contains(&format!("\"the user prompt submit is cut off\"   score {:.2}\n", miss.score.unwrap_or_default())), "{text}");
+
+        // With a minimum set, a miss also says what its score was against it.
+        let mut set = BaseConfig::default();
+        set.matching.min_score = Some(100.0);
+        let bench = Bench::from_parts(&set, without(), Vec::new(), Vec::new(), TriggerContext::default(), by_domain.clone(), tests.clone());
+        let report = bench.run(&Filter::Domain("base".into())).unwrap();
         let why = &report.tested[0].outcomes[0].verdict.why;
-        assert_eq!(why, "matched: GLOBAL(always) · base: has no prompt keywords");
+        assert!(why.starts_with("matched: GLOBAL(always) · base: has no prompt keywords · score "), "{why}");
+        assert!(why.ends_with(" under min_score 100.00 (terms: cut)"), "{why}");
 
         let with = vec![domain("GLOBAL", "always", &[]), domain("base", "triggered", &["user prompt submit"])];
         let bench = Bench::from_parts(&config, with, Vec::new(), Vec::new(), TriggerContext::default(), by_domain, tests);

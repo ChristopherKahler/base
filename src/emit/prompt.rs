@@ -93,6 +93,48 @@ pub struct PromptBlock {
     /// The rules and decisions in the block, for the match log (K1, BO-13): served when the block is printed, cut for
     /// the budget when it is dropped. Never read for the output.
     pub logged: Vec<super::match_log::Item>,
+    /// A RANKED block's rules or decisions, one part each, best first (BO-18, K7d): the fit withholds a ranked block's
+    /// parts lowest score first, and the block prints its head, the parts it kept, its tail and one line naming what it
+    /// withheld. Empty for every other block, which is printed whole or dropped whole, as before.
+    pub parts: Vec<BlockPart>,
+    /// A ranked block's lines before its parts (the header, steering lines).
+    pub head: String,
+    /// A ranked block's lines after its parts.
+    pub tail: String,
+}
+
+/// One rule or decision of a ranked block: its line, its score, and what printing it records (D15) and logs (K1).
+#[derive(Debug, Clone)]
+pub struct BlockPart {
+    pub text: String,
+    pub score: f32,
+    pub claims: Vec<Claim>,
+    pub logged: Vec<super::match_log::Item>,
+}
+
+impl BlockPart {
+    pub fn new(text: &str, score: f32) -> Self {
+        BlockPart { text: text.trim_matches(['\r', '\n']).to_string(), score, claims: Vec::new(), logged: Vec::new() }
+    }
+
+    pub fn with_claims(mut self, claims: impl IntoIterator<Item = Claim>) -> Self {
+        self.claims.extend(claims);
+        self
+    }
+
+    pub fn with_logged(mut self, items: impl IntoIterator<Item = super::match_log::Item>) -> Self {
+        self.logged.extend(items);
+        self
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.text.len()
+    }
+}
+
+/// Lines joined one per line, empty ones left out.
+fn lines<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    parts.into_iter().map(|s| s.trim_matches(['\r', '\n'])).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n")
 }
 
 impl PromptBlock {
@@ -105,7 +147,56 @@ impl PromptBlock {
             noun,
             claims: Vec::new(),
             logged: Vec::new(),
+            parts: Vec::new(),
+            head: String::new(),
+            tail: String::new(),
         }
+    }
+
+    /// A ranked block (BO-18): `head`, then `parts` in the order given (the caller puts the best first), then `tail`.
+    /// Its text is all of them; `items` counts the parts. With no parts it is a plain block of `head` and `tail`.
+    pub fn ranked(
+        id: impl Into<String>,
+        priority: Priority,
+        head: &str,
+        parts: Vec<BlockPart>,
+        tail: &str,
+        noun: &'static str,
+    ) -> Self {
+        let text = lines(std::iter::once(head).chain(parts.iter().map(|p| p.text.as_str())).chain(std::iter::once(tail)));
+        let items = parts.len();
+        let mut b = PromptBlock::new(id, priority, &text, items, noun);
+        if !b.text.is_empty() && !parts.is_empty() {
+            b.head = head.trim_matches(['\r', '\n']).to_string();
+            b.tail = tail.trim_matches(['\r', '\n']).to_string();
+            b.parts = parts;
+        }
+        b
+    }
+
+    pub fn is_ranked(&self) -> bool {
+        !self.parts.is_empty()
+    }
+
+    /// Printing it records something: a claim of its own or of one of its parts.
+    pub fn has_claims(&self) -> bool {
+        !self.claims.is_empty() || self.parts.iter().any(|p| !p.claims.is_empty())
+    }
+
+    /// This ranked block as printed with only the parts `kept` marks: its head, those parts, its tail, and, when any
+    /// part is withheld, [`partial_line`]. With every part kept, its text.
+    fn render_kept(&self, kept: &[bool], key: &str, budget_bytes: usize) -> String {
+        let withheld: Vec<&BlockPart> = self.parts.iter().zip(kept).filter(|(_, k)| !**k).map(|(p, _)| p).collect();
+        if withheld.is_empty() {
+            return self.text.clone();
+        }
+        let bytes: usize = withheld.iter().map(|p| p.bytes()).sum();
+        let line = partial_line(self, withheld.len(), bytes, key, budget_bytes);
+        lines(
+            std::iter::once(self.head.as_str())
+                .chain(self.parts.iter().zip(kept).filter(|(_, k)| **k).map(|(p, _)| p.text.as_str()))
+                .chain([self.tail.as_str(), line.as_str()]),
+        )
     }
 
     pub fn with_claims(mut self, claims: impl IntoIterator<Item = Claim>) -> Self {
@@ -214,6 +305,18 @@ pub fn pointer_line(block: &PromptBlock, key: &str, budget_bytes: usize) -> Stri
     )
 }
 
+/// The line a partly printed ranked block ends with (BO-18): [`pointer_line`]'s shape, with how many of its parts it
+/// withheld out of how many, and their bytes (lynx's G0 verdict, condition 1).
+pub fn partial_line(block: &PromptBlock, withheld: usize, bytes: usize, key: &str, budget_bytes: usize) -> String {
+    format!(
+        "[base: withheld {withheld} of {} {} ({} bytes) over [budget] {key} = {budget_bytes} · full text: {}]",
+        block.parts.len(),
+        block.id,
+        thousands(bytes),
+        show_command(&block.id)
+    )
+}
+
 /// One line for every dropped block, used only when their pointer lines alone do not fit.
 fn aggregate_line(dropped: &[&PromptBlock], key: &str, budget_bytes: usize) -> String {
     let names: Vec<String> = dropped
@@ -254,9 +357,13 @@ pub struct Fitted {
     pub full_text: String,
     /// Every block, in output order.
     pub blocks: Vec<PromptBlock>,
-    /// Per block in [`Fitted::blocks`]: printed whole (true) or dropped (false).
+    /// Per block in [`Fitted::blocks`]: printed, whole or in part (true), or dropped whole (false).
     pub kept: Vec<bool>,
+    /// Per block: which of a ranked block's parts were printed. Empty for every other block.
+    pub parts_kept: Vec<Vec<bool>>,
     pub budget_bytes: usize,
+    /// The budget's key as the pointer lines name it.
+    pub key: String,
 }
 
 impl Fitted {
@@ -268,22 +375,66 @@ impl Fitted {
         self.full_text.len()
     }
 
+    /// The blocks printed, whole or in part.
     pub fn kept_blocks(&self) -> impl Iterator<Item = &PromptBlock> {
         self.blocks.iter().zip(&self.kept).filter(|(_, k)| **k).map(|(b, _)| b)
     }
 
+    /// The blocks dropped whole.
     pub fn dropped_blocks(&self) -> impl Iterator<Item = &PromptBlock> {
         self.blocks.iter().zip(&self.kept).filter(|(_, k)| !**k).map(|(b, _)| b)
     }
 
-    /// The bytes of every dropped block.
-    pub fn withheld_bytes(&self) -> usize {
-        self.dropped_blocks().map(PromptBlock::bytes).sum()
+    /// The ranked blocks printed with some parts withheld: each block, how many parts it withheld, and their bytes.
+    pub fn partial_blocks(&self) -> impl Iterator<Item = (&PromptBlock, usize, usize)> {
+        self.blocks.iter().enumerate().filter(|(i, _)| self.kept[*i]).filter_map(|(i, b)| {
+            let withheld: Vec<&BlockPart> =
+                b.parts.iter().zip(&self.parts_kept[i]).filter(|(_, k)| !**k).map(|(p, _)| p).collect();
+            (!withheld.is_empty()).then(|| (b, withheld.len(), withheld.iter().map(|p| p.bytes()).sum()))
+        })
     }
 
-    /// Something was dropped.
+    /// Block `i` exactly as printed, or `None` when it was dropped whole.
+    pub fn printed_text(&self, i: usize) -> Option<String> {
+        let b = self.blocks.get(i)?;
+        if !self.kept[i] {
+            return None;
+        }
+        Some(if b.is_ranked() { b.render_kept(&self.parts_kept[i], &self.key, self.budget_bytes) } else { b.text.clone() })
+    }
+
+    /// What the printed output records (D15): the claims of every printed block, and of the parts a ranked block
+    /// printed. A withheld part's rule stays due.
+    pub fn printed_claims(&self) -> Vec<&Claim> {
+        let mut out = Vec::new();
+        for (i, b) in self.blocks.iter().enumerate().filter(|(i, _)| self.kept[*i]) {
+            out.extend(b.claims.iter());
+            out.extend(b.parts.iter().zip(&self.parts_kept[i]).filter(|(_, k)| **k).flat_map(|(p, _)| p.claims.iter()));
+        }
+        out
+    }
+
+    /// Every item the blocks log (K1), with its block and whether it was printed: a block's own items with the block,
+    /// a part's with the part.
+    pub fn logged(&self) -> Vec<(&PromptBlock, &super::match_log::Item, bool)> {
+        let mut out = Vec::new();
+        for (i, b) in self.blocks.iter().enumerate() {
+            out.extend(b.logged.iter().map(|item| (b, item, self.kept[i])));
+            for (p, k) in b.parts.iter().zip(&self.parts_kept[i]) {
+                out.extend(p.logged.iter().map(|item| (b, item, self.kept[i] && *k)));
+            }
+        }
+        out
+    }
+
+    /// The bytes of every dropped block and of every withheld part.
+    pub fn withheld_bytes(&self) -> usize {
+        self.dropped_blocks().map(PromptBlock::bytes).sum::<usize>() + self.partial_blocks().map(|(_, _, b)| b).sum::<usize>()
+    }
+
+    /// Something was dropped or withheld.
     pub fn lost(&self) -> bool {
-        self.kept.iter().any(|k| !k)
+        self.kept.iter().any(|k| !k) || self.partial_blocks().next().is_some()
     }
 
     /// Every block was dropped that could be and the output is still over the budget: only a budget
@@ -306,78 +457,189 @@ impl Fitted {
 /// 4. Only when the pointer lines themselves do not fit do they become one line, and the blocks
 ///    still kept are dropped from the bottom until that fits; then step 3 runs again, since the one
 ///    line is far shorter than the pointer lines it replaced.
+///
+/// RANKED BLOCKS (BO-18, K7d, lynx's G0 verdict on Q1). A rule is the unit that is never cut. Within one priority the
+/// ranked blocks act as one unit at the place of the first of them, and inside that unit the fit withholds parts, the
+/// lowest score first, one at a time; a ranked block with every part withheld is dropped whole and leaves its pointer
+/// line. Put back best first. The priority order (F2) is untouched: ranking only reorders and sheds within a priority.
+/// Output with no ranked block is what it was before, byte for byte.
 pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -> Fitted {
     let header = header.trim_matches(['\r', '\n']);
     let mut blocks = blocks.blocks;
     blocks.sort_by_key(|b| b.priority);
     let n = blocks.len();
-    let pointers: Vec<String> = blocks.iter().map(|b| pointer_line(b, key, budget_bytes)).collect();
-    let mut kept = vec![true; n];
+    let units = drop_order(&blocks);
+    let mut state = FitState { kept: vec![true; n], parts: blocks.iter().map(|b| vec![true; b.parts.len()]).collect() };
 
-    let render = |kept: &[bool]| -> String {
-        compose(
-            header,
-            (0..n).map(|i| if kept[i] { blocks[i].text.as_str() } else { pointers[i].as_str() }),
-        )
-    };
-    let render_aggregate = |kept: &[bool]| -> String {
-        let dropped: Vec<&PromptBlock> = (0..n).filter(|i| !kept[*i]).map(|i| &blocks[i]).collect();
-        let line = (!dropped.is_empty()).then(|| aggregate_line(&dropped, key, budget_bytes));
-        compose(
-            header,
-            (0..n).filter(|i| kept[*i]).map(|i| blocks[i].text.as_str()).chain(line.as_deref()),
-        )
-    };
-
-    // Put back, highest priority first, every dropped block that fits the room left. Nothing kept is dropped for it.
-    let readmit = |kept: &mut Vec<bool>, text: &mut String, render: &dyn Fn(&[bool]) -> String| {
-        for i in 0..n {
-            if kept[i] {
-                continue;
-            }
-            kept[i] = true;
-            let trial = render(kept);
-            if trial.len() <= budget_bytes {
-                *text = trial;
+    let (text, full_text) = {
+        let pointers: Vec<String> = blocks.iter().map(|b| pointer_line(b, key, budget_bytes)).collect();
+        // Block `i` as `s` prints it, or `None` when it is dropped whole.
+        let piece = |s: &FitState, i: usize| -> Option<String> {
+            if blocks[i].is_ranked() {
+                s.parts[i].iter().any(|k| *k).then(|| blocks[i].render_kept(&s.parts[i], key, budget_bytes))
             } else {
-                kept[i] = false;
+                s.kept[i].then(|| blocks[i].text.clone())
             }
-        }
-    };
+        };
+        let render = |s: &FitState| -> String {
+            let pieces: Vec<String> = (0..n).map(|i| piece(s, i).unwrap_or_else(|| pointers[i].clone())).collect();
+            compose(header, pieces.iter().map(String::as_str))
+        };
+        let render_aggregate = |s: &FitState| -> String {
+            let dropped: Vec<&PromptBlock> = (0..n).filter(|i| piece(s, *i).is_none()).map(|i| &blocks[i]).collect();
+            let line = (!dropped.is_empty()).then(|| aggregate_line(&dropped, key, budget_bytes));
+            let pieces: Vec<String> = (0..n).filter_map(|i| piece(s, i)).collect();
+            compose(header, pieces.iter().map(String::as_str).chain(line.as_deref()))
+        };
 
-    let full_text = render(&kept);
-    let mut text = full_text.clone();
-    if text.len() > budget_bytes {
-        for i in (0..n).rev() {
+        // Put back, highest priority first (the best part first), every dropped block or withheld part that fits the
+        // room left. Nothing kept is dropped for it.
+        let readmit = |s: &mut FitState, text: &mut String, render: &dyn Fn(&FitState) -> String| {
+            for &u in units.iter().rev() {
+                if s.is_kept(u) {
+                    continue;
+                }
+                s.set(u, true);
+                let trial = render(s);
+                if trial.len() <= budget_bytes {
+                    *text = trial;
+                } else {
+                    s.set(u, false);
+                }
+            }
+        };
+
+        let full_text = render(&state);
+        let mut text = full_text.clone();
+        if text.len() > budget_bytes {
+            // A rule withheld from a ranked block costs the line that names it (or, its last, the block's pointer
+            // line), which can be longer than the rule. Withheld alone it would grow the output and push out a block of
+            // a higher priority (F2). So, as a block no longer than its pointer line is never dropped, a rule is
+            // withheld only in a run that shortens the output: it and, while the output is no shorter, the next rules
+            // of the same priority, lowest score first (two short rules of one block go together, and the block leaves
+            // its pointer line). A run that never gets shorter is put back and the next rule tried.
+            let mut k = 0;
+            while k < units.len() && text.len() > budget_bytes {
+                let u = units[k];
+                k += 1;
+                match u {
+                    Unit::Block(i) if blocks[i].bytes() <= pointers[i].len() => {}
+                    Unit::Block(_) => {
+                        state.set(u, false);
+                        text = render(&state);
+                    }
+                    Unit::Part(b, _) => {
+                        let priority = blocks[b].priority;
+                        let mut run = vec![u];
+                        state.set(u, false);
+                        let mut trial = render(&state);
+                        let mut next = k;
+                        while trial.len() >= text.len() {
+                            let Some(&Unit::Part(nb, nj)) = units.get(next) else { break };
+                            if blocks[nb].priority != priority {
+                                break;
+                            }
+                            state.set(Unit::Part(nb, nj), false);
+                            run.push(Unit::Part(nb, nj));
+                            trial = render(&state);
+                            next += 1;
+                        }
+                        if trial.len() < text.len() {
+                            text = trial;
+                            k = next;
+                        } else {
+                            for x in run {
+                                state.set(x, true);
+                            }
+                        }
+                    }
+                }
+            }
             if text.len() <= budget_bytes {
-                break;
-            }
-            if blocks[i].bytes() <= pointers[i].len() {
-                continue;
-            }
-            kept[i] = false;
-            text = render(&kept);
-        }
-        if text.len() <= budget_bytes {
-            readmit(&mut kept, &mut text, &render);
-        } else {
-            text = render_aggregate(&kept);
-            for i in (0..n).rev() {
+                readmit(&mut state, &mut text, &render);
+            } else {
+                text = render_aggregate(&state);
+                for &u in &units {
+                    if text.len() <= budget_bytes {
+                        break;
+                    }
+                    if state.is_kept(u) {
+                        state.set(u, false);
+                        text = render_aggregate(&state);
+                    }
+                }
+                // The one line is far shorter than the pointer lines it replaced, so blocks may fit again.
                 if text.len() <= budget_bytes {
-                    break;
-                }
-                if kept[i] {
-                    kept[i] = false;
-                    text = render_aggregate(&kept);
+                    readmit(&mut state, &mut text, &render_aggregate);
                 }
             }
-            // The one line is far shorter than the pointer lines it replaced, so blocks may fit again.
-            if text.len() <= budget_bytes {
-                readmit(&mut kept, &mut text, &render_aggregate);
-            }
+        }
+        (text, full_text)
+    };
+    let kept: Vec<bool> =
+        (0..n).map(|i| if blocks[i].is_ranked() { state.parts[i].iter().any(|k| *k) } else { state.kept[i] }).collect();
+    Fitted { text, full_text, blocks, kept, parts_kept: state.parts, budget_bytes, key: key.to_string() }
+}
+
+/// What the fit drops or withholds, one at a time: a plain block, or one part of a ranked block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    Block(usize),
+    Part(usize, usize),
+}
+
+/// Which blocks and parts the fit has kept so far.
+struct FitState {
+    kept: Vec<bool>,
+    parts: Vec<Vec<bool>>,
+}
+
+impl FitState {
+    fn is_kept(&self, u: Unit) -> bool {
+        match u {
+            Unit::Block(i) => self.kept[i],
+            Unit::Part(i, j) => self.parts[i][j],
         }
     }
-    Fitted { text, full_text, blocks, kept, budget_bytes }
+
+    fn set(&mut self, u: Unit, kept: bool) {
+        match u {
+            Unit::Block(i) => self.kept[i] = kept,
+            Unit::Part(i, j) => self.parts[i][j] = kept,
+        }
+    }
+}
+
+/// The order the fit drops in, first dropped first, over blocks already in priority order: the lowest priority first,
+/// within one priority the last pushed first, and the ranked blocks of a priority as one unit at the place of the first
+/// of them, their parts lowest score first (ties: the later block, then the later part, goes first). With no ranked
+/// block this is every block from the last to the first, as before.
+fn drop_order(blocks: &[PromptBlock]) -> Vec<Unit> {
+    let mut out = Vec::new();
+    let mut end = blocks.len();
+    while end > 0 {
+        let p = blocks[end - 1].priority;
+        let mut start = end - 1;
+        while start > 0 && blocks[start - 1].priority == p {
+            start -= 1;
+        }
+        let ranked: Vec<usize> = (start..end).filter(|&k| blocks[k].is_ranked()).collect();
+        for k in (start..end).rev() {
+            if !blocks[k].is_ranked() {
+                out.push(Unit::Block(k));
+            } else if ranked.first() == Some(&k) {
+                let mut parts: Vec<(usize, usize)> =
+                    ranked.iter().flat_map(|&b| (0..blocks[b].parts.len()).map(move |j| (b, j))).collect();
+                parts.sort_by(|x, y| {
+                    let (sx, sy) = (blocks[x.0].parts[x.1].score, blocks[y.0].parts[y.1].score);
+                    sx.total_cmp(&sy).then(y.cmp(x))
+                });
+                out.extend(parts.into_iter().map(|(b, j)| Unit::Part(b, j)));
+            }
+        }
+        end = start;
+    }
+    out
 }
 
 /// Print the fitted output: the prompt hook's one writer.
@@ -413,6 +675,14 @@ struct BlockRow {
     bytes: usize,
     printed: bool,
     text: String,
+    /// A ranked block printed with parts withheld (BO-18): how many it withheld, their bytes, and the text as printed.
+    /// Absent on every other block, so a file with none reads as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    withheld_items: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    withheld_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    printed_text: Option<String>,
 }
 
 /// Keep `fitted`'s blocks for `session_id`, so `base hooks show <block>` can print one, and drop the
@@ -435,15 +705,21 @@ pub fn write_blocks(base: &Path, session_id: &str, fitted: &Fitted) -> FullOutpu
         blocks: fitted
             .blocks
             .iter()
-            .zip(&fitted.kept)
-            .map(|(b, kept)| BlockRow {
-                id: b.id.clone(),
-                priority: b.priority.number(),
-                items: b.items,
-                noun: b.noun.to_string(),
-                bytes: b.bytes(),
-                printed: *kept,
-                text: b.text.clone(),
+            .enumerate()
+            .map(|(i, b)| {
+                let partial = fitted.partial_blocks().find(|(p, _, _)| std::ptr::eq(*p, b));
+                BlockRow {
+                    id: b.id.clone(),
+                    priority: b.priority.number(),
+                    items: b.items,
+                    noun: b.noun.to_string(),
+                    bytes: b.bytes(),
+                    printed: fitted.kept[i],
+                    text: b.text.clone(),
+                    withheld_items: partial.map(|(_, n, _)| n),
+                    withheld_bytes: partial.map(|(_, _, bytes)| bytes),
+                    printed_text: partial.and_then(|_| fitted.printed_text(i)),
+                }
             })
             .collect(),
     };
@@ -522,7 +798,11 @@ pub fn show(base: &Path, session: Option<&str>, block: Option<&str>) -> Result<S
                 b.priority,
                 counted(b.items, if b.noun.is_empty() { "item" } else { &b.noun }),
                 thousands(b.bytes),
-                if b.printed { "printed" } else { "withheld" }
+                match (b.printed, b.withheld_items) {
+                    (true, Some(w)) => format!("printed, {w} of {} withheld", b.items),
+                    (true, None) => "printed".to_string(),
+                    (false, _) => "withheld".to_string(),
+                }
             ));
         }
         return Ok(Shown { stdout: out, note });
@@ -763,6 +1043,160 @@ mod tests {
         assert!(f.text.len() <= 1000, "{} bytes:\n{}", f.text.len(), f.text);
         assert_eq!(f.text.lines().filter(|l| l.starts_with("[base: withheld")).count(), 1, "one line:\n{}", f.text);
         assert_eq!(kept_ids(&f).first(), Some(&"hooks-rules"), "the matched block was put back:\n{}", f.text);
+    }
+
+    /// A ranked block of `scores.len()` rules, each line `bytes` long, a claim and a logged item per rule.
+    fn ranked(id: &str, p: Priority, scores: &[f32], bytes: usize) -> PromptBlock {
+        let parts = scores
+            .iter()
+            .enumerate()
+            .map(|(j, s)| {
+                let line: String = format!("  {j}. {id} rule scored {s} ").chars().chain(std::iter::repeat('r')).take(bytes).collect();
+                BlockPart::new(&line, *s)
+                    .with_claims([Claim::Rule { id: format!("{id}-{j}"), content: 0, scope: None }])
+                    .with_logged([super::super::match_log::Item::rule(&format!("{id}-{j}"), id)])
+            })
+            .collect();
+        PromptBlock::ranked(id, p, &format!("[DOMAIN: {id}]"), parts, "", "rule")
+    }
+
+    fn printed_rule_ids(f: &Fitted) -> Vec<String> {
+        f.printed_claims()
+            .into_iter()
+            .filter_map(|c| match c {
+                Claim::Rule { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// BO-18 (K7d, lynx's G0 Q1): a ranked block that does not fit keeps its best rules and withholds the rest, lowest
+    /// score first, ending with one line in the pointer line's shape; only the printed rules are recorded as shown
+    /// (D15) and logged as served.
+    #[test]
+    fn a_ranked_block_sheds_its_lowest_rule_first_and_names_what_it_withheld() {
+        let b = ranked("tools-rules", Priority::Matched, &[5.0, 4.0, 3.0, 2.0, 1.0], 300);
+        let full = b.text.len();
+        let f = fit(HEADER, blocks(vec![b]), 1300, KEY);
+        assert!(f.text.len() <= 1300, "{} bytes:\n{}", f.text.len(), f.text);
+        assert!(full > 1300, "control: the block alone is over the budget");
+        assert_eq!(printed_rule_ids(&f), ["tools-rules-0", "tools-rules-1", "tools-rules-2"], "the three best:\n{}", f.text);
+        assert_eq!(kept_ids(&f), ["tools-rules"], "printed in part, not dropped");
+        let last = f.text.trim_end().lines().last().unwrap_or_default();
+        assert_eq!(
+            last,
+            "[base: withheld 2 of 5 tools-rules (600 bytes) over [budget] prompt_bytes = 1300 · full text: base hooks show tools-rules]"
+        );
+        assert!(f.text.contains("  0. tools-rules") && !f.text.contains("  3. tools-rules"), "{}", f.text);
+        let (_, n, bytes) = f.partial_blocks().next().expect("one partial block");
+        assert_eq!((n, bytes), (2, 600));
+        assert_eq!(f.withheld_bytes(), 600);
+        assert!(f.lost());
+        let served: Vec<&str> = f.logged().into_iter().filter(|(_, _, p)| *p).map(|(_, i, _)| i.id.as_str()).collect();
+        assert_eq!(served, ["tools-rules-0", "tools-rules-1", "tools-rules-2"]);
+        assert_eq!(f.printed_text(0).as_deref(), Some(f.text.split_once("\n\n").map(|x| x.1.trim_end()).unwrap_or_default()));
+    }
+
+    /// The ranked blocks of one priority shed as one unit, by score across blocks; a plain block pushed after the first
+    /// of them still goes before them, one pushed before them after them (today's order otherwise).
+    #[test]
+    fn ranked_rules_of_one_priority_go_lowest_score_first_across_blocks() {
+        let f = fit(
+            HEADER,
+            blocks(vec![
+                block("check-line", Priority::Matched, 300),
+                ranked("a-rules", Priority::Matched, &[9.0, 2.0], 300),
+                ranked("b-rules", Priority::Matched, &[5.0, 1.0], 300),
+                block("linked-mode", Priority::Matched, 300),
+            ]),
+            1500,
+            KEY,
+        );
+        assert!(f.text.len() <= 1500, "{} bytes:\n{}", f.text.len(), f.text);
+        assert_eq!(dropped_ids(&f), ["linked-mode"], "pushed after the first ranked block: dropped before any rule");
+        assert!(kept_ids(&f).contains(&"check-line"), "pushed before them: kept longest");
+        let score = |id: &str| match id {
+            "a-rules-0" => 9.0,
+            "b-rules-0" => 5.0,
+            "a-rules-1" => 2.0,
+            _ => 1.0,
+        };
+        let printed = printed_rule_ids(&f);
+        let withheld: Vec<&str> =
+            ["a-rules-0", "a-rules-1", "b-rules-0", "b-rules-1"].into_iter().filter(|id| !printed.iter().any(|p| p == id)).collect();
+        assert!(withheld.len() >= 2, "control: rules from both blocks were withheld:\n{}", f.text);
+        for p in &printed {
+            for w in &withheld {
+                assert!(score(p) >= score(w), "{p} printed and {w} withheld, against their scores:\n{}", f.text);
+            }
+        }
+    }
+
+    /// F2 stands: a lower priority's best rule goes before a higher priority's worst.
+    #[test]
+    fn ranking_never_crosses_priorities() {
+        let f = fit(
+            HEADER,
+            blocks(vec![
+                ranked("global-rules", Priority::Global, &[50.0, 40.0], 400),
+                ranked("tools-rules", Priority::Matched, &[0.5, 0.1], 400),
+            ]),
+            1100,
+            KEY,
+        );
+        assert!(f.text.len() <= 1100, "{} bytes:\n{}", f.text.len(), f.text);
+        assert_eq!(printed_rule_ids(&f), ["tools-rules-0", "tools-rules-1"], "{}", f.text);
+        assert_eq!(dropped_ids(&f), ["global-rules"], "every part withheld: dropped whole, with its pointer line");
+        assert!(f.text.contains("[base: withheld global-rules (2 rules, "), "{}", f.text);
+    }
+
+    /// A short rule whose withholding would cost more than it saves (the block's pointer line is longer than the block)
+    /// is not withheld, so the fit drops the next block instead of a higher-priority one (F2). Before this guard the
+    /// fit withheld it, dropped the middle block, still did not fit, dropped the top block, and the readmission could
+    /// not put the top block back while the lower ones printed.
+    #[test]
+    fn a_rule_shorter_than_its_pointer_line_is_not_withheld_over_a_higher_block() {
+        let top = block("top-rules", Priority::Matched, 1000);
+        let mid = block("mid-context", Priority::Context, 400);
+        let low = ranked("low-rules", Priority::Relay, &[1.0], 30);
+        let full = fit(HEADER, blocks(vec![top.clone(), mid.clone(), low.clone()]), usize::MAX, KEY).full_text.len();
+        let over = 266;
+        let budget = full - over;
+        let mid_saves = mid.bytes() - pointer_line(&mid, KEY, budget).len();
+        let low_costs = pointer_line(&low, KEY, budget).len() - low.bytes();
+        assert!(over > mid_saves - low_costs && over < mid_saves, "control: {mid_saves} saved, {low_costs} cost, {over} over");
+        let f = fit(HEADER, blocks(vec![top, mid, low]), budget, KEY);
+        assert!(f.text.len() <= budget, "{} bytes:\n{}", f.text.len(), f.text);
+        assert_eq!(kept_ids(&f), ["top-rules", "low-rules"], "{}", f.text);
+        assert_eq!(dropped_ids(&f), ["mid-context"]);
+        assert_eq!(printed_rule_ids(&f), ["low-rules-0"]);
+    }
+
+    /// Two rules each shorter than the line naming a withheld rule: withheld one at a time neither shortens the output,
+    /// withheld together their block leaves its pointer line, which does. They go together, and the higher priority's
+    /// block stays whole (a guard that judged each rule alone kept both and cut the higher block instead).
+    #[test]
+    fn short_rules_of_one_block_are_withheld_together() {
+        let top = ranked("top-rules", Priority::Matched, &[2.0, 1.0], 400);
+        let low = ranked("low-rules", Priority::Global, &[2.0, 1.0], 70);
+        let full = fit(HEADER, blocks(vec![top.clone(), low.clone()]), usize::MAX, KEY).full_text.len();
+        let budget = full - (low.bytes() - pointer_line(&low, KEY, full).len());
+        assert!(low.parts.iter().all(|p| p.bytes() < 110), "control: each low rule is shorter than a withheld-rules line");
+        let f = fit(HEADER, blocks(vec![top, low]), budget, KEY);
+        assert!(f.text.len() <= budget, "{} bytes:\n{}", f.text.len(), f.text);
+        assert_eq!(dropped_ids(&f), ["low-rules"], "{}", f.text);
+        assert_eq!(printed_rule_ids(&f), ["top-rules-0", "top-rules-1"], "the higher block whole:\n{}", f.text);
+    }
+
+    /// Readmission puts the best withheld rule back first: dropping a large low rule makes room a better one fills.
+    #[test]
+    fn readmission_puts_the_best_withheld_rule_back_first() {
+        let mut list = ranked("tools-rules", Priority::Matched, &[3.0, 2.0, 1.0], 200);
+        list.parts[2].text = format!("{}{}", list.parts[2].text, "x".repeat(800));
+        let list = PromptBlock::ranked("tools-rules", Priority::Matched, "[DOMAIN: tools-rules]", list.parts, "", "rule");
+        let f = fit(HEADER, blocks(vec![list]), 700, KEY);
+        assert!(f.text.len() <= 700, "{} bytes:\n{}", f.text.len(), f.text);
+        assert_eq!(printed_rule_ids(&f), ["tools-rules-0", "tools-rules-1"], "{}", f.text);
     }
 
     #[test]

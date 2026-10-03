@@ -204,6 +204,7 @@ pub fn handle(
     push_global_decisions(graph.as_ref(), cwd, config, out);
     push_rule_proposals(graph.as_ref(), config, out);
     push_rule_pass(session_id, config, out);
+    refresh_score_index(graph.as_ref(), cwd, config);
 
     if let Ok(signal_result) = crate::signal::run_signals(cwd, config, "session-start") {
         diagnostics.extend(signal_result.diagnostics.iter().cloned());
@@ -334,6 +335,24 @@ fn load_session_graph(cwd: &Path, config: &BaseConfig) -> Option<oxigraph::store
     let graph = store::load_graphs(&paths).ok()?;
     ontology::load_vocabulary(&graph, &config.namespace).ok()?;
     Some(graph)
+}
+
+/// K7e (BO-18): count the rule index the prompt hook ranks by, from the graph session start already loaded, into the
+/// folder the prompt hook reads it from. Unchanged scoring texts write nothing. Silent: a failure is one line on stderr
+/// and the prompt hook serves keyword-only until a later sync builds it; `base doctor` names a missing index.
+fn refresh_score_index(graph: Option<&oxigraph::store::Store>, cwd: &Path, config: &BaseConfig) {
+    if !config.matching.bm25 {
+        return;
+    }
+    let Some(dir) = crate::domain::score_index::index_dir(cwd) else { return };
+    let domains = crate::domain::load_domains(cwd);
+    // Session start's own load is strict and gives nothing on one bad line; the index is then counted from the lenient
+    // load the commands use (`store::load_merged`), never from no graph at all, or it would lose every graph rule and
+    // decision until the next command rebuilt it.
+    let lenient = graph.is_none().then(|| crate::store::load_merged(cwd)).flatten();
+    if let Err(why) = crate::domain::score_index::refresh(graph.or(lenient.as_ref()), config, &domains, &dir) {
+        eprintln!("base: could not build the rule index in {}: {why}", dir.display());
+    }
 }
 
 /// The global decisions with no keywords (BO-03, F5): a decision of an always-on domain reaches a prompt only

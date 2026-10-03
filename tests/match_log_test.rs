@@ -194,7 +194,10 @@ fn match_log_row_for_prompt() {
     assert_eq!(decision["id"], slug.as_str(), "a decision by its slug");
     assert_eq!(decision["block"], "global-decisions");
     assert_eq!(row["cut"], serde_json::json!([]));
-    assert_eq!(row["scores"], serde_json::json!([]));
+    // BO-18 (K7f): no topic rule scored; the prompt's BM25 scores are logged, the keyword-matched decision's among them.
+    let scores = row["scores"].as_array().expect("scores");
+    assert!(scores.iter().all(|s| s["by"] == "bm25"), "{scores:#?}");
+    assert!(scores.iter().any(|s| s["id"] == slug.as_str()), "the decision's score: {scores:#?}");
     assert!(row.get("tool").is_none() && row.get("path").is_none(), "{row}");
     assert_owner_only(&h.log_path());
 }
@@ -323,10 +326,12 @@ fn match_log_records_topic_cuts_and_scores() {
     assert_eq!(find(&third)["reason"], "not matched");
     assert_eq!(find(&third)["limit"], "topic_min_score");
     assert_eq!(find(&third)["score"], 0.25, "one rule-text word: under the 0.75 minimum");
+    // BO-18: the row also holds the prompt's BM25 scores (`by: bm25`, K7f); `select`'s are the `topic` ones.
     let mut scores: Vec<(String, f64)> = row["scores"]
         .as_array()
         .unwrap()
         .iter()
+        .filter(|s| s["by"] == "topic")
         .map(|s| (s["id"].as_str().unwrap().to_string(), s["score"].as_f64().unwrap()))
         .collect();
     let mut want = vec![(first, 2.0), (second, 1.0), (third, 0.25)];
