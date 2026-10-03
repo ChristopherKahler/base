@@ -296,13 +296,12 @@ fn evidence(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Evidence, St
             manual: true,
         });
     }
-    let session = crate::relay::env_session_id().or_else(|| {
-        args.transcript
-            .as_deref()
-            .and_then(|t| Path::new(t).file_stem())
-            .and_then(|s| s.to_str())
-            .map(String::from)
-    });
+    // A transcript named with --transcript is its own session's, whoever runs the command: gate 4 and BO-17 read past
+    // turns from inside another Claude Code session, whose CLAUDE_CODE_SESSION_ID is not the transcript's.
+    let session = match args.transcript.as_deref() {
+        Some(t) => Path::new(t).file_stem().and_then(|s| s.to_str()).map(String::from),
+        None => crate::relay::env_session_id(),
+    };
     let path = transcript_for(cwd, args.transcript.as_deref(), session.as_deref())?;
     let events = transcript::read_all(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let turns = super::turns(events, &config.corrections);

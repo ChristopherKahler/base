@@ -339,10 +339,8 @@ pub fn on_stop(config: &BaseConfig, cwd: &Path, event: &serde_json::Value, sessi
                                 }
                             }
                         }
-                        Event::Wrote(f) => {
-                            if !state.turn_writes.contains(&f) && state.turn_writes.len() < MAX_WRITTEN {
-                                state.turn_writes.push(f);
-                            }
+                        Event::Wrote(f) if !state.turn_writes.contains(&f) && state.turn_writes.len() < MAX_WRITTEN => {
+                            state.turn_writes.push(f);
                         }
                         _ => {}
                     }
