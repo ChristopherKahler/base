@@ -90,6 +90,9 @@ pub struct PromptBlock {
     /// What `items` counts, singular: "rule", "record", "message".
     pub noun: &'static str,
     pub claims: Vec<Claim>,
+    /// The rules and decisions in the block, for the match log (K1, BO-13): served when the block is printed, cut for
+    /// the budget when it is dropped. Never read for the output.
+    pub logged: Vec<super::match_log::Item>,
 }
 
 impl PromptBlock {
@@ -101,11 +104,17 @@ impl PromptBlock {
             items,
             noun,
             claims: Vec::new(),
+            logged: Vec::new(),
         }
     }
 
     pub fn with_claims(mut self, claims: impl IntoIterator<Item = Claim>) -> Self {
         self.claims.extend(claims);
+        self
+    }
+
+    pub fn with_logged(mut self, items: impl IntoIterator<Item = super::match_log::Item>) -> Self {
+        self.logged.extend(items);
         self
     }
 

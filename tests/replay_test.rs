@@ -433,6 +433,53 @@ fn replay_prompt_output_is_whole_blocks_in_priority_order() {
     println!("replay: {} prompts, {cut} with blocks dropped whole", prompt_runs().len());
 }
 
+/// BO-13 (K1, D2). Every corpus prompt writes one match-log row for its session, and the row agrees with what the hook
+/// printed: each rule or decision it lists as served sits in a block that was printed, each one cut for the budget in
+/// a block that was dropped, and every rules block and the global decisions block are listed whole, item for item.
+/// Before BO-13 nothing recorded which rules a prompt matched or lost, or that a prompt matched only the always-on
+/// domain.
+#[test]
+fn replay_every_prompt_logs_what_it_matched_served_and_cut() {
+    let runs = prompt_runs();
+    let log = runs[0].ws.join(".base").join("match-log.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap_or_else(|e| panic!("{}: {e}", log.display()));
+    let rows: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).expect("a row")).collect();
+    let (mut budget_cuts, mut only_always) = (0usize, 0usize);
+    for run in runs {
+        let p = &run.prompt;
+        let mine: Vec<&serde_json::Value> = rows.iter().filter(|r| r["session"] == run.session.as_str()).collect();
+        assert_eq!(mine.len(), 1, "{p:?}: one row per prompt");
+        let row = mine[0];
+        assert_eq!(row["event"], "prompt");
+        assert_eq!(row["text"], base::scrub::scrub(p).as_str(), "{p:?}: the prompt, scrubbed");
+        let file = seed::prompt_blocks(&run.ws, &run.session);
+        let printed = |block: &str| file.blocks.iter().find(|b| b.id == block).map(|b| b.printed);
+        let served = row["served"].as_array().expect("served");
+        let cut = row["cut"].as_array().expect("cut");
+        for item in served {
+            let block = item["block"].as_str().unwrap_or_default();
+            assert_eq!(printed(block), Some(true), "{p:?}: served from a block that was not printed: {item}");
+        }
+        for c in cut.iter().filter(|c| c["limit"] == "prompt_bytes") {
+            let block = c["block"].as_str().unwrap_or_default();
+            assert_eq!(printed(block), Some(false), "{p:?}: cut for the budget from a block that printed: {c}");
+            budget_cuts += 1;
+        }
+        for b in file.blocks.iter().filter(|b| b.id.ends_with("-rules") || b.id == "global-decisions") {
+            let listed = served.iter().chain(cut).filter(|i| i["block"] == b.id.as_str()).count();
+            assert_eq!(listed, b.items, "{p:?}: block {} holds {} items and the row lists {listed}", b.id, b.items);
+        }
+        let matched = row["matched"].as_array().expect("matched");
+        only_always += usize::from(!matched.is_empty() && matched.iter().all(|m| m["by"] == "always"));
+    }
+    assert!(budget_cuts > 0, "control: the corpus drops blocks, so a budget cut was checked");
+    println!(
+        "replay match log: {} prompts, {} rows, {budget_cuts} rules or decisions cut for the budget, {only_always} matched only the always-on domain",
+        runs.len(),
+        rows.len()
+    );
+}
+
 /// BO-02 (F6c). The corpus runs at the shipped budgets, and those are now the size `base doctor --measure` found the
 /// host delivering whole on Claude Code 2.1.287: no prompt prints more than that, and a block larger than the old
 /// 4,000-byte cap prints whole. On the operator's store the always-on rules block is 9,372 bytes, and under the old

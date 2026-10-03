@@ -30,6 +30,7 @@ base secret list                         # secret NAMES only, never values
 base changes [-g] [--since <offset>] [--cursor]   # graph write log as JSON; --cursor prints the end offset only
 base hooks manifest                      # base's hook wiring as JSON, for an installer outside base
 base hooks show [<block>] [--session <id>]   # one block of this session's last prompt-hook output; no block: list them
+base log matches [--last <n>] [--session <id>] [--rule <id>] [--json]   # what each prompt and file touch matched, by what, and what was served and cut
 ```
 
 Projects, milestones, tasks (read side):

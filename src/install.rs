@@ -565,8 +565,16 @@ write_full_output = true     # untrimmed hook output also goes to .base/hook-out
 # Each session's own hook output (its full session start, its last prompt's
 # output, its handoff letters) is kept in .base/hook-output/<session id>/.
 # Session start removes a session's folder once untouched this many days.
+# .base/match-log.jsonl records what every prompt and file touch matched,
+# what was served and what was cut (`base log matches`); session start
+# removes its rows older than the same number of days. It stays on this
+# machine, and secrets (API keys, tokens, passwords, private keys) are
+# replaced with [SECRET:<kind>] before anything is written.
+# prompt_text: "full" keeps each prompt, "matched" only the words that
+# matched a keyword or rule, "off" no prompt text at all.
 [log]
 prompt_days = 90
+prompt_text = "full"
 
 # ─── [doctor] — what `base doctor` calls stale ───────────────
 # A project's next step older than this many days is flagged, with the

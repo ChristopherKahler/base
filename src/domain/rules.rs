@@ -817,20 +817,39 @@ pub fn content_words(text: &str) -> HashSet<String> {
 /// Own words and domain keywords match as whole phrases with `contains_word`, so `ping chris` is one phrase, not two
 /// loose words. Text words match as a set, capped at [`TOPIC_TEXT_CAP`] in total.
 pub fn topic_score(prompt: &str, own_words: &[String], rule_text: &str, domain_keywords: &[String]) -> f32 {
+    topic_match(prompt, own_words, rule_text, domain_keywords).score
+}
+
+/// [`topic_score`] and the words that earned it, so the match log can keep what matched (K1c `matched`) without
+/// scoring again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopicMatch {
+    pub score: f32,
+    /// The own phrases, keyword phrases and rule-text words the prompt carried, sorted.
+    pub words: Vec<String>,
+}
+
+/// The one scorer behind [`topic_score`].
+pub fn topic_match(prompt: &str, own_words: &[String], rule_text: &str, domain_keywords: &[String]) -> TopicMatch {
     let lower = prompt.to_lowercase();
-    let phrases = |list: &[String]| {
+    let phrases = |list: &[String]| -> Vec<String> {
         list.iter()
             .map(|w| w.trim().to_lowercase())
             .filter(|w| !w.is_empty())
             .collect::<HashSet<_>>()
             .into_iter()
             .filter(|w| domain::matcher::contains_word(&lower, w))
-            .count() as f32
+            .collect()
     };
-    let text_hits = content_words(rule_text).intersection(&content_words(prompt)).count() as f32;
-    phrases(own_words) * TOPIC_OWN_PHRASE
-        + phrases(domain_keywords) * TOPIC_KEYWORD_PHRASE
-        + (text_hits * TOPIC_TEXT_WORD).min(TOPIC_TEXT_CAP)
+    let (own, keywords) = (phrases(own_words), phrases(domain_keywords));
+    let text: Vec<String> = content_words(rule_text).intersection(&content_words(prompt)).cloned().collect();
+    let score = own.len() as f32 * TOPIC_OWN_PHRASE
+        + keywords.len() as f32 * TOPIC_KEYWORD_PHRASE
+        + (text.len() as f32 * TOPIC_TEXT_WORD).min(TOPIC_TEXT_CAP);
+    let mut words: Vec<String> = own.into_iter().chain(keywords).chain(text).collect();
+    words.sort();
+    words.dedup();
+    TopicMatch { score, words }
 }
 
 // ─── Loading the rules that carry matchers ───────────────────────────────────
@@ -1010,6 +1029,57 @@ impl Why {
             Why::Always | Why::Topic(_) => None,
         }
     }
+
+    /// The match log's `by` (K1): `always`, `topic`, `place: <place>`, `action: <action>`.
+    pub fn label(&self) -> String {
+        match self {
+            Why::Always => "always".to_string(),
+            Why::Place(p) => format!("place: {p}"),
+            Why::Action(a) => format!("action: {a}"),
+            Why::Topic(_) => "topic".to_string(),
+        }
+    }
+
+    /// A topic rule's score; `None` for every other reason.
+    pub fn score(&self) -> Option<f32> {
+        match self {
+            Why::Topic(s) => Some(*s),
+            _ => None,
+        }
+    }
+}
+
+/// The match log's entries for what a selection served (K1).
+pub fn served_items(served: &[Served]) -> Vec<crate::emit::match_log::Item> {
+    served
+        .iter()
+        .map(|s| crate::emit::match_log::Item {
+            by: Some(s.why.label()),
+            score: s.why.score(),
+            ..crate::emit::match_log::Item::rule(&s.rule.id, &s.rule.domain)
+        })
+        .collect()
+}
+
+/// The match log's entries for what a selection cut and why (K1): `topic limit` under `topic_max`, `not matched`
+/// under `topic_min_score`.
+pub fn cut_items(selection: &Selection) -> Vec<crate::emit::match_log::Cut> {
+    selection
+        .cut
+        .iter()
+        .map(|c| {
+            let (reason, limit) = match c.reason {
+                CutReason::TopicLimit => ("topic limit", "topic_max"),
+                CutReason::NotMatched => ("not matched", "topic_min_score"),
+            };
+            let item = crate::emit::match_log::Item {
+                by: Some("topic".into()),
+                score: Some(c.score),
+                ..crate::emit::match_log::Item::rule(&c.id, &c.domain)
+            };
+            crate::emit::match_log::Cut::new(item, reason, limit)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1023,6 +1093,39 @@ pub struct Selection {
     pub served: Vec<Served>,
     /// Per domain, how many topic rules matched this prompt and were cut by `topic_max`: F6's pointer line.
     pub topic_withheld: Vec<(String, usize)>,
+    /// Every rule `select` scored and did not return, and why (K1, BO-13). The prompt budget, the third reason, is
+    /// decided later by the fit and is not here.
+    pub cut: Vec<CutRule>,
+    /// Every topic score above zero `select` computed, in rule order: served, cut, or not due because this session
+    /// was already shown the rule (K1's "the scores `select` used").
+    pub scores: Vec<Scored>,
+}
+
+/// Why `select` scored a rule and did not return it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutReason {
+    /// It matched and was due, and `[rules] topic_max` cut it.
+    TopicLimit,
+    /// It scored above zero and under `[rules] topic_min_score`.
+    NotMatched,
+}
+
+/// A rule [`select`] scored and did not return.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CutRule {
+    pub id: String,
+    pub domain: String,
+    pub reason: CutReason,
+    pub score: f32,
+}
+
+/// One topic score [`select`] computed, and the words that earned it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Scored {
+    pub id: String,
+    pub domain: String,
+    pub score: f32,
+    pub words: Vec<String>,
 }
 
 /// What [`select`] needs beyond the rules and the event.
@@ -1065,11 +1168,25 @@ pub fn select_unrecorded(
     let mut seen: HashSet<&str> = HashSet::new();
     let mut topics: Vec<(usize, Why)> = Vec::new();
     let mut others: Vec<(usize, Why)> = Vec::new();
+    let mut cut: Vec<CutRule> = Vec::new();
+    let mut scores: Vec<Scored> = Vec::new();
     for (i, c) in converted.iter().enumerate() {
         if !seen.insert(c.rule.id.as_str()) {
             continue;
         }
-        let Some(why) = first_hit(c, event, &parts, cx) else {
+        let (hit, topic) = first_hit(c, event, &parts, cx);
+        if let Some(t) = topic.filter(|t| t.score > 0.0) {
+            if hit.is_none() {
+                cut.push(CutRule {
+                    id: c.rule.id.clone(),
+                    domain: c.rule.domain.clone(),
+                    reason: CutReason::NotMatched,
+                    score: t.score,
+                });
+            }
+            scores.push(Scored { id: c.rule.id.clone(), domain: c.rule.domain.clone(), score: t.score, words: t.words });
+        }
+        let Some(why) = hit else {
             continue;
         };
         let reshow = match why {
@@ -1085,12 +1202,13 @@ pub fn select_unrecorded(
     let score = |w: &Why| if let Why::Topic(s) = w { *s } else { 0.0 };
     topics.sort_by(|a, b| score(&b.1).total_cmp(&score(&a.1)));
     let mut topic_withheld: Vec<(String, usize)> = Vec::new();
-    for (i, _) in topics.iter().skip(cx.rules.topic_max) {
-        let domain = &converted[*i].rule.domain;
-        match topic_withheld.iter_mut().find(|(d, _)| d == domain) {
+    for (i, why) in topics.iter().skip(cx.rules.topic_max) {
+        let rule = &converted[*i].rule;
+        match topic_withheld.iter_mut().find(|(d, _)| *d == rule.domain) {
             Some((_, n)) => *n += 1,
-            None => topic_withheld.push((domain.clone(), 1)),
+            None => topic_withheld.push((rule.domain.clone(), 1)),
         }
+        cut.push(CutRule { id: rule.id.clone(), domain: rule.domain.clone(), reason: CutReason::TopicLimit, score: score(why) });
     }
     topics.truncate(cx.rules.topic_max);
 
@@ -1099,27 +1217,35 @@ pub fn select_unrecorded(
         .chain(topics)
         .map(|(i, why)| Served { rule: converted[i].rule.clone(), why })
         .collect();
-    Selection { served, topic_withheld }
+    Selection { served, topic_withheld, cut, scores }
 }
 
-fn first_hit(c: &Converted, event: &Event<'_>, parts: &[Vec<String>], cx: &SelectContext<'_>) -> Option<Why> {
+/// The first reason `c` fires on this event, and, for a topic rule on a prompt, the score it was judged on (fired or
+/// not), so `select` can say what it scored without scoring twice.
+fn first_hit(
+    c: &Converted,
+    event: &Event<'_>,
+    parts: &[Vec<String>],
+    cx: &SelectContext<'_>,
+) -> (Option<Why>, Option<TopicMatch>) {
     let has = |k: Kind| c.matchers.iter().any(|m| m.kind == k);
     match event {
-        Event::SessionStart => has(Kind::Always).then_some(Why::Always),
+        Event::SessionStart => (has(Kind::Always).then_some(Why::Always), None),
         Event::Prompt { text } => {
             if has(Kind::Always) {
-                return Some(Why::Always);
+                return (Some(Why::Always), None);
             }
             if !has(Kind::Topic) {
-                return None;
+                return (None, None);
             }
             let own: Vec<String> =
                 c.matchers.iter().filter(|m| m.kind == Kind::Topic).flat_map(|m| m.words.iter().cloned()).collect();
             let keywords = cx.keywords.get(&c.rule.domain).map(Vec::as_slice).unwrap_or_default();
-            let s = topic_score(text, &own, &c.rule.text, keywords);
-            (s > 0.0 && s >= cx.rules.topic_min_score).then_some(Why::Topic(s))
+            let t = topic_match(text, &own, &c.rule.text, keywords);
+            let s = t.score;
+            ((s > 0.0 && s >= cx.rules.topic_min_score).then_some(Why::Topic(s)), Some(t))
         }
-        Event::PreTool { tool, paths, .. } => c.matchers.iter().find_map(|m| match m.kind {
+        Event::PreTool { tool, paths, .. } => (c.matchers.iter().find_map(|m| match m.kind {
             Kind::Place => m
                 .place
                 .as_ref()
@@ -1132,7 +1258,7 @@ fn first_hit(c: &Converted, event: &Event<'_>, parts: &[Vec<String>], cx: &Selec
                 .or_else(|| m.command.as_ref().filter(|cmd| parts.iter().any(|part| command_hit(cmd, part))))
                 .map(|a| Why::Action(a.clone())),
             Kind::Always | Kind::Topic => None,
-        }),
+        }), None),
     }
 }
 

@@ -45,6 +45,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod match_log;
 pub mod prompt;
 pub mod record;
 pub mod session_files;

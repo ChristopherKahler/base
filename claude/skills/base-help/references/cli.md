@@ -11,6 +11,8 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base hooks`
 - `base hooks manifest`
 - `base hooks show`
+- `base log`
+- `base log matches`
 - `base ast` (alias: a)
 - `base ast query` (alias: q)
 - `base ast list` (alias: l)
@@ -185,6 +187,7 @@ Usage: base [COMMAND]
 Commands:
   hook             Handle Claude Code hook events (session-start, post-tool-use, user-prompt-submit)
   hooks            Publish base's hook wiring for an external installer (JSON)
+  log              Read base's own logs: `base log matches` shows what prompts and file touches matched
   ast              Query AST codebase graph (entities, calls, imports) [aliases: a]
   project          Manage projects [aliases: p]
   milestone        Manage milestones (epics within a project) [aliases: m]
@@ -296,6 +299,48 @@ Arguments:
 Options:
       --session <SESSION>
           Session id override (defaults to CLAUDE_CODE_SESSION_ID)
+
+  -h, --help
+          Print help
+```
+
+## base log
+
+```text
+Read base's own logs: `base log matches` shows what prompts and file touches matched
+
+Usage: base log <COMMAND>
+
+Commands:
+  matches  What each prompt and file touch matched, by what, and what was served and cut: the last rows of .base/match-log.jsonl, oldest first
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base log matches
+
+```text
+What each prompt and file touch matched, by what, and what was served and cut: the last rows of .base/match-log.jsonl, oldest first
+
+Usage: base log matches [OPTIONS]
+
+Options:
+      --last <LAST>
+          How many rows
+          
+          [default: 20]
+
+      --session <SESSION>
+          Only this session's rows (an id, or the start of one)
+
+      --rule <RULE>
+          Only rows that served or cut this rule or decision (its id, or the start of one, as --json shows it)
+
+      --json
+          Print the rows as JSON, one per line
 
   -h, --help
           Print help

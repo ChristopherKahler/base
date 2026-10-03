@@ -8,6 +8,7 @@ use crate::domain;
 use crate::domain::matcher::{match_domains_auto, MatchReason, TriggerContext};
 use crate::domain::query::resolve_and_run_query;
 use crate::domain::session::{rules_hash, Bracket, ReShow, SessionState};
+use crate::emit::match_log::{Cut, Item, Matched, Trace};
 use crate::emit::prompt::{Claim, Fitted, Priority, PromptBlock, PromptBlocks};
 
 /// What the prompt hook collects before anything is printed: the context-bracket line, the named blocks, and the
@@ -27,6 +28,13 @@ pub struct PromptSink {
     pub header: String,
     pub blocks: PromptBlocks,
     pending: Option<Pending>,
+    /// What matched and what `select` and the walk cut, for the match log (K1, BO-13). The blocks carry what they
+    /// serve; the dispatcher writes the row once the output is printed.
+    pub trace: Trace,
+    /// The prompt, as the hook read it, for the match log's row. Empty when there was none.
+    pub prompt: String,
+    /// This session's prompt number, for the match log's row.
+    pub prompt_num: Option<u32>,
 }
 
 /// Where the session lives and the tier it was served at, held until the output is fitted.
@@ -160,6 +168,7 @@ pub fn collect(
     if prompt.is_empty() {
         return Ok(super::HookEventData::default());
     }
+    sink.prompt = prompt.clone();
 
     // No early return on an empty domain set: bracket rules are tier-gated, not
     // domain-gated, and must still inject for a user with no domains configured.
@@ -221,7 +230,8 @@ pub fn collect(
         let store = crate::store::load_merged(cwd);
         let converted = crate::domain::rules::rules_with_matchers(store.as_ref(), config, &domains);
         let prompt_num = session.prompt_count_for(session_id);
-        sink.blocks.extend(matcher_blocks(config, &prompt, &session, bracket, &converted, &domains));
+        sink.prompt_num = Some(prompt_num);
+        sink.blocks.extend(matcher_blocks(config, &prompt, &session, bracket, &converted, &domains, &mut sink.trace));
         sink.blocks.extend(bracket_block);
         sink.hold(session, base_dir, bracket);
         return Ok(super::HookEventData {
@@ -245,6 +255,7 @@ pub fn collect(
                     cmd.rules.len(),
                     "rule",
                 )
+                .with_logged([Item::of_kind(&cmd.name, "command")])
             })
             .filter(|b| !b.text.is_empty())
             .collect();
@@ -253,6 +264,10 @@ pub fn collect(
             // Bracket rules ride along with star commands too — a mode changes
             // stance, it does not suspend the always-on layer.
             let prompt_num = session.prompt_count_for(session_id);
+            sink.prompt_num = Some(prompt_num);
+            for b in &cmd_blocks {
+                sink.trace.matched.extend(b.logged.iter().map(|i| Matched::new(&i.id, "command", None)));
+            }
             sink.blocks.extend(cmd_blocks);
             sink.blocks.extend(bracket_block);
             sink.hold(session, base_dir, bracket);
@@ -294,6 +309,16 @@ pub fn collect(
             .unwrap_or_default(),
     };
     let matched = match_domains_auto(&prompt, &domains, &active_paths, &trigger_ctx);
+    for dm in &matched {
+        for m in matched_entries(dm) {
+            if m.by == "keyword"
+                && let Some(kw) = &m.value
+            {
+                sink.trace.word(kw);
+            }
+            sink.trace.matched.push(m);
+        }
+    }
     if matched.is_empty() {
         // N-WALK-DEAD-WITHOUT-A-MATCHED-DOMAIN. The walk resolves what the
         // PROMPT TEXT names, which has nothing to do with whether a domain
@@ -330,8 +355,9 @@ pub fn collect(
         // gated on it, so gating here would be the one place in the hook where
         // the walk still consulted it.
         let nomatch_prompt_num = session.prompt_count_for(session_id);
+        sink.prompt_num = Some(nomatch_prompt_num);
         sink.header = format!("<context-bracket>[{bracket}] (prompt {nomatch_prompt_num})</context-bracket>");
-        sink.blocks.extend(matcher_blocks(config, &prompt, &session, bracket, &converted, &domains));
+        sink.blocks.extend(matcher_blocks(config, &prompt, &session, bracket, &converted, &domains, &mut sink.trace));
         if let Some(ref store) = graph_store {
             let nothing_served = std::collections::HashSet::new();
             let walked =
@@ -341,6 +367,7 @@ pub fn collect(
             // Dedup and render as one unit; the marks wait for the print -- see `render_walk_block`.
             let w = render_walk_block(&session, walked, config.injection.walk_budget);
             sink.blocks.extend(w.blocks);
+            sink.trace.cut.extend(w.cut);
         }
         sink.blocks.extend(bracket_block);
         let prompt_count = session.prompt_count;
@@ -356,8 +383,9 @@ pub fn collect(
     let prompt_num = session.prompt_count_for(session_id);
 
     // The context bracket tag, always kept and counted first.
+    sink.prompt_num = Some(prompt_num);
     sink.header = format!("<context-bracket>[{bracket}] (prompt {prompt_num})</context-bracket>");
-    let matcher = matcher_blocks(config, &prompt, &session, bracket, &converted, &domains);
+    let matcher = matcher_blocks(config, &prompt, &session, bracket, &converted, &domains, &mut sink.trace);
     let matcher_served = matcher.iter().any(|b| !b.claims.is_empty());
     sink.blocks.extend(matcher);
 
@@ -415,12 +443,21 @@ pub fn collect(
         if domain_def.is_always() {
             domain_served.insert(domain_walk_key(config, domain_def));
         }
+        // The decisions the CONTEXT block lists, for the match log (K1).
+        let mut context_decisions: Vec<Item> = Vec::new();
         let neighborhood_text = match (&graph_store, lean_mode) {
             (Some(store), false) => {
                 let (n, served) =
                     crate::domain::query::query_domain_neighborhood(store, config, domain_def, &|id| {
                         domain_def.is_always() && global.contains(id)
                     });
+                if !n.is_empty() {
+                    context_decisions = served
+                        .iter()
+                        .filter(|iri| crate::emit::match_log::is_decision(iri))
+                        .map(|iri| Item::decision(iri, Some(&domain_def.name)))
+                        .collect();
+                }
                 domain_served.extend(served);
                 n
             }
@@ -557,13 +594,15 @@ pub fn collect(
                     content: r.content_hash,
                     scope: None,
                 }))
-                .with_claims(steering_claim);
+                .with_claims(steering_claim)
+                .with_logged(fresh.iter().map(|(_, r)| Item::rule(&r.id, &domain_def.name)));
         injected_any |= !rules_block.text.is_empty();
         sink.blocks.push(rules_block);
         if context_due {
             sink.blocks.push(
                 PromptBlock::new(format!("{slug}-context"), context_priority, &context_text, count_records(&context_text), "record")
-                    .with_claims([Claim::Injected { key: context_key, hash: context_hash }]),
+                    .with_claims([Claim::Injected { key: context_key, hash: context_hash }])
+                    .with_logged(context_decisions),
             );
             injected_any = true;
         }
@@ -581,12 +620,12 @@ pub fn collect(
     if !listed.is_empty() {
         domain_served.extend(listed.iter().map(|d| d.id.clone()));
         sink.blocks.push(
-            PromptBlock::new("global-decisions", Priority::Global, &decisions_text, listed.len(), "decision").with_claims(
-                listed.iter().map(|d| {
+            PromptBlock::new("global-decisions", Priority::Global, &decisions_text, listed.len(), "decision")
+                .with_claims(listed.iter().map(|d| {
                     let (key, hash) = d.claim_key();
                     Claim::Injected { key, hash }
-                }),
-            ),
+                }))
+                .with_logged(listed.iter().map(|d| Item::decision(&d.id, Some(&d.domain)))),
         );
         injected_any = true;
     }
@@ -600,7 +639,8 @@ pub fn collect(
         }
         sink.blocks.push(
             PromptBlock::new(format!("command-{}", crate::crud::slugify(&key)), priority, &text, rules, "rule")
-                .with_claims([Claim::Injected { key: claim_key, hash }]),
+                .with_claims([Claim::Injected { key: claim_key, hash }])
+                .with_logged([Item::of_kind(&key, "command")]),
         );
         injected_any = true;
     }
@@ -641,13 +681,14 @@ pub fn collect(
     if let Some(walked) = walked {
         // Dedup and render as one unit; the marks wait for the print -- see
         // `render_walk_block`. The no-match return above is the other caller.
-        let w = render_walk_block(&session, walked, config.injection.walk_budget);
+        let mut w = render_walk_block(&session, walked, config.injection.walk_budget);
         if config.devmode.enabled && w.deduped > 0 {
             walk_note.push_str(&format!("  walk: {} name(s) already injected this session\n", w.deduped));
         }
         if !w.blocks.is_empty() {
             injected_any = true;
         }
+        sink.trace.cut.extend(std::mem::take(&mut w.cut));
         if config.devmode.enabled {
             for (r, recs) in &w.served {
                 walk_note.push_str(&format!(
@@ -753,6 +794,27 @@ pub fn collect(
     })
 }
 
+/// The match log's entries for one matched domain (K1): `always`; one per keyword that hit; and, for a path this
+/// session touched, `path` with the folder or trigger that held it, or `parent` with `<child> nested` (D13).
+fn matched_entries(dm: &crate::domain::matcher::DomainMatch) -> Vec<Matched> {
+    let name = &dm.domain.name;
+    let mut out = Vec::new();
+    if dm.reason == MatchReason::Always {
+        out.push(Matched::new(name, "always", None));
+    }
+    for kw in &dm.keywords {
+        out.push(Matched::new(name, "keyword", Some(kw.clone())));
+    }
+    if let Some(path) = &dm.path {
+        let (by, value) = match &dm.parent_of {
+            Some(child) => ("parent", Some(format!("{child} nested"))),
+            None => ("path", dm.held_by.clone()),
+        };
+        out.push(Matched { path: Some(path.clone()), ..Matched::new(name, by, value) });
+    }
+    out
+}
+
 /// A domain's record in the walk's key form, `<iri>`.
 pub(crate) fn domain_walk_key(config: &BaseConfig, domain_def: &domain::DomainDef) -> String {
     format!("<{}>", crate::crud::build_iri(&config.namespace, "domain", &crate::crud::slugify(&domain_def.name)))
@@ -823,7 +885,12 @@ fn bracket_rules_block(config: &BaseConfig, cwd: &Path, session: &mut SessionSta
         let (id, content) = crate::domain::session::bracket_rule_key(t);
         Claim::BracketRule { id, content }
     });
-    Some(PromptBlock::new("bracket-rules", Priority::Bracket, &text, texts.len(), "rule").with_claims(claims))
+    let logged = texts.iter().map(|t| Item::of_kind(&crate::domain::session::bracket_rule_key(t).0, "bracket-rule"));
+    Some(
+        PromptBlock::new("bracket-rules", Priority::Bracket, &text, texts.len(), "rule")
+            .with_claims(claims)
+            .with_logged(logged),
+    )
 }
 
 /// Rules that carry matchers of their own, for one prompt (4d): always rules on the session's first prompt and on
@@ -842,6 +909,7 @@ fn matcher_blocks(
     bracket: Bracket,
     converted: &[crate::domain::rules::Converted],
     domains: &[domain::DomainDef],
+    trace: &mut Trace,
 ) -> Vec<PromptBlock> {
     if converted.is_empty() {
         return Vec::new();
@@ -858,6 +926,17 @@ fn matcher_blocks(
     };
     let event = crate::domain::rules::Event::Prompt { text: prompt };
     let selection = crate::domain::rules::select_unrecorded(converted, &event, session, &cx);
+    // K1: what `select` cut and the scores it used, read off the selection, never scored again. The words of a rule
+    // that reached the minimum are words that matched.
+    trace.cut.extend(crate::domain::rules::cut_items(&selection));
+    for s in &selection.scores {
+        trace.scores.push(crate::emit::match_log::Score { id: s.id.clone(), domain: s.domain.clone(), score: s.score });
+        if s.score >= config.rules.topic_min_score {
+            for w in &s.words {
+                trace.word(w);
+            }
+        }
+    }
     let mut blocks: Vec<PromptBlock> = Vec::new();
     for g in crate::domain::rules::selection_groups(&selection) {
         let (id, priority) = match &g.topic_domain {
@@ -876,7 +955,11 @@ fn matcher_blocks(
             content: s.rule.content_hash,
             scope: s.why.scope().map(String::from),
         });
-        blocks.push(PromptBlock::new(id, priority, &text, g.served.len(), "rule").with_claims(claims));
+        blocks.push(
+            PromptBlock::new(id, priority, &text, g.served.len(), "rule")
+                .with_claims(claims)
+                .with_logged(crate::domain::rules::served_items(&g.served)),
+        );
     }
     // A domain whose every topic rule the cap cut has no group to carry its pointer line: it goes alone.
     for (domain, n) in &selection.topic_withheld {
@@ -927,6 +1010,8 @@ struct WalkBlock {
     dropped: usize,
     /// What survived dedup, in render order, for the devmode per-name lines.
     served: Vec<(crate::hook::walk::Resolved, Vec<crate::hook::walk::Record>)>,
+    /// The decisions the walk budget dropped, for the match log (K1).
+    cut: Vec<Cut>,
 }
 
 fn render_walk_block(
@@ -950,7 +1035,10 @@ fn render_walk_block(
         }
         served.push((r, recs));
     }
-    let (rendered, dropped) = crate::hook::walk::render(&served, budget);
+    let (rendered, dropped, written) = crate::hook::walk::render_counted(&served, budget);
+    // The pieces below come out in `served` order, one per name that wrote a record: the n-th piece is the n-th name
+    // with records written, and its records are that name's first `written` ones.
+    let mut shown = served.iter().zip(&written).filter(|(_, n)| **n > 0);
     // One block per `<base-context>` element. A name the walk budget squeezed out
     // entirely rendered no element, so it has no block and no claim, and is free to
     // come back next prompt.
@@ -968,12 +1056,26 @@ fn render_walk_block(
             key: format!("walk:{}", r.id),
             hash: crate::domain::session::rules_hash(std::slice::from_ref(&r.id)),
         });
+        let logged: Vec<Item> = shown
+            .next()
+            .map(|((_, recs), n)| {
+                recs.iter().take(*n).filter(|r| r.kind == "decision").map(|r| Item::decision(&r.id, None)).collect()
+            })
+            .unwrap_or_default();
         blocks.push(
             PromptBlock::new(format!("walk-{}", crate::crud::slugify(name)), Priority::Context, piece, records, "record")
-                .with_claims(claims),
+                .with_claims(claims)
+                .with_logged(logged),
         );
     }
-    WalkBlock { blocks, deduped, dropped, served }
+    let cut = served
+        .iter()
+        .zip(&written)
+        .flat_map(|((_, recs), n)| recs.iter().skip(*n))
+        .filter(|r| r.kind == "decision")
+        .map(|r| Cut::new(Item::decision(&r.id, None), "budget", "walk_budget"))
+        .collect();
+    WalkBlock { blocks, deduped, dropped, served, cut }
 }
 
 // ─── DEVMODE output ─────────────────────────────────────────

@@ -8,6 +8,7 @@ use crate::config::BaseConfig;
 use crate::crud;
 use crate::domain;
 use crate::domain::session::SessionState;
+use crate::emit::match_log::{Item, Matched, Trace};
 
 /// PreToolUse: see file path in tool call → match file_keywords + path triggers → inject rules BEFORE tool executes.
 /// Also: inject AST file map for source files, and point a code search at the code map that covers it (F20).
@@ -21,8 +22,19 @@ pub fn handle(
     cwd: &Path,
     event: &serde_json::Value,
 ) -> Result<(super::HookEventData, String)> {
+    handle_traced(config, cwd, event).map(|(data, context, _)| (data, context))
+}
+
+/// [`handle`], and what the call matched and served, for the match log (K1, BO-13): the touched paths, each domain
+/// they brought in and by what, and every rule printed. The dispatcher writes the row after the output is printed.
+pub fn handle_traced(
+    config: &BaseConfig,
+    cwd: &Path,
+    event: &serde_json::Value,
+) -> Result<(super::HookEventData, String, Trace)> {
     let mut output = String::new();
     let mut data = super::HookEventData::default();
+    let mut trace = Trace { tool: event.get("tool_name").and_then(|v| v.as_str()).map(String::from), ..Trace::default() };
 
     // ─── Memory intercept (Write/Edit/Read on memory files) ──
     // Must be FIRST — if we intercept, we may block the tool call (exit 2).
@@ -69,6 +81,7 @@ pub fn handle(
     } else {
         named.clone()
     };
+    trace.paths = touched.clone();
     // Single SessionState lifecycle for the whole hook — rule marks, domain dedup
     // marks and AST-injected marks share one instance, saved once at the end (Q3).
     let base_dir = crate::config::find_workspace_base(cwd);
@@ -153,6 +166,8 @@ pub fn handle(
             data.rules_injected += selection.served.len();
             session_dirty = true;
         }
+        trace.served.extend(domain::rules::served_items(&selection.served));
+        trace.cut.extend(domain::rules::cut_items(&selection));
     }
 
     if !file_paths.is_empty() {
@@ -196,8 +211,9 @@ pub fn handle(
                 .unwrap_or_default(),
         };
         let matched = match_by_file(&domains, &touched, &named, &trigger_ctx);
+        trace.matched.extend(matched.iter().map(|m| m.logged.clone()));
 
-        for (domain_def, parent_of) in &matched {
+        for FileMatch { domain: domain_def, parent_of, .. } in &matched {
             // Read the rules FIRST, then key the dedup on what came back.
             //
             // Until 0.16.0 this was the other way round: the key was
@@ -246,6 +262,7 @@ pub fn handle(
             if !fresh.is_empty() {
                 session_dirty = true;
             }
+            trace.served.extend(fresh.iter().map(|(_, r)| Item::rule(&r.id, &domain_def.name)));
             // D13: a parent's block says whose parent it is.
             let label = match parent_of {
                 Some(child) => format!("{} (parent of {child})", domain_def.name),
@@ -419,7 +436,7 @@ pub fn handle(
         }
 
     let context = output.trim_end().to_string();
-    Ok((data, context))
+    Ok((data, context, trace))
 }
 
 /// Content-version of a file for content-keyed dedup: a hash of its bytes (0 if
@@ -471,33 +488,49 @@ fn match_by_file<'a>(
     paths: &[String],
     named: &[String],
     ctx: &domain::matcher::TriggerContext,
-) -> Vec<(&'a domain::DomainDef, Option<String>)> {
+) -> Vec<FileMatch<'a>> {
     let eligible = |d: &domain::DomainDef| d.auto_inject && !d.is_always();
-    let mut direct: Vec<(&domain::DomainDef, Option<String>)> = Vec::new();
-    let mut parents: Vec<(&domain::DomainDef, Option<String>)> = Vec::new();
+    let mut direct: Vec<FileMatch<'a>> = Vec::new();
+    let mut parents: Vec<FileMatch<'a>> = Vec::new();
+    // The touched path goes in the log's entry only when the call touched more than one: the row names a lone one.
+    let which = |p: &str| (paths.len() > 1).then(|| p.to_string());
     for hit in domain::matcher::path_hits(domains, paths, ctx) {
         let d = &domains[hit.domain];
         if !eligible(d) {
             continue;
         }
         match hit.via {
-            domain::matcher::PathVia::Parent(child) => parents.push((d, Some(child))),
-            _ => direct.push((d, None)),
+            domain::matcher::PathVia::Parent(child) => {
+                let logged = Matched { path: which(&hit.path), ..Matched::new(&d.name, "parent", Some(format!("{child} nested"))) };
+                parents.push(FileMatch { domain: d, parent_of: Some(child), logged });
+            }
+            _ => {
+                let logged = Matched { path: which(&hit.path), ..Matched::new(&d.name, "path", Some(hit.value.clone())) };
+                direct.push(FileMatch { domain: d, parent_of: None, logged });
+            }
         }
     }
     // File keyword match: a keyword in a path the call names (lightweight: a full content scan would read the file).
     for d in domains.iter().filter(|d| eligible(d)) {
-        let listed = direct.iter().chain(&parents).any(|(x, _)| std::ptr::eq(*x, d));
+        let listed = direct.iter().chain(&parents).any(|m| std::ptr::eq(m.domain, d));
         let file_kw_hit = d
             .file_keywords
             .iter()
-            .any(|kw| named.iter().any(|fp| fp.to_lowercase().contains(&kw.to_lowercase())));
-        if !listed && file_kw_hit {
-            direct.push((d, None));
+            .find(|kw| named.iter().any(|fp| fp.to_lowercase().contains(&kw.to_lowercase())));
+        if !listed && let Some(kw) = file_kw_hit {
+            direct.push(FileMatch { domain: d, parent_of: None, logged: Matched::new(&d.name, "file_keyword", Some(kw.clone())) });
         }
     }
     direct.extend(parents);
     direct
+}
+
+/// A domain a tool call's paths brought in ([`match_by_file`]): the project it is the nested parent of, when that is
+/// why it came (D13), and its match-log entry (K1).
+struct FileMatch<'a> {
+    domain: &'a domain::DomainDef,
+    parent_of: Option<String>,
+    logged: Matched,
 }
 
 /// Every path a tool call names, absolute, each once (P1): the tool's own file path (Read, Edit, Write, a notebook,
