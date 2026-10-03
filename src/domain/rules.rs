@@ -488,6 +488,152 @@ pub fn matchers_from_flags(
     Ok(normalize_matchers(&out))
 }
 
+// ─── Test prompts (K2, BO-14) ────────────────────────────────────────────────
+
+/// The predicates a rule's test prompts are stored under, as local names under the namespace prefix: flat literals on
+/// the rule, beside its matchers, so a rule reads back the same from `domains.toml` (through sync) and from the graph.
+pub const TEST_PREDICATES: [&str; 2] = ["firesOn", "quietOn"];
+
+/// At most this many prompts that must serve a rule (K2a: "2 to 3").
+pub const MAX_FIRES_ON: usize = 3;
+/// At most this many prompts that must not serve a rule (K2a: "1 to 2").
+pub const MAX_QUIET_ON: usize = 2;
+
+/// A rule's test prompts (K2a): prompts that must serve it, and prompts that must not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleTests {
+    pub fires_on: Vec<String>,
+    pub quiet_on: Vec<String>,
+}
+
+impl RuleTests {
+    pub fn is_empty(&self) -> bool {
+        self.fires_on.is_empty() && self.quiet_on.is_empty()
+    }
+
+    /// Add one stored prompt under its predicate. Blank prompts and repeats are skipped.
+    pub fn add(&mut self, pred: &str, prompt: &str) {
+        let list = match pred {
+            "firesOn" => &mut self.fires_on,
+            "quietOn" => &mut self.quiet_on,
+            _ => return,
+        };
+        let prompt = prompt.trim();
+        if !prompt.is_empty() && !list.iter().any(|p| p == prompt) {
+            list.push(prompt.to_string());
+        }
+    }
+
+    /// Both lists sorted: the graph keeps no order, so every reader shows the same prompts in the same order.
+    pub fn sorted(mut self) -> Self {
+        self.fires_on.sort();
+        self.quiet_on.sort();
+        self
+    }
+}
+
+/// A rule's test prompts as `(predicate, value)` pairs: the shape `base domain sync`, `base rule add` and
+/// `base rule update` write. Blank prompts and repeats are left out.
+pub fn test_literals(fires_on: &[String], quiet_on: &[String]) -> Vec<(&'static str, String)> {
+    let mut t = RuleTests::default();
+    for p in fires_on {
+        t.add("firesOn", p);
+    }
+    for p in quiet_on {
+        t.add("quietOn", p);
+    }
+    t.fires_on
+        .into_iter()
+        .map(|p| ("firesOn", p))
+        .chain(t.quiet_on.into_iter().map(|p| ("quietOn", p)))
+        .collect()
+}
+
+/// A rule that carries test prompts: its domain and text, so `base rule test` can name it even when its domain is no
+/// longer in `domains.toml` (it then misses on every `fires_on`, which is the point).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredTests {
+    pub domain: String,
+    pub text: String,
+    pub tests: RuleTests,
+}
+
+/// Every rule's test prompts, by [`rule_id`], across both tiers' graphs and the `domains.toml` files `domains` came
+/// from.
+///
+/// The graph holds a CLI rule's tests (they live nowhere else) and a synced copy of every `domains.toml` rule's tests;
+/// the files are read as well, so a store that was never synced still has them. A rule declared in two places is one
+/// rule (the id is the text) and carries the tests of both. Superseded rules are left out: no prompt serves them.
+pub fn rule_tests(store: Option<&Store>, config: &BaseConfig, domains: &[DomainDef]) -> HashMap<String, StoredTests> {
+    let mut out: HashMap<String, StoredTests> = HashMap::new();
+    let mut put = |domain: &str, text: &str, pred: &str, value: &str| {
+        let e = out.entry(rule_id(domain, text)).or_insert_with(|| StoredTests {
+            domain: domain.to_string(),
+            text: text.to_string(),
+            tests: RuleTests::default(),
+        });
+        e.tests.add(pred, value);
+    };
+    if let Some(store) = store {
+        let ns = &config.namespace;
+        let p = &ns.prefix;
+        let pfx = crud::prefixes(ns);
+        // Inside the GRAPH group, beside the pattern it constrains, for the reason `from_graph` gives.
+        let no_superseded = crate::supersede::sparql_exclude_superseded(ns, "rule");
+        let sparql = format!(
+            "{pfx}\n\
+             SELECT ?domain ?text ?tp ?tv WHERE {{\n\
+               GRAPH ?g {{\n\
+                 ?domain {p}:hasRule ?rule .\n\
+                 ?rule {p}:ruleText ?text .\n\
+                 ?rule ?tp ?tv .\n\
+                 FILTER(?tp IN ({p}:firesOn, {p}:quietOn))\n\
+                 {no_superseded}\
+               }}\n\
+             }}"
+        );
+        let names: HashMap<String, &str> = domains
+            .iter()
+            .map(|d| (crud::build_iri(ns, "domain", &crud::slugify(&d.name)), d.name.as_str()))
+            .collect();
+        if let Ok(oxigraph::sparql::QueryResults::Solutions(rows)) = crate::store::query(store, &sparql) {
+            for row in rows.filter_map(|r| r.ok()) {
+                let term = |k: &str| {
+                    row.get(k).map(|t| match t.into() {
+                        TermRef::NamedNode(n) => n.as_str().to_string(),
+                        TermRef::Literal(l) => l.value().to_string(),
+                        _ => String::new(),
+                    })
+                };
+                let (Some(domain), Some(text), Some(tp), Some(tv)) = (term("domain"), term("text"), term("tp"), term("tv"))
+                else {
+                    continue;
+                };
+                let name = names
+                    .get(&domain)
+                    .map_or_else(|| domain.rsplit('/').next().unwrap_or_default().to_string(), |n| (*n).to_string());
+                let pred = tp.rsplit(['#', '/']).next().unwrap_or_default();
+                put(&name, &text, pred, &tv);
+            }
+        }
+    }
+    for d in domains {
+        for r in &d.rules {
+            let (fires_on, quiet_on) = r.tests();
+            for (pred, v) in test_literals(fires_on, quiet_on) {
+                put(&d.name, r.text(), pred, &v);
+            }
+        }
+    }
+    out.into_iter()
+        .map(|(id, mut s)| {
+            s.tests = std::mem::take(&mut s.tests).sorted();
+            (id, s)
+        })
+        .filter(|(_, s)| !s.tests.is_empty())
+        .collect()
+}
+
 /// One line naming a rule's matchers, for `base rule list` (F11: it "shows each rule's kinds and matchers").
 pub fn describe_matchers(matchers: &[Matcher]) -> String {
     matchers

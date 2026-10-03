@@ -1396,6 +1396,35 @@ pub enum RuleAction {
         /// Topic words and phrases, comma-separated: "ping chris, relay ping". Makes it a topic rule
         #[arg(long)]
         words: Option<String>,
+        /// A prompt that must serve this rule (repeatable, at most 3); `base rule test` checks it
+        #[arg(long)]
+        fires_on: Vec<String>,
+        /// A prompt that must not serve this rule (repeatable, at most 2); `base rule test` checks it
+        #[arg(long)]
+        quiet_on: Vec<String>,
+    },
+    /// Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
+    Update {
+        /// The rule, as `base rule list` prints it: <domain>.<id> (the id, or its first 4 or more characters)
+        rule: String,
+        /// A prompt that must serve this rule (repeatable; a rule holds at most 3)
+        #[arg(long)]
+        fires_on: Vec<String>,
+        /// A prompt that must not serve this rule (repeatable; a rule holds at most 2)
+        #[arg(long)]
+        quiet_on: Vec<String>,
+        /// Empty both test lists first, then add what is given
+        #[arg(long)]
+        clear_tests: bool,
+    },
+    /// Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
+    Test {
+        /// Only this domain's rules
+        #[arg(long)]
+        domain: Option<String>,
+        /// Only this rule: <domain>.<id> or <id>
+        #[arg(long)]
+        rule: Option<String>,
     },
     /// List rules for a domain from the graph
     List {
@@ -3089,6 +3118,10 @@ pub fn run() {
                         if let Some(full) = path.as_deref().and_then(|p| domain::trigger_spelling(&cwd, global, p)) {
                             println!("  path: {full}");
                         }
+                        // K2, "on every config change": the domain's rule tests, when it has any.
+                        if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &name) {
+                            println!("{line}");
+                        }
                     }
                     Err(e) if e.downcast_ref::<domain::TriggerRefused>().is_some() => die("Error", e),
                     Err(e) => die("Failed", e),
@@ -3118,7 +3151,13 @@ pub fn run() {
             }
             DomainAction::Create { name, keyword, path } => {
                 match domain::create_domain(&cwd, global, &name, keyword.as_deref(), path.as_deref()) {
-                    Ok(c) => println!("Domain '{name}' created ({} tier)", c.tier.label()),
+                    Ok(c) => {
+                        println!("Domain '{name}' created ({} tier)", c.tier.label());
+                        // K2: a domain created again over rules that kept their tests.
+                        if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &name) {
+                            println!("{line}");
+                        }
+                    }
                     Err(e) if e.downcast_ref::<domain::TriggerRefused>().is_some() => die("Error", e),
                     Err(e) => die("Failed", e),
                 }
@@ -3126,7 +3165,11 @@ pub fn run() {
             DomainAction::Remove { name } => {
                 match domain::remove_domain(&cwd, global, &name) {
                     Ok(c) if !c.is_noop() => {
-                        println!("Domain '{name}' removed ({} tier)", c.tier.label())
+                        println!("Domain '{name}' removed ({} tier)", c.tier.label());
+                        // K2: the rules it held keep their tests; their fires_on now miss, and this says so.
+                        if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &name) {
+                            println!("{line}");
+                        }
                     }
                     // #52. This said "not found" about a domain that exists in
                     // the other tier, and exited 0. Name the tier searched, name
@@ -3151,7 +3194,10 @@ pub fn run() {
                 }
                 match domain::remove_trigger(&cwd, global, &name, keyword.as_deref(), path.as_deref()) {
                     Ok(c) if !c.is_noop() => {
-                        println!("Trigger removed from domain '{name}' ({} tier)", c.tier.label())
+                        println!("Trigger removed from domain '{name}' ({} tier)", c.tier.label());
+                        if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &name) {
+                            println!("{line}");
+                        }
                     }
                     // #18. This reported success whether or not anything went,
                     // and with a same-named domain in the other tier it edited
@@ -3713,7 +3759,7 @@ pub fn run() {
         Some(Commands::Rule { global, action }) => {
             let rule_cwd = tier_cwd(&cwd, global);
             match action {
-                RuleAction::Add { domain: name, text, rationale, supersedes, kind, place, path, tool, command, words } => {
+                RuleAction::Add { domain: name, text, rationale, supersedes, kind, place, path, tool, command, words, fires_on, quiet_on } => {
                     let name = domain::canonical_name(&cwd, &name);
                     // P7: a --path is a place written as its full path, checked to lie inside the domain's project.
                     let mut place = place;
@@ -3727,14 +3773,106 @@ pub fn run() {
                         Ok(m) => m,
                         Err(msg) => die("Failed", msg),
                     };
-                    match crud::rule::add_with_matchers(&rule_cwd, &config.namespace, &name, &text, rationale.as_deref(), supersedes.as_deref(), &matchers) {
+                    // K2b: test prompts go in with the rule, under K2a's caps.
+                    let mut tests = domain::rules::RuleTests::default();
+                    for p in &fires_on {
+                        tests.add("firesOn", p);
+                    }
+                    for p in &quiet_on {
+                        tests.add("quietOn", p);
+                    }
+                    if let Err(msg) = domain::rule_test::check_caps("the rule", &tests) {
+                        die("Error", msg);
+                    }
+                    match crud::rule::add_with_tests(&rule_cwd, &config.namespace, &name, &text, rationale.as_deref(), supersedes.as_deref(), &matchers, &tests) {
                         Ok(index) => {
-                            println!("Rule {index} added to domain '{name}'");
+                            let id = domain::rules::rule_id(&name, &text);
+                            println!("Rule {index} added to domain '{name}' [{}]", domain::rule_test::short_ref(&name, &id));
                             if !matchers.is_empty() {
                                 println!("  match: {}", domain::rules::describe_matchers(&matchers));
                             }
+                            if !tests.is_empty() {
+                                println!("  tests: {}", domain::rule_test::tests_line(&tests));
+                            }
+                            // K2, "on every config change": the domain's tests, when it has any.
+                            if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &name) {
+                                println!("{line}");
+                            }
                         }
                         Err(e) => die("Failed", e),
+                    }
+                }
+                RuleAction::Update { rule, fires_on, quiet_on, clear_tests } => {
+                    let (want_domain, id) = crud::rule::parse_rule_ref(&rule).unwrap_or_else(|msg| die("Error", msg));
+                    let want_domain = want_domain.map(|d| domain::canonical_name(&cwd, &d));
+                    if fires_on.is_empty() && quiet_on.is_empty() && !clear_tests {
+                        die("Error", "give --fires-on, --quiet-on or --clear-tests");
+                    }
+                    let found = crud::rule::find(&cwd, &config.namespace, want_domain.as_deref(), &id).unwrap_or_else(|e| die("Failed", e));
+                    let found = match found.as_slice() {
+                        [] => die("Error", format!("no rule '{rule}' in either tier (ids come from base rule list --domain <domain>)")),
+                        [one] => one,
+                        many => {
+                            let names: Vec<String> = many.iter().map(|f| domain::rule_test::short_ref(&f.domain, &f.id)).collect();
+                            die("Error", format!("'{rule}' fits {} rules: {}; give more of the id", many.len(), names.join(", ")))
+                        }
+                    };
+                    let short = domain::rule_test::short_ref(&found.domain, &found.id);
+                    if found.homes.is_empty() {
+                        let why = match found.copies.iter().find(|c| c.starts_with("ext:")) {
+                            Some(ext) => format!("{short} comes from the extension {ext}, so its tests cannot be stored with it"),
+                            None => format!("{short} is only a synced copy whose domains.toml line is gone; run base domain sync"),
+                        };
+                        die("Error", why);
+                    }
+                    let mut tests = if clear_tests { domain::rules::RuleTests::default() } else { found.tests.clone() };
+                    for p in &fires_on {
+                        tests.add("firesOn", p);
+                    }
+                    for p in &quiet_on {
+                        tests.add("quietOn", p);
+                    }
+                    let tests = tests.sorted();
+                    if let Err(msg) = domain::rule_test::check_caps(&short, &tests) {
+                        die("Error", msg);
+                    }
+                    match crud::rule::store_tests(&config.namespace, found, &tests) {
+                        Ok(wrote) => {
+                            println!("Rule {short} tests: {} (in {})", domain::rule_test::tests_line(&tests), wrote.join(", "));
+                            if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &found.domain) {
+                                println!("{line}");
+                            }
+                        }
+                        Err(e) => die("Failed", e),
+                    }
+                }
+                RuleAction::Test { domain: want_domain, rule } => {
+                    use domain::rule_test::Filter;
+                    let filter = match (want_domain, rule) {
+                        (_, Some(r)) => match crud::rule::parse_rule_ref(&r) {
+                            Ok((d, id)) => Filter::Rule { domain: d.map(|d| domain::canonical_name(&cwd, &d)), id },
+                            Err(msg) => {
+                                eprintln!("Error: {msg}");
+                                std::process::exit(2);
+                            }
+                        },
+                        (Some(d), None) => Filter::Domain(domain::canonical_name(&cwd, &d)),
+                        (None, None) => Filter::All,
+                    };
+                    // From where the operator stands, as the prompt hook reads it: `--global` stands in the global tier.
+                    let bench = domain::rule_test::Bench::load(&config, &rule_cwd);
+                    match bench.run(&filter) {
+                        Ok(report) => {
+                            print!("{}", report.render());
+                            if report.failed() {
+                                std::process::exit(1);
+                            }
+                        }
+                        // Exit 2, not 1: the run did not start, which a script must not read as a failed test.
+                        Err(msg) => {
+                            eprintln!("Error: {msg}");
+                            std::process::exit(2);
+                        }
                     }
                 }
                 RuleAction::List { domain: name, include_superseded } => {

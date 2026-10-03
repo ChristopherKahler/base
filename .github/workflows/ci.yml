@@ -59,6 +59,13 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         run: python scripts/ci_guards.py test-count --platform "${{ runner.os }}" --log cargo-test.log
+      # K2e (BO-14): `base rule test` over a fixture rule set that carries tests, so a matcher change that breaks
+      # prompt matching fails the build. A step in this job rather than a job of its own, so the required check names
+      # stay the same; the script's control run must exit 1, so the step is shown able to fail.
+      - name: base rule test on the fixture rule set
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: bash scripts/rule-test-fixture.sh
       # Cut a whole release in a throwaway clone. It runs here rather than in a
       # job of its own because it reuses this one's target directory and cargo
       # registry; on its own it would pay for both again. 0.13.16's first

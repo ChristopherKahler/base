@@ -201,6 +201,12 @@ fn sync_domain_list(
                 .iter()
                 .map(|(pred, v)| format!("                       {p}:{pred} \"{}\" ;\n", crud::escape_sparql_literal(v)))
                 .collect();
+            // Its test prompts (K2a), the same way: the file holds them, and the collector above clears the copy.
+            let (fires_on, quiet_on) = rule.tests();
+            let test_triples: String = crate::domain::rules::test_literals(fires_on, quiet_on)
+                .iter()
+                .map(|(pred, v)| format!("                       {p}:{pred} \"{}\" ;\n", crud::escape_sparql_literal(v)))
+                .collect();
             let rule_insert = format!(
                 "{pfx}\n\
                  INSERT DATA {{\n\
@@ -210,6 +216,7 @@ fn sync_domain_list(
                        {p}:priority \"{i}\" ;\n\
                  {rationale_triple}\
                  {matcher_triples}\
+                 {test_triples}\
                        {p}:source \"{}\" .\n\
                      <{domain_iri}> {p}:hasRule <{rule_iri}> .\n\
                    }}\n\
