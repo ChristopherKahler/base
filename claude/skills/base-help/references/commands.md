@@ -32,6 +32,7 @@ base hooks manifest                      # base's hook wiring as JSON, for an in
 base hooks show [<block>] [--session <id>]   # one block of this session's last prompt-hook output; no block: list them
 base log matches [--last <n>] [--session <id>] [--rule <id>] [--json]   # what each prompt and file touch matched, by what, and what was served and cut
 base log corrections [--session <id>] [--transcript <path>] [--json]   # what base flagged as possible corrections: this session's signal rows, or a whole transcript read turn by turn as the hooks read it
+base tune --dry-run [--session <id>] [--transcript <path>] [--store]   # what the rule pass would read and how many Haiku calls it would make; calls nothing, writes nothing
 ```
 
 Projects, milestones, tasks (read side):
@@ -118,6 +119,8 @@ base rule add --domain X --text "..." --keywords "a, b" --fires-on "<prompt>"   
 base rule propose --from-turn [--text "..."] [--keywords "a, b"] [--example "<prompt>"] [--rule <domain>.<id>] [--decision <slug>] [--new] [--domain X] [--dry-run]   # this turn's correction as a pending proposal: keyword gap, rewrite or new rule
 base rule replay <p-NNNN> | --domain X | --rule <domain>.<id> | --decision <slug> [--add-keyword "..."] [--drop-keyword "..."]   # run a change over your recent prompts: which start or stop serving it, its share, TOO BROAD over [tune] broad_share
 base rule review [--approve <id> [--broad-ok]] [--reject <id> [--reason "..."]] [--edit <id> --text "..." --keywords "a, b"]   # the pending proposals with their replays; one key each on a terminal (a, e, r, s, q), or one flag
+base rule unretire <domain>.<id>   # serve a retired rule again: undoes an approved retire proposal (a retired rule is marked, never deleted)
+base tune [--session <id>] [--transcript <path>] [--store] [--max-calls <n>]   # the rule pass: Haiku judges the sessions since the last pass and writes proposals for base rule review; applies nothing; --session/--transcript repeatable, --max-calls 10 by default
 base rule remove --domain X --index <N>   # by INDEX, not by text; get N from `base rule list --domain X`
 ```
 

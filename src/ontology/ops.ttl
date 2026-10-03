@@ -576,3 +576,34 @@ ops:editedKeyword rdf:type rdf:Property ;
 ops:appliedTo     rdf:type rdf:Property ;
                   rdfs:domain ops:RuleProposal ;
                   rdfs:comment "Where the approved change was written: domains.toml or the graph, and its tier" .
+
+# ─── The rule pass (BO-17, K4) ────────────────────────────
+# base tune: proposals from patterns across sessions (drop keyword, merge, split, retire), and a retired rule.
+
+ops:proposalOrigin rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "Who wrote it: correction (base rule propose, one turn) or tune (the rule pass)" .
+
+ops:evidence      rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "One line of what the rule pass saw behind the proposal" .
+
+ops:droppedKeyword rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "One keyword a drop-keyword proposal takes away" .
+
+ops:mergeTarget   rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "A merge's second rule, <domain>.<id>" .
+
+ops:secondText    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "A split's second rule: its wording" .
+
+ops:secondKeyword rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "A split's second rule: one of its keywords" .
+
+ops:retiredAt     rdf:type rdf:Property ;
+                  rdfs:domain ops:Rule ;
+                  rdfs:comment "When the rule was retired: no hook serves it, it stays listed, and base rule unretire brings it back" .

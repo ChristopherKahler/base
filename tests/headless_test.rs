@@ -18,7 +18,7 @@ use seed::{run_base_in_session, run_hook};
 
 const BIN: &str = env!("CARGO_BIN_EXE_base");
 
-/// The five hooks base wires (`install::HOOK_TABLE`), each with the payload Claude Code sends it.
+/// The six hooks base wires (`install::HOOK_TABLE`), each with the payload Claude Code sends it.
 fn events(ws: &Path, session: &str) -> Vec<(&'static str, serde_json::Value)> {
     let cwd = ws.display().to_string();
     let file = ws.join("src").join("lib.rs").display().to_string();
@@ -61,6 +61,10 @@ fn events(ws: &Path, session: &str) -> Vec<(&'static str, serde_json::Value)> {
             "stop",
             serde_json::json!({ "cwd": cwd, "hook_event_name": "Stop", "stop_hook_active": false, "session_id": session }),
         ),
+        (
+            "session-end",
+            serde_json::json!({ "cwd": cwd, "hook_event_name": "SessionEnd", "reason": "other", "session_id": session }),
+        ),
     ]
 }
 
@@ -84,9 +88,9 @@ fn seed_root(tag: &str) -> PathBuf {
     root
 }
 
-/// F27b: under `BASE_HEADLESS` each of the five hooks exits 0 with nothing on stdout or stderr and writes nothing:
+/// F27b: under `BASE_HEADLESS` each of the six hooks exits 0 with nothing on stdout or stderr and writes nothing:
 /// no hook log row, no session file, no relay registration, even with the calling session's relay title and terminal
-/// tab in its environment. The control runs the same five hooks without the marker and shows each one writes a log row
+/// tab in its environment. The control runs the same six hooks without the marker and shows each one writes a log row
 /// and changes the store, so the silence above is the marker's doing and not a probe that could not see a write.
 #[test]
 fn hooks_exit_silently_under_marker() {
@@ -122,7 +126,7 @@ fn hooks_exit_silently_under_marker() {
     assert_eq!(rows(&s.ws, "hook-events.jsonl").len(), events_before, "no hook-events row under the marker");
     assert_eq!(rows(&s.ws, "hook-output.jsonl").len(), output_before, "no hook-output row under the marker");
 
-    // Control: the same five hooks, same environment, with BASE_HEADLESS=0, which is not the marker (only 1 is).
+    // Control: the same six hooks, same environment, with BASE_HEADLESS=0, which is not the marker (only 1 is).
     for (event, payload) in events(&s.ws, "headless-child") {
         let mut env = inherited.to_vec();
         env.push(("BASE_HEADLESS", "0"));
@@ -132,7 +136,7 @@ fn hooks_exit_silently_under_marker() {
     let events = rows(&s.ws, "hook-events.jsonl");
     assert_eq!(
         hooks_in(&events[events_before..]),
-        ["session-start", "user-prompt-submit", "pre-tool-use", "post-tool-use", "stop"],
+        ["session-start", "user-prompt-submit", "pre-tool-use", "post-tool-use", "stop", "session-end"],
         "with BASE_HEADLESS=0 every hook logs a hook-events row, so the check above could see one"
     );
     let output = rows(&s.ws, "hook-output.jsonl");

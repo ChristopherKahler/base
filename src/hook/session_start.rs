@@ -85,7 +85,7 @@ pub fn handle(
         out.push(
             "hooks-wired",
             &format!(
-                "[hooks] wired base hook {} into ~/.claude/settings.json (new in this release; live from the next session).\n",
+                "[hooks] wired base hook {} into ~/.claude/settings.json (new in this build; live from the next session; the file before it is kept beside it as settings.json.bak-base-*).\n",
                 added.join(", ")
             ),
             1,
@@ -137,6 +137,7 @@ pub fn handle(
         out.push("corrections", &format!("{line}\n"), 1);
     }
     crate::corrections::prune_state(config.log.prompt_days);
+    crate::corrections::tune::prune_marks(config.log.prompt_days);
 
     // Every app gets a code map the first time a session opens in it — a
     // marked repo, or a bare folder of source files nobody has `git init`ed
@@ -202,6 +203,7 @@ pub fn handle(
     let queries_shown = render_adhoc_queries(graph.as_ref(), cwd, config, out);
     push_global_decisions(graph.as_ref(), cwd, config, out);
     push_rule_proposals(graph.as_ref(), config, out);
+    push_rule_pass(session_id, config, out);
 
     if let Ok(signal_result) = crate::signal::run_signals(cwd, config, "session-start") {
         diagnostics.extend(signal_result.diagnostics.iter().cloned());
@@ -360,12 +362,25 @@ fn push_rule_proposals(graph: Option<&oxigraph::store::Store>, config: &BaseConf
     }
 }
 
+/// D7e (BO-17): earlier sessions that ended, or sat untouched for a day, with corrections no rule pass has read. One
+/// line, and nothing when there are none. It only counts: the pass is the AI's to run (`base tune`), never a hook's.
+/// `[corrections] enabled = false` turns it off with the counts it reads (G0 question 12).
+fn push_rule_pass(session_id: Option<&str>, config: &BaseConfig, out: &mut SessionOutput) {
+    if !config.corrections.enabled {
+        return;
+    }
+    let n = crate::corrections::tune::catch_up(session_id);
+    if n > 0 {
+        out.push(crate::corrections::tune::CATCH_UP_BLOCK, &format!("{}\n", crate::corrections::tune::catch_up_line(n)), n);
+    }
+}
+
 /// Spec B1: every block's rank, and inside its rank its place. The trimmer takes the bottom of the
 /// lowest rank first, so the `Tail` order is B1 row 8's list read upward: diagnostics shrink first,
 /// pulse last, and the relay wake contract outlasts the operator profile and the notices. A kind
 /// missing from this table sorts after all of it, and `every_pushed_kind_has_a_place_in_the_layout`
 /// fails the build when one does.
-pub const LAYOUT: [(&str, Rank); 35] = [
+pub const LAYOUT: [(&str, Rank); 36] = [
     ("instructions", Rank::Pinned),
     ("graph-unhealthy", Rank::DueNow),
     ("reminders", Rank::DueNow),
@@ -374,6 +389,8 @@ pub const LAYOUT: [(&str, Rank); 35] = [
     // BO-16, K5b: the rule proposals left from earlier sessions, one line, AFTER the handoffs so it never pushes
     // DUE NOW or HANDOFFS down, and at Primary so it is never inside the first screen's measure (header, Pinned, DueNow).
     ("rule-proposals", Rank::Primary),
+    // BO-17, D7e: earlier sessions with corrections no rule pass has read, one line, beside the proposals it leads to.
+    ("rule-pass", Rank::Primary),
     ("forks", Rank::Secondary),
     // BEFORE the working-set blocks it qualifies, deliberately. The trimmer takes the
     // bottom of a rank first, so a scope clause placed after the rows would be trimmed
@@ -451,6 +468,7 @@ pub fn command_for(kind: &str) -> Option<&'static str> {
         "operator" => Some("base operator show"),
         "handoffs" => Some("base handoff list"),
         "rule-proposals" => Some("base rule review"),
+        "rule-pass" => Some("base tune"),
         "reminders" => Some("base reminder list"),
         "forks" => Some("base fork list"),
         "projects" => Some("base project list --all"),
