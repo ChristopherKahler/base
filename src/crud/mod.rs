@@ -1,3 +1,4 @@
+pub mod alias;
 pub mod ast_map;
 pub mod ast_query;
 pub mod decision;
@@ -12,6 +13,7 @@ pub mod milestone;
 pub mod note;
 pub mod project;
 pub mod project_paths;
+pub mod rename;
 pub mod rule;
 pub mod reminder;
 pub mod task;
@@ -444,6 +446,17 @@ pub fn resolve_slug_in(store: &oxigraph::store::Store, ns: &NamespaceConfig, ent
                 let display = term_display(term.into());
                 return Ok(display);
             }
+        }
+    }
+
+    // Try 4 (BO-24, R4): a name from before `base project rename`, the project or domain itself or a `{name}.{rest}`
+    // record keyed by it. Last, so a record that really carries the name always wins over an alias.
+    if let Some((old, new, rewritten)) = alias::rewrite(store, ns, input) {
+        let iri = build_iri(ns, entity_type, &rewritten);
+        let ask = format!("{pfx}\nASK WHERE {{ GRAPH ?g {{ <{iri}> a {p}:{type_name} }} }}");
+        if let Ok(QueryResults::Boolean(true)) = crate::store::query(store, &ask) {
+            alias::notice(&old, &new);
+            return Ok(rewritten);
         }
     }
 

@@ -1104,3 +1104,68 @@ fn replay_file_scoped_injection_holds_on_the_corpus_store() {
     check("after");
     println!("replay file-scoped injection: 3 projects, 1 nested, broad trigger named then narrowed, 6 tool calls checked");
 }
+
+/// BO-24 (build rule 13), on a corpus store: `project rename` moves a corpus project's records in both tiers (its
+/// handoffs' `project` fields too: the corpus files one handoff in five in the global tier), keeps the old name as an
+/// alias, edits domains.toml by two lines and leaves doctor's counts as they were. Its preview writes nothing.
+#[test]
+fn replay_project_rename_holds_on_the_corpus_store() {
+    let case = cases().into_iter().next().expect("a corpus case");
+    let s = write_case_as(&case, "bo24-rename");
+    let run = |args: &[&str]| {
+        let (code, out, err) = run_base(&s, args);
+        assert!(code == 0 || args[0] == "doctor", "base {args:?}: {err}");
+        (out, err)
+    };
+    // The records a real project carries: a domain with its name as a keyword, a decision, a rule.
+    run(&["domain", "add-trigger", "--domain", "project-00", "--keyword", "project-00"]);
+    run(&["decision", "log", "--domain", "project-00", "--decision", "corpus decision", "--rationale", "r"]);
+    run(&["rule", "add", "--domain", "project-00", "--text", "project-00 corpus rule"]);
+    let (ws, gbl, toml) = (
+        s.ws.join(".base").join("graph.nq"),
+        s.home.join(".base-gbl").join(".base").join("graph.nq"),
+        s.ws.join(".base").join("domains.toml"),
+    );
+    let bytes = |p: &Path| std::fs::read(p).unwrap_or_default();
+    let text = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let fields = |name: &str| -> (usize, usize) {
+        let f = format!("<{}project> \"{name}\"", seed::NS);
+        (text(&ws).matches(&f).count(), text(&gbl).matches(&f).count())
+    };
+    let orphans = |json: &str| -> usize {
+        let v: serde_json::Value = serde_json::from_str(json).expect("doctor --json");
+        v["tiers"].as_array().expect("tiers").iter()
+            .flat_map(|t| t["domain_orphans"].as_array().cloned().unwrap_or_default())
+            .map(|p| p[1].as_u64().unwrap_or(0) as usize)
+            .sum()
+    };
+    let before = [bytes(&ws), bytes(&gbl), bytes(&toml)];
+    let toml_before = text(&toml);
+    let handoffs = fields("project-00");
+    assert!(handoffs.0 > 0 && handoffs.1 > 0, "control: corpus handoffs name project-00 in both tiers: {handoffs:?}");
+    let orphans_before = orphans(&run(&["doctor", "--json"]).0);
+
+    let (preview, _) = run(&["project", "rename", "project-00", "corpus-renamed"]);
+    assert!(preview.starts_with("PREVIEW") && preview.contains("(global graph)"), "{preview}");
+    assert_eq!([bytes(&ws), bytes(&gbl), bytes(&toml)], before, "the preview wrote");
+
+    run(&["project", "rename", "project-00", "corpus-renamed", "--yes"]);
+    let all = text(&ws) + &text(&gbl);
+    for old in ["project/project-00>", "domain/project-00>", "decision/project-00.", "rule/project-00/"] {
+        assert!(!all.contains(&format!("{}{old}", seed::NS)), "{old} survived the rename");
+    }
+    assert_eq!(fields("corpus-renamed"), handoffs, "every handoff naming the project follows it, in its own tier");
+    assert_eq!(fields("project-00"), (0, 0));
+    assert_eq!(
+        text(&toml),
+        toml_before.replacen("name = \"project-00\"\n", "name = \"corpus-renamed\"\naliases = [\"project-00\"]\n", 1),
+        "domains.toml changes by the name line and one alias line"
+    );
+    assert!(text(&toml).contains("\"project-00\""), "the old name stays a keyword (R5)");
+    let (out, err) = run(&["project", "get", "project-00"]);
+    assert!(out.starts_with("Project: corpus-renamed") && err.contains("project-00 is now corpus-renamed"), "{out}{err}");
+    let (out, _) = run(&["decision", "log", "--domain", "project-00", "--decision", "late corpus decision", "--rationale", "r"]);
+    assert!(out.contains("slug: corpus-renamed.late-corpus-decision"), "{out}");
+    assert_eq!(orphans(&run(&["doctor", "--json"]).0), orphans_before, "doctor's orphan count moved");
+    println!("replay project rename: handoff fields {handoffs:?} (workspace, global) followed, 0 old IDs, orphans {orphans_before} before and after");
+}

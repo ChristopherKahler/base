@@ -238,6 +238,10 @@ ops:triggerPath   rdf:type rdf:Property ;
                   rdfs:range xsd:string ;
                   rdfs:comment "A path glob that activates this domain" .
 
+ops:alias         rdf:type rdf:Property ;
+                  rdfs:range xsd:string ;
+                  rdfs:comment "A name this project or domain had before `base project rename`; commands that name it reach the record" .
+
 ops:hasDecision   rdf:type rdf:Property ;
                   rdfs:domain ops:Domain ;
                   rdfs:range ops:Decision ;

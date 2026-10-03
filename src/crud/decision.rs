@@ -171,6 +171,78 @@ pub fn search(cwd: &Path, ns: &NamespaceConfig, keyword: &str) -> Result<()> {
     Ok(())
 }
 
+/// One decision by its `{domain}.{decision}` slug, all fields; `None` when there is no such decision (BO-24: the
+/// reader `decision show` prints, so an old slug can be shown resolving to the renamed record).
+pub fn get_data(cwd: &Path, ns: &NamespaceConfig, slug: &str) -> Result<Option<DecisionRecord>> {
+    let p = &ns.prefix;
+    let iri = crud::build_iri(ns, "decision", slug);
+    let kw_pred = crate::domain::global_decisions::PRED_KEYWORD;
+    let sparql = format!(
+        "SELECT ?name ?rationale ?recall ?status ?created ?lastActive ?domain ?kw WHERE {{\n\
+           GRAPH ?g {{\n\
+             <{iri}> a {p}:Decision ;\n\
+               {p}:name ?name .\n\
+             OPTIONAL {{ <{iri}> {p}:rationale ?rationale }}\n\
+             OPTIONAL {{ <{iri}> {p}:recall ?recall }}\n\
+             OPTIONAL {{ <{iri}> {p}:status ?status }}\n\
+             OPTIONAL {{ <{iri}> {p}:createdAt ?created }}\n\
+             OPTIONAL {{ <{iri}> {p}:lastActive ?lastActive }}\n\
+             OPTIONAL {{ ?domain {p}:hasDecision <{iri}> }}\n\
+           }}\n\
+           OPTIONAL {{ GRAPH ?kg {{ <{iri}> {p}:{kw_pred} ?kw }} }}\n\
+         }}"
+    );
+    let QueryResults::Solutions(rows) = crud::load_and_query(cwd, ns, &sparql)? else {
+        return Ok(None);
+    };
+    let mut rec: Option<DecisionRecord> = None;
+    for row in rows.filter_map(|r| r.ok()) {
+        let lit = |k: &str| row.get(k).map(|t| crud::term_display(t.into()));
+        let r = rec.get_or_insert_with(|| DecisionRecord {
+            id: slug.to_string(),
+            name: lit("name").unwrap_or_default(),
+            rationale: lit("rationale"),
+            recall: lit("recall"),
+            status: lit("status"),
+            domain: row.get("domain").map(|t| crud::slug_of(&crud::term_display(t.into()))),
+            created: lit("created"),
+            last_active: lit("lastActive"),
+            keywords: Vec::new(),
+        });
+        if let Some(kw) = lit("kw")
+            && !r.keywords.contains(&kw)
+        {
+            r.keywords.push(kw);
+        }
+    }
+    if let Some(r) = &mut rec {
+        r.keywords.sort();
+    }
+    Ok(rec)
+}
+
+/// `base decision show <slug>`: one decision's fields, or its record as JSON.
+pub fn show(cwd: &Path, ns: &NamespaceConfig, slug: &str, json: bool) -> Result<()> {
+    let rec = get_data(cwd, ns, slug)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rec)?);
+        return Ok(());
+    }
+    let Some(d) = rec else {
+        anyhow::bail!("no decision '{slug}'");
+    };
+    println!("Decision: {}", d.id);
+    println!("  name: {}", d.name);
+    if let Some(v) = &d.domain { println!("  domain: {v}"); }
+    if let Some(v) = &d.rationale { println!("  rationale: {v}"); }
+    if let Some(v) = &d.recall { println!("  recall: {v}"); }
+    if let Some(v) = &d.status { println!("  status: {v}"); }
+    if !d.keywords.is_empty() { println!("  keywords: {}", d.keywords.join(", ")); }
+    if let Some(v) = &d.created { println!("  created: {v}"); }
+    if let Some(v) = &d.last_active { println!("  lastActive: {v}"); }
+    Ok(())
+}
+
 /// `--json` search: valid JSON array on stdout, nothing else.
 pub fn search_json(cwd: &Path, ns: &NamespaceConfig, keyword: &str) -> Result<()> {
     let rows = search_data(cwd, ns, keyword)?;

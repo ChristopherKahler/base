@@ -99,7 +99,7 @@ pub fn graph_for(cwd: &Path, tier: Tier) -> Option<PathBuf> {
     }
 }
 
-fn global_domains_toml() -> PathBuf {
+pub(crate) fn global_domains_toml() -> PathBuf {
     crate::home::home_root()
         .unwrap_or_default()
         .join(".base-gbl")

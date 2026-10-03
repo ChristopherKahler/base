@@ -73,6 +73,7 @@ fn devmode_block_format_includes_domains() {
     let all_domains = vec![
         base::domain::DomainDef {
             name: "GLOBAL".into(),
+            aliases: vec![],
             mode: "always".into(),
             auto_inject: true,
             root: None,
@@ -91,6 +92,7 @@ fn devmode_block_format_includes_domains() {
         },
         base::domain::DomainDef {
             name: "DEVELOPMENT".into(),
+            aliases: vec![],
             mode: "triggered".into(),
             auto_inject: true,
             root: None,
@@ -109,6 +111,7 @@ fn devmode_block_format_includes_domains() {
         },
         base::domain::DomainDef {
             name: "UNMATCHED".into(),
+            aliases: vec![],
             mode: "triggered".into(),
             auto_inject: true,
             root: None,

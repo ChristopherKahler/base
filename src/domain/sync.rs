@@ -92,7 +92,7 @@ fn sync_domain_list(
              DELETE {{ GRAPH <{graph}> {{ <{domain_iri}> ?p ?o . }} }}\n\
              WHERE  {{ GRAPH <{graph}> {{ <{domain_iri}> ?p ?o .\n\
                       FILTER(?p IN ({p}:name, {p}:status, {p}:promptKeyword,\n\
-                                    {p}:fileKeyword, {p}:triggerPath, {p}:updatedAt)) }} }}"
+                                    {p}:fileKeyword, {p}:triggerPath, {p}:alias, {p}:updatedAt)) }} }}"
         );
         store
             .update(&domain_gc)
@@ -117,6 +117,13 @@ fn sync_domain_list(
             .map(|path| format!("      {p}:triggerPath \"{}\" ;\n", crud::escape_sparql_literal(path)))
             .collect();
 
+        // BO-24: the names a `project rename` left behind, so a lookup by an old name finds this domain in the graph.
+        let alias_triples: String = domain_def
+            .aliases
+            .iter()
+            .map(|a| format!("      {p}:alias \"{}\" ;\n", crud::escape_sparql_literal(a)))
+            .collect();
+
         let now = crud::now_iso();
         let domain_insert = format!(
             "{pfx}\n\
@@ -128,6 +135,7 @@ fn sync_domain_list(
              {prompt_kw_triples}\
              {file_kw_triples}\
              {path_triples}\
+             {alias_triples}\
                    {p}:updatedAt \"{now}\"^^xsd:dateTime .\n\
                }}\n\
              }}",

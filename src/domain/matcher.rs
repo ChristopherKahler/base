@@ -533,6 +533,7 @@ mod tests {
     fn make_domain(name: &str, mode: &str, keywords: &[&str], rules: &[&str]) -> DomainDef {
         DomainDef {
             name: name.into(),
+            aliases: Vec::new(),
             mode: mode.into(),
             auto_inject: true,
             root: None,

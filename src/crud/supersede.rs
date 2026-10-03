@@ -43,18 +43,18 @@ pub fn resolve_slug(
     // record. So the input is tried VERBATIM as well, which is the form every base
     // command prints and therefore the form an operator pastes back.
     let slug = crud::slugify(input);
-    let tails = [format!("/{input}"), format!("/{slug}")];
-    let mut hits: Vec<String> = store
-        .iter()
-        .filter_map(|q| q.ok())
-        .filter_map(|q| match q.subject {
-            oxigraph::model::Subject::NamedNode(n) => Some(n.into_string()),
-            _ => None,
-        })
-        .filter(|s| s.starts_with(&ns.uri) && tails.iter().any(|t| s.ends_with(t)))
-        .collect();
-    hits.sort();
-    hits.dedup();
+    let mut hits = subjects_ending(store, ns, &[format!("/{input}"), format!("/{slug}")]);
+
+    // BO-24 (R4): a slug from before `base project rename` (`vintrix.<decision>`) names the renamed record, and says so.
+    if hits.is_empty()
+        && let Some((old, new, rewritten)) = crud::alias::rewrite(store, ns, input)
+    {
+        let renamed = subjects_ending(store, ns, &[format!("/{rewritten}")]);
+        if renamed.len() == 1 {
+            crud::alias::notice(&old, &new);
+            hits = renamed;
+        }
+    }
 
     match hits.len() {
         1 => Ok(hits.remove(0)),
@@ -75,6 +75,22 @@ pub fn resolve_slug(
             hits.join(", ")
         ),
     }
+}
+
+/// Every record IRI in `store` (under `ns`) ending in one of `tails`, sorted and once each.
+fn subjects_ending(store: &Store, ns: &NamespaceConfig, tails: &[String]) -> Vec<String> {
+    let mut hits: Vec<String> = store
+        .iter()
+        .filter_map(|q| q.ok())
+        .filter_map(|q| match q.subject {
+            oxigraph::model::Subject::NamedNode(n) => Some(n.into_string()),
+            _ => None,
+        })
+        .filter(|s| s.starts_with(&ns.uri) && tails.iter().any(|t| s.ends_with(t)))
+        .collect();
+    hits.sort();
+    hits.dedup();
+    hits
 }
 
 /// Write "`new_iri` supersedes `old_iri`" into `graph_iri`, refusing a self-reference

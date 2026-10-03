@@ -893,6 +893,17 @@ pub enum ProjectAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Rename a project and its same-named domain in every tier (records, rules, decisions, tasks, domains.toml).
+    /// The old name stays an alias: commands that name it still reach the project. PREVIEW unless --yes.
+    Rename {
+        /// The project's slug or display name now
+        old: String,
+        /// The new name: lowercase letters, digits and dashes
+        new: String,
+        /// Apply the rename (without it, prints the plan and writes nothing)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1060,6 +1071,14 @@ pub enum DecisionAction {
         #[arg(long)]
         keyword: String,
         /// Emit JSON (stable dashboard contract) instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one decision by its {domain}.{decision} slug
+    Show {
+        /// Decision slug ({domain}.{decision})
+        slug: String,
+        /// Emit JSON instead of the human field list
         #[arg(long)]
         json: bool,
     },
@@ -1899,6 +1918,10 @@ pub fn run() {
         Some(Commands::Project { action }) => match action {
             ProjectAction::Add { name, status, path, stage, parent, nested } => {
                 let slug = crud::slugify(&name);
+                // BO-24: an old name still reads as the renamed project, so a new project under it would never be reached.
+                if let Some(now) = crud::rename::renamed_to(&cwd, &config.namespace, &slug) {
+                    die("Error", format!("'{name}' is an old name of project '{now}' (renamed); pick another name"));
+                }
                 // F25c: a parent that names no project, or would close a loop, is refused before anything is written.
                 let parent = match parent.as_deref() {
                     Some(p) => match crud::project::check_parent(&cwd, &config.namespace, &slug, p) {
@@ -2105,6 +2128,23 @@ pub fn run() {
                     }
                 }
             }
+            ProjectAction::Rename { old, new, yes } => {
+                let plan = match crud::rename::plan(&cwd, &config.namespace, &old, &new) {
+                    Ok(p) => p,
+                    Err(e) => die(project_error_prefix(&e), e),
+                };
+                let report = crud::rename::describe(&plan);
+                let result = if yes { Some(crud::rename::apply(&plan)) } else { None };
+                let (from, to) = (plan.old.clone(), plan.new.clone());
+                // The plan holds the rename lock and both graph locks; `die` exits without running destructors, so
+                // they are released here, before any exit, or every later write would wait out a dead lock.
+                drop(plan);
+                match result {
+                    None => print!("PREVIEW (nothing written; add --yes to rename)\n{report}"),
+                    Some(Ok(())) => print!("RENAMED {from} -> {to}\n{report}"),
+                    Some(Err(e)) => die("Failed", e),
+                }
+            }
         },
 
         // ─── Milestone ──────────────────────────────────
@@ -2296,9 +2336,12 @@ pub fn run() {
 
         // ─── Decision ────────────────────────────────────
         Some(Commands::Decision { global, action }) => {
-            let cwd = tier_cwd(&cwd, global);
+            // Where the operator stands, before `-g` routes the command: an old domain name is read from here (BO-24).
+            let standing_cwd = &cwd;
+            let cwd = tier_cwd(standing_cwd, global);
             match action {
                 DecisionAction::Log { domain, decision, rationale, recall, supersedes } => {
+                    let domain = domain::canonical_name(standing_cwd, &domain);
                     match crud::decision::log_with(&cwd, &config.namespace, &domain, &decision, &rationale, recall.as_deref(), supersedes.as_deref()) {
                         Ok(slug) => println!("Decision logged (slug: {slug})"),
                         Err(e) => die("Failed", e),
@@ -2311,6 +2354,14 @@ pub fn run() {
                         crud::decision::search(&cwd, &config.namespace, &keyword)
                     };
                     if let Err(e) = r { die("Error", e); }
+                }
+                DecisionAction::Show { slug, json } => {
+                    let Some(s) = resolve(&cwd, &config.namespace, "decision", &slug) else {
+                        std::process::exit(1);
+                    };
+                    if let Err(e) = crud::decision::show(&cwd, &config.namespace, &s, json) {
+                        die("Error", e);
+                    }
                 }
                 DecisionAction::Delete { keyword } => {
                     // Show what will be deleted first
@@ -2347,6 +2398,7 @@ pub fn run() {
         // ─── Entity ──────────────────────────────────────
         Some(Commands::Entity { action }) => match action {
             EntityAction::Add { name, entity_type, domain, project } => {
+                let domain = domain::canonical_name(&cwd, &domain);
                 match crud::entity::add(&cwd, &config.namespace, &name, &entity_type, &domain, project.as_deref()) {
                     Ok(slug) => println!("Entity '{name}' created (slug: {slug}, domain: {domain})"),
                     Err(e) => die("Failed", e),
@@ -2393,6 +2445,8 @@ pub fn run() {
             let cwd = tier_cwd(standing_cwd, global);
             match action {
                 HandoffAction::Create { project, doc, slug } => {
+                    // An old project name files the handoff under the renamed project (BO-24, R4).
+                    let project = domain::canonical_name(standing_cwd, &project);
                     let gbl = base::home::home_root();
                     match crud::handoff::create(
                         gbl.as_deref(),
@@ -2516,9 +2570,11 @@ pub fn run() {
 
         // ─── Fork ────────────────────────────────────────
         Some(Commands::Fork { global, action }) => {
-            let cwd = tier_cwd(&cwd, global);
+            let standing_cwd = &cwd;
+            let cwd = tier_cwd(standing_cwd, global);
             match action {
                 ForkAction::Create { project, doc, slug } => {
+                    let project = domain::canonical_name(standing_cwd, &project);
                     match crud::handoff::create_fork(&cwd, &config.namespace, &project, &doc, slug.as_deref()) {
                         Ok(slug) => println!("Fork '{slug}' registered for '{project}'"),
                         Err(e) => die("Failed", e),
@@ -2861,6 +2917,7 @@ pub fn run() {
         // ─── Domain ──────────────────────────────────────
         Some(Commands::Domain { global, action }) => match action {
             DomainAction::AddTrigger { domain: name, keyword, path } => {
+                let name = domain::canonical_name(&cwd, &name);
                 if keyword.is_none() && path.is_none() {
                     eprintln!("Provide --keyword and/or --path");
                     return;
@@ -2927,6 +2984,7 @@ pub fn run() {
                 }
             }
             DomainAction::RemoveTrigger { domain: name, keyword, path } => {
+                let name = domain::canonical_name(&cwd, &name);
                 if keyword.is_none() && path.is_none() {
                     eprintln!("Provide --keyword and/or --path to remove");
                     return;
@@ -3496,6 +3554,7 @@ pub fn run() {
             let rule_cwd = tier_cwd(&cwd, global);
             match action {
                 RuleAction::Add { domain: name, text, rationale, supersedes, kind, place, path, tool, command, words } => {
+                    let name = domain::canonical_name(&cwd, &name);
                     // P7: a --path is a place written as its full path, checked to lie inside the domain's project.
                     let mut place = place;
                     match crud::rule::scoped_places(&cwd, &name, &path) {
@@ -3519,6 +3578,7 @@ pub fn run() {
                     }
                 }
                 RuleAction::List { domain: name, include_superseded } => {
+                    let name = domain::canonical_name(&cwd, &name);
                     // #53. Without --global this shows BOTH tiers, because the
                     // hook injects both and no single command used to print
                     // what the agent actually receives. --global keeps the
@@ -3535,6 +3595,7 @@ pub fn run() {
                     }
                 }
                 RuleAction::Remove { domain: name, index } => {
+                    let name = domain::canonical_name(&cwd, &name);
                     let tier = if global { "global" } else { "workspace" };
                     let other = if global { "workspace" } else { "global" };
                     match crud::rule::remove(&rule_cwd, &config.namespace, &name, index) {
@@ -3555,6 +3616,8 @@ pub fn run() {
 
         // ─── Learn ────────────────────────────────────────
         Some(Commands::Learn { global, text, r#type, domain, project, entity, supersedes, mention, context, remove, update, list }) => {
+            // An old domain name reads as the renamed domain, judged from where the operator stands (BO-24).
+            let domain = domain.map(|d| base::domain::canonical_name(&cwd, &d));
             let cwd = tier_cwd(&cwd, global);
             if list {
                 if let Err(e) = crud::note::list_notes(&cwd, &config.namespace, if r#type != "insight" { Some(&r#type) } else { None }, domain.as_deref()) {
@@ -3614,6 +3677,7 @@ pub fn run() {
         // ─── Recall ─────────────────────────────────────────
         Some(Commands::Recall { keyword, domain, include_superseded, slug }) => {
             outside_workspace_note(&cwd);
+            let domain = domain.map(|d| base::domain::canonical_name(&cwd, &d));
             // Note IRIs to stamp lastRead on (usage signal for `base graph purge --stale`).
             // Resolved BEFORE printing so an explicit recall marks what it surfaced.
             let mut surfaced: Vec<String> = Vec::new();

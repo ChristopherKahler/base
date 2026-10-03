@@ -1687,6 +1687,41 @@ fn reap_stale_lock(lock: &Path) -> bool {
     }
 }
 
+/// Take the lock file `lock` WITHOUT waiting, for a command that refuses to run beside another run of itself rather
+/// than queue behind it (`project rename`, BO-24 R7). `Ok(None)` while a live process holds it. A holder that is
+/// gone is reaped at once, whatever the file's age: only that one command takes this file, so a dead pid in it is
+/// a crashed run, never a slow one.
+pub fn try_lock(lock: &Path) -> Result<Option<GraphLockGuard>> {
+    if let Some(parent) = lock.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating directory for lock {}", lock.display()))?;
+    }
+    if HELD_LOCKS.with(|h| h.borrow().iter().any(|p| p == lock)) {
+        return Ok(Some(GraphLockGuard { path: lock.to_path_buf(), reentrant: true }));
+    }
+    for _ in 0..2 {
+        match create_lock_file(lock) {
+            Ok(mut fh) => {
+                let _ = writeln!(fh, "{}", std::process::id());
+                HELD_LOCKS.with(|h| h.borrow_mut().push(lock.to_path_buf()));
+                return Ok(Some(GraphLockGuard { path: lock.to_path_buf(), reentrant: false }));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match lock_pid(lock) {
+                Some(pid) if !holder_is_alive(pid) => {
+                    let _ = fs::remove_file(lock);
+                }
+                _ => return Ok(None),
+            },
+            Err(e) => return Err(e).with_context(|| format!("taking the lock {}", lock.display())),
+        }
+    }
+    Ok(None)
+}
+
+/// The pid written in a lock file, for a refusal that names who holds it.
+pub fn lock_holder(lock: &Path) -> Option<u32> {
+    lock_pid(lock)
+}
+
 /// Whether this thread currently holds a graph lock. The tripwire reads it.
 pub fn holds_graph_lock() -> bool {
     HELD_LOCKS.with(|h| !h.borrow().is_empty())

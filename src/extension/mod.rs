@@ -467,6 +467,7 @@ pub fn extension_domains_to_domain_defs(ext: &ExtensionDef) -> Vec<crate::domain
         .iter()
         .map(|ed| crate::domain::DomainDef {
             name: format!("ext:{}:{}", ext.name, ed.name),
+            aliases: Vec::new(),
             mode: "triggered".into(),
             auto_inject: true,
             root: None,
