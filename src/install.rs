@@ -598,7 +598,8 @@ prompt_text = "full"
 # are flagged as undated.
 # From the match log, doctor also lists the rules no prompt served in
 # dead_days days, the rules and decisions served and then corrected at least
-# ignored_after times, and the decisions served review_served times with no
+# ignored_after times and twice as often as the log's average, and the
+# decisions served review_served times with no
 # update in review_days days ("still true?"). Advice only: none of it changes
 # the verdict. Noisy domains use [tune] broad_share.
 [doctor]

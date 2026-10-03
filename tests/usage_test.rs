@@ -290,10 +290,10 @@ fn listing_fixture(tag: &str, base_toml: &str) -> Fixture {
     let mut log = Log::default();
     // 35 days ago: the hook-log rule served, and never again.
     log.prompt(ago(35, 0), "old", 1, "why did the hook fail", &[("tools", "keyword", Some("hook"))], &[("rule", &hooklog)], &[]);
-    // 118 typed prompts in the window, and m1 and m2 below: 120. Keyword matches: tools on 30 (25%, at the limit, not
-    // over), notes on 29 + 2 by `memo` (25.8%, over) and 10 more by `minutes`, a keyword notes no longer has. Path
-    // matches of tools on 48 do not count.
-    for i in 0..118u32 {
+    // 117 typed prompts in the window, and m1 to m3 below: 120. Keyword matches: tools on 30 (25%, at the limit, not
+    // over), notes on 28 + 3 by `memo` (25.8%, over) and 10 more by `minutes`, a keyword notes no longer has. Path
+    // matches of tools on 47 do not count.
+    for i in 0..117u32 {
         let ts = ago(1 + i64::from(i % 9), i64::from(i));
         let session = format!("s{:03}", i / 4);
         let n = i % 4 + 1;
@@ -301,13 +301,13 @@ fn listing_fixture(tag: &str, base_toml: &str) -> Fixture {
         if i < 30 {
             matched.push(("tools", "keyword", Some("lint")));
         }
-        if (30..59).contains(&i) {
+        if (30..58).contains(&i) {
             matched.push(("notes", "keyword", Some("memo")));
         }
-        if (59..69).contains(&i) {
+        if (58..68).contains(&i) {
             matched.push(("notes", "keyword", Some("minutes")));
         }
-        if (70..118).contains(&i) {
+        if (70..117).contains(&i) {
             matched.push(("tools", "path", Some("C:/work/tools")));
         }
         let served: Vec<(&str, &str)> = if i < 30 && n == 1 { vec![("rule", lint.as_str())] } else { vec![] };
@@ -319,14 +319,18 @@ fn listing_fixture(tag: &str, base_toml: &str) -> Fixture {
     for i in 0..50 {
         log.prompt(ago(1, i), "bg", 50 + i as u32, "<task-notification>lint finished</task-notification>", &[("tools", "keyword", Some("lint"))], &[], &[]);
     }
-    // The lint rule corrected after 3 of its servings (s000, s001, s002 at prompt 1; C1 on prompt 2); the memo rule
-    // after 2 of its own.
+    // The lint rule corrected after 3 of its 8 servings (s000, s001, s002 at prompt 1; C1 on prompt 2); the memo rule
+    // after 3 of its 3. A decision served 8 times on file touches, never corrected. The log's average: 6 of 20 servings
+    // (lint 8, memo 3, the hook-log rule 1, the decision 8), 30%, so an ignored rule needs 60%: memo is, lint is not.
     for s in ["s000", "s001", "s002"] {
         log.signal(ago(1, 1), s, 2, &[("C1", "phrase")]);
     }
-    for s in ["m1", "m2"] {
+    for s in ["m1", "m2", "m3"] {
         log.prompt(ago(2, 5), s, 1, "date the memo", &[("notes", "keyword", Some("memo"))], &[("rule", &memo)], &[]);
         log.signal(ago(2, 4), s, 2, &[("C1", "phrase")]);
+    }
+    for i in 0..8 {
+        log.file(ago(3, i), &format!("f{i}"), &[("decision", "global.plain-decision")]);
     }
     let mut rows = log.rows;
     rows.sort_by(|x, y| {
@@ -339,7 +343,7 @@ fn listing_fixture(tag: &str, base_toml: &str) -> Fixture {
 
 /// Each kind at its threshold: dead (a domain never matched, a rule last served before the window, a rule only ever
 /// withheld, a new rule counted not listed), noisy (over the share, not at it; current keywords only; no path matches,
-/// no task notifications), ignored (3 corrections listed, 2 not).
+/// no task notifications), ignored (3 corrections at twice the log average listed; 3 corrections under it not).
 #[test]
 fn doctor_lists_dead_noisy_ignored() {
     let fx = listing_fixture("lists", "");
@@ -364,24 +368,22 @@ fn doctor_lists_dead_noisy_ignored() {
     ));
     let dead_block = &section[section.find("   dead").unwrap()..section.find("   noisy").unwrap()];
     for served_or_new in [short("tools", R_NEW), short("tools", R_LINT), short("notes", R_MEMO)] {
-        assert!(!dead_block.contains(&served_or_new), "{served_or_new} is not dead:
-{dead_block}");
+        assert!(!dead_block.contains(&served_or_new), "{served_or_new} is not dead:\n{dead_block}");
     }
     // Noisy: notes over the share on `memo` only; tools at 25% exactly is not over it.
     has("   noisy (matched by keyword on more than 25% of typed prompts, last 30 days): 1");
     has("     domain notes · 26% (31 of 120) · by keyword memo 26% · its 1 rule · narrow its keywords: base rule replay --domain notes --drop-keyword memo");
     hasnt("domain tools ·");
     hasnt("minutes");
-    // Ignored: the lint rule at 3 corrections; the memo rule at 2 is under it.
-    has("   ignored (served, then corrected 3+ times): 1");
+    // Ignored: the memo rule, corrected after 3 of 3 servings; the lint rule's 3 of 8 (38%) is under twice the log's 30%.
+    has("   ignored (corrected after 3+ times, and after at least twice the log average of 30% of servings): 1");
     has(&format!(
-        "     {} \"Name the lint target first.\"   served 8 · corrected after 3 · reword it: base rule propose --rule {} --text \"...\"",
-        short("tools", R_LINT),
-        short("tools", R_LINT)
+        "     {} \"Date every memo.\"   served 3 · corrected after 3 (100%, log average 30%) · reword it: base rule propose --rule {} --text \"...\"",
+        short("notes", R_MEMO),
+        short("notes", R_MEMO)
     ));
     let ignored_block = &section[section.find("   ignored").unwrap()..section.find("   review").unwrap()];
-    assert!(!ignored_block.contains(&short("notes", R_MEMO)), "2 corrections are under 3:
-{ignored_block}");
+    assert!(!ignored_block.contains(&short("tools", R_LINT)), "3 of 8 is under twice the average:\n{ignored_block}");
     assert!(l.iter().any(|x| x.starts_with("   correction detector")), "{section}");
 }
 
@@ -509,7 +511,7 @@ fn rule_stats_output() {
 /// Non-default thresholds are honoured, and a base.toml without the keys reads as the defaults.
 #[test]
 fn thresholds_from_config() {
-    let toml = "[doctor]\ndead_days = 40\nignored_after = 2\nreview_served = 3\nreview_days = 5\n\n[tune]\nbroad_share = 0.2\n";
+    let toml = "[doctor]\ndead_days = 40\nignored_after = 4\nreview_served = 3\nreview_days = 5\n\n[tune]\nbroad_share = 0.2\n";
     let fx = listing_fixture("thresholds", toml);
     fx.graph(&quads_decision("global.keep-notes-short", "Keep notes short", Some(&ago(6, 0)), None, false));
     let mut log: Vec<Value> = std::fs::read_to_string(fx.ws.join(".base").join("match-log.jsonl"))
@@ -531,9 +533,8 @@ fn thresholds_from_config() {
     has("   noisy (matched by keyword on more than 20% of typed prompts, last 40 days): 2");
     // A 40-day window also holds the prompt 35 days ago (tools by `hook`) and the 3 decision prompts below.
     has("     domain tools · 25% (31 of 124) · by keyword lint 24%, hook 1% ·");
-    // ignored_after 2: the memo rule is listed now.
-    has("   ignored (served, then corrected 2+ times): 2");
-    has(&short("notes", R_MEMO));
+    // ignored_after 4: the memo rule's 3 corrections are under it now.
+    has("   ignored (corrected after 4+ times, and after at least twice the log average of 26% of servings): 0");
     // review_served 3, review_days 5.
     has("   review (served 3+ times, unchanged 5+ days): 1");
     has("     global.keep-notes-short \"Keep notes short\"   served 3 · unchanged 6 days ·");
@@ -590,7 +591,7 @@ fn doctor_usage_young_log() {
     assert_eq!(lines[1], format!("   match log: 1 day (since {}) · 61 typed prompts, 646 task notifications · 0 with no text", today()));
     assert_eq!(lines[2], "   dead (not served in 30 days): not judged yet · the match log covers 1 day, fewer than [doctor] dead_days = 30");
     assert_eq!(lines[3], "   noisy: not judged yet · 61 typed prompts in the last 30 days, fewer than 100");
-    assert_eq!(lines[4], "   ignored (served, then corrected 3+ times): 0");
+    assert_eq!(lines[4], "   ignored (corrected after 3+ times, and after at least twice the log average of 0% of servings): 0");
 }
 
 /// Advice only: a store whose section lists dead, noisy, ignored and review ends HEALTHY, exit 0, as the same store
@@ -610,7 +611,7 @@ fn doctor_usage_never_changes_the_verdict() {
     fx.log(&Log { rows });
 
     let (code, section, out) = fx.section();
-    for listed in ["   dead (not served in 30 days): 3", "   noisy (matched by keyword", "   ignored (served, then corrected 3+ times): 1", "   review (served 1+ times, unchanged 5+ days): 1"] {
+    for listed in ["   dead (not served in 30 days): 3", "   noisy (matched by keyword", "   ignored (corrected after 3+ times, and after at least twice the log average of 29% of servings): 1", "   review (served 1+ times, unchanged 5+ days): 1"] {
         assert!(section.contains(listed), "missing {listed:?}:\n{section}");
     }
     assert!(out.trim_end().ends_with("Verdict: HEALTHY ✓"), "{out}");

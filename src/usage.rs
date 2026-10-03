@@ -49,6 +49,12 @@ use crate::emit::match_log;
 /// prompts must not make a domain 67% noisy.
 pub const NOISY_MIN_PROMPTS: usize = 100;
 
+/// How many times the log's average share of servings followed by a correction a rule's own share must reach before
+/// it is listed as ignored (lynx's ruling at gate 4). On the operator's replayed log 1,243 of 7,536 servings (16.5%)
+/// were followed by a correction about that reply or the next, so a rule served 20 times passes 3 corrections by
+/// chance: with `[doctor] ignored_after` alone, 46 of the 52 rules ever served were listed; with this, 1.
+pub const IGNORED_TIMES_AVERAGE: f64 = 2.0;
+
 /// Lines each list prints before it says how many more there are.
 const SHOWN: usize = 10;
 
@@ -264,6 +270,23 @@ impl Scan {
             }
         }
         c
+    }
+
+    /// Over the whole log, every rule's and decision's servings: how many a correction followed, and how many there
+    /// were. Their share is the average an ignored rule is measured against.
+    pub fn average(&self) -> (usize, usize) {
+        let (mut corrected, mut all) = (0, 0);
+        for list in self.servings.values() {
+            for s in list {
+                all += 1;
+                if let (Some(sess), Some(n)) = (s.session, s.turn)
+                    && (self.signals.contains(&(sess, n)) || self.signals.contains(&(sess, n + 1)))
+                {
+                    corrected += 1;
+                }
+            }
+        }
+        (corrected, all)
     }
 
     /// Every decision the log shows served, by slug.
@@ -590,6 +613,19 @@ pub struct Ignored {
     pub corrected: usize,
 }
 
+/// The log's average: servings a correction followed, of all servings, over the whole log.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Average {
+    pub corrected: usize,
+    pub servings: usize,
+}
+
+impl Average {
+    pub fn share(&self) -> f64 {
+        if self.servings == 0 { 0.0 } else { self.corrected as f64 / self.servings as f64 }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Review {
     pub decision: String,
@@ -656,6 +692,8 @@ pub struct Section {
     /// `None`: not judged (too few typed prompts in the window, or no prompt text kept).
     pub noisy: Option<Vec<Noisy>>,
     pub ignored: Vec<Ignored>,
+    /// What an ignored rule's share is measured against.
+    pub average: Average,
     pub review: Vec<Review>,
     pub detector: DetectorLine,
     pub limits: Limits,
@@ -774,18 +812,25 @@ pub fn build(i: &Inputs) -> Section {
     };
     let now_decisions = i.store.map(|s| decisions_now(s, i.config, &decision_slugs)).unwrap_or_default();
 
-    // Ignored: rules and decisions, over the whole log.
+    // Ignored: rules and decisions, over the whole log: corrected after at least `ignored_after` times, and after at
+    // least IGNORED_TIMES_AVERAGE times the log's average share of servings (lynx's ruling at gate 4).
+    let (corrected, servings) = scan.average();
+    let average = Average { corrected, servings };
+    let floor = IGNORED_TIMES_AVERAGE * average.share();
+    let ignored_by = |c: &Counts| {
+        c.corrected_after >= limits.ignored_after && c.served_all > 0 && c.corrected_after as f64 >= floor * c.served_all as f64
+    };
     let mut ignored: Vec<Ignored> = Vec::new();
     for r in &rules {
         let c = scan.counts(&Key::Rule(r.id.clone()));
-        if c.corrected_after >= limits.ignored_after {
+        if ignored_by(&c) {
             ignored.push(Ignored { kind: "rule".into(), id: r.short(), text: r.text.clone(), served: c.served_all, corrected: c.corrected_after });
         }
     }
     for slug in &decision_slugs {
         let Some(d) = now_decisions.get(*slug).filter(|d| !d.superseded) else { continue };
         let c = scan.counts_since(&Key::Decision(slug.to_string()), d.updated.map(|t| t.timestamp()));
-        if c.corrected_after >= limits.ignored_after {
+        if ignored_by(&c) {
             ignored.push(Ignored { kind: "decision".into(), id: slug.to_string(), text: d.name.clone(), served: c.served_all, corrected: c.corrected_after });
         }
     }
@@ -806,7 +851,7 @@ pub fn build(i: &Inputs) -> Section {
     }
     review.sort_by(|a, b| b.served.cmp(&a.served).then_with(|| a.decision.cmp(&b.decision)));
 
-    Section { log: Some(log), dead, too_new, noisy, ignored, review, detector, limits }
+    Section { log: Some(log), dead, too_new, noisy, ignored, average, review, detector, limits }
 }
 
 fn noisy_n(n: &Noisy) -> usize {
@@ -998,18 +1043,24 @@ pub fn render(s: &Section) -> String {
         }
     }
 
-    out.push_str(&format!("   ignored (served, then corrected {}+ times): {}\n", l.ignored_after, s.ignored.len()));
+    let avg = percent(s.average.corrected, s.average.servings);
+    out.push_str(&format!(
+        "   ignored (corrected after {}+ times, and after at least twice the log average of {avg} of servings): {}\n",
+        l.ignored_after,
+        s.ignored.len()
+    ));
     for i in s.ignored.iter().take(SHOWN) {
         let next = match i.kind.as_str() {
             "decision" => format!("reword it: {}", cmd_decision_update(&i.id)),
             _ => format!("reword it: {}", cmd_propose_rewrite(&i.id)),
         };
         out.push_str(&format!(
-            "     {} \"{}\"   served {} · corrected after {} · {next}\n",
+            "     {} \"{}\"   served {} · corrected after {} ({}, log average {avg}) · {next}\n",
             i.id,
             clip(&i.text, 40),
             i.served,
-            i.corrected
+            i.corrected,
+            percent(i.corrected, i.served)
         ));
     }
     more_line(&mut out, s.ignored.len());

@@ -496,7 +496,8 @@ pub struct DoctorConfig {
     /// A rule not served in this many days is dead (K8b). Also the window of the noisy list and the detector line.
     #[serde(default = "default_dead_days")]
     pub dead_days: u64,
-    /// A rule or decision served and then corrected at least this many times is ignored (K8b).
+    /// A rule or decision served and then corrected at least this many times is ignored (K8b), when its share of
+    /// servings corrected is also at least twice the log's average (`usage::IGNORED_TIMES_AVERAGE`, lynx's gate-4 ruling).
     #[serde(default = "default_ignored_after")]
     pub ignored_after: usize,
     /// F14c: a decision served at least this many times, and unchanged for `review_days`, is listed as "still true?".
