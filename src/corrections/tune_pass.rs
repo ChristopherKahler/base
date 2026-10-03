@@ -340,11 +340,13 @@ rules at the right moment. Read the turns below and answer with one JSON object 
 1. \"corrections\": every turn where the USER corrects the AI: says it got something wrong, repeats an instruction it \
 ignored, tells it to stop doing something, or undoes what it did. A new request, a question, an approval or thanks is \
 not a correction. For each: \"turn\"; \"why\" (what the AI got wrong, one sentence); \"rule\" (one sentence the AI \
-should follow from now on, written to the AI); \"keywords\" (2 to 4 words or short phrases copied exactly from the \
-USER's prompt that should bring the rule back); \"domain\" (one name from DOMAINS, or null).
+should follow from now on, written to the AI); \"keywords\" (one to three keywords, each one to three words copied \
+exactly from the USER's prompt, that a later prompt on the same subject would also contain); \"domain\" (one name \
+from DOMAINS, or null).
 2. \"not_corrections\": the numbers of the turns base flagged that are not corrections.
 3. \"unmatched\": for each turn listed under NO DOMAIN MATCHED that belongs to one of the DOMAINS: \"turn\", \
-\"domain\", \"keywords\" (words copied exactly from that prompt that should have brought the domain).";
+\"domain\", \"keywords\" (one to three keywords, each one to three words copied exactly from that prompt, that should \
+have brought the domain).";
 
 const SESSION_FOOTER: &str = "Answer in this shape, with your own values:
 {\"corrections\":[{\"turn\":3,\"why\":\"...\",\"rule\":\"...\",\"keywords\":[\"...\"],\"domain\":\"...\"}],\

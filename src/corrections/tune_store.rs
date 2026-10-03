@@ -249,7 +249,8 @@ fn store_prompt(bench: &Bench<'_>, c: &Candidates) -> String {
     }
     if !c.split.is_empty() {
         s.push_str("SPLIT: rules that may hold two separate instructions. For each: \"split\": true if so, and \"parts\": \
-                    two rules, each {\"text\", \"keywords\": [2 to 4 words that should bring it back]}.\n");
+                    two rules, each {\"text\", \"keywords\": [one to three keywords, each one to three words, that should \
+                    bring it back]}.\n");
         for (n, (r, served)) in c.split.iter().enumerate() {
             s.push_str(&format!("[s{}] served on {served} prompts: {}\n", n + 1, quote(&r.text, 800)));
         }
