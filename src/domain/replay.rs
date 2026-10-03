@@ -51,11 +51,22 @@ pub struct Change {
     pub target: Target,
     pub add: Vec<String>,
     pub drop: Vec<String>,
-    /// New wording: a rewrite's.
+    /// New wording: a rewrite's, a merge's, or a split's first part.
     pub text: Option<String>,
+    /// A merge (BO-17): the second rule, `<domain>.<id>`, folded with the target into one rule of the new wording.
+    pub merge: Option<String>,
+    /// A split (BO-17): the second rule's wording and keywords; the target keeps the first part.
+    pub second: Option<(String, Vec<String>)>,
+    /// A retirement (BO-17): the rule stops being served.
+    pub retire: bool,
 }
 
 impl Change {
+    /// A change of keywords only: the shape every BO-16 change has.
+    pub fn keywords(target: Target, add: Vec<String>, drop: Vec<String>) -> Self {
+        Change { target, add, drop, text: None, merge: None, second: None, retire: false }
+    }
+
     /// `domain base · add keyword "user prompt submit"`: the target and what changes, for a header line.
     pub fn describe(&self) -> String {
         let mut parts: Vec<String> = vec![match &self.target {
@@ -73,10 +84,21 @@ impl Change {
         if !self.drop.is_empty() {
             parts.push(format!("drop {} {}", noun(self.drop.len()), quoted(&self.drop)));
         }
+        if let Some(m) = &self.merge {
+            parts.push(format!("merged with rule {m}"));
+        }
         if let Some(t) = &self.text
             && !matches!(self.target, Target::NewRule { .. })
         {
-            parts.push(format!("new wording \"{}\"", clip(t, 80)));
+            let what = if self.second.is_some() { "first part" } else { "new wording" };
+            parts.push(format!("{what} \"{}\"", clip(t, 80)));
+        }
+        if let Some((t, k)) = &self.second {
+            let words = if k.is_empty() { String::new() } else { format!(" · its {} {}", noun(k.len()), quoted(k)) };
+            parts.push(format!("second part \"{}\"{words}", clip(t, 80)));
+        }
+        if self.retire {
+            parts.push("retired".to_string());
         }
         parts.join(" · ")
     }
@@ -238,10 +260,13 @@ enum Probe {
     Rule(RuleRef),
     /// A decision of an always-on domain, on its own keywords.
     Keywords(Vec<String>),
+    /// Any of these (a merge's two rules before, a split's two parts after).
+    Any(Vec<Probe>),
 }
 
 fn served(bench: &Bench<'_>, probe: &Probe, prompt: &str) -> bool {
     match probe {
+        Probe::Any(list) => list.iter().any(|p| served(bench, p, prompt)),
         Probe::Nothing => false,
         // No rule with matchers has an empty id, so `judge` asks the domain.
         Probe::Domain(d) => bench.judge(&RuleRef { id: String::new(), domain: d.clone(), text: String::new() }, prompt).served,
@@ -283,6 +308,19 @@ pub fn edit_topic_words(matchers: &[Matcher], add: &[String], drop: &[String]) -
         }
         None if !add.is_empty() => out.push(Matcher::for_topic(edit_list(&[], add, &[]))),
         None => {}
+    }
+    out
+}
+
+/// Two rules' matchers as one: the topic words joined, every other matcher kept once.
+pub fn union_matchers(a: &[Matcher], b: &[Matcher]) -> Vec<Matcher> {
+    let mut out: Vec<Matcher> = a.to_vec();
+    for m in b {
+        match (m.kind == Kind::Topic, out.iter().position(|x| x.kind == Kind::Topic)) {
+            (true, Some(i)) => out[i].words = edit_list(&out[i].words, &m.words, &[]),
+            _ if out.contains(m) => {}
+            _ => out.push(m.clone()),
+        }
     }
     out
 }
@@ -335,14 +373,51 @@ fn plan<'a>(config: &BaseConfig, live: &Bench<'a>, store: Option<&Store>, change
                     None => {}
                 }
             }
+            // A merge (BO-17): the second rule's matchers join the target's, and both go; the merged rule is served on
+            // their union, or through the target's domain when neither had matchers of its own.
+            let mut before = Probe::Rule(rule.clone());
+            if let Some(b) = change.merge.as_deref() {
+                let other = find_rule(live, b)?;
+                if let Some(j) = converted.iter().position(|c| c.rule.id == other.id) {
+                    let theirs = converted.remove(j).matchers;
+                    match converted.iter_mut().find(|c| c.rule.id == rule.id) {
+                        Some(c) => c.matchers = union_matchers(&c.matchers, &theirs),
+                        None => converted.push(Converted {
+                            rule: rules::build(&rule.domain, rule.text.clone(), None, None),
+                            matchers: theirs,
+                        }),
+                    }
+                }
+                before = Probe::Any(vec![Probe::Rule(rule.clone()), Probe::Rule(other)]);
+            }
             if let Some(text) = change.text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
                 after_ref = RuleRef { id: rules::rule_id(&rule.domain, text), domain: rule.domain.clone(), text: text.to_string() };
                 if let Some(c) = converted.iter_mut().find(|c| c.rule.id == rule.id) {
                     c.rule = rules::build(&rule.domain, text.to_string(), c.rule.rationale.clone(), c.rule.iri.clone());
                 }
             }
+            let mut after_probe = Probe::Rule(after_ref);
+            // A split (BO-17): the second part is a rule of its own, on its keywords, or through the domain without.
+            if let Some((text, words)) = &change.second {
+                let part = rules::build(&rule.domain, text.clone(), None, None);
+                let part_ref = RuleRef { id: part.id.clone(), domain: rule.domain.clone(), text: text.clone() };
+                let probe = if !injected(live, &rule.domain) {
+                    Probe::Nothing
+                } else if words.is_empty() {
+                    Probe::Domain(rule.domain.clone())
+                } else {
+                    converted.push(Converted { rule: part, matchers: edit_topic_words(&[], words, &[]) });
+                    Probe::Rule(part_ref)
+                };
+                after_probe = Probe::Any(vec![after_probe, probe]);
+            }
+            // A retirement (BO-17): no hook serves it after.
+            if change.retire {
+                converted.retain(|c| c.rule.id != rule.id);
+                after_probe = Probe::Nothing;
+            }
             let after = live.changed(live.domains.clone(), converted);
-            Ok(Plan { after, before: Probe::Rule(rule), after_probe: Probe::Rule(after_ref) })
+            Ok(Plan { after, before, after_probe })
         }
         Target::Decision(slug) => {
             let store = store.ok_or_else(|| "no graph here, so no decision to replay".to_string())?;

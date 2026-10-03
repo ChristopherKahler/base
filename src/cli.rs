@@ -266,6 +266,25 @@ pub enum Commands {
         #[arg(long)]
         cursor: bool,
     },
+    /// The rule pass: read the sessions since the last pass and write rule proposals for base rule review (keyword gap,
+    /// rewrite, new rule, drop keyword, merge, split, retire). Nothing is applied. Uses headless Claude on Haiku
+    Tune {
+        /// Show what it would read and how many Haiku calls it would make; call nothing, write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Read this session instead of the ones due (repeatable)
+        #[arg(long)]
+        session: Vec<String>,
+        /// Read this transcript as a session instead of the ones due (repeatable)
+        #[arg(long)]
+        transcript: Vec<String>,
+        /// Run the store check (merge, split, drop keyword, retire) even when it ran in the last day
+        #[arg(long)]
+        store: bool,
+        /// Haiku calls this pass makes at most; sessions past it wait for the next pass
+        #[arg(long, default_value_t = base::corrections::tune_pass::DEFAULT_MAX_CALLS)]
+        max_calls: usize,
+    },
     /// Manage rules in the graph (add, list, remove)
     Rule {
         /// Target the global tier (~/.base-gbl/) instead of workspace.
@@ -1511,6 +1530,11 @@ pub enum RuleAction {
         /// With --approve or --edit: apply a change its replay flags TOO BROAD (show the user the replay first)
         #[arg(long)]
         broad_ok: bool,
+    },
+    /// Serve a retired rule again: clear the retirement an approved retire proposal made
+    Unretire {
+        /// The rule, as `base rule list --include-superseded` prints it: <domain>.<id>
+        rule: String,
     },
     /// Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
     Update {
@@ -3898,6 +3922,20 @@ pub fn run() {
             }
         }
 
+        // ─── Tune (BO-17, K4) ─────────────────────────────
+        // A command the AI runs in its turn, never a hook (K4c): the prompt hook's `rule pass due` line and session
+        // start's catch-up line only ask for it.
+        Some(Commands::Tune { dry_run, session, transcript, store, max_calls }) => {
+            use base::corrections::tune_pass;
+            let args = tune_pass::Args { dry_run, sessions: session, transcripts: transcript, store, max_calls };
+            let mut judge = tune_pass::Haiku::new();
+            let running = base::relay::env_session_id();
+            match tune_pass::run(&config, &cwd, &args, &mut judge, running.as_deref()) {
+                Ok(report) => print!("{}", tune_pass::render(&report)),
+                Err(msg) => die("Error", msg),
+            }
+        }
+
         // ─── Rule ─────────────────────────────────────────
         Some(Commands::Rule { global, action }) => {
             let rule_cwd = tier_cwd(&cwd, global);
@@ -4009,7 +4047,7 @@ pub fn run() {
                                 (_, _, Some(s)) => Target::Decision(s),
                                 _ => die("Error", "give a proposal id, or --domain, --rule or --decision with --add-keyword or --drop-keyword"),
                             };
-                            let change = Change { target, add: split(&add_keyword), drop: split(&drop_keyword), text: None };
+                            let change = Change::keywords(target, split(&add_keyword), split(&drop_keyword));
                             if change.add.is_empty() && change.drop.is_empty() {
                                 die("Error", "give --add-keyword \"...\" or --drop-keyword \"...\"");
                             }
@@ -4039,6 +4077,10 @@ pub fn run() {
                         }
                     }
                 }
+                RuleAction::Unretire { rule } => match base::corrections::review::unretire(&config, &rule_cwd, &rule) {
+                    Ok(out) => print!("{out}"),
+                    Err(msg) => die("Error", msg),
+                },
                 RuleAction::Update { rule, fires_on, quiet_on, clear_tests } => {
                     let (want_domain, id) = crud::rule::parse_rule_ref(&rule).unwrap_or_else(|msg| die("Error", msg));
                     let want_domain = want_domain.map(|d| domain::canonical_name(&cwd, &d));

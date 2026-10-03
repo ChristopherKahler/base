@@ -70,30 +70,43 @@ pub struct Args {
     pub prompt: Option<u32>,
 }
 
-/// The three kinds (K3). BO-17 adds its own (drop keyword, merge, split, retire).
+/// The three kinds a correction sorts into (K3), and the four the rule pass adds from patterns across sessions (K4a,
+/// BO-17): drop a keyword, merge two rules, split one, retire one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     KeywordGap,
     Rewrite,
     NewRule,
+    DropKeyword,
+    Merge,
+    Split,
+    Retire,
 }
 
 impl Kind {
-    /// As stored: `keyword-gap`, `rewrite`, `new-rule`.
+    /// As stored: `keyword-gap`, `rewrite`, `new-rule`, `drop-keyword`, `merge`, `split`, `retire`.
     pub fn slug(self) -> &'static str {
         match self {
             Kind::KeywordGap => "keyword-gap",
             Kind::Rewrite => "rewrite",
             Kind::NewRule => "new-rule",
+            Kind::DropKeyword => "drop-keyword",
+            Kind::Merge => "merge",
+            Kind::Split => "split",
+            Kind::Retire => "retire",
         }
     }
 
-    /// As printed: `keyword gap`, `rewrite`, `new rule`.
+    /// As printed: `keyword gap`, `rewrite`, `new rule`, `drop keyword`, `merge`, `split`, `retire`.
     pub fn label(self) -> &'static str {
         match self {
             Kind::KeywordGap => "keyword gap",
             Kind::Rewrite => "rewrite",
             Kind::NewRule => "new rule",
+            Kind::DropKeyword => "drop keyword",
+            Kind::Merge => "merge",
+            Kind::Split => "split",
+            Kind::Retire => "retire",
         }
     }
 }
@@ -163,20 +176,91 @@ pub struct Proposal {
     pub turn_key: String,
     /// It replaced the turn's earlier proposal.
     pub replaced: bool,
+    /// `correction` (BO-15: one turn, sorted) or `tune` (BO-17: the rule pass wrote it).
+    pub origin: &'static str,
+    /// What the rule pass saw behind it, one line each: the prompts, the counts.
+    pub evidence: Vec<String>,
+    /// Keywords a drop-keyword proposal takes away (its `keywords` are the narrower ones it adds, if any).
+    pub dropped: Vec<String>,
+    /// A merge's second rule, `<domain>.<id>`.
+    pub merge_with: Option<String>,
+    /// A split's second part: its wording and its keywords (the first part is `text` and `keywords`).
+    pub second: Option<(String, Vec<String>)>,
 }
 
 /// What the correction is, read from its turn or from the flags.
-struct Evidence {
-    prompt: String,
-    signals: Vec<Signal>,
-    session: Option<String>,
-    turn: Option<u32>,
-    manual: bool,
+#[derive(Debug, Clone)]
+pub struct Evidence {
+    pub prompt: String,
+    pub signals: Vec<Signal>,
+    pub session: Option<String>,
+    pub turn: Option<u32>,
+    pub manual: bool,
 }
 
 /// Run `base rule propose`: sort the correction, and write the proposal unless `--dry-run`.
 pub fn run(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Proposal, String> {
     let ev = evidence(config, cwd, args)?;
+    let mut sorter = Sorter::load(config, cwd);
+    let mut prop = sorter.sort(args, ev)?;
+    if !args.dry_run {
+        sorter.write(&mut prop)?;
+    }
+    Ok(prop)
+}
+
+/// Everything a sort reads, loaded once: the domains (synced into the graph first, as every hook does), both tiers'
+/// store, every rule and decision as a candidate. The rule pass (BO-17) sorts several corrections on one load.
+pub struct Sorter<'a> {
+    config: &'a BaseConfig,
+    cwd: PathBuf,
+    domains: Vec<crate::domain::DomainDef>,
+    store: Option<oxigraph::store::Store>,
+    candidates: Vec<Candidate>,
+    recent: Option<Vec<String>>,
+    highest: u32,
+}
+
+impl<'a> Sorter<'a> {
+    pub fn load(config: &'a BaseConfig, cwd: &Path) -> Self {
+        let domains = crate::domain::load_domains(cwd);
+        crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
+        let store = crate::store::load_merged(cwd);
+        let candidates = load_candidates(config, store.as_ref(), &domains);
+        let highest = store.as_ref().map(|s| max_id(s, &config.namespace)).unwrap_or(0);
+        Sorter { config, cwd: cwd.to_path_buf(), domains, store, candidates, recent: None, highest }
+    }
+
+    /// The merged store this sorter read.
+    pub fn store(&self) -> Option<&oxigraph::store::Store> {
+        self.store.as_ref()
+    }
+
+    /// Write `prop` as a pending proposal in the cwd's tier.
+    pub fn write(&mut self, prop: &mut Proposal) -> Result<(), String> {
+        write(self.config, &self.cwd, self.highest, prop)?;
+        if let Some(n) = prop.id.as_deref().and_then(|i| i.trim_start_matches("p-").parse::<u32>().ok()) {
+            self.highest = self.highest.max(n);
+        }
+        Ok(())
+    }
+
+    fn recent(&mut self) -> Vec<String> {
+        if self.recent.is_none() {
+            self.recent = Some(recent_prompts(&self.cwd));
+        }
+        self.recent.clone().unwrap_or_default()
+    }
+
+    /// Sort one correction (`ev`) as `args` says, without writing it.
+    pub fn sort(&mut self, args: &Args, ev: Evidence) -> Result<Proposal, String> {
+        let config = self.config;
+        let cwd = self.cwd.clone();
+        sort_with(self, config, &cwd, args, ev)
+    }
+}
+
+fn sort_with(sorter: &mut Sorter<'_>, config: &BaseConfig, cwd: &Path, args: &Args, ev: Evidence) -> Result<Proposal, String> {
     let c3: Vec<&Signal> = ev.signals.iter().filter(|s| s.layer == "C3").collect();
     if !c3.is_empty() && c3.iter().all(|s| s.kind == "DEFERRED") {
         return Err("this turn's marker is DEFERRED: the AI held its position. A disagreement is logged \
@@ -197,11 +281,8 @@ pub fn run(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Proposal, Str
         args.keywords.as_deref().map(crate::domain::global_decisions::parse_keywords).unwrap_or_default();
     let text = args.text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(String::from);
 
-    let domains = crate::domain::load_domains(cwd);
-    // Domains synced first, as every hook does, then both tiers loaded once: the candidates and the next id read it.
-    crate::hook::user_prompt_submit::ensure_domain_sync_pub(config, cwd);
-    let store = crate::store::load_merged(cwd);
-    let mut candidates = load_candidates(config, store.as_ref(), &domains);
+    let domains = sorter.domains.clone();
+    let mut candidates = sorter.candidates.clone();
     rank(&mut candidates, text.as_deref(), &given_keywords, marker.as_deref(), &ev.prompt);
     let fit = pick(args, &candidates)?;
 
@@ -216,7 +297,7 @@ pub fn run(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Proposal, Str
     let trigger = trigger_row.map(|i| &rows[i]);
 
     let (keywords, suggested) = if given_keywords.is_empty() {
-        (suggest(&ev.prompt, &config.corrections, &recent_prompts(cwd)), true)
+        (suggest(&ev.prompt, &config.corrections, &sorter.recent()), true)
     } else {
         (given_keywords, false)
     };
@@ -266,13 +347,13 @@ pub fn run(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Proposal, Str
         warnings.push("none of the keywords is in the example, so its fires_on test would miss".to_string());
     }
     let session = ev.session.clone();
-    let fingerprint = fingerprint(kind, &target, &keywords, text.as_deref());
+    let fingerprint = fingerprint(kind, &target, &keywords, text.as_deref(), "");
     // K5e (BO-16): a proposal the user rejected is never offered again, in either tier.
-    if let Some((id, when)) = store.as_ref().and_then(|s| super::review::rejected(s, &config.namespace, &fingerprint)) {
+    if let Some((id, when)) = sorter.store.as_ref().and_then(|s| super::review::rejected(s, &config.namespace, &fingerprint)) {
         return Err(format!("rejected on {when} as {id}: this proposal is not offered again. Nothing was written."));
     }
     let turn_key = turn_key(session.as_deref(), &ev, &fingerprint);
-    let mut proposal = Proposal {
+    let proposal = Proposal {
         id: None,
         kind,
         meaning,
@@ -294,11 +375,12 @@ pub fn run(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Proposal, Str
         note,
         warnings,
         replaced: false,
+        origin: "correction",
+        evidence: Vec::new(),
+        dropped: Vec::new(),
+        merge_with: None,
+        second: None,
     };
-    if !args.dry_run {
-        let highest = store.as_ref().map(|s| max_id(s, &config.namespace)).unwrap_or(0);
-        write(config, cwd, highest, &mut proposal)?;
-    }
     Ok(proposal)
 }
 
@@ -374,13 +456,13 @@ fn evidence(config: &BaseConfig, cwd: &Path, args: &Args) -> Result<Evidence, St
 }
 
 /// A signal of the turn before that belongs to this turn's correction: a C2 other than the turn's own repeat.
-fn carried_over(s: &Signal) -> bool {
+pub(crate) fn carried_over(s: &Signal) -> bool {
     s.layer == "C2" && s.kind != "repeat"
 }
 
 /// The session's transcript: `--transcript`, else the one the hooks recorded, else
 /// `<claude config>/projects/*/<session>.jsonl`.
-fn transcript_for(cwd: &Path, given: Option<&str>, session: Option<&str>) -> Result<PathBuf, String> {
+pub(crate) fn transcript_for(cwd: &Path, given: Option<&str>, session: Option<&str>) -> Result<PathBuf, String> {
     if let Some(t) = given {
         return Ok(PathBuf::from(t));
     }
@@ -827,12 +909,74 @@ fn hex16(text: &str) -> String {
 }
 
 /// Kind, target and change, hashed: the key BO-16's K5e keeps for a rejected proposal, so the same one is never
-/// offered again.
-fn fingerprint(kind: Kind, target: &Target, keywords: &[String], text: Option<&str>) -> String {
+/// offered again. `extra` carries what only the rule pass's kinds have (the dropped keywords, a merge's second rule, a
+/// split's second part); empty for the three a correction sorts into, so their fingerprints are what BO-15 stored.
+pub fn fingerprint(kind: Kind, target: &Target, keywords: &[String], text: Option<&str>, extra: &str) -> String {
     let mut kw: Vec<String> = keywords.iter().map(|k| k.trim().to_lowercase()).collect();
     kw.sort();
     let text = text.map(|t| t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()).unwrap_or_default();
-    hex16(&format!("{}|{}:{}|{}|{}", kind.slug(), target.kind, target.id.to_lowercase(), kw.join(","), text))
+    let base = format!("{}|{}:{}|{}|{}", kind.slug(), target.kind, target.id.to_lowercase(), kw.join(","), text);
+    if extra.is_empty() { hex16(&base) } else { hex16(&format!("{base}|{}", extra.to_lowercase())) }
+}
+
+/// What a proposal the rule pass makes from a pattern carries beyond its kind and target (BO-17).
+#[derive(Debug, Clone, Default)]
+pub struct PatternParts {
+    pub text: Option<String>,
+    pub keywords: Vec<String>,
+    /// The prompt it must serve on, when it adds keywords.
+    pub example: Option<String>,
+    pub evidence: Vec<String>,
+    pub dropped: Vec<String>,
+    pub merge_with: Option<String>,
+    pub second: Option<(String, Vec<String>)>,
+}
+
+/// A proposal the rule pass makes from a pattern across prompts (BO-17): no turn, its evidence in lines, keyed on what
+/// it proposes so the same one found again replaces itself.
+pub fn pattern(kind: Kind, target: Target, why: String, parts: PatternParts) -> Proposal {
+    let mut extra: Vec<String> = Vec::new();
+    if !parts.dropped.is_empty() {
+        let mut d: Vec<String> = parts.dropped.iter().map(|k| k.trim().to_lowercase()).collect();
+        d.sort();
+        extra.push(format!("drop:{}", d.join(",")));
+    }
+    if let Some(m) = &parts.merge_with {
+        extra.push(format!("merge:{m}"));
+    }
+    if let Some((t, k)) = &parts.second {
+        extra.push(format!("second:{}|{}", t.split_whitespace().collect::<Vec<_>>().join(" "), k.join(",")));
+    }
+    let fingerprint = fingerprint(kind, &target, &parts.keywords, parts.text.as_deref(), &extra.join("|"));
+    let example = parts.example.map(|e| crate::scrub::scrub(&e)).unwrap_or_default();
+    Proposal {
+        id: None,
+        kind,
+        meaning: "pattern",
+        target,
+        why,
+        text: parts.text,
+        keywords: parts.keywords,
+        suggested: false,
+        prompt: example.clone(),
+        example,
+        marker: None,
+        signals: Vec::new(),
+        session: None,
+        title: None,
+        turn: None,
+        candidates: Vec::new(),
+        note: None,
+        warnings: Vec::new(),
+        turn_key: hex16(&format!("tune|{fingerprint}")),
+        fingerprint,
+        replaced: false,
+        origin: "tune",
+        evidence: parts.evidence.iter().map(|e| crate::scrub::scrub(e)).collect(),
+        dropped: parts.dropped,
+        merge_with: parts.merge_with,
+        second: parts.second,
+    }
 }
 
 /// The turn, hashed: one proposal per turn, replaced when the command runs again for it. A turn read from the
@@ -936,8 +1080,29 @@ fn triples(prop: &Proposal, id: &str, iri: &str, p: &str) -> String {
     for k in &prop.keywords {
         s.push_str(&lit("proposedKeyword", k));
     }
-    s.push_str(&lit("firesOn", &prop.example));
-    s.push_str(&lit("triggerPrompt", &prop.prompt));
+    for k in &prop.dropped {
+        s.push_str(&lit("droppedKeyword", k));
+    }
+    if let Some(m) = &prop.merge_with {
+        s.push_str(&lit("mergeTarget", m));
+    }
+    if let Some((t, k)) = &prop.second {
+        s.push_str(&lit("secondText", t));
+        for w in k {
+            s.push_str(&lit("secondKeyword", w));
+        }
+    }
+    s.push_str(&lit("proposalOrigin", prop.origin));
+    // Numbered, because a graph keeps no order and the first line is the headline: review sorts and strips the number.
+    for (n, e) in prop.evidence.iter().enumerate() {
+        s.push_str(&lit("evidence", &format!("{n:02} {e}")));
+    }
+    if !prop.example.is_empty() {
+        s.push_str(&lit("firesOn", &prop.example));
+    }
+    if !prop.prompt.is_empty() {
+        s.push_str(&lit("triggerPrompt", &prop.prompt));
+    }
     if let Some(m) = &prop.marker {
         s.push_str(&lit("markerLine", m));
     }

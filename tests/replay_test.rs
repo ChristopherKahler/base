@@ -1665,3 +1665,175 @@ fn replay_rule_review_on_the_corpus_store() {
     let (_, listed, _) = run_base(&s, &["rule", "review"]);
     assert_eq!(listed, "no rule proposals pending\n");
 }
+
+/// The rule pass's lines, word for word as BO-17's scope gives them.
+const TUNE_DUE_3: &str = "rule pass due: 3 corrections since the last one · run base tune";
+const TUNE_CATCH_UP_1: &str = "rule pass due: 1 earlier session has unreviewed corrections · run base tune";
+
+/// What base serves: the workspace's config files and every rule line its graph holds, proposals left out.
+fn served_config(s: &seed::Seed) -> Vec<String> {
+    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+    let mut rules: Vec<String> = read(s.ws.join(".base").join("graph.nq"))
+        .lines()
+        .filter(|l| ["ruleText", "hasRule", "match", "firesOn", "quietOn", "supersede", "retiredAt"].iter().any(|k| l.contains(k)))
+        .filter(|l| !l.contains("proposal/p-"))
+        .map(String::from)
+        .collect();
+    rules.sort();
+    vec![read(s.ws.join(".base").join("domains.toml")), read(s.ws.join(".base").join("base.toml")), rules.join("\n")]
+}
+
+/// BO-17 (K4, C5, D5, D7). The BO-15 corpus session through the real prompt and Stop hooks reaches the rule pass's due
+/// line on prompt 8, after its third flagged correction (prompts 2, 4 and 7), and on no other prompt: the C2 signals of
+/// turns 1, 3 and 5 count once, on the prompts that answer them, and turn 8's DEFERRED not at all. The hooks' count is
+/// the pass's own: `base tune --dry-run` reads the same four flagged turns. Ended (SessionEnd), the session is caught up
+/// at the next session start. A fake-judged pass writes its proposals with their evidence and applies nothing; after
+/// it, the catch-up line is gone and a second pass has nothing to read. Before BO-17 no correction went back into the
+/// rules unless the AI ran `base rule propose` itself.
+#[test]
+fn replay_tune_pass_on_the_corpus_store() {
+    use transcripts::Ev;
+    let s = seed::write(&root("bo17-tune"), &seed::TINY, &fixture("base.toml"));
+    std::fs::write(s.ws.join(".base").join("domains.toml"), fixture("domains.toml")).expect("domains.toml");
+    let ws = s.ws.display().to_string().replace('\\', "/");
+    let corpus: CorrectionsCorpus =
+        serde_json::from_str(&fixture("corrections-session.json").replace("{ws}", &ws)).expect("the corrections corpus");
+    let session = corpus.session.clone();
+    let mut lead: Vec<Ev> = Vec::new();
+    let mut turns: Vec<Vec<Ev>> = Vec::new();
+    for e in corpus.events {
+        match e {
+            Ev::Prompt(_) | Ev::Notification(_) => turns.push(vec![e]),
+            other => match turns.last_mut() {
+                Some(t) => t.push(other),
+                None => lead.push(other),
+            },
+        }
+    }
+    let transcript = s.home.join(".claude").join("projects").join("replay").join(format!("{session}.jsonl"));
+    let tp = transcript.display().to_string();
+    transcripts::append(&transcript, &session, &lead);
+    let hook = |event: &str, extra: serde_json::Value| -> String {
+        let mut payload = serde_json::json!({ "cwd": s.ws.display().to_string(), "session_id": session, "transcript_path": tp });
+        if let (Some(p), Some(e)) = (payload.as_object_mut(), extra.as_object()) {
+            p.extend(e.clone());
+        }
+        let (code, out, err) = seed::run_hook_at(&s, &s.ws, event, &payload, &[]);
+        assert_eq!(code, 0, "{event}: {err}");
+        out
+    };
+
+    // The session, as BO-15's replay drives it: the user's change between turns, no Stop after an interrupt or a refusal.
+    let mut due_on: Vec<u32> = Vec::new();
+    for (i, turn) in turns.iter().enumerate() {
+        let num = i as u32 + 1;
+        for e in turn {
+            if let Ev::FileChanged(f) = e {
+                std::fs::write(f, "port = 9000\n# changed by hand between turns\n").expect("the user's change");
+            }
+        }
+        transcripts::append(&transcript, &session, &turn[..1]);
+        let last_line = std::fs::read_to_string(&transcript).expect("the transcript").lines().last().unwrap_or_default().to_string();
+        let line: serde_json::Value = serde_json::from_str(&last_line).expect("the prompt line");
+        let prompt = line["message"]["content"].as_str().expect("the prompt's text").to_string();
+        let out = hook("user-prompt-submit", serde_json::json!({ "hook_event_name": "UserPromptSubmit", "prompt": prompt }));
+        if out.contains(TUNE_DUE_3) {
+            due_on.push(num);
+        }
+        assert_eq!(out.matches("rule pass due:").count(), usize::from(out.contains(TUNE_DUE_3)), "prompt {num}: another due line:\n{out}");
+        for e in &turn[1..] {
+            if let Ev::Write(f) | Ev::Edit(f) = e {
+                std::fs::write(f, "port = 8080\n").expect("the AI's write");
+            }
+        }
+        transcripts::append(&transcript, &session, &turn[1..]);
+        if matches!(turn.last(), Some(Ev::Interrupt | Ev::InterruptToolUse | Ev::Denial)) {
+            continue;
+        }
+        let reply = turn.iter().rev().find_map(|e| match e {
+            Ev::Text(t) => Some(t.clone()),
+            _ => None,
+        });
+        hook("stop", serde_json::json!({ "hook_event_name": "Stop", "stop_hook_active": false, "last_assistant_message": reply.unwrap_or_default() }));
+    }
+    assert_eq!(due_on, [8], "the due line on prompt 8 only, the prompt after the third flagged correction");
+    let cursor = s.home.join(".base-gbl").join("corrections").join(format!("{session}.json"));
+    let cursor: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cursor).expect("the session's cursor file")).expect("its JSON");
+    assert_eq!(cursor["tune"]["flagged"], serde_json::json!([2, 4, 7, 10]), "one flagged turn per correction: {}", cursor["tune"]);
+    assert_eq!(cursor["tune"]["prompts"], 9, "typed prompts: the task notification is not one");
+
+    // Closed, the session is caught up at the next session start; nothing ran the pass.
+    hook("session-end", serde_json::json!({ "hook_event_name": "SessionEnd", "reason": "prompt_input_exit" }));
+    let (_, start, _) = run_session_start(&s, Some("b017b017-0000-4000-8000-0000000000a2"));
+    assert!(start.contains(TUNE_CATCH_UP_1), "{start}");
+
+    let tune = |args: &[&str], env: &[(&str, &std::ffi::OsStr)]| -> String {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_base"))
+            .args(args)
+            .current_dir(&s.ws)
+            .env("BASE_HOME", &s.home)
+            .env("BASE_NO_AUTO_UPDATE", "1")
+            .env("BASE_AST_NO_SPAWN", "1")
+            .env_remove("BASE_RELAY_AS")
+            .env_remove("BASE_HEADLESS")
+            .env_remove("BASE_LLM_FAKE")
+            .env_remove("BASE_LLM_FAKE_LOG")
+            .env_remove("WT_SESSION")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("CLAUDECODE")
+            .envs(env.iter().copied())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the base binary runs");
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "base {args:?}: {stdout}{stderr}");
+        stdout.into_owned()
+    };
+
+    // The dry run reads what the hooks counted, and calls nothing.
+    let calls = s.ws.join("judge-calls.jsonl");
+    let fail = std::ffi::OsString::from("fail");
+    let dry = tune(&["tune", "--dry-run"], &[("BASE_LLM_FAKE", &fail), ("BASE_LLM_FAKE_LOG", calls.as_os_str())]);
+    assert!(dry.starts_with("would read: 1 session (b015b015), 9 prompts, 4 flagged corrections, "), "{dry}");
+    assert!(dry.contains("haiku: would make 1 call (0 cached)\n"), "{dry}");
+    assert!(!calls.exists(), "a dry run makes no call");
+
+    // The pass, judged by a fake: three corrections, one false flag, one prompt that belonged to a domain.
+    let judged = serde_json::json!({
+        "corrections": [
+            { "turn": 2, "why": "it gave the port from the template after the user changed the file",
+              "rule": "Read the config file again before stating a port; the user may have changed it.",
+              "keywords": ["staging proxy"], "domain": null },
+            { "turn": 4, "why": "it started clearing the whole build folder",
+              "rule": "When asked to clean up, clear only the temp files and keep the build folder.",
+              "keywords": ["build folder", "temp files"], "domain": "build-process" },
+            { "turn": 7, "why": "it read open tickets as the whole team's",
+              "rule": "Open tickets means the user's own unless they say the team's.",
+              "keywords": ["assigned to me"], "domain": null }
+        ],
+        "not_corrections": [10],
+        "unmatched": [{ "turn": 5, "domain": "client-work", "keywords": ["open tickets"] }]
+    });
+    let fake = s.ws.join("judge.json");
+    std::fs::write(&fake, serde_json::json!({ "answers": [{ "when": "TURNS:", "answer": judged.to_string() }] }).to_string()).expect("the fake");
+    let before = served_config(&s);
+    let out = tune(&["tune"], &[("BASE_LLM_FAKE", fake.as_os_str()), ("BASE_LLM_FAKE_LOG", calls.as_os_str())]);
+    assert!(out.starts_with("read: 1 session (b015b015), 9 prompts, 4 flagged corrections, 0 unflagged found by the backstop\n"), "{out}");
+    assert!(out.contains("haiku: 1 call (cached: 0)\n"), "{out}");
+    assert!(out.contains("proposals written: 4 (see base rule review)\n"), "{out}");
+    assert!(out.contains("detector: 3 of 3 judged corrections flagged (by layer: C1 1, C2 2, C3 2), 0 missed, false flags by layer: C2 1\n"), "{out}");
+    assert_eq!(std::fs::read_to_string(&calls).expect("the call log").lines().count(), 1, "one call for the session");
+    assert_eq!(served_config(&s), before, "nothing applied: the config and every rule are as they were");
+
+    let review = run_base(&s, &["rule", "review"]).1;
+    assert_eq!(review.matches("from a correction the rule pass found").count(), 3, "the three judged corrections:\n{review}");
+    assert!(review.contains("p-0002 new rule · build-process") && review.contains("words \"build folder\""), "a keyword no other prompt carries is left out:\n{review}");
+    assert!(review.contains("evidence: judged a correction: it started clearing the whole build folder"), "{review}");
+    assert!(review.contains("p-0004 keyword gap · client-work · add \"open tickets\"") && review.contains("· from the rule pass ("), "{review}");
+
+    // Read: no catch-up line, and a second pass reads nothing.
+    let (_, start, _) = run_session_start(&s, Some("b017b017-0000-4000-8000-0000000000a3"));
+    assert!(!start.contains("rule pass due"), "{start}");
+    let again = tune(&["tune", "--dry-run"], &[]);
+    assert!(again.starts_with("would read: 0 sessions, 0 prompts"), "{again}");
+}

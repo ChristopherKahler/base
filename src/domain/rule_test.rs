@@ -132,6 +132,16 @@ impl<'a> Bench<'a> {
             .collect()
     }
 
+    /// The domains `prompt` brings in by keyword or path, as the prompt hook matches a fresh session's first prompt,
+    /// the always-on ones left out: they match every prompt (BO-17, "a prompt with no domain match").
+    pub fn matched_domains(&self, prompt: &str) -> Vec<String> {
+        matcher::match_domains_auto(prompt, &self.domains, &[], &self.ctx)
+            .into_iter()
+            .filter(|m| !matches!(m.reason, MatchReason::Always))
+            .map(|m| m.domain.name.clone())
+            .collect()
+    }
+
     /// A bench from parts already loaded: the seam the unit tests drive.
     pub fn from_parts(
         config: &'a BaseConfig,
