@@ -867,6 +867,32 @@ mod tests {
         b
     }
 
+    /// BO-20: a shadow candidate's blocks go where live's matching blocks were, the rest of live's list unmoved; with no
+    /// matching block of live's, after the blocks the hook put first.
+    #[test]
+    fn replace_matcher_puts_the_candidates_blocks_where_lives_were() {
+        let matching = |id: &str| {
+            let mut b = block(id, Priority::Matched, 40);
+            b.matcher = true;
+            b
+        };
+        let mut list = PromptBlocks::new();
+        list.push(block("correction-check", Priority::Matched, 40));
+        list.push(matching("a-rules"));
+        list.push(matching("a-context"));
+        list.push(block("walk-x", Priority::Context, 40));
+        list.replace_matcher(vec![block("b-rules", Priority::Matched, 40)], 1);
+        let ids: Vec<&str> = list.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, ["correction-check", "b-rules", "walk-x"]);
+
+        let mut none = PromptBlocks::new();
+        none.push(block("correction-check", Priority::Matched, 40));
+        none.push(block("walk-x", Priority::Context, 40));
+        none.replace_matcher(vec![block("b-rules", Priority::Matched, 40)], 1);
+        let ids: Vec<&str> = none.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, ["correction-check", "b-rules", "walk-x"]);
+    }
+
     fn blocks(list: Vec<PromptBlock>) -> PromptBlocks {
         let mut out = PromptBlocks::new();
         out.extend(list);

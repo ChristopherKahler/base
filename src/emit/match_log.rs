@@ -899,6 +899,21 @@ mod tests {
         assert_eq!(first[0].session.as_deref(), Some("s00000"));
     }
 
+    /// Lynx's Q7 ruling on BO-20: a prompt row keeps its 20 best BM25 scores and every topic score.
+    #[test]
+    fn a_row_keeps_the_best_bm25_scores_and_every_topic_score() {
+        let score = |id: &str, s: f32, by: &str| Score { id: id.into(), domain: "d".into(), score: s, by: by.into() };
+        let mut scores: Vec<Score> = (0..30).map(|i| score(&format!("r{i:02}"), i as f32, "bm25")).collect();
+        scores.insert(3, score("t1", 0.5, "topic"));
+        let kept = kept_scores(scores);
+        let bm25: Vec<&Score> = kept.iter().filter(|s| s.by == "bm25").collect();
+        assert_eq!(bm25.len(), BM25_SCORES_KEPT);
+        assert!(bm25.iter().all(|s| s.score >= 10.0), "the best twenty: {bm25:?}");
+        assert!(kept.iter().any(|s| s.id == "t1"), "a topic score stays");
+        let few: Vec<Score> = (0..5).map(|i| score(&format!("r{i}"), i as f32, "bm25")).collect();
+        assert_eq!(kept_scores(few.clone()), few, "under the limit nothing goes");
+    }
+
     #[test]
     fn summary_folds_keywords_per_domain() {
         let m = vec![

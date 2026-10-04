@@ -699,7 +699,9 @@ fn parse_piece<'a>(piece: &'a [u8], ctx: &Ctx) -> Piece<'a> {
         if text.is_empty() {
             continue;
         }
-        if quiet(text) {
+        // A quiet row carrying a shadow entry is read in the shadow mode: the candidate may serve where live served
+        // nothing (BO-20).
+        if quiet(text) && !(ctx.shadow && text.contains("\"shadow\":")) {
             if ctx.own && let Some(day) = ts_day(text, &mut clock) {
                 out.quiet_oldest = Some(out.quiet_oldest.map_or(day, |o| o.min(day)));
             }

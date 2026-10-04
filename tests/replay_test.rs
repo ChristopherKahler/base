@@ -493,6 +493,44 @@ fn replay_every_prompt_logs_what_it_matched_served_and_cut() {
     );
 }
 
+/// BO-20 (K9c). With a shadow running, every corpus prompt prints exactly what it prints with none (the same corpus,
+/// the same session ids, on a seed of its own), and every prompt the matching ran on carries the candidate's entry in
+/// its row; a star command passes the matching by and carries none.
+#[test]
+fn replay_shadow_leaves_output_alone() {
+    let runs = prompt_runs();
+    let s = seed::write(&root("prompts-shadow"), &seed::TINY, &fixture("base.toml"));
+    std::fs::write(s.ws.join(".base").join("domains.toml"), fixture("domains.toml")).expect("domains.toml");
+    // The corpus serves with BM25 (the default); the candidate is the keyword-only matcher.
+    let (code, out, err) = run_base(&s, &["shadow", "start", "--matcher", "keyword-only"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let rooted = |ws: &Path, text: &str| {
+        let root = ws.parent().expect("seed root").display().to_string();
+        text.replace(&root, "<root>").replace(&root.replace('\\', "/"), "<root>")
+    };
+    for run in runs {
+        let (code, stdout, stderr) = run_prompt_submit(&s, &run.prompt, Some(&run.session));
+        assert_eq!(code, 0, "{:?}: {stderr}", run.prompt);
+        assert_eq!(rooted(&s.ws, &stdout), rooted(&run.ws, &run.stdout), "{:?}: the shadow changed the output", run.prompt);
+    }
+    let log = std::fs::read_to_string(s.ws.join(".base").join("match-log.jsonl")).expect("match log");
+    let rows: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).expect("a row")).collect();
+    let (mut with, mut stars) = (0usize, 0usize);
+    for row in rows.iter().filter(|r| r["event"] == "prompt") {
+        let star = row["matched"].as_array().is_some_and(|m| m.iter().any(|x| x["by"] == "command"));
+        if star {
+            stars += 1;
+            assert!(row.get("shadow").is_none(), "a star command runs no matching: {row}");
+        } else {
+            assert!(row["shadow"]["candidate"].is_string(), "every matched prompt carries the candidate's entry: {row}");
+            with += 1;
+        }
+    }
+    assert_eq!(with + stars, runs.len(), "one row per prompt");
+    assert!(with > 0, "control: the corpus has prompts the matching ran on");
+    println!("replay shadow: {} prompts, outputs identical, {with} rows with the candidate's entry, {stars} star commands", runs.len());
+}
+
 /// BO-19 (K8a, D15). The usage counts follow what the prompt hook printed: after the corpus runs, `base rule stats`
 /// counts each rule served exactly as often as the match log's rows list it under `served`, and a rule the budget
 /// withheld from a prompt is not counted served for it.

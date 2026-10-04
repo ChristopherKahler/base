@@ -448,10 +448,10 @@ pub fn start(config: &BaseConfig, cwd: &Path, what: &Start) -> Result<String, St
     let mut out = format!("started candidate {} beside live {}\n", candidate.name, live.name);
     out.push_str(&format!("  candidate: {}\n", describe(&candidate)));
     out.push_str(&format!("  live:      {}\n", describe(&live)));
-    out.push_str(&format!(
+    out.push_str(
         "  every prompt and file touch now runs both; only live's pick is served. Progress: base shadow report · end it: \
-         base shadow stop\n"
-    ));
+         base shadow stop\n",
+    );
     Ok(out)
 }
 

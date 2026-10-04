@@ -920,6 +920,39 @@ fn clip(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
 
+    /// BO-20: the one writer sets and removes `[match]` keys line by line, as it sets `[budget]`: every other line, and
+    /// the comment on a line it changes, stay; a section that is missing is added; anything that is not TOML is refused.
+    #[test]
+    fn set_section_keys_sets_and_removes_keys_and_keeps_every_other_line() {
+        let own = |k: &str| vec![k.to_string()];
+        let before = "[budget]\nprompt_bytes = 10000\n\n[match]\n# a note\nbm25 = false # why\nmin_score = 6.0\n\n[shadow]\nmax_ms = 50\n";
+        let after = set_section_keys(
+            before,
+            "match",
+            &[("bm25", Some("true".into())), ("min_score", None), ("relative", Some("0.5".into()))],
+            &own,
+        )
+        .expect("written");
+        assert_eq!(after, "[budget]\nprompt_bytes = 10000\n\n[match]\n# a note\nbm25 = true # why\nrelative = 0.5\n\n[shadow]\nmax_ms = 50\n");
+        let back = set_section_keys(
+            &after,
+            "match",
+            &[("bm25", Some("false".into())), ("min_score", Some("6.0".into())), ("relative", None)],
+            &own,
+        )
+        .expect("written");
+        assert_eq!(back, before, "set back, the file is byte for byte what it was");
+        assert_eq!(
+            set_section_keys("[budget]\nx = 1\n", "match", &[("bm25", Some("true".into()))], &own).expect("written"),
+            "[budget]\nx = 1\n\n[match]\nbm25 = true\n"
+        );
+        assert_eq!(set_section_keys("[budget]\nx = 1\n", "match", &[("bm25", None)], &own).expect("written"), "[budget]\nx = 1\n");
+        assert!(set_section_keys(before, "match", &[("bm25", Some("tr ue".into()))], &own).is_err(), "not TOML: refused");
+        let crlf = before.replace('\n', "\r\n");
+        let written = set_section_keys(&crlf, "match", &[("bm25", Some("true".into()))], &own).expect("written");
+        assert!(written.contains("bm25 = true # why\r\n") && !written.replace("\r\n", "").contains('\n'), "CRLF kept");
+    }
+
     /// A host that delivers `limit` bytes whole and hands anything larger over as the 2,000-character preview, answered
     /// the way the model answers: the highest marker whose line starts inside what it sees, and whether END is there.
     struct Fake {

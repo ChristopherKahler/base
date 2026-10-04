@@ -84,6 +84,9 @@ pub struct Judged {
     pub shown: HashMap<String, String>,
 }
 
+/// One event's ids: what the candidate adds, and what it drops.
+type Picks<'a> = (HashSet<&'a str>, HashSet<&'a str>);
+
 /// One correction a win or a loss was counted from.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Attributed {
@@ -177,7 +180,7 @@ fn judge_with<'c>(
     let mut drops: BTreeMap<&str, usize> = BTreeMap::new();
     let mut ms: Vec<u64> = Vec::new();
     // Each (session, prompt)'s adds and drops, for the corrections.
-    let mut by_turn: HashMap<(u32, u32), (HashSet<&str>, HashSet<&str>)> = HashMap::new();
+    let mut by_turn: HashMap<(u32, u32), Picks<'_>> = HashMap::new();
     for e in &events {
         if e.entry.skipped.is_some() {
             j.skipped += 1;

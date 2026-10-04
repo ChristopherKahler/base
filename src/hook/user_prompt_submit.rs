@@ -770,11 +770,8 @@ pub(crate) fn in_time(deadline: Deadline) -> std::result::Result<(), Slow> {
 
 /// [`serve`] for live: the world as it is, `[match]` as base.toml says, no time limit.
 fn serve_live(config: &BaseConfig, cwd: &Path, world: &World, session: &SessionState, trace: &mut Trace) -> Served {
-    match serve(config, cwd, world, &View::live(world), &Matching::live(config, world), session, trace, None) {
-        Ok(s) => s,
-        // Unreachable: only a deadline ends a run early, and live has none.
-        Err(Slow) => Served::default(),
-    }
+    // `Err(Slow)` cannot happen: only a deadline ends a run early, and live has none.
+    serve(config, cwd, world, &View::live(world), &Matching::live(config, world), session, trace, None).unwrap_or_default()
 }
 
 /// What a prompt is served by its matching (K9b's one function): the domains its keywords, its session's paths and

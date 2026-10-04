@@ -359,6 +359,32 @@ mod tests {
         format!("<{u}{a}> <{u}{PRED_SUPERSEDED_BY}> <{u}{b}> <{g}> .\n")
     }
 
+    /// Every quad of `store` as N-Quads, sorted: two stores that dump the same hold the same quads.
+    fn dump(store: &Store) -> String {
+        let mut lines: Vec<String> = store.iter().map(|q| q.unwrap().to_string()).collect();
+        lines.sort();
+        lines.join("\n")
+    }
+
+    /// BO-20 (lynx's Q3 condition): `unlink_update` removes exactly the quads `link_update` wrote. A store linked and
+    /// then unlinked dumps byte for byte as before, the old record's own status included; the link itself wrote three.
+    #[test]
+    fn unlink_undoes_link_exactly() {
+        let ns = ns();
+        let u = &ns.uri;
+        let g = "http://example.org/graph/ws/seed";
+        let (old, new) = (format!("{u}rule/tools/cli-1"), format!("{u}rule/tools/cli-2"));
+        let store = store_with(&format!(
+            "<{old}> <{u}ruleText> \"Name the folder.\" <{g}> .\n<{old}> <{u}status> \"active\" <{g}> .\n<{new}> <{u}ruleText> \"Name the folder you write to.\" <{g}> .\n"
+        ));
+        let before = dump(&store);
+        let prefixes = crate::crud::prefixes(&ns);
+        store.update(&format!("{prefixes}\n{}", link_update(&ns, g, &old, &new))).unwrap();
+        assert_eq!(store.len().unwrap(), 6, "control: the link wrote its three quads");
+        store.update(&format!("{prefixes}\n{}", unlink_update(&ns, g, &old, &new))).unwrap();
+        assert_eq!(dump(&store), before, "unlinked, the store is as it was");
+    }
+
     #[test]
     fn the_exclusion_filter_binds_a_variable_derived_from_its_subject() {
         let f = sparql_exclude_superseded(&ns(), "n");
