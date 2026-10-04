@@ -44,6 +44,13 @@ fn day_ago(days: i64) -> String {
     (Local::now() - Duration::days(days)).format("%Y-%m-%d").to_string()
 }
 
+/// The days a log covers when its oldest row is [`ago`]`(days, 0)`, counted as the reader does: on a day with a clock
+/// change near midnight, `days` times 24 hours back can land a calendar day off.
+fn covered_since(days: i64) -> u64 {
+    let oldest = (Local::now() - Duration::days(days)).date_naive();
+    (Local::now().date_naive() - oldest).num_days() as u64 + 1
+}
+
 /// A home and a workspace: domains.toml, the workspace graph, the global base.toml, and a match log built by
 /// [`Log`].
 struct Fixture {
@@ -278,7 +285,7 @@ fn usage_counts_from_match_log() {
     assert_eq!(scan.counts(&k("rule-g")).corrected_after, 0, "a phrase on the prompt that brought the rule in is about the reply before it");
     assert_eq!(scan.counts(&k("rule-h")).corrected_after, 1, "a refusal in the next turn");
     assert_eq!(scan.typed, 14, "typed prompts in the window: the one 40 days ago is outside it, and the row whose scores hold a malformed entry still counts (scores are not built)");
-    assert_eq!(scan.days_covered(), 41);
+    assert_eq!(scan.days_covered(), covered_since(40));
 
     let dk = Key::Decision("global.memo-folder".into());
     assert_eq!(scan.counts(&dk).corrected_after, 1);
@@ -327,16 +334,17 @@ fn usage_scan_is_the_same_at_any_thread_count() {
     };
     let dirs = [own, global];
     let today = Local::now().date_naive();
-    let one = usage::scan_with(&dirs, today, 30, &current, Reading { threads: 1, block: Reading::BLOCK });
+    let one = usage::scan_with(&dirs, today, 30, &current, Reading { threads: 1, block: Reading::BLOCK, piece: Reading::PIECE });
     assert_eq!((one.typed, one.machine, one.textless), (17, 1, 1), "K8a's 14, two more typed here and one in the other tier");
-    assert_eq!(one.days_covered(), 46, "the quiet row 45 days ago in the archive file");
+    assert_eq!(one.days_covered(), covered_since(45), "the quiet row 45 days ago in the archive file");
     assert_eq!(one.counts(&Key::Rule("rule-a".into())).served_all, 5);
     assert_eq!(one.counts(&Key::Rule("rule-b".into())).served_all, 2, "K8a's one and the long line's");
     assert_eq!(one.keyword_prompts.get("tools"), Some(&1));
     assert!(one.decision_reach.get("global.memo-folder").is_some_and(|n| *n >= 1));
-    for (threads, block) in [(8, Reading::BLOCK), (3, 4096), (2, 97), (5, 1)] {
-        let many = usage::scan_with(&dirs, today, 30, &current, Reading { threads, block });
-        assert_eq!(many, one, "{threads} threads, blocks of {block} bytes");
+    // A piece of 1 byte splits even these small files among the threads; the default 1 MB reads them on one.
+    for (threads, block, piece) in [(8, Reading::BLOCK, 1), (3, 4096, 1), (2, 97, 1), (5, 1, 1), (8, Reading::BLOCK, Reading::PIECE)] {
+        let many = usage::scan_with(&dirs, today, 30, &current, Reading { threads, block, piece });
+        assert_eq!(many, one, "{threads} threads, blocks of {block} bytes, pieces of {piece} or more");
     }
     let _ = std::fs::remove_dir_all(&root);
 }

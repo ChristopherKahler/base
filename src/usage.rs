@@ -76,6 +76,8 @@ pub struct Reading {
     pub threads: usize,
     /// Bytes read at a time; a block runs on to the end of its last line.
     pub block: usize,
+    /// The fewest bytes a thread is given: a small block is read on fewer threads, a small file on the calling one.
+    pub piece: usize,
 }
 
 impl Reading {
@@ -83,6 +85,8 @@ impl Reading {
     pub const BLOCK: usize = 32 << 20;
     /// The most threads used, whatever the machine has (lynx's ruling at gate 4).
     pub const MAX_THREADS: usize = 8;
+    /// 1 MB: below it a thread costs more to start than the lines it would parse.
+    pub const PIECE: usize = 1 << 20;
     /// Set to a number, the threads to use instead: for timing (gate 4 ran it at 2) and tests.
     pub const THREADS_ENV: &str = "BASE_USAGE_THREADS";
 
@@ -92,7 +96,7 @@ impl Reading {
         let set = std::env::var(Self::THREADS_ENV).ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| (1..=64).contains(n));
         let threads =
             set.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(Self::MAX_THREADS));
-        Reading { threads, block: Self::BLOCK }
+        Reading { threads, block: Self::BLOCK, piece: Self::PIECE }
     }
 }
 
@@ -438,7 +442,7 @@ pub fn scan_with(dirs: &[PathBuf], today: NaiveDate, window_days: u64, current: 
         let ctx = Ctx { current, start: out.window_start(), own: i == 0 };
         for path in match_log::files(dir) {
             each_block(&path, &mut buf, reading.block, |block| {
-                for piece in parse_block(block, &ctx, reading.threads) {
+                for piece in parse_block(block, &ctx, reading) {
                     if let Some(day) = piece.quiet_oldest {
                         out.oldest = Some(out.oldest.map_or(day, |o| o.min(day)));
                     }
@@ -454,8 +458,8 @@ pub fn scan_with(dirs: &[PathBuf], today: NaiveDate, window_days: u64, current: 
 }
 
 /// Each block of `path`, in order: about `size` bytes, on to the end of a line, so no line is split between two. A
-/// line longer than `size` makes a longer block. A read error ends the file, as an unreadable line did before. No file
-/// is no block.
+/// line longer than `size` makes a longer block. A read error ends the file after its last whole line, as an
+/// unreadable line did before. No file is no block.
 fn each_block(path: &Path, buf: &mut Vec<u8>, size: usize, mut each: impl FnMut(&[u8])) {
     let Ok(mut file) = std::fs::File::open(path) else { return };
     // A small file needs no 32 MB block; one that grows while it is read is read on.
@@ -469,24 +473,27 @@ fn each_block(path: &Path, buf: &mut Vec<u8>, size: usize, mut each: impl FnMut(
             buf.resize(kept + size, 0);
         }
         let (mut filled, end) = (kept, kept + size);
-        let mut done = false;
+        let (mut ended, mut failed) = (false, false);
         while filled < end {
             match file.read(&mut buf[filled..end]) {
                 Ok(0) => {
-                    done = true;
+                    ended = true;
                     break;
                 }
                 Ok(n) => filled += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => {
-                    done = true;
+                    failed = true;
                     break;
                 }
             }
         }
-        if done {
-            if filled > 0 {
-                each(&buf[..filled]);
+        if ended || failed {
+            // At the end the last line counts with or without its line end; after an error only whole lines do, as
+            // the bytes after the last line end are a line cut short.
+            let upto = if failed { buf[..filled].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1) } else { filled };
+            if upto > 0 {
+                each(&buf[..upto]);
             }
             return;
         }
@@ -586,15 +593,26 @@ enum PromptKind {
     Typed(Vec<(usize, Vec<String>)>),
 }
 
-/// The pieces of `block`, parsed at once on up to `threads` threads, in order.
-fn parse_block<'a>(block: &'a [u8], ctx: &Ctx, threads: usize) -> Vec<Piece<'a>> {
-    let parts = pieces(block, threads.max(1));
+/// The pieces of `block`, parsed at once on up to `reading.threads` threads, in order.
+fn parse_block<'a>(block: &'a [u8], ctx: &Ctx, reading: Reading) -> Vec<Piece<'a>> {
+    let n = reading.threads.min(block.len().div_ceil(reading.piece.max(1))).max(1);
+    let parts = pieces(block, n);
     if parts.len() <= 1 {
         return vec![parse_piece(block, ctx)];
     }
     std::thread::scope(|s| {
-        let workers: Vec<_> = parts.into_iter().map(|p| s.spawn(move || parse_piece(p, ctx))).collect();
-        workers.into_iter().map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
+        // A thread the system will not give is no failure: that piece is read here, in its place.
+        let workers: Vec<_> = parts
+            .into_iter()
+            .map(|p| std::thread::Builder::new().spawn_scoped(s, move || parse_piece(p, ctx)).map_err(|_| p))
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| match w {
+                Ok(worker) => worker.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+                Err(p) => parse_piece(p, ctx),
+            })
+            .collect()
     })
 }
 
@@ -624,7 +642,8 @@ fn parse_piece<'a>(piece: &'a [u8], ctx: &Ctx) -> Piece<'a> {
         let Ok(mut row) = serde_json::from_str::<LeanRow>(text) else { continue };
         let Some((day, at)) = clock.when(&row.ts) else { continue };
         let window = day >= ctx.start;
-        for item in row.cut.drain(..) {
+        // Taken, not drained: the rows applied in order keep no room for the cut entries.
+        for item in std::mem::take(&mut row.cut) {
             let rule = match &*item.kind {
                 "rule" => true,
                 "decision" => false,
