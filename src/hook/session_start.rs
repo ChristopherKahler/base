@@ -206,6 +206,7 @@ pub fn handle(
     push_rule_pass(session_id, config, out);
     refresh_score_index(graph.as_ref(), cwd, config);
     push_matcher(config, cwd, out);
+    push_upgrade(cwd, out);
 
     if let Ok(signal_result) = crate::signal::run_signals(cwd, config, "session-start") {
         diagnostics.extend(signal_result.diagnostics.iter().cloned());
@@ -368,6 +369,15 @@ fn push_matcher(config: &BaseConfig, cwd: &Path, out: &mut SessionOutput) {
     }
 }
 
+/// BO-26 (U5): what an earlier upgrade did, each change with its undo, once. Nothing at all for a home that was never
+/// upgraded: one small file read per tier.
+fn push_upgrade(cwd: &Path, out: &mut SessionOutput) {
+    let lines = crate::upgrade::announcements(cwd);
+    if !lines.is_empty() {
+        out.push("upgrade", &format!("{}\n", lines.join("\n")), lines.len());
+    }
+}
+
 /// The global decisions with no keywords (BO-03, F5): a decision of an always-on domain reaches a prompt only
 /// on one of its keywords, so one with none is shown here, at session start, and nowhere else.
 fn push_global_decisions(graph: Option<&oxigraph::store::Store>, cwd: &Path, config: &BaseConfig, out: &mut SessionOutput) {
@@ -412,7 +422,7 @@ fn push_rule_pass(session_id: Option<&str>, config: &BaseConfig, out: &mut Sessi
 /// pulse last, and the relay wake contract outlasts the operator profile and the notices. A kind
 /// missing from this table sorts after all of it, and `every_pushed_kind_has_a_place_in_the_layout`
 /// fails the build when one does.
-pub const LAYOUT: [(&str, Rank); 37] = [
+pub const LAYOUT: [(&str, Rank); 38] = [
     ("instructions", Rank::Pinned),
     ("graph-unhealthy", Rank::DueNow),
     ("reminders", Rank::DueNow),
@@ -425,6 +435,8 @@ pub const LAYOUT: [(&str, Rank); 37] = [
     ("rule-pass", Rank::Primary),
     // BO-20, K9h: a shadow candidate promoted, rolled back or ready, one line each, once, beside the rule lines.
     ("matcher", Rank::Primary),
+    // BO-26, U5: what an upgrade did, one line per change with its undo, once, beside the matcher's line.
+    ("upgrade", Rank::Primary),
     ("forks", Rank::Secondary),
     // BEFORE the working-set blocks it qualifies, deliberately. The trimmer takes the
     // bottom of a rank first, so a scope clause placed after the rows would be trimmed
@@ -486,10 +498,12 @@ const DATA_BLOCKS: [&str; 6] = ["reminders", "handoffs", "forks", "projects", "t
 /// their own trigger (migrate, hooks-wired, contract, automap) are not here: a failing map build
 /// or a duplicate contract repeats every session, and with no command their floor already names
 /// the file.
-pub const SHOWN_ONCE: [&str; 6] = [
+pub const SHOWN_ONCE: [&str; 7] = [
     "first-run",
     // BO-20: an announcement leaves the shadow state as it is produced.
     "matcher",
+    // BO-26: an upgrade's lines leave its record as they are produced.
+    "upgrade",
     "update-applied",
     "relay-inbox",
     "relay-tasks",

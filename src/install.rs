@@ -8,7 +8,18 @@ use crate::manifest::{self, Manifest};
 /// The generic star-command pack offered at install. A fresh install otherwise
 /// ships zero commands, which leaves a new user with the machinery and no idea
 /// what to type first.
-const STARTER_COMMANDS: &str = include_str!("starter-commands.toml");
+pub const STARTER_COMMANDS: &str = include_str!("starter-commands.toml");
+
+/// Every starter pack an earlier base shipped, oldest first, with the releases that shipped it: the text of
+/// `src/starter-commands.toml` at each commit that changed it (`git log --follow`), read against the release tags.
+/// The upgrade replaces a command block of a user's `commands.toml` that is still one of these, unedited, with this
+/// build's (BO-26, U3). When `starter-commands.toml` changes, the text it replaces is added here, or users who never
+/// edited the pack keep the old text forever; `the_starter_pack_history_ends_at_the_current_pack` fails until it is.
+pub const STARTER_COMMANDS_SHIPPED: [(&str, &str); 3] = [
+    ("0.13.0 to 0.14.1", include_str!("starter-commands/0.13.0.toml")),
+    ("0.14.2 to 0.15.2", include_str!("starter-commands/0.14.2.toml")),
+    ("the dev builds of 2026-09-20", include_str!("starter-commands/dev-2026-09-20.toml")),
+];
 
 /// What to do about the starter star commands: ask (interactive default),
 /// or a decision already made by flag for unattended installs.
@@ -2075,6 +2086,24 @@ pub fn ensure_claude_md_current() -> Option<ClaudeMdRefresh> {
 mod tests {
     use super::*;
     use crate::config::BracketConfig;
+
+    /// BO-26 (U3): an upgrade brings a user's unedited starter commands up to [`STARTER_COMMANDS`] only from a text in
+    /// [`STARTER_COMMANDS_SHIPPED`]. So a change to `src/starter-commands.toml` must add the text it replaces there, and
+    /// then update this hash; until both are done this fails. Line endings do not count (a Windows checkout is CRLF).
+    #[test]
+    fn the_starter_pack_history_ends_at_the_current_pack() {
+        use sha2::{Digest, Sha256};
+        let normal = |t: &str| t.replace("\r\n", "\n");
+        let hash: String =
+            Sha256::digest(normal(STARTER_COMMANDS).as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hash, "32d15e38170ec8390cd8d70fb8a25580e8f3b6078ebe860deae1bfbc68905e48",
+            "src/starter-commands.toml changed: add the text it replaces to STARTER_COMMANDS_SHIPPED, then update this hash"
+        );
+        for (shipped, text) in STARTER_COMMANDS_SHIPPED {
+            assert_ne!(normal(text), normal(STARTER_COMMANDS), "{shipped} is the current pack, not an earlier one");
+        }
+    }
 
     fn write(dir: &Path, body: &str) -> std::path::PathBuf {
         let p = dir.join("base.toml");

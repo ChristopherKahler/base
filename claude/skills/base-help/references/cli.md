@@ -3541,13 +3541,16 @@ Options:
 ```text
 Show details for a specific star command
 
-Usage: base commands show <NAME>
+Usage: base commands show [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
           Command name (case-insensitive, without *)
 
 Options:
+      --shipped
+          Show the command as this version of base ships it in the starter pack, not your own copy
+
   -h, --help
           Print help
 ```
@@ -3745,7 +3748,7 @@ Options:
           Self-heal: quarantine malformed lines and atomically rewrite the good set (backs up first)
 
       --restore [<RESTORE>]
-          Restore the workspace graph from a backup snapshot. Bare `--restore` lists snapshots
+          Put back a backup base made: a graph snapshot (`graph.nq.bak-*`) in a tier's .base, or a `<name>.toml.BAK-<date>-pre-<version>` an upgrade left beside a config file. A bare name is a workspace snapshot. Bare `--restore` lists the workspace's snapshots. Anything else is refused
 
       --fix
           Plan the repair of what doctor reports and change nothing: records of another workspace moved out, corrections linked to the one record they name (the rest stay corrections), supersession disagreements settled, `[signal] max_chars` migrated, each tier compacted and its backups cut to `[graph] keep_backups`. `--fix --yes` applies the plan, snapshotting each graph first

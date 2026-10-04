@@ -27,7 +27,8 @@
 //!
 //! Then each tier is compacted with the existing `base graph compact` (F24a; it refuses an unhealthy graph, so the
 //! repairs come first) and keeps `[graph] keep_backups` snapshots (F24b). Last, base.toml's legacy `[signal] max_chars`
-//! moves to `[budget] memory_chars`, or goes when that is already set (F16).
+//! moves to `[budget] memory_chars`, or goes when that is already set (F16), or when it is the installer's 2000, which
+//! nobody chose (U6, BO-26).
 //!
 //! Every apply snapshots a graph before writing it, as compact does. A tier that does not parse is left alone with the
 //! command that repairs it: `base doctor --repair` comes first.
@@ -208,8 +209,12 @@ pub struct ConfigFix {
     /// The legacy value.
     pub max_chars: Option<i64>,
     /// True: the value moved to `[budget] memory_chars`, which was unset. False: the key was removed, because
-    /// `memory_chars` is set (`memory_chars` holds that value).
+    /// `memory_chars` is set (`memory_chars` holds that value), or because the value is the installer's (`installer`).
     pub moved: bool,
+    /// The value is [`INSTALLER_MAX_CHARS`], which the 0.15 installer wrote into every base.toml, so nobody chose it: it
+    /// is removed and the memory block keeps `memory_chars` (U6, lynx's G0 ruling on BO-26's Q5).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub installer: bool,
     /// The memory block's budget before the move: the value already set (removed), or the default (moved).
     pub memory_chars: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -222,12 +227,24 @@ pub struct ConfigFix {
 /// doctor --fix` and the upgrade path both call this). Errors are per tier and per file, so one that fails does not
 /// stop the others.
 pub fn run(cwd: &Path, apply: bool) -> Report {
+    run_where(cwd, apply, |_| true)
+}
+
+/// [`run`] on one of the tiers doctor reads from `cwd` (`global` or `workspace`), with the base.toml that tier holds.
+/// The automatic upgrade records each tier on its own, so a workspace first opened after the upgrade gets its repair
+/// without the global tier's being made again (BO-26, U1).
+pub fn run_tier(cwd: &Path, apply: bool, tier: &str) -> Report {
+    run_where(cwd, apply, |t| t == tier)
+}
+
+fn run_where(cwd: &Path, apply: bool, want: impl Fn(&str) -> bool) -> Report {
     // The registry from the workspace's own config, found by the walk, so a run from a subfolder reads what doctor reads.
     let root = crate::config::find_workspace_base(cwd).and_then(|b| b.parent().map(Path::to_path_buf));
     let config = BaseConfig::load(root.as_deref().unwrap_or(cwd));
     let home = crate::home::home_root();
     let tiers = crate::doctor::tier_paths(cwd)
         .into_iter()
+        .filter(|(tier, _)| want(tier))
         .map(|(tier, path)| {
             let mut fix = TierFix::new(&tier, &path);
             // Each tier read with its own namespace, from its own base.toml, as `doctor::diagnose_tier` reads it.
@@ -240,7 +257,7 @@ pub fn run(cwd: &Path, apply: bool) -> Report {
             fix
         })
         .collect();
-    Report { applied: apply, tiers, config: config_fixes(cwd, apply) }
+    Report { applied: apply, tiers, config: config_fixes(cwd, apply, &want) }
 }
 
 struct Ctx<'a> {
@@ -315,6 +332,10 @@ fn tier_fix(ctx: &Ctx<'_>, path: &Path, apply: bool, fix: &mut TierFix) -> Resul
             let out = crate::graph::compact_tier(path)?;
             lines_now = out.lines_after;
             backup = Some(out.backup);
+        }
+        // What this run took out, by the snapshot it took first, so doctor can tell the repair's own shrink from a loss.
+        if let Some(snap) = &backup {
+            record_shrink(path, Path::new(snap), count_lines(Path::new(snap)).saturating_sub(lines_now));
         }
         fix.compact = Some(Compaction { how, lines_before, lines_after: lines_now, backup });
         store::prune_backups(path, keep, None);
@@ -402,9 +423,19 @@ fn foreign_graphs(ns: &NamespaceConfig, store: &Store, path: &Path) -> Result<(G
 type GraphQuads = Vec<(String, Vec<Quad>)>;
 
 /// F15c's one refusal: a "foreign" graph holding at least as many quads as the tier's own is this workspace under an
-/// earlier folder name, and moving it out would empty the workspace. It stays where it is.
-fn left_in_place(quads: usize, own: usize) -> bool {
+/// earlier folder name, and moving it out would empty the workspace. It stays where it is. Doctor reads the same rule
+/// before it offers `--fix` for foreign records.
+pub fn left_in_place(quads: usize, own: usize) -> bool {
     quads >= own
+}
+
+/// Why a graph [`left_in_place`] stays: `--fix` says it in its plan and doctor beside the graph (BO-26, lynx's U4
+/// ruling), since only a person can say whose records they are.
+pub fn left_in_place_reason(quads: usize, own: usize) -> String {
+    format!(
+        "{quads} quads, at least this workspace's own {own}: the shape of this workspace under an earlier folder name, \
+         not another workspace's records"
+    )
 }
 
 fn move_foreign(ctx: &Ctx<'_>, path: &Path, store: &Store, fix: &mut TierFix) -> Result<Vec<(Dest, Vec<Quad>)>> {
@@ -434,13 +465,7 @@ fn move_foreign(ctx: &Ctx<'_>, path: &Path, store: &Store, fix: &mut TierFix) ->
         let left_behind = subjects.iter().map(|s| per_subject.get(s).copied().unwrap_or(0)).sum::<usize>()
             - quads.iter().filter(|q| subject_iri(&q.subject).is_some()).count();
         let dest = if left_in_place(quads.len(), own) {
-            Dest::Left {
-                why: format!(
-                    "{} quads, at least this workspace's own {own}: the shape of this workspace under an earlier folder \
-                     name, not another workspace's records",
-                    quads.len()
-                ),
-            }
+            Dest::Left { why: left_in_place_reason(quads.len(), own) }
         } else {
             destination(ctx, path, &workspace)
         };
@@ -856,8 +881,21 @@ fn settle_disagreements(ns: &NamespaceConfig, store: &Store) -> Result<Vec<Disag
 
 // ─── F16: [signal] max_chars ─────────────────────────────────────────────────
 
-/// Every base.toml doctor names as carrying `[signal] max_chars`, planned, and rewritten when `apply`.
-fn config_fixes(cwd: &Path, apply: bool) -> Vec<ConfigFix> {
+/// The `[signal] max_chars` the 0.15 installer wrote into every base.toml (`max_chars = 2000 # injection budget per
+/// session-start`), and the template's commented line. It capped every signal at session start, not the memory block,
+/// so moving it into `[budget] memory_chars` would give an upgraded user half 0.16's memory block for a number they never
+/// chose. F16 removes it instead and the default applies (U6). Any other value was set by someone and moves as before.
+pub const INSTALLER_MAX_CHARS: i64 = 2000;
+
+/// Which tier a base.toml belongs to: the global one under the home, every other one the workspace's.
+fn config_tier(file: &Path, global: Option<&Path>) -> &'static str {
+    let key = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if global.is_some_and(|g| key(g) == key(file)) { "global" } else { "workspace" }
+}
+
+/// Every base.toml doctor names as carrying `[signal] max_chars`, in the tiers `want` takes, planned, and rewritten when
+/// `apply`.
+fn config_fixes(cwd: &Path, apply: bool, want: &dyn Fn(&str) -> bool) -> Vec<ConfigFix> {
     let global = crate::home::home_root().map(|h| h.join(".base-gbl").join("base.toml"));
     let set_in = |file: &Path| -> Option<i64> {
         let table: toml::Table = std::fs::read_to_string(file).ok()?.parse().ok()?;
@@ -866,6 +904,7 @@ fn config_fixes(cwd: &Path, apply: bool) -> Vec<ConfigFix> {
     BaseConfig::legacy_keys(cwd)
         .into_iter()
         .filter(|k| k.section == "signal" && k.key == "max_chars")
+        .filter(|k| want(config_tier(&k.file, global.as_deref())))
         .map(|k| {
             // Set where this file reads it: in the file itself, or for a workspace's file, in the global one under it.
             let set = set_in(&k.file).or_else(|| global.as_deref().filter(|g| *g != k.file).and_then(set_in));
@@ -873,6 +912,7 @@ fn config_fixes(cwd: &Path, apply: bool) -> Vec<ConfigFix> {
                 file: k.file.display().to_string(),
                 max_chars: None,
                 moved: set.is_none(),
+                installer: false,
                 memory_chars: set.unwrap_or(crate::config::BudgetConfig::default().memory_chars as i64),
                 error: None,
             };
@@ -889,6 +929,11 @@ fn migrate_max_chars(file: &Path, apply: bool, fix: &mut ConfigFix) -> Result<()
     let table: toml::Table = before.parse().with_context(|| format!("{} does not parse", file.display()))?;
     let value = table.get("signal").and_then(|s| s.get("max_chars")).cloned();
     fix.max_chars = value.as_ref().and_then(toml::Value::as_integer);
+    // U6: only a value that would move. With `memory_chars` set the key goes either way, as before.
+    if fix.moved && fix.max_chars == Some(INSTALLER_MAX_CHARS) {
+        fix.installer = true;
+        fix.moved = false;
+    }
     let after = rewrite_max_chars(&before, fix.moved.then_some(fix.max_chars).flatten())?;
     if apply {
         let tmp = file.with_extension("toml.fix-tmp");
@@ -959,6 +1004,37 @@ fn local(iri: &str, ns_uri: &str) -> String {
 fn count_lines(path: &Path) -> usize {
     use std::io::BufRead;
     std::fs::File::open(path).map(|f| std::io::BufReader::new(f).lines().map_while(Result::ok).count()).unwrap_or(0)
+}
+
+/// Beside a tier's graph: how many lines each repair took out (records moved to where they belong, duplicate lines
+/// dropped), by the file name of the snapshot it took before writing. Doctor reads it so a graph smaller than base's own
+/// repair snapshot is not called a possible data loss, as long as it is smaller by no more than the repair took out
+/// (BO-26, lynx's U4 ruling). A snapshot `base graph compact` took by itself has no entry, and keeps the warning.
+pub const SHRINK_RECORD: &str = "repair-shrink.json";
+
+/// Record that the repair which took `snapshot` took `removed` lines out of `graph`. Entries for snapshots rotated out
+/// are dropped. Best effort: without the entry doctor keeps its warning, the safe side.
+fn record_shrink(graph: &Path, snapshot: &Path, removed: usize) {
+    let Some(name) = snapshot.file_name().and_then(|n| n.to_str()) else { return };
+    let file = graph.with_file_name(SHRINK_RECORD);
+    let mut all: BTreeMap<String, usize> =
+        std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    all.retain(|n, _| graph.with_file_name(n).exists());
+    all.insert(name.to_string(), removed);
+    let tmp = file.with_extension("json.tmp");
+    if let Ok(text) = serde_json::to_string_pretty(&all)
+        && std::fs::write(&tmp, text).is_ok()
+    {
+        let _ = std::fs::rename(&tmp, &file);
+    }
+}
+
+/// How many lines the repair that took `snapshot` (a snapshot of `graph`) took out, when one recorded it.
+pub fn recorded_shrink(graph: &Path, snapshot: &Path) -> Option<usize> {
+    let name = snapshot.file_name()?.to_str()?;
+    let all: BTreeMap<String, usize> =
+        serde_json::from_str(&std::fs::read_to_string(graph.with_file_name(SHRINK_RECORD)).ok()?).ok()?;
+    all.get(name).copied()
 }
 
 fn mb(bytes: u64) -> u64 {
@@ -1037,6 +1113,12 @@ pub fn format_as(r: &Report, command: &str) -> String {
                 format!(
                     "[signal] max_chars = {value} -> [budget] memory_chars = {value} (memory_chars was unset; the memory \
                      block's budget was the default {})",
+                    c.memory_chars
+                )
+            } else if c.installer {
+                format!(
+                    "[signal] max_chars = {value} removed (the installer's value, not chosen; the memory block keeps \
+                     [budget] memory_chars = {})",
                     c.memory_chars
                 )
             } else {

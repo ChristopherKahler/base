@@ -187,7 +187,8 @@ fn fix_prints_plan_without_changing() {
         "supersession disagreement",
         "(by the repair's write)",
         "keep 3, remove 3",
-        "[signal] max_chars = 2000 -> [budget] memory_chars = 2000 (memory_chars was unset",
+        // BO-26 (U6): the installer's 2000 is removed, not moved, so the memory block keeps its default.
+        "[signal] max_chars = 2000 removed (the installer's value, not chosen; the memory block keeps [budget] memory_chars = 4000)",
         "nothing changed: base doctor --fix --yes applies this plan",
     ] {
         assert!(plan.contains(want), "the plan does not say {want:?}:\n{plan}");

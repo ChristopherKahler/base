@@ -459,8 +459,8 @@ pub fn migrate_tiers(cwd: &Path, ns: &NamespaceConfig, trigger: Trigger) -> Vec<
 /// correction, D18), another workspace's records, a supersession disagreement,
 /// legacy `[signal] max_chars`, graphs never compacted and ten backups a tier. The repair is [`crate::fix::run`], the
 /// function `base doctor --fix` calls, and nothing else, so the two cannot drift: `base graph migrate` plans it and
-/// `base graph migrate --yes` applies it. Whether an upgrade applies it unasked is the 0.16.0 migration walkthrough's
-/// call (BO-21), not this function's.
+/// `base graph migrate --yes` applies it. An upgrade applies it unasked, once per version and tier, in the background
+/// process the first session start on the new version starts ([`crate::upgrade`], BO-26), through [`crate::fix::run_tier`].
 pub fn upgrade(cwd: &Path, apply: bool) -> crate::fix::Report {
     crate::fix::run(cwd, apply)
 }

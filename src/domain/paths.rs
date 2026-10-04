@@ -79,7 +79,7 @@ pub fn tier_files(cwd: &Path) -> Vec<(Tier, PathBuf, Option<PathBuf>)> {
 }
 
 /// A path in the one spelling base stores (F25b): absolute, `/`, drive letter upper-cased.
-fn spelled(p: &str) -> String {
+pub(crate) fn spelled(p: &str) -> String {
     crate::crud::project::absolute_path(p, None, None).unwrap_or_else(|| p.to_string())
 }
 
