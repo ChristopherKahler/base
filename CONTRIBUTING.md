@@ -33,7 +33,12 @@ Every change is a branch and a pull request, even a one-line one. The PR title i
 
 ## Releases
 
-`scripts/release.sh <version> --push` from a clean `main`. It bumps the version, lets cargo rewrite the lock, regenerates the coach, runs the suite, commits, tags and pushes; the Release workflow builds the binaries after its own docs gate passes. Never edit `Cargo.lock` by hand and never tag by hand.
+A release goes through a pull request like any other change, because `main` is protected (admins included). Two steps:
+
+1. `scripts/release.sh <version> --push` from a clean `main` that matches `origin/main`. On a new branch `release/v<version>` it bumps the version, lets cargo rewrite the lock, writes the changelog section, regenerates the coach, runs the suite and commits; then it pushes that branch and opens its PR, with the new changelog section as the body. Nothing is tagged yet. Merge the PR once CI is green.
+2. `scripts/release.sh <version> --tag` once it has merged. It reads the PR from GitHub and tags its merge commit, but only when that commit's `Cargo.toml` carries the version, its `CHANGELOG.md` has the section, and every check run on it passed; then it pushes the tag alone. The Release workflow builds the binaries after its own docs gate passes.
+
+Never edit `Cargo.lock` by hand and never tag by hand.
 
 ## Where things are discussed
 

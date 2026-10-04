@@ -8,8 +8,9 @@ name: CI
 # report in the 0.16.0 round; scripts/ci_guards.py holds them and their selftest:
 #   - Windows runs the suite and strict clippy beside Linux. Until then every job
 #     ran ubuntu-latest, and the Windows suite hung on relay_wake_script_test.
-#   - Every job has timeout-minutes (30 for tests, 15 for the rest), so a hang
-#     fails the job instead of running for hours. The `guards` job checks it.
+#   - Every job in every workflow file has timeout-minutes (30 for tests and
+#     builds, 15 for the rest), so a hang fails the job instead of running for
+#     hours. The `guards` job checks it (every file since BO-22, ci.yml before).
 #   - .github/ignored-tests.txt lists every #[ignore] with its reason.
 #   - .github/test-counts.txt holds how many tests pass on each platform; the
 #     count step fails on any difference, either way, and on any FAILED target.
@@ -66,7 +67,9 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         run: bash scripts/rule-test-fixture.sh
-      # Cut a whole release in a throwaway clone. It runs here rather than in a
+      # Cut a whole release in a throwaway clone: prepare, push and open the PR,
+      # and every refusal of the tag step, against a local bare origin and a stub
+      # gh, so nothing reaches GitHub. It runs here rather than in a
       # job of its own because it reuses this one's target directory and cargo
       # registry; on its own it would pay for both again. 0.13.16's first
       # attempt died on a step order every other test passed. Linux only: the
