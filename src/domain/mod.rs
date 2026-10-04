@@ -42,6 +42,10 @@ pub enum RuleEntry {
         fires_on: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         quiet_on: Vec<String>,
+        /// BO-20 (K9f): a shadow candidate that loses this rule is never promoted automatically. Set with `base rule
+        /// update <rule> --protected`; not written back when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        protected: bool,
     },
 }
 
@@ -83,6 +87,23 @@ impl RuleEntry {
         match self {
             RuleEntry::Bare(_) => (&[], &[]),
             RuleEntry::Detailed { fires_on, quiet_on, .. } => (fires_on, quiet_on),
+        }
+    }
+
+    /// Marked protected (BO-20): a shadow candidate's loss on it blocks promotion.
+    pub fn protected(&self) -> bool {
+        matches!(self, RuleEntry::Detailed { protected: true, .. })
+    }
+
+    /// A table with nothing but its text goes back to a plain string, so a file round-trips as it was written.
+    fn plain_when_bare(self) -> Self {
+        match self {
+            RuleEntry::Detailed { text, rationale: None, matchers, fires_on, quiet_on, protected: false }
+                if matchers.is_empty() && fires_on.is_empty() && quiet_on.is_empty() =>
+            {
+                RuleEntry::Bare(text)
+            }
+            other => other,
         }
     }
 }
@@ -203,9 +224,9 @@ impl DomainDef {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct DomainsFile {
+pub(crate) struct DomainsFile {
     #[serde(default)]
-    domain: Vec<DomainDef>,
+    pub(crate) domain: Vec<DomainDef>,
 }
 
 // ─── Loading (tiered: global → workspace) ────────────────────
@@ -544,18 +565,15 @@ pub fn set_rule_tests(toml_path: &Path, domain: &str, id: &str, tests: &rules::R
     };
     let (fires_on, quiet_on) = (tests.fires_on.clone(), tests.quiet_on.clone());
     let next = match std::mem::replace(r, RuleEntry::Bare(String::new())) {
-        RuleEntry::Bare(text) => RuleEntry::Detailed { text, rationale: None, matchers: Vec::new(), fires_on, quiet_on },
-        RuleEntry::Detailed { text, rationale, matchers, .. } => RuleEntry::Detailed { text, rationale, matchers, fires_on, quiet_on },
+        RuleEntry::Bare(text) => {
+            RuleEntry::Detailed { text, rationale: None, matchers: Vec::new(), fires_on, quiet_on, protected: false }
+        }
+        RuleEntry::Detailed { text, rationale, matchers, protected, .. } => {
+            RuleEntry::Detailed { text, rationale, matchers, fires_on, quiet_on, protected }
+        }
     };
     // Nothing but its text left: a plain string again.
-    *r = match next {
-        RuleEntry::Detailed { text, rationale: None, matchers, fires_on, quiet_on }
-            if matchers.is_empty() && fires_on.is_empty() && quiet_on.is_empty() =>
-        {
-            RuleEntry::Bare(text)
-        }
-        other => other,
-    };
+    *r = next.plain_when_bare();
     let tmp = toml_path.with_extension("toml.tmp");
     std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
     std::fs::rename(&tmp, toml_path)?;
@@ -577,17 +595,52 @@ pub fn set_rule_matchers(toml_path: &Path, domain: &str, id: &str, matchers: &[r
     };
     let matchers = matchers.to_vec();
     let next = match std::mem::replace(r, RuleEntry::Bare(String::new())) {
-        RuleEntry::Bare(text) => RuleEntry::Detailed { text, rationale: None, matchers, fires_on: Vec::new(), quiet_on: Vec::new() },
-        RuleEntry::Detailed { text, rationale, fires_on, quiet_on, .. } => RuleEntry::Detailed { text, rationale, matchers, fires_on, quiet_on },
-    };
-    *r = match next {
-        RuleEntry::Detailed { text, rationale: None, matchers, fires_on, quiet_on }
-            if matchers.is_empty() && fires_on.is_empty() && quiet_on.is_empty() =>
-        {
-            RuleEntry::Bare(text)
+        RuleEntry::Bare(text) => RuleEntry::Detailed {
+            text,
+            rationale: None,
+            matchers,
+            fires_on: Vec::new(),
+            quiet_on: Vec::new(),
+            protected: false,
+        },
+        RuleEntry::Detailed { text, rationale, fires_on, quiet_on, protected, .. } => {
+            RuleEntry::Detailed { text, rationale, matchers, fires_on, quiet_on, protected }
         }
-        other => other,
     };
+    *r = next.plain_when_bare();
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, toml_path)?;
+    Ok(true)
+}
+
+/// Mark one rule of `domain` in the domains.toml at `toml_path` protected, or clear the mark (BO-20, `base rule update
+/// --protected`): the rule whose [`rules::rule_id`] is `id`, written as [`set_rule_tests`] writes. `Ok(false)` when the
+/// file has no such rule.
+pub fn set_rule_protected(toml_path: &Path, domain: &str, id: &str, protected: bool) -> anyhow::Result<bool> {
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(toml_path)?)?;
+    let want = crate::crud::slugify(domain);
+    let Some(d) = file.domain.iter_mut().find(|d| crate::crud::slugify(&d.name) == want) else {
+        return Ok(false);
+    };
+    let name = d.name.clone();
+    let Some(r) = d.rules.iter_mut().find(|r| rules::rule_id(&name, r.text()) == id) else {
+        return Ok(false);
+    };
+    let next = match std::mem::replace(r, RuleEntry::Bare(String::new())) {
+        RuleEntry::Bare(text) => RuleEntry::Detailed {
+            text,
+            rationale: None,
+            matchers: Vec::new(),
+            fires_on: Vec::new(),
+            quiet_on: Vec::new(),
+            protected,
+        },
+        RuleEntry::Detailed { text, rationale, matchers, fires_on, quiet_on, .. } => {
+            RuleEntry::Detailed { text, rationale, matchers, fires_on, quiet_on, protected }
+        }
+    };
+    *r = next.plain_when_bare();
     let tmp = toml_path.with_extension("toml.tmp");
     std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
     std::fs::rename(&tmp, toml_path)?;

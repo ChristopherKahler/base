@@ -56,6 +56,7 @@ pub mod scope;
 pub mod scrub;
 pub mod secret;
 pub mod settings_json;
+pub mod shadow;
 pub mod shell;
 pub mod signal;
 pub mod standards;

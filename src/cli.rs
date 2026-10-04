@@ -285,6 +285,12 @@ pub enum Commands {
         #[arg(long, default_value_t = base::corrections::tune_pass::DEFAULT_MAX_CALLS)]
         max_calls: usize,
     },
+    /// Shadow mode: run a candidate matcher beside the live one on every prompt and file touch, judge it by the
+    /// corrections that follow, and promote it or roll it back. Nothing runs until a shadow is started
+    Shadow {
+        #[command(subcommand)]
+        action: ShadowAction,
+    },
     /// Manage rules in the graph (add, list, remove)
     Rule {
         /// Target the global tier (~/.base-gbl/) instead of workspace.
@@ -1396,6 +1402,55 @@ pub enum ForkAction {
     Unarchive { slug: String },
 }
 
+/// `base shadow` (BO-20, K9).
+#[derive(Subcommand)]
+pub enum ShadowAction {
+    /// Start a candidate beside live: a matcher (--matcher, with any of the admission settings) or pending proposals
+    /// (--from-proposals). One at a time; live is snapshotted as it is
+    Start {
+        /// The candidate's matcher: bm25, or keyword-only ([match] bm25 = false)
+        #[arg(long, value_parser = ["bm25", "keyword-only"], required_unless_present = "from_proposals")]
+        matcher: Option<String>,
+        /// The candidate's [match] min_score: a rule no keyword brought is served at this BM25 score
+        #[arg(long)]
+        min_score: Option<f32>,
+        /// The candidate weighs each term of a score admission down by how common it is in your last 1,000 typed
+        /// prompts ([match] prompt_idf)
+        #[arg(long)]
+        prompt_idf: bool,
+        /// The candidate admits a rule on its score only when it shares this many distinct terms with the prompt, or one
+        /// two-word term ([match] min_terms)
+        #[arg(long)]
+        min_terms: Option<usize>,
+        /// The candidate admits a rule on its score only at or over this share of the prompt's best rule score, 0.5 for
+        /// half ([match] relative)
+        #[arg(long)]
+        relative: Option<f32>,
+        /// Pending proposals to run as the candidate, comma-separated: p-0001,p-0002
+        #[arg(long, value_delimiter = ',', conflicts_with_all = ["matcher", "min_score", "prompt_idf", "min_terms", "relative"])]
+        from_proposals: Vec<String>,
+    },
+    /// End the running candidate without promoting it; live is unchanged and its rows stay
+    Stop,
+    /// The candidate against live since it started: events, where they differ, wins, losses, and whether it can be
+    /// promoted. Read only
+    Report {
+        /// Emit JSON, every added and dropped rule listed
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make the candidate live now, whatever the report says; or name an earlier version to make it live again
+    Promote {
+        /// A version base shadow report or session start named (keyword-0002, bm25-0003)
+        version: Option<String>,
+        /// Apply a proposal its replay flags TOO BROAD (show the user the replay first)
+        #[arg(long)]
+        broad_ok: bool,
+    },
+    /// Undo the last promotion: the version live had before it is restored
+    Rollback,
+}
+
 // `rule add`'s flags (P7 added `--path`) make its variant the large one. Parsed once per process, so the size costs
 // nothing, and boxing a clap variant would only make the match below harder to read.
 #[allow(clippy::large_enum_variant)]
@@ -1549,6 +1604,12 @@ pub enum RuleAction {
         /// Empty both test lists first, then add what is given
         #[arg(long)]
         clear_tests: bool,
+        /// Mark the rule protected: a shadow candidate that loses it is never promoted automatically
+        #[arg(long, conflicts_with = "unprotected")]
+        protected: bool,
+        /// Clear the protected mark
+        #[arg(long)]
+        unprotected: bool,
     },
     /// Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
     Test {
@@ -2036,6 +2097,8 @@ struct RefreshIndexOnExit {
 impl Drop for RefreshIndexOnExit {
     fn drop(&mut self) {
         base::domain::score_index::refresh_for(&self.config, &self.cwd);
+        // BO-20: a BM25 candidate beside a keyword-only live, the prompt-IDF counts, a proposals candidate's own index.
+        base::shadow::run::refresh_indexes(&self.config, &self.cwd);
     }
 }
 
@@ -4012,6 +4075,35 @@ pub fn run() {
             }
         }
 
+        // ─── Shadow (BO-20, K9) ───────────────────────────
+        Some(Commands::Shadow { action }) => {
+            use base::shadow;
+            let out = match action {
+                ShadowAction::Start { matcher, min_score, prompt_idf, min_terms, relative, from_proposals } => {
+                    let what = if !from_proposals.is_empty() {
+                        shadow::Start::Proposals(from_proposals)
+                    } else {
+                        shadow::Start::Matcher {
+                            bm25: matcher.as_deref() == Some("bm25"),
+                            min_score,
+                            prompt_idf,
+                            min_terms,
+                            relative,
+                        }
+                    };
+                    shadow::start(&config, &cwd, &what)
+                }
+                ShadowAction::Stop => shadow::stop(),
+                ShadowAction::Report { json } => shadow::report::run(&config, &cwd, json),
+                ShadowAction::Promote { version, broad_ok } => shadow::promote::by_hand(&config, &cwd, version.as_deref(), broad_ok),
+                ShadowAction::Rollback => shadow::promote::rollback_by_hand(&config, &cwd),
+            };
+            match out {
+                Ok(text) => print!("{text}"),
+                Err(msg) => die("Error", msg),
+            }
+        }
+
         // ─── Rule ─────────────────────────────────────────
         Some(Commands::Rule { global, action }) => {
             let rule_cwd = tier_cwd(&cwd, global);
@@ -4157,11 +4249,12 @@ pub fn run() {
                     Ok(out) => print!("{out}"),
                     Err(msg) => die("Error", msg),
                 },
-                RuleAction::Update { rule, fires_on, quiet_on, clear_tests } => {
+                RuleAction::Update { rule, fires_on, quiet_on, clear_tests, protected, unprotected } => {
                     let (want_domain, id) = crud::rule::parse_rule_ref(&rule).unwrap_or_else(|msg| die("Error", msg));
                     let want_domain = want_domain.map(|d| domain::canonical_name(&cwd, &d));
-                    if fires_on.is_empty() && quiet_on.is_empty() && !clear_tests {
-                        die("Error", "give --fires-on, --quiet-on or --clear-tests");
+                    let tests_given = !fires_on.is_empty() || !quiet_on.is_empty() || clear_tests;
+                    if !tests_given && !protected && !unprotected {
+                        die("Error", "give --fires-on, --quiet-on, --clear-tests, --protected or --unprotected");
                     }
                     let found = crud::rule::find(&cwd, &config.namespace, want_domain.as_deref(), &id).unwrap_or_else(|e| die("Failed", e));
                     let found = match found.as_slice() {
@@ -4185,6 +4278,24 @@ pub fn run() {
                     let homes = found.homes_for(global);
                     if homes.is_empty() {
                         die("Error", format!("{short} is not in the global tier, only in the workspace; run it without -g"));
+                    }
+                    // BO-20 (K9f): the protected mark is kept where the rule's tests are.
+                    if protected || unprotected {
+                        let targets: Vec<&crud::rule::TestHome> = homes.iter().map(|(h, _)| h).collect();
+                        match crud::rule::store_protected(&config.namespace, found, &targets, protected) {
+                            Ok(wrote) if wrote.is_empty() => {
+                                die("Error", format!("{short} changed after it was read, and nothing was stored; run the command again"))
+                            }
+                            Ok(wrote) if protected => println!(
+                                "Rule {short} is protected: a shadow candidate that loses it is never promoted automatically (in {})",
+                                wrote.join(", ")
+                            ),
+                            Ok(wrote) => println!("Rule {short} is no longer protected (in {})", wrote.join(", ")),
+                            Err(e) => die("Failed", e),
+                        }
+                        if !tests_given {
+                            return;
+                        }
                     }
                     let mut tests = domain::rules::RuleTests::default();
                     if !clear_tests {

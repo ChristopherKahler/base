@@ -219,6 +219,8 @@ pub struct Sorter<'a> {
     candidates: Vec<Candidate>,
     recent: Option<Vec<String>>,
     highest: u32,
+    /// The candidates' corpus, counted the first time [`Sorter::fit_for`] asks.
+    corpus: Option<bm25::Corpus>,
 }
 
 impl<'a> Sorter<'a> {
@@ -228,7 +230,7 @@ impl<'a> Sorter<'a> {
         let store = crate::store::load_merged(cwd);
         let candidates = load_candidates(config, store.as_ref(), &domains);
         let highest = store.as_ref().map(|s| max_id(s, &config.namespace)).unwrap_or(0);
-        Sorter { config, cwd: cwd.to_path_buf(), domains, store, candidates, recent: None, highest }
+        Sorter { config, cwd: cwd.to_path_buf(), domains, store, candidates, recent: None, highest, corpus: None }
     }
 
     /// The merged store this sorter read.
@@ -257,6 +259,39 @@ impl<'a> Sorter<'a> {
         let config = self.config;
         let cwd = self.cwd.clone();
         sort_with(self, config, &cwd, args, ev)
+    }
+
+    /// How a reader names the rule or decision the match log calls `id`: `<domain>.<id>` for a rule, the slug for a
+    /// decision (BO-20's report).
+    pub fn shown(&self, id: &str) -> Option<&str> {
+        self.candidates.iter().find(|c| c.id == id).map(|c| c.show.as_str())
+    }
+
+    /// The rule or decision a correction is about, by this sort (BO-20, the shadow report's wins and losses): the
+    /// candidate [`rank`] puts first for the correcting prompt and its marker line, when [`pick`] says it stands out,
+    /// as `(kind, id)` with the id the match log uses. `None` when none stands out.
+    ///
+    /// The ranking is [`rank`]'s with no `--text` and no `--keywords` (a correction found in the log has neither), on a
+    /// corpus counted once for every correction a report sorts.
+    pub fn fit_for(&mut self, prompt: &str, marker: Option<&str>) -> Option<(&'static str, String)> {
+        let corpus = self.corpus.get_or_insert_with(|| bm25::Corpus::new(self.candidates.iter().map(|c| bm25::words(&c.doc))));
+        let mut query: Vec<String> = Vec::new();
+        if let Some(m) = marker {
+            query.extend(bm25::words(m.split_once(':').map(|(_, rest)| rest).unwrap_or(m)));
+        }
+        query.extend(bm25::words(prompt));
+        let mut ranked: Vec<(f32, usize, usize)> = (0..self.candidates.len())
+            .map(|i| {
+                let r = corpus.score(i, &query);
+                (r.score, r.matched.len(), i)
+            })
+            .collect();
+        let cands = &self.candidates;
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| cands[a.2].show.cmp(&cands[b.2].show)));
+        let (best, terms, i) = *ranked.first()?;
+        let next = ranked.get(1).map_or(0.0, |r| r.0);
+        (best >= FIT_MIN_SCORE && terms >= FIT_MIN_TERMS && best >= FIT_MIN_MARGIN * next)
+            .then(|| (cands[i].kind, cands[i].id.clone()))
     }
 }
 

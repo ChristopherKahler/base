@@ -269,6 +269,37 @@ impl PromptBlocks {
     pub fn iter(&self) -> impl Iterator<Item = &PromptBlock> {
         self.blocks.iter()
     }
+
+    /// The matching's blocks ([`PromptBlock::matcher`]) taken out and `blocks` put where they were (BO-20, K9b): a shadow
+    /// candidate's own pick in live's list, everything else as live had it. Where live's matching built nothing, they go
+    /// after the first `front` blocks, the ones the hook put first after the matching ran.
+    pub fn replace_matcher(&mut self, blocks: Vec<PromptBlock>, front: usize) {
+        let at = self.blocks.iter().position(|b| b.matcher).unwrap_or(front.min(self.blocks.len()));
+        let mut rest: Vec<PromptBlock> = std::mem::take(&mut self.blocks).into_iter().filter(|b| !b.matcher).collect();
+        let tail = rest.split_off(at.min(rest.len()));
+        for b in rest.into_iter().chain(blocks).chain(tail) {
+            self.push(b);
+        }
+    }
+
+    /// Is there a block with this id.
+    pub fn has(&self, id: &str) -> bool {
+        self.blocks.iter().any(|b| b.id == id)
+    }
+
+    /// Take out the block with this id, if there is one.
+    pub fn remove(&mut self, id: &str) {
+        self.blocks.retain(|b| b.id != id);
+    }
+
+    /// Put `block` after the last block `after` says yes to (first, when none does).
+    pub fn insert_after(&mut self, block: PromptBlock, after: impl Fn(&PromptBlock) -> bool) {
+        let at = self.blocks.iter().rposition(after).map_or(0, |i| i + 1);
+        let mut tail = self.blocks.split_off(at);
+        self.push(block);
+        let mut moved = std::mem::take(&mut tail);
+        self.blocks.append(&mut moved);
+    }
 }
 
 /// The command a pointer line names for a dropped block.

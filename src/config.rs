@@ -348,6 +348,58 @@ pub struct BaseConfig {
     /// `[match]` (BO-18). `match` is a Rust keyword, hence the field's name.
     #[serde(default, rename = "match")]
     pub matching: MatchConfig,
+    /// `[shadow]` (BO-20, K9).
+    #[serde(default)]
+    pub shadow: ShadowConfig,
+}
+
+// ─── Shadow Config (BO-20: K9) ───────────────────────────────
+
+/// `[shadow]`: how a candidate matcher run beside the live one is judged (K9, `base shadow`). Nothing runs until someone
+/// starts a shadow (`base shadow start`); with none started these keys are read by nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowConfig {
+    /// K9d: a candidate run that takes longer than this many milliseconds is stopped for that event, and the row says
+    /// it was skipped.
+    #[serde(default = "default_shadow_max_ms")]
+    pub max_ms: u64,
+    /// K9f: typed prompts the candidate must have run on before it can be promoted.
+    #[serde(default = "default_shadow_min_prompts")]
+    pub min_prompts: usize,
+    /// K9f with lynx's Q5 ruling: promoted only when its wins are at least this many times its losses, zero losses
+    /// counting as one (so the default needs at least 3 wins).
+    #[serde(default = "default_shadow_win_ratio")]
+    pub win_ratio: f64,
+    /// K9i: promote at the next session start once the conditions hold. `false`: session start says it is ready once,
+    /// and `base shadow promote` does it.
+    #[serde(default = "default_true")]
+    pub auto_promote: bool,
+    /// K9g: typed prompts watched after a promotion before it is judged.
+    #[serde(default = "default_shadow_watch_prompts")]
+    pub watch_prompts: usize,
+    /// K9g with lynx's Q6 ruling: rolled back only when corrections per 100 prompts over the watch exceed the 100 before
+    /// by more than this many standard deviations of the noise two windows of `watch_prompts` show at the before rate.
+    #[serde(default = "default_shadow_rollback_sd")]
+    pub rollback_sd: f64,
+}
+
+fn default_shadow_max_ms() -> u64 { 50 }
+fn default_shadow_min_prompts() -> usize { 200 }
+fn default_shadow_win_ratio() -> f64 { 3.0 }
+fn default_shadow_watch_prompts() -> usize { 100 }
+fn default_shadow_rollback_sd() -> f64 { 2.5 }
+
+impl Default for ShadowConfig {
+    fn default() -> Self {
+        Self {
+            max_ms: default_shadow_max_ms(),
+            min_prompts: default_shadow_min_prompts(),
+            win_ratio: default_shadow_win_ratio(),
+            auto_promote: default_true(),
+            watch_prompts: default_shadow_watch_prompts(),
+            rollback_sd: default_shadow_rollback_sd(),
+        }
+    }
 }
 
 // ─── Match Config (BO-18: K7, D9) ────────────────────────────
@@ -355,7 +407,7 @@ pub struct BaseConfig {
 /// `[match]`: how a prompt is scored against the rules and global decisions it could be served (K7, BM25). A rule a
 /// keyword or a touched path brings is always served, as before; scoring ranks every candidate so a tight budget sheds
 /// the weakest first, and, when `min_score` is set, serves a rule no keyword brought whose score reaches it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchConfig {
     /// Score and rank with BM25. `false` serves keyword-only, exactly as before BO-18 (a rollback, and BO-20's other
     /// side).
@@ -369,12 +421,39 @@ pub struct MatchConfig {
     /// they admitted shared only common words with it. BO-20 measures what would.
     #[serde(default)]
     pub min_score: Option<f32>,
+    /// BO-20's first admission fix (lynx's Q7 ruling on BO-18): a rule admitted on its score is judged on a score whose
+    /// every term weighs as much less as the term is common in the user's own last 1,000 typed prompts (`need`, `want`,
+    /// `session` weigh little). Off by default; it acts as off while `[log] prompt_text` keeps no text to count.
+    #[serde(default)]
+    pub prompt_idf: bool,
+    /// BO-20's second: a rule is admitted on its score only when it shares at least this many distinct terms with the
+    /// prompt, or one two-word term. 1, the default, narrows nothing.
+    #[serde(default = "default_min_terms")]
+    pub min_terms: usize,
+    /// BO-20's third: a rule is admitted on its score only at or over this share of the prompt's best rule score
+    /// (0.5: half of it). Unset by default.
+    #[serde(default)]
+    pub relative: Option<f32>,
 }
+
+fn default_min_terms() -> usize { 1 }
 
 impl MatchConfig {
     /// Does a BM25 score of `score` serve a rule no keyword or path brought: only when `min_score` is set and reached.
     pub fn admits(&self, score: f32) -> bool {
         reaches(self.min_score, score)
+    }
+
+    /// The setting each key holds, as `base.toml` would carry it: every `[match]` key, `None` for one unset. The one
+    /// list `base shadow` snapshots, compares and writes (BO-20, K9a).
+    pub fn keys(&self) -> Vec<(&'static str, Option<toml::Value>)> {
+        vec![
+            ("bm25", Some(toml::Value::Boolean(self.bm25))),
+            ("min_score", self.min_score.map(|v| toml::Value::Float(f64::from(v)))),
+            ("prompt_idf", Some(toml::Value::Boolean(self.prompt_idf))),
+            ("min_terms", Some(toml::Value::Integer(self.min_terms as i64))),
+            ("relative", self.relative.map(|v| toml::Value::Float(f64::from(v)))),
+        ]
     }
 }
 
@@ -386,7 +465,7 @@ pub fn reaches(min: Option<f32>, score: f32) -> bool {
 
 impl Default for MatchConfig {
     fn default() -> Self {
-        Self { bm25: default_true(), min_score: None }
+        Self { bm25: default_true(), min_score: None, prompt_idf: false, min_terms: default_min_terms(), relative: None }
     }
 }
 

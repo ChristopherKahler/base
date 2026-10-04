@@ -574,15 +574,15 @@ pub fn global_config_path() -> Option<PathBuf> {
     crate::home::home_root().map(|h| h.join(".base-gbl").join("base.toml"))
 }
 
-/// Is this line a table header, and is it `[budget]`?
-fn header(line: &str) -> Option<bool> {
+/// Is this line a table header, and is it `[<section>]`?
+fn header(line: &str, section: &str) -> Option<bool> {
     let t = line.trim_start();
     if !t.starts_with('[') {
         return None;
     }
     let body = t.split('#').next().unwrap_or("").trim();
     let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-    Some(compact == "[budget]")
+    Some(compact == format!("[{section}]"))
 }
 
 /// The key a `key = value` line sets, if it is one.
@@ -621,56 +621,84 @@ fn comment_at(line: &str) -> Option<usize> {
     None
 }
 
-/// `[budget]` keys set in a base.toml's text, every other line left exactly as it was.
+/// The spellings of a `[budget]` key: its own, and the old one it replaced (`prompt_chars`).
+fn budget_spellings(key: &str) -> Vec<String> {
+    let mut v = vec![key.to_string()];
+    v.extend(crate::config::RENAMED_BUDGET_KEYS.iter().filter(|k| k.new == key).map(|k| k.old.to_string()));
+    v
+}
+
+/// `[budget]` keys set in a base.toml's text, every other line left exactly as it was ([`set_section_keys`] on
+/// `[budget]`).
 ///
-/// A key the section already has keeps its line, its indentation and its trailing comment; only the value changes. A
-/// key spelled the old way (`prompt_chars`) is rewritten to the new spelling, because both spellings set one field and a
-/// file holding both no longer parses. A key the section lacks goes after the section's last key line, so the comment
-/// block that heads the next section stays with it. No `[budget]` section: one is appended.
+/// A key spelled the old way (`prompt_chars`) is rewritten to the new spelling, because both spellings set one field and
+/// a file holding both no longer parses.
 ///
 /// `keys` holds TOML literals: `"10000"`, `"\"2.1.287\""`. The result is parsed back, and refused unless every key
 /// reads back as written and every other value in the file is unchanged.
 pub fn set_budget_keys(text: &str, keys: &[(&str, String)]) -> Result<String> {
+    let keys: Vec<(&str, Option<String>)> = keys.iter().map(|(k, v)| (*k, Some(v.clone()))).collect();
+    set_section_keys(text, "budget", &keys, &budget_spellings)
+}
+
+/// The keys of one section set or removed in a base.toml's text, every other line left exactly as it was: the one
+/// writer that keeps an operator's file as they wrote it (`base doctor --measure` writes `[budget]` through it, a shadow
+/// promotion and rollback `[match]`, BO-20).
+///
+/// A key the section already has keeps its line, its indentation and its trailing comment; only the value changes. A
+/// key set to `None` loses its line. A key the section lacks goes after the section's last key line, so the comment
+/// block that heads the next section stays with it. No such section: one is appended, when any key is set.
+/// `spellings` gives every name a key is written under (its own first).
+///
+/// `keys` holds TOML literals. The result is parsed back, and refused unless every key reads back as asked (a removed
+/// key absent) and every other value in the file is unchanged.
+pub fn set_section_keys(
+    text: &str,
+    section: &str,
+    keys: &[(&str, Option<String>)],
+    spellings: &dyn Fn(&str) -> Vec<String>,
+) -> Result<String> {
     let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
-    let spellings = |key: &str| -> Vec<String> {
-        let mut v = vec![key.to_string()];
-        v.extend(
-            crate::config::RENAMED_BUDGET_KEYS
-                .iter()
-                .filter(|k| k.new == key)
-                .map(|k| k.old.to_string()),
-        );
-        v
-    };
-    let start = lines.iter().position(|l| header(l) == Some(true));
+    let start = lines.iter().position(|l| header(l, section) == Some(true));
     match start {
         None => {
-            if lines.last().is_some_and(|l| !l.ends_with('\n')) {
-                lines.push(nl.to_string());
-            }
-            if !lines.is_empty() {
-                lines.push(nl.to_string());
-            }
-            lines.push(format!("[budget]{nl}"));
-            for (k, v) in keys {
-                lines.push(format!("{k} = {v}{nl}"));
+            let set: Vec<(&str, &String)> = keys.iter().filter_map(|(k, v)| v.as_ref().map(|v| (*k, v))).collect();
+            if !set.is_empty() {
+                if lines.last().is_some_and(|l| !l.ends_with('\n')) {
+                    lines.push(nl.to_string());
+                }
+                if !lines.is_empty() {
+                    lines.push(nl.to_string());
+                }
+                lines.push(format!("[{section}]{nl}"));
+                for (k, v) in set {
+                    lines.push(format!("{k} = {v}{nl}"));
+                }
             }
         }
         Some(start) => {
-            let end = lines[start + 1..]
+            let mut end = lines[start + 1..]
                 .iter()
-                .position(|l| header(l).is_some())
+                .position(|l| header(l, section).is_some())
                 .map_or(lines.len(), |i| start + 1 + i);
             let mut missing = Vec::new();
             for (k, v) in keys {
                 let names = spellings(k);
                 let mut found = false;
-                for line in lines.iter_mut().take(end).skip(start + 1) {
-                    let Some(at) = key_of(line) else { continue };
-                    if !names.iter().any(|n| n == at) {
+                let mut i = start + 1;
+                while i < end {
+                    let named = key_of(&lines[i]).is_some_and(|at| names.iter().any(|n| n == at));
+                    if !named {
+                        i += 1;
                         continue;
                     }
+                    let Some(v) = v else {
+                        lines.remove(i);
+                        end -= 1;
+                        continue;
+                    };
+                    let line = &mut lines[i];
                     let ending = if line.ends_with("\r\n") {
                         "\r\n"
                     } else if line.ends_with('\n') {
@@ -686,8 +714,9 @@ pub fn set_budget_keys(text: &str, keys: &[(&str, String)]) -> Result<String> {
                     });
                     *line = format!("{indent}{k} = {v}{}{ending}", comment.unwrap_or_default());
                     found = true;
+                    i += 1;
                 }
-                if !found {
+                if let (false, Some(v)) = (found, v) {
                     missing.push(format!("{k} = {v}{nl}"));
                 }
             }
@@ -703,36 +732,50 @@ pub fn set_budget_keys(text: &str, keys: &[(&str, String)]) -> Result<String> {
         }
     }
     let out: String = lines.concat();
-    check_written(text, &out, keys)?;
+    check_written(text, &out, section, keys, spellings)?;
     Ok(out)
 }
 
-/// Refuses an edit unless the result parses, every key reads back as its literal, and nothing else changed.
-fn check_written(before: &str, after: &str, keys: &[(&str, String)]) -> Result<()> {
+/// Refuses an edit unless the result parses, every key reads back as asked, and nothing else changed.
+fn check_written(
+    before: &str,
+    after: &str,
+    section: &str,
+    keys: &[(&str, Option<String>)],
+    spellings: &dyn Fn(&str) -> Vec<String>,
+) -> Result<()> {
     let mut old: toml::Table = toml::from_str(before).context("the existing base.toml does not parse")?;
     let mut new: toml::Table = toml::from_str(after).context("the edited base.toml would not parse; nothing written")?;
     for (k, v) in keys {
-        let want: toml::Table = toml::from_str(&format!("x = {v}")).with_context(|| format!("{k} = {v} is not TOML"))?;
-        let got = new.get("budget").and_then(|b| b.get(*k));
-        if got != want.get("x") {
-            bail!("[budget] {k} would read back as {got:?}, not {v}; nothing written");
+        let got = new.get(section).and_then(|b| b.get(*k));
+        match v {
+            Some(v) => {
+                let want: toml::Table = toml::from_str(&format!("x = {v}")).with_context(|| format!("{k} = {v} is not TOML"))?;
+                if got != want.get("x") {
+                    bail!("[{section}] {k} would read back as {got:?}, not {v}; nothing written");
+                }
+            }
+            None => {
+                if let Some(other) = spellings(k).iter().find(|n| new.get(section).and_then(|b| b.get(n.as_str())).is_some()) {
+                    bail!("[{section}] {other} would still be set; nothing written");
+                }
+            }
         }
     }
     for t in [&mut old, &mut new] {
-        if let Some(toml::Value::Table(b)) = t.get_mut("budget") {
+        if let Some(toml::Value::Table(b)) = t.get_mut(section) {
             for (k, _) in keys {
-                b.remove(*k);
-                for r in crate::config::RENAMED_BUDGET_KEYS.iter().filter(|r| r.new == *k) {
-                    b.remove(r.old);
+                for n in spellings(k) {
+                    b.remove(&n);
                 }
             }
             if b.is_empty() {
-                t.remove("budget");
+                t.remove(section);
             }
         }
     }
     if old != new {
-        bail!("the edit would change more than the [budget] keys it sets; nothing written");
+        bail!("the edit would change more than the [{section}] keys it sets; nothing written");
     }
     Ok(())
 }

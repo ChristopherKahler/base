@@ -356,6 +356,12 @@ impl Corpus {
 
     /// Document `doc`'s score for `query` (its words, see [`words`]), and the query words it holds.
     pub fn score(&self, doc: usize, query: &[String]) -> Ranked {
+        self.score_weighted(doc, query, &|_| 1.0)
+    }
+
+    /// [`Corpus::score`] with each query word's part multiplied by `weight(word)`: BO-20's prompt IDF weighs a word down
+    /// by how common it is in the user's own prompts. A weight of 1 for every word is [`Corpus::score`], to the bit.
+    pub fn score_weighted(&self, doc: usize, query: &[String], weight: &dyn Fn(&str) -> f32) -> Ranked {
         let mut score = 0.0f32;
         let mut matched: Vec<String> = Vec::new();
         let (Some(counts), Some(len)) = (self.docs.get(doc), self.lens.get(doc)) else {
@@ -364,7 +370,8 @@ impl Corpus {
         let norm = if self.avg_len > 0.0 { *len as f32 / self.avg_len } else { 1.0 };
         for w in query {
             let Some(tf) = counts.get(w).map(|t| *t as f32) else { continue };
-            score += self.idf(w) * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * norm));
+            // The weight multiplies the whole part last, so a weight of 1 leaves every bit of the sum as it was.
+            score += (self.idf(w) * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * norm))) * weight(w);
             if !matched.contains(w) {
                 matched.push(w.clone());
             }

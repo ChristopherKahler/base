@@ -190,6 +190,14 @@ pub fn link_update(ns: &NamespaceConfig, graph_iri: &str, old_iri: &str, new_iri
     )
 }
 
+/// The inverse of [`link_update`] (BO-20: a shadow promotion's rollback): ONE `DELETE DATA` of exactly the three quads
+/// `link_update` writes into `graph_iri`, and nothing else. A status the old record carried before the link is not one
+/// of them (an `INSERT DATA` adds a quad beside it), so the store reads as it did before the link. Prefixed as
+/// `link_update` is: the caller puts `crud::prefixes` in front.
+pub fn unlink_update(ns: &NamespaceConfig, graph_iri: &str, old_iri: &str, new_iri: &str) -> String {
+    link_update(ns, graph_iri, old_iri, new_iri).replacen("INSERT DATA", "DELETE DATA", 1)
+}
+
 /// What `base doctor` reports about supersession on one tier.
 ///
 /// Every field is a COUNT or a list of IRIs, never a judgement: doctor is where an

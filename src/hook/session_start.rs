@@ -205,6 +205,7 @@ pub fn handle(
     push_rule_proposals(graph.as_ref(), config, out);
     push_rule_pass(session_id, config, out);
     refresh_score_index(graph.as_ref(), cwd, config);
+    push_matcher(config, cwd, out);
 
     if let Ok(signal_result) = crate::signal::run_signals(cwd, config, "session-start") {
         diagnostics.extend(signal_result.diagnostics.iter().cloned());
@@ -355,6 +356,18 @@ fn refresh_score_index(graph: Option<&oxigraph::store::Store>, cwd: &Path, confi
     }
 }
 
+/// K9f, K9g, K9h (BO-20): while a shadow runs, after the index refresh, promote a candidate whose evidence is clear,
+/// roll back a promotion whose corrections rose past the noise, and say each once. With no shadow ever started this is
+/// one failed file open and prints nothing (the seamless upgrade). The indexes a running shadow needs are counted
+/// first: a BM25 candidate beside a keyword-only live, the prompt-IDF counts, a proposals candidate's own index.
+fn push_matcher(config: &BaseConfig, cwd: &Path, out: &mut SessionOutput) {
+    crate::shadow::run::refresh_indexes(config, cwd);
+    let lines = crate::shadow::promote::session_start(config, cwd);
+    if !lines.is_empty() {
+        out.push("matcher", &format!("{}\n", lines.join("\n")), lines.len());
+    }
+}
+
 /// The global decisions with no keywords (BO-03, F5): a decision of an always-on domain reaches a prompt only
 /// on one of its keywords, so one with none is shown here, at session start, and nowhere else.
 fn push_global_decisions(graph: Option<&oxigraph::store::Store>, cwd: &Path, config: &BaseConfig, out: &mut SessionOutput) {
@@ -399,7 +412,7 @@ fn push_rule_pass(session_id: Option<&str>, config: &BaseConfig, out: &mut Sessi
 /// pulse last, and the relay wake contract outlasts the operator profile and the notices. A kind
 /// missing from this table sorts after all of it, and `every_pushed_kind_has_a_place_in_the_layout`
 /// fails the build when one does.
-pub const LAYOUT: [(&str, Rank); 36] = [
+pub const LAYOUT: [(&str, Rank); 37] = [
     ("instructions", Rank::Pinned),
     ("graph-unhealthy", Rank::DueNow),
     ("reminders", Rank::DueNow),
@@ -410,6 +423,8 @@ pub const LAYOUT: [(&str, Rank); 36] = [
     ("rule-proposals", Rank::Primary),
     // BO-17, D7e: earlier sessions with corrections no rule pass has read, one line, beside the proposals it leads to.
     ("rule-pass", Rank::Primary),
+    // BO-20, K9h: a shadow candidate promoted, rolled back or ready, one line each, once, beside the rule lines.
+    ("matcher", Rank::Primary),
     ("forks", Rank::Secondary),
     // BEFORE the working-set blocks it qualifies, deliberately. The trimmer takes the
     // bottom of a rank first, so a scope clause placed after the rows would be trimmed
@@ -471,8 +486,10 @@ const DATA_BLOCKS: [&str; 6] = ["reminders", "handoffs", "forks", "projects", "t
 /// their own trigger (migrate, hooks-wired, contract, automap) are not here: a failing map build
 /// or a duplicate contract repeats every session, and with no command their floor already names
 /// the file.
-pub const SHOWN_ONCE: [&str; 5] = [
+pub const SHOWN_ONCE: [&str; 6] = [
     "first-run",
+    // BO-20: an announcement leaves the shadow state as it is produced.
+    "matcher",
     "update-applied",
     "relay-inbox",
     "relay-tasks",

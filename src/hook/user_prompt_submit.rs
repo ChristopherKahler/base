@@ -266,6 +266,7 @@ pub fn collect(
             bracket,
             now: SessionState::now_secs(),
             index: load_index(config, base_dir.as_deref()),
+            weights: load_weights(config, base_dir.as_deref()),
             ..World::default()
         };
         let served = serve_live(config, cwd, &world, &session, &mut sink.trace);
@@ -373,6 +374,7 @@ pub fn collect(
         lean: bracket == Bracket::Fresh && prompt_num <= 2,
         now: SessionState::now_secs(),
         index: load_index(config, base_dir.as_deref()),
+        weights: load_weights(config, base_dir.as_deref()),
         ..World::default()
     };
     let served = serve_live(config, cwd, &world, &session, &mut sink.trace);
@@ -613,6 +615,8 @@ pub struct World {
     pub now: u64,
     /// The rule index live scores with (BO-18): `None` under `[match] bm25 = false`, or before the first sync.
     pub index: Option<crate::domain::score_index::ScoreIndex>,
+    /// The prompt-IDF counts live admits with (BO-20): `None` unless `[match] prompt_idf` is on with a `min_score`.
+    pub weights: Option<crate::domain::score_index::PromptWeights>,
     /// Each domain's rules (`rules::rules_for_domain`), by name, read the first time a run asks.
     rules: RefCell<HashMap<String, Rc<Vec<crate::domain::rules::ServedRule>>>>,
     /// Each domain's CONTEXT: its neighbourhood, the records that served, and its query's text, by name.
@@ -716,16 +720,18 @@ impl<'a> View<'a> {
     }
 }
 
-/// How a run scores: the `[match]` settings and the index it scores with (BO-18; BO-20 adds the candidate's).
+/// How a run scores: the `[match]` settings, the index it scores with and the prompt-IDF counts it admits with (BO-18;
+/// BO-20 adds the candidate's).
 pub struct Matching<'a> {
     pub settings: &'a crate::config::MatchConfig,
     pub index: Option<&'a crate::domain::score_index::ScoreIndex>,
+    pub weights: Option<&'a crate::domain::score_index::PromptWeights>,
 }
 
 impl<'a> Matching<'a> {
-    /// Live's: `[match]` as base.toml says, and the index `collect` loaded.
+    /// Live's: `[match]` as base.toml says, and the index and counts `collect` loaded.
     pub fn live(config: &'a BaseConfig, w: &'a World) -> Self {
-        Matching { settings: &config.matching, index: w.index.as_ref() }
+        Matching { settings: &config.matching, index: w.index.as_ref(), weights: w.weights.as_ref() }
     }
 }
 
@@ -755,7 +761,7 @@ pub type Deadline = Option<std::time::Instant>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Slow;
 
-fn in_time(deadline: Deadline) -> std::result::Result<(), Slow> {
+pub(crate) fn in_time(deadline: Deadline) -> std::result::Result<(), Slow> {
     match deadline {
         Some(d) if std::time::Instant::now() > d => Err(Slow),
         _ => Ok(()),
@@ -814,7 +820,7 @@ pub fn serve(
     let scoring = score(matching, prompt, trace);
     let admitted = scoring
         .as_ref()
-        .map(|s| admitted_by_score(s, prompt, domains, &matched, &converted_ids))
+        .map(|s| admitted_by_score(s, matching, prompt, domains, &matched, &converted_ids))
         .unwrap_or_default();
     for a in &admitted {
         trace.matched.push(Matched::new(&a.domain.name, "score", Some(format!("{:.2}", a.best))));
@@ -1269,6 +1275,17 @@ fn load_index(config: &BaseConfig, base_dir: Option<&Path>) -> Option<crate::dom
     base_dir.and_then(crate::domain::score_index::ScoreIndex::load)
 }
 
+/// The prompt-IDF counts live admits with (BO-20), when `[match] prompt_idf` is on and a `min_score` makes admission
+/// possible; `None` otherwise, and while none were counted (`[log] prompt_text` keeps no whole prompt): prompt IDF then
+/// acts as off.
+fn load_weights(config: &BaseConfig, base_dir: Option<&Path>) -> Option<crate::domain::score_index::PromptWeights> {
+    let m = &config.matching;
+    if !(m.bm25 && m.prompt_idf && m.min_score.is_some()) {
+        return None;
+    }
+    base_dir.and_then(crate::domain::score_index::PromptWeights::load)
+}
+
 /// Score the prompt with `matching`'s index (BO-18, K7c). `None` when `[match] bm25 = false`, or when no index has been
 /// built yet; the match log then says `index: missing`. Either way the prompt is served keyword-only, byte for byte as
 /// before BO-18. Every score above zero goes in the match log (K7f).
@@ -1304,8 +1321,14 @@ struct Admitted<'a> {
 /// `[match] min_score` is unset (lynx's Q7 ruling). A domain that is always-on, has `auto_inject = false`, matched
 /// already, or is vetoed by one of its `exclude` patterns admits nothing; a rule with matchers of its own is judged by
 /// `select` instead.
+///
+/// BO-20's three admission fixes only narrow `min_score` (`[match] min_terms`, `relative`, `prompt_idf`): a rule must
+/// also share enough distinct terms or a two-word term, reach its share of the prompt's best rule score, and reach
+/// `min_score` again with each term weighed down by how common it is in the user's own prompts. At their defaults they
+/// turn nothing away.
 fn admitted_by_score<'a>(
     scoring: &Scoring,
+    matching: &Matching<'_>,
     prompt: &str,
     domains: &'a [domain::DomainDef],
     matched: &[crate::domain::matcher::DomainMatch<'_>],
@@ -1314,10 +1337,21 @@ fn admitted_by_score<'a>(
     if scoring.min_score.is_none() {
         return Vec::new();
     }
+    let settings = matching.settings;
+    let best_rule = scoring.scores.ranked.iter().find(|s| s.doc.kind == DocKind::Rule).map_or(0.0, |s| s.score);
+    let weights = matching.weights.filter(|_| settings.prompt_idf);
     let lower = prompt.to_lowercase();
     let mut out: Vec<Admitted<'a>> = Vec::new();
     for s in scoring.scores.ranked.iter().filter(|s| s.doc.kind == DocKind::Rule && crate::config::reaches(scoring.min_score, s.score)) {
         if converted.contains(s.doc.id.as_str()) {
+            continue;
+        }
+        if !enough_terms(&s.terms, settings.min_terms) || settings.relative.is_some_and(|r| s.score < r * best_rule) {
+            continue;
+        }
+        if let (Some(w), Some(index)) = (weights, matching.index)
+            && !crate::config::reaches(scoring.min_score, index.weighted_score(&s.doc.id, prompt, w))
+        {
             continue;
         }
         let Some(d) = domains.iter().find(|d| d.name == s.doc.domain) else { continue };
@@ -1342,6 +1376,12 @@ fn admitted_by_score<'a>(
         }
     }
     out
+}
+
+/// `[match] min_terms` (BO-20): a rule shares at least `n` distinct one-word terms with the prompt, or any two-word
+/// term (`bm25::terms` makes `"prompt submit"` of neighbouring words).
+fn enough_terms(terms: &[String], n: usize) -> bool {
+    n <= 1 || terms.iter().any(|t| t.contains(' ')) || terms.iter().filter(|t| !t.contains(' ')).count() >= n
 }
 
 /// One rule as a part of a ranked block (BO-18): its line, its score, its claim (D15) and its match-log item, with

@@ -200,6 +200,21 @@ impl GlobalDecisions {
     }
 
     /// The global decision `base decision update` addresses as `slug`.
+    /// Decision `slug` as a proposal would leave it (BO-20, a shadow candidate's copy): `add` and `drop` made to its
+    /// keywords (kept sorted, lowercased, once each), and its name changed when `name` is given. A slug this set does
+    /// not hold is left alone.
+    pub fn edit(&mut self, slug: &str, add: &[String], drop: &[String], name: Option<&str>) {
+        let Some(d) = self.by_id.values_mut().find(|d| d.slug == slug) else { return };
+        let mut keywords: Vec<String> =
+            crate::domain::replay::edit_list(&d.keywords, add, drop).into_iter().map(|k| k.trim().to_lowercase()).collect();
+        keywords.sort();
+        keywords.dedup();
+        d.keywords = keywords;
+        if let Some(n) = name.map(str::trim).filter(|n| !n.is_empty()) {
+            d.name = n.to_string();
+        }
+    }
+
     pub fn by_slug(&self, slug: &str) -> Option<&GlobalDecision> {
         self.by_id.values().find(|d| d.slug == slug)
     }

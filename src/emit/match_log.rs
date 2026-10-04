@@ -219,6 +219,7 @@ pub fn signal_row(session: Option<&str>, prompt_num: Option<u32>, signals: Vec<S
         signals,
         index: None,
         min_score: None,
+        shadow: None,
     }
 }
 
@@ -293,6 +294,45 @@ pub struct Row {
     /// On a prompt row scored with BM25: the `[match] min_score` in force, so a later tune knows the threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_score: Option<f32>,
+    /// While a shadow runs (BO-20, K9b): what the candidate would have served instead. Absent on every row when none
+    /// runs, so a row reads as it did before BO-20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<Shadow>,
+}
+
+/// What a shadow candidate would have served on one event (BO-20, K9b): only how its pick differs from live's, as ids.
+/// Equal picks write `{"candidate": "bm25-0003", "ms": 4}`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Shadow {
+    /// The candidate's version name.
+    pub candidate: String,
+    /// Rules and decisions the candidate would have printed and live did not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adds: Vec<String>,
+    /// Rules and decisions live printed and the candidate would not have.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drops: Vec<String>,
+    /// `slow`: the run passed `[shadow] max_ms` and was stopped, so nothing is known of its pick (K9d).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+    /// How long the candidate ran, in milliseconds.
+    pub ms: u64,
+}
+
+/// The BM25 scores a prompt row keeps, best first (lynx's Q7 ruling on BO-20): a threshold only ever admits from the
+/// top, and every served or cut item carries its own score. The full list made the median prompt row 7,462 bytes.
+pub const BM25_SCORES_KEPT: usize = 20;
+
+/// `scores` with every topic score and the [`BM25_SCORES_KEPT`] best BM25 scores, in their order.
+fn kept_scores(scores: Vec<Score>) -> Vec<Score> {
+    if scores.iter().filter(|s| s.by == "bm25").count() <= BM25_SCORES_KEPT {
+        return scores;
+    }
+    // The BM25 entries best first, a tie going to the earlier one; the first BM25_SCORES_KEPT stay where they were.
+    let mut order: Vec<usize> = (0..scores.len()).filter(|&i| scores[i].by == "bm25").collect();
+    order.sort_by(|&a, &b| scores[b].score.total_cmp(&scores[a].score).then(a.cmp(&b)));
+    let keep: std::collections::HashSet<usize> = order.into_iter().take(BM25_SCORES_KEPT).collect();
+    scores.into_iter().enumerate().filter(|(i, s)| s.by != "bm25" || keep.contains(i)).map(|(_, s)| s).collect()
 }
 
 fn now() -> String {
@@ -337,10 +377,11 @@ pub fn prompt_row(
         matched: scrubbed(trace.matched),
         served,
         cut,
-        scores: trace.scores,
+        scores: kept_scores(trace.scores),
         signals: Vec::new(),
         index: trace.index,
         min_score: trace.min_score,
+        shadow: None,
     }
 }
 
@@ -376,6 +417,7 @@ pub fn file_row(trace: Trace, session: Option<&str>) -> Option<Row> {
         signals: Vec::new(),
         index: None,
         min_score: None,
+        shadow: None,
     })
 }
 
@@ -836,6 +878,7 @@ mod tests {
                 signals: Vec::new(),
                 index: None,
                 min_score: None,
+                shadow: None,
             };
             format!("{}\n", serde_json::to_string(&r).unwrap())
         };

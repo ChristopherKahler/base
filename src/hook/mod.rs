@@ -219,7 +219,7 @@ fn run_event(
             Ok(HookEventData { session_id, ..Default::default() })
         }
         "pre-tool-use" => {
-            let (mut data, mut context, trace) = pre_tool_use::handle_traced(&config, &cwd, stdin_json)?;
+            let (mut data, mut context, trace, kept) = pre_tool_use::handle_traced(&config, &cwd, stdin_json)?;
             let (tool_name, file_path) = extract_tool_context(stdin_json);
             data.tool_name = tool_name;
             data.file_path = file_path;
@@ -259,11 +259,14 @@ fn run_event(
             }
             // The match log's row (K1), after the print, never in the way of it (K1g).
             let _ = std::io::stdout().flush();
-            if let Some(row) = crate::emit::match_log::file_row(trace, session_id.as_deref())
+            if let Some(mut row) = crate::emit::match_log::file_row(trace, session_id.as_deref())
                 && let Some(dir) = crate::crud::handoff_show::session_start_dir(&cwd)
-                && let Err(why) = crate::emit::match_log::append(&dir, &row)
             {
-                eprintln!("base: the tool hook could not write its match log row: {why}");
+                // The shadow candidate (BO-20, K9b), after the print: what it would have served on this call.
+                row.shadow = kept.as_ref().map(|k| crate::shadow::run::file(&config, k));
+                if let Err(why) = crate::emit::match_log::append(&dir, &row) {
+                    eprintln!("base: the tool hook could not write its match log row: {why}");
+                }
             }
             data.session_id = session_id;
             Ok(data)
@@ -314,7 +317,11 @@ fn run_event(
             // rules went first and the rules matched to the prompt last. Now each part is a named block
             // with a priority, the fit drops whole blocks lowest priority first, each leaves a pointer
             // line, and the session records as shown only what was printed (D15).
+            // A shadow candidate (BO-20, K9b) decides on what `collect` read, so `collect` keeps it. With no shadow started
+            // this is one failed file open, and nothing below changes (the seamless upgrade).
+            let shadow = crate::shadow::active();
             let mut sink = user_prompt_submit::PromptSink::default();
+            sink.keep_world = shadow.is_some();
             let handled = user_prompt_submit::collect(&config, &cwd, stdin_json, &mut sink);
             // Each relay block's side effects (messages marked seen, a reply deleted once announced, a ping
             // recorded as delivered, the wake nudge throttled) are held back with the block's id and run only if
@@ -373,6 +380,14 @@ fn run_event(
             if let Some(block) = correction.as_ref().and_then(|c| c.block.clone()) {
                 sink.blocks.push_front(block);
             }
+            // Live's list before its fit, for the shadow candidate's own fit (only while one runs), and how many blocks went
+            // first after the matching ran.
+            let front = sink
+                .blocks
+                .iter()
+                .filter(|b| b.id == crate::corrections::CHECK_BLOCK || b.id == crate::corrections::tune::DUE_BLOCK)
+                .count();
+            let pre_fit = shadow.as_ref().map(|_| (sink.blocks.clone(), sink.header.clone()));
             // Fitted to `[budget] prompt_bytes` under the key the operator actually wrote; then D15: what will be
             // printed is recorded as shown, and nothing else.
             let (fitted, committed) = sink.fit_and_commit(&config);
@@ -423,7 +438,14 @@ fn run_event(
                 // The match log's row (K1): what matched, what the printed blocks served, what the budget, the topic
                 // cap and the walk cut. Written after the print and never in the way of it (K1g).
                 if !sink.prompt.is_empty() {
-                    let row = crate::emit::match_log::prompt_row(
+                    // The shadow candidate (K9b), after the print and the flush: what it would have printed instead.
+                    let shadow_entry = match (&shadow, sink.kept.as_ref(), pre_fit) {
+                        (Some(active), Some(kept), Some((blocks, header))) => {
+                            Some(crate::shadow::run::prompt(&config, &cwd, active, kept, blocks, front, &header, &fitted))
+                        }
+                        _ => None,
+                    };
+                    let mut row = crate::emit::match_log::prompt_row(
                         std::mem::take(&mut sink.trace),
                         &fitted,
                         config.budget.key_as_written("prompt_bytes"),
@@ -432,6 +454,7 @@ fn run_event(
                         sink.prompt_num,
                         config.log.prompt_text_mode(),
                     );
+                    row.shadow = shadow_entry;
                     if let Err(why) = crate::emit::match_log::append(&dir, &row) {
                         eprintln!("base: the prompt hook could not write its match log row: {why}");
                     }
