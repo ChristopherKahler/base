@@ -1,5 +1,8 @@
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::Result;
 
@@ -36,6 +39,18 @@ pub struct PromptSink {
     pub prompt: String,
     /// This session's prompt number, for the match log's row.
     pub prompt_num: Option<u32>,
+    /// Set by the dispatcher before `collect` when a shadow runs (BO-20): keep what `collect` decided with.
+    pub keep_world: bool,
+    /// What `collect` decided with, kept only when `keep_world` is set, so a shadow candidate decides on it after the
+    /// print (K9b, K9c).
+    pub kept: Option<Kept>,
+}
+
+/// What the prompt hook decided with (BO-20): the world it read, and a copy of the session state it decided against,
+/// taken before the print recorded anything in it.
+pub struct Kept {
+    pub world: World,
+    pub session: SessionState,
 }
 
 /// Where the session lives and the tier it was served at, held until the output is fitted.
@@ -56,6 +71,13 @@ impl PromptSink {
     /// BO-01, and keep where it lives for `commit`. The records of what was shown are not in it: they wait for the
     /// fit. Saving here and reloading in `commit` keeps the window between a load and a save of the shared `.session`
     /// file as short as it was, rather than holding the state across the relay delivery in between.
+    /// Keep `world` and a copy of `session` for a shadow candidate, when the dispatcher asked (`keep_world`).
+    fn keep(&mut self, world: World, session: &SessionState) {
+        if self.keep_world {
+            self.kept = Some(Kept { world, session: session.clone() });
+        }
+    }
+
     fn hold(&mut self, session: SessionState, base_dir: Option<PathBuf>, tier: Bracket) {
         if let Some(base_dir) = base_dir {
             let _ = session.save(&base_dir);
@@ -159,6 +181,10 @@ impl PromptSink {
 ///
 /// See [`PromptSink`] for why: the dispatcher owns the one measured write and the one session save, so what is
 /// recorded as shown is exactly what was printed.
+///
+/// THREE PARTS SINCE BO-20. It reads what a prompt is matched against into a [`World`], decides what that serves in
+/// [`serve`], and adds what does not depend on the matching: the walk, grounding, the bracket rules, DEVMODE. A shadow
+/// candidate (K9b) runs the same [`serve`] on the same world, so the two can differ only by how they match.
 pub fn collect(
     config: &BaseConfig,
     cwd: &Path,
@@ -232,18 +258,21 @@ pub fn collect(
         let converted = crate::domain::rules::rules_with_matchers(store.as_ref(), config, &domains);
         let prompt_num = session.prompt_count_for(session_id);
         sink.prompt_num = Some(prompt_num);
-        let scoring = load_scoring(config, base_dir.as_deref(), &prompt, &mut sink.trace);
-        sink.blocks.extend(matcher_blocks(
-            config,
-            &prompt,
-            &session,
+        let world = World {
+            prompt,
+            domains,
+            store,
+            converted,
             bracket,
-            &converted,
-            &domains,
-            scoring.as_ref(),
-            &mut sink.trace,
-        ));
+            now: SessionState::now_secs(),
+            index: load_index(config, base_dir.as_deref()),
+            weights: load_weights(config, base_dir.as_deref()),
+            ..World::default()
+        };
+        let served = serve_live(config, cwd, &world, &session, &mut sink.trace);
+        sink.blocks.extend(served.blocks);
         sink.blocks.extend(bracket_block);
+        sink.keep(world, &session);
         sink.hold(session, base_dir, bracket);
         return Ok(super::HookEventData {
             prompt_num: Some(prompt_num),
@@ -307,7 +336,6 @@ pub fn collect(
     // Rules with matchers of their own (4d): read once, served on this prompt whether or not a domain matches, and
     // kept out of every domain block below (F1).
     let converted = crate::domain::rules::rules_with_matchers(graph_store.as_ref(), config, &domains);
-    let converted_ids: HashSet<&str> = converted.iter().map(|c| c.rule.id.as_str()).collect();
 
     // The paths this session touched (tool-hook log), never the store.
     let active_paths = gather_active_paths(cwd, base_dir.as_deref(), session_id);
@@ -319,32 +347,41 @@ pub fn collect(
             .map(|s| crate::domain::registered_projects(s, &config.namespace, cwd))
             .unwrap_or_default(),
     };
-    let matched = match_domains_auto(&prompt, &domains, &active_paths, &trigger_ctx);
-    for dm in &matched {
-        for m in matched_entries(dm) {
-            if m.by == "keyword"
-                && let Some(kw) = &m.value
-            {
-                sink.trace.word(kw);
-            }
-            sink.trace.matched.push(m);
-        }
-    }
-    // BM25 (BO-18, K7): this prompt's score for every rule and global decision, and the rules no keyword or path
-    // brought whose score reaches `[match] min_score`, by domain, when one is set. With no index, or `[match] bm25 = false`, there is no
-    // scoring and the prompt is served keyword-only, as before.
-    let scoring = load_scoring(config, base_dir.as_deref(), &prompt, &mut sink.trace);
-    let admitted = scoring
-        .as_ref()
-        .map(|s| admitted_by_score(s, &prompt, &domains, &matched, &converted_ids))
-        .unwrap_or_default();
-    for a in &admitted {
-        sink.trace.matched.push(Matched::new(&a.domain.name, "score", Some(format!("{:.2}", a.best))));
-        for t in &a.terms {
-            sink.trace.word(t);
-        }
-    }
-    if matched.is_empty() && admitted.is_empty() {
+
+    // This session's depth — not the workspace-wide total, which concurrent
+    // sessions inflate.
+    //
+    // `prompt_count_for(session_id)`, NOT the raw `session.prompt_count`: the no-match path used to be the one place
+    // reaching for the raw counter, and the main path prints the per-session number, so the raw one would show a user
+    // two different prompt numbers depending on whether a domain happened to match, each inflated by every
+    // concurrent session sharing the workspace.
+    let prompt_num = session.prompt_count_for(session_id);
+    // The context bracket tag, always kept and counted first.
+    sink.prompt_num = Some(prompt_num);
+    sink.header = format!("<context-bracket>[{bracket}] (prompt {prompt_num})</context-bracket>");
+
+    let world = World {
+        prompt,
+        domains,
+        store: graph_store,
+        global,
+        converted,
+        active_paths,
+        trigger_ctx,
+        commands,
+        bracket,
+        // Lean mode (FRESH, first 2 prompts — rules only, skip neighborhood)
+        lean: bracket == Bracket::Fresh && prompt_num <= 2,
+        now: SessionState::now_secs(),
+        index: load_index(config, base_dir.as_deref()),
+        weights: load_weights(config, base_dir.as_deref()),
+        ..World::default()
+    };
+    let served = serve_live(config, cwd, &world, &session, &mut sink.trace);
+    let Served { blocks, domain_served, mut injected_any, loaded_domains, deduped_count, matched_any } = served;
+    sink.blocks.extend(blocks);
+
+    if !matched_any {
         // N-WALK-DEAD-WITHOUT-A-MATCHED-DOMAIN. The walk resolves what the
         // PROMPT TEXT names, which has nothing to do with whether a domain
         // trigger fired. Returning here without running it left every machine
@@ -360,43 +397,22 @@ pub fn collect(
         // domains getting nothing at all -- and on an install whose domains are
         // all `mode = "triggered"`, nothing ever.
         //
-        // `prompt_count_for(session_id)`, NOT the raw `session.prompt_count`.
-        // Of the four return sites in this function this was the only one
-        // reaching for the raw counter, and the main path below prints the
-        // per-session number -- so the raw one would show a user two different
-        // prompt numbers depending on whether a domain happened to match, each
-        // inflated by every concurrent session sharing the workspace.
-        //
         // The returned `HookEventData` keeps `session.prompt_count` unchanged.
         // That field feeds the JSONL log rather than the prompt, it has always
         // carried that number here, and whether it should is a separate
         // question from what the reader sees.
         //
         // Nothing to dedup against: `domain_served` is filled by the domain
-        // loop below, which an empty `matched` makes a no-op.
+        // loop in `serve`, which an empty match makes a no-op.
         //
-        // No lean-mode gate either. `lean_mode` needs the prompt number
-        // computed below this return -- and the walk on the main path is not
-        // gated on it, so gating here would be the one place in the hook where
-        // the walk still consulted it.
-        let nomatch_prompt_num = session.prompt_count_for(session_id);
-        sink.prompt_num = Some(nomatch_prompt_num);
-        sink.header = format!("<context-bracket>[{bracket}] (prompt {nomatch_prompt_num})</context-bracket>");
-        sink.blocks.extend(matcher_blocks(
-            config,
-            &prompt,
-            &session,
-            bracket,
-            &converted,
-            &domains,
-            scoring.as_ref(),
-            &mut sink.trace,
-        ));
-        if let Some(ref store) = graph_store {
+        // No lean-mode gate either. The walk on the main path is not gated on it,
+        // so gating here would be the one place in the hook where the walk still
+        // consulted it. No grounding and no DEVMODE on this path, as before.
+        if let Some(ref store) = world.store {
             let nothing_served = std::collections::HashSet::new();
             let walked =
-                crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &nothing_served, &|id| {
-                    global_withheld(&global, &session, id, &prompt)
+                crate::hook::walk::walk_from_text(store, cwd, config, &world.prompt, &nothing_served, &|id| {
+                    global_withheld(&world.global, &session, id, &world.prompt)
                 });
             // Dedup and render as one unit; the marks wait for the print -- see `render_walk_block`.
             let w = render_walk_block(&session, walked, config.injection.walk_budget);
@@ -405,357 +421,12 @@ pub fn collect(
         }
         sink.blocks.extend(bracket_block);
         let prompt_count = session.prompt_count;
+        sink.keep(world, &session);
         sink.hold(session, base_dir, bracket);
         return Ok(super::HookEventData {
             prompt_num: Some(prompt_count),
             ..Default::default()
         });
-    }
-
-    // This session's depth — not the workspace-wide total, which concurrent
-    // sessions inflate.
-    let prompt_num = session.prompt_count_for(session_id);
-
-    // The context bracket tag, always kept and counted first.
-    sink.prompt_num = Some(prompt_num);
-    sink.header = format!("<context-bracket>[{bracket}] (prompt {prompt_num})</context-bracket>");
-    let matcher =
-        matcher_blocks(config, &prompt, &session, bracket, &converted, &domains, scoring.as_ref(), &mut sink.trace);
-    let matcher_served = matcher.iter().any(PromptBlock::has_claims);
-    sink.blocks.extend(matcher);
-
-    // Determine if we're in lean mode (FRESH, first 2 prompts — rules only, skip neighborhood)
-    let lean_mode = bracket == Bracket::Fresh && prompt_num <= 2;
-
-    // Track injection metadata for DEVMODE
-    let mut loaded_domains: Vec<(String, String, usize)> = Vec::new(); // (name, match_reason, rule_count)
-    let mut deduped_count = 0usize;
-    // Remember whether any fresh content was injected (gates the grounding block).
-    let mut injected_any = matcher_served;
-    // Domain-linked command modes (Phase 28), one entry per command: the best priority among the domains that link
-    // it, its rendered rules, and how many. Each becomes a block of its own after the loop (BO-01).
-    let mut linked: Vec<(String, Priority, String, usize)> = Vec::new();
-    // Every record IRI the domain blocks serve this prompt. The walk below dedups
-    // against it, so a record cannot arrive twice under two headings.
-    let mut domain_served: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let now = SessionState::now_secs();
-
-    // Format and emit matched rules
-    for dm in &matched {
-        let domain_def = dm.domain;
-        let (rules_priority, context_priority) = domain_priorities(&dm.reason);
-
-        // The rules and the neighbourhood are read separately now, because they are
-        // deduped differently: the rules per RULE (F9), the neighbourhood as a block.
-        // A rule with matchers of its own left this block in 4d: it was served on them above (F1).
-        let rules: Vec<crate::domain::rules::ServedRule> =
-            crate::domain::rules::rules_for_domain(graph_store.as_ref(), config, domain_def)
-                .into_iter()
-                .filter(|r| !converted_ids.contains(r.id.as_str()))
-                .collect();
-        // Due, not claimed (D15): `commit` records each rule only if this domain's rules block is printed.
-        let mut fresh: Vec<(usize, &crate::domain::rules::ServedRule)> = rules
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| {
-                session.rule_due(&r.id, r.content_hash, bracket, None, ReShow::PerSession { on_tier_change: true }, now)
-            })
-            .collect();
-        // Best first when the prompt was scored (BO-18, K7d), today's order breaking ties; each rule keeps its number.
-        if let Some(s) = &scoring {
-            fresh.sort_by(|a, b| s.scores.get(&b.1.id).total_cmp(&s.scores.get(&a.1.id)));
-        }
-        // What this prompt serves, so the walk still resolves a rule this block held
-        // back and does not list again one it serves.
-        domain_served.extend(fresh.iter().filter_map(|(_, r)| r.iri.clone()));
-        // D13: a domain that came only as a nested parent says whose parent it is, as the tool hook's block does.
-        let label = match &dm.parent_of {
-            Some(child) => format!("{} (parent of {child})", domain_def.name),
-            None => domain_def.name.clone(),
-        };
-        let rules_text = crate::domain::rules::render_block_as("DOMAIN", &label, &fresh, rules.len(), &domain_def.name);
-
-        // An always-on domain's CONTEXT block named the domain as served whenever it listed decisions, so the walk
-        // never listed the domain itself. Its decisions now have their own block and the CONTEXT is often empty, so
-        // the domain is marked here, in lean mode too: the walk would otherwise add "domain GLOBAL" to blocks that
-        // reach it (measured on the BO-03 replay, 5 of 300 prompts).
-        if domain_def.is_always() {
-            domain_served.insert(domain_walk_key(config, domain_def));
-        }
-        // The decisions the CONTEXT block lists, for the match log (K1).
-        let mut context_decisions: Vec<Item> = Vec::new();
-        let neighborhood_text = match (&graph_store, lean_mode) {
-            (Some(store), false) => {
-                let (n, served) =
-                    crate::domain::query::query_domain_neighborhood(store, config, domain_def, &|id| {
-                        domain_def.is_always() && global.contains(id)
-                    });
-                if !n.is_empty() {
-                    context_decisions = served
-                        .iter()
-                        .filter(|iri| crate::emit::match_log::is_decision(iri))
-                        .map(|iri| Item::decision(iri, Some(&domain_def.name)))
-                        .collect();
-                }
-                domain_served.extend(served);
-                n
-            }
-            _ => String::new(),
-        };
-
-        // ─── Steering layer (v0.4): role / linked commands / output-mode / format ───
-        // Role (Phase 29): first line of the domain block.
-        let role_line = domain_def.role.as_deref().map(str::trim).filter(|r| !r.is_empty());
-
-        // Domain-linked command rules (Phase 28). Explicit *commands short-circuit
-        // before domain matching, so this path only fires when no explicit star was
-        // typed. BO-01: a linked mode is no longer folded into the first domain's
-        // block. Two domains of different priorities can link one mode, and the
-        // budget can drop the one that carried it while keeping the other, so the
-        // mode is one block, at the better of the two priorities.
-        if command_activation_fires(&domain_def.command_activation, &dm.reason) {
-            for cmd_name in &domain_def.commands {
-                if let Some(cmd) = commands.iter().find(|c| c.name.eq_ignore_ascii_case(cmd_name)) {
-                    let rendered = crate::command::format_command_output(cmd);
-                    if rendered.is_empty() {
-                        continue;
-                    }
-                    let key = cmd.name.to_lowercase();
-                    match linked.iter_mut().find(|(k, ..)| *k == key) {
-                        Some(entry) => entry.1 = entry.1.min(rules_priority),
-                        None => linked.push((key, rules_priority, rendered, cmd.rules.len())),
-                    }
-                }
-            }
-        }
-
-        // Output mode (Phase 31) + format directive (Phase 32).
-        let output_mode_line = output_mode_directive(domain_def.output_mode.as_deref());
-        let format_line = domain_def.format.as_deref().map(str::trim).filter(|f| !f.is_empty());
-
-        // Notes surface ONLY through explicit queries — no bulk dumps.
-        // If a domain needs notes injected, configure `query = "..."` in domains.toml
-        // pointing to a SPARQL file in queries/ that filters and shapes the output.
-        let query_text = match (&graph_store, &domain_def.query) {
-            (Some(store), Some(query_name)) => {
-                let fmt = domain_def.query_format.as_deref().unwrap_or("list");
-                resolve_and_run_query(store, config, cwd, query_name, fmt, &domain_def.name)
-            }
-            _ => String::new(),
-        };
-
-        // TWO PARTS, DEDUPED AND RANKED APART (BO-01). The rules were deduped one at
-        // a time above. The steering lines and the CONTEXT were one block hash until
-        // BO-01, and they are two now, each recorded only when its own block is
-        // printed: a context the budget keeps dropping stays due, and the steering
-        // lines that did print are not sent again with it on every prompt.
-        //
-        // Hash over SORTED lines: SPARQL result order shifts when the graph file is
-        // rewritten (post-tool-use fires on every edit), and an order-sensitive hash
-        // would re-inject unchanged content every prompt.
-        let sorted_hash = |text: &str| {
-            let mut lines: Vec<String> = text.lines().map(String::from).collect();
-            lines.sort();
-            rules_hash(&lines)
-        };
-        let steering: Vec<&str> = [role_line, output_mode_line, format_line].into_iter().flatten().collect();
-        let steering_hash = sorted_hash(&steering.join("\n"));
-        let steering_due = !steering.is_empty() && !session.is_injected(&domain_def.name, steering_hash);
-        let context_text: String = [neighborhood_text.as_str(), query_text.as_str()]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let context_key = format!("context:{}", domain_def.name);
-        let context_hash = sorted_hash(&context_text);
-        let context_due = !context_text.is_empty() && !session.is_injected(&context_key, context_hash);
-        let injected_rule_count = fresh.len();
-
-        // Nothing due. A domain that HAS rules and had every one of them already served
-        // this session is not "contributes nothing": it is a dedup, and it has to be
-        // COUNTED as one, or it drops out of `HookEventData::suppressed` and the
-        // devmode dedup list and reads as a domain that never matched
-        // (`graph_injection_test::dedup_skips_unchanged_graph_injection`). A domain
-        // with nothing at all to say (no rules, a query that returned nothing) is
-        // neither injected nor a dedup, and no longer turns on the grounding block.
-        if rules_text.is_empty() && !steering_due && !context_due {
-            if !rules.is_empty() || !steering.is_empty() || !context_text.is_empty() {
-                deduped_count += 1;
-                let dedup_reason = if config.devmode.enabled {
-                    format!("dedup [{}]", dm.reason)
-                } else {
-                    "dedup".into()
-                };
-                loaded_domains.push((domain_def.name.clone(), dedup_reason, injected_rule_count));
-            }
-            continue;
-        }
-
-        // Use the actual match reason from the matcher (only meaningful in DEVMODE)
-        let match_reason = if config.devmode.enabled {
-            match &dm.path {
-                Some(p) => format!("{} ({p})", dm.reason),
-                None => format!("{}", dm.reason),
-            }
-        } else if domain_def.is_always() {
-            "always_on".to_string()
-        } else {
-            "matched".to_string()
-        };
-        loaded_domains.push((
-            domain_def.name.clone(),
-            match_reason,
-            injected_rule_count,
-        ));
-
-        // The rules block: the steering lines ride with fresh rules, as they always
-        // did, and alone when they changed. A domain matched to the prompt puts its
-        // rules at 1 and its context at 2; an always-on domain puts both at 4 (F2).
-        let slug = crate::crud::slugify(&domain_def.name);
-        let with_steering = steering_due || !rules_text.is_empty();
-        let rules_part: Vec<&str> = [
-            role_line.filter(|_| with_steering),
-            Some(rules_text.as_str()),
-            output_mode_line.filter(|_| with_steering),
-            format_line.filter(|_| with_steering),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .collect();
-        // Recorded whenever the rules block prints, steering lines or not: the domain's own key says it was served.
-        let steering_claim =
-            with_steering.then(|| Claim::Injected { key: domain_def.name.clone(), hash: steering_hash });
-        let rules_block = match (&scoring, crate::domain::rules::block_lines("DOMAIN", &label, &fresh, rules.len(), &domain_def.name)) {
-            // Scored (BO-18): one part per rule, best first, so the budget withholds the weakest first (K7d). The role
-            // line rides with the header, the output-mode and format lines with the tail.
-            (Some(s), Some(lines)) => {
-                let head = lines_of([role_line, Some(lines.header.as_str())]);
-                let tail = lines_of([lines.tail.as_deref(), output_mode_line, format_line]);
-                let parts = fresh.iter().zip(&lines.rules).map(|((_, r), line)| rule_part(line, r, &domain_def.name, s, None)).collect();
-                PromptBlock::ranked(format!("{slug}-rules"), rules_priority, &head, parts, &tail, "rule").with_claims(steering_claim)
-            }
-            _ => PromptBlock::new(format!("{slug}-rules"), rules_priority, &rules_part.join("\n"), fresh.len(), "rule")
-                .with_claims(fresh.iter().map(|(_, r)| Claim::Rule {
-                    id: r.id.clone(),
-                    content: r.content_hash,
-                    scope: None,
-                }))
-                .with_claims(steering_claim)
-                .with_logged(fresh.iter().map(|(_, r)| Item::rule(&r.id, &domain_def.name))),
-        };
-        injected_any |= !rules_block.text.is_empty();
-        sink.blocks.push(rules_block);
-        if context_due {
-            sink.blocks.push(
-                PromptBlock::new(format!("{slug}-context"), context_priority, &context_text, count_records(&context_text), "record")
-                    .with_claims([Claim::Injected { key: context_key, hash: context_hash }])
-                    .with_logged(context_decisions),
-            );
-            injected_any = true;
-        }
-    }
-
-    // K7d (BO-18): the rules no keyword or path brought whose score reached `[match] min_score`, each domain's in its
-    // own `[DOMAIN: …]` block at priority 1, best first. Only the rules: the domain's context, steering lines and linked
-    // modes still need a keyword or a path.
-    if let Some(s) = &scoring {
-        for a in &admitted {
-            let domain_def = a.domain;
-            let rules: Vec<crate::domain::rules::ServedRule> =
-                crate::domain::rules::rules_for_domain(graph_store.as_ref(), config, domain_def)
-                    .into_iter()
-                    .filter(|r| a.ids.contains(&r.id))
-                    .collect();
-            let mut fresh: Vec<(usize, &crate::domain::rules::ServedRule)> = rules
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| {
-                    session.rule_due(&r.id, r.content_hash, bracket, None, ReShow::PerSession { on_tier_change: true }, now)
-                })
-                .collect();
-            fresh.sort_by(|x, y| s.scores.get(&y.1.id).total_cmp(&s.scores.get(&x.1.id)));
-            domain_served.extend(fresh.iter().filter_map(|(_, r)| r.iri.clone()));
-            let Some(lines) = crate::domain::rules::block_lines("DOMAIN", &domain_def.name, &fresh, rules.len(), &domain_def.name)
-            else {
-                continue;
-            };
-            let parts = fresh
-                .iter()
-                .zip(&lines.rules)
-                .map(|((_, r), line)| rule_part(line, r, &domain_def.name, s, Some("score")))
-                .collect();
-            let slug = crate::crud::slugify(&domain_def.name);
-            let block = PromptBlock::ranked(format!("{slug}-rules"), Priority::Matched, &lines.header, parts, lines.tail.as_deref().unwrap_or(""), "rule");
-            injected_any |= !block.text.is_empty();
-            loaded_domains.push((domain_def.name.clone(), "score".to_string(), fresh.len()));
-            sink.blocks.push(block);
-        }
-    }
-
-    // F5: the global decisions this prompt names by keyword, each once per session (and again after a DEPLETED or
-    // CRITICAL force-refresh, as CONTEXT is) and recorded only if printed (D15), at priority 4 with the rest of the
-    // always-on layer. Not held back in lean mode: unlike the
-    // neighbourhood, a keyword is a direct match to what the prompt is about. A decision another domain's
-    // CONTEXT already printed on this prompt is not listed twice.
-    let (decisions_text, listed) = global.prompt_block(&prompt, &|d| {
-        let (key, hash) = d.claim_key();
-        session.is_injected(&key, hash) || domain_served.contains(&d.id)
-    });
-    if !listed.is_empty() {
-        domain_served.extend(listed.iter().map(|d| d.id.clone()));
-        match &scoring {
-            // Scored (BO-18): ranked like the rules, admitted only by their keywords as before (F5, lynx's G0 Q4). One
-            // block per always-on domain, so each keeps its header over its own decisions.
-            Some(s) => {
-                let mut by_domain: Vec<(&str, Vec<&crate::domain::global_decisions::GlobalDecision>)> = Vec::new();
-                for d in &listed {
-                    match by_domain.iter_mut().find(|(name, _)| *name == d.domain) {
-                        Some((_, list)) => list.push(d),
-                        None => by_domain.push((&d.domain, vec![*d])),
-                    }
-                }
-                for (domain, mut list) in by_domain {
-                    list.sort_by(|a, b| s.scores.get(&b.id).total_cmp(&s.scores.get(&a.id)));
-                    let head = format!("[{domain} CONTEXT · decisions matched by keyword]");
-                    let parts = list
-                        .iter()
-                        .map(|d| {
-                            let score = s.scores.get(&d.id);
-                            let (key, hash) = d.claim_key();
-                            BlockPart::new(&format!("  - Decision: {}", d.name), score)
-                                .with_claims([Claim::Injected { key, hash }])
-                                .with_logged([Item { score: (score > 0.0).then_some(score), ..Item::decision(&d.id, Some(&d.domain)) }])
-                        })
-                        .collect();
-                    sink.blocks.push(PromptBlock::ranked("global-decisions", Priority::Global, &head, parts, "", "decision"));
-                }
-            }
-            None => sink.blocks.push(
-                PromptBlock::new("global-decisions", Priority::Global, &decisions_text, listed.len(), "decision")
-                    .with_claims(listed.iter().map(|d| {
-                        let (key, hash) = d.claim_key();
-                        Claim::Injected { key, hash }
-                    }))
-                    .with_logged(listed.iter().map(|d| Item::decision(&d.id, Some(&d.domain)))),
-            ),
-        }
-        injected_any = true;
-    }
-
-    // The linked command modes, each once per session per text, recorded only if printed (D15).
-    for (key, priority, text, rules) in linked {
-        let claim_key = format!("command:{key}");
-        let hash = rules_hash(std::slice::from_ref(&text));
-        if session.is_injected(&claim_key, hash) {
-            continue;
-        }
-        sink.blocks.push(
-            PromptBlock::new(format!("command-{}", crate::crud::slugify(&key)), priority, &text, rules, "rule")
-                .with_claims([Claim::Injected { key: claim_key, hash }])
-                .with_logged([Item::of_kind(&key, "command")]),
-        );
-        injected_any = true;
     }
 
     // ─── Prompt-time traversal ───────────────────────────────────────────
@@ -776,15 +447,15 @@ pub fn collect(
     // cheaper than the search it replaces. Prompts 1 and 2 are usually where
     // someone starts work, which is where that signal is worth most.
     //
-    // The NEIGHBOURHOOD skip above still honours lean mode. That is what the
+    // The NEIGHBOURHOOD skip in `serve` still honours lean mode. That is what the
     // flag was built for and it is untouched.
     //
     // The maps, the closures and the reasons for both now live in
     // `walk::walk_from_text`, which `base context` calls as well. One seam, so the
     // command and the prompt path cannot answer differently about the same graph.
-    let walked = graph_store.as_ref().map(|store| {
-        crate::hook::walk::walk_from_text(store, cwd, config, &prompt, &domain_served, &|id| {
-            global_withheld(&global, &session, id, &prompt)
+    let walked = world.store.as_ref().map(|store| {
+        crate::hook::walk::walk_from_text(store, cwd, config, &world.prompt, &domain_served, &|id| {
+            global_withheld(&world.global, &session, id, &world.prompt)
         })
     });
 
@@ -841,7 +512,7 @@ pub fn collect(
     // fresh injection this prompt. Skipped on dedup-only prompts (already grounded).
     // Priority 4: an instruction for every prompt, not one matched to this one.
     if config.grounding.enabled && injected_any {
-        sink.blocks.push(PromptBlock::new("grounding", Priority::Global, &grounding_block(), 1, "instruction"));
+        sink.blocks.push(grounding_prompt_block());
     }
 
     sink.blocks.extend(bracket_block);
@@ -849,25 +520,7 @@ pub fn collect(
     // DEVMODE, last: priority 5 after the bracket rules. What it lists as loaded is what the hook built; the
     // budget may still drop a block it names, and the pointer line for it says so.
     if config.devmode.enabled {
-        let mut devmode = format_devmode_block(
-            &loaded_domains,
-            &domains,
-            bracket,
-            session.prompt_count,
-            deduped_count,
-        );
-        // An inert trigger is named on every prompt it would otherwise have judged, so a
-        // domain that stopped loading is never a silent drop (F29 step 6).
-        for (domain, trigger, fault) in crate::domain::matcher::inert_triggers(&domains, &trigger_ctx) {
-            devmode.push_str(&format!(
-                "  inert: {}\n",
-                crate::domain::matcher::fault_sentence(domain, trigger, &fault)
-            ));
-        }
-        if !walk_note.is_empty() {
-            devmode.push_str(&walk_note);
-        }
-        sink.blocks.push(PromptBlock::new("devmode", Priority::Bracket, &devmode, 1, "block"));
+        sink.blocks.push(devmode_prompt_block(&world, &loaded_domains, session.prompt_count, deduped_count, &walk_note));
     }
 
     // Build event data for JSONL logging
@@ -878,19 +531,20 @@ pub fn collect(
         .collect();
 
     // Capture first 120 chars of the prompt for dashboard display
-    let prompt_preview = if prompt.len() > 120 {
-        let truncated: String = prompt.char_indices()
+    let prompt_preview = if world.prompt.len() > 120 {
+        let truncated: String = world.prompt.char_indices()
             .take_while(|(i, _)| *i < 117)
             .map(|(_, c)| c)
             .collect();
         Some(format!("{truncated}…"))
     } else {
-        Some(prompt.clone())
+        Some(world.prompt.clone())
     };
 
     let prompt_count = session.prompt_count;
     // The session is saved by `PromptSink::commit`, once the output is fitted: AFTER the walk, so the prompt
     // count and tier it recorded are in what gets saved, and with only the marks of what was printed.
+    sink.keep(world, &session);
     sink.hold(session, base_dir, bracket);
 
     // `rules_injected` and `bracket_rules_injected` are filled by the dispatcher from what `commit` recorded:
@@ -905,6 +559,603 @@ pub fn collect(
         session_id: None, // populated by run() after handle returns
         ..Default::default()
     })
+}
+
+/// The grounding block (Phase 30), as the main path pushes it.
+pub(crate) fn grounding_prompt_block() -> PromptBlock {
+    PromptBlock::new("grounding", Priority::Global, &grounding_block(), 1, "instruction")
+}
+
+/// The DEVMODE block: what was loaded, what is available, every inert trigger, and the walk's notes.
+pub(crate) fn devmode_prompt_block(
+    world: &World,
+    loaded_domains: &[(String, String, usize)],
+    prompt_count: u32,
+    deduped_count: usize,
+    walk_note: &str,
+) -> PromptBlock {
+    let mut devmode = format_devmode_block(loaded_domains, &world.domains, world.bracket, prompt_count, deduped_count);
+    // An inert trigger is named on every prompt it would otherwise have judged, so a
+    // domain that stopped loading is never a silent drop (F29 step 6).
+    for (domain, trigger, fault) in crate::domain::matcher::inert_triggers(&world.domains, &world.trigger_ctx) {
+        devmode.push_str(&format!(
+            "  inert: {}\n",
+            crate::domain::matcher::fault_sentence(domain, trigger, &fault)
+        ));
+    }
+    if !walk_note.is_empty() {
+        devmode.push_str(walk_note);
+    }
+    PromptBlock::new("devmode", Priority::Bracket, &devmode, 1, "block")
+}
+
+// ─── The matching, once (BO-20, K9b) ─────────────────────────
+
+/// What `collect` read for one prompt before deciding what it serves: everything [`serve`] matches against. When a
+/// shadow runs, the sink keeps it until the match-log row is written, so the candidate decides on the very same data
+/// and reads none of it again (K9d: the reading is the slow part, the matching is not).
+#[derive(Default)]
+pub struct World {
+    pub prompt: String,
+    pub domains: Vec<domain::DomainDef>,
+    /// Both tiers, merged; `None` with no graph.
+    pub store: Option<oxigraph::store::Store>,
+    /// The always-on domains' decisions with their keywords (BO-03, F5).
+    pub global: crate::domain::global_decisions::GlobalDecisions,
+    /// Rules with matchers of their own (4d).
+    pub converted: Vec<crate::domain::rules::Converted>,
+    /// The paths this session touched.
+    pub active_paths: Vec<String>,
+    pub trigger_ctx: TriggerContext,
+    /// The star commands, for the modes a domain links (Phase 28).
+    pub commands: Vec<crate::command::CommandDef>,
+    pub bracket: Bracket,
+    /// FRESH and the first two prompts: rules only, no neighbourhood.
+    pub lean: bool,
+    pub now: u64,
+    /// The rule index live scores with (BO-18): `None` under `[match] bm25 = false`, or before the first sync.
+    pub index: Option<crate::domain::score_index::ScoreIndex>,
+    /// The prompt-IDF counts live admits with (BO-20): `None` unless `[match] prompt_idf` is on with a `min_score`.
+    pub weights: Option<crate::domain::score_index::PromptWeights>,
+    /// Each domain's rules (`rules::rules_for_domain`), by name, read the first time a run asks.
+    rules: RefCell<HashMap<String, Rc<Vec<crate::domain::rules::ServedRule>>>>,
+    /// Each domain's CONTEXT: its neighbourhood, the records that served, and its query's text, by name.
+    context: RefCell<HashMap<String, Rc<DomainContext>>>,
+}
+
+/// One domain's CONTEXT as the domain loop builds it.
+#[derive(Debug, Default)]
+pub struct DomainContext {
+    /// The neighbourhood text: empty in lean mode, with no graph, or when the domain has none.
+    pub neighborhood: String,
+    /// Every record IRI the neighbourhood listed (its decisions and the rest), for the walk's dedup.
+    pub served: Vec<String>,
+    /// The domain's `query` result, empty without one.
+    pub query: String,
+}
+
+impl World {
+    /// `domain_def`'s rules, read from the graph (or its `domains.toml` copy) the first time any run asks.
+    pub fn rules_of(&self, config: &BaseConfig, domain_def: &domain::DomainDef) -> Rc<Vec<crate::domain::rules::ServedRule>> {
+        if let Some(r) = self.rules.borrow().get(&domain_def.name) {
+            return Rc::clone(r);
+        }
+        let r = Rc::new(crate::domain::rules::rules_for_domain(self.store.as_ref(), config, domain_def));
+        self.rules.borrow_mut().insert(domain_def.name.clone(), Rc::clone(&r));
+        r
+    }
+
+    /// `domain_def`'s CONTEXT, read the first time any run asks: its neighbourhood (not in lean mode), with the
+    /// always-on domain's global decisions left out (F5), and its query.
+    pub fn context_of(
+        &self,
+        config: &BaseConfig,
+        cwd: &Path,
+        domain_def: &domain::DomainDef,
+        global: &crate::domain::global_decisions::GlobalDecisions,
+    ) -> Rc<DomainContext> {
+        if let Some(c) = self.context.borrow().get(&domain_def.name) {
+            return Rc::clone(c);
+        }
+        let mut c = DomainContext::default();
+        if let (Some(store), false) = (&self.store, self.lean) {
+            let (n, served) = crate::domain::query::query_domain_neighborhood(store, config, domain_def, &|id| {
+                domain_def.is_always() && global.contains(id)
+            });
+            c.neighborhood = n;
+            c.served = served;
+        }
+        // Notes surface ONLY through explicit queries — no bulk dumps.
+        // If a domain needs notes injected, configure `query = "..."` in domains.toml
+        // pointing to a SPARQL file in queries/ that filters and shapes the output.
+        if let (Some(store), Some(query_name)) = (&self.store, &domain_def.query) {
+            let fmt = domain_def.query_format.as_deref().unwrap_or("list");
+            c.query = resolve_and_run_query(store, config, cwd, query_name, fmt, &domain_def.name);
+        }
+        let c = Rc::new(c);
+        self.context.borrow_mut().insert(domain_def.name.clone(), Rc::clone(&c));
+        c
+    }
+
+    /// Has a run read `domain_def`'s rules yet?
+    pub fn has_rules_of(&self, domain_def: &domain::DomainDef) -> bool {
+        self.rules.borrow().contains_key(&domain_def.name)
+    }
+
+    /// Has a run read `domain_def`'s CONTEXT yet?
+    pub fn has_context_of(&self, domain_def: &domain::DomainDef) -> bool {
+        self.context.borrow().contains_key(&domain_def.name)
+    }
+}
+
+/// What a run matches with, beyond the world: the domains, the rules with matchers and the global decisions as it sees
+/// them, and its edits to the rules a domain serves through its triggers. Live sees the world as it is; a shadow
+/// candidate made from proposals sees copies with the proposals' changes made (BO-20, K9a).
+pub struct View<'a> {
+    pub domains: Cow<'a, [domain::DomainDef]>,
+    pub converted: Cow<'a, [crate::domain::rules::Converted]>,
+    pub global: Cow<'a, crate::domain::global_decisions::GlobalDecisions>,
+    /// By domain name: the ids of the rules the edits take away, and the rules they add.
+    pub rule_edits: HashMap<String, (HashSet<String>, Vec<crate::domain::rules::ServedRule>)>,
+}
+
+impl<'a> View<'a> {
+    /// The world as it is.
+    pub fn live(w: &'a World) -> Self {
+        View {
+            domains: Cow::Borrowed(&w.domains),
+            converted: Cow::Borrowed(&w.converted),
+            global: Cow::Borrowed(&w.global),
+            rule_edits: HashMap::new(),
+        }
+    }
+
+    /// `domain_def`'s rules as this view serves them: the world's, with this view's edits made.
+    fn rules_of(&self, w: &World, config: &BaseConfig, domain_def: &domain::DomainDef) -> Vec<crate::domain::rules::ServedRule> {
+        let base = w.rules_of(config, domain_def);
+        match self.rule_edits.get(&domain_def.name) {
+            None => base.as_ref().clone(),
+            Some((gone, added)) => base.iter().filter(|r| !gone.contains(&r.id)).cloned().chain(added.iter().cloned()).collect(),
+        }
+    }
+}
+
+/// How a run scores: the `[match]` settings, the index it scores with and the prompt-IDF counts it admits with (BO-18;
+/// BO-20 adds the candidate's).
+pub struct Matching<'a> {
+    pub settings: &'a crate::config::MatchConfig,
+    pub index: Option<&'a crate::domain::score_index::ScoreIndex>,
+    pub weights: Option<&'a crate::domain::score_index::PromptWeights>,
+}
+
+impl<'a> Matching<'a> {
+    /// Live's: `[match]` as base.toml says, and the index and counts `collect` loaded.
+    pub fn live(config: &'a BaseConfig, w: &'a World) -> Self {
+        Matching { settings: &config.matching, index: w.index.as_ref(), weights: w.weights.as_ref() }
+    }
+}
+
+/// What [`serve`] decided for one prompt.
+#[derive(Default)]
+pub struct Served {
+    /// The blocks, in the order the hook pushes them, each marked [`PromptBlock::matcher`].
+    pub blocks: Vec<PromptBlock>,
+    /// Every record IRI the domain blocks serve: the walk dedups against it, so a record cannot arrive twice under two
+    /// headings.
+    pub domain_served: HashSet<String>,
+    /// Something fresh was built: it turns on the grounding block.
+    pub injected_any: bool,
+    /// For DEVMODE: each domain's name, why it loaded, and how many rules.
+    pub loaded_domains: Vec<(String, String, usize)>,
+    /// Domains that matched and had nothing left to say this session.
+    pub deduped_count: usize,
+    /// A domain matched by keyword, by path or by score. Otherwise only rules with matchers of their own can have
+    /// been served, and the hook takes its no-match path.
+    pub matched_any: bool,
+}
+
+/// When a shadow candidate's time is up (K9d). Live has none and is never cut short.
+pub type Deadline = Option<std::time::Instant>;
+
+/// A run that ran out of time before it was done (K9d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slow;
+
+pub(crate) fn in_time(deadline: Deadline) -> std::result::Result<(), Slow> {
+    match deadline {
+        Some(d) if std::time::Instant::now() > d => Err(Slow),
+        _ => Ok(()),
+    }
+}
+
+/// [`serve`] for live: the world as it is, `[match]` as base.toml says, no time limit.
+fn serve_live(config: &BaseConfig, cwd: &Path, world: &World, session: &SessionState, trace: &mut Trace) -> Served {
+    // `Err(Slow)` cannot happen: only a deadline ends a run early, and live has none.
+    serve(config, cwd, world, &View::live(world), &Matching::live(config, world), session, trace, None).unwrap_or_default()
+}
+
+/// What a prompt is served by its matching (K9b's one function): the domains its keywords, its session's paths and
+/// its BM25 scores bring, the rules with matchers of their own `select` serves, each matched domain's rules and
+/// CONTEXT, the rules admitted by score, the global decisions it names, and the modes the domains link. Decided against
+/// `session` and never recorded in it: the claims ride on the blocks (D15). What it matched, scored and cut goes in
+/// `trace`.
+///
+/// Live and a shadow candidate both run it, on one [`World`]: `view` and `matching` are all that differ. Past
+/// `deadline` it stops ([`Slow`]); it checks before each domain, where the reading is.
+#[allow(clippy::too_many_arguments)] // the hook's own state, passed through from `collect` and the shadow
+pub fn serve(
+    config: &BaseConfig,
+    cwd: &Path,
+    w: &World,
+    view: &View<'_>,
+    matching: &Matching<'_>,
+    session: &SessionState,
+    trace: &mut Trace,
+    deadline: Deadline,
+) -> std::result::Result<Served, Slow> {
+    let domains: &[domain::DomainDef] = &view.domains;
+    let converted: &[crate::domain::rules::Converted] = &view.converted;
+    let global: &crate::domain::global_decisions::GlobalDecisions = &view.global;
+    let converted_ids: HashSet<&str> = converted.iter().map(|c| c.rule.id.as_str()).collect();
+    let prompt = w.prompt.as_str();
+    let bracket = w.bracket;
+
+    let matched = match_domains_auto(prompt, domains, &w.active_paths, &w.trigger_ctx);
+    for dm in &matched {
+        for m in matched_entries(dm) {
+            if m.by == "keyword"
+                && let Some(kw) = &m.value
+            {
+                trace.word(kw);
+            }
+            trace.matched.push(m);
+        }
+    }
+    // BM25 (BO-18, K7): this prompt's score for every rule and global decision, and the rules no keyword or path
+    // brought whose score reaches `[match] min_score`, by domain, when one is set. With no index, or `[match] bm25 =
+    // false`, there is no scoring and the prompt is served keyword-only, as before.
+    let scoring = score(matching, prompt, trace);
+    let admitted = scoring
+        .as_ref()
+        .map(|s| admitted_by_score(s, matching, prompt, domains, &matched, &converted_ids))
+        .unwrap_or_default();
+    for a in &admitted {
+        trace.matched.push(Matched::new(&a.domain.name, "score", Some(format!("{:.2}", a.best))));
+        for t in &a.terms {
+            trace.word(t);
+        }
+    }
+    let mut out = Served { matched_any: !matched.is_empty() || !admitted.is_empty(), ..Served::default() };
+    let matcher = matcher_blocks(config, prompt, session, bracket, converted, domains, scoring.as_ref(), trace);
+    if !out.matched_any {
+        out.blocks = matcher;
+        return Ok(marked(out));
+    }
+    // Remember whether any fresh content was injected (gates the grounding block).
+    out.injected_any = matcher.iter().any(PromptBlock::has_claims);
+    out.blocks.extend(matcher);
+
+    // Domain-linked command modes (Phase 28), one entry per command: the best priority among the domains that link
+    // it, its rendered rules, and how many. Each becomes a block of its own after the loop (BO-01).
+    let mut linked: Vec<(String, Priority, String, usize)> = Vec::new();
+    let now = w.now;
+
+    // Format and emit matched rules
+    for dm in &matched {
+        let domain_def = dm.domain;
+        if !w.has_rules_of(domain_def) || !w.has_context_of(domain_def) {
+            in_time(deadline)?;
+        }
+        let (rules_priority, context_priority) = domain_priorities(&dm.reason);
+
+        // The rules and the neighbourhood are read separately now, because they are
+        // deduped differently: the rules per RULE (F9), the neighbourhood as a block.
+        // A rule with matchers of its own left this block in 4d: it was served on them above (F1).
+        let rules: Vec<crate::domain::rules::ServedRule> = view
+            .rules_of(w, config, domain_def)
+            .into_iter()
+            .filter(|r| !converted_ids.contains(r.id.as_str()))
+            .collect();
+        // Due, not claimed (D15): `commit` records each rule only if this domain's rules block is printed.
+        let mut fresh: Vec<(usize, &crate::domain::rules::ServedRule)> = rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                session.rule_due(&r.id, r.content_hash, bracket, None, ReShow::PerSession { on_tier_change: true }, now)
+            })
+            .collect();
+        // Best first when the prompt was scored (BO-18, K7d), today's order breaking ties; each rule keeps its number.
+        if let Some(s) = &scoring {
+            fresh.sort_by(|a, b| s.scores.get(&b.1.id).total_cmp(&s.scores.get(&a.1.id)));
+        }
+        // What this prompt serves, so the walk still resolves a rule this block held
+        // back and does not list again one it serves.
+        out.domain_served.extend(fresh.iter().filter_map(|(_, r)| r.iri.clone()));
+        // D13: a domain that came only as a nested parent says whose parent it is, as the tool hook's block does.
+        let label = match &dm.parent_of {
+            Some(child) => format!("{} (parent of {child})", domain_def.name),
+            None => domain_def.name.clone(),
+        };
+        let rules_text = crate::domain::rules::render_block_as("DOMAIN", &label, &fresh, rules.len(), &domain_def.name);
+
+        // An always-on domain's CONTEXT block named the domain as served whenever it listed decisions, so the walk
+        // never listed the domain itself. Its decisions now have their own block and the CONTEXT is often empty, so
+        // the domain is marked here, in lean mode too: the walk would otherwise add "domain GLOBAL" to blocks that
+        // reach it (measured on the BO-03 replay, 5 of 300 prompts).
+        if domain_def.is_always() {
+            out.domain_served.insert(domain_walk_key(config, domain_def));
+        }
+        let context = w.context_of(config, cwd, domain_def, global);
+        // The decisions the CONTEXT block lists, for the match log (K1).
+        let mut context_decisions: Vec<Item> = Vec::new();
+        if !context.neighborhood.is_empty() {
+            context_decisions = context
+                .served
+                .iter()
+                .filter(|iri| crate::emit::match_log::is_decision(iri))
+                .map(|iri| Item::decision(iri, Some(&domain_def.name)))
+                .collect();
+        }
+        out.domain_served.extend(context.served.iter().cloned());
+        let neighborhood_text = context.neighborhood.as_str();
+
+        // ─── Steering layer (v0.4): role / linked commands / output-mode / format ───
+        // Role (Phase 29): first line of the domain block.
+        let role_line = domain_def.role.as_deref().map(str::trim).filter(|r| !r.is_empty());
+
+        // Domain-linked command rules (Phase 28). Explicit *commands short-circuit
+        // before domain matching, so this path only fires when no explicit star was
+        // typed. BO-01: a linked mode is no longer folded into the first domain's
+        // block. Two domains of different priorities can link one mode, and the
+        // budget can drop the one that carried it while keeping the other, so the
+        // mode is one block, at the better of the two priorities.
+        if command_activation_fires(&domain_def.command_activation, &dm.reason) {
+            for cmd_name in &domain_def.commands {
+                if let Some(cmd) = w.commands.iter().find(|c| c.name.eq_ignore_ascii_case(cmd_name)) {
+                    let rendered = crate::command::format_command_output(cmd);
+                    if rendered.is_empty() {
+                        continue;
+                    }
+                    let key = cmd.name.to_lowercase();
+                    match linked.iter_mut().find(|(k, ..)| *k == key) {
+                        Some(entry) => entry.1 = entry.1.min(rules_priority),
+                        None => linked.push((key, rules_priority, rendered, cmd.rules.len())),
+                    }
+                }
+            }
+        }
+
+        // Output mode (Phase 31) + format directive (Phase 32).
+        let output_mode_line = output_mode_directive(domain_def.output_mode.as_deref());
+        let format_line = domain_def.format.as_deref().map(str::trim).filter(|f| !f.is_empty());
+
+        let query_text = context.query.as_str();
+
+        // TWO PARTS, DEDUPED AND RANKED APART (BO-01). The rules were deduped one at
+        // a time above. The steering lines and the CONTEXT were one block hash until
+        // BO-01, and they are two now, each recorded only when its own block is
+        // printed: a context the budget keeps dropping stays due, and the steering
+        // lines that did print are not sent again with it on every prompt.
+        //
+        // Hash over SORTED lines: SPARQL result order shifts when the graph file is
+        // rewritten (post-tool-use fires on every edit), and an order-sensitive hash
+        // would re-inject unchanged content every prompt.
+        let sorted_hash = |text: &str| {
+            let mut lines: Vec<String> = text.lines().map(String::from).collect();
+            lines.sort();
+            rules_hash(&lines)
+        };
+        let steering: Vec<&str> = [role_line, output_mode_line, format_line].into_iter().flatten().collect();
+        let steering_hash = sorted_hash(&steering.join("\n"));
+        let steering_due = !steering.is_empty() && !session.is_injected(&domain_def.name, steering_hash);
+        let context_text: String = [neighborhood_text, query_text]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let context_key = format!("context:{}", domain_def.name);
+        let context_hash = sorted_hash(&context_text);
+        let context_due = !context_text.is_empty() && !session.is_injected(&context_key, context_hash);
+        let injected_rule_count = fresh.len();
+
+        // Nothing due. A domain that HAS rules and had every one of them already served
+        // this session is not "contributes nothing": it is a dedup, and it has to be
+        // COUNTED as one, or it drops out of `HookEventData::suppressed` and the
+        // devmode dedup list and reads as a domain that never matched
+        // (`graph_injection_test::dedup_skips_unchanged_graph_injection`). A domain
+        // with nothing at all to say (no rules, a query that returned nothing) is
+        // neither injected nor a dedup, and no longer turns on the grounding block.
+        if rules_text.is_empty() && !steering_due && !context_due {
+            if !rules.is_empty() || !steering.is_empty() || !context_text.is_empty() {
+                out.deduped_count += 1;
+                let dedup_reason = if config.devmode.enabled {
+                    format!("dedup [{}]", dm.reason)
+                } else {
+                    "dedup".into()
+                };
+                out.loaded_domains.push((domain_def.name.clone(), dedup_reason, injected_rule_count));
+            }
+            continue;
+        }
+
+        // Use the actual match reason from the matcher (only meaningful in DEVMODE)
+        let match_reason = if config.devmode.enabled {
+            match &dm.path {
+                Some(p) => format!("{} ({p})", dm.reason),
+                None => format!("{}", dm.reason),
+            }
+        } else if domain_def.is_always() {
+            "always_on".to_string()
+        } else {
+            "matched".to_string()
+        };
+        out.loaded_domains.push((
+            domain_def.name.clone(),
+            match_reason,
+            injected_rule_count,
+        ));
+
+        // The rules block: the steering lines ride with fresh rules, as they always
+        // did, and alone when they changed. A domain matched to the prompt puts its
+        // rules at 1 and its context at 2; an always-on domain puts both at 4 (F2).
+        let slug = crate::crud::slugify(&domain_def.name);
+        let with_steering = steering_due || !rules_text.is_empty();
+        let rules_part: Vec<&str> = [
+            role_line.filter(|_| with_steering),
+            Some(rules_text.as_str()),
+            output_mode_line.filter(|_| with_steering),
+            format_line.filter(|_| with_steering),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
+        // Recorded whenever the rules block prints, steering lines or not: the domain's own key says it was served.
+        let steering_claim =
+            with_steering.then(|| Claim::Injected { key: domain_def.name.clone(), hash: steering_hash });
+        let rules_block = match (&scoring, crate::domain::rules::block_lines("DOMAIN", &label, &fresh, rules.len(), &domain_def.name)) {
+            // Scored (BO-18): one part per rule, best first, so the budget withholds the weakest first (K7d). The role
+            // line rides with the header, the output-mode and format lines with the tail.
+            (Some(s), Some(lines)) => {
+                let head = lines_of([role_line, Some(lines.header.as_str())]);
+                let tail = lines_of([lines.tail.as_deref(), output_mode_line, format_line]);
+                let parts = fresh.iter().zip(&lines.rules).map(|((_, r), line)| rule_part(line, r, &domain_def.name, s, None)).collect();
+                PromptBlock::ranked(format!("{slug}-rules"), rules_priority, &head, parts, &tail, "rule").with_claims(steering_claim)
+            }
+            _ => PromptBlock::new(format!("{slug}-rules"), rules_priority, &rules_part.join("\n"), fresh.len(), "rule")
+                .with_claims(fresh.iter().map(|(_, r)| Claim::Rule {
+                    id: r.id.clone(),
+                    content: r.content_hash,
+                    scope: None,
+                }))
+                .with_claims(steering_claim)
+                .with_logged(fresh.iter().map(|(_, r)| Item::rule(&r.id, &domain_def.name))),
+        };
+        out.injected_any |= !rules_block.text.is_empty();
+        out.blocks.push(rules_block);
+        if context_due {
+            out.blocks.push(
+                PromptBlock::new(format!("{slug}-context"), context_priority, &context_text, count_records(&context_text), "record")
+                    .with_claims([Claim::Injected { key: context_key, hash: context_hash }])
+                    .with_logged(context_decisions),
+            );
+            out.injected_any = true;
+        }
+    }
+
+    // K7d (BO-18): the rules no keyword or path brought whose score reached `[match] min_score`, each domain's in its
+    // own `[DOMAIN: …]` block at priority 1, best first. Only the rules: the domain's context, steering lines and linked
+    // modes still need a keyword or a path.
+    if let Some(s) = &scoring {
+        for a in &admitted {
+            let domain_def = a.domain;
+            if !w.has_rules_of(domain_def) {
+                in_time(deadline)?;
+            }
+            let rules: Vec<crate::domain::rules::ServedRule> = view
+                .rules_of(w, config, domain_def)
+                .into_iter()
+                .filter(|r| a.ids.contains(&r.id))
+                .collect();
+            let mut fresh: Vec<(usize, &crate::domain::rules::ServedRule)> = rules
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    session.rule_due(&r.id, r.content_hash, bracket, None, ReShow::PerSession { on_tier_change: true }, now)
+                })
+                .collect();
+            fresh.sort_by(|x, y| s.scores.get(&y.1.id).total_cmp(&s.scores.get(&x.1.id)));
+            out.domain_served.extend(fresh.iter().filter_map(|(_, r)| r.iri.clone()));
+            let Some(lines) = crate::domain::rules::block_lines("DOMAIN", &domain_def.name, &fresh, rules.len(), &domain_def.name)
+            else {
+                continue;
+            };
+            let parts = fresh
+                .iter()
+                .zip(&lines.rules)
+                .map(|((_, r), line)| rule_part(line, r, &domain_def.name, s, Some("score")))
+                .collect();
+            let slug = crate::crud::slugify(&domain_def.name);
+            let block = PromptBlock::ranked(format!("{slug}-rules"), Priority::Matched, &lines.header, parts, lines.tail.as_deref().unwrap_or(""), "rule");
+            out.injected_any |= !block.text.is_empty();
+            out.loaded_domains.push((domain_def.name.clone(), "score".to_string(), fresh.len()));
+            out.blocks.push(block);
+        }
+    }
+
+    // F5: the global decisions this prompt names by keyword, each once per session (and again after a DEPLETED or
+    // CRITICAL force-refresh, as CONTEXT is) and recorded only if printed (D15), at priority 4 with the rest of the
+    // always-on layer. Not held back in lean mode: unlike the
+    // neighbourhood, a keyword is a direct match to what the prompt is about. A decision another domain's
+    // CONTEXT already printed on this prompt is not listed twice.
+    let (decisions_text, listed) = global.prompt_block(prompt, &|d| {
+        let (key, hash) = d.claim_key();
+        session.is_injected(&key, hash) || out.domain_served.contains(&d.id)
+    });
+    if !listed.is_empty() {
+        out.domain_served.extend(listed.iter().map(|d| d.id.clone()));
+        match &scoring {
+            // Scored (BO-18): ranked like the rules, admitted only by their keywords as before (F5, lynx's G0 Q4). One
+            // block per always-on domain, so each keeps its header over its own decisions.
+            Some(s) => {
+                let mut by_domain: Vec<(&str, Vec<&crate::domain::global_decisions::GlobalDecision>)> = Vec::new();
+                for d in &listed {
+                    match by_domain.iter_mut().find(|(name, _)| *name == d.domain) {
+                        Some((_, list)) => list.push(d),
+                        None => by_domain.push((&d.domain, vec![*d])),
+                    }
+                }
+                for (domain, mut list) in by_domain {
+                    list.sort_by(|a, b| s.scores.get(&b.id).total_cmp(&s.scores.get(&a.id)));
+                    let head = format!("[{domain} CONTEXT · decisions matched by keyword]");
+                    let parts = list
+                        .iter()
+                        .map(|d| {
+                            let score = s.scores.get(&d.id);
+                            let (key, hash) = d.claim_key();
+                            BlockPart::new(&format!("  - Decision: {}", d.name), score)
+                                .with_claims([Claim::Injected { key, hash }])
+                                .with_logged([Item { score: (score > 0.0).then_some(score), ..Item::decision(&d.id, Some(&d.domain)) }])
+                        })
+                        .collect();
+                    out.blocks.push(PromptBlock::ranked("global-decisions", Priority::Global, &head, parts, "", "decision"));
+                }
+            }
+            None => out.blocks.push(
+                PromptBlock::new("global-decisions", Priority::Global, &decisions_text, listed.len(), "decision")
+                    .with_claims(listed.iter().map(|d| {
+                        let (key, hash) = d.claim_key();
+                        Claim::Injected { key, hash }
+                    }))
+                    .with_logged(listed.iter().map(|d| Item::decision(&d.id, Some(&d.domain)))),
+            ),
+        }
+        out.injected_any = true;
+    }
+
+    // The linked command modes, each once per session per text, recorded only if printed (D15).
+    for (key, priority, text, rules) in linked {
+        let claim_key = format!("command:{key}");
+        let hash = rules_hash(std::slice::from_ref(&text));
+        if session.is_injected(&claim_key, hash) {
+            continue;
+        }
+        out.blocks.push(
+            PromptBlock::new(format!("command-{}", crate::crud::slugify(&key)), priority, &text, rules, "rule")
+                .with_claims([Claim::Injected { key: claim_key, hash }])
+                .with_logged([Item::of_kind(&key, "command")]),
+        );
+        out.injected_any = true;
+    }
+    Ok(marked(out))
+}
+
+/// Every block `serve` built, marked as the matching's: a shadow candidate's fit swaps exactly these (BO-20).
+fn marked(mut out: Served) -> Served {
+    for b in &mut out.blocks {
+        b.matcher = true;
+    }
+    out
 }
 
 /// The match log's entries for one matched domain (K1): `always`; one per keyword that hit; and, for a path this
@@ -1012,17 +1263,36 @@ pub(crate) struct Scoring {
     pub(crate) min_score: Option<f32>,
 }
 
-/// Score the prompt against the index the last sync counted (K7e: loaded here, never counted here). `None` when
-/// `[match] bm25 = false`, or when no index has been built yet; the match log then says `index: missing`. Either way the
-/// prompt is served keyword-only, byte for byte as before BO-18. Every score above zero goes in the match log (K7f).
-fn load_scoring(config: &BaseConfig, base_dir: Option<&Path>, prompt: &str, trace: &mut Trace) -> Option<Scoring> {
+/// The rule index the last sync counted (K7e: loaded here, never counted here), when `[match] bm25` is on; `None`
+/// otherwise, and before the first sync.
+fn load_index(config: &BaseConfig, base_dir: Option<&Path>) -> Option<crate::domain::score_index::ScoreIndex> {
     if !config.matching.bm25 {
         return None;
     }
-    let index = base_dir.and_then(crate::domain::score_index::ScoreIndex::load);
-    trace.index = Some(if index.is_some() { "ok" } else { "missing" }.to_string());
-    let index = index?;
-    trace.min_score = config.matching.min_score;
+    base_dir.and_then(crate::domain::score_index::ScoreIndex::load)
+}
+
+/// The prompt-IDF counts live admits with (BO-20), when `[match] prompt_idf` is on and a `min_score` makes admission
+/// possible; `None` otherwise, and while none were counted (`[log] prompt_text` keeps no whole prompt): prompt IDF then
+/// acts as off.
+fn load_weights(config: &BaseConfig, base_dir: Option<&Path>) -> Option<crate::domain::score_index::PromptWeights> {
+    let m = &config.matching;
+    if !(m.bm25 && m.prompt_idf && m.min_score.is_some()) {
+        return None;
+    }
+    base_dir.and_then(crate::domain::score_index::PromptWeights::load)
+}
+
+/// Score the prompt with `matching`'s index (BO-18, K7c). `None` when `[match] bm25 = false`, or when no index has been
+/// built yet; the match log then says `index: missing`. Either way the prompt is served keyword-only, byte for byte as
+/// before BO-18. Every score above zero goes in the match log (K7f).
+pub(crate) fn score(matching: &Matching<'_>, prompt: &str, trace: &mut Trace) -> Option<Scoring> {
+    if !matching.settings.bm25 {
+        return None;
+    }
+    trace.index = Some(if matching.index.is_some() { "ok" } else { "missing" }.to_string());
+    let index = matching.index?;
+    trace.min_score = matching.settings.min_score;
     let scores = index.scores(prompt);
     for s in &scores.ranked {
         let id = match s.doc.kind {
@@ -1031,7 +1301,7 @@ fn load_scoring(config: &BaseConfig, base_dir: Option<&Path>, prompt: &str, trac
         };
         trace.scores.push(Score { id, domain: s.doc.domain.clone(), score: s.score, by: "bm25".into() });
     }
-    Some(Scoring { scores, min_score: config.matching.min_score })
+    Some(Scoring { scores, min_score: matching.settings.min_score })
 }
 
 /// A domain no keyword or path brought, with its rules whose BM25 score reached `[match] min_score` (K7d).
@@ -1048,8 +1318,14 @@ struct Admitted<'a> {
 /// `[match] min_score` is unset (lynx's Q7 ruling). A domain that is always-on, has `auto_inject = false`, matched
 /// already, or is vetoed by one of its `exclude` patterns admits nothing; a rule with matchers of its own is judged by
 /// `select` instead.
+///
+/// BO-20's three admission fixes only narrow `min_score` (`[match] min_terms`, `relative`, `prompt_idf`): a rule must
+/// also share enough distinct terms or a two-word term, reach its share of the prompt's best rule score, and reach
+/// `min_score` again with each term weighed down by how common it is in the user's own prompts. At their defaults they
+/// turn nothing away.
 fn admitted_by_score<'a>(
     scoring: &Scoring,
+    matching: &Matching<'_>,
     prompt: &str,
     domains: &'a [domain::DomainDef],
     matched: &[crate::domain::matcher::DomainMatch<'_>],
@@ -1058,10 +1334,21 @@ fn admitted_by_score<'a>(
     if scoring.min_score.is_none() {
         return Vec::new();
     }
+    let settings = matching.settings;
+    let best_rule = scoring.scores.ranked.iter().find(|s| s.doc.kind == DocKind::Rule).map_or(0.0, |s| s.score);
+    let weights = matching.weights.filter(|_| settings.prompt_idf);
     let lower = prompt.to_lowercase();
     let mut out: Vec<Admitted<'a>> = Vec::new();
     for s in scoring.scores.ranked.iter().filter(|s| s.doc.kind == DocKind::Rule && crate::config::reaches(scoring.min_score, s.score)) {
         if converted.contains(s.doc.id.as_str()) {
+            continue;
+        }
+        if !enough_terms(&s.terms, settings.min_terms) || settings.relative.is_some_and(|r| s.score < r * best_rule) {
+            continue;
+        }
+        if let (Some(w), Some(index)) = (weights, matching.index)
+            && !crate::config::reaches(scoring.min_score, index.weighted_score(&s.doc.id, prompt, w))
+        {
             continue;
         }
         let Some(d) = domains.iter().find(|d| d.name == s.doc.domain) else { continue };
@@ -1086,6 +1373,12 @@ fn admitted_by_score<'a>(
         }
     }
     out
+}
+
+/// `[match] min_terms` (BO-20): a rule shares at least `n` distinct one-word terms with the prompt, or any two-word
+/// term (`bm25::terms` makes `"prompt submit"` of neighbouring words).
+fn enough_terms(terms: &[String], n: usize) -> bool {
+    n <= 1 || terms.iter().any(|t| t.contains(' ')) || terms.iter().filter(|t| !t.contains(' ')).count() >= n
 }
 
 /// One rule as a part of a ranked block (BO-18): its line, its score, its claim (D15) and its match-log item, with

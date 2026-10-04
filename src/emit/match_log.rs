@@ -219,6 +219,7 @@ pub fn signal_row(session: Option<&str>, prompt_num: Option<u32>, signals: Vec<S
         signals,
         index: None,
         min_score: None,
+        shadow: None,
     }
 }
 
@@ -293,6 +294,45 @@ pub struct Row {
     /// On a prompt row scored with BM25: the `[match] min_score` in force, so a later tune knows the threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_score: Option<f32>,
+    /// While a shadow runs (BO-20, K9b): what the candidate would have served instead. Absent on every row when none
+    /// runs, so a row reads as it did before BO-20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<Shadow>,
+}
+
+/// What a shadow candidate would have served on one event (BO-20, K9b): only how its pick differs from live's, as ids.
+/// Equal picks write `{"candidate": "bm25-0003", "ms": 4}`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Shadow {
+    /// The candidate's version name.
+    pub candidate: String,
+    /// Rules and decisions the candidate would have printed and live did not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adds: Vec<String>,
+    /// Rules and decisions live printed and the candidate would not have.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drops: Vec<String>,
+    /// `slow`: the run passed `[shadow] max_ms` and was stopped, so nothing is known of its pick (K9d).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+    /// How long the candidate ran, in milliseconds.
+    pub ms: u64,
+}
+
+/// The BM25 scores a prompt row keeps, best first (lynx's Q7 ruling on BO-20): a threshold only ever admits from the
+/// top, and every served or cut item carries its own score. The full list made the median prompt row 7,462 bytes.
+pub const BM25_SCORES_KEPT: usize = 20;
+
+/// `scores` with every topic score and the [`BM25_SCORES_KEPT`] best BM25 scores, in their order.
+fn kept_scores(scores: Vec<Score>) -> Vec<Score> {
+    if scores.iter().filter(|s| s.by == "bm25").count() <= BM25_SCORES_KEPT {
+        return scores;
+    }
+    // The BM25 entries best first, a tie going to the earlier one; the first BM25_SCORES_KEPT stay where they were.
+    let mut order: Vec<usize> = (0..scores.len()).filter(|&i| scores[i].by == "bm25").collect();
+    order.sort_by(|&a, &b| scores[b].score.total_cmp(&scores[a].score).then(a.cmp(&b)));
+    let keep: std::collections::HashSet<usize> = order.into_iter().take(BM25_SCORES_KEPT).collect();
+    scores.into_iter().enumerate().filter(|(i, s)| s.by != "bm25" || keep.contains(i)).map(|(_, s)| s).collect()
 }
 
 fn now() -> String {
@@ -337,10 +377,11 @@ pub fn prompt_row(
         matched: scrubbed(trace.matched),
         served,
         cut,
-        scores: trace.scores,
+        scores: kept_scores(trace.scores),
         signals: Vec::new(),
         index: trace.index,
         min_score: trace.min_score,
+        shadow: None,
     }
 }
 
@@ -354,13 +395,17 @@ fn scrubbed(mut matched: Vec<Matched>) -> Vec<Matched> {
     matched
 }
 
-/// A tool call's row, or `None` when it touched no path and served nothing: such a call is not a file touch.
-pub fn file_row(trace: Trace, session: Option<&str>) -> Option<Row> {
-    if trace.paths.is_empty() && trace.served.is_empty() {
-        return None;
-    }
+/// A tool call that touched no path and served nothing: not a file touch, so it writes no row (unless a shadow candidate
+/// would have served something on it, BO-20).
+pub fn quiet_call(trace: &Trace) -> bool {
+    trace.paths.is_empty() && trace.served.is_empty()
+}
+
+/// A tool call's row. The tool hook writes it for a file touch, and for a [`quiet_call`] only when a shadow candidate
+/// would have served something on it.
+pub fn tool_row(trace: Trace, session: Option<&str>) -> Row {
     let paths: Vec<String> = trace.paths.iter().map(|p| crate::scrub::scrub(p)).collect();
-    Some(Row {
+    Row {
         ts: now(),
         session: session.map(String::from),
         event: "file".into(),
@@ -376,7 +421,8 @@ pub fn file_row(trace: Trace, session: Option<&str>) -> Option<Row> {
         signals: Vec::new(),
         index: None,
         min_score: None,
-    })
+        shadow: None,
+    }
 }
 
 /// Append `row` to `dir`'s [`FILE`] as one line in one write. A failure comes back naming the path; never a panic.
@@ -836,6 +882,7 @@ mod tests {
                 signals: Vec::new(),
                 index: None,
                 min_score: None,
+                shadow: None,
             };
             format!("{}\n", serde_json::to_string(&r).unwrap())
         };
@@ -854,6 +901,21 @@ mod tests {
         let first = last_rows(dir.path(), 5, &Filter { rule: Some("r00000".into()), ..Filter::default() }).unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].session.as_deref(), Some("s00000"));
+    }
+
+    /// Lynx's Q7 ruling on BO-20: a prompt row keeps its 20 best BM25 scores and every topic score.
+    #[test]
+    fn a_row_keeps_the_best_bm25_scores_and_every_topic_score() {
+        let score = |id: &str, s: f32, by: &str| Score { id: id.into(), domain: "d".into(), score: s, by: by.into() };
+        let mut scores: Vec<Score> = (0..30).map(|i| score(&format!("r{i:02}"), i as f32, "bm25")).collect();
+        scores.insert(3, score("t1", 0.5, "topic"));
+        let kept = kept_scores(scores);
+        let bm25: Vec<&Score> = kept.iter().filter(|s| s.by == "bm25").collect();
+        assert_eq!(bm25.len(), BM25_SCORES_KEPT);
+        assert!(bm25.iter().all(|s| s.score >= 10.0), "the best twenty: {bm25:?}");
+        assert!(kept.iter().any(|s| s.id == "t1"), "a topic score stays");
+        let few: Vec<Score> = (0..5).map(|i| score(&format!("r{i}"), i as f32, "bm25")).collect();
+        assert_eq!(kept_scores(few.clone()), few, "under the limit nothing goes");
     }
 
     #[test]

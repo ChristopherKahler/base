@@ -121,6 +121,13 @@ base rule propose --from-turn [--text "..."] [--keywords "a, b"] [--example "<pr
 base rule replay <p-NNNN> | --domain X | --rule <domain>.<id> | --decision <slug> [--add-keyword "..."] [--drop-keyword "..."]   # run a change over your recent prompts: which start or stop serving it, its share, TOO BROAD over [tune] broad_share
 base rule review [--approve <id> [--broad-ok]] [--reject <id> [--reason "..."]] [--edit <id> --text "..." --keywords "a, b"]   # the pending proposals with their replays; one key each on a terminal (a, e, r, s, q), or one flag
 base rule unretire <domain>.<id>   # serve a retired rule again: undoes an approved retire proposal (a retired rule is marked, never deleted)
+base rule update <domain>.<id> --protected | --unprotected   # mark a rule protected: a shadow candidate that loses it is never promoted automatically
+base shadow start --matcher bm25 | keyword-only [--min-score X] [--prompt-idf] [--min-terms N] [--relative R]   # run a candidate matcher beside live on every prompt and file touch; only live's pick is served
+base shadow start --from-proposals p-0001,p-0002   # run pending proposals as the candidate, applied in memory; nothing is written until promotion
+base shadow report [--json]   # the candidate against live since it started: where they differ, wins, losses, and whether it can be promoted
+base shadow promote [<version>] [--broad-ok]   # make the candidate live now (writes [match] in ~/.base-gbl/base.toml, or approves its proposals), or a named version again
+base shadow rollback   # undo the last promotion: the version live had before is restored
+base shadow stop   # end the candidate without promoting it; live is unchanged and its rows stay
 base tune [--session <id>] [--transcript <path>] [--store] [--max-calls <n>]   # the rule pass: Haiku judges the sessions since the last pass and writes proposals for base rule review; applies nothing; --session/--transcript repeatable, --max-calls 10 by default
 base rule remove --domain X --index <N>   # by INDEX, not by text; get N from `base rule list --domain X`
 ```

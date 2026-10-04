@@ -22,16 +22,17 @@ pub fn handle(
     cwd: &Path,
     event: &serde_json::Value,
 ) -> Result<(super::HookEventData, String)> {
-    handle_traced(config, cwd, event).map(|(data, context, _)| (data, context))
+    handle_traced(config, cwd, event).map(|(data, context, _, _)| (data, context))
 }
 
 /// [`handle`], and what the call matched and served, for the match log (K1, BO-13): the touched paths, each domain
 /// they brought in and by what, and every rule printed. The dispatcher writes the row after the output is printed.
+/// While a shadow runs (BO-20), also what the candidate decides on, which the dispatcher hands it after the print.
 pub fn handle_traced(
     config: &BaseConfig,
     cwd: &Path,
     event: &serde_json::Value,
-) -> Result<(super::HookEventData, String, Trace)> {
+) -> Result<(super::HookEventData, String, Trace, Option<FileKept>)> {
     let mut output = String::new();
     let mut data = super::HookEventData::default();
     let mut trace = Trace { tool: event.get("tool_name").and_then(|v| v.as_str()).map(String::from), ..Trace::default() };
@@ -127,49 +128,40 @@ pub fn handle_traced(
         event.get("session_id").and_then(|v| v.as_str()),
     );
 
-    // ─── Rules with matchers of their own (F4, F5; A2, A3) ──
-    // Every tool call reaches this, not only one that names a file: a Bash, PowerShell or MCP call carries no
-    // `file_path`, and that is where action rules fire (A3). Place rules match the tool's file path and every
-    // path its command names (F4). A rule with matchers of its own is served here and never through its domain's
-    // trigger (F1); a rule with none stays on the domain path below, exactly as before (K4, `auk`'s HARD RULE).
+    // ─── Rule serving: rules with matchers of their own, and the touched file's project ──
+    // One function, `serve_file` (BO-20, K9b), so a shadow candidate decides exactly as live does. What it read is kept
+    // in a `FileWorld`, and the candidate runs on it after the print, on the session as it was before this call.
     let converted = domain::rules::rules_with_matchers(graph_store.as_ref(), config, &domains);
-    let converted_ids: HashSet<&str> = converted.iter().map(|c| c.rule.id.as_str()).collect();
-    if !converted.is_empty() {
-        let tool = event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-        let command = tool_command(event);
-        let home = crate::home::home_root();
-        let home_str = home.as_ref().map(|h| h.display().to_string());
-        // The touched paths (P1), plus every path-shaped word of the command whether it exists or not, which is what
-        // a place rule matched on before 0.16.0.
-        let mut paths: Vec<String> = named.clone();
-        if let Some(cmd) = command {
-            for p in crate::hook::automap::bash_paths(cmd, cwd, home.as_deref()) {
-                if let Some(s) = p.to_str()
-                    && !paths.iter().any(|x| x == s)
-                {
-                    paths.push(s.to_string());
-                }
-            }
-        }
-        let keywords = HashMap::new();
-        let cx = domain::rules::SelectContext {
-            bracket: tier,
-            now: SessionState::now_secs(),
-            home: home_str.as_deref(),
-            keywords: &keywords,
-            rules: &config.rules,
-            bm25: None,
-        };
-        let rule_event = domain::rules::Event::PreTool { tool, paths: &paths, command };
-        let selection = domain::rules::select(&converted, &rule_event, &mut session, &cx);
-        if !selection.served.is_empty() {
-            output.push_str(&domain::rules::render_selection(&selection));
-            data.rules_injected += selection.served.len();
-            session_dirty = true;
-        }
-        trace.served.extend(domain::rules::served_items(&selection.served));
-        trace.cut.extend(domain::rules::cut_items(&selection));
+    let trigger_ctx = (!touched.is_empty()).then(|| domain::matcher::TriggerContext {
+        home: crate::home::home_root().map(|h| h.display().to_string()),
+        registered: graph_store
+            .as_ref()
+            .map(|s| domain::registered_projects(s, &config.namespace, cwd))
+            .unwrap_or_default(),
+    });
+    let world = FileWorld {
+        store: graph_store,
+        domains,
+        converted,
+        tier,
+        tool: event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        command: tool_command(event).map(String::from),
+        cwd: cwd.to_path_buf(),
+        named: named.clone(),
+        touched: touched.clone(),
+        trigger_ctx,
+        rules: Default::default(),
+    };
+    let shadow = crate::shadow::active();
+    let shadow_session = shadow.as_ref().map(|_| session.clone());
+    let served = serve_file(config, &world, &FileView::live(&world), &mut session, None).unwrap_or_default();
+    if served.select_count > 0 {
+        output.push_str(&served.select_text);
+        data.rules_injected += served.select_count;
+        session_dirty = true;
     }
+    trace.served.extend(served.select_served.iter().cloned());
+    trace.cut.extend(served.select_cut.iter().cloned());
 
     if !file_paths.is_empty() {
         // Track apps whose files are being edited this turn so the Stop hook can
@@ -203,77 +195,22 @@ pub fn handle_traced(
     }
 
     // ─── Domain rule injection: the touched file's project (P2, D13) ─────
-    if !touched.is_empty() {
-        let trigger_ctx = domain::matcher::TriggerContext {
-            home: crate::home::home_root().map(|h| h.display().to_string()),
-            registered: graph_store
-                .as_ref()
-                .map(|s| domain::registered_projects(s, &config.namespace, cwd))
-                .unwrap_or_default(),
-        };
-        let matched = match_by_file(&domains, &touched, &named, &trigger_ctx);
-        trace.matched.extend(matched.iter().map(|m| m.logged.clone()));
-
-        for FileMatch { domain: domain_def, parent_of, .. } in &matched {
-            // Read the rules FIRST, then key the dedup on what came back.
-            //
-            // Until 0.16.0 this was the other way round: the key was
-            // `rules_hash(&domain_def.rendered_rules())`, which renders the TOML,
-            // and the payload was `query_rules_from_graph`, which reads the graph.
-            // A domain whose rules live only in the graph — which is every domain
-            // whose rules were added with `base rule add` — has an EMPTY
-            // `rendered_rules()`, so its key was a constant. The first tool call
-            // injected and marked it; every later call in that session computed the
-            // same constant and was suppressed, however the rules had changed. The
-            // reverse cost the other way: a domains.toml edit changed the key and
-            // re-injected text the reader had already seen.
-            //
-            // Reading before deciding costs one query on a domain that turns out to
-            // be deduped. That is the price of a key that describes the payload, and
-            // the defect it removes is a rule the operator added never arriving.
-            // A rule with matchers of its own left this path in 4d: it was served on them above (F1).
-            let rules: Vec<domain::rules::ServedRule> =
-                domain::rules::rules_for_domain(graph_store.as_ref(), config, domain_def)
-                    .into_iter()
-                    .filter(|r| !converted_ids.contains(r.id.as_str()))
-                    .collect();
-
-            // Dedup per RULE, not per domain block (F9). Before this the whole block
-            // was one unit, so adding a single rule to a seventeen-rule domain handed
-            // the reader all seventeen again, sixteen of which it had already been
-            // told this session. Measured live 2026-09-14: editing BASE-WORK-ORDER.md
-            // served all thirteen basemode rules, for an edit to a base work order.
-            //
-            // Scope is `None`, which means once per session and again on a tier
-            // change. Every rule left on this path has no matchers of its own, so it is
-            // serving through its domain's trigger, and K4 says an unconverted rule keeps
-            // exactly the behaviour it has today until an operator approves a conversion.
-            //
-            // `claim_rule` records as it decides, so this loop cannot claim a rule it
-            // then fails to render: everything that survives the filter is rendered.
-            let fresh: Vec<(usize, &domain::rules::ServedRule)> = rules
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| session.claim_rule(&r.id, r.content_hash, tier, None))
-                .collect();
-            if fresh.is_empty() && !rules.is_empty() {
-                data.suppressed += 1;
-                continue;
-            }
-            if !fresh.is_empty() {
-                session_dirty = true;
-            }
-            trace.served.extend(fresh.iter().map(|(_, r)| Item::rule(&r.id, &domain_def.name)));
-            // D13: a parent's block says whose parent it is.
-            let label = match parent_of {
-                Some(child) => format!("{} (parent of {child})", domain_def.name),
-                None => domain_def.name.clone(),
-            };
-            let rules_text =
-                domain::rules::render_block_as("FILE MATCH", &label, &fresh, rules.len(), &domain_def.name);
-
+    trace.matched.extend(served.matched.iter().cloned());
+    for fd in &served.domains {
+        let domain_def = &fd.def;
+        if fd.fresh.is_empty() && fd.all > 0 {
+            data.suppressed += 1;
+            continue;
+        }
+        if !fd.fresh.is_empty() {
+            session_dirty = true;
+        }
+        trace.served.extend(fd.fresh.iter().map(|(_, r)| Item::rule(&r.id, &domain_def.name)));
+        let fresh: Vec<(usize, &domain::rules::ServedRule)> = fd.fresh.iter().map(|(i, r)| (*i, r)).collect();
+        let rules_text = domain::rules::render_block_as("FILE MATCH", &fd.label, &fresh, fd.all, &domain_def.name);
+        {
             // Query-triggered injection for filepath-matched domains
-            let mut query_text = match (&graph_store, &domain_def.query) {
+            let mut query_text = match (&world.store, &domain_def.query) {
                 (Some(store), Some(query_name)) => {
                     let fmt = domain_def.query_format.as_deref().unwrap_or("list");
                     crate::domain::query::resolve_and_run_query(
@@ -379,7 +316,7 @@ pub fn handle_traced(
         // ─── PAUL context injection (file change history) ───────
         // When editing a file that has FileChange/Decision history in the
         // graph, surface the decisions and changes that shaped it.
-        if let Some(store) = &graph_store {
+        if let Some(store) = &world.store {
             for fp in &file_paths {
                 if let Some(fp_str) = fp.to_str() {
                     let paul_ctx = query_paul_context(store, config, fp_str);
@@ -437,7 +374,11 @@ pub fn handle_traced(
         }
 
     let context = output.trim_end().to_string();
-    Ok((data, context, trace))
+    // What a shadow candidate decides on after the print (BO-20): only while one runs.
+    let live: std::collections::BTreeSet<String> =
+        trace.served.iter().filter(|i| i.kind == "rule").map(|i| i.id.clone()).collect();
+    let kept = shadow.zip(shadow_session).map(|(active, session)| FileKept { active, world, session, live });
+    Ok((data, context, trace, kept))
 }
 
 /// Content-version of a file for content-keyed dedup: a hash of its bytes (0 if
@@ -475,6 +416,217 @@ fn is_source_file(path: &str) -> bool {
         ".f90", ".pas", ".sh", ".bash", ".json", ".toml", ".yaml", ".yml",
     ];
     exts.iter().any(|ext| path.ends_with(ext))
+}
+
+// ─── The rule serving, once (BO-20, K9b) ─────────────────────────
+
+/// What a tool call's rule serving reads: the store, the domains, the rules with matchers of their own, the tier, the
+/// tool and the paths. Kept while a shadow runs, so the candidate decides on the very same data after the print.
+pub struct FileWorld {
+    pub store: Option<oxigraph::store::Store>,
+    pub domains: Vec<domain::DomainDef>,
+    pub converted: Vec<domain::rules::Converted>,
+    pub tier: domain::session::Bracket,
+    pub tool: String,
+    pub command: Option<String>,
+    pub cwd: PathBuf,
+    /// Every path the call names.
+    pub named: Vec<String>,
+    /// The paths the project match reads: `named`, or the session's folder for a command that names none.
+    pub touched: Vec<String>,
+    /// `None` when the call touched nothing.
+    pub trigger_ctx: Option<domain::matcher::TriggerContext>,
+    /// Each domain's rules, read the first time a run asks.
+    pub rules: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<domain::rules::ServedRule>>>>,
+}
+
+impl FileWorld {
+    /// `d`'s rules (`rules_for_domain`), read once.
+    pub fn rules_of(&self, config: &BaseConfig, d: &domain::DomainDef) -> std::rc::Rc<Vec<domain::rules::ServedRule>> {
+        if let Some(r) = self.rules.borrow().get(&d.name) {
+            return std::rc::Rc::clone(r);
+        }
+        let r = std::rc::Rc::new(domain::rules::rules_for_domain(self.store.as_ref(), config, d));
+        self.rules.borrow_mut().insert(d.name.clone(), std::rc::Rc::clone(&r));
+        r
+    }
+}
+
+/// What a run serves with: live's domains and rules, or a proposals candidate's copies with their changes made.
+pub struct FileView<'a> {
+    pub domains: std::borrow::Cow<'a, [domain::DomainDef]>,
+    pub converted: std::borrow::Cow<'a, [domain::rules::Converted]>,
+    /// By domain name: the ids of the rules the changes take away, and the rules they add.
+    pub rule_edits: HashMap<String, (HashSet<String>, Vec<domain::rules::ServedRule>)>,
+}
+
+impl<'a> FileView<'a> {
+    pub fn live(w: &'a FileWorld) -> Self {
+        FileView {
+            domains: std::borrow::Cow::Borrowed(&w.domains),
+            converted: std::borrow::Cow::Borrowed(&w.converted),
+            rule_edits: HashMap::new(),
+        }
+    }
+}
+
+/// What a tool call's rule serving decided: `select`'s rules (rendered, logged and cut) and each matched domain's.
+#[derive(Default)]
+pub struct FileServed {
+    pub select_text: String,
+    pub select_count: usize,
+    pub select_served: Vec<Item>,
+    pub select_cut: Vec<crate::emit::match_log::Cut>,
+    pub matched: Vec<Matched>,
+    pub domains: Vec<FileDomain>,
+}
+
+impl FileServed {
+    /// The rule ids it would print.
+    pub fn printed(&self) -> std::collections::BTreeSet<String> {
+        let mut out: std::collections::BTreeSet<String> =
+            self.select_served.iter().filter(|i| i.kind == "rule").map(|i| i.id.clone()).collect();
+        out.extend(self.domains.iter().flat_map(|d| d.fresh.iter().map(|(_, r)| r.id.clone())));
+        out
+    }
+}
+
+/// One domain a tool call's paths brought in, and its rules due now.
+pub struct FileDomain {
+    pub def: domain::DomainDef,
+    /// Its name, and `(parent of <child>)` when it came as a nested parent (D13).
+    pub label: String,
+    /// The rules not yet shown this session, each with its place in the domain's list.
+    pub fresh: Vec<(usize, domain::rules::ServedRule)>,
+    /// How many rules the domain serves through its trigger.
+    pub all: usize,
+}
+
+/// What a running shadow candidate decides on after the tool hook's print (BO-20): the world, the session as it was
+/// before live's serving recorded anything in it, and the rule ids live printed.
+pub struct FileKept {
+    pub active: crate::shadow::Active,
+    pub world: FileWorld,
+    pub session: SessionState,
+    pub live: std::collections::BTreeSet<String>,
+}
+
+/// A tool call's rule serving (K9b's one function for the tool hook): the rules with matchers of their own `select`
+/// serves for this call (F4, F5; A2, A3), then the domains the touched paths bring (P2, D13), each with its rules not
+/// shown this session. Records in `session` as it decides, as `select` and `claim_rule` always have; live passes its
+/// session, a shadow candidate a copy. Past `deadline` it stops before reading a domain's rules ([`Slow`]).
+///
+/// [`Slow`]: crate::hook::user_prompt_submit::Slow
+pub fn serve_file(
+    config: &BaseConfig,
+    w: &FileWorld,
+    view: &FileView<'_>,
+    session: &mut SessionState,
+    deadline: crate::hook::user_prompt_submit::Deadline,
+) -> std::result::Result<FileServed, crate::hook::user_prompt_submit::Slow> {
+    let mut out = FileServed::default();
+    let converted: &[domain::rules::Converted] = &view.converted;
+    let converted_ids: HashSet<&str> = converted.iter().map(|c| c.rule.id.as_str()).collect();
+    // Every tool call reaches this, not only one that names a file: a Bash, PowerShell or MCP call carries no
+    // `file_path`, and that is where action rules fire (A3). Place rules match the tool's file path and every
+    // path its command names (F4). A rule with matchers of its own is served here and never through its domain's
+    // trigger (F1); a rule with none stays on the domain path below, exactly as before (K4, `auk`'s HARD RULE).
+    if !converted.is_empty() {
+        let home = crate::home::home_root();
+        let home_str = home.as_ref().map(|h| h.display().to_string());
+        // The touched paths (P1), plus every path-shaped word of the command whether it exists or not, which is what
+        // a place rule matched on before 0.16.0.
+        let mut paths: Vec<String> = w.named.clone();
+        if let Some(cmd) = w.command.as_deref() {
+            for p in crate::hook::automap::bash_paths(cmd, &w.cwd, home.as_deref()) {
+                if let Some(s) = p.to_str()
+                    && !paths.iter().any(|x| x == s)
+                {
+                    paths.push(s.to_string());
+                }
+            }
+        }
+        let keywords = HashMap::new();
+        let cx = domain::rules::SelectContext {
+            bracket: w.tier,
+            now: SessionState::now_secs(),
+            home: home_str.as_deref(),
+            keywords: &keywords,
+            rules: &config.rules,
+            bm25: None,
+        };
+        let rule_event = domain::rules::Event::PreTool { tool: &w.tool, paths: &paths, command: w.command.as_deref() };
+        let selection = domain::rules::select(converted, &rule_event, session, &cx);
+        if !selection.served.is_empty() {
+            out.select_text = domain::rules::render_selection(&selection);
+            out.select_count = selection.served.len();
+        }
+        out.select_served = domain::rules::served_items(&selection.served);
+        out.select_cut = domain::rules::cut_items(&selection);
+    }
+    let Some(trigger_ctx) = w.trigger_ctx.as_ref() else { return Ok(out) };
+    let matched = match_by_file(&view.domains, &w.touched, &w.named, trigger_ctx);
+    out.matched = matched.iter().map(|m| m.logged.clone()).collect();
+    for FileMatch { domain: domain_def, parent_of, .. } in &matched {
+        if !w.rules.borrow().contains_key(&domain_def.name) {
+            crate::hook::user_prompt_submit::in_time(deadline)?;
+        }
+        // Read the rules FIRST, then key the dedup on what came back.
+        //
+        // Until 0.16.0 this was the other way round: the key was
+        // `rules_hash(&domain_def.rendered_rules())`, which renders the TOML,
+        // and the payload was `query_rules_from_graph`, which reads the graph.
+        // A domain whose rules live only in the graph — which is every domain
+        // whose rules were added with `base rule add` — has an EMPTY
+        // `rendered_rules()`, so its key was a constant. The first tool call
+        // injected and marked it; every later call in that session computed the
+        // same constant and was suppressed, however the rules had changed. The
+        // reverse cost the other way: a domains.toml edit changed the key and
+        // re-injected text the reader had already seen.
+        //
+        // Reading before deciding costs one query on a domain that turns out to
+        // be deduped. That is the price of a key that describes the payload, and
+        // the defect it removes is a rule the operator added never arriving.
+        // A rule with matchers of its own left this path in 4d: it was served on them above (F1).
+        let base = w.rules_of(config, domain_def);
+        let rules: Vec<domain::rules::ServedRule> = match view.rule_edits.get(&domain_def.name) {
+            None => base.iter().filter(|r| !converted_ids.contains(r.id.as_str())).cloned().collect(),
+            Some((gone, added)) => base
+                .iter()
+                .filter(|r| !gone.contains(&r.id))
+                .cloned()
+                .chain(added.iter().cloned())
+                .filter(|r| !converted_ids.contains(r.id.as_str()))
+                .collect(),
+        };
+
+        // Dedup per RULE, not per domain block (F9). Before this the whole block
+        // was one unit, so adding a single rule to a seventeen-rule domain handed
+        // the reader all seventeen again, sixteen of which it had already been
+        // told this session. Measured live 2026-09-14: editing BASE-WORK-ORDER.md
+        // served all thirteen basemode rules, for an edit to a base work order.
+        //
+        // Scope is `None`, which means once per session and again on a tier
+        // change. Every rule left on this path has no matchers of its own, so it is
+        // serving through its domain's trigger, and K4 says an unconverted rule keeps
+        // exactly the behaviour it has today until an operator approves a conversion.
+        //
+        // `claim_rule` records as it decides, so this loop cannot claim a rule it
+        // then fails to render: everything that survives the filter is rendered.
+        let fresh: Vec<(usize, domain::rules::ServedRule)> = rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| session.claim_rule(&r.id, r.content_hash, w.tier, None))
+            .map(|(i, r)| (i, r.clone()))
+            .collect();
+        // D13: a parent's block says whose parent it is.
+        let label = match parent_of {
+            Some(child) => format!("{} (parent of {child})", domain_def.name),
+            None => domain_def.name.clone(),
+        };
+        out.domains.push(FileDomain { def: (*domain_def).clone(), label, fresh, all: rules.len() });
+    }
+    Ok(out)
 }
 
 /// The domains a tool call's touched paths bring in, in serving order, each with the project it is the nested parent

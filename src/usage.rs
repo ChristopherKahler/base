@@ -123,6 +123,9 @@ struct LeanRow<'a> {
     cut: Vec<LeanItem<'a>>,
     #[serde(default, borrow)]
     signals: Vec<LeanSignal<'a>>,
+    /// While a shadow ran (BO-20): what its candidate would have served instead. Read only by the shadow report.
+    #[serde(default)]
+    shadow: Option<crate::emit::match_log::Shadow>,
 }
 
 #[derive(Deserialize)]
@@ -155,6 +158,9 @@ struct LeanSignal<'a> {
     layer: Cow<'a, str>,
     #[serde(borrow)]
     kind: Cow<'a, str>,
+    /// A C3 signal's marker line, which the shadow report sorts a correction by (BO-20).
+    #[serde(default, borrow, deserialize_with = "opt_str")]
+    value: Option<Cow<'a, str>>,
 }
 
 /// An optional string, borrowed from the block where its JSON holds no escape (serde's `Option<Cow<str>>` always
@@ -260,6 +266,39 @@ pub struct Scan {
     pub decision_reach: HashMap<String, usize>,
     /// The same, per keyword.
     pub decision_hits: HashMap<String, BTreeMap<String, usize>>,
+    /// Filled only by [`scan_for_shadow`] (BO-20): what the shadow report reads.
+    pub shadow: Option<ShadowScan>,
+}
+
+/// What the shadow report reads from the log (BO-20, K9e), in log order: every typed prompt with its text, every
+/// correction with the reply it is about (lynx's Q4 mapping, [`about`]), each C3 marker line, and every row of one
+/// candidate.
+#[derive(Debug, Default, PartialEq)]
+pub struct ShadowScan {
+    /// The candidate whose rows are kept.
+    pub candidate: String,
+    /// Typed prompts: (session, prompt number, seconds since the epoch).
+    pub typed: Vec<(u32, u32, i64)>,
+    /// Their texts, by (session, prompt number).
+    pub texts: HashMap<(u32, u32), String>,
+    /// Corrections: (session, the reply they are about, seconds since the epoch of the row), once per pair.
+    pub corrections: Vec<(u32, u32, i64)>,
+    /// The C3 `UPDATED` or `CORRECTED` marker line logged on a prompt, by (session, prompt number).
+    pub markers: HashMap<(u32, u32), String>,
+    /// The candidate's rows.
+    pub events: Vec<ShadowEvent>,
+}
+
+/// One row of a running candidate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShadowEvent {
+    pub session: Option<u32>,
+    /// The prompt; for a file touch, the session's latest prompt read before it.
+    pub turn: Option<u32>,
+    pub at: i64,
+    /// `typed`, `machine` (a task notification and the like), `textless` or `file`.
+    pub kind: &'static str,
+    pub entry: crate::emit::match_log::Shadow,
 }
 
 /// What a scan compares the log against: the configuration as it is now.
@@ -433,14 +472,39 @@ pub fn scan(dirs: &[PathBuf], today: NaiveDate, window_days: u64, current: &Curr
     scan_with(dirs, today, window_days, current, Reading::from_env())
 }
 
+/// [`scan`] for the shadow report (BO-20): every row of the log, with [`Scan::shadow`] filled for `candidate`. A file
+/// last written before `since` (seconds since the epoch) holds no row from after it and is not read.
+pub fn scan_for_shadow(
+    dirs: &[PathBuf],
+    today: NaiveDate,
+    current: &Current,
+    candidate: &str,
+    reading: Reading,
+    since: Option<i64>,
+) -> Scan {
+    // Every row is in the window: the report filters by the candidate's start itself.
+    const ALL_DAYS: u64 = 100 * 366;
+    let shadow = ShadowScan { candidate: candidate.to_string(), ..ShadowScan::default() };
+    let from = since.and_then(|t| u64::try_from(t).ok()).map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t));
+    scan_into(dirs, Scan { today, window_days: ALL_DAYS, shadow: Some(shadow), ..Scan::default() }, current, reading, from)
+}
+
 /// [`scan`], read as `reading` says.
 pub fn scan_with(dirs: &[PathBuf], today: NaiveDate, window_days: u64, current: &Current, reading: Reading) -> Scan {
-    let mut out = Scan { today, window_days: window_days.max(1), ..Scan::default() };
+    scan_into(dirs, Scan { today, window_days: window_days.max(1), ..Scan::default() }, current, reading, None)
+}
+
+fn scan_into(dirs: &[PathBuf], mut out: Scan, current: &Current, reading: Reading, from: Option<std::time::SystemTime>) -> Scan {
     let mut walk = Walk::default();
     let mut buf = Vec::new();
     for (i, dir) in dirs.iter().enumerate() {
-        let ctx = Ctx { current, start: out.window_start(), own: i == 0 };
+        let ctx = Ctx { current, start: out.window_start(), own: i == 0, shadow: out.shadow.is_some() };
         for path in match_log::files(dir) {
+            if let Some(from) = from
+                && std::fs::metadata(&path).and_then(|m| m.modified()).is_ok_and(|m| m < from)
+            {
+                continue;
+            }
             each_block(&path, &mut buf, reading.block, |block| {
                 for piece in parse_block(block, &ctx, reading) {
                     if let Some(day) = piece.quiet_oldest {
@@ -532,6 +596,8 @@ struct Ctx<'c> {
     start: NaiveDate,
     /// The cwd's own tier: its rows say how old the log is.
     own: bool,
+    /// The shadow report reads: typed prompts keep their text (BO-20).
+    shadow: bool,
 }
 
 /// One piece of a block as a worker read it.
@@ -633,7 +699,9 @@ fn parse_piece<'a>(piece: &'a [u8], ctx: &Ctx) -> Piece<'a> {
         if text.is_empty() {
             continue;
         }
-        if quiet(text) {
+        // A quiet row carrying a shadow entry is read in the shadow mode: the candidate may serve where live served
+        // nothing (BO-20).
+        if quiet(text) && !(ctx.shadow && text.contains("\"shadow\":")) {
             if ctx.own && let Some(day) = ts_day(text, &mut clock) {
                 out.quiet_oldest = Some(out.quiet_oldest.map_or(day, |o| o.min(day)));
             }
@@ -662,7 +730,14 @@ fn parse_piece<'a>(piece: &'a [u8], ctx: &Ctx) -> Piece<'a> {
             match row.text.take() {
                 None => PromptKind::Textless,
                 Some(t) if crate::domain::transcript::machine_prompt(&t) => PromptKind::Machine,
-                Some(t) => PromptKind::Typed(decision_hits(&t, &row, ctx.current)),
+                Some(t) => {
+                    let hits = decision_hits(&t, &row, ctx.current);
+                    // The shadow report sorts a correction by the prompt that made it (BO-20).
+                    if ctx.shadow {
+                        row.text = Some(t);
+                    }
+                    PromptKind::Typed(hits)
+                }
             }
         } else {
             row.text = None;
@@ -751,7 +826,19 @@ fn take(out: &mut Scan, parsed: Parsed, own: bool, current: &Current, walk: &mut
     if row.event == "signal" {
         if let (Some(s), Some(n)) = (session, row.prompt_num) {
             for reply in row.signals.iter().filter_map(|sig| about(sig, n)) {
-                out.signals.insert((s, reply));
+                let new = out.signals.insert((s, reply));
+                if new && let Some(sh) = out.shadow.as_mut() {
+                    sh.corrections.push((s, reply, at));
+                }
+            }
+            if let Some(sh) = out.shadow.as_mut()
+                && let Some(line) = row
+                    .signals
+                    .iter()
+                    .find(|sig| sig.layer == "C3" && matches!(&*sig.kind, "UPDATED" | "CORRECTED"))
+                    .and_then(|sig| sig.value.as_deref())
+            {
+                sh.markers.insert((s, n), line.to_string());
             }
         }
         return;
@@ -770,6 +857,25 @@ fn take(out: &mut Scan, parsed: Parsed, own: bool, current: &Current, walk: &mut
         let Some(log) = out.items.named(&item.kind, &item.id) else { continue };
         log.named_on(day);
         log.servings.push(Serving { day, at, session, turn });
+    }
+    if let Some(sh) = out.shadow.as_mut() {
+        let kind = match (&*row.event, &prompt) {
+            ("prompt", PromptKind::Typed(_)) => "typed",
+            ("prompt", PromptKind::Machine) => "machine",
+            ("prompt", _) => "textless",
+            _ => "file",
+        };
+        if kind == "typed"
+            && let (Some(s), Some(n)) = (session, row.prompt_num)
+        {
+            sh.typed.push((s, n, at));
+            if let Some(t) = row.text.as_deref() {
+                sh.texts.insert((s, n), t.to_string());
+            }
+        }
+        if let Some(entry) = row.shadow.as_ref().filter(|e| e.candidate == sh.candidate) {
+            sh.events.push(ShadowEvent { session, turn, at, kind, entry: entry.clone() });
+        }
     }
     if !window {
         return;

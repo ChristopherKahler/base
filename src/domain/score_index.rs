@@ -200,6 +200,13 @@ impl ScoreIndex {
         out
     }
 
+    /// `id`'s score for `prompt` with each term weighed by `weights` (BO-20's prompt IDF), or 0 when it is not in the
+    /// index. Only the admission test asks, for the few rules whose plain score already reached `[match] min_score`.
+    pub fn weighted_score(&self, id: &str, prompt: &str, weights: &PromptWeights) -> f32 {
+        let Some(doc) = self.docs.iter().position(|d| d.id == id) else { return 0.0 };
+        self.corpus.score_weighted(doc, &query_terms(prompt), &|t| weights.weight(t)).score
+    }
+
     /// The index in `base_dir`, or `None` when there is none, it does not parse, or it was counted by another format or
     /// another tokenizer: the caller then serves keyword-only.
     pub fn load(base_dir: &Path) -> Option<Self> {
@@ -325,6 +332,101 @@ pub fn sources_from(
         }
     }
     out
+}
+
+/// The prompt-IDF counts, beside the index in a tier's `.base` (BO-20).
+pub const PROMPTS_FILE: &str = "bm25-prompts.json";
+
+/// How many of the user's own most recent typed prompts the prompt IDF counts.
+pub const PROMPTS_COUNTED: usize = 1000;
+
+/// How common each term is in the user's own last [`PROMPTS_COUNTED`] typed prompts (BO-20's first admission fix,
+/// `[match] prompt_idf`). A term's weight is `idf_p(t) / idf_p(never seen)`, with `idf_p` BM25's IDF over those prompts:
+/// a term no prompt held weighs 1, a term in most of them nearly 0. Counted when the index is, and only while
+/// `[match] prompt_idf` is on for live or for a shadow candidate; read by the prompt hook, never counted there.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PromptWeights {
+    pub format: u32,
+    pub terms_version: u32,
+    /// How many prompts were counted.
+    pub prompts: u32,
+    /// How many of them held each term ([`query_terms`]: each term once per prompt).
+    pub df: HashMap<String, u32>,
+}
+
+impl PromptWeights {
+    /// Count `prompts`, each term once per prompt.
+    pub fn count<'a>(prompts: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut out = PromptWeights { format: FORMAT, terms_version: bm25::TERMS_VERSION, ..Self::default() };
+        for p in prompts {
+            out.prompts += 1;
+            for t in query_terms(p) {
+                *out.df.entry(t).or_default() += 1;
+            }
+        }
+        out
+    }
+
+    fn idf(&self, df: u32) -> f32 {
+        let (n, df) = (self.prompts as f32, df as f32);
+        (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+    }
+
+    /// `term`'s weight: 1 for a term none of the prompts held, near 0 for one nearly all held. 1 for every term when
+    /// nothing was counted.
+    pub fn weight(&self, term: &str) -> f32 {
+        if self.prompts == 0 {
+            return 1.0;
+        }
+        let never = self.idf(0);
+        if never <= 0.0 {
+            return 1.0;
+        }
+        (self.idf(self.df.get(term).copied().unwrap_or(0)) / never).clamp(0.0, 1.0)
+    }
+
+    /// The counts in `base_dir`, when they were counted by this format and tokenizer.
+    pub fn load(base_dir: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(base_dir.join(PROMPTS_FILE)).ok()?;
+        let w: PromptWeights = serde_json::from_str(&text).ok()?;
+        (w.format == FORMAT && w.terms_version == bm25::TERMS_VERSION).then_some(w)
+    }
+
+    /// Write the counts into `base_dir` through a temp file and a rename, as the index is written.
+    pub fn save(&self, base_dir: &Path) -> std::io::Result<()> {
+        let path = base_dir.join(PROMPTS_FILE);
+        let tmp = base_dir.join(format!("{PROMPTS_FILE}.tmp-{}", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_string(self).map_err(std::io::Error::other)?)?;
+        crate::store::rename_with_retry(&tmp, &path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+    }
+}
+
+/// The typed prompts the prompt IDF counts: the last [`PROMPTS_COUNTED`] prompt rows of `cwd`'s tiers that keep their
+/// whole text, task notifications left out. Empty while `[log] prompt_text` keeps no whole prompt (`matched` keeps the
+/// words that matched a keyword, which would count the keywords themselves as common).
+pub fn counted_prompts(config: &BaseConfig, cwd: &Path) -> Vec<String> {
+    if config.log.prompt_text_mode() != crate::emit::match_log::PromptText::Full {
+        return Vec::new();
+    }
+    crate::domain::replay::recent_prompts(cwd, PROMPTS_COUNTED).rows.into_iter().map(|(_, t)| t).collect()
+}
+
+/// Count and write the prompt-IDF counts into `base_dir` when some version uses them (`wanted`); otherwise leave
+/// whatever is there. Best effort, as the index refresh is.
+pub fn refresh_prompt_weights(config: &BaseConfig, cwd: &Path, base_dir: &Path, wanted: bool) {
+    if !wanted {
+        return;
+    }
+    let prompts = counted_prompts(config, cwd);
+    let w = PromptWeights::count(prompts.iter().map(String::as_str));
+    if PromptWeights::load(base_dir).is_some_and(|old| old == w) {
+        return;
+    }
+    if let Err(why) = w.save(base_dir) {
+        eprintln!("base: could not write the prompt counts {}: {why}", base_dir.join(PROMPTS_FILE).display());
+    }
 }
 
 /// Can a prompt serve `domain`'s rules on their score alone (K7d): a domain of `domains.toml` with `auto_inject`, not

@@ -119,6 +119,12 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base recall`
 - `base changes`
 - `base tune`
+- `base shadow`
+- `base shadow start`
+- `base shadow stop`
+- `base shadow report`
+- `base shadow promote`
+- `base shadow rollback`
 - `base rule`
 - `base rule add`
 - `base rule propose`
@@ -215,6 +221,7 @@ Commands:
   recall           Search notes by keyword, domain, or slug
   changes          Read the graph change log — every successful graph write, as JSON
   tune             The rule pass: read the sessions since the last pass and write rule proposals for base rule review (keyword gap, rewrite, new rule, drop keyword, merge, split, retire). Nothing is applied. Uses headless Claude on Haiku
+  shadow           Shadow mode: run a candidate matcher beside the live one on every prompt and file touch, judge it by the corrections that follow, and promote it or roll it back. Nothing runs until a shadow is started
   rule             Manage rules in the graph (add, list, remove)
   install          Install base globally: build, symlink, create ~/.base-gbl, wire hooks, write manifest
   getting-started  What to read once base is installed: workspaces, relay, star commands, CARL
@@ -2583,6 +2590,116 @@ Options:
           Print help
 ```
 
+## base shadow
+
+```text
+Shadow mode: run a candidate matcher beside the live one on every prompt and file touch, judge it by the corrections that follow, and promote it or roll it back. Nothing runs until a shadow is started
+
+Usage: base shadow <COMMAND>
+
+Commands:
+  start     Start a candidate beside live: a matcher (--matcher, with any of the admission settings) or pending proposals (--from-proposals). One at a time; live is snapshotted as it is
+  stop      End the running candidate without promoting it; live is unchanged and its rows stay
+  report    The candidate against live since it started: events, where they differ, wins, losses, and whether it can be promoted. Read only
+  promote   Make the candidate live now, whatever the report says; or name an earlier version to make it live again
+  rollback  Undo the last promotion: the version live had before it is restored
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base shadow start
+
+```text
+Start a candidate beside live: a matcher (--matcher, with any of the admission settings) or pending proposals (--from-proposals). One at a time; live is snapshotted as it is
+
+Usage: base shadow start [OPTIONS]
+
+Options:
+      --matcher <MATCHER>
+          The candidate's matcher: bm25, or keyword-only ([match] bm25 = false)
+          
+          [possible values: bm25, keyword-only]
+
+      --min-score <MIN_SCORE>
+          The candidate's [match] min_score: a rule no keyword brought is served at this BM25 score
+
+      --prompt-idf
+          The candidate weighs each term of a score admission down by how common it is in your last 1,000 typed prompts ([match] prompt_idf)
+
+      --min-terms <MIN_TERMS>
+          The candidate admits a rule on its score only when it shares this many distinct terms with the prompt, or one two-word term ([match] min_terms)
+
+      --relative <RELATIVE>
+          The candidate admits a rule on its score only at or over this share of the prompt's best rule score, 0.5 for half ([match] relative)
+
+      --from-proposals <FROM_PROPOSALS>
+          Pending proposals to run as the candidate, comma-separated: p-0001,p-0002
+
+  -h, --help
+          Print help
+```
+
+## base shadow stop
+
+```text
+End the running candidate without promoting it; live is unchanged and its rows stay
+
+Usage: base shadow stop
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base shadow report
+
+```text
+The candidate against live since it started: events, where they differ, wins, losses, and whether it can be promoted. Read only
+
+Usage: base shadow report [OPTIONS]
+
+Options:
+      --json
+          Emit JSON, every added and dropped rule listed
+
+  -h, --help
+          Print help
+```
+
+## base shadow promote
+
+```text
+Make the candidate live now, whatever the report says; or name an earlier version to make it live again
+
+Usage: base shadow promote [OPTIONS] [VERSION]
+
+Arguments:
+  [VERSION]
+          A version base shadow report or session start named (keyword-0002, bm25-0003)
+
+Options:
+      --broad-ok
+          Apply a proposal its replay flags TOO BROAD (show the user the replay first)
+
+  -h, --help
+          Print help
+```
+
+## base shadow rollback
+
+```text
+Undo the last promotion: the version live had before it is restored
+
+Usage: base shadow rollback
+
+Options:
+  -h, --help
+          Print help
+```
+
 ## base rule
 
 ```text
@@ -2839,6 +2956,12 @@ Options:
 
       --clear-tests
           Empty both test lists first, then add what is given
+
+      --protected
+          Mark the rule protected: a shadow candidate that loses it is never promoted automatically
+
+      --unprotected
+          Clear the protected mark
 
   -h, --help
           Print help (see a summary with '-h')

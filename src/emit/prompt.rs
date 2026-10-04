@@ -101,6 +101,9 @@ pub struct PromptBlock {
     pub head: String,
     /// A ranked block's lines after its parts.
     pub tail: String,
+    /// Built by the matching (`user_prompt_submit::serve`, BO-20): a shadow candidate's fit puts its own in place of
+    /// these. Never read for the output.
+    pub matcher: bool,
 }
 
 /// One rule or decision of a ranked block: its line, its score, and what printing it records (D15) and logs (K1).
@@ -150,6 +153,7 @@ impl PromptBlock {
             parts: Vec::new(),
             head: String::new(),
             tail: String::new(),
+            matcher: false,
         }
     }
 
@@ -215,7 +219,7 @@ impl PromptBlock {
 }
 
 /// The blocks of one prompt, in the order the hook built them.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PromptBlocks {
     blocks: Vec<PromptBlock>,
 }
@@ -264,6 +268,37 @@ impl PromptBlocks {
 
     pub fn iter(&self) -> impl Iterator<Item = &PromptBlock> {
         self.blocks.iter()
+    }
+
+    /// The matching's blocks ([`PromptBlock::matcher`]) taken out and `blocks` put where they were (BO-20, K9b): a shadow
+    /// candidate's own pick in live's list, everything else as live had it. Where live's matching built nothing, they go
+    /// after the first `front` blocks, the ones the hook put first after the matching ran.
+    pub fn replace_matcher(&mut self, blocks: Vec<PromptBlock>, front: usize) {
+        let at = self.blocks.iter().position(|b| b.matcher).unwrap_or(front.min(self.blocks.len()));
+        let mut rest: Vec<PromptBlock> = std::mem::take(&mut self.blocks).into_iter().filter(|b| !b.matcher).collect();
+        let tail = rest.split_off(at.min(rest.len()));
+        for b in rest.into_iter().chain(blocks).chain(tail) {
+            self.push(b);
+        }
+    }
+
+    /// Is there a block with this id.
+    pub fn has(&self, id: &str) -> bool {
+        self.blocks.iter().any(|b| b.id == id)
+    }
+
+    /// Take out the block with this id, if there is one.
+    pub fn remove(&mut self, id: &str) {
+        self.blocks.retain(|b| b.id != id);
+    }
+
+    /// Put `block` after the last block `after` says yes to (first, when none does).
+    pub fn insert_after(&mut self, block: PromptBlock, after: impl Fn(&PromptBlock) -> bool) {
+        let at = self.blocks.iter().rposition(after).map_or(0, |i| i + 1);
+        let mut tail = self.blocks.split_off(at);
+        self.push(block);
+        let mut moved = std::mem::take(&mut tail);
+        self.blocks.append(&mut moved);
     }
 }
 
@@ -830,6 +865,32 @@ mod tests {
         let b = PromptBlock::new(id, p, &body, 1, "item");
         assert_eq!(b.bytes(), bytes, "control: {id} is {bytes} bytes");
         b
+    }
+
+    /// BO-20: a shadow candidate's blocks go where live's matching blocks were, the rest of live's list unmoved; with no
+    /// matching block of live's, after the blocks the hook put first.
+    #[test]
+    fn replace_matcher_puts_the_candidates_blocks_where_lives_were() {
+        let matching = |id: &str| {
+            let mut b = block(id, Priority::Matched, 40);
+            b.matcher = true;
+            b
+        };
+        let mut list = PromptBlocks::new();
+        list.push(block("correction-check", Priority::Matched, 40));
+        list.push(matching("a-rules"));
+        list.push(matching("a-context"));
+        list.push(block("walk-x", Priority::Context, 40));
+        list.replace_matcher(vec![block("b-rules", Priority::Matched, 40)], 1);
+        let ids: Vec<&str> = list.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, ["correction-check", "b-rules", "walk-x"]);
+
+        let mut none = PromptBlocks::new();
+        none.push(block("correction-check", Priority::Matched, 40));
+        none.push(block("walk-x", Priority::Context, 40));
+        none.replace_matcher(vec![block("b-rules", Priority::Matched, 40)], 1);
+        let ids: Vec<&str> = none.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, ["correction-check", "b-rules", "walk-x"]);
     }
 
     fn blocks(list: Vec<PromptBlock>) -> PromptBlocks {

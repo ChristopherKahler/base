@@ -865,6 +865,92 @@ pub fn find(cwd: &Path, ns: &NamespaceConfig, domain: Option<&str>, id: &str) ->
     Ok(found)
 }
 
+/// The graph predicate that marks a rule protected (BO-20, K9f): `protected "true"` on its record.
+pub const PRED_PROTECTED: &str = "protected";
+
+/// Mark `rule` protected, or clear the mark, in each of `homes` (BO-20, `base rule update --protected`): where its tests
+/// are stored, so the mark lives with the rule. A `domains.toml` entry gets `protected = true`; a graph rule
+/// `protected "true"`, removed again by `--unprotected`. Says where it wrote; empty when no home still holds the rule.
+pub fn store_protected(ns: &NamespaceConfig, rule: &FoundRule, homes: &[&TestHome], protected: bool) -> Result<Vec<String>> {
+    let mut wrote: Vec<String> = Vec::new();
+    for home in homes.iter().copied() {
+        match home {
+            TestHome::Toml { file, .. } => {
+                if crate::domain::set_rule_protected(file, &rule.domain, &rule.id, protected)? {
+                    wrote.push(home.label());
+                }
+            }
+            TestHome::Graph { cwd, iri, .. } => {
+                let p = &ns.prefix;
+                let iri = iri.trim_start_matches('<').trim_end_matches('>');
+                let mut sparql = format!(
+                    "{}
+DELETE {{ GRAPH ?g {{ <{iri}> {p}:{PRED_PROTECTED} ?v }} }}
+                     WHERE {{ GRAPH ?g {{ <{iri}> {p}:{PRED_PROTECTED} ?v }} }}",
+                    crud::prefixes(ns)
+                );
+                if protected {
+                    sparql.push_str(&format!(
+                        " ;
+INSERT {{ GRAPH ?g {{ <{iri}> {p}:{PRED_PROTECTED} \"true\" }} }}
+                         WHERE {{ GRAPH ?g {{ <{iri}> {p}:ruleText ?text }} }}"
+                    ));
+                }
+                let (store, trig_path, _lock) = crud::lock_and_load(cwd)?;
+                let ask = format!("{}
+ASK {{ GRAPH ?g {{ <{iri}> {p}:ruleText ?text }} }}", crud::prefixes(ns));
+                if !matches!(crate::store::query(&store, &ask)?, QueryResults::Boolean(true)) {
+                    continue;
+                }
+                crate::store::update_and_write(
+                    &store,
+                    &trig_path,
+                    &sparql,
+                    crate::store::Scope::Wide,
+                    crate::store::Intent::Knowledge,
+                )?;
+                wrote.push(home.label());
+            }
+        }
+    }
+    Ok(wrote)
+}
+
+/// Every rule marked protected, by its id: the `domains.toml` entries of both tiers that say `protected = true`, and
+/// the graph rules of both tiers that carry `protected "true"` (BO-20, K9f).
+pub fn protected_ids(cwd: &Path, ns: &NamespaceConfig) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for d in crate::domain::load_domains(cwd) {
+        for r in d.rules.iter().filter(|r| r.protected()) {
+            out.insert(crate::domain::rules::rule_id(&d.name, r.text()));
+        }
+    }
+    let p = &ns.prefix;
+    let sparql = format!(
+        "{}
+SELECT ?domain ?text WHERE {{ GRAPH ?g {{ ?domain {p}:hasRule ?rule . ?rule {p}:ruleText ?text ;          {p}:{PRED_PROTECTED} \"true\" }} }}",
+        crud::prefixes(ns)
+    );
+    let names: std::collections::HashMap<String, String> = crate::domain::load_domains(cwd)
+        .into_iter()
+        .map(|d| (crud::build_iri(ns, "domain", &crud::slugify(&d.name)), d.name))
+        .collect();
+    if let Some(store) = crate::store::load_merged(cwd)
+        && let Ok(QueryResults::Solutions(rows)) = crate::store::query(&store, &sparql)
+    {
+        for row in rows.filter_map(|r| r.ok()) {
+            let (Some(d), Some(t)) = (row.get("domain"), row.get("text")) else { continue };
+            let d = match d {
+                oxigraph::model::Term::NamedNode(n) => n.as_str().to_string(),
+                _ => continue,
+            };
+            let name = names.get(&d).cloned().unwrap_or_else(|| d.rsplit('/').next().unwrap_or_default().to_string());
+            out.insert(crate::domain::rules::rule_id(&name, &crud::term_display(t.into())));
+        }
+    }
+    out
+}
+
 /// Write `tests` as the whole test list of `rule` in each of `homes`, and say where. A `domains.toml` entry is rewritten
 /// ([`crate::domain::set_rule_tests`]); a CLI rule's literals are replaced in its own tier's graph, under that tier's
 /// lock, in each named graph that holds the rule. A home that no longer holds the rule (it changed after [`find`]
