@@ -501,14 +501,12 @@ const DATA_BLOCKS: [&str; 6] = ["reminders", "handoffs", "forks", "projects", "t
 /// their own trigger (migrate, hooks-wired, contract, automap) are not here: a failing map build
 /// or a duplicate contract repeats every session, and with no command their floor already names
 /// the file.
-pub const SHOWN_ONCE: [&str; 8] = [
+pub const SHOWN_ONCE: [&str; 7] = [
     "first-run",
     // BO-20: an announcement leaves the shadow state as it is produced.
     "matcher",
     // BO-26: an upgrade's lines leave its record as they are produced.
     "upgrade",
-    // BO-27: the archive it announces happens as the line is produced.
-    "reminder-archived",
     "update-applied",
     "relay-inbox",
     "relay-tasks",
@@ -525,6 +523,9 @@ pub fn command_for(kind: &str) -> Option<&'static str> {
         "rule-proposals" => Some("base rule review"),
         "rule-pass" => Some("base tune"),
         "reminders" => Some("base reminder list"),
+        // BO-27: what the auto-archive pass archived stays listed there, each with the slug its undo takes, so a floor
+        // that names it loses nothing even when the full output was not written.
+        "reminder-archived" => Some("base reminder list --archived"),
         "forks" => Some("base fork list"),
         "projects" => Some("base project list --all"),
         "tasks" => Some("base task list"),
@@ -1513,5 +1514,20 @@ mod tests {
             })
             .collect();
         assert!(checked.len() >= 5, "checked {checked:?}");
+    }
+
+    /// BO-27 code review: the line naming an automatic archive and its undo sits at Primary, so a long session start
+    /// can collapse it to its floor, and with no full output written a floor naming only that file would leave the
+    /// archive unsaid. Its floor names the command that lists every archived reminder with its slug instead, whether or
+    /// not the file was written.
+    #[test]
+    fn an_auto_archive_line_floors_to_the_archived_list() {
+        for full in [FullOutput::off(), FullOutput::not_written("no folder")] {
+            assert_eq!(
+                floor_line("reminder-archived", 2, &full),
+                "reminder-archived 2 · all: base reminder list --archived"
+            );
+        }
+        assert_eq!(place("reminder-archived").0, Rank::Primary, "beside the upgrade's lines");
     }
 }

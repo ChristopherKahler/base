@@ -3187,13 +3187,13 @@ pub fn run() {
                     ) {
                         // A name a tier already holds moves that reminder's one clock (BO-27, V5): an archived one is
                         // revived, never left archived behind a "set".
-                        Ok((slug, outcome)) => {
+                        Ok((slug, outcome, stored)) => {
                             let what = match outcome {
                                 crud::reminder::SetOutcome::Created => "set",
                                 crud::reminder::SetOutcome::Moved => "moved (it already existed; its date changed)",
                                 crud::reminder::SetOutcome::Revived => "revived (it was archived)",
                             };
-                            println!("Reminder '{name}' {what} — surfaces at session start on/after {surface_at} (slug: {slug})")
+                            println!("Reminder '{stored}' {what} — surfaces at session start on/after {surface_at} (slug: {slug})")
                         }
                         Err(e) => die("Failed", e),
                     },
@@ -3281,10 +3281,8 @@ pub fn run() {
                     Ok(Unarchived::NotFound) => die(
                         "Failed",
                         format!(
-                            "no reminder '{slug}' in any tier — nothing was unarchived. Searched:
-  {}",
-                            crud::reminder::searched_tiers(home.as_deref(), &cwd).join("
-  ")
+                            "no reminder '{slug}' in any tier — nothing was unarchived. Searched:\n  {}",
+                            crud::reminder::searched_tiers(home.as_deref(), &cwd).join("\n  ")
                         ),
                     ),
                     Ok(Unarchived::NotArchived) => {

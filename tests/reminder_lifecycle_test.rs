@@ -667,6 +667,9 @@ fn auto_archive_announces_once_with_undo() {
     let undo = format!("base reminder unarchive {}", r.slug);
     let expected = format!("reminder: archived '{}' (12d overdue, warned {}) · undo: {undo}", r.name, days_ago(2));
     assert_eq!(archive_lines(&archiving), vec![expected.as_str()], "{archiving}");
+    let reason = quads(&seed, &r.slug, "archivedReason");
+    let why = format!("auto: 12d past due, warned {}", days_ago(2));
+    assert!(reason.len() == 1 && reason[0].contains(&why), "the stored reason says when and why: {reason:?}");
     let (_, next, _) = run_session_start(&seed, Some("bo27-v4b"));
     assert!(archive_lines(&next).is_empty(), "said once:\n{next}");
     assert!(line_with(&next, &r.name).is_none(), "control: it is archived:\n{next}");
@@ -758,4 +761,31 @@ fn readding_a_live_reminder_moves_its_clock() {
     let (_, live, _) = run_base(&seed, &["reminder", "list"]);
     let line = line_with(&live, &r.name).unwrap_or_else(|| panic!("{live}"));
     assert!(line.contains(&days_ahead(2)) && !line.contains("overdue"), "{line}");
+}
+
+/// BO-27 code review: `unarchive` brings back only the copies that are archived. A live copy of the same slug in the
+/// other tier keeps its own time, so its overdue age and its warning clock are not reset by someone else's undo.
+#[test]
+fn unarchive_leaves_a_live_copy_in_the_other_tier_alone() {
+    let seed = workspace("bo27-v5d");
+    let r = add_due(&seed, "Renew the lease", &days_ago(9));
+    let (code, out, err) = run_base(&seed, &["reminder", "archive", &r.slug]);
+    assert_eq!(code, 0, "archive: {out}{err}");
+    let live_at = midnight(&days_ago(9));
+    add_global_reminder(&seed, &r.slug, &r.name, &live_at);
+    let global = seed.home.join(".base-gbl").join(".base").join("graph.nq");
+    let global_line = || {
+        std::fs::read_to_string(&global)
+            .expect("global graph")
+            .lines()
+            .find(|l| l.contains(&format!("reminder/{}> <{}resurfaceAt>", r.slug, seed::NS)))
+            .map(str::to_string)
+    };
+    let before = global_line().expect("control: the live global copy");
+
+    let (code, out, err) = run_base(&seed, &["reminder", "unarchive", &r.slug]);
+    assert_eq!(code, 0, "unarchive: {out}{err}");
+    assert!(out.contains("(workspace tier)") && !out.contains("global"), "only the archived copy: {out}");
+    assert_eq!(global_line().as_deref(), Some(before.as_str()), "the live copy kept its own time");
+    assert!(quads(&seed, &r.slug, "status").is_empty(), "the workspace copy is live again");
 }

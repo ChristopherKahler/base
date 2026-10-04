@@ -203,8 +203,12 @@ pub fn titles_in_use_for(session_id: &str) -> Vec<String> {
 /// a title already in use costs one read. Best-effort: a registry that cannot be written leaves the reminder off,
 /// never a ping unsent.
 pub fn mark_used(pairs: &[(&str, &str)]) {
+    let pairs: Vec<&(&str, &str)> = pairs.iter().filter(|(t, s)| !t.is_empty() && !s.is_empty()).collect();
+    if pairs.is_empty() {
+        return;
+    }
     let due = |reg: &SessionRegistry, title: &str, sid: &str| {
-        !sid.is_empty() && reg.sessions.get(title).is_some_and(|e| e.session_id == sid && !e.in_use())
+        reg.sessions.get(title).is_some_and(|e| e.session_id == sid && !e.in_use())
     };
     let reg = load();
     if !pairs.iter().any(|(t, s)| due(&reg, t, s)) {
@@ -385,14 +389,17 @@ pub fn touch(session_id: &str, cwd: &Path) -> Option<String> {
 /// `[relay] enabled = false` setting) refreshes a title the session already
 /// holds and never draws one for it.
 pub fn touch_with(session_id: &str, cwd: &Path, auto_name: bool) -> Option<String> {
-    let held = titles_for(session_id);
-    if let Some(t) = held.first().cloned() {
+    let reg = load();
+    let held: Vec<&SessionEntry> = reg.sessions.values().filter(|e| e.session_id == session_id).collect();
+    if let Some(first) = held.first() {
+        let t = first.title.clone();
+        // A launcher's pinned title is set by hand (BO-27, V2), including for a session that took it before this
+        // build wrote `used_by`. Checked on the rows already read, so a title in use costs no second read.
+        let unmarked = relay_as().filter(|p| held.iter().any(|e| &e.title == p && !e.in_use()));
         if should_heartbeat(session_id) {
             heartbeat(session_id);
         }
-        // A launcher's pinned title is set by hand (BO-27, V2), including for a session that took it before this
-        // build wrote `used_by`.
-        if let Some(pinned) = relay_as().filter(|p| held.contains(p)) {
+        if let Some(pinned) = unmarked {
             mark_used(&[(pinned.as_str(), session_id)]);
         }
         return Some(t);

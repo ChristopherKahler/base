@@ -36,7 +36,9 @@ pub enum SetOutcome {
 
 /// `base reminder add`: a new reminder, or, when a tier already holds the slug, that reminder's one clock moved to
 /// `surface_at` and its archive cleared (BO-27, V5). `add` alone is an `INSERT DATA`, so before this a re-added name
-/// kept its archive and never surfaced, and a re-added live one gained a second surface time.
+/// kept its archive and never surfaced, and a re-added live one gained a second surface time. A reminder is its slug in
+/// every command (`snooze`, `archive`, `remove`), so a name that slugs to one a tier holds is that reminder; the name
+/// returned is the one it is stored under, which is what the command prints.
 pub fn set(
     gbl_root: Option<&Path>,
     cwd: &Path,
@@ -44,12 +46,13 @@ pub fn set(
     name: &str,
     surface_at: &str,
     due_date: Option<&str>,
-) -> Result<(String, SetOutcome)> {
+) -> Result<(String, SetOutcome, String)> {
     let slug = crud::slugify(name);
     let held = find(gbl_root, cwd, ns, &slug)?;
-    if held.is_empty() {
-        return Ok((add(cwd, ns, name, surface_at, due_date)?, SetOutcome::Created));
-    }
+    let Some(first) = held.first() else {
+        return Ok((add(cwd, ns, name, surface_at, due_date)?, SetOutcome::Created, name.to_string()));
+    };
+    let stored = first.name.clone();
     let outcome = if held.iter().any(|r| r.archived) { SetOutcome::Revived } else { SetOutcome::Moved };
     let date = match due_date {
         Some(d) => d.to_string(),
@@ -58,7 +61,7 @@ pub fn set(
             .with_context(|| format!("not a time: {surface_at}"))?,
     };
     snooze(gbl_root, cwd, ns, &slug, surface_at, &date)?;
-    Ok((slug, outcome))
+    Ok((slug, outcome, stored))
 }
 
 /// Insert a reminder as given. [`set`] is the command's path: it checks first whether a tier holds the slug.
@@ -142,10 +145,15 @@ pub fn archives_on(when: &str, warned: Option<&str>) -> Option<String> {
     Some(due.max(shown).format("%Y-%m-%d").to_string())
 }
 
-/// The local calendar date of an RFC 3339 time.
+/// The local calendar date of a stored time, read as [`surface_time`] reads one: RFC 3339, or a timezone-less
+/// `xsd:dateTime` as local time. A `warnedAt` another writer stored without an offset still counts.
 fn local_date(when: &str) -> Option<chrono::NaiveDate> {
-    let parsed = chrono::DateTime::parse_from_rfc3339(when).ok()?;
-    Some(parsed.with_timezone(&chrono::Local).date_naive())
+    surface_time(when).map(|t| t.date_naive())
+}
+
+/// Whole calendar days since a stored time, by [`local_date`].
+fn days_since(when: &str) -> Option<i64> {
+    local_date(when).map(|d| (chrono::Local::now().date_naive() - d).num_days())
 }
 
 /// Does this store hold reminder `slug`? Asked per tier file, so a command never reports a
@@ -160,15 +168,29 @@ fn store_holds(store: &Store, ns: &NamespaceConfig, slug: &str) -> bool {
     matches!(store.query(&ask), Ok(QueryResults::Boolean(true)))
 }
 
-fn mutate_file_if_holds(
+/// Does this store hold reminder `slug` archived?
+fn store_archived(store: &Store, ns: &NamespaceConfig, slug: &str) -> bool {
+    let iri = crud::build_iri(ns, "reminder", slug);
+    let p = &ns.prefix;
+    let ask = format!(
+        "{}
+ASK {{ GRAPH ?g {{ <{iri}> a {p}:Reminder ; {p}:status \"{ARCHIVED}\" }} }}",
+        crud::prefixes(ns)
+    );
+    matches!(store.query(&ask), Ok(QueryResults::Boolean(true)))
+}
+
+/// Run `sparql` on one tier file when `wanted` says its store is one to change, under the graph lock from load to
+/// write. Returns whether it ran.
+fn mutate_file_where(
     path: &Path,
     ns: &NamespaceConfig,
-    slug: &str,
     sparql: &str,
+    wanted: &dyn Fn(&Store) -> bool,
 ) -> Result<bool> {
     crate::store::with_graph_lock(path, || {
         let store = crate::store::load_or_empty(path)?;
-        if !store_holds(&store, ns, slug) {
+        if !wanted(&store) {
             return Ok(false);
         }
         let full = format!("{}\n{}", crud::prefixes(ns), sparql);
@@ -197,13 +219,29 @@ fn apply_to_tiers(
     slug: &str,
     sparql: &str,
 ) -> Result<Vec<String>> {
+    let files = apply_where(gbl_root, cwd, ns, sparql, &|s| store_holds(s, ns, slug))?;
+    Ok(labels(gbl_root, &files))
+}
+
+/// Run `sparql` against every tier file whose store `wanted` accepts, and return the files it ran on.
+fn apply_where(
+    gbl_root: Option<&Path>,
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    sparql: &str,
+    wanted: &dyn Fn(&Store) -> bool,
+) -> Result<Vec<std::path::PathBuf>> {
     let mut changed = Vec::new();
     for f in crud::all_tier_files(gbl_root, cwd) {
-        if mutate_file_if_holds(&f, ns, slug, sparql)? {
-            changed.push(crud::tier_label_of_file(&f, gbl_root).to_string());
+        if mutate_file_where(&f, ns, sparql, wanted)? {
+            changed.push(f);
         }
     }
     Ok(changed)
+}
+
+fn labels(gbl_root: Option<&Path>, files: &[std::path::PathBuf]) -> Vec<String> {
+    files.iter().map(|f| crud::tier_label_of_file(f, gbl_root).to_string()).collect()
 }
 
 /// The tier files a lookup searched, for the not-found sentence.
@@ -229,6 +267,20 @@ pub fn snooze(
     surface_at: &str,
     due_date: &str,
 ) -> Result<Vec<String>> {
+    reset(gbl_root, cwd, ns, slug, surface_at, due_date, false)
+}
+
+/// [`snooze`]'s one clock move, in every tier holding the slug, or with `only_archived` only in the tiers where it is
+/// archived ([`unarchive`]: a live copy in another tier keeps its own clock and warning).
+fn reset(
+    gbl_root: Option<&Path>,
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    slug: &str,
+    surface_at: &str,
+    due_date: &str,
+    only_archived: bool,
+) -> Result<Vec<String>> {
     let iri = crud::build_iri(ns, "reminder", slug);
     let p = &ns.prefix;
     let sparql = format!(
@@ -247,18 +299,19 @@ pub fn snooze(
            OPTIONAL {{ GRAPH ?g {{ <{iri}> {p}:archivedReason ?oldWhy }} }}\n\
            OPTIONAL {{ GRAPH ?g {{ <{iri}> {p}:warnedAt ?oldWarned }} }} }}"
     );
-    let changed = apply_to_tiers(gbl_root, cwd, ns, slug, &sparql)?;
+    let wanted = |s: &Store| store_holds(s, ns, slug) && (!only_archived || store_archived(s, ns, slug));
+    let changed = apply_where(gbl_root, cwd, ns, &sparql, &wanted)?;
 
     // The rewritten dueDate lands in a second pass, and only where the first one changed
     // something: a reminder with no dueDate must not gain one from a snooze.
-    if !changed.is_empty() {
-        let restore = format!(
-            "INSERT {{ GRAPH ?g {{ <{iri}> {p}:dueDate \"{due_date}\"^^xsd:date }} }}\n\
-             WHERE  {{ GRAPH ?g {{ <{iri}> a {p}:Reminder ; {p}:resurfaceAt ?w }} }}"
-        );
-        apply_to_tiers(gbl_root, cwd, ns, slug, &restore)?;
+    let restore = format!(
+        "INSERT {{ GRAPH ?g {{ <{iri}> {p}:dueDate \"{due_date}\"^^xsd:date }} }}\n\
+         WHERE  {{ GRAPH ?g {{ <{iri}> a {p}:Reminder ; {p}:resurfaceAt ?w }} }}"
+    );
+    for f in &changed {
+        mutate_file_where(f, ns, &restore, &|s| store_holds(s, ns, slug))?;
     }
-    Ok(changed)
+    Ok(labels(gbl_root, &changed))
 }
 
 /// Archive a reminder in every tier holding the slug: it stops surfacing and is KEPT.
@@ -314,9 +367,15 @@ pub fn unarchive(gbl_root: Option<&Path>, cwd: &Path, ns: &NamespaceConfig, slug
         return Ok(Unarchived::NotArchived);
     }
     let now = chrono::Local::now();
-    let at = held.iter().filter_map(|r| surface_time(&r.when)).max().filter(|t| *t > now).unwrap_or(now);
+    let at = held
+        .iter()
+        .filter(|r| r.archived)
+        .filter_map(|r| surface_time(&r.when))
+        .max()
+        .filter(|t| *t > now)
+        .unwrap_or(now);
     let surface_at = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
-    let tiers = snooze(gbl_root, cwd, ns, slug, &surface_at, &at.format("%Y-%m-%d").to_string())?;
+    let tiers = reset(gbl_root, cwd, ns, slug, &surface_at, &at.format("%Y-%m-%d").to_string(), true)?;
     Ok(Unarchived::Restored { tiers, surface_at })
 }
 
@@ -331,35 +390,14 @@ pub fn mark_warned(gbl_root: Option<&Path>, cwd: &Path, ns: &NamespaceConfig, sl
     let now = crud::now_iso();
     let values: Vec<String> = slugs.iter().map(|s| format!("<{}>", crud::build_iri(ns, "reminder", s))).collect();
     let sparql = format!(
-        "{pfx}\nINSERT {{ GRAPH ?g {{ ?r {p}:warnedAt \"{now}\"^^xsd:dateTime }} }}\n\
-         WHERE  {{ VALUES ?r {{ {values} }}\n\
-           GRAPH ?g {{ ?r a {p}:Reminder }}\n\
+        "INSERT {{ GRAPH ?g {{ ?r {p}:warnedAt \"{now}\"^^xsd:dateTime }} }}
+         WHERE  {{ VALUES ?r {{ {values} }}
+           GRAPH ?g {{ ?r a {p}:Reminder }}
            FILTER NOT EXISTS {{ GRAPH ?g {{ ?r {p}:warnedAt ?w }} }} }}",
-        pfx = crud::prefixes(ns),
         values = values.join(" "),
     );
-    let mut changed = Vec::new();
-    for f in crud::all_tier_files(gbl_root, cwd) {
-        let wrote = crate::store::with_graph_lock(&f, || {
-            let store = crate::store::load_or_empty(&f)?;
-            if !slugs.iter().any(|s| store_holds(&store, ns, s)) {
-                return Ok(false);
-            }
-            crate::store::update_and_write(
-                &store,
-                &f,
-                &sparql,
-                crate::store::Scope::Target,
-                crate::store::Intent::Knowledge,
-            )
-            .with_context(|| format!("recording the reminder warning failed: {sparql}"))?;
-            Ok(true)
-        })?;
-        if wrote {
-            changed.push(crud::tier_label_of_file(&f, gbl_root).to_string());
-        }
-    }
-    Ok(changed)
+    let files = apply_where(gbl_root, cwd, ns, &sparql, &|store| slugs.iter().any(|s| store_holds(store, ns, s)))?;
+    Ok(labels(gbl_root, &files))
 }
 
 /// One row of `list`, read from one tier file so the tier is known rather than guessed.
@@ -521,7 +559,7 @@ pub fn auto_archive_pass(
 ) -> Result<Vec<AutoArchived>> {
     let mut archived = Vec::new();
     for due in overdue_for_auto_archive(gbl_root, cwd, ns)? {
-        let reason = format!("auto: {AUTO_ARCHIVE_DAYS}d past due");
+        let reason = format!("auto: {}d past due, warned {}", due.days, due.warned_on);
         if !archive(gbl_root, cwd, ns, &due.slug, Some(&reason))?.is_empty() {
             archived.push(due);
         }
@@ -551,7 +589,7 @@ pub fn overdue_for_auto_archive(
                 continue;
             }
             let Some(days) = days_past(&r.when).filter(|d| *d >= AUTO_ARCHIVE_DAYS) else { continue };
-            let Some(warned) = r.warned.as_deref().filter(|w| days_past(w).is_some_and(|d| d >= WARN_GRACE_DAYS))
+            let Some(warned) = r.warned.as_deref().filter(|w| days_since(w).is_some_and(|d| d >= WARN_GRACE_DAYS))
             else {
                 continue;
             };
@@ -583,5 +621,20 @@ mod tests {
         ] {
             assert_eq!(is_due(&value, archived, now), due, "{value:?}, archived {archived}");
         }
+    }
+
+    /// BO-27 code review: a `warnedAt` stored with no timezone, as another writer may store an `xsd:dateTime`, still
+    /// counts its days, so it cannot hold a reminder back from its archive forever. Controls: RFC 3339, and garbage.
+    #[test]
+    fn a_warning_time_with_no_timezone_still_counts() {
+        let now = chrono::Local::now();
+        let two_ago = (now - chrono::Duration::days(2)).naive_local();
+        assert_eq!(days_since(&two_ago.format("%Y-%m-%dT%H:%M:%S").to_string()), Some(2));
+        assert_eq!(days_since(&(now - chrono::Duration::days(2)).to_rfc3339()), Some(2));
+        assert_eq!(days_since("not a time"), None);
+        let due = (now - chrono::Duration::days(15)).to_rfc3339();
+        let on = (now + chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+        let warned = (now - chrono::Duration::days(1)).naive_local().format("%Y-%m-%dT%H:%M:%S").to_string();
+        assert_eq!(archives_on(&due, Some(&warned)).as_deref(), Some(on.as_str()), "first shown yesterday: tomorrow");
     }
 }
