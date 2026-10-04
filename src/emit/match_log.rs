@@ -395,13 +395,17 @@ fn scrubbed(mut matched: Vec<Matched>) -> Vec<Matched> {
     matched
 }
 
-/// A tool call's row, or `None` when it touched no path and served nothing: such a call is not a file touch.
-pub fn file_row(trace: Trace, session: Option<&str>) -> Option<Row> {
-    if trace.paths.is_empty() && trace.served.is_empty() {
-        return None;
-    }
+/// A tool call that touched no path and served nothing: not a file touch, so it writes no row (unless a shadow candidate
+/// would have served something on it, BO-20).
+pub fn quiet_call(trace: &Trace) -> bool {
+    trace.paths.is_empty() && trace.served.is_empty()
+}
+
+/// A tool call's row. The tool hook writes it for a file touch, and for a [`quiet_call`] only when a shadow candidate
+/// would have served something on it.
+pub fn tool_row(trace: Trace, session: Option<&str>) -> Row {
     let paths: Vec<String> = trace.paths.iter().map(|p| crate::scrub::scrub(p)).collect();
-    Some(Row {
+    Row {
         ts: now(),
         session: session.map(String::from),
         event: "file".into(),
@@ -418,7 +422,7 @@ pub fn file_row(trace: Trace, session: Option<&str>) -> Option<Row> {
         index: None,
         min_score: None,
         shadow: None,
-    })
+    }
 }
 
 /// Append `row` to `dir`'s [`FILE`] as one line in one write. A failure comes back naming the path; never a panic.

@@ -259,13 +259,22 @@ fn run_event(
             }
             // The match log's row (K1), after the print, never in the way of it (K1g).
             let _ = std::io::stdout().flush();
-            if let Some(mut row) = crate::emit::match_log::file_row(trace, session_id.as_deref())
-                && let Some(dir) = crate::crud::handoff_show::session_start_dir(&cwd)
-            {
-                // The shadow candidate (BO-20, K9b), after the print: what it would have served on this call.
-                row.shadow = kept.as_ref().map(|k| crate::shadow::run::file(&config, k));
-                if let Err(why) = crate::emit::match_log::append(&dir, &row) {
-                    eprintln!("base: the tool hook could not write its match log row: {why}");
+            if let Some(dir) = crate::crud::handoff_show::session_start_dir(&cwd) {
+                // The shadow candidate (BO-20, K9b), after the print: what it would have served on this call. A call that
+                // touched no path and served nothing is not a file touch and writes no row, unless the candidate would
+                // have served something on it (a merge proposal can carry a rule's tool matcher onto another rule). A
+                // matcher candidate picks what live picks on a tool call (no `[match]` key reaches it): not run there.
+                let quiet = crate::emit::match_log::quiet_call(&trace);
+                let entry = kept
+                    .as_ref()
+                    .filter(|k| !quiet || k.active.version.is_proposals())
+                    .map(|k| crate::shadow::run::file(&config, k));
+                if !quiet || entry.as_ref().is_some_and(|e| !e.adds.is_empty()) {
+                    let mut row = crate::emit::match_log::tool_row(trace, session_id.as_deref());
+                    row.shadow = entry;
+                    if let Err(why) = crate::emit::match_log::append(&dir, &row) {
+                        eprintln!("base: the tool hook could not write its match log row: {why}");
+                    }
                 }
             }
             data.session_id = session_id;

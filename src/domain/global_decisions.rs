@@ -199,7 +199,6 @@ impl GlobalDecisions {
         self.by_id.values()
     }
 
-    /// The global decision `base decision update` addresses as `slug`.
     /// Decision `slug` as a proposal would leave it (BO-20, a shadow candidate's copy): `add` and `drop` made to its
     /// keywords (kept sorted, lowercased, once each), and its name changed when `name` is given. A slug this set does
     /// not hold is left alone.
@@ -215,6 +214,7 @@ impl GlobalDecisions {
         }
     }
 
+    /// The global decision `base decision update` addresses as `slug`.
     pub fn by_slug(&self, slug: &str) -> Option<&GlobalDecision> {
         self.by_id.values().find(|d| d.slug == slug)
     }

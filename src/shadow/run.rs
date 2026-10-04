@@ -125,9 +125,10 @@ pub fn prompt(
         let served = ups::serve(config, cwd, w, &view, &matching, &kept.session, &mut scratch, Some(until))?;
         ups::in_time(Some(until))?;
         let mut list = blocks;
-        // Grounding rides on any fresh injection (Phase 30): the walk is live's, the rest the candidate's.
+        // Grounding rides on any fresh injection (Phase 30), the walk being live's and the rest the candidate's; and
+        // never on a prompt the candidate matched nothing on, as the hook's no-match path prints none, walk or not.
         let walked = list.iter().any(|b| !b.matcher && b.id.starts_with("walk-"));
-        let wants_grounding = config.grounding.enabled && (served.injected_any || walked);
+        let wants_grounding = config.grounding.enabled && served.matched_any && (served.injected_any || walked);
         list.replace_matcher(served.blocks, front);
         match (list.has("grounding"), wants_grounding) {
             (true, false) => list.remove("grounding"),

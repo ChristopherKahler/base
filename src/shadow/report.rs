@@ -39,6 +39,11 @@ pub enum Status {
     WorkspaceOverride { file: String },
     /// A proposal its replay flags TOO BROAD (BO-16 refuses it without `--broad-ok`, lynx's Q10 pick).
     TooBroad { proposals: Vec<String> },
+    /// A proposal of the candidate's approved or rejected since it started, or held by no tier of this folder: approving
+    /// it would fail, so it is never tried.
+    NotPending { proposals: Vec<String> },
+    /// Its automatic promotion failed at a session start, which said why; it is not tried again automatically.
+    NotPromoted,
     /// Every condition holds and `auto_promote = false`: `base shadow promote` does it.
     Ready,
     /// Every condition holds: the next session start promotes it.
@@ -128,7 +133,21 @@ pub fn judge_scan_quiet<'c>(
     sh: &usage::ShadowScan,
     sorter: &mut Option<crate::corrections::propose::Sorter<'c>>,
 ) -> Judged {
-    judge_with(config, cwd, running, version, sh, sorter, false)
+    judge_with(config, cwd, running, version, sh, sorter, false, false)
+}
+
+/// [`judge_scan_quiet`] for session start's own pass: while the candidate has fewer typed prompts than `[shadow]
+/// min_prompts` it is collecting whatever its wins, so its corrections are not sorted and the protected rules not read
+/// (no store load on that hook for the first `min_prompts` prompts).
+pub fn judge_for_session_start<'c>(
+    config: &'c BaseConfig,
+    cwd: &Path,
+    running: &Running,
+    version: &Version,
+    sh: &usage::ShadowScan,
+    sorter: &mut Option<crate::corrections::propose::Sorter<'c>>,
+) -> Judged {
+    judge_with(config, cwd, running, version, sh, sorter, false, true)
 }
 
 /// [`judge`] on a scan already read. `sorter` is loaded the first time a correction needs sorting.
@@ -140,7 +159,7 @@ pub fn judge_scan<'c>(
     sh: &usage::ShadowScan,
     sorter: &mut Option<crate::corrections::propose::Sorter<'c>>,
 ) -> Judged {
-    judge_with(config, cwd, running, version, sh, sorter, true)
+    judge_with(config, cwd, running, version, sh, sorter, true, false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -152,6 +171,7 @@ fn judge_with<'c>(
     sh: &usage::ShadowScan,
     sorter: &mut Option<crate::corrections::propose::Sorter<'c>>,
     notes: bool,
+    collecting_stops: bool,
 ) -> Judged {
     let since = epoch(&running.since).unwrap_or(i64::MIN);
     let events: Vec<&usage::ShadowEvent> = sh.events.iter().filter(|e| e.at >= since).collect();
@@ -224,6 +244,10 @@ fn judge_with<'c>(
         let at = |q: f64| ms[((ms.len() as f64 - 1.0) * q).round() as usize];
         j.ms = (at(0.5), at(0.9), *ms.last().unwrap_or(&0));
     }
+    if collecting_stops && j.events < config.shadow.min_prompts {
+        j.status = Status::Collecting { have: j.events, need: config.shadow.min_prompts };
+        return j;
+    }
 
     // The corrections since the start whose replies the candidate had events on.
     let protected = crate::crud::rule::protected_ids(cwd, &config.namespace);
@@ -289,9 +313,29 @@ fn judge_with<'c>(
     j
 }
 
-/// K9f, in order: enough typed prompts, then the protected rules, then wins against losses (lynx's Q5: zero losses
-/// count as one), then what would stop a write (a workspace `[match]`, a TOO BROAD proposal).
+/// The candidate's proposals that are no longer pending as `cwd` reads the store: approved or rejected since it started,
+/// or held by no tier here. Empty for a matcher candidate.
+pub fn not_pending(config: &BaseConfig, cwd: &Path, version: &Version) -> Vec<String> {
+    if !version.is_proposals() {
+        return Vec::new();
+    }
+    let all = crate::corrections::review::load(config, cwd);
+    version
+        .proposals
+        .iter()
+        .filter(|p| !all.iter().any(|q| q.id == p.id && q.status == "pending"))
+        .map(|p| p.id.clone())
+        .collect()
+}
+
+/// K9f, in order: a proposals candidate's proposals still pending (else nothing can be promoted), enough typed prompts,
+/// then the protected rules, then wins against losses (lynx's Q5: zero losses count as one), then what would stop a
+/// write (a workspace `[match]`, a TOO BROAD proposal).
 fn status(config: &BaseConfig, cwd: &Path, version: &Version, j: &Judged) -> Status {
+    let gone = not_pending(config, cwd, version);
+    if !gone.is_empty() {
+        return Status::NotPending { proposals: gone };
+    }
     let need = config.shadow.min_prompts;
     if j.events < need {
         return Status::Collecting { have: j.events, need };
@@ -349,6 +393,14 @@ pub fn status_line(s: &Status, config: &BaseConfig) -> String {
             "status: no automatic promotion: {} TOO BROAD on replay; with the user's yes: base shadow promote --broad-ok",
             proposals.join(", ")
         ),
+        Status::NotPending { proposals } => format!(
+            "status: not promoted: {} no longer pending here (approved or rejected since the start, or not in this folder's \
+             tiers); end it: base shadow stop",
+            proposals.join(", ")
+        ),
+        Status::NotPromoted => "status: its automatic promotion failed (the session start said why) and is not tried again \
+                                automatically; by hand: base shadow promote"
+            .to_string(),
         Status::Ready => "status: ready to promote: base shadow promote".to_string(),
         Status::Promotes => {
             "status: promotion conditions met (auto_promote = true): promotes at the next session start".to_string()
@@ -424,11 +476,20 @@ pub fn run(config: &BaseConfig, cwd: &Path, json: bool) -> Result<String, String
             .to_string();
         if let Some(p) = &state.promotion {
             out.push_str(&format!("{}\n", super::promote::describe_last(p)));
+            // Both rates while the watch runs (lynx's Q6 ruling).
+            if p.watching
+                && let Some(line) = super::promote::watch_line(config, cwd, p)
+            {
+                out.push_str(&format!("  {line}\n"));
+            }
         }
         return Ok(out);
     };
     let version = Version::load(&dir, &running.name).ok_or_else(|| format!("version {} is missing from {}", running.name, dir.display()))?;
-    let j = judge(config, cwd, running, &version);
+    let mut j = judge(config, cwd, running, &version);
+    if j.status == Status::Promotes && state.not_promoted.as_deref() == Some(running.name.as_str()) {
+        j.status = Status::NotPromoted;
+    }
     if json {
         return serde_json::to_string_pretty(&j).map(|s| s + "\n").map_err(|e| e.to_string());
     }

@@ -63,6 +63,10 @@ pub struct State {
     /// The candidate whose "ready to promote" line was printed (`auto_promote = false`, lynx's Q9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_told: Option<String>,
+    /// The candidate whose automatic promotion failed: session start does not try it again (`base shadow promote` by
+    /// hand still does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_promoted: Option<String>,
     /// The number the next version takes: one counter for every version on the machine.
     #[serde(default = "first_number")]
     pub next: u32,
@@ -182,6 +186,10 @@ pub struct Version {
     pub kind: String,
     /// Every `[match]` key.
     pub settings: MatchConfig,
+    /// A matcher candidate's `[match]` keys that differ from live's when it started: what its promotion writes, so a
+    /// key edited by hand since then is left as it is. Empty for a live snapshot and a proposals candidate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proposals: Vec<ChangeSnap>,
     /// SHA-256 over the settings, the proposals, every domain's prompt keywords, file keywords and paths, every rule in
@@ -369,6 +377,7 @@ fn live_version(config: &BaseConfig, cwd: &Path, state: &mut State, dir: &Path) 
         name: state.name(matcher_kind(&config.matching)),
         kind: matcher_kind(&config.matching).to_string(),
         settings: config.matching.clone(),
+        sets: Vec::new(),
         proposals: Vec::new(),
         hash,
         created: now(),
@@ -425,11 +434,20 @@ pub fn start(config: &BaseConfig, cwd: &Path, what: &Start) -> Result<String, St
             ("proposals".to_string(), config.matching.clone(), snaps)
         }
     };
+    // The keys the candidate changes from live: what a promotion writes (a key edited by hand meanwhile is kept).
+    let sets: Vec<String> = settings
+        .keys()
+        .into_iter()
+        .zip(config.matching.keys())
+        .filter(|((_, want), (_, has))| want != has)
+        .map(|((k, _), _)| k.to_string())
+        .collect();
     let candidate = Version {
         name: state.name(&kind),
         kind,
         hash: content_hash(config, cwd, &settings, &proposals),
         settings,
+        sets,
         proposals,
         created: now(),
     };
@@ -441,6 +459,7 @@ pub fn start(config: &BaseConfig, cwd: &Path, what: &Start) -> Result<String, St
         live_hash: live.hash.clone(),
     });
     state.ready_told = None;
+    state.not_promoted = None;
     state.save(&dir)?;
     // A candidate that scores needs a current index, and a proposals candidate its own: counted now, not at the next
     // session start.
@@ -465,6 +484,7 @@ pub fn stop() -> Result<String, String> {
         return Ok("no shadow is running; nothing stopped\n".to_string());
     };
     state.ready_told = None;
+    state.not_promoted = None;
     state.save(&dir)?;
     Ok(format!(
         "stopped candidate {} (running against {} since {}); live is unchanged. Its rows stay in the match log and its \

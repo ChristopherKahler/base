@@ -139,15 +139,26 @@ fn entry(name: &str, adds: &[&str], drops: &[&str]) -> Value {
     json!({"candidate": name, "adds": adds, "drops": drops, "ms": 3})
 }
 
+/// Move the running candidate's start `seconds` back, so rows written before now count as its events.
+fn backdate(s: &seed::Seed, seconds: i64) {
+    let p = shadow_dir(s).join("state.json");
+    let mut st = state(s);
+    st["candidate"]["since"] = json!(at(-seconds));
+    std::fs::write(&p, serde_json::to_string_pretty(&st).expect("state")).expect("state.json");
+}
+
 /// Evidence for `name`: `events` typed prompts the candidate ran on, of which `wins` added the quartz rule and a
 /// correction about that reply fits it, and `losses` dropped the cobalt rule and a correction fits that. Each in a
-/// session of its own; the corrections are prompt 2 of their session.
+/// session of its own; the corrections are prompt 2 of their session. Written in the hour before now, the candidate's
+/// start moved back first, as a candidate that has run a while has it at the session start that judges it: the typed
+/// prompts then come before any promotion made now, as they do in use.
 fn evidence(s: &seed::Seed, name: &str, events: usize, wins: usize, losses: usize) {
+    backdate(s, 7200);
     let (quartz, cobalt) = (id("ledger", QUARTZ), id("tide", COBALT));
     let mut out: Vec<Value> = Vec::new();
     for i in 0..events {
         let session = format!("ev-{i:04}");
-        let t = 10 + i as i64 * 3;
+        let t = -3600 + 10 + i as i64 * 3;
         let sh = if i < wins {
             entry(name, &[quartz.as_str()], &[])
         } else if i < wins + losses {
@@ -411,9 +422,10 @@ fn promoted_and_watched(s: &seed::Seed, before_fixed: usize, after_fixed: usize)
     name
 }
 
-/// K9g with lynx's Q6 ruling (Example 3's shape): corrections rose from 4 to 7 per 100 prompts, under the noise margin
-/// at a rate of 4 (2.5 x sqrt(2 x 0.04 x 0.96 / 100) x 100 = 6.9), so the promotion stands; from 4 to 15, over it, so
-/// live goes back and session start says so with both rates and the margin.
+/// K9g with lynx's Q6 ruling and its edge (Example 3's shape): corrections rose from 4 to 7 per 100 prompts, under the
+/// noise margin at the rate pooled over both windows (11 of 200: 2.5 x sqrt(p (1 - p) (1/100 + 1/100)) x 100 = 8.1), so
+/// the promotion stands; from 4 to 15, over it (19 of 200: 10.4), so live goes back and session start says so with
+/// both rates and the margin.
 #[test]
 fn auto_rollback_when_corrections_rise() {
     let s = seeded("rollback-noise", "[match]\nbm25 = false\n");
@@ -431,11 +443,114 @@ fn auto_rollback_when_corrections_rise() {
     let (code, out, err) = run_session_start(&s, Some("watch-1"));
     assert_eq!(code, 0, "{err}");
     let line = format!(
-        "matcher: {name} rolled back (corrections rose from 4 to 15 per 100 prompts, over the 7 noise margin) · redo: base shadow promote {name}"
+        "matcher: {name} rolled back (corrections rose from 4 to 15 per 100 prompts, over the 10 noise margin) · redo: base shadow promote {name}"
     );
     assert!(out.contains(&line), "{line}\n----\n{out}");
     assert!(global_toml(&s).contains("bm25 = false"), "{}", global_toml(&s));
     assert_eq!(state(&s)["live"], previous.as_str());
+}
+
+/// Q6's edge (lynx, 2026-10-03): with no correction over the 100 typed prompts before a promotion, one correction over
+/// the 100 after is no rollback (the pooled rate's margin is 2.5 per 100); a margin taken at a before rate of 0 was 0.
+#[test]
+fn a_zero_before_rate_and_one_correction_after_is_no_rollback() {
+    let s = seeded("rollback-zero", "[match]\nbm25 = false\n");
+    let name = promoted_and_watched(&s, 0, 1);
+    let (code, out, err) = run_session_start(&s, Some("watch-1"));
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains("rolled back"), "one correction over a before rate of 0 is noise:\n{out}");
+    assert_eq!(state(&s)["promotion"]["watching"], false, "the watch is over");
+    assert_eq!(state(&s)["live"], name.as_str());
+    assert!(global_toml(&s).contains("bm25 = true"), "{}", global_toml(&s));
+}
+
+/// Q6's edge: a promotion with no typed prompt before it has nothing to compare a watch with, so it is never rolled
+/// back automatically; its line and the report say so, with the undo by hand.
+#[test]
+fn a_promotion_with_no_prompts_before_it_is_not_rolled_back_and_says_why() {
+    let s = seeded("rollback-unwatched", "[match]\nbm25 = false\n");
+    base_ok(&s, &["shadow", "start", "--matcher", "bm25"]);
+    let name = candidate(&s);
+    let said = "no automatic rollback (no typed prompts before it to compare with) · undo: base shadow rollback";
+    let out = base_ok(&s, &["shadow", "promote"]);
+    assert!(out.contains(said), "{out}");
+    assert_eq!(state(&s)["promotion"]["watching"], false, "nothing to watch against");
+    // A hundred typed prompts after it, forty corrected: still no rollback.
+    let mut later: Vec<Value> = Vec::new();
+    for i in 0..100 {
+        let (session, ts) = (format!("after-{i:03}"), at(5 + i as i64));
+        later.push(prompt_row(&ts, &session, 1, &format!("a later request number {i}"), None));
+        if i < 40 {
+            later.push(interrupt_row(&ts, &session, 1));
+        }
+    }
+    append(&s, &later);
+    let (code, out, err) = run_session_start(&s, Some("watch-1"));
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(said), "the promotion's own line, printed once:\n{out}");
+    assert!(!out.contains("rolled back"), "no automatic rollback:\n{out}");
+    assert_eq!(state(&s)["live"], name.as_str());
+    let report = base_ok(&s, &["shadow", "report"]);
+    assert!(report.contains(said), "{report}");
+}
+
+/// Code review (BO-20): the watch reads the logs of the folder the promotion was judged in, so a session start in
+/// another workspace judges it on the prompts the rate before came from (4 to 40 per 100 rolls back).
+#[test]
+fn the_watch_reads_the_folder_the_promotion_was_judged_in() {
+    let s = seeded("watch-folder", "[match]\nbm25 = false\n");
+    let name = promoted_and_watched(&s, 4, 40);
+    let other = s.ws.parent().expect("the seed's root").join("another-workspace");
+    std::fs::create_dir_all(other.join(".base")).expect("another workspace");
+    let payload = json!({"cwd": other.display().to_string(), "hook_event_name": "SessionStart", "source": "startup",
+                         "session_id": "watch-elsewhere"});
+    let (code, out, err) = seed::run_hook_at(&s, &other, "session-start", &payload, &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(&format!("matcher: {name} rolled back")), "judged on the promoting folder's prompts:\n{out}");
+    assert!(global_toml(&s).contains("bm25 = false"), "{}", global_toml(&s));
+}
+
+/// Code review (BO-20): a promotion writes only the `[match]` keys the candidate set at its start, so a key edited by
+/// hand while it ran stays as the operator left it.
+#[test]
+fn promotion_writes_only_the_keys_the_candidate_set() {
+    let s = seeded("sets", "[match]\nbm25 = false\n");
+    base_ok(&s, &["shadow", "start", "--matcher", "bm25"]);
+    let file = s.home.join(".base-gbl").join("base.toml");
+    let edited = global_toml(&s).replace("bm25 = false\n", "bm25 = false\nmin_score = 6.0\n");
+    assert!(edited.contains("min_score = 6.0"), "control: the edit landed");
+    std::fs::write(&file, &edited).expect("base.toml");
+    base_ok(&s, &["shadow", "promote"]);
+    let toml = global_toml(&s);
+    assert!(toml.contains("bm25 = true"), "{toml}");
+    assert!(toml.contains("min_score = 6.0"), "the key edited by hand stays:\n{toml}");
+}
+
+/// Code review (BO-20): a proposals candidate whose proposal was approved by hand since it started is never promoted:
+/// session start backs nothing up and says nothing, and the report says why.
+#[test]
+fn a_proposal_no_longer_pending_is_not_promoted() {
+    let s = seeded("not-pending", "");
+    base_ok(&s, &["domain", "sync"]);
+    base_ok(&s, &[
+        "rule", "propose", "--example", "the cobalt manifest came late again", "--keywords", "cobalt manifest", "--rule",
+        &base::domain::rule_test::short_ref("tide", &id("tide", COBALT)),
+    ]);
+    base_ok(&s, &["shadow", "start", "--from-proposals", "p-0001"]);
+    let name = candidate(&s);
+    base_ok(&s, &["rule", "review", "--approve", "p-0001", "--broad-ok"]);
+    evidence(&s, &name, 200, 3, 0);
+    let (code, out, err) = run_session_start(&s, Some("start-not-pending"));
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains("matcher:"), "nothing promoted, nothing said:\n{out}");
+    let backups = std::fs::read_dir(s.ws.join(".base"))
+        .expect(".base")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(&format!("pre-{name}")))
+        .count();
+    assert_eq!(backups, 0, "nothing backed up");
+    let report = base_ok(&s, &["shadow", "report"]);
+    assert!(report.contains("status: not promoted: p-0001 no longer pending here"), "{report}");
 }
 
 /// K9h: an announcement is printed by one session start, and not by the next.
