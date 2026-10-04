@@ -48,6 +48,11 @@ pub struct SessionEntry {
     /// session cards by these keywords.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<String>,
+    /// The session that used this title: it sent an inbox item under it, was sent one under it, or was launched with
+    /// it pinned by `BASE_RELAY_AS` (BO-27, V2). It counts only while that session holds the title, so a title handed
+    /// to another session starts unused, as its inbox does (BO-05).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub used_by: String,
 }
 
 impl SessionEntry {
@@ -55,6 +60,13 @@ impl SessionEntry {
         parse_ts(&self.last_heartbeat)
             .map(|t| (chrono::Local::now() - t).num_seconds() < IDLE_AFTER_SECS)
             .unwrap_or(false)
+    }
+
+    /// The title is in use: set by hand, or the session holding it sent or was sent an inbox item under it (BO-27,
+    /// V2). Only a title in use is reminded to start an inbox watcher. Before BO-27 every session start drew a title
+    /// for every session and the hooks told each one to arm a watcher, relay user or not.
+    pub fn in_use(&self) -> bool {
+        !self.auto || (!self.used_by.is_empty() && self.used_by == self.session_id)
     }
 }
 
@@ -173,6 +185,51 @@ pub fn titles_for(session_id: &str) -> Vec<String> {
         .filter(|e| e.session_id == session_id)
         .map(|e| e.title.clone())
         .collect()
+}
+
+/// The titles this session holds that are in use ([`SessionEntry::in_use`]): the ones the hooks remind to start an
+/// inbox watcher. The same single read of the registry as [`titles_for`].
+pub fn titles_in_use_for(session_id: &str) -> Vec<String> {
+    load()
+        .sessions
+        .values()
+        .filter(|e| e.session_id == session_id && e.in_use())
+        .map(|e| e.title.clone())
+        .collect()
+}
+
+/// Record that each `(title, session)` pair used the title, where that session holds it and it is not in use yet
+/// (BO-27, V2). Reads the registry first and takes the lock only when something changes, so a send or a delivery to
+/// a title already in use costs one read. Best-effort: a registry that cannot be written leaves the reminder off,
+/// never a ping unsent.
+pub fn mark_used(pairs: &[(&str, &str)]) {
+    let pairs: Vec<&(&str, &str)> = pairs.iter().filter(|(t, s)| !t.is_empty() && !s.is_empty()).collect();
+    if pairs.is_empty() {
+        return;
+    }
+    let due = |reg: &SessionRegistry, title: &str, sid: &str| {
+        reg.sessions.get(title).is_some_and(|e| e.session_id == sid && !e.in_use())
+    };
+    let reg = load();
+    if !pairs.iter().any(|(t, s)| due(&reg, t, s)) {
+        return;
+    }
+    let _ = with_lock(|| {
+        let mut reg = load();
+        let mut dirty = false;
+        for (title, sid) in pairs {
+            if due(&reg, title, sid)
+                && let Some(e) = reg.sessions.get_mut(*title)
+            {
+                e.used_by = (*sid).to_string();
+                dirty = true;
+            }
+        }
+        if dirty {
+            save(&reg)?;
+        }
+        Ok(())
+    });
 }
 
 pub fn list() -> Vec<SessionEntry> {
@@ -332,9 +389,18 @@ pub fn touch(session_id: &str, cwd: &Path) -> Option<String> {
 /// `[relay] enabled = false` setting) refreshes a title the session already
 /// holds and never draws one for it.
 pub fn touch_with(session_id: &str, cwd: &Path, auto_name: bool) -> Option<String> {
-    if let Some(t) = titles_for(session_id).into_iter().next() {
+    let reg = load();
+    let held: Vec<&SessionEntry> = reg.sessions.values().filter(|e| e.session_id == session_id).collect();
+    if let Some(first) = held.first() {
+        let t = first.title.clone();
+        // A launcher's pinned title is set by hand (BO-27, V2), including for a session that took it before this
+        // build wrote `used_by`. Checked on the rows already read, so a title in use costs no second read.
+        let unmarked = relay_as().filter(|p| held.iter().any(|e| &e.title == p && !e.in_use()));
         if should_heartbeat(session_id) {
             heartbeat(session_id);
+        }
+        if let Some(pinned) = unmarked {
+            mark_used(&[(pinned.as_str(), session_id)]);
         }
         return Some(t);
     }
@@ -376,6 +442,8 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<(String, Option<String>
         {
             let previous = (!prev.session_id.is_empty()).then(|| prev.session_id.clone());
             let now = now_iso();
+            // Same tab, same title: peers still address it, so a title in use stays in use (BO-27, V2).
+            prev.used_by = if prev.in_use() { session_id.to_string() } else { String::new() };
             prev.session_id = session_id.to_string();
             prev.last_heartbeat = now.clone();
             // The row describes the session that holds it now. Without this a reclaimed title kept its
@@ -389,11 +457,11 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<(String, Option<String>
             return Ok((t, previous));
         }
         // BASE_RELAY_AS pins the codename at launch (e.g. `cc work` wrapper);
-        // otherwise fall back to the random wordlist pick.
-        let name = match std::env::var("BASE_RELAY_AS") {
-            Ok(t) if !t.is_empty() => t,
-            _ => pick_name(session_id, &reg),
-        };
+        // otherwise fall back to the random wordlist pick. A pinned title was chosen by hand, so it is in use from the
+        // start (BO-27, V2); a wordlist pick is not until a ping goes to or from it.
+        let pinned = relay_as();
+        let used_by = if pinned.is_some() { session_id.to_string() } else { String::new() };
+        let name = pinned.unwrap_or_else(|| pick_name(session_id, &reg));
         // The pick may be a title another session held (a dead holder, or a launcher's BASE_RELAY_AS).
         let previous = reg.sessions.get(&name).map(|e| e.session_id.clone()).filter(|s| !s.is_empty());
         let now = now_iso();
@@ -409,12 +477,18 @@ fn auto_register(session_id: &str, cwd: &Path) -> Result<(String, Option<String>
                 last_heartbeat: now,
                 auto: true,
                 wt_session: std::env::var("WT_SESSION").unwrap_or_default(),
+                used_by,
                 ..Default::default()
             },
         );
         save(&reg)?;
         Ok((name, previous))
     })
+}
+
+/// The title a launcher pinned with `BASE_RELAY_AS`, when it set one.
+fn relay_as() -> Option<String> {
+    std::env::var("BASE_RELAY_AS").ok().filter(|t| !t.is_empty())
 }
 
 /// Pick a codename for a session: hash its id to a start index, then walk the

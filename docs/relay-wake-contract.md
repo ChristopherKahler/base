@@ -30,6 +30,14 @@ watcher, and whether it does is observable from outside the session.
    Once per session, and once more each time a watcher dies (the sentinel was
    written after the line was given, and is stale now). Never the script, and
    never on a tool call.
+   **Only for a title in use** (BO-27, V2): one set by hand (`base relay
+   register --as`, or pinned at launch by `BASE_RELAY_AS`), or one this session
+   has sent a ping or task from or been sent one to (`used_by` on its row in
+   `sessions.json`, `SessionEntry::in_use`). An auto-codename nobody has used
+   gets no line, so a user who never uses relay is never told to start a
+   Monitor. A ping to such a session still reaches it at its next prompt, and
+   from then on its title is in use. `[relay] wake_nudge = false` turns the line
+   off for every title.
 4. **Session arms**: one Monitor call with those fields. Claude Code's Monitor
    tool has no `persistent` field and caps `timeout_ms` at 1,800,000 (30
    minutes), so the watcher always expires; when it does, run `base relay arm`

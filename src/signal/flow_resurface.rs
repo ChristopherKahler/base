@@ -285,6 +285,9 @@ pub struct DueNow {
     /// k. Session start steps down these when DUE NOW would push the first screen past its limit;
     /// the last one keeps the most overdue reminder, so DUE NOW never shows none.
     pub fits: Vec<(String, usize)>,
+    /// One per slug: its line carries the archive warning and no session start has shown that warning before. Session
+    /// start records `warnedAt` on the ones it printed (BO-27, V4), and the archive counts from then.
+    pub first_warned: Vec<bool>,
 }
 
 /// The DUE NOW block (spec B1 row 3): reminders whose `resurfaceAt` time has passed, across both
@@ -304,12 +307,13 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<DueNow> {
     // Every reminder, and `crud::reminder::is_due` decides which are due: the same rule the header and the pulse
     // count by (BO-06, F10c). Archived is read in the reminder's own graph, as the old `FILTER NOT EXISTS` read it.
     let sparql = format!(
-        "{pfx}\nSELECT ?r ?name ?when ?archived WHERE {{\n\
+        "{pfx}\nSELECT ?r ?name ?when ?archived ?warned WHERE {{\n\
            GRAPH ?g {{\n\
              ?r a {p}:Reminder ;\n\
                {p}:name ?name ;\n\
                {p}:resurfaceAt ?when .\n\
              BIND(EXISTS {{ ?r {p}:status \"{archived}\" }} AS ?archived)\n\
+             OPTIONAL {{ ?r {p}:warnedAt ?warned }}\n\
            }}\n\
          }}\n\
          ORDER BY ?when",
@@ -321,7 +325,7 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<DueNow> {
         return Ok(DueNow::default());
     };
 
-    let rows: Vec<(String, String, String)> = solutions
+    let rows: Vec<(String, String, String, Option<String>)> = solutions
         .filter_map(|r| r.ok())
         .filter_map(|row| {
             let get = |k: &str| {
@@ -335,7 +339,8 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<DueNow> {
             }
             let r = get("r");
             let slug = r.rsplit('/').next().unwrap_or(&r).to_string();
-            Some((slug, get("name"), when))
+            let warned = get("warned");
+            Some((slug, get("name"), when, (!warned.is_empty()).then_some(warned)))
         })
         .collect();
 
@@ -345,21 +350,26 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<DueNow> {
 
     // Flag 6 still holds: a handled reminder is archived, not removed. Line 3 of the instruction
     // block names `base reminder archive <number>`; `remove` is never what session start offers.
+    let mut first_warned: Vec<bool> = Vec::with_capacity(rows.len());
     let lines: Vec<String> = rows
         .iter()
         .enumerate()
-        .map(|(i, (_, name, when))| {
+        .map(|(i, (_, name, when, warned))| {
             let n = i + 1;
             let mut line = format!("  {n} {name}");
-            // R3/D4: from day 8 the line says when it goes and how to keep it.
+            let mut warns = false;
+            // R3/D4: from day 8 the line says when it goes and how to keep it. The date counts from the first time a
+            // session start showed this warning (BO-27, V4), so a reminder warned late still gets its days.
             if crud::reminder::days_past(when)
                 .is_some_and(|d| d >= crud::reminder::WARN_FROM_DAYS)
-                && let Some(on) = crud::reminder::archives_on(when)
+                && let Some(on) = crud::reminder::archives_on(when, warned.as_deref())
             {
                 line.push_str(&format!(
                     " · archives {on} unless reset: base reminder snooze {n} <duration>"
                 ));
+                warns = true;
             }
+            first_warned.push(warns && warned.is_none());
             line
         })
         .collect();
@@ -380,10 +390,11 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<DueNow> {
     };
     Ok(DueNow {
         text: block(total),
-        slugs: rows.into_iter().map(|(slug, _, _)| slug).collect(),
+        slugs: rows.into_iter().map(|(slug, _, _, _)| slug).collect(),
         // Capped, so the renderings stay linear in the reminder count: with no cap, 1,000 due
         // reminders would build 999 renderings of up to 1,000 lines each (BO-00 code review).
         fits: (1..total.min(FIT_CAP + 1)).rev().map(|k| (block(k), k)).collect(),
+        first_warned,
     })
 }
 

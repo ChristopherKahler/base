@@ -460,7 +460,7 @@ fn nudge_due(
     *state == Armed::NotWatching && sentinel.is_some_and(|s| s > at)
 }
 
-/// The nudge lines due now for every title this session holds, one line per title, with the stamps held back as
+/// The nudge lines due now for every title in use this session holds, one line per title, with the stamps held back as
 /// commits: the prompt hook runs them only if it prints the block (BO-01), so a dropped line is still due next prompt.
 pub fn nudge_lines_deferred(session_id: &str, force: bool) -> Option<super::Part> {
     // Harnesses without a Monitor tool (Agent SDK runs, brain.js NPCs) can't
@@ -475,7 +475,9 @@ pub fn nudge_lines_deferred(session_id: &str, force: bool) -> Option<super::Part
 fn nudge_lines_for(session_id: &str, force: bool) -> Option<super::Part> {
     let mut out = String::new();
     let mut commits: Vec<super::Commit> = Vec::new();
-    for title in super::session_registry::titles_for(session_id) {
+    // Only a title in use (BO-27, V2): set by hand, or one that sent or was sent a ping. A title session start drew
+    // for a session that never used relay is not told to arm anything.
+    for title in super::session_registry::titles_in_use_for(session_id) {
         // armed_state, NOT is_watching: a live watcher running an older script must still be told once, or a fix to
         // the script never reaches the sessions already running one (grebe, 2026-09-20).
         let state = armed_state(&title);

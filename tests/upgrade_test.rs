@@ -714,3 +714,61 @@ fn doctor_says_why_a_graph_is_left_in_place() {
     assert!(report.contains("Verdict: UNHEALTHY"), "{report}");
     assert!(!report.contains("plans the repair of: records of another workspace"), "{report}");
 }
+
+/// BO-27, V4, on a store 0.15.2 wrote (BO-21 check 29's rem10 shape): reminders 15, 10 and 7 days overdue, which
+/// 0.15.2 never warned about. At the first session start on this build, the one that also runs the upgrade's store
+/// repair, every one of them is still listed; the 15- and 10-day ones are in DUE NOW with the warning, dated two days
+/// out, and nothing is archived. The repair's move and the warning records both land in the workspace graph. Before
+/// BO-27 the first start archived the 15- and 10-day reminders with no line anywhere.
+#[test]
+fn upgrade_from_0_15_2_keeps_overdue_reminders() {
+    const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+    let s = home("rem10");
+    with_foreign(&s);
+    upgraded(&s);
+    let g = format!("{NS}graph/ws/ws");
+    let created = (chrono::Local::now() - chrono::Duration::days(20)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let reminders = [
+        ("pay-the-insurance-premium", "pay the insurance premium", 15),
+        ("call-the-bank-about-the-loan", "call the bank about the loan", 10),
+        ("check-the-backups-ran", "check the backups ran", 7),
+    ];
+    let mut text = read(&ws_graph(&s));
+    for (slug, name, days) in reminders {
+        let day = (chrono::Local::now() - chrono::Duration::days(days)).date_naive();
+        let midnight = day
+            .and_hms_opt(0, 0, 0)
+            .and_then(|t| t.and_local_timezone(chrono::Local).earliest())
+            .expect("local midnight")
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        let r = format!("{NS}reminder/{slug}");
+        let _ = writeln!(text, "<{r}> <{RDF_TYPE}> <{NS}Reminder> <{g}> .");
+        let _ = writeln!(text, "<{r}> <{NS}name> \"{name}\" <{g}> .");
+        let _ = writeln!(text, "<{r}> <{NS}resurfaceAt> \"{midnight}\"^^<{XSD}dateTime> <{g}> .");
+        let _ = writeln!(text, "<{r}> <{NS}dueDate> \"{day}\"^^<{XSD}date> <{g}> .");
+        let _ = writeln!(text, "<{r}> <{NS}createdAt> \"{created}\"^^<{XSD}dateTime> <{g}> .");
+        let _ = writeln!(text, "<{r}> <{NS}lastActive> \"{created}\"^^<{XSD}dateTime> <{g}> .");
+        let _ = writeln!(text, "<{r}> <{NS}hasDomain> <{NS}domain/unfiled> <{g}> .");
+    }
+    write(&ws_graph(&s), &text);
+    let in_two_days = (chrono::Local::now() + chrono::Duration::days(2)).format("%Y-%m-%d").to_string();
+
+    let first = start(&s);
+    for (_, name, days) in &reminders[..2] {
+        let line = first.lines().find(|l| l.contains(name)).unwrap_or_else(|| panic!("{name} left DUE NOW:\n{first}"));
+        assert!(line.contains(&format!("archives {in_two_days} unless reset")), "{days}-day reminder: {line}");
+    }
+    assert!(!first.contains("reminder: archived"), "nothing is archived at the first start:\n{first}");
+    let graph = read(&ws_graph(&s));
+    assert!(!graph.contains("graph/ws/gone"), "control: the repair moved the foreign records out");
+    assert_eq!(graph.matches(&format!("<{NS}warnedAt>")).count(), 2, "both warnings recorded beside the repair");
+
+    for _ in 0..2 {
+        let (code, listed, err) = run_base(&s, &["reminder", "list"]);
+        assert_eq!(code, 0, "{err}");
+        for (_, name, _) in &reminders {
+            assert!(listed.contains(name), "{name} is missing from reminder list:\n{listed}");
+        }
+        start(&s);
+    }
+}
