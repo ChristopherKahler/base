@@ -44,11 +44,13 @@ fn day_ago(days: i64) -> String {
     (Local::now() - Duration::days(days)).format("%Y-%m-%d").to_string()
 }
 
-/// The days a log covers when its oldest row is [`ago`]`(days, 0)`, counted as the reader does: on a day with a clock
-/// change near midnight, `days` times 24 hours back can land a calendar day off.
-fn covered_since(days: i64) -> u64 {
-    let oldest = (Local::now() - Duration::days(days)).date_naive();
-    (Local::now().date_naive() - oldest).num_days() as u64 + 1
+/// How many days a log covers, and since which day, when its oldest row is [`ago`]`(days, minutes)`, counted as the
+/// reader does. Rows minutes back from a run just after midnight, or 24-hour days across a clock change, can land a
+/// calendar day off a count written as a number (CI ran at 00:14 UTC on 2026-10-04 and found 3 days where 2 were
+/// written).
+fn covered(days: i64, minutes: i64) -> (u64, String) {
+    let oldest = Local::now() - Duration::days(days) - Duration::minutes(minutes);
+    ((Local::now().date_naive() - oldest.date_naive()).num_days() as u64 + 1, oldest.format("%Y-%m-%d").to_string())
 }
 
 /// A home and a workspace: domains.toml, the workspace graph, the global base.toml, and a match log built by
@@ -285,7 +287,7 @@ fn usage_counts_from_match_log() {
     assert_eq!(scan.counts(&k("rule-g")).corrected_after, 0, "a phrase on the prompt that brought the rule in is about the reply before it");
     assert_eq!(scan.counts(&k("rule-h")).corrected_after, 1, "a refusal in the next turn");
     assert_eq!(scan.typed, 14, "typed prompts in the window: the one 40 days ago is outside it, and the row whose scores hold a malformed entry still counts (scores are not built)");
-    assert_eq!(scan.days_covered(), covered_since(40));
+    assert_eq!(scan.days_covered(), covered(40, 0).0);
 
     let dk = Key::Decision("global.memo-folder".into());
     assert_eq!(scan.counts(&dk).corrected_after, 1);
@@ -336,7 +338,7 @@ fn usage_scan_is_the_same_at_any_thread_count() {
     let today = Local::now().date_naive();
     let one = usage::scan_with(&dirs, today, 30, &current, Reading { threads: 1, block: Reading::BLOCK, piece: Reading::PIECE });
     assert_eq!((one.typed, one.machine, one.textless), (17, 1, 1), "K8a's 14, two more typed here and one in the other tier");
-    assert_eq!(one.days_covered(), covered_since(45), "the quiet row 45 days ago in the archive file");
+    assert_eq!(one.days_covered(), covered(45, 0).0, "the quiet row 45 days ago in the archive file");
     assert_eq!(one.counts(&Key::Rule("rule-a".into())).served_all, 5);
     assert_eq!(one.counts(&Key::Rule("rule-b".into())).served_all, 2, "K8a's one and the long line's");
     assert_eq!(one.keyword_prompts.get("tools"), Some(&1));
@@ -420,7 +422,7 @@ fn doctor_lists_dead_noisy_ignored() {
     let has = |want: &str| assert!(section.contains(want), "missing {want:?} in:\n{section}\n\nfull:\n{out}");
     let hasnt = |want: &str| assert!(!section.contains(want), "unexpected {want:?} in:\n{section}");
 
-    has("   match log: 36 days (since ");
+    has(&format!("   match log: {} days (since {}", covered(35, 0).0, covered(35, 0).1));
     has(" · 120 typed prompts, 50 task notifications · 0 with no text");
     // Dead: fleet's 1 rule, the hook-log rule, GLOBAL's rule; the new tools rule counted, not listed.
     has("   dead (not served in 30 days): 3 · 1 more first seen under 30 days ago");
@@ -552,7 +554,7 @@ fn rule_stats_output() {
     let (code, out, err) = fx.base(&["rule", "stats", "--domain", "tools"]);
     assert_eq!(code, 0, "{out}{err}");
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines[0], format!("from the match log: 36 days (since {})", day_ago(35)));
+    assert_eq!(lines[0], format!("from the match log: {} days (since {})", covered(35, 0).0, covered(35, 0).1));
     let (lint, hooklog, new) = (short("tools", R_LINT), short("tools", R_HOOKLOG), short("tools", R_NEW));
     let w = lint.len();
     assert_eq!(lines[1], format!("| {:<w$} | served 30d | served all | corrected after | last served |", "rule"));
@@ -596,7 +598,7 @@ fn thresholds_from_config() {
     let (_, section, _) = fx.section();
     let has = |want: &str| assert!(section.contains(want), "missing {want:?} in:\n{section}");
     // dead_days 40: the 36-day log is too young for it.
-    has("   dead (not served in 40 days): not judged yet · the match log covers 36 days, fewer than [doctor] dead_days = 40");
+    has(&format!("   dead (not served in 40 days): not judged yet · the match log covers {} days, fewer than [doctor] dead_days = 40", covered(35, 0).0));
     // broad_share 0.2: tools at 25% is over it now.
     has("   noisy (matched by keyword on more than 20% of typed prompts, last 40 days): 2");
     // A 40-day window also holds the prompt 35 days ago (tools by `hook`) and the 3 decision prompts below.
@@ -616,7 +618,9 @@ fn thresholds_from_config() {
     matched.log(&log);
     let (_, section, _) = matched.section();
     let lines = lines_of(&section);
-    assert_eq!(lines[1], format!("   match log: 2 days (since {}) · 120 prompts · [log] prompt_text = \"matched\"", day_ago(1)), "{section}");
+    // The oldest row is a day and 119 minutes back: 2 days, or 3 when the run is just after midnight.
+    let (days, since) = covered(1, 119);
+    assert_eq!(lines[1], format!("   match log: {days} days (since {since}) · 120 prompts · [log] prompt_text = \"matched\""), "{section}");
     assert_eq!(lines[3], "   noisy: not judged · [log] prompt_text = \"matched\" keeps too little of a prompt to tell yours from a task notification", "{section}");
 
     // No [doctor] keys: the defaults.
