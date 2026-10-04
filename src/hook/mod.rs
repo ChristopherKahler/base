@@ -80,6 +80,16 @@ pub fn dispatch(event: &str) {
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
         return;
     }
+    // Not a Claude Code hook: the background process the first session start on a new version starts (BO-26, U1). It has
+    // no payload and no hook-log row (a row with no payload would read as a failed hook), and stands in the folder it was
+    // started in.
+    if event == "upgrade" {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Err(e) = crate::upgrade::run(&cwd) {
+            eprintln!("base hook upgrade: {e:#}");
+        }
+        return;
+    }
     let outcome = run(event);
     let (success, data, error) = match &outcome.result {
         Ok(d) => (true, Some(d), None),
@@ -214,6 +224,12 @@ fn run_event(
                 && let Err(why) = crate::emit::match_log::retain(&dir, config.log.prompt_days, chrono::Local::now())
             {
                 eprintln!("base: session start could not prune the match log: {why}");
+            }
+            // BO-26 (U1): the upgrade, when this is the first session start on a new version, in a process of its own that
+            // outlives this hook, after the print and after this session's own writes. The next session start says what it
+            // did.
+            if handled.is_ok() {
+                crate::upgrade::after_session_start(&config, &cwd);
             }
             handled?;
             Ok(HookEventData { session_id, ..Default::default() })

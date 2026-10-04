@@ -424,7 +424,9 @@ pub enum Commands {
         /// Self-heal: quarantine malformed lines and atomically rewrite the good set (backs up first)
         #[arg(long)]
         repair: bool,
-        /// Restore the workspace graph from a backup snapshot. Bare `--restore` lists snapshots.
+        /// Put back a backup base made: a graph snapshot (`graph.nq.bak-*`) in a tier's .base, or a
+        /// `<name>.toml.BAK-<date>-pre-<version>` an upgrade left beside a config file. A bare name is a workspace
+        /// snapshot. Bare `--restore` lists the workspace's snapshots. Anything else is refused.
         #[arg(long, num_args = 0..=1)]
         restore: Option<Option<String>>,
         /// Plan the repair of what doctor reports and change nothing: records of another workspace moved out,
@@ -748,6 +750,9 @@ pub enum CommandAction {
     Show {
         /// Command name (case-insensitive, without *)
         name: String,
+        /// Show the command as this version of base ships it in the starter pack, not your own copy
+        #[arg(long)]
+        shipped: bool,
     },
     /// Add a new star command to commands.toml
     Add {
@@ -4974,8 +4979,13 @@ pub fn run() {
                     println!("\n{} command(s) available. Type *NAME in a prompt to activate.", commands.len());
                 }
             }
-            CommandAction::Show { name } => {
-                let commands = command::load_commands(&cwd);
+            CommandAction::Show { name, shipped } => {
+                // `--shipped` (BO-26): the starter pack's text, which an upgraded user compares their own copy with.
+                let commands = if shipped {
+                    command::shipped_command(&name).into_iter().collect()
+                } else {
+                    command::load_commands(&cwd)
+                };
                 match commands.iter().find(|c| c.name.eq_ignore_ascii_case(&name)) {
                     Some(cmd) => {
                         println!("*{}", cmd.name);
@@ -4987,6 +4997,7 @@ pub fn run() {
                             println!("  {i}. {rule}");
                         }
                     }
+                    None if shipped => eprintln!("base ships no command '{name}' in its starter pack."),
                     None => eprintln!("Command '{name}' not found. Run `base commands list` to see available."),
                 }
             }
@@ -5421,15 +5432,19 @@ pub fn run() {
                     Err(e) => die("base doctor --measure", e),
                 }
             } else if let Some(which) = restore {
-                // --restore: workspace tier only (operator's corruptible graph).
-                let Some(base_dir) = base::config::find_workspace_base(&cwd) else {
-                    eprintln!("doctor --restore: no workspace .base/ found from {}", cwd.display());
-                    std::process::exit(1);
+                // --restore: a backup base made, in either tier (BO-26, Q4); a bare name or a bare `--restore` is the
+                // workspace's.
+                let base_dir = base::config::find_workspace_base(&cwd);
+                let need_ws = || -> std::path::PathBuf {
+                    base_dir.clone().unwrap_or_else(|| {
+                        eprintln!("doctor --restore: no workspace .base/ found from {}", cwd.display());
+                        std::process::exit(1);
+                    })
                 };
-                let ws = base_dir.join("graph.nq");
                 match which {
                     // Bare `--restore` → list available snapshots, mutate nothing.
                     None => {
+                        let ws = need_ws().join("graph.nq");
                         let baks = base::doctor::list_backups(&ws);
                         if json {
                             let rows: Vec<_> = baks
@@ -5447,13 +5462,47 @@ pub fn run() {
                             println!("\nRestore with: base doctor --restore <path>");
                         }
                     }
-                    // `--restore <name|path>` → resolve, snapshot current, swap in.
+                    // `--restore <name|path>` → resolve, refuse anything base did not make, snapshot current, swap in.
                     Some(arg) => {
                         let candidate = std::path::Path::new(&arg);
                         let backup = if candidate.is_absolute() {
                             candidate.to_path_buf()
                         } else {
-                            base_dir.join(&arg)
+                            need_ws().join(&arg)
+                        };
+                        let ws = match base::doctor::restorable(&cwd, &backup) {
+                            Ok(base::doctor::Restorable::Graph { graph }) => graph,
+                            Ok(base::doctor::Restorable::Config { file }) => {
+                                match base::doctor::restore_config(&file, &backup) {
+                                    Ok(aside) => {
+                                        let aside = aside.map(|a| a.display().to_string());
+                                        if json {
+                                            println!(
+                                                "{}",
+                                                serde_json::json!({
+                                                    "restored": file.display().to_string(),
+                                                    "from": backup.display().to_string(),
+                                                    "replaced_copy": aside,
+                                                })
+                                            );
+                                        } else {
+                                            println!("Restored {} from {}", file.display(), backup.display());
+                                            if let Some(a) = aside {
+                                                println!("  the file it replaced is at {a}");
+                                            }
+                                        }
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("doctor --restore failed: {e:#}");
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                            Err(why) => {
+                                eprintln!("doctor --restore: {why}");
+                                std::process::exit(1);
+                            }
                         };
                         match base::doctor::restore_tier(&ws, &backup) {
                             Ok(()) => {

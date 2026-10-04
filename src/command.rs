@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 // ─── Star command schema ────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct CommandDef {
     pub name: String,
     #[serde(default)]
@@ -17,6 +17,17 @@ pub struct CommandDef {
 struct CommandsFile {
     #[serde(default)]
     command: Vec<CommandDef>,
+}
+
+/// The commands a commands.toml text holds, in file order, or `None` when it does not parse.
+pub fn parse_commands(text: &str) -> Option<Vec<CommandDef>> {
+    toml::from_str::<CommandsFile>(text).ok().map(|f| f.command)
+}
+
+/// The star command named `name` (case-insensitive) as this build ships it in the starter pack (`base commands show
+/// <name> --shipped`, BO-26): what an upgraded user compares their own copy with.
+pub fn shipped_command(name: &str) -> Option<CommandDef> {
+    parse_commands(crate::install::STARTER_COMMANDS)?.into_iter().find(|c| c.name.eq_ignore_ascii_case(name))
 }
 
 // ─── Loading (tiered: global → workspace) ───────────────────

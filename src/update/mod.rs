@@ -518,13 +518,9 @@ pub fn spawn_background_update() {
     // Spawned and never waited on: the hook process exits immediately, the
     // child is reparented and finishes the download on its own. All three
     // stdio handles are null so nothing it does can print into a session.
-    let _ = std::process::Command::new(exe)
-        .arg("update")
-        .env("BASE_UPDATE_BACKGROUND", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    // `detached::spawn` (BO-26, U7): on Windows the child would otherwise hold the hook's stdout open, and the session
+    // start would wait for the whole download.
+    let _ = crate::detached::spawn(std::process::Command::new(exe).arg("update").env("BASE_UPDATE_BACKGROUND", "1"));
 }
 
 /// Clear the in-flight marker. Called by the child when it finishes, so a

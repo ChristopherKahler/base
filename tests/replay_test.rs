@@ -1375,7 +1375,8 @@ fn replay_handoff_lanes_and_tiers_hold_on_the_corpus_store() {
 
 /// BO-12 (build rule 13), on a corpus store: `base doctor --fix` plans and writes nothing; `--fix --yes` keeps doctor's
 /// count of corrections naming nothing as it was (the corpus writes one note in four as a correction, none naming a
-/// record, and since BO-25 (D18) those stay corrections), moves the seed's legacy `[signal] max_chars`, and cuts the
+/// record, and since BO-25 (D18) those stay corrections), removes the seed's legacy `[signal] max_chars` (the installer's
+/// 2000, BO-26 U6), and cuts the
 /// backups to `[graph] keep_backups`. The corpus workspace keeps every
 /// quad in `graph/ws/seed` under a folder named `ws`, the shape of a renamed workspace, so `--fix` leaves its records in
 /// place rather than moving the whole store out as another workspace's.
@@ -2007,4 +2008,58 @@ fn replay_bm25_admits_and_ranks_on_the_corpus() {
     assert!(admitted > 0, "control: no corpus prompt was served a rule on its score alone");
     assert!(partial > 0, "control: no block printed in part, so the ranking under the budget was not exercised");
     println!("replay bm25: {} prompts, {admitted} served a domain's rules by score, {partial} blocks printed in part", runs.len());
+}
+
+/// BO-26 (build rule 13: no action needed after an update), on a corpus store an older base ran in:
+/// its stamp, the 0.14.2 starter pack, and the seed's legacy `[signal] max_chars`. One session start, and doctor no longer
+/// asks for `--fix` or names the legacy key, the starter `*base` carries this version's `rule add`, the next session
+/// start prints each change once with its undo, and the one after prints none.
+#[test]
+fn replay_upgrade_needs_no_command_on_the_corpus_store() {
+    let case = cases().into_iter().next().expect("a corpus case");
+    let s = write_case_as(&case, "bo26-upgrade");
+    let gbl = s.home.join(".base-gbl");
+    std::fs::write(gbl.join(".hooks-wired-0.15.2"), "").expect("an older base's stamp");
+    let pack = include_str!("../src/starter-commands/0.14.2.toml").replace("\r\n", "\n");
+    std::fs::write(gbl.join("commands.toml"), &pack).expect("the starter pack 0.15.2 installed");
+    // Another workspace's project in this workspace's graph, so the repair writes the graph and leaves its snapshot, the
+    // one doctor then compares the graph against (lynx's U4 ruling on the "possible data loss" line).
+    let graph = s.ws.join(".base").join("graph.nq");
+    let mut text = std::fs::read_to_string(&graph).expect("the corpus graph");
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "<{ns}project/gone-project> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{ns}Project> <{ns}graph/ws/gone> .\n\
+         <{ns}project/gone-project> <{ns}name> \"gone-project\" <{ns}graph/ws/gone> .\n",
+        ns = seed::NS
+    ));
+    std::fs::write(&graph, text).expect("a foreign record");
+    let doctor = || run_base(&s, &["doctor"]).1;
+    let before = doctor();
+    for want in ["legacy: [signal] max_chars", "`base doctor --fix` plans the repair of"] {
+        assert!(before.contains(want), "control: doctor asks for {want:?} before:\n{before}");
+    }
+    let start = || {
+        let payload = serde_json::json!({
+            "cwd": s.ws.display().to_string(), "hook_event_name": "SessionStart", "source": "startup", "session_id": "bo26-replay",
+        });
+        let (code, out, err) = seed::run_hook(&s, "session-start", &payload, &[("BASE_NO_SPAWN", "1")]);
+        assert_eq!(code, 0, "{err}");
+        out.lines().filter(|l| l.trim_start().starts_with("upgrade:")).map(String::from).collect::<Vec<String>>()
+    };
+    assert!(start().is_empty(), "the first session start prints before the upgrade runs");
+    let after = doctor();
+    for gone in ["legacy: [signal] max_chars", "`base doctor --fix` plans the repair of", "possible data loss"] {
+        assert!(!after.contains(gone), "{gone:?} is still asked for after the upgrade:\n{after}");
+    }
+    assert!(after.contains("taken before base's own repair"), "the repair's own shrink, said plainly:\n{after}");
+    let commands = std::fs::read_to_string(gbl.join("commands.toml")).expect("commands.toml");
+    assert!(commands.contains("--fires-on"), "the starter *base follows the upgrade");
+    let lines = start();
+    assert!(lines.iter().any(|l| l.contains("global base.toml")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("global commands.toml")), "{lines:?}");
+    assert!(lines.iter().all(|l| !l.contains("undo") || l.contains("undo: base doctor --restore \"")), "{lines:?}");
+    assert!(start().is_empty(), "each change is said once");
+    println!("replay upgrade: {} lines once, doctor asks for nothing after one session start", lines.len());
 }

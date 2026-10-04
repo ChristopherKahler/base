@@ -434,13 +434,15 @@ fn doctor_reports_zero_broad_triggers_after_migration() {
         );
         assert!(human.contains("path trigger `.base-gbl` on `base-config` holds 1 registered project (fork-log)"), "{human}");
         assert!(!human.contains("auto_inject = false"), "D1: never the fix\n{human}");
-        assert!(!report.healthy, "a broad trigger counts against the verdict");
+        // BO-26 replaced "a broad trigger counts against the verdict": it is advice (lynx's G0 ruling on Q2).
+        assert!(report.trigger_faults.is_empty() && !report.trigger_advice.is_empty(), "{human}");
 
         let list = root.join("paths.toml");
         std::fs::write(&list, base::domain::paths::format_list(&base::domain::paths::suggest(root))).unwrap();
         base::domain::paths::apply_cmd(root, &list, false, true).unwrap();
         let report = base::doctor::diagnose(root);
         assert_eq!(report.trigger_faults, Vec::<String>::new(), "{}", base::doctor::format_human(&report));
+        assert_eq!(report.trigger_advice, Vec::<String>::new(), "P8: zero broad triggers\n{}", base::doctor::format_human(&report));
     });
 }
 

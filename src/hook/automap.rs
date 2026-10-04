@@ -636,12 +636,8 @@ pub fn delegate_wsl_contact(paths: &[String]) {
         }
         let _ = std::fs::write(&marker, p.as_bytes());
         let script = wsl_script(p);
-        let _ = Command::new("wsl")
-            .args(["-e", "sh", "-lc", &script])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        // `detached::spawn` (BO-26, U7): not the tool hook's own pipes, or Claude Code waits for `wsl` to finish.
+        let _ = crate::detached::spawn(Command::new("wsl").args(["-e", "sh", "-lc", &script]));
     }
 }
 
@@ -1270,12 +1266,9 @@ fn spawn_sync(app_root: &Path, register: bool) {
     if !register {
         cmd.env("BASE_AST_SKIP_REGISTER", "1");
     }
-    let _ = cmd
-        .current_dir(app_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    // `detached::spawn` (BO-26, U7): on Windows the build would otherwise hold the hook's stdout open, and the hook's
+    // caller would wait for the whole build (measured: end of file at 1.9 s for a hook that exited at 0.05 s).
+    let _ = crate::detached::spawn(cmd.current_dir(app_root));
 }
 
 #[cfg(test)]

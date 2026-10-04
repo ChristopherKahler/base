@@ -66,8 +66,9 @@ fn register_three(root: &Path) {
     register(root, "studio", "Documents/Studio");
 }
 
-/// (a) doctor names a broad trigger, the domain and the projects it holds, per tier, and the verdict is UNHEALTHY;
-/// a trigger on a folder inside a project, holding none, is not named; no line advises `auto_inject = false`.
+/// (a) doctor names a broad trigger, the domain and the projects it holds, per tier, as advice: since BO-26 (lynx's G0
+/// ruling on Q2) a broad trigger fires and is not counted against the verdict; a trigger on a folder inside a project,
+/// holding none, is not named; no line advises `auto_inject = false`.
 #[test]
 fn doctor_names_a_trigger_that_holds_registered_projects() {
     let tmp = home();
@@ -85,7 +86,11 @@ fn doctor_names_a_trigger_that_holds_registered_projects() {
         );
         assert!(!human.contains("path trigger `Documents/Studio/drafts`"), "a folder inside one project holds none: {human}");
         assert!(!human.contains("auto_inject = false"), "D1: never the fix\n{human}");
-        assert!(!report.healthy, "a broad trigger is a fault, not an advisory");
+        // BO-26 replaced "a broad trigger is a fault, not an advisory": it is advice, and only a trigger that cannot fire
+        // is a fault (this home's unrooted `*.md` still is).
+        assert!(!report.trigger_faults.iter().any(|f| f.contains("`Documents`")), "{:?}", report.trigger_faults);
+        assert!(report.trigger_faults.iter().any(|f| f.contains("`*.md` on `globbed` is not a rooted path")), "{:?}", report.trigger_faults);
+        assert!(report.trigger_advice.iter().any(|a| a.contains("path trigger `Documents` on `notes` holds 3")), "{:?}", report.trigger_advice);
     });
 
     let tmp = home();
