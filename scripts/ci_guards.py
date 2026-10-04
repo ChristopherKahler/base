@@ -13,7 +13,8 @@ before anything is installed. Each guard closes a way a false green reached a re
   no-test-filters      A hanging test was left out of the run and the total quoted anyway. ci.yml's
                        `cargo test` commands may carry no `--skip`, `--exclude`, test name or
                        target filter. Arguments are allowed by name; anything else fails.
-  timeouts             A hang ran for hours. Every job in ci.yml has `timeout-minutes`.
+  timeouts             A hang ran for hours. Every job in every workflow file has `timeout-minutes`;
+                       until BO-22 this read ci.yml alone, and release.yml's four jobs had none.
   test-count           Tests can vanish without failing (a target that stops compiling on one
                        platform, a test deleted). The `test result: ok. N passed` lines of a
                        `cargo test` log must sum to the platform's number in
@@ -287,14 +288,17 @@ def check_no_test_filters(root: Path) -> int:
 JOB = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 
 
-def check_timeouts(root: Path) -> int:
-    path = root / CI_WORKFLOW
-    if not path.is_file():
-        print(f"FAIL: {CI_WORKFLOW.as_posix()} does not exist")
-        return 2
+def workflow_jobs(path: Path) -> dict[str, bool]:
+    """Each job in a workflow file, and whether it sets a job-level `timeout-minutes`.
+
+    A job that calls a reusable workflow (`uses:` at job level) counts as set: GitHub refuses the
+    key there, and the called file is a workflow file whose own jobs this guard reads.
+    """
     jobs: dict[str, bool] = {}
     in_jobs, current = False, None
     for line in path.read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("#"):
+            continue  # a comment at column 0 does not end the jobs block
         if re.match(r"^\S", line):
             in_jobs, current = line.startswith("jobs:"), None
             continue
@@ -304,14 +308,29 @@ def check_timeouts(root: Path) -> int:
         if m:
             current = m.group(1)
             jobs[current] = False
-        elif current and re.match(r"^    timeout-minutes:\s*\d+\s*(#.*)?$", line):
+        elif current and re.match(r"^    (timeout-minutes:\s*\d+|uses:\s*\S+)\s*(#.*)?$", line):
             jobs[current] = True
-    if not jobs:
-        return fail([f"no jobs found in {CI_WORKFLOW.as_posix()}; this check read nothing"])
-    missing = [j for j, ok in jobs.items() if not ok]
-    if missing:
-        return fail([f"{CI_WORKFLOW.as_posix()}: job '{j}' has no timeout-minutes, so a hang runs for hours" for j in missing])
-    print(f"timeout-minutes: set on all {len(jobs)} job(s): {', '.join(jobs)}")
+    return jobs
+
+
+def check_timeouts(root: Path) -> int:
+    files = workflow_files(root)
+    if not files:
+        return fail([f"no workflow files under {WORKFLOWS.as_posix()}; this check read nothing"])
+    problems, read = [], []
+    for path in files:
+        rel = path.relative_to(root).as_posix()
+        jobs = workflow_jobs(path)
+        if not jobs:
+            problems.append(f"no jobs found in {rel}; this check read nothing there")
+            continue
+        problems += [f"{rel}: job '{j}' has no timeout-minutes, so a hang runs for hours" for j, ok in jobs.items() if not ok]
+        read.append((rel, list(jobs)))
+    if problems:
+        return fail(problems)
+    print(f"timeout-minutes: set on all {sum(len(j) for _, j in read)} job(s) in {len(read)} workflow file(s)")
+    for rel, jobs in read:
+        print(f"  {rel}: {', '.join(jobs)}")
     return 0
 
 
@@ -448,9 +467,34 @@ def selftest() -> int:
     root = tree({".github/workflows/ci.yml": "jobs:\n  a:\n    timeout-minutes: 5\n    steps:\n      - run: cargo build\n"})
     arm("no-test-filters: no cargo test at all fails", check_no_test_filters, (root,), 1, "read nothing")
 
-    arm("timeouts: every job has one", check_timeouts, (tree({".github/workflows/ci.yml": wf_ok}),), 0, "all 2 job(s)")
+    arm("timeouts: every job has one", check_timeouts, (tree({".github/workflows/ci.yml": wf_ok}),), 0,
+        "all 2 job(s) in 1 workflow file(s)")
     root = tree({".github/workflows/ci.yml": wf_ok.replace("    timeout-minutes: 15\n", "")})
-    arm("timeouts: a job without one fails and is named", check_timeouts, (root,), 1, "job 'clippy' has no timeout-minutes")
+    arm("timeouts: a job without one fails and is named", check_timeouts, (root,), 1,
+        ".github/workflows/ci.yml: job 'clippy' has no timeout-minutes")
+    # BO-22: release.yml's jobs had none and nothing noticed, because only ci.yml was read.
+    release_ok = (
+        "on:\n  push:\n    tags:\n      - 'v*'\n\njobs:\n"
+        "  docs-gate:\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    steps:\n      - run: cargo test --bin base help_docs\n"
+        "# a comment at column 0 between two jobs\n"
+        "  build:\n    needs: docs-gate\n    runs-on: ${{ matrix.os }}\n    timeout-minutes: 30\n    steps:\n"
+        "      - run: cargo build --release\n"
+    )
+    root = tree({".github/workflows/ci.yml": wf_ok, ".github/workflows/release.yml": release_ok})
+    arm("timeouts: every job in every workflow file has one", check_timeouts, (root,), 0,
+        "all 4 job(s) in 2 workflow file(s)")
+    root = tree({".github/workflows/ci.yml": wf_ok,
+                 ".github/workflows/release.yml": release_ok.replace("    timeout-minutes: 30\n", "")})
+    arm("timeouts: a job without one in a second workflow file, after a column-0 comment, fails naming file and job", check_timeouts, (root,), 1,
+        ".github/workflows/release.yml: job 'build' has no timeout-minutes", must_not_say="ci.yml: job")
+    root = tree({".github/workflows/ci.yml": wf_ok, ".github/workflows/other.yaml": "on: push\n"})
+    arm("timeouts: a workflow file with no jobs read fails", check_timeouts, (root,), 1,
+        "no jobs found in .github/workflows/other.yaml")
+    root = tree({".github/workflows/ci.yml": wf_ok, ".github/workflows/call.yml":
+                 "jobs:\n  call:\n    uses: ./.github/workflows/ci.yml\n  own:\n    runs-on: x\n    steps: []\n"})
+    arm("timeouts: a job calling a reusable workflow needs none, its neighbour still does", check_timeouts, (root,), 1,
+        ".github/workflows/call.yml: job 'own' has no timeout-minutes", must_not_say="job 'call'")
+    arm("timeouts: no workflow files fails", check_timeouts, (tree({"README.md": "no workflows\n"}),), 1, "read nothing")
 
     counts = "# comment\nlinux 12\nwindows 10\n"
     log = ("     Running unittests src/lib.rs\n\ntest result: ok. 7 passed; 0 failed; 1 ignored; 0 measured\n"
