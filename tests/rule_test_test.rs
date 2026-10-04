@@ -424,7 +424,7 @@ fn rule_update_refusals() {
     };
     refused(&["rule", "update", &id, "--fires-on", "four"], "would hold 4 --fires-on prompts; a rule holds at most 3");
     refused(&["rule", "update", &id, "--quiet-on", "q3"], "a rule holds at most 2");
-    refused(&["rule", "update", &id], "give --fires-on, --quiet-on or --clear-tests");
+    refused(&["rule", "update", &id], "give --fires-on, --quiet-on, --clear-tests, --protected or --unprotected");
     refused(&["rule", "update", "probe.ffffffff", "--fires-on", "x"], "no rule 'probe.ffffffff'");
     refused(&["rule", "update", "probe.xyz", "--fires-on", "x"], "is not a rule id");
     // A prompt in both lists can never pass (code review, finding 9).

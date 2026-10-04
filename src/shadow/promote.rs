@@ -459,13 +459,15 @@ fn toml_texts(cwd: &Path) -> Vec<(PathBuf, String)> {
 /// Approve each of `version`'s proposals through BO-16's review, recording what each wrote. A failure undoes what the
 /// earlier ones wrote, and says so.
 fn approve_all(config: &BaseConfig, cwd: &Path, version: &Version, broad_ok: bool) -> Result<Undo, String> {
-    // BO-12's backup path for store edits, and a copy of each domains.toml, before anything is written.
+    // BO-12's backup path for store edits, and a copy of each domains.toml, before anything is written. The snapshot is
+    // taken under the graph lock, as every other graph backup is, so no locked writer is part way through it.
     let op = format!("pre-{}", version.name);
     for (_, c) in tiers(cwd) {
         if let Ok(path) = crud::workspace_graph_path(&c)
             && path.is_file()
         {
-            crate::store::snapshot(&path, &op).map_err(|e| format!("backing up {}: {e:#}", path.display()))?;
+            crate::store::with_graph_lock(&path, || crate::store::snapshot(&path, &op))
+                .map_err(|e| format!("backing up {}: {e:#}", path.display()))?;
         }
     }
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
@@ -524,12 +526,6 @@ fn undo_steps(config: &BaseConfig, steps: &[Step], restoring: &str) -> Result<()
         }
         for g in &step.graphs {
             let tier_cwd = PathBuf::from(&g.tier_cwd);
-            if snapshotted.insert(g.tier_cwd.clone())
-                && let Ok(path) = crud::workspace_graph_path(&tier_cwd)
-                && path.is_file()
-            {
-                crate::store::snapshot(&path, &op).map_err(|e| format!("backing up {}: {e:#}", path.display()))?;
-            }
             let mut sparql: Vec<String> = Vec::new();
             // A supersede edge pair the approval wrote goes through `unlink_update`, which removes exactly the three quads
             // `link_update` writes (lynx's Q3 condition); the old record's status before is in `removed`, if it had one.
@@ -562,6 +558,10 @@ fn undo_steps(config: &BaseConfig, steps: &[Step], restoring: &str) -> Result<()
                 continue;
             }
             let (store, trig_path, _lock) = crud::lock_and_load(&tier_cwd).map_err(|e| format!("{e:#}"))?;
+            // Each tier's graph is backed up once per undo, under the lock just taken, before its first write.
+            if snapshotted.insert(g.tier_cwd.clone()) && trig_path.is_file() {
+                crate::store::snapshot(&trig_path, &op).map_err(|e| format!("backing up {}: {e:#}", trig_path.display()))?;
+            }
             crate::store::update_and_write(
                 &store,
                 &trig_path,
