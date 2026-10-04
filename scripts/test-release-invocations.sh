@@ -32,12 +32,41 @@ say() { printf '%s\n' "$*"; }
 bad() { printf '  FAIL  %s\n' "$*"; fail=$((fail + 1)); }
 ok()  { printf '  ok    %s\n' "$*"; }
 
-# The values release.sh has in scope when it runs its line.
-OLD="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+# The values release.sh has in scope when it runs its line. OLD is Cargo.toml's
+# version, whose tag exists once that version is released. A release commit is
+# tested before its tag exists: the release PR and its merge commit run this as a
+# required check, and `release.sh --tag` refuses a merge commit whose checks are
+# not green (BO-22). There the nearest version tag reachable from HEAD stands in
+# for it: the argv is the same, and the range only needs a tag that exists. Only
+# there: an untagged version with no `chore(release)` commit for it in that range
+# was changed by hand, and fails.
+CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+OLD="$CARGO_VERSION"
+if ! git rev-parse -q --verify "refs/tags/v$OLD" >/dev/null; then
+  OLD="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null | sed 's/^v//')"
+fi
 NEW="99.99.99"
 export OLD NEW
 
-say "Release invocations, against base $OLD"
+say "Release invocations, against base $CARGO_VERSION"
+stop() {
+  bad "$1"
+  say ""
+  say "FAIL -- nothing ran: $2"
+  exit 1
+}
+if [ -z "$OLD" ]; then
+  stop "v$CARGO_VERSION is not tagged and no version tag is reachable from HEAD, so release.sh's range has no start" \
+       "a clone without tags cannot test the release's command lines."
+elif [ "$OLD" = "$CARGO_VERSION" ]; then
+  say "  range: v$OLD..HEAD, from Cargo.toml's version"
+else
+  subjects="$(git log --format=%s "v$OLD..HEAD")"
+  awk -v want="chore(release): $CARGO_VERSION" '$0 == want || index($0, want " ") == 1 { found = 1 } END { exit !found }' <<<"$subjects" ||
+    stop "Cargo.toml says $CARGO_VERSION, which is not tagged, and no 'chore(release): $CARGO_VERSION' commit is in v$OLD..HEAD: was the version changed by hand?" \
+         "only a release commit may carry a version that has no tag yet."
+  say "  range: v$OLD..HEAD, from the nearest version tag: v$CARGO_VERSION is not tagged yet, so this is a release commit"
+fi
 say ""
 
 # ── scripts/release.sh ──────────────────────────────────────────────────────
@@ -66,9 +95,10 @@ say ""
 
 # ── .github/workflows/release.yml ───────────────────────────────────────────
 # The release body is extracted from CHANGELOG.md by tag name; GITHUB_REF_NAME
-# is what the workflow has, so that is what this gives it.
+# is what the workflow has, so that is what this gives it: the tag this
+# Cargo.toml's version is, or will be once `release.sh --tag` pushes it.
 say ".github/workflows/release.yml"
-GITHUB_REF_NAME="v$OLD"
+GITHUB_REF_NAME="v$CARGO_VERSION"
 export GITHUB_REF_NAME
 found=0
 while IFS= read -r line; do
