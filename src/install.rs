@@ -514,8 +514,9 @@ uri = "http://ops-sys.local/ontology#"
 
 # ─── [devmode] — per-response diagnostics ────────────────────
 # Appends a 🔧 DEVMODE block (loaded domains + context bracket) to each response.
+# Off by default. Turn it on while tuning a domain: base config set devmode.enabled true
 [devmode]
-enabled = true            # false = no diagnostic block
+enabled = false           # true = a diagnostic block on every response
 
 # ─── [bracket] — context-window pressure tiers ───────────────
 # Scales how much gets injected as the context window fills.

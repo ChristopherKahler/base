@@ -169,6 +169,7 @@ pub fn handle(
     // with the real folder last-touch, then decay cold projects active→deferred (and
     // revive the reverse) BEFORE signals surface, so the rendered state is already
     // true. Fail-open; gated on [protocol] enabled.
+    push_auto_archived(config, cwd, out);
     reconcile_active_state(config, cwd);
 
     // Emit operator profile (if configured)
@@ -422,7 +423,7 @@ fn push_rule_pass(session_id: Option<&str>, config: &BaseConfig, out: &mut Sessi
 /// pulse last, and the relay wake contract outlasts the operator profile and the notices. A kind
 /// missing from this table sorts after all of it, and `every_pushed_kind_has_a_place_in_the_layout`
 /// fails the build when one does.
-pub const LAYOUT: [(&str, Rank); 38] = [
+pub const LAYOUT: [(&str, Rank); 39] = [
     ("instructions", Rank::Pinned),
     ("graph-unhealthy", Rank::DueNow),
     ("reminders", Rank::DueNow),
@@ -437,6 +438,8 @@ pub const LAYOUT: [(&str, Rank); 38] = [
     ("matcher", Rank::Primary),
     // BO-26, U5: what an upgrade did, one line per change with its undo, once, beside the matcher's line.
     ("upgrade", Rank::Primary),
+    // BO-27, V4: a reminder the auto-archive pass archived, one line each with its undo, once, in the upgrade's shape.
+    ("reminder-archived", Rank::Primary),
     ("forks", Rank::Secondary),
     // BEFORE the working-set blocks it qualifies, deliberately. The trimmer takes the
     // bottom of a rank first, so a scope clause placed after the rows would be trimmed
@@ -498,12 +501,14 @@ const DATA_BLOCKS: [&str; 6] = ["reminders", "handoffs", "forks", "projects", "t
 /// their own trigger (migrate, hooks-wired, contract, automap) are not here: a failing map build
 /// or a duplicate contract repeats every session, and with no command their floor already names
 /// the file.
-pub const SHOWN_ONCE: [&str; 7] = [
+pub const SHOWN_ONCE: [&str; 8] = [
     "first-run",
     // BO-20: an announcement leaves the shadow state as it is produced.
     "matcher",
     // BO-26: an upgrade's lines leave its record as they are produced.
     "upgrade",
+    // BO-27: the archive it announces happens as the line is produced.
+    "reminder-archived",
     "update-applied",
     "relay-inbox",
     "relay-tasks",
@@ -758,6 +763,30 @@ impl SessionOutput {
             );
         }
 
+        // BO-27, V4: a reminder's archive warning counts as seen only once a session start has printed it. DUE NOW lists
+        // the first `items_shown` of its reminders (the first-screen pass may step it down), in `reminders` order, so
+        // exactly those lines printed. Recorded here, between the render and the print.
+        if let Some(signals) = &self.signals {
+            let printed = rendered
+                .blocks
+                .iter()
+                .find(|b| kind_of(b.id()) == "reminders")
+                .map(|b| b.items_shown())
+                .unwrap_or(0);
+            let first: Vec<String> = signals
+                .reminders
+                .iter()
+                .zip(&signals.reminders_first_warned)
+                .take(printed)
+                .filter(|(_, first)| **first)
+                .map(|(slug, _)| slug.clone())
+                .collect();
+            if let Err(why) =
+                crate::crud::reminder::mark_warned(crate::home::home_root().as_deref(), cwd, &config.namespace, &first)
+            {
+                eprintln!("base: session start could not record that it showed a reminder's archive warning: {why:#}");
+            }
+        }
         if let Some(signals) = self.signals {
             let in_full: HashSet<&str> = rendered
                 .blocks
@@ -1040,18 +1069,30 @@ fn check_and_banner(out: &mut SessionOutput) {
     }
 }
 
+/// R3: reminders 10+ days past due archive themselves, in every tier, once their warning has been shown for
+/// [`crate::crud::reminder::WARN_GRACE_DAYS`] (BO-27, V4). Not folded into `protocol::reconcile`: that pass is gated
+/// on `[protocol] enabled` and is workspace-only, and reminders are neither. Before signals render, so DUE NOW is
+/// already true.
+///
+/// Each archive is said once, here, with its undo: this pass is the only thing that archives automatically and it runs
+/// only at session start, so the start that archives is the start that says so. Until BO-27 its result was discarded
+/// (`let _ =`) and reminders left DUE NOW with no line anywhere. Fail-open: an error goes to stderr and the start goes
+/// on.
+fn push_auto_archived(config: &BaseConfig, cwd: &Path, out: &mut SessionOutput) {
+    match crate::crud::reminder::auto_archive_pass(crate::home::home_root().as_deref(), cwd, &config.namespace) {
+        Ok(archived) if !archived.is_empty() => {
+            let lines: Vec<String> = archived.iter().map(|a| a.line()).collect();
+            out.push("reminder-archived", &format!("{}\n", lines.join("\n")), lines.len());
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("base: the reminder auto-archive pass failed, nothing was archived: {e:#}"),
+    }
+}
+
 /// Mechanical active⇄deferred reconcile (task-artifact protocol). Fail-open: any
 /// error leaves graph state as-is and never blocks session start. Silent unless a
 /// status actually flipped (suppression principle — lastActive refreshes are noiseless).
 fn reconcile_active_state(config: &BaseConfig, cwd: &Path) {
-    // R3: reminders 10+ days past due archive themselves, in every tier. Not folded into
-    // `protocol::reconcile` — that pass is gated on `[protocol] enabled` and is workspace-only,
-    // and reminders are neither. Fail-open like the reconcile it sits beside.
-    let _ = crate::crud::reminder::auto_archive_pass(
-        crate::home::home_root().as_deref(),
-        cwd,
-        &config.namespace,
-    );
     // Spec C5: handoffs, forks, tasks and milestones that went cold are deferred, in every tier, before
     // signals render, so session start already shows the truth. Gated on `[defer] enabled`, false in code
     // (lane 3 verdicts, AMENDMENTS B). Fail-open like the passes beside it.

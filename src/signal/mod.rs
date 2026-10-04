@@ -84,6 +84,9 @@ pub struct SignalOutput {
     /// The slug of every reminder DUE NOW numbers, number 1 first, for the letters file
     /// `base reminder archive|snooze <number>` reads.
     pub reminders: Vec<String>,
+    /// One per entry of `reminders`: its line shows the archive warning for the first time (BO-27, V4). Session start
+    /// records `warnedAt` on the ones it printed.
+    pub reminders_first_warned: Vec<bool>,
     /// Every number session start prints (BO-06, F10): the header and the pulse read these, and each block's first line
     /// prints the same ones. Counted whether or not the signal listing the items is shown this session.
     pub counts: counts::Counts,
@@ -139,6 +142,7 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
     let mut diagnostics: Vec<String> = Vec::new();
     let mut letters: Vec<(char, String)> = Vec::new();
     let mut reminders: Vec<String> = Vec::new();
+    let mut reminders_first_warned: Vec<bool> = Vec::new();
     // Filled by the scans below as they list their items, each number once (BO-06, F10).
     let mut counts = counts::Counts::default();
     let layout = &config.session_start;
@@ -231,6 +235,7 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
             let n = due.slugs.len();
             counts.reminders_due = n;
             reminders = due.slugs;
+            reminders_first_warned = due.first_warned;
             let block = SignalBlock {
                 kind: "reminders",
                 text: due.text,
@@ -309,6 +314,7 @@ pub fn run_signals(cwd: &Path, config: &BaseConfig, hook: &str) -> Result<Signal
         diagnostics,
         letters,
         reminders,
+        reminders_first_warned,
         counts,
         state,
     })

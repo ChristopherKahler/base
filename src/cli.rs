@@ -1331,6 +1331,11 @@ pub enum ReminderAction {
         /// The reminder's slug, or its number in the last session start's DUE NOW
         slug: String,
     },
+    /// Bring an archived reminder back: it surfaces from its own time, or from now if that has passed
+    Unarchive {
+        /// The reminder's slug (`base reminder list --archived` prints it)
+        slug: String,
+    },
     /// Remove a reminder (hard delete)
     Remove { slug: String },
 }
@@ -3172,8 +3177,24 @@ pub fn run() {
         Some(Commands::Reminder { action }) => match action {
             ReminderAction::Add { name, due, at, in_dur } => {
                 match resolve_surface_at(due.as_deref(), at.as_deref(), in_dur.as_deref()) {
-                    Ok(surface_at) => match crud::reminder::add(&cwd, &config.namespace, &name, &surface_at, due.as_deref()) {
-                        Ok(slug) => println!("Reminder '{name}' set — surfaces at session start on/after {surface_at} (slug: {slug})"),
+                    Ok(surface_at) => match crud::reminder::set(
+                        base::home::home_root().as_deref(),
+                        &cwd,
+                        &config.namespace,
+                        &name,
+                        &surface_at,
+                        due.as_deref(),
+                    ) {
+                        // A name a tier already holds moves that reminder's one clock (BO-27, V5): an archived one is
+                        // revived, never left archived behind a "set".
+                        Ok((slug, outcome)) => {
+                            let what = match outcome {
+                                crud::reminder::SetOutcome::Created => "set",
+                                crud::reminder::SetOutcome::Moved => "moved (it already existed; its date changed)",
+                                crud::reminder::SetOutcome::Revived => "revived (it was archived)",
+                            };
+                            println!("Reminder '{name}' {what} — surfaces at session start on/after {surface_at} (slug: {slug})")
+                        }
                         Err(e) => die("Failed", e),
                     },
                     Err(e) => die("Invalid time", e),
@@ -3248,6 +3269,30 @@ pub fn run() {
                     Ok(changed) => {
                         for tier in changed {
                             println!("Reminder '{slug}' archived ({tier})");
+                        }
+                    }
+                    Err(e) => die("Failed", e),
+                }
+            }
+            ReminderAction::Unarchive { slug } => {
+                use crud::reminder::Unarchived;
+                let home = base::home::home_root();
+                match crud::reminder::unarchive(home.as_deref(), &cwd, &config.namespace, &slug) {
+                    Ok(Unarchived::NotFound) => die(
+                        "Failed",
+                        format!(
+                            "no reminder '{slug}' in any tier — nothing was unarchived. Searched:
+  {}",
+                            crud::reminder::searched_tiers(home.as_deref(), &cwd).join("
+  ")
+                        ),
+                    ),
+                    Ok(Unarchived::NotArchived) => {
+                        println!("Reminder '{slug}' is not archived; nothing changed (base reminder list shows it)")
+                    }
+                    Ok(Unarchived::Restored { tiers, surface_at }) => {
+                        for tier in tiers {
+                            println!("Reminder '{slug}' unarchived ({tier}) — surfaces at session start on/after {surface_at}");
                         }
                     }
                     Err(e) => die("Failed", e),

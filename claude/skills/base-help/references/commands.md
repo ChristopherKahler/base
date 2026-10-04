@@ -156,6 +156,7 @@ base reminder add --name "..." [--due YYYY-MM-DD] [--at <ISO-8601>] [--in 30s|3m
 base reminder snooze <slug> <duration>   # moves its due time and resets the archive clock
 base reminder archive <slug>             # handled: kept, never shown again (remove deletes)
 base reminder archive <number>           # snooze too: the number on its line in the last session start's DUE NOW
+base reminder unarchive <slug>           # back from an archive: surfaces from its own time, or from now if passed
 base reminder remove <slug>
 ```
 

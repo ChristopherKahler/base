@@ -2063,3 +2063,123 @@ fn replay_upgrade_needs_no_command_on_the_corpus_store() {
     assert!(start().is_empty(), "each change is said once");
     println!("replay upgrade: {} lines once, doctor asks for nothing after one session start", lines.len());
 }
+
+/// BO-27, V2 and V3, on a corpus store: sessions titled only by session start, each with a session start and its first
+/// corpus prompt, print no relay watcher line; a session registered by hand is reminded at its start; a session pinged
+/// by another is reminded at its next prompt, with the ping. Before BO-27 every session start and the first prompt of
+/// every session carried the line.
+#[test]
+fn replay_watcher_reminder_only_for_titles_in_use() {
+    let case = cases().into_iter().next().expect("a corpus case");
+    let s = write_case_as(&case, "bo27-relay");
+    let hook = |event: &str, session: &str, prompt: Option<&str>| {
+        let mut payload = serde_json::json!({
+            "cwd": s.ws.display().to_string(), "hook_event_name": event, "source": "startup", "session_id": session,
+        });
+        if let Some(p) = prompt {
+            payload["prompt"] = serde_json::Value::from(p);
+        }
+        let name = if prompt.is_some() { "user-prompt-submit" } else { "session-start" };
+        let (code, out, err) = seed::run_hook(&s, name, &payload, &[]);
+        assert_eq!(code, 0, "{name}: {err}");
+        out
+    };
+    let watcher = |out: &str| out.lines().filter(|l| l.starts_with("relay:") && l.contains("inbox watcher")).count();
+
+    let mut outputs = 0;
+    let mut lines = 0;
+    for (i, prompt) in prompts().iter().take(10).enumerate() {
+        let session = format!("bo27-quiet-{i:02}");
+        for out in [hook("SessionStart", &session, None), hook("UserPromptSubmit", &session, Some(prompt))] {
+            outputs += 1;
+            lines += watcher(&out);
+        }
+    }
+    assert_eq!(lines, 0, "{lines} watcher lines in {outputs} outputs of sessions titled only by session start");
+
+    let (code, _, err) = run_base_in_session(&s, &["relay", "register", "--as", "replay-hand"], "bo27-hand");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(watcher(&hook("SessionStart", "bo27-hand", None)), 1, "a title registered by hand is reminded");
+
+    let pinged = "bo27-pinged";
+    hook("SessionStart", pinged, None);
+    let reg = std::fs::read_to_string(s.home.join(".base-gbl").join(".base").join("sessions.json")).expect("sessions.json");
+    let reg: serde_json::Value = serde_json::from_str(&reg).expect("sessions.json parses");
+    let title = reg["sessions"]
+        .as_object()
+        .and_then(|m| m.values().find(|e| e["session_id"] == pinged))
+        .and_then(|e| e["title"].as_str())
+        .expect("session start drew a title")
+        .to_string();
+    let (code, _, err) =
+        run_base_in_session(&s, &["relay", "ping", "--to", &title, "--msg", "the corpus run finished"], "bo27-hand");
+    assert_eq!(code, 0, "{err}");
+    let next = hook("UserPromptSubmit", pinged, Some("what is next"));
+    assert!(next.contains("the corpus run finished") && watcher(&next) == 1, "pinged: the ping and the line:\n{next}");
+    println!("replay relay: 0 of {outputs} unused-title outputs carry the watcher line; registered 1 of 1; pinged 1 of 1");
+}
+
+/// BO-27, V4, on a corpus store: reminders 15 and 10 days overdue that no session start has warned about stay in DUE NOW
+/// with the warning at the first two starts (the first screen still fits), and archive at a start two days after the
+/// warning was first shown, one line each with its undo, once. Before BO-27 both were archived at the first start with
+/// no line.
+#[test]
+fn replay_overdue_reminders_are_warned_before_they_archive() {
+    let case = Case {
+        name: "bo27-overdue".into(),
+        reminders: vec![
+            (15, "Renew the wildcard certificate for the staging domain".into()),
+            (10, "Send the quarterly board pack".into()),
+            (3, "Book the venue for the offsite".into()),
+        ],
+        ..Case::default()
+    };
+    let s = write_case_as(&case, "bo27-overdue");
+    let start = || {
+        let (code, out, err) = run_session_start(&s, Some("bo27-overdue"));
+        assert_eq!(code, 0, "{err}");
+        (out, last_record(&s, "session-start"))
+    };
+    let archived = |out: &str| out.lines().filter(|l| l.starts_with("reminder: archived ")).map(String::from).collect::<Vec<_>>();
+    let in_two_days = (chrono::Local::now() + chrono::Duration::days(2)).format("%Y-%m-%d").to_string();
+    for run in 0..2 {
+        let (out, record) = start();
+        for (_, name) in &case.reminders[..2] {
+            let line = out.lines().find(|l| l.contains(name.as_str())).unwrap_or_else(|| panic!("start {run}: {name} left DUE NOW:\n{out}"));
+            assert!(line.contains(&format!("archives {in_two_days} unless reset")), "start {run}: {line}");
+        }
+        assert!(archived(&out).is_empty(), "start {run} archived something:\n{out}");
+        assert_eq!(record["first_screen_ok"], true, "start {run}: the first screen fits: {record}");
+    }
+
+    let graph = s.ws.join(".base").join("graph.nq");
+    let when = (chrono::Local::now() - chrono::Duration::days(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let text = std::fs::read_to_string(&graph).expect("the corpus graph");
+    let mut moved = 0;
+    let out: Vec<String> = text
+        .lines()
+        .map(|l| match l.find(&format!("<{}warnedAt> \"", seed::NS)) {
+            Some(at) => {
+                moved += 1;
+                let head = &l[..at + format!("<{}warnedAt> \"", seed::NS).len()];
+                let tail = &l[head.len()..];
+                format!("{head}{when}{}", &tail[tail.find('"').expect("a closing quote")..])
+            }
+            None => l.to_string(),
+        })
+        .collect();
+    assert_eq!(moved, 2, "the two warned reminders carry one warnedAt each");
+    std::fs::write(&graph, out.join("\n") + "\n").expect("the corpus graph, two days on");
+
+    let (third, _) = start();
+    let lines = archived(&third);
+    assert_eq!(lines.len(), 2, "{third}");
+    for (i, line) in lines.iter().enumerate() {
+        assert!(line.ends_with(&format!("undo: base reminder unarchive replay-reminder-{i}")), "{line}");
+    }
+    let (fourth, _) = start();
+    assert!(archived(&fourth).is_empty(), "said once:\n{fourth}");
+    let (_, listed, _) = run_base(&s, &["reminder", "list", "--archived"]);
+    assert!(case.reminders[..2].iter().all(|(_, n)| listed.contains(n.as_str())), "kept as archived:\n{listed}");
+    println!("replay reminders: 2 of 2 overdue kept and warned at 2 starts, archived with 2 undo lines at the third, 0 lines at the fourth");
+}

@@ -66,6 +66,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base reminder list`
 - `base reminder snooze`
 - `base reminder archive`
+- `base reminder unarchive`
 - `base reminder remove`
 - `base handoff`
 - `base handoff create`
@@ -1395,12 +1396,13 @@ Manage reminders
 Usage: base reminder <COMMAND>
 
 Commands:
-  add      Add a reminder (provide one of --in, --at, or --due)
-  list     List reminders
-  snooze   Move a reminder's surface time forward from now: 30s, 3m, 2h, 1d
-  archive  Archive a reminder: it stops surfacing and is kept. `remove` deletes
-  remove   Remove a reminder (hard delete)
-  help     Print this message or the help of the given subcommand(s)
+  add        Add a reminder (provide one of --in, --at, or --due)
+  list       List reminders
+  snooze     Move a reminder's surface time forward from now: 30s, 3m, 2h, 1d
+  archive    Archive a reminder: it stops surfacing and is kept. `remove` deletes
+  unarchive  Bring an archived reminder back: it surfaces from its own time, or from now if that has passed
+  remove     Remove a reminder (hard delete)
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -1475,6 +1477,22 @@ Usage: base reminder archive <SLUG>
 Arguments:
   <SLUG>
           The reminder's slug, or its number in the last session start's DUE NOW
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base reminder unarchive
+
+```text
+Bring an archived reminder back: it surfaces from its own time, or from now if that has passed
+
+Usage: base reminder unarchive <SLUG>
+
+Arguments:
+  <SLUG>
+          The reminder's slug (`base reminder list --archived` prints it)
 
 Options:
   -h, --help

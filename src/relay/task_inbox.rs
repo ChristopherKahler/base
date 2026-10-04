@@ -158,6 +158,12 @@ pub fn enqueue(ns: &NamespaceConfig, task: &InboxTask) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", sanitize(&task.slug)));
     write_json_atomic(&path, task)?;
+    // Both ends of the item now use their titles, so both are reminded to keep an inbox watcher (BO-27, V2). The
+    // sender's session is recorded only when the sending process holds its `from` title (`relay::sending_session`).
+    super::session_registry::mark_used(&[
+        (task.to_title.as_str(), task.to_session.as_str()),
+        (task.from.as_str(), task.from_session.as_str()),
+    ]);
 
     // Durable graph mirror — best-effort. A failure here must never sink the
     // relay: the JSON inbox is what actually drives delivery.
@@ -563,9 +569,19 @@ pub fn deliver_deferred(session_id: &str, phase: Phase) -> Option<super::Part> {
         return None;
     }
     let mut tasks: Vec<(PathBuf, InboxTask)> = Vec::new();
+    let mut addressed: Vec<&str> = Vec::new();
     for title in &titles {
-        tasks.extend(sort_inbox(title, session_id, None));
+        let mine = sort_inbox(title, session_id, None);
+        if !mine.is_empty() {
+            addressed.push(title.as_str());
+        }
+        tasks.extend(mine);
     }
+    // A title whose folder holds an item addressed to this session is in use, whoever wrote the file (BO-27, V2):
+    // `enqueue` marks what it writes, and this covers the rest. At once, not as a commit: the item was addressed to
+    // this session whether or not this prompt prints it.
+    let pairs: Vec<(&str, &str)> = addressed.into_iter().map(|t| (t, session_id)).collect();
+    super::session_registry::mark_used(&pairs);
     // A delivered ping past a day is history: never listed again, and its file stays until its sender is answered.
     tasks.retain(|(_, t)| t.status != "done" && !ping_is_stale(t));
     tasks.sort_by(|a, b| order_key(&a.1).cmp(&order_key(&b.1)));
