@@ -9,8 +9,10 @@ use crate::config::BracketConfig;
 
 // ─── Context Bracket ────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A session's depth. FRESH, a new session's, is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Bracket {
+    #[default]
     Fresh,
     Moderate,
     Depleted,
@@ -139,7 +141,7 @@ pub enum ReShow {
     Throttle { secs: u64 },
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SessionState {
     /// Session this instance is acting for. Not persisted — it is set at load and
     /// namespaces every dedup key below, so one session's injections cannot

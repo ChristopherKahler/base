@@ -101,6 +101,9 @@ pub struct PromptBlock {
     pub head: String,
     /// A ranked block's lines after its parts.
     pub tail: String,
+    /// Built by the matching (`user_prompt_submit::serve`, BO-20): a shadow candidate's fit puts its own in place of
+    /// these. Never read for the output.
+    pub matcher: bool,
 }
 
 /// One rule or decision of a ranked block: its line, its score, and what printing it records (D15) and logs (K1).
@@ -150,6 +153,7 @@ impl PromptBlock {
             parts: Vec::new(),
             head: String::new(),
             tail: String::new(),
+            matcher: false,
         }
     }
 
@@ -215,7 +219,7 @@ impl PromptBlock {
 }
 
 /// The blocks of one prompt, in the order the hook built them.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PromptBlocks {
     blocks: Vec<PromptBlock>,
 }

@@ -64,7 +64,7 @@ impl GlobalDecision {
 }
 
 /// Every live global decision in a store, by id. Superseded and transient records are not in it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GlobalDecisions {
     by_id: HashMap<String, GlobalDecision>,
 }
