@@ -493,6 +493,42 @@ fn replay_every_prompt_logs_what_it_matched_served_and_cut() {
     );
 }
 
+/// BO-19 (K8a, D15). The usage counts follow what the prompt hook printed: after the corpus runs, `base rule stats`
+/// counts each rule served exactly as often as the match log's rows list it under `served`, and a rule the budget
+/// withheld from a prompt is not counted served for it.
+#[test]
+fn replay_usage_counts_follow_the_hook() {
+    let runs = prompt_runs();
+    let ws = runs[0].ws.clone();
+    let home = ws.parent().expect("the seed root").join("home");
+    let s = seed::Seed { home, ws: ws.clone() };
+    let text = std::fs::read_to_string(ws.join(".base").join("match-log.jsonl")).expect("the corpus wrote a match log");
+    let rows: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).expect("a row")).collect();
+    let listed = |field: &str, id: &str| -> usize {
+        rows.iter()
+            .flat_map(|r| r[field].as_array().cloned().unwrap_or_default())
+            .filter(|i| i["kind"] == "rule" && i["id"] == id)
+            .count()
+    };
+    let (code, out, err) = run_base(&s, &["rule", "stats", "--json"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let stats: serde_json::Value = serde_json::from_str(&out).expect("rule stats --json");
+    let rules = stats["rules"].as_array().expect("rules");
+    assert!(!rules.is_empty(), "control: the corpus domains hold rules");
+    let (mut served_rules, mut withheld_only) = (0usize, 0usize);
+    for r in rules {
+        let id = r["id"].as_str().expect("an id");
+        let served = r["served_all"].as_u64().expect("served_all") as usize;
+        assert_eq!(served, listed("served", id), "{}: rule stats against the rows' served lists", r["rule"]);
+        assert_eq!(r["served_window"].as_u64(), Some(served as u64), "{}: every corpus row is from today", r["rule"]);
+        served_rules += usize::from(served > 0);
+        withheld_only += usize::from(served == 0 && listed("cut", id) > 0);
+    }
+    assert!(served_rules > 0, "control: the corpus serves rules");
+    assert!(withheld_only > 0, "control: the corpus withholds a rule it never serves, and that rule counts 0");
+    println!("replay usage: {} rules, {served_rules} served, {withheld_only} only ever withheld", rules.len());
+}
+
 /// BO-02 (F6c). The corpus runs at the shipped budgets, and those are now the size `base doctor --measure` found the
 /// host delivering whole on Claude Code 2.1.287: no prompt prints more than that, and a block larger than the old
 /// 4,000-byte cap prints whole. On the operator's store the always-on rules block is 9,372 bytes, and under the old

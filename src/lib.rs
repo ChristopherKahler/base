@@ -62,3 +62,4 @@ pub mod standards;
 pub mod store;
 pub mod supersede;
 pub mod update;
+pub mod usage;

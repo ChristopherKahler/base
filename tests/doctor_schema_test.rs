@@ -81,6 +81,7 @@ fn an_unmigrated_tier_says_so_and_counts_its_orphans() {
         trigger_faults: vec![],
         hook_output: vec![],
         next_steps: Vec::new(),
+        usage: Default::default(),
         seam: base::store::LOCK_SEAM_MARKER,
     };
     let human = base::doctor::format_human(&report);
@@ -111,6 +112,7 @@ fn a_migrated_tier_reports_its_schema_version_and_no_orphans() {
         trigger_faults: vec![],
         hook_output: vec![],
         next_steps: Vec::new(),
+        usage: Default::default(),
         seam: base::store::LOCK_SEAM_MARKER,
     };
     let human = base::doctor::format_human(&report);

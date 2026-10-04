@@ -1559,6 +1559,16 @@ pub enum RuleAction {
         #[arg(long)]
         rule: Option<String>,
     },
+    /// Each rule's numbers from the match log: times served in the last [doctor] dead_days days and in all, times a
+    /// correction followed in the same or the next turn, and the day it was last served. Read only
+    Stats {
+        /// Only this domain's rules
+        #[arg(long)]
+        domain: Option<String>,
+        /// Emit JSON instead of the table
+        #[arg(long)]
+        json: bool,
+    },
     /// List rules for a domain from the graph
     List {
         #[arg(long)]
@@ -4246,6 +4256,16 @@ pub fn run() {
                         }
                     }
                 }
+                RuleAction::Stats { domain: want_domain, json } => {
+                    // From where the operator stands, as `rule test` reads it: `--global` stands in the global tier.
+                    let want_domain = want_domain.map(|d| domain::canonical_name(&cwd, &d));
+                    let stats = base::usage::stats_for(&rule_cwd, &config, want_domain.as_deref());
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&stats).unwrap_or_else(|_| "{}".into()));
+                    } else {
+                        print!("{}", base::usage::render_stats(&stats));
+                    }
+                }
                 RuleAction::List { domain: name, include_superseded } => {
                     let name = domain::canonical_name(&cwd, &name);
                     // #53. Without --global this shows BOTH tiers, because the
@@ -5624,8 +5644,71 @@ mod tests {
             &["graph", "move", "--select", "domain:tools", "--to", "other", "--yes", "--dry-run"],
             &["project", "delete", "tools"],
             &["rule", "list", "--domain", "tools"],
+            &["rule", "stats"],
+            &["rule", "stats", "--domain", "tools", "--json"],
         ] {
             assert!(!rebuilds_index(args), "{args:?} changes nothing a prompt is served");
+        }
+    }
+
+    /// A command line split as bash splits it: on spaces; a double-quoted run kept whole, `\"` inside it a quote; a
+    /// single-quoted run kept whole and as written; a backslash outside quotes keeps the character after it.
+    fn shell_words(line: &str) -> Vec<String> {
+        let (mut out, mut word, mut quoted, mut single, mut any) = (Vec::new(), String::new(), false, false, false);
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' if !quoted => {
+                    single = !single;
+                    any = true;
+                }
+                c if single => word.push(c),
+                '\\' if quoted && chars.peek() == Some(&'"') => word.push(chars.next().unwrap_or('"')),
+                '\\' if !quoted => {
+                    if let Some(next) = chars.next() {
+                        word.push(next);
+                    }
+                }
+                '"' => {
+                    quoted = !quoted;
+                    any = true;
+                }
+                c if c.is_whitespace() && !quoted => {
+                    if any || !word.is_empty() {
+                        out.push(std::mem::take(&mut word));
+                    }
+                    any = false;
+                }
+                c => word.push(c),
+            }
+        }
+        if any || !word.is_empty() {
+            out.push(word);
+        }
+        out
+    }
+
+    /// BO-19 (lynx's G0 condition): every next step `base doctor`'s usage section and `base rule stats` print parses
+    /// with this binary's own parser, each form built by the functions the section prints with.
+    #[test]
+    fn every_usage_next_step_parses() {
+        assert_eq!(shell_words("a \"b c\" d"), ["a", "b c", "d"]);
+        assert_eq!(shell_words("x '$HOME it'\\''s' y"), ["x", "$HOME it's", "y"]);
+        let mut keywords = Vec::new();
+        for line in base::usage::next_step_examples() {
+            let words = shell_words(&line);
+            assert_eq!(words[0], "base", "{line}");
+            match Cli::try_parse_from(&words) {
+                Err(e) => panic!("{line} does not parse: {e}"),
+                Ok(Cli { command: Some(Commands::Rule { action: RuleAction::Replay { drop_keyword, .. }, .. }), .. }) => {
+                    keywords.extend(drop_keyword)
+                }
+                Ok(_) => {}
+            }
+        }
+        // A keyword a shell would act on reaches the command as written.
+        for kw in ["user prompt submit", "a&b|*.rs", "$HOME it's"] {
+            assert!(keywords.iter().any(|k| k == kw), "{kw:?} not read back: {keywords:?}");
         }
     }
 }

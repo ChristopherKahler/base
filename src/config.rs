@@ -486,19 +486,43 @@ impl Default for CorrectionsConfig {
 
 // ─── Doctor Config (F23) ─────────────────────────────────────
 
-/// `[doctor]`: what `base doctor` reports as stale.
+/// `[doctor]`: what `base doctor` reports as stale, and how it reads the match log for the rules and decisions that
+/// need attention (BO-19, K8, F14c). Every key has a default, so a base.toml written before BO-19 parses as before.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoctorConfig {
     /// A project's next step older than this many days is flagged (F23b; D12's "N days", 14 by lynx's pick).
     #[serde(default = "default_stale_next_days")]
     pub stale_next_days: i64,
+    /// A rule not served in this many days is dead (K8b). Also the window of the noisy list and the detector line.
+    #[serde(default = "default_dead_days")]
+    pub dead_days: u64,
+    /// A rule or decision served and then corrected at least this many times is ignored (K8b), when its share of
+    /// servings corrected is also at least twice the log's average (`usage::IGNORED_TIMES_AVERAGE`, lynx's gate-4 ruling).
+    #[serde(default = "default_ignored_after")]
+    pub ignored_after: usize,
+    /// F14c: a decision served at least this many times, and unchanged for `review_days`, is listed as "still true?".
+    #[serde(default = "default_review_served")]
+    pub review_served: usize,
+    /// F14c: days with no `base decision update` before a decision served `review_served` times is listed.
+    #[serde(default = "default_review_days")]
+    pub review_days: i64,
 }
 
 fn default_stale_next_days() -> i64 { 14 }
+fn default_dead_days() -> u64 { 30 }
+fn default_ignored_after() -> usize { 3 }
+fn default_review_served() -> usize { 20 }
+fn default_review_days() -> i64 { 60 }
 
 impl Default for DoctorConfig {
     fn default() -> Self {
-        Self { stale_next_days: default_stale_next_days() }
+        Self {
+            stale_next_days: default_stale_next_days(),
+            dead_days: default_dead_days(),
+            ignored_after: default_ignored_after(),
+            review_served: default_review_served(),
+            review_days: default_review_days(),
+        }
     }
 }
 
