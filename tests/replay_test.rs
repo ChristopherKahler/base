@@ -2252,9 +2252,11 @@ fn replay_upgrade_turns_the_installers_devmode_off_once() {
         // lynx's ruling: on this one start the paragraph may push the rest of the first screen (header, Pinned, DUE
         // NOW: everything above HANDOFFS) past the bar, by its own block and no more; the run counts as fitting and
         // its record names the block.
+        // What the paragraph adds there: its two lines, the blank line after them, and step 1's exception in the
+        // instructions (the same allowance session start gives the emitter).
         let screen = second.split("\nHANDOFFS").next().unwrap_or(&second);
-        let block = units(&format!("{}\n{}\n", lines[1], lines[2]));
-        assert!(units(screen).saturating_sub(block) <= 1990, "the screen without the paragraph fits:\n{second}");
+        let added = units(&format!("{}\n{}\n\n", lines[1], lines[2])) + units(" except the developer mode paragraph above");
+        assert!(units(screen).saturating_sub(added) <= 1990, "the screen without the paragraph fits:\n{second}");
         assert!(!err.contains("more than the first"), "no overflow reported:\n{err}");
         let rows = std::fs::read_to_string(s.ws.join(".base").join("hook-output.jsonl")).expect("hook-output.jsonl");
         let row: serde_json::Value = rows
