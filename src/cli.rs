@@ -170,9 +170,12 @@ pub enum Commands {
         target: Option<String>,
         /// Unattended: proceed past the extractor's file-count safety threshold
         /// without asking (what the hooks pass — nobody is there to answer).
-        /// With no terminal attached, the AST build is stopped after 15 minutes
+        /// The AST build is then stopped after 15 minutes, unless --no-time-limit is given
         #[arg(long)]
         yes: bool,
+        /// With --ast --yes: build with no time limit, for a tree too big to finish in 15 minutes (the hooks never pass it)
+        #[arg(long)]
+        no_time_limit: bool,
         /// Repair missing edges (backfill decision→domain, milestone→project, task→project links)
         #[arg(long)]
         repair: bool,
@@ -3314,7 +3317,7 @@ pub fn run() {
         },
 
         // ─── Sync ────────────────────────────────────────
-        Some(Commands::Sync { incremental, ast, target, yes, repair }) => {
+        Some(Commands::Sync { incremental, ast, target, yes, no_time_limit, repair }) => {
             if repair {
                 // The lines print after the write has landed: a repair that is on
                 // stdout is on disk.
@@ -3392,9 +3395,8 @@ pub fn run() {
                 // `None`: an unattended build stopped at its time limit (#174).
                 let status = if yes {
                     use base::hook::automap::{limit_for, run_unattended, unattended_limit, Unattended};
-                    use std::io::IsTerminal;
-                    // Unattended (no terminal): a time limit. At a terminal: none, a person is there (#174).
-                    let limit = limit_for(yes, std::io::stdin().is_terminal());
+                    // Every `--yes` run gets the time limit (#174) unless `--no-time-limit` lifts it; the hooks never pass that.
+                    let limit = limit_for(yes, no_time_limit);
                     run_unattended(&mut extractor, limit).map(|outcome| match outcome {
                         Unattended::Ended(status, stderr) => {
                             if status.success() {

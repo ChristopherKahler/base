@@ -368,9 +368,8 @@ pub fn session_start_notice(cwd: &Path) -> Option<String> {
         } else {
             "It will try again the next time Claude finishes a reply."
         };
-        // A tree that needs longer than the limit stops the same way every time; typed at a terminal, the same build has
-        // no limit (`limit_for`).
-        let by_hand = format!("To build it with no time limit, run base sync --ast --yes --target {root} in a terminal.");
+        // A tree that needs longer than the limit stops the same way every time: say how to build it without one.
+        let by_hand = format!("To build it with no time limit, run `base sync --ast --yes --no-time-limit --target {root}`.");
         return Some(if base_ast.join("ast.ttl").is_file() {
             format!(
                 "[AST] base stopped updating the code map for {root} after {span} because it was stuck. \
@@ -714,11 +713,11 @@ fn stopped_span(line: &str) -> Option<&str> {
     line.strip_prefix(STOPPED)?.strip_suffix(STUCK)
 }
 
-/// The limit a `sync --ast` run gets: one only when it is unattended, `--yes` with nobody at a terminal (the hooks,
-/// first contact, the WSL delegate and the git hook all start it with no terminal). A person who types
-/// `base sync --ast --yes` at a terminal gets no limit, which is the way to build a tree too big to finish in time.
-pub fn limit_for(yes: bool, at_terminal: bool) -> Option<Duration> {
-    (yes && !at_terminal).then(unattended_limit)
+/// The limit a `sync --ast` run gets: every `--yes` run, which is what every unattended path passes, unless
+/// `--no-time-limit` is given. The hooks never pass that; a person (or Claude for them) does, to build a tree too big to
+/// finish in time.
+pub fn limit_for(yes: bool, no_time_limit: bool) -> Option<Duration> {
+    (yes && !no_time_limit).then(unattended_limit)
 }
 
 /// The limit this run uses: [`UNATTENDED_LIMIT_SECS`], or a test's `BASE_AST_LIMIT_SECS`.

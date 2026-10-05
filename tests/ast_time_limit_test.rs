@@ -171,7 +171,7 @@ fn a_stopped_refresh_shows_at_session_start_even_with_a_map() {
         line(&record),
         Some(format!(
             "[AST] base stopped updating the code map for {} after 10 minutes because it was stuck. \
-             Your old map is still there. It will try again the next time Claude finishes a reply. To build it with no time limit, run base sync --ast --yes --target {} in a terminal.",
+             Your old map is still there. It will try again the next time Claude finishes a reply. To build it with no time limit, run `base sync --ast --yes --no-time-limit --target {}`.",
             app.display(),
             app.display()
         ))
@@ -187,7 +187,7 @@ fn a_stopped_refresh_shows_at_session_start_even_with_a_map() {
         line(&record),
         Some(format!(
             "[AST] base stopped updating the code map for {} after 10 minutes because it was stuck. \
-             Your old map is still there. It is trying again now, in the background. To build it with no time limit, run base sync --ast --yes --target {} in a terminal.",
+             Your old map is still there. It is trying again now, in the background. To build it with no time limit, run `base sync --ast --yes --no-time-limit --target {}`.",
             app.display(),
             app.display()
         ))
@@ -199,7 +199,7 @@ fn a_stopped_refresh_shows_at_session_start_even_with_a_map() {
         line(&record),
         Some(format!(
             "[AST] base stopped updating the code map for {} after 10 minutes because it was stuck. \
-             Your old map is still there. Another build is running now. To build it with no time limit, run base sync --ast --yes --target {} in a terminal.",
+             Your old map is still there. Another build is running now. To build it with no time limit, run `base sync --ast --yes --no-time-limit --target {}`.",
             app.display(),
             app.display()
         ))
@@ -211,21 +211,55 @@ fn a_stopped_refresh_shows_at_session_start_even_with_a_map() {
         line(&record),
         Some(format!(
             "[AST] base stopped building the code map for {} after 10 minutes because it was stuck. \
-             There is no map yet. It is trying again now, in the background. To build it with no time limit, run base sync --ast --yes --target {} in a terminal.",
+             There is no map yet. It is trying again now, in the background. To build it with no time limit, run `base sync --ast --yes --no-time-limit --target {}`.",
             app.display(),
             app.display()
         ))
     );
 }
 
-/// The limit is for runs nobody is at: `--yes` with no terminal. Typed at a terminal, or without `--yes`, no limit.
+/// Every `--yes` run has the limit; `--no-time-limit` lifts it; without `--yes` there is none.
 #[test]
-fn only_an_unattended_run_has_a_limit() {
+fn only_no_time_limit_lifts_the_limit() {
     use base::hook::automap::{limit_for, unattended_limit};
     assert_eq!(limit_for(true, false), Some(unattended_limit()));
     assert_eq!(limit_for(true, true), None);
     assert_eq!(limit_for(false, false), None);
     assert_eq!(limit_for(false, true), None);
+}
+
+/// The command the stopped-build line names really builds past the limit.
+#[test]
+fn no_time_limit_lets_a_long_build_finish() {
+    const SLOW: &str = r##"import sys, time
+from pathlib import Path
+out = Path(sys.argv[sys.argv.index("--out") + 1])
+time.sleep(5)
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text("# a map\n")
+"##;
+    let home = tempfile::tempdir().unwrap();
+    let app = home.path().join("dev").join("app");
+    std::fs::create_dir_all(app.join(".git")).unwrap();
+    std::fs::write(app.join("a.py"), "def f():\n    pass\n").unwrap();
+    let scripts = app.join("scripts").join("ast");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::write(scripts.join("onto_ast.py"), SLOW).unwrap();
+    let out = Command::new(BIN)
+        .args(["sync", "--ast", "--yes", "--no-time-limit", "--target"])
+        .arg(&app)
+        .current_dir(&app)
+        .env("BASE_HOME", home.path())
+        .env("BASE_AST_LIMIT_SECS", "2")
+        .env("BASE_AST_SKIP_REGISTER", "1")
+        .env("BASE_NO_AUTO_UPDATE", "1")
+        .env_remove("CLAUDECODE")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("AST extraction complete"), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(app.join(".base-ast").join("ast.ttl").is_file(), "a 5 s build finished past the 2 s limit");
 }
 
 #[test]

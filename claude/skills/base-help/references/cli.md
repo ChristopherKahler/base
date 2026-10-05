@@ -1812,7 +1812,10 @@ Options:
           Target directory for AST extraction (defaults to cwd)
 
       --yes
-          Unattended: proceed past the extractor's file-count safety threshold without asking (what the hooks pass — nobody is there to answer). With no terminal attached, the AST build is stopped after 15 minutes
+          Unattended: proceed past the extractor's file-count safety threshold without asking (what the hooks pass — nobody is there to answer). The AST build is then stopped after 15 minutes, unless --no-time-limit is given
+
+      --no-time-limit
+          With --ast --yes: build with no time limit, for a tree too big to finish in 15 minutes (the hooks never pass it)
 
       --repair
           Repair missing edges (backfill decision→domain, milestone→project, task→project links)
