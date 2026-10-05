@@ -32,8 +32,22 @@ fn graph(ws: &Path) -> String {
     std::fs::read_to_string(ws.join(".base").join("graph.nq")).unwrap_or_default()
 }
 
+/// The line for a link to a folder holding one excluded file.
+fn folder_line(link_rel: &str) -> String {
+    format!(
+        "base sync skipped {link_rel}: it links into private, which sync.exclude keeps out of the graph, so the 1 file under it was not read."
+    )
+}
+
+/// The line for a link to one excluded file.
+fn file_line(link_rel: &str) -> String {
+    format!(
+        "base sync skipped {link_rel}: it links to private/secret.md, which sync.exclude keeps out of the graph, so it was not read."
+    )
+}
+
 /// One leg: sync, then the excluded canary is nowhere in the graph, the public one is, and the link is named once.
-fn assert_excluded_through(ws: &Path, link_rel: &str, leg: &str) {
+fn assert_excluded_through(ws: &Path, want: &str, leg: &str) {
     let report = extract::sync(ws, &config(), false).unwrap();
     let g = graph(ws);
     assert!(g.contains("CANARY-PUBLIC-1"), "{leg}: control, the public note is synced");
@@ -41,13 +55,7 @@ fn assert_excluded_through(ws: &Path, link_rel: &str, leg: &str) {
     assert!(!g.to_lowercase().contains("secret"), "{leg}: nothing of the excluded note is in the graph");
     assert_eq!(report.excluded_links.len(), 1, "{leg}: one line per link: {:?}", report.excluded_links);
     let line = &report.excluded_links[0];
-    assert_eq!(
-        line,
-        &format!(
-            "base sync skipped {link_rel}: it links into private, which sync.exclude keeps out of the graph, so the 1 file under it was not read."
-        ),
-        "{leg}"
-    );
+    assert_eq!(line, want, "{leg}");
 }
 
 #[cfg(windows)]
@@ -75,7 +83,7 @@ fn exclude_holds_through_a_link() {
             std::fs::symlink_metadata(ws.join("notes").join("alias")).unwrap().file_type().is_symlink(),
             "a junction reads as a link"
         );
-        assert_excluded_through(ws, "notes/alias", "junction");
+        assert_excluded_through(ws, &folder_line("notes/alias"), "junction");
         legs_run.push("junction");
 
         let tmp = tempfile::tempdir().unwrap();
@@ -83,12 +91,25 @@ fn exclude_holds_through_a_link() {
         workspace(ws);
         match std::os::windows::fs::symlink_dir(ws.join("private"), ws.join("notes").join("alias")) {
             Ok(()) => {
-                assert_excluded_through(ws, "notes/alias", "directory symlink");
+                assert_excluded_through(ws, &folder_line("notes/alias"), "directory symlink");
                 legs_run.push("directory symlink");
             }
             // ERROR_PRIVILEGE_NOT_HELD: this account may not create symlinks.
             Err(e) if e.raw_os_error() == Some(1314) => {}
             Err(e) => panic!("symlink_dir failed for another reason: {e}"),
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        workspace(ws);
+        let target = ws.join("private").join("secret.md");
+        match std::os::windows::fs::symlink_file(&target, ws.join("notes").join("secret-link.md")) {
+            Ok(()) => {
+                assert_excluded_through(ws, &file_line("notes/secret-link.md"), "file symlink");
+                legs_run.push("file symlink");
+            }
+            Err(e) if e.raw_os_error() == Some(1314) => {}
+            Err(e) => panic!("symlink_file failed for another reason: {e}"),
         }
     }
 
@@ -98,14 +119,14 @@ fn exclude_holds_through_a_link() {
         let ws = tmp.path();
         workspace(ws);
         std::os::unix::fs::symlink("../private", ws.join("notes").join("alias")).unwrap();
-        assert_excluded_through(ws, "notes/alias", "directory symlink");
+        assert_excluded_through(ws, &folder_line("notes/alias"), "directory symlink");
         legs_run.push("directory symlink");
 
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         workspace(ws);
         std::os::unix::fs::symlink("../private/secret.md", ws.join("notes").join("secret-link.md")).unwrap();
-        assert_excluded_through(ws, "notes/secret-link.md", "file symlink");
+        assert_excluded_through(ws, &file_line("notes/secret-link.md"), "file symlink");
         legs_run.push("file symlink");
     }
 

@@ -4,7 +4,7 @@ pub mod paul_json;
 pub mod paul_md;
 pub mod paul_toml;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -306,8 +306,8 @@ fn discover_files(cwd: &Path, sync_config: &crate::config::SyncConfig) -> (Vec<P
     let root = crate::config::resolve(cwd);
     // Each directory is resolved once; a file costs one `lstat`, and only a file that is itself a link is resolved.
     let mut dirs: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
-    // link as walked → (where it leads, files not read through it)
-    let mut through: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    // link as walked → (where it leads, whether it is a folder, the files not read through it)
+    let mut through: BTreeMap<String, (String, bool, BTreeSet<PathBuf>)> = BTreeMap::new();
 
     for pattern in &sync_config.include {
         let full_pattern = format!("{}/{}", cwd.display(), pattern);
@@ -329,7 +329,8 @@ fn discover_files(cwd: &Path, sync_config: &crate::config::SyncConfig) -> (Vec<P
                     && excluded(&real)
                 {
                     let (link, leads_to) = first_link(cwd, &rel, root).unwrap_or_else(|| (rel.clone(), real.clone()));
-                    through.entry(link).or_insert((leads_to, 0)).1 += 1;
+                    let folder = cwd.join(&link).is_dir();
+                    through.entry(link).or_insert((leads_to, folder, BTreeSet::new())).2.insert(entry);
                     continue;
                 }
                 files.push(entry);
@@ -341,9 +342,18 @@ fn discover_files(cwd: &Path, sync_config: &crate::config::SyncConfig) -> (Vec<P
     files.dedup();
     let warnings = through
         .into_iter()
-        .map(|(link, (to, n))| {
-            let files = if n == 1 { "the 1 file under it was".to_string() } else { format!("the {n} files under it were") };
-            format!("base sync skipped {link}: it links into {to}, which sync.exclude keeps out of the graph, so {files} not read.")
+        .map(|(link, (to, folder, skipped))| match (folder, skipped.len()) {
+            (false, _) => format!(
+                "base sync skipped {link}: it links to {to}, which sync.exclude keeps out of the graph, so it was not read."
+            ),
+            (true, 1) => format!(
+                "base sync skipped {link}: it links into {to}, which sync.exclude keeps out of the graph, so the 1 file \
+                 under it was not read."
+            ),
+            (true, n) => format!(
+                "base sync skipped {link}: it links into {to}, which sync.exclude keeps out of the graph, so the {n} files \
+                 under it were not read."
+            ),
         })
         .collect();
     (files, warnings)
