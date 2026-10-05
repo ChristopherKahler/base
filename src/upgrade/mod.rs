@@ -327,9 +327,10 @@ fn announce(record: &mut Record, line: String) {
 
 fn failure_line(tier: &Tier, why: &str) -> String {
     format!(
-        "{LEAD} The cleanup of {} base data did not finish: {why}. What it could not fix was left as it was, and base \
+        "{LEAD} The cleanup of {} base data did not finish: {}. What it could not fix was left as it was, and base \
          will not try again by itself. To run it yourself: `base doctor --fix --yes`.",
-        whose(tier)
+        whose(tier),
+        why.trim_end_matches('.')
     )
 }
 
@@ -341,29 +342,17 @@ fn whose(tier: &Tier) -> &'static str {
 
 /// `1 entry`, `2 entries`.
 fn count(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
+    format!("{n} {}", crate::corrections::tune_pass::plural(n, one, many))
 }
 
 /// `a`, `a and b`, `a, b and c`.
 fn and_list(items: &[String]) -> String {
-    match items {
-        [] => String::new(),
-        [one] => one.clone(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
-    }
+    crate::first_run::join_names(&items.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 /// `4000` as `4,000`, the way a person reads a number.
 fn thousands(n: i64) -> String {
-    let digits = n.unsigned_abs().to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    if n < 0 { format!("-{out}") } else { out }
+    usize::try_from(n).map_or_else(|_| n.to_string(), crate::emit::prompt::thousands)
 }
 
 /// A tier whose upgrade stopped on an error: recorded as failed for this version, with the lines it had produced and one
@@ -512,12 +501,18 @@ fn repair_lines(tier: &Tier, report: &crate::fix::Report, toml_backup: Option<&P
     let mut out = Vec::new();
     // Where moved entries stop showing up: a workspace's data shows in that workspace, the global data in every one.
     let here = if tier.label == "global" { "in every workspace" } else { "here" };
+    // Entries sent to the global tier's own graph still show up in every workspace, this one included.
+    let global_graph = crate::home::home_root().map(|h| canonical(&h.join(".base-gbl").join(".base").join("graph.nq")));
     for t in report.tiers.iter().filter(|t| t.error.is_none() && t.skipped.is_none()) {
-        // Into a workspace registered and reachable here, where they show up now; or into a file of their own beside
-        // this tier's graph, which nothing reads.
-        let (mut back, mut folders, mut aside, mut files) = (0usize, Vec::new(), 0usize, Vec::new());
+        // Into the global data; into a workspace registered and reachable here, where they show up now; or into a file
+        // of their own beside this tier's graph, which nothing reads (no registered workspace by that name, one with no
+        // base data here, or several by that name).
+        let (mut to_global, mut back, mut folders, mut aside, mut files) = (0usize, 0usize, Vec::new(), 0usize, Vec::new());
         for f in &t.foreign {
             match &f.dest {
+                Dest::Workspace { path } if global_graph.as_ref() == Some(&canonical(Path::new(path))) => {
+                    to_global += f.records.len();
+                }
                 Dest::Workspace { path } => {
                     back += f.records.len();
                     folders.push(workspace_folder(path));
@@ -534,6 +529,13 @@ fn repair_lines(tier: &Tier, report: &crate::fix::Report, toml_backup: Option<&P
         files.sort();
         files.dedup();
         let mut sentences: Vec<String> = Vec::new();
+        if to_global > 0 {
+            let (belongs, them) = if to_global == 1 { ("belongs", "it") } else { ("belong", "them") };
+            sentences.push(format!(
+                "We moved {} that {belongs} to your global base data back into it, where every workspace sees {them}.",
+                count(to_global, "entry", "entries")
+            ));
+        }
         if back > 0 {
             let at: Vec<String> = folders.iter().map(|f| format!("`{f}`")).collect();
             let (whom, into) = if at.len() == 1 {
@@ -548,18 +550,20 @@ fn repair_lines(tier: &Tier, report: &crate::fix::Report, toml_backup: Option<&P
             ));
         }
         if aside > 0 {
-            let owner = if files.len() == 1 { "another workspace" } else { "other workspaces" };
-            let (belongs, they, shows) =
-                if aside == 1 { ("belongs", "It is", "it no longer shows") } else { ("belong", "They are", "they no longer show") };
+            let owner = if files.len() == 1 {
+                "another workspace, because base found no single place on this computer where that workspace keeps its"
+            } else {
+                "other workspaces, because base found no single place on this computer where those workspaces keep their"
+            };
+            let (they, shows) = if aside == 1 { ("It is", "it no longer shows") } else { ("They are", "they no longer show") };
             let file = if files.len() == 1 { "a separate file" } else { "separate files" };
             sentences.push(format!(
-                "We set aside {} that {belongs} to {owner} we could not find on this computer. {they} saved in {file} in \
-                 {} .base folder, so nothing was lost, but {shows} up {here}.",
+                "We set aside {} from {owner} data. {they} saved in {file} in {} .base folder, so nothing was lost, but \
+                 {shows} up {here}.",
                 count(aside, "entry", "entries"),
                 whose(tier)
             ));
         }
-        let mut changes = usize::from(back > 0) + usize::from(aside > 0);
         let mut also: Vec<String> = Vec::new();
         let mixups = t.corrections.linked.len() + t.supersession.len();
         if mixups > 0 {
@@ -567,7 +571,6 @@ fn repair_lines(tier: &Tier, report: &crate::fix::Report, toml_backup: Option<&P
                 "fixed {} in how entries point to the ones they replace",
                 count(mixups, "small mix-up", "small mix-ups")
             ));
-            changes += 1;
         }
         let mut snapshot = t.snapshot.clone();
         if let Some(c) = &t.compact
@@ -575,7 +578,6 @@ fn repair_lines(tier: &Tier, report: &crate::fix::Report, toml_backup: Option<&P
         {
             also.push("removed repeated lines".to_string());
             snapshot = snapshot.or_else(|| c.backup.clone());
-            changes += 1;
         }
         let deleted = t.backups.removed.len();
         if deleted > 0 {
@@ -595,15 +597,11 @@ fn repair_lines(tier: &Tier, report: &crate::fix::Report, toml_backup: Option<&P
         if sentences.is_empty() {
             continue;
         }
-        // A restore puts the graph back; it cannot bring back a deleted backup copy.
-        let lead = if deleted > 0 {
-            "To undo the rest"
-        } else if changes > 1 {
-            "To undo all of it"
-        } else {
-            "To undo it"
-        };
-        out.push(format!("{LEAD} {}{}", sentences.join(" "), undo(lead, snapshot.as_deref().map(Path::new))));
+        // The restore puts this tier's data back as it was before the cleanup. It does not take back copies the cleanup
+        // wrote elsewhere (each destination skips what it already holds), or bring back a deleted backup copy, so the
+        // line promises the data, not "all of it".
+        let lead = format!("To put {} base data back as it was", whose(tier));
+        out.push(format!("{LEAD} {}{}", sentences.join(" "), undo(&lead, snapshot.as_deref().map(Path::new))));
     }
     for c in report.config.iter().filter(|c| c.error.is_none()) {
         let put_back = undo("To put the old setting back", toml_backup);
@@ -801,6 +799,11 @@ mod tests {
         let mut t = tier_fix(Some(SNAP));
         t.foreign = vec![foreign(1, into_workspace("/home/u/a")), foreign(3, into_workspace("/home/u/b")), foreign(5, aside("gone"))];
         out.push(("4a back into two workspaces, and set aside", store_line(&ws, t)));
+        // Into the global tier's own graph: shown in every workspace, this one too (code review).
+        let global = crate::home::home_root().expect("a home").join(".base-gbl").join(".base").join("graph.nq");
+        let mut t = tier_fix(Some(SNAP));
+        t.foreign = vec![foreign(3, Dest::Workspace { path: global.display().to_string() })];
+        out.push(("4g back into the global data", store_line(&ws, t)));
         let mut t = tier_fix(None);
         t.compact = Some(Compaction { how: "base graph compact", lines_before: 1200, lines_after: 1100, backup: Some(SNAP.into()) });
         out.push(("4b repeated lines alone", store_line(&ws, t)));
@@ -952,11 +955,12 @@ mod tests {
             assert!(line(row).contains(&format!("`{command}`")), "row {row} lost `{command}`:\n{}", line(row));
         }
         // Rows 12a, 13 and 14 for a workspace's file: the line says which file to edit and what to set in it.
-        assert!(line("12a the paragraph, a workspace's file").contains("set `enabled = true` under `[devmode]` in /home/u/work/.base/base.toml"));
+        assert!(line("12a the paragraph, a workspace's file").contains("set `enabled = true` under `[devmode]` in `/home/u/work/.base/base.toml`"));
         assert!(line("13 a linked base.toml, a workspace's").contains("set `enabled = false` under `[devmode]` in that file."));
-        assert!(line("14 developer mode left on, a workspace's").contains("set `enabled = false` under `[devmode]` in /home/u/work/.base/base.toml."));
-        // A deleted backup copy cannot be restored, so a line that deleted some says the restore undoes the rest.
-        assert!(line("4c set aside, old copies deleted").contains(&format!("To undo the rest, run `{}`.", restore(SNAP))));
+        assert!(line("14 developer mode left on, a workspace's").contains("set `enabled = false` under `[devmode]` in `/home/u/work/.base/base.toml`."));
+        // The restore puts this tier's data back; it cannot take back copies written elsewhere or a deleted backup copy,
+        // so the line promises the data and nothing more (code review).
+        assert!(line("4c set aside, old copies deleted").contains(&format!("To put this workspace's base data back as it was, run `{}`.", restore(SNAP))));
         assert!(!line("4c one old copy deleted alone").contains("--restore"), "{}", line("4c one old copy deleted alone"));
 
         let row1 = line("1 the installer's max_chars");
@@ -980,15 +984,19 @@ mod tests {
         assert_eq!(
             line("4 set aside, two mix-ups"),
             format!(
-                "{LEAD} We set aside 13 entries that belong to another workspace we could not find on this computer. They \
-                 are saved in a separate file in this workspace's .base folder, so nothing was lost, but they no longer \
-                 show up here. We also fixed 2 small mix-ups in how entries point to the ones they replace. To undo all \
-                 of it, run `base doctor --restore \"{SNAP}\"`."
+                "{LEAD} We set aside 13 entries from another workspace, because base found no single place on this computer \
+                 where that workspace keeps its data. They are saved in a separate file in this workspace's .base folder, so \
+                 nothing was lost, but they no longer show up here. We also fixed 2 small mix-ups in how entries point to the \
+                 ones they replace. To put this workspace's base data back as it was, run `base doctor --restore \"{SNAP}\"`."
             )
         );
-        assert!(line("4 one entry set aside").contains("We set aside 1 entry that belongs to another workspace"));
-        assert!(line("4 one entry set aside").contains("It is saved in a separate file") && line("4 one entry set aside").contains("it no longer shows up here. To undo it,"));
-        assert!(line("4 set aside into two files, global").contains("6 entries that belong to other workspaces"));
+        assert!(line("4 one entry set aside").contains("We set aside 1 entry from another workspace, because"));
+        assert!(line("4 one entry set aside").contains("It is saved in a separate file") && line("4 one entry set aside").contains("it no longer shows up here. To put"));
+        assert!(line("4 set aside into two files, global").contains("6 entries from other workspaces, because base found no single place"));
+        assert!(line("4 set aside into two files, global").contains("To put your global base data back as it was"));
+        assert!(line("4g back into the global data").contains(
+            "We moved 3 entries that belong to your global base data back into it, where every workspace sees them."
+        ));
         assert!(line("4 set aside into two files, global").contains("in separate files in your global .base folder"));
         assert!(line("4 set aside into two files, global").contains("no longer show up in every workspace"));
         assert!(line("4a back into a workspace").contains(

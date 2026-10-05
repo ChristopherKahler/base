@@ -44,7 +44,7 @@ const TRACKER: &str = "https://github.com/ChristopherKahler/base/issues";
 pub const PRODUCT_LINE: &str = "base — Built by Chris Kahler";
 
 /// "a", "a and b", "a, b and c".
-fn join_names(names: &[&str]) -> String {
+pub(crate) fn join_names(names: &[&str]) -> String {
     match names {
         [] => String::new(),
         [one] => (*one).to_string(),

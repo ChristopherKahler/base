@@ -2062,7 +2062,10 @@ fn replay_upgrade_needs_no_command_on_the_corpus_store() {
     let lines = start();
     assert!(lines.iter().any(|l| l.contains("characters of your saved notes")), "{lines:?}");
     assert!(lines.iter().any(|l| l.contains("global commands.toml")), "{lines:?}");
-    assert!(lines.iter().all(|l| !l.contains("To undo") || l.contains(", run `base doctor --restore \"")), "{lines:?}");
+    assert!(
+        lines.iter().all(|l| !l.contains("base doctor --restore") || l.contains(", run `base doctor --restore \"")),
+        "{lines:?}"
+    );
     assert!(start().is_empty(), "each change is said once");
     println!("replay upgrade: {} lines once, doctor asks for nothing after one session start", lines.len());
 }

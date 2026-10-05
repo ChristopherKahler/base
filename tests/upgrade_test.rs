@@ -189,9 +189,13 @@ fn upgrade_runs_store_repair_once() {
     let lines = upgrade_lines(&second);
     assert!(
         lines.iter().any(|l| l.contains(
-            "We set aside 1 entry that belongs to another workspace we could not find on this computer. It is saved in a \
-             separate file in this workspace's .base folder, so nothing was lost, but it no longer shows up here."
-        ) && l.contains(&format!("To undo it, run `base doctor --restore \"{}", s.ws.join(".base").display()))),
+            "We set aside 1 entry from another workspace, because base found no single place on this computer where that \
+             workspace keeps its data. It is saved in a separate file in this workspace's .base folder, so nothing was lost, \
+             but it no longer shows up here."
+        ) && l.contains(&format!(
+            "To put this workspace's base data back as it was, run `base doctor --restore \"{}",
+            s.ws.join(".base").display()
+        ))),
         "{second}"
     );
     let third = start(&s);
@@ -761,9 +765,10 @@ fn doctor_says_why_a_graph_is_left_in_place() {
     let report = doctor(&s);
     assert!(
         report.contains(&format!(
-            "base found data saved under what looks like this workspace's earlier folder name ({NS}graph/ws/old-name). It \
-             is probably yours from before the folder was renamed. base will not move it by itself, because only you can \
-             say whose it is."
+            "base found data saved under what looks like this workspace's earlier folder name, `old-name` \
+             ({NS}graph/ws/old-name). It is at least as large as this workspace's own data (21 against 18), so it is \
+             probably yours from before the folder was renamed. base will not move it by itself, because only you can say \
+             whose it is."
         )),
         "{report}"
     );
@@ -995,7 +1000,7 @@ fn devmode_off_line_names_how_to_turn_it_back_on() {
     for want in [
         "turned developer mode off",
         "The 0.15 installer turned it on for everyone",
-        "a DEVMODE block listing which of your domains base loaded and why; your replies now end without it.",
+        "a DEVMODE block listing which of your domains base loaded and why. To see",
         "To see what base adds without the block, run `base log matches`.",
         "To turn developer mode back on, run `base config set devmode.enabled true` (while it is on, base does not update itself).",
         "To undo this change, run `base doctor --restore \"",
