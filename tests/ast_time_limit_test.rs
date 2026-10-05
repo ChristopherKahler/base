@@ -171,7 +171,8 @@ fn a_stopped_refresh_shows_at_session_start_even_with_a_map() {
         line(&record),
         Some(format!(
             "[AST] base stopped updating the code map for {} after 10 minutes because it was stuck. \
-             Your old map is still there. It will try again the next time Claude finishes a reply.",
+             Your old map is still there. It will try again the next time Claude finishes a reply. To build it with no time limit, run base sync --ast --yes --target {} in a terminal.",
+            app.display(),
             app.display()
         ))
     );
@@ -186,7 +187,8 @@ fn a_stopped_refresh_shows_at_session_start_even_with_a_map() {
         line(&record),
         Some(format!(
             "[AST] base stopped updating the code map for {} after 10 minutes because it was stuck. \
-             Your old map is still there. It is trying again now, in the background.",
+             Your old map is still there. It is trying again now, in the background. To build it with no time limit, run base sync --ast --yes --target {} in a terminal.",
+            app.display(),
             app.display()
         ))
     );
@@ -197,7 +199,8 @@ fn a_stopped_refresh_shows_at_session_start_even_with_a_map() {
         line(&record),
         Some(format!(
             "[AST] base stopped updating the code map for {} after 10 minutes because it was stuck. \
-             Your old map is still there. Another build is running now.",
+             Your old map is still there. Another build is running now. To build it with no time limit, run base sync --ast --yes --target {} in a terminal.",
+            app.display(),
             app.display()
         ))
     );
@@ -208,18 +211,30 @@ fn a_stopped_refresh_shows_at_session_start_even_with_a_map() {
         line(&record),
         Some(format!(
             "[AST] base stopped building the code map for {} after 10 minutes because it was stuck. \
-             There is no map yet. It is trying again now, in the background.",
+             There is no map yet. It is trying again now, in the background. To build it with no time limit, run base sync --ast --yes --target {} in a terminal.",
+            app.display(),
             app.display()
         ))
     );
 }
 
+/// The limit is for runs nobody is at: `--yes` with no terminal. Typed at a terminal, or without `--yes`, no limit.
 #[test]
-fn the_limit_is_ten_minutes_and_under_the_build_lock() {
-    assert_eq!(base::hook::automap::UNATTENDED_LIMIT_SECS, 600);
+fn only_an_unattended_run_has_a_limit() {
+    use base::hook::automap::{limit_for, unattended_limit};
+    assert_eq!(limit_for(true, false), Some(unattended_limit()));
+    assert_eq!(limit_for(true, true), None);
+    assert_eq!(limit_for(false, false), None);
+    assert_eq!(limit_for(false, true), None);
+}
+
+#[test]
+fn the_limit_is_fifteen_minutes_and_under_the_build_lock() {
+    // At least five times the longest unattended build measured on a real tree, and under the 30-minute build lock.
+    assert_eq!(base::hook::automap::UNATTENDED_LIMIT_SECS, 900);
     assert_eq!(
-        base::hook::automap::stopped_record(Duration::from_secs(600), b""),
-        "base stopped the code map build after 10 minutes because it was stuck.\n"
+        base::hook::automap::stopped_record(Duration::from_secs(900), b""),
+        "base stopped the code map build after 15 minutes because it was stuck.\n"
     );
     assert_eq!(base::hook::automap::spoken(Duration::from_secs(60)), "1 minute");
     assert_eq!(base::hook::automap::spoken(Duration::from_secs(90)), "90 seconds");

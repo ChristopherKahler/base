@@ -169,7 +169,8 @@ pub enum Commands {
         #[arg(long)]
         target: Option<String>,
         /// Unattended: proceed past the extractor's file-count safety threshold
-        /// without asking (what the hooks pass — nobody is there to answer)
+        /// without asking (what the hooks pass — nobody is there to answer).
+        /// With no terminal attached, the AST build is stopped after 15 minutes
         #[arg(long)]
         yes: bool,
         /// Repair missing edges (backfill decision→domain, milestone→project, task→project links)
@@ -3390,8 +3391,10 @@ pub fn run() {
                 let base_ast_dir = ast_ttl.parent().map(|p| p.to_path_buf());
                 // `None`: an unattended build stopped at its time limit (#174).
                 let status = if yes {
-                    use base::hook::automap::{run_unattended, unattended_limit, Unattended};
-                    let limit = unattended_limit();
+                    use base::hook::automap::{limit_for, run_unattended, unattended_limit, Unattended};
+                    use std::io::IsTerminal;
+                    // Unattended (no terminal): a time limit. At a terminal: none, a person is there (#174).
+                    let limit = limit_for(yes, std::io::stdin().is_terminal());
                     run_unattended(&mut extractor, limit).map(|outcome| match outcome {
                         Unattended::Ended(status, stderr) => {
                             if status.success() {
@@ -3415,7 +3418,10 @@ pub fn run() {
                             Some(status)
                         }
                         Unattended::Stopped(stderr) => {
-                            let _ = std::fs::write(&last_error, base::hook::automap::stopped_record(limit, &stderr));
+                            let _ = std::fs::write(
+                                &last_error,
+                                base::hook::automap::stopped_record(limit.unwrap_or_else(unattended_limit), &stderr),
+                            );
                             None
                         }
                     })

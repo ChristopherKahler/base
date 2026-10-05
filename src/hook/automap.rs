@@ -368,15 +368,18 @@ pub fn session_start_notice(cwd: &Path) -> Option<String> {
         } else {
             "It will try again the next time Claude finishes a reply."
         };
+        // A tree that needs longer than the limit stops the same way every time; typed at a terminal, the same build has
+        // no limit (`limit_for`).
+        let by_hand = format!("To build it with no time limit, run base sync --ast --yes --target {root} in a terminal.");
         return Some(if base_ast.join("ast.ttl").is_file() {
             format!(
                 "[AST] base stopped updating the code map for {root} after {span} because it was stuck. \
-                 Your old map is still there. {next}"
+                 Your old map is still there. {next} {by_hand}"
             )
         } else {
             format!(
                 "[AST] base stopped building the code map for {root} after {span} because it was stuck. \
-                 There is no map yet. {next}"
+                 There is no map yet. {next} {by_hand}"
             )
         });
     }
@@ -687,7 +690,7 @@ const BUILD_LOCK_SECS: u64 = 30 * 60;
 /// The longest an unattended code-map build (`sync --ast --yes`) may run (#174). Past it the build and every process it
 /// started are stopped, and `.last-error` says so. Below [`BUILD_LOCK_SECS`], so a stopped build is always gone before
 /// its `.building` lock lapses and lets a second build start beside it. A build by hand without `--yes` has no limit.
-pub const UNATTENDED_LIMIT_SECS: u64 = 10 * 60;
+pub const UNATTENDED_LIMIT_SECS: u64 = 15 * 60;
 const _: () = assert!(UNATTENDED_LIMIT_SECS < BUILD_LOCK_SECS);
 
 /// Shortens [`UNATTENDED_LIMIT_SECS`] for a test, in seconds. Not a `base.toml` key.
@@ -709,6 +712,13 @@ pub fn spoken(span: Duration) -> String {
 /// The span in a stopped build's `.last-error` line, or `None` for any other failure.
 fn stopped_span(line: &str) -> Option<&str> {
     line.strip_prefix(STOPPED)?.strip_suffix(STUCK)
+}
+
+/// The limit a `sync --ast` run gets: one only when it is unattended, `--yes` with nobody at a terminal (the hooks,
+/// first contact, the WSL delegate and the git hook all start it with no terminal). A person who types
+/// `base sync --ast --yes` at a terminal gets no limit, which is the way to build a tree too big to finish in time.
+pub fn limit_for(yes: bool, at_terminal: bool) -> Option<Duration> {
+    (yes && !at_terminal).then(unattended_limit)
 }
 
 /// The limit this run uses: [`UNATTENDED_LIMIT_SECS`], or a test's `BASE_AST_LIMIT_SECS`.
@@ -733,9 +743,10 @@ pub enum Unattended {
 /// still holding the pipe kept an unattended build waiting at no CPU for as long as nobody killed it. Past the limit
 /// the whole process tree is stopped: on Windows through a job object (which also takes the tree down if this process
 /// is killed), on Unix through the extractor's own process group.
-pub fn run_unattended(cmd: &mut Command, limit: Duration) -> std::io::Result<Unattended> {
+pub fn run_unattended(cmd: &mut Command, limit: Option<Duration>) -> std::io::Result<Unattended> {
     use std::io::Read;
-    let deadline = std::time::Instant::now() + limit;
+    // No limit (a person at a terminal): no deadline, but the same reading of stderr and the same stop for leftovers.
+    let deadline = limit.map(|limit| std::time::Instant::now() + limit);
     cmd.stdin(Stdio::null()).stderr(Stdio::piped());
     let tree = tree::Tree::prepare(cmd);
     let mut child = cmd.spawn()?;
@@ -769,7 +780,7 @@ pub fn run_unattended(cmd: &mut Command, limit: Duration) -> std::io::Result<Una
                 return Err(e);
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             break None;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -778,7 +789,8 @@ pub fn run_unattended(cmd: &mut Command, limit: Duration) -> std::io::Result<Una
         Some(status) => {
             // It ended, so its work is done. Something it started that still holds stderr is a leftover: a short grace
             // for the last bytes, then it is stopped rather than waited for.
-            let grace = Duration::from_secs(2).min(deadline.saturating_duration_since(std::time::Instant::now()));
+            let left = deadline.map_or(Duration::MAX, |d| d.saturating_duration_since(std::time::Instant::now()));
+            let grace = Duration::from_secs(2).min(left);
             if closed.recv_timeout(grace).is_err() {
                 tree.stop(&mut child);
                 let _ = closed.recv_timeout(Duration::from_secs(2));
