@@ -553,6 +553,9 @@ pub fn diagnose(cwd: &Path) -> DoctorReport {
     }
     // P3: a trigger still written relative works, and is worth writing out.
     warnings.extend(relative_trigger_advice(cwd));
+    // BO-28: the upgrade turned the 0.15 installer's developer mode off; for 14 days, and while nobody has set it since,
+    // doctor repeats how to see what base injects without it and how to turn it back on.
+    warnings.extend(crate::upgrade::devmode::advice(cwd));
     // K7e (BO-18): with no rule index the prompt hook serves keyword-only. A warning naming what builds it, never a
     // health verdict: a fresh install has none until its first session start (lynx's G0 verdict, Q6).
     warnings.extend(score_index_advice(cwd));

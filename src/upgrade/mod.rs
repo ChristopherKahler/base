@@ -11,6 +11,8 @@
 //! - **U2's mechanical part**: a path trigger written relative is written out as the full path it resolves to
 //!   ([`triggers`]), and the triggers 0.15.2 left inert and that fire now are named once.
 //! - **U3**: a starter command still as an earlier base shipped it gets this build's text ([`commands`]).
+//! - **BO-28**: a base.toml still holding the 0.15 installer's `[devmode] enabled = true` line is marked, and the next
+//!   session start turns developer mode off and says so first on its screen ([`devmode`]).
 //!
 //! Every change is backed up first and announced once with its undo, `base doctor --restore <backup>` (U5). The
 //! announcements wait in each tier's record until a session start prints them. Nothing a user wrote is deleted.
@@ -31,6 +33,7 @@
 //! `[graph] auto_migrate = false` turns all of it off.
 
 pub mod commands;
+pub mod devmode;
 pub mod triggers;
 
 use std::path::{Path, PathBuf};
@@ -70,6 +73,9 @@ pub struct Record {
     /// Lines no session start has printed yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub announce: Vec<String>,
+    /// The developer-mode step (BO-28): absent unless this tier's base.toml held the installer's line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devmode_off: Option<devmode::Off>,
 }
 
 /// A tier as the upgrade sees it.
@@ -292,6 +298,9 @@ pub fn run(cwd: &Path) -> Result<()> {
         if let Err(e) = upgrade_tier(cwd, tier, &due.from, &mut ctx) {
             record_failed(tier, &due.from, &format!("{e:#}"));
         }
+        // BO-28, after the tier's record is written whatever it came to: a store repair that failed does not keep the
+        // installer's developer mode on.
+        devmode::mark(tier);
     }
     Ok(())
 }

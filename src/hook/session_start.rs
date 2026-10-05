@@ -207,6 +207,7 @@ pub fn handle(
     push_rule_pass(session_id, config, out);
     refresh_score_index(graph.as_ref(), cwd, config);
     push_matcher(config, cwd, out);
+    push_devmode_off(config, cwd, out);
     push_upgrade(cwd, out);
 
     if let Ok(signal_result) = crate::signal::run_signals(cwd, config, "session-start") {
@@ -370,6 +371,23 @@ fn push_matcher(config: &BaseConfig, cwd: &Path, out: &mut SessionOutput) {
     }
 }
 
+/// BO-28: the 0.15 installer's developer mode, turned off by this start and said here, once, first on the screen
+/// ([`crate::upgrade::devmode`]). Before [`push_upgrade`], so the line about a tier that could not be changed is among that
+/// block's lines in this same start. Nothing at all unless an upgrade marked a tier due: one small file read per tier.
+fn push_devmode_off(config: &BaseConfig, cwd: &Path, out: &mut SessionOutput) {
+    if !config.graph.auto_migrate {
+        return;
+    }
+    let paragraphs = crate::upgrade::devmode::at_session_start(cwd);
+    if !paragraphs.is_empty() {
+        let text = format!("{}
+{}
+", crate::upgrade::devmode::HEADER, paragraphs.join("
+"));
+        out.push("devmode-off", &text, paragraphs.len());
+    }
+}
+
 /// BO-26 (U5): what an earlier upgrade did, each change with its undo, once. Nothing at all for a home that was never
 /// upgraded: one small file read per tier.
 fn push_upgrade(cwd: &Path, out: &mut SessionOutput) {
@@ -423,7 +441,10 @@ fn push_rule_pass(session_id: Option<&str>, config: &BaseConfig, out: &mut Sessi
 /// pulse last, and the relay wake contract outlasts the operator profile and the notices. A kind
 /// missing from this table sorts after all of it, and `every_pushed_kind_has_a_place_in_the_layout`
 /// fails the build when one does.
-pub const LAYOUT: [(&str, Rank); 39] = [
+pub const LAYOUT: [(&str, Rank); 40] = [
+    // BO-28: the upgrade turned the 0.15 installer's developer mode off at this start. First, above the instructions,
+    // and `Pinned`, so no budget pass shortens it and it is always inside the first screen. Printed at one start only.
+    ("devmode-off", Rank::Pinned),
     ("instructions", Rank::Pinned),
     ("graph-unhealthy", Rank::DueNow),
     ("reminders", Rank::DueNow),
@@ -501,8 +522,10 @@ const DATA_BLOCKS: [&str; 6] = ["reminders", "handoffs", "forks", "projects", "t
 /// their own trigger (migrate, hooks-wired, contract, automap) are not here: a failing map build
 /// or a duplicate contract repeats every session, and with no command their floor already names
 /// the file.
-pub const SHOWN_ONCE: [&str; 7] = [
+pub const SHOWN_ONCE: [&str; 8] = [
     "first-run",
+    // BO-28: the paragraph leaves the tier's record as the change is made.
+    "devmode-off",
     // BO-20: an announcement leaves the shadow state as it is produced.
     "matcher",
     // BO-26: an upgrade's lines leave its record as they are produced.
@@ -659,7 +682,7 @@ impl SessionOutput {
             placed.push(Placed {
                 id: "instructions".to_string(),
                 kind: "instructions".to_string(),
-                text: instruction_block(&letters),
+                text: instruction_block(&letters, placed.iter().any(|p| p.kind == "devmode-off")),
                 total: 0,
                 shown: 0,
                 fits: Vec::new(),
@@ -849,10 +872,13 @@ struct Placed {
 ///
 /// After: 617 units of instructions; on the copy of Chris's store, all 5 due reminders print and the
 /// first screen measures under the 1,990 bar (FINAL STATE of BO-06 has the numbers).
-pub fn instruction_block(letters: &[(char, String)]) -> String {
-    let mut s = String::from(
+///
+/// `devmode_off`: this start printed the developer-mode paragraph above it (BO-28), which step 1 then lets through.
+pub fn instruction_block(letters: &[(char, String)], devmode_off: bool) -> String {
+    let prepended = if devmode_off { "Nothing prepended except the developer mode paragraph above." } else { "Nothing prepended." };
+    let mut s = format!(
         "DO THIS FIRST IN YOUR FIRST REPLY:\n\
-         1. Show DUE NOW, then HANDOFFS, exactly as lettered. Nothing prepended. No \"is this stale?\" questions.\n\
+         1. Show DUE NOW, then HANDOFFS, exactly as lettered. {prepended} No \"is this stale?\" questions.\n\
          2. The user names a handoff: run `base handoff show <what they said>` and read the doc it prints.\n\
          3. Snooze or archive a letter: `base handoff snooze <slug> <N>` · `base handoff archive <slug>`. A handled reminder: `base reminder archive <number>`.\n\
          4. FORKS are side-work, not lettered: `base fork snooze <title> <N>` · `base fork archive <title>`.\n\
