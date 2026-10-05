@@ -6,6 +6,9 @@
 //! session-start stamp, `.hooks-wired-0.15.2`; a home without one is new. Session start runs with `BASE_NO_SPAWN=1`, so the
 //! upgrade it would start in the background runs before the hook exits and what each test reads is settled; one test
 //! drives the real background process.
+//!
+//! BO-28 adds the developer-mode step: a base.toml holding the 0.15 installer's `[devmode]` line is marked by that
+//! upgrade, and the next session start turns developer mode off and says so first (the tests at the end).
 
 mod seed;
 
@@ -771,4 +774,254 @@ fn upgrade_from_0_15_2_keeps_overdue_reminders() {
         }
         start(&s);
     }
+}
+
+// ─── BO-28: the 0.15 installer's developer mode ───────────────────────────
+
+/// The `[devmode]` line every installer from 0.13.0 to 0.15.2 wrote, byte for byte.
+const DEVMODE_015: &str = "enabled = true            # false = no diagnostic block";
+/// The line 0.16's installer writes, and what the upgrade turns the one above into.
+const DEVMODE_016: &str = "enabled = false           # true = a diagnostic block on every response";
+/// A global base.toml as a 0.15 installer left it, with a line of the user's own above it.
+const BASE_TOML_015: &str = "# my settings\n\n# Appends a DEVMODE block (loaded domains + context bracket) to each response.\n[devmode]\n\
+                             enabled = true            # false = no diagnostic block\n\n[bracket]\nenabled = true\n";
+
+/// The paragraph a session start printed under its developer-mode heading, if it printed one.
+fn devmode_paragraph(out: &str) -> Option<String> {
+    let mut lines = out.lines();
+    lines.find(|l| l.starts_with("DEVELOPER MODE TURNED OFF"))?;
+    lines.next().map(str::to_string)
+}
+
+/// The backup a paragraph's `base doctor --restore` names.
+fn restore_path(paragraph: &str) -> String {
+    let (_, tail) = paragraph.rsplit_once("base doctor --restore \"").expect("the paragraph names a restore");
+    tail.trim_end_matches('"').to_string()
+}
+
+/// One prompt in the session the starts belong to.
+fn prompt(s: &Seed) -> String {
+    let payload = serde_json::json!({
+        "cwd": s.ws.display().to_string(),
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "what changed in the build since yesterday",
+        "session_id": "bo26-session",
+    });
+    let (code, out, err) = run_hook(s, "user-prompt-submit", &payload, &[]);
+    assert_eq!(code, 0, "prompt failed:\n{out}\n{err}");
+    out
+}
+
+/// A home an older base ran in whose global base.toml is the 0.15 installer's.
+fn home_015(tag: &str) -> Seed {
+    let s = home(tag);
+    write(&gbl(&s).join("base.toml"), BASE_TOML_015);
+    upgraded(&s);
+    s
+}
+
+/// W1: the 0.15 installer's line becomes 0.16's, and nothing else in the file changes; the file is copied aside first, and
+/// the tier's record says when and where. Never again: a file put back by hand stays on.
+#[test]
+fn upgrade_turns_installer_devmode_off() {
+    let s = home_015("devmode-off");
+    let toml = gbl(&s).join("base.toml");
+    start(&s);
+    assert_eq!(read(&toml), BASE_TOML_015, "the first start's upgrade only marks it");
+    assert_eq!(record(&gbl(&s).join(".base"))["devmode_off"]["status"], "due");
+
+    start(&s);
+    assert_eq!(read(&toml), BASE_TOML_015.replace(DEVMODE_015, DEVMODE_016), "only the [devmode] line changed");
+    let backups = upgrade_backups(&toml);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(read(&backups[0]), BASE_TOML_015, "backed up as it was");
+    let rec = record(&gbl(&s).join(".base"));
+    assert_eq!(rec["devmode_off"]["status"], "done", "{rec}");
+    let recorded = PathBuf::from(rec["devmode_off"]["backup"].as_str().expect("the backup is recorded"));
+    assert_eq!(recorded.file_name(), backups[0].file_name(), "{rec}");
+    assert!(rec["devmode_off"]["at"].is_string(), "{rec}");
+
+    // The user puts it back: no later start turns it off again.
+    write(&toml, BASE_TOML_015);
+    for _ in 0..2 {
+        start(&s);
+    }
+    assert_eq!(read(&toml), BASE_TOML_015, "turned off once, never again");
+}
+
+/// W1, Example 2: developer mode turned on by `base config set` (the whole file written again, its comments gone), or a
+/// line with a comment of the user's own, is theirs: no change, no backup, no line, no advice.
+#[test]
+fn user_set_devmode_is_kept() {
+    let s = home("devmode-kept");
+    let toml = gbl(&s).join("base.toml");
+    write(&toml, BASE_TOML_015);
+    let (code, out, err) = run_base(&s, &["config", "set", "devmode.enabled", "true"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let by_command = read(&toml);
+    assert!(!by_command.contains("# false = no diagnostic block"), "control: the command wrote the file again:\n{by_command}");
+    let by_hand = home("devmode-hand");
+    write(&gbl(&by_hand).join("base.toml"), "[devmode]\nenabled = true            # mine, kept on on purpose\n");
+    for (s, kept) in [(&s, by_command), (&by_hand, read(&gbl(&by_hand).join("base.toml")))] {
+        upgraded(s);
+        for n in 0..3 {
+            let out = start(s);
+            assert!(devmode_paragraph(&out).is_none(), "start {n}:\n{out}");
+        }
+        let toml = gbl(s).join("base.toml");
+        assert_eq!(read(&toml), kept);
+        assert!(upgrade_backups(&toml).is_empty(), "{:?}", upgrade_backups(&toml));
+        assert_eq!(record(&gbl(s).join(".base"))["devmode_off"], serde_json::Value::Null);
+        assert!(!doctor(s).contains("turned developer mode off"));
+        assert!(prompt(s).contains("DEVMODE"), "still on");
+    }
+}
+
+/// W2a: the paragraph is the first thing under the header, whole, at the start that turns developer mode off, even when
+/// that start is over its byte budget and every other block is cut to its one line.
+#[test]
+fn devmode_off_line_is_on_the_first_screen() {
+    let s = home_015("devmode-screen");
+    with_foreign(&s);
+    write(&gbl(&s).join("commands.toml"), &PACK_0142.replace("\r\n", "\n"));
+    write(&gbl(&s).join("base.toml"), &format!("{BASE_TOML_015}\n[budget]\nsession_start_bytes = 1000\n"));
+    start(&s);
+    let out = start(&s);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines.len() > 2, "{out}");
+    assert!(lines[1].starts_with("DEVELOPER MODE TURNED OFF"), "first under the header:\n{out}");
+    let paragraph = devmode_paragraph(&out).expect("the paragraph");
+    assert_eq!(lines[2], paragraph);
+    assert!(paragraph.ends_with('"') && paragraph.contains("base doctor --restore \""), "whole:\n{paragraph}");
+    let full = read(&s.ws.join(".base").join("hook-output").join("bo26-session").join("session-start.md"));
+    assert!(!upgrade_lines(&full).is_empty(), "control: the upgrade had its own lines this start:\n{full}");
+    assert!(upgrade_lines(&out).is_empty(), "control: the budget cut them to one line:\n{out}");
+}
+
+/// W2b, W2c: what changed and why, what the block did, where to see the same thing without it, the command that turns it
+/// back on and the restore of a backup that exists; the instruction block lets the paragraph through on that start only.
+#[test]
+fn devmode_off_line_names_how_to_turn_it_back_on() {
+    let s = home_015("devmode-words");
+    // A reminder due today: DUE NOW prints at every start, and with it the instruction block.
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let (code, out, err) = run_base(&s, &["reminder", "add", "--name", "renew the domain", "--due", &today]);
+    assert_eq!(code, 0, "{out}{err}");
+    start(&s);
+    let out = start(&s);
+    let paragraph = devmode_paragraph(&out).unwrap_or_else(|| panic!("no paragraph:\n{out}"));
+    for want in [
+        "turned developer mode off",
+        "The 0.15 installer had turned it on for every user",
+        "a DEVMODE block listing the domains and rules base injected",
+        "To see what base injects without it: base log matches.",
+        "To turn it back on: base config set devmode.enabled true (while it is on, base does not update itself).",
+        "To undo this change: base doctor --restore \"",
+    ] {
+        assert!(paragraph.contains(want), "{want:?} missing:\n{paragraph}");
+    }
+    assert!(Path::new(&restore_path(&paragraph)).is_file(), "{paragraph}");
+    assert!(out.contains("Nothing prepended except the developer mode paragraph above."), "{out}");
+    let next = start(&s);
+    assert!(devmode_paragraph(&next).is_none() && !next.contains("except the developer mode"), "once:\n{next}");
+}
+
+/// W2d: doctor repeats the paragraph from the change until 14 days after it, and stops once the user sets developer mode
+/// themselves.
+#[test]
+fn doctor_shows_devmode_line_for_14_days() {
+    let s = home_015("devmode-doctor");
+    assert!(!doctor(&s).contains("turned developer mode off"), "control: nothing before the change");
+    start(&s);
+    let paragraph = devmode_paragraph(&start(&s)).expect("the paragraph");
+    assert!(doctor(&s).contains(&paragraph), "day 0:\n{}", doctor(&s));
+    let rec_file = gbl(&s).join(".base").join("upgrade.json");
+    let at = |days: i64| {
+        let mut rec = record(&gbl(&s).join(".base"));
+        rec["devmode_off"]["at"] = serde_json::Value::from((chrono::Local::now() - chrono::Duration::days(days)).to_rfc3339());
+        write(&rec_file, &rec.to_string());
+    };
+    at(13);
+    assert!(doctor(&s).contains(&paragraph), "day 13");
+    at(15);
+    assert!(!doctor(&s).contains("turned developer mode off"), "day 15:\n{}", doctor(&s));
+    at(0);
+    assert!(doctor(&s).contains(&paragraph), "control: today again");
+    let (code, out, err) = run_base(&s, &["config", "set", "devmode.enabled", "false"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!doctor(&s).contains("turned developer mode off"), "set by the user:\n{}", doctor(&s));
+}
+
+/// The two ways back the paragraph prints, each run as printed: the restore puts the installer's file back, and the
+/// command turns it on; either way the prompt carries the DEVMODE block again, and no later start turns it off.
+#[test]
+fn devmode_undo_restores() {
+    for (tag, by_restore) in [("devmode-restore", true), ("devmode-command", false)] {
+        let s = home_015(tag);
+        start(&s);
+        let paragraph = devmode_paragraph(&start(&s)).expect("the paragraph");
+        assert!(!prompt(&s).contains("DEVMODE"), "control: off");
+        let (code, out, err) = if by_restore {
+            run_base(&s, &["doctor", "--restore", &restore_path(&paragraph)])
+        } else {
+            run_base(&s, &["config", "set", "devmode.enabled", "true"])
+        };
+        assert_eq!(code, 0, "{out}{err}");
+        if by_restore {
+            assert_eq!(read(&gbl(&s).join("base.toml")), BASE_TOML_015, "restored byte for byte");
+        }
+        let (_, got, _) = run_base(&s, &["config", "get", "devmode.enabled"]);
+        assert_eq!(got.trim(), "true", "{tag}");
+        assert!(prompt(&s).contains("DEVMODE"), "{tag}: the block is back");
+        start(&s);
+        let (_, got, _) = run_base(&s, &["config", "get", "devmode.enabled"]);
+        assert_eq!(got.trim(), "true", "{tag}: not turned off again");
+    }
+}
+
+/// G0 Q1: a base.toml that is a link is never written, not even through the link; one line says developer mode is
+/// still on there and how to turn it off.
+#[test]
+fn linked_base_toml_is_left_with_a_line() {
+    let s = home("devmode-linked");
+    let shared = s.home.join("shared").join("base.toml");
+    write(&shared, BASE_TOML_015);
+    let link = gbl(&s).join("base.toml");
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&shared, &link);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(&shared, &link);
+    if let Err(e) = made {
+        // A Windows account without the symlink privilege cannot make one; Linux CI always runs this.
+        println!("skipped: no symlink here ({e})");
+        return;
+    }
+    upgraded(&s);
+    start(&s);
+    let out = start(&s);
+    assert_eq!(read(&shared), BASE_TOML_015);
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "still a link");
+    assert!(devmode_paragraph(&out).is_none(), "{out}");
+    let lines = upgrade_lines(&out);
+    assert!(
+        lines.iter().any(|l| l.contains("developer mode is still on in") && l.contains("a link, so the upgrade left it")),
+        "{lines:?}"
+    );
+    assert!(upgrade_lines(&start(&s)).is_empty(), "once");
+}
+
+/// G0 Q2's timing: the block stops at the start that says so. After the first start (whose upgrade only marks it) the
+/// prompt still carries the DEVMODE block and nothing has been said; the second start turns it off and prints the
+/// paragraph, and its prompt carries no block; the third prints nothing.
+#[test]
+fn devmode_off_happens_at_the_start_that_says_so() {
+    let s = home_015("devmode-when");
+    let first = start(&s);
+    assert!(devmode_paragraph(&first).is_none(), "{first}");
+    assert!(prompt(&s).contains("DEVMODE"), "on until the start that says so");
+    let second = start(&s);
+    assert!(devmode_paragraph(&second).is_some(), "{second}");
+    assert!(!prompt(&s).contains("DEVMODE"), "off from that start");
+    let third = start(&s);
+    assert!(devmode_paragraph(&third).is_none() && !third.contains("DEVELOPER MODE"), "{third}");
 }
