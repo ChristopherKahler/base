@@ -701,3 +701,123 @@ fn doctor_usage_never_changes_the_verdict() {
     assert!(out.trim_end().ends_with("Verdict: HEALTHY ✓"), "{out}");
 }
 
+// ─── BO-31 (Z2) ──────────────────────────────────────────────────────────────
+
+const R_FILE: &str = "Run the linter before you edit src/hook/mod.rs, never after.";
+
+impl Fixture {
+    /// Replace the workspace's domains with `toml`.
+    fn domains(&self, toml: &str) {
+        std::fs::write(self.ws.join(".base").join("domains.toml"), toml).unwrap();
+    }
+}
+
+/// A section's lines from the one that starts with `heading` up to the next heading at its depth.
+fn list_under<'a>(section: &'a str, heading: &str) -> Vec<&'a str> {
+    let lines = lines_of(section);
+    let at = lines.iter().position(|l| l.starts_with(heading)).unwrap_or_else(|| panic!("no {heading:?} in:\n{section}"));
+    let mut out = vec![lines[at]];
+    out.extend(lines[at + 1..].iter().take_while(|l| l.starts_with("     ")));
+    out
+}
+
+/// BO-31 (Z2): doctor names the rules held back for space most often over the recorded prompts (the match log's
+/// `budget` cuts in the window), most often first, each with its numbers and what to do: move a rule of an always-on
+/// domain, give a path to one that names a file, shorten the rest. Advice only.
+#[test]
+fn doctor_names_rules_held_back_most_often() {
+    let fx = Fixture::new("heldback", "");
+    fx.domains(&format!(
+        "[[domain]]\nname = \"tools\"\nmode = \"triggered\"\nprompt_keywords = [\"hook\", \"lint\"]\nrules = [\"{R_FILE}\", \"{R_LINT}\"]\n\n\
+         [[domain]]\nname = \"notes\"\nmode = \"triggered\"\nprompt_keywords = [\"memo\"]\nrules = [\"{R_MEMO}\"]\n\n\
+         [[domain]]\nname = \"GLOBAL\"\nmode = \"always\"\nrules = [\"{R_PLAIN}\"]\n"
+    ));
+    let (file, plain, memo, lint) = (rid("tools", R_FILE), rid("GLOBAL", R_PLAIN), rid("notes", R_MEMO), rid("tools", R_LINT));
+    let mut log = Log::default();
+    for i in 0..5 {
+        let mut cut = vec![("rule", plain.as_str(), "budget", "global-rules")];
+        if i < 3 {
+            cut.push(("rule", file.as_str(), "budget", "tools-rules"));
+        }
+        if i == 0 {
+            cut.push(("rule", memo.as_str(), "budget", "notes-rules"));
+            // A cut for another reason is not a hold for space.
+            cut.push(("rule", lint.as_str(), "topic limit", "tools-topic-rules"));
+        }
+        log.prompt(ago(1, i), &format!("h{i}"), 1, "lint the hook memo", &[("GLOBAL", "always", None)], &[], &cut);
+    }
+    log.prompt(ago(1, 10), "h9", 1, "plain words please", &[("GLOBAL", "always", None)], &[("rule", plain.as_str())], &[]);
+    // Outside the window: not counted.
+    log.prompt(ago(40, 0), "old", 1, "an old memo", &[], &[], &[("rule", memo.as_str(), "budget", "notes-rules")]);
+    fx.log(&log);
+
+    let (code, section, out) = fx.section();
+    let shorten = |rule: &str| format!("base rule propose --rule {rule} --text \"...\"");
+    let (sp, sf, sm) = (short("GLOBAL", R_PLAIN), short("tools", R_FILE), short("notes", R_MEMO));
+    assert_eq!(
+        list_under(&section, "   held back for space"),
+        [
+            "   held back for space (matched a message but did not fit in its 10,000-byte limit, last 30 days): 3".to_string(),
+            format!(
+                "     {sp} \"Answer in plain words.\"   held back 5 times, in full 1 time · 22 bytes · it is in GLOBAL, so every \
+                 session gets it: if it is about one project, move it to that project's domain, or shorten it: {}",
+                shorten(&sp)
+            ),
+            format!(
+                "     {sf} \"Run the linter before you edit src/hook/...\"   held back 3 times, in full 0 times · 60 bytes · it names \
+                 src/hook/mod.rs: if it is about work on that file, give it a path so it loads only with that file (base rule \
+                 add --path), or shorten it: {}",
+                shorten(&sf)
+            ),
+            format!(
+                "     {sm} \"Date every memo.\"   held back 1 time, in full 0 times · 16 bytes · shorten it to one or two \
+                 sentences: {}",
+                shorten(&sm)
+            ),
+        ],
+        "full:\n{out}"
+    );
+    assert!(!section.contains(&format!("{} \"Name the lint", short("tools", R_LINT))), "a topic-limit cut is not listed");
+    assert!(out.trim_end().ends_with("Verdict: HEALTHY ✓"), "advice only:\n{out}");
+    assert_eq!(code, 0);
+    let (_, json, _) = fx.base(&["doctor", "--json"]);
+    let v: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["usage"]["held_back"][0]["withheld"], 5);
+    assert_eq!(v["usage"]["held_back"][1]["advice"]["kind"], "path");
+}
+
+/// BO-31 (Z2): doctor names the rules longer than 500 bytes, longest first, with what to do about each; a rule at or
+/// under 500 bytes is not listed.
+#[test]
+fn doctor_names_the_longest_rules() {
+    let fx = Fixture::new("longest", "");
+    let long = |n: usize, word: &str| -> String { format!("Keep {word} short. ").chars().chain(std::iter::repeat('x')).take(n).collect() };
+    let (r600, r520, r500) = (long(600, "builds"), long(520, "notes"), long(500, "memos"));
+    fx.domains(&format!(
+        "[[domain]]\nname = \"tools\"\nmode = \"triggered\"\nprompt_keywords = [\"lint\"]\nrules = [\"{r520}\", \"{r500}\"]\n\n\
+         [[domain]]\nname = \"GLOBAL\"\nmode = \"always\"\nrules = [\"{r600}\"]\n"
+    ));
+    let mut log = Log::default();
+    log.prompt(ago(1, 0), "l1", 1, "lint it", &[("tools", "keyword", Some("lint"))], &[], &[]);
+    fx.log(&log);
+
+    let (_, section, out) = fx.section();
+    let (s600, s520) = (short("GLOBAL", &r600), short("tools", &r520));
+    assert_eq!(
+        list_under(&section, "   longest rules"),
+        [
+            "   longest rules (over 500 bytes of the 10,000 a message can carry): 2".to_string(),
+            format!(
+                "     {s600} \"Keep builds short. xxxxxxxxxxxxxxxxxxxxx...\"   600 bytes · it is in GLOBAL, so every session gets \
+                 it: if it is about one project, move it to that project's domain, or shorten it: base rule propose --rule \
+                 {s600} --text \"...\""
+            ),
+            format!(
+                "     {s520} \"Keep notes short. xxxxxxxxxxxxxxxxxxxxxx...\"   520 bytes · shorten it to one or two sentences: \
+                 base rule propose --rule {s520} --text \"...\""
+            ),
+        ],
+        "full:\n{out}"
+    );
+    assert!(!section.contains(&short("tools", &r500)), "500 bytes is not over 500");
+}

@@ -30,7 +30,7 @@ base config list                         # all config keys
 base secret list                         # secret NAMES only, never values
 base changes [-g] [--since <offset>] [--cursor]   # graph write log as JSON; --cursor prints the end offset only
 base hooks manifest                      # base's hook wiring as JSON, for an installer outside base
-base hooks show [<block>] [--session <id>]   # one block of this session's last prompt-hook output; no block: list them
+base hooks show [<block>] [--session <id>]   # one block of this session's last prompt-hook output; no block: list them. Rules held back for space are listed by title under this command, at the end of the prompt's output
 base log matches [--last <n>] [--session <id>] [--rule <id>] [--json]   # what each prompt and file touch matched, by what, and what was served and cut
 base log corrections [--session <id>] [--transcript <path>] [--json]   # what base flagged as possible corrections: this session's signal rows, or a whole transcript read turn by turn as the hooks read it
 base tune --dry-run [--session <id>] [--transcript <path>] [--store]   # what the rule pass would read and how many Haiku calls it would make; calls nothing, writes nothing
@@ -118,6 +118,7 @@ base rule add --domain X --text "..."    # global tier: -g goes on `rule`, BEFOR
 base rule add --domain X --text "..." --fires-on "<prompt>" --quiet-on "<prompt>"   # with test prompts (at most 3 and 2)
 base rule update <domain>.<id> --fires-on "<prompt>" --quiet-on "<prompt>" [--clear-tests]   # add test prompts where the rule lives; the id is in `base rule list`
 base rule add --domain X --text "..." --keywords "a, b" --fires-on "<prompt>"   # inside a Claude Code session both are required; the keywords become the rule's own words
+base rule add --domain X --text "<one or two sentences>" --rationale "<why>" --keywords "a, b" --fires-on "<prompt>" --path <file>   # a rule that fits the prompt budget: short text, the reason in its own field, specific keywords, a path for a rule about one file; GLOBAL only for what every session needs
 base rule propose --from-turn [--text "..."] [--keywords "a, b"] [--example "<prompt>"] [--rule <domain>.<id>] [--decision <slug>] [--new] [--domain X] [--dry-run]   # this turn's correction as a pending proposal: keyword gap, rewrite or new rule
 base rule replay <p-NNNN> | --domain X | --rule <domain>.<id> | --decision <slug> [--add-keyword "..."] [--drop-keyword "..."]   # run a change over your recent prompts: which start or stop serving it, its share, TOO BROAD over [tune] broad_share
 base rule review [--approve <id> [--broad-ok]] [--reject <id> [--reason "..."]] [--edit <id> --text "..." --keywords "a, b"]   # the pending proposals with their replays; one key each on a terminal (a, e, r, s, q), or one flag

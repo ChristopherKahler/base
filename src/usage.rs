@@ -938,6 +938,8 @@ pub struct RuleNow {
     pub always: bool,
     /// Its domain injects (`auto_inject`): a rule of one that does not is off, not dead.
     pub injects: bool,
+    /// Its bytes as the prompt hook prints it, its reason included (BO-31).
+    pub bytes: usize,
 }
 
 impl RuleNow {
@@ -960,6 +962,7 @@ pub fn rules_now(domains: &[DomainDef], store: Option<&Store>, config: &BaseConf
             }
             out.push(RuleNow {
                 own_matchers: converted.contains(&r.id),
+                bytes: r.rendered.len(),
                 id: r.id,
                 domain: d.name.clone(),
                 text: r.text,
@@ -1090,6 +1093,43 @@ pub struct Review {
     pub unchanged_days: Option<i64>,
 }
 
+/// What a person can do about a rule that does not fit (BO-31, Z2): the first that applies, and always the option to
+/// shorten it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FitAdvice {
+    /// Its domain is always on, so every session gets it, whatever the session is about.
+    Move { domain: String },
+    /// It names a file and comes in on its domain's triggers, not on a path of its own.
+    Path { file: String },
+    Shorten,
+}
+
+/// A rule the prompt hook held back for space in the window (BO-31, Z2).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HeldBack {
+    /// `<domain>.<id>`.
+    pub rule: String,
+    pub text: String,
+    /// Times held back for the budget, and times printed in full, in the window.
+    pub withheld: usize,
+    pub served: usize,
+    pub bytes: usize,
+    pub advice: FitAdvice,
+}
+
+/// A rule longer than [`LONG_RULE_BYTES`] (BO-31, Z2).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Longest {
+    pub rule: String,
+    pub text: String,
+    pub bytes: usize,
+    pub advice: FitAdvice,
+}
+
+/// A rule longer than this is listed among the longest (BO-31, G0 Q4): about two long sentences is 300 bytes.
+pub const LONG_RULE_BYTES: usize = 500;
+
 /// The correction detector's record over the window (BO-17's backstop, K8c).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct DetectorLine {
@@ -1110,6 +1150,9 @@ pub struct Limits {
     /// `[log] prompt_text` when it is not `full`: then a row keeps too little text to tell a person's prompt from a
     /// task notification, and noisy is not judged.
     pub prompt_text: Option<String>,
+    /// `[budget] prompt_bytes`, which the held-back line names (BO-31).
+    pub prompt_bytes: usize,
+    pub long_rule_bytes: usize,
 }
 
 impl Limits {
@@ -1124,6 +1167,8 @@ impl Limits {
             review_days: dc.review_days,
             noisy_min_prompts: NOISY_MIN_PROMPTS,
             prompt_text: (mode != crate::emit::match_log::PromptText::Full).then(|| config.log.prompt_text.trim().to_string()),
+            prompt_bytes: config.budget.prompt_bytes,
+            long_rule_bytes: LONG_RULE_BYTES,
         }
     }
 }
@@ -1150,6 +1195,10 @@ pub struct Section {
     /// What an ignored rule's share is measured against.
     pub average: Average,
     pub review: Vec<Review>,
+    /// Rules held back for space in the window, most often first (BO-31).
+    pub held_back: Vec<HeldBack>,
+    /// Rules over [`LONG_RULE_BYTES`], longest first (BO-31).
+    pub longest: Vec<Longest>,
     pub detector: DetectorLine,
     pub limits: Limits,
 }
@@ -1306,7 +1355,79 @@ pub fn build(i: &Inputs) -> Section {
     }
     review.sort_by(|a, b| b.served.cmp(&a.served).then_with(|| a.decision.cmp(&b.decision)));
 
-    Section { log: Some(log), dead, too_new, noisy, ignored, average, review, detector, limits }
+    // Held back for space (BO-31, Z2): a rule the prompt budget withheld in the window, most often first. Read from the
+    // match log's `cut` entries of reason `budget`, which [`scan`] already counts per rule.
+    let mut held_back: Vec<HeldBack> = rules
+        .iter()
+        .filter_map(|r| {
+            let c = scan.counts(&Key::Rule(r.id.clone()));
+            (c.withheld_window > 0).then(|| HeldBack {
+                rule: r.short(),
+                text: r.text.clone(),
+                withheld: c.withheld_window,
+                served: c.served_window,
+                bytes: r.bytes,
+                advice: fit_advice(r),
+            })
+        })
+        .collect();
+    held_back.sort_by(|a, b| b.withheld.cmp(&a.withheld).then_with(|| b.bytes.cmp(&a.bytes)).then_with(|| a.rule.cmp(&b.rule)));
+    let mut longest: Vec<Longest> = rules
+        .iter()
+        .filter(|r| r.bytes > LONG_RULE_BYTES)
+        .map(|r| Longest { rule: r.short(), text: r.text.clone(), bytes: r.bytes, advice: fit_advice(r) })
+        .collect();
+    longest.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.rule.cmp(&b.rule)));
+
+    Section { log: Some(log), dead, too_new, noisy, ignored, average, review, held_back, longest, detector, limits }
+}
+
+/// What to suggest for a rule that does not fit (BO-31, Z2): move a rule of an always-on domain to the domain it is
+/// about; give a path to a rule that names a file and has none of its own; otherwise shorten it.
+fn fit_advice(r: &RuleNow) -> FitAdvice {
+    if r.always {
+        return FitAdvice::Move { domain: r.domain.clone() };
+    }
+    if !r.own_matchers
+        && let Some(file) = named_file(&r.text)
+    {
+        return FitAdvice::Path { file };
+    }
+    FitAdvice::Shorten
+}
+
+/// The first file a rule's text names: a path with a file name (`src/hook/mod.rs`, `~/.base-gbl/base.toml`), or a bare
+/// file name with a common extension (`commands.toml`). Never a web address, a version (`0.16.0`) or a host name.
+pub fn named_file(text: &str) -> Option<String> {
+    const EXTENSIONS: [&str; 22] = [
+        "rs", "toml", "md", "json", "jsonl", "py", "ts", "tsx", "js", "ps1", "sh", "yml", "yaml", "txt", "nq", "html", "css",
+        "sql", "php", "go", "cmd", "lock",
+    ];
+    for raw in text.split_whitespace() {
+        let token = raw.trim_matches(|c: char| "\"'`()[]{}<>,;:!?".contains(c)).trim_end_matches('.');
+        // `config.rs:36` names config.rs.
+        let token = match token.rsplit_once(':') {
+            Some((file, line)) if !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()) => file,
+            _ => token,
+        };
+        if token.contains("://") || token.starts_with("www.") {
+            continue;
+        }
+        let name = token.rsplit(['/', '\\']).next().unwrap_or(token);
+        let Some((stem, ext)) = name.rsplit_once('.') else { continue };
+        let ext_ok = !ext.is_empty()
+            && ext.len() <= 5
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            && ext.starts_with(|c: char| c.is_ascii_alphabetic());
+        if stem.is_empty() || !ext_ok {
+            continue;
+        }
+        let is_path = token.contains('/') || token.contains('\\');
+        if is_path || EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
+            return Some(token.to_string());
+        }
+    }
+    None
 }
 
 fn noisy_n(n: &Noisy) -> usize {
@@ -1537,8 +1658,62 @@ pub fn render(s: &Section) -> String {
     }
     more_line(&mut out, s.review.len());
 
+    // BO-31 (Z2): the rules that do not fit, and what to do about each. Advice only.
+    out.push_str(&format!(
+        "   held back for space (matched a message but did not fit in its {}-byte limit, last {} days): {}\n",
+        thousands(l.prompt_bytes),
+        l.dead_days,
+        s.held_back.len()
+    ));
+    for h in s.held_back.iter().take(SHOWN) {
+        out.push_str(&format!(
+            "     {} \"{}\"   held back {} {}, in full {} {} · {} bytes · {}\n",
+            h.rule,
+            clip(&h.text, 40),
+            h.withheld,
+            plural(h.withheld, "time", "times"),
+            h.served,
+            plural(h.served, "time", "times"),
+            thousands(h.bytes),
+            advice_text(&h.advice, &h.rule)
+        ));
+    }
+    more_line(&mut out, s.held_back.len());
+    out.push_str(&format!(
+        "   longest rules (over {} bytes of the {} a message can carry): {}\n",
+        thousands(l.long_rule_bytes),
+        thousands(l.prompt_bytes),
+        s.longest.len()
+    ));
+    for r in s.longest.iter().take(SHOWN) {
+        out.push_str(&format!(
+            "     {} \"{}\"   {} bytes · {}\n",
+            r.rule,
+            clip(&r.text, 40),
+            thousands(r.bytes),
+            advice_text(&r.advice, &r.rule)
+        ));
+    }
+    more_line(&mut out, s.longest.len());
+
     out.push_str(&detector_line(&s.detector, l.dead_days));
     out
+}
+
+/// One rule's advice as the held-back and longest lines end (BO-31, Z2): what to do, then the command that shortens it.
+fn advice_text(a: &FitAdvice, rule: &str) -> String {
+    let shorten = cmd_propose_rewrite(rule);
+    match a {
+        FitAdvice::Move { domain } => format!(
+            "it is in {domain}, so every session gets it: if it is about one project, move it to that project's domain, \
+             or shorten it: {shorten}"
+        ),
+        FitAdvice::Path { file } => format!(
+            "it names {file}: if it is about work on that file, give it a path so it loads only with that file \
+             (base rule add --path), or shorten it: {shorten}"
+        ),
+        FitAdvice::Shorten => format!("shorten it to one or two sentences: {shorten}"),
+    }
 }
 
 fn dead_line(d: &Dead, days: u64) -> String {

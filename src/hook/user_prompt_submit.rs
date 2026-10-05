@@ -288,6 +288,7 @@ pub fn collect(
         let cmd_blocks: Vec<PromptBlock> = matched
             .iter()
             .map(|cmd| {
+                let rule_lines: Vec<String> = cmd.rules.iter().enumerate().map(|(i, r)| format!("  {i}. {r}")).collect();
                 PromptBlock::new(
                     format!("command-{}", crate::crud::slugify(&cmd.name)),
                     Priority::Matched,
@@ -295,6 +296,7 @@ pub fn collect(
                     cmd.rules.len(),
                     "rule",
                 )
+                .with_titles(rule_lines.iter().map(String::as_str))
                 .with_logged([Item::of_kind(&cmd.name, "command")])
             })
             .filter(|b| !b.text.is_empty())
@@ -837,7 +839,7 @@ pub fn serve(
 
     // Domain-linked command modes (Phase 28), one entry per command: the best priority among the domains that link
     // it, its rendered rules, and how many. Each becomes a block of its own after the loop (BO-01).
-    let mut linked: Vec<(String, Priority, String, usize)> = Vec::new();
+    let mut linked: Vec<(String, Priority, String, Vec<String>)> = Vec::new();
     let now = w.now;
 
     // Format and emit matched rules
@@ -919,7 +921,8 @@ pub fn serve(
                     let key = cmd.name.to_lowercase();
                     match linked.iter_mut().find(|(k, ..)| *k == key) {
                         Some(entry) => entry.1 = entry.1.min(rules_priority),
-                        None => linked.push((key, rules_priority, rendered, cmd.rules.len())),
+                        // Each rule's line as `format_command_output` prints it, for its title (BO-31).
+                        None => linked.push((key, rules_priority, rendered, cmd.rules.iter().enumerate().map(|(i, r)| format!("  {i}. {r}")).collect())),
                     }
                 }
             }
@@ -1013,7 +1016,10 @@ pub fn serve(
         // Recorded whenever the rules block prints, steering lines or not: the domain's own key says it was served.
         let steering_claim =
             with_steering.then(|| Claim::Injected { key: domain_def.name.clone(), hash: steering_hash });
-        let rules_block = match (&scoring, crate::domain::rules::block_lines("DOMAIN", &label, &fresh, rules.len(), &domain_def.name)) {
+        let block_lines = crate::domain::rules::block_lines("DOMAIN", &label, &fresh, rules.len(), &domain_def.name);
+        // Each rule's line, for its title when the budget drops the block (BO-31).
+        let rule_lines: Vec<&str> = block_lines.as_ref().map(|l| l.rules.iter().map(String::as_str).collect()).unwrap_or_default();
+        let rules_block = match (&scoring, &block_lines) {
             // Scored (BO-18): one part per rule, best first, so the budget withholds the weakest first (K7d). The role
             // line rides with the header, the output-mode and format lines with the tail.
             (Some(s), Some(lines)) => {
@@ -1023,6 +1029,7 @@ pub fn serve(
                 PromptBlock::ranked(format!("{slug}-rules"), rules_priority, &head, parts, &tail, "rule").with_claims(steering_claim)
             }
             _ => PromptBlock::new(format!("{slug}-rules"), rules_priority, &rules_part.join("\n"), fresh.len(), "rule")
+                .with_titles(rule_lines)
                 .with_claims(fresh.iter().map(|(_, r)| Claim::Rule {
                     id: r.id.clone(),
                     content: r.content_hash,
@@ -1141,7 +1148,8 @@ pub fn serve(
             continue;
         }
         out.blocks.push(
-            PromptBlock::new(format!("command-{}", crate::crud::slugify(&key)), priority, &text, rules, "rule")
+            PromptBlock::new(format!("command-{}", crate::crud::slugify(&key)), priority, &text, rules.len(), "rule")
+                .with_titles(rules.iter().map(String::as_str))
                 .with_claims([Claim::Injected { key: claim_key, hash }])
                 .with_logged([Item::of_kind(&key, "command")]),
         );
@@ -1250,8 +1258,11 @@ fn bracket_rules_block(config: &BaseConfig, cwd: &Path, session: &mut SessionSta
         Claim::BracketRule { id, content }
     });
     let logged = texts.iter().map(|t| Item::of_kind(&crate::domain::session::bracket_rule_key(t).0, "bracket-rule"));
+    // Each rule's line as `render_bracket_rules` prints it, for its title when the budget drops the block (BO-31).
+    let rule_lines: Vec<String> = texts.iter().enumerate().map(|(i, t)| format!("  {i}. {t}")).collect();
     Some(
         PromptBlock::new("bracket-rules", Priority::Bracket, &text, texts.len(), "rule")
+            .with_titles(rule_lines.iter().map(String::as_str))
             .with_claims(claims)
             .with_logged(logged),
     )
@@ -1392,6 +1403,7 @@ fn rule_part(
 ) -> BlockPart {
     let score = scoring.scores.get(&rule.id);
     BlockPart::new(line, score)
+        .titled()
         .with_claims([Claim::Rule { id: rule.id.clone(), content: rule.content_hash, scope: None }])
         .with_logged([Item {
             score: (score > 0.0).then_some(score),
@@ -1487,6 +1499,7 @@ fn matcher_blocks(
                 .zip(items)
                 .map(|((r, claim), item)| {
                     BlockPart::new(&format!("  - {}", r.rule.rendered), s.scores.get(&r.rule.id))
+                        .titled()
                         .with_claims([claim])
                         .with_logged([item])
                 })
@@ -1494,8 +1507,10 @@ fn matcher_blocks(
             blocks.push(PromptBlock::ranked(id, priority, head, parts, &tail, "rule"));
             continue;
         }
+        let rule_lines: Vec<String> = g.served.iter().map(|r| format!("  - {}", r.rule.rendered)).collect();
         blocks.push(
             PromptBlock::new(id, priority, &text, g.served.len(), "rule")
+                .with_titles(rule_lines.iter().map(String::as_str))
                 .with_claims(claims)
                 .with_logged(crate::domain::rules::served_items(&g.served)),
         );
