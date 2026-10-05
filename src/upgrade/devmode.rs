@@ -127,41 +127,44 @@ fn is_link(file: &Path) -> bool {
     std::fs::symlink_metadata(file).is_ok_and(|m| m.file_type().is_symlink())
 }
 
-/// How a user turns it on, or off, in this tier's file: `base config set` writes the global file only, and a workspace's
-/// value wins over the global one.
+/// How a user turns it on, or off, in this tier's file, as the rest of a sentence: `base config set` writes the global
+/// file only, and a workspace's value wins over the global one.
 fn set_to(tier: &Tier, file: &Path, value: bool) -> String {
     if tier.label == "global" {
-        format!("base config set devmode.enabled {value}")
+        format!("run `base config set devmode.enabled {value}`")
     } else {
-        format!("set enabled = {value} under [devmode] in {}", file.display())
+        format!("set `enabled = {value}` under `[devmode]` in {}", file.display())
     }
 }
 
 /// The paragraph session start prints once and `base doctor` repeats: what changed and why, what the block did, where
-/// to see the same thing without it, and both ways back.
+/// to see the same thing without it, and both ways back. Every command in backticks, so the period after one is never
+/// copied into it (BO-30).
 pub fn paragraph(tier: &Tier, file: &Path, backup: &Path, version: &str) -> String {
     format!(
-        "base {version} turned developer mode off. The 0.15 installer had turned it on for every user, so Claude ended every \
-         reply with a DEVMODE block listing the domains and rules base injected. To see what base injects without it: \
-         base log matches. To turn it back on: {} (while it is on, base does not update itself). To undo this change: \
-         base doctor --restore \"{}\"",
+        "base {version} turned developer mode off. The 0.15 installer turned it on for everyone, so Claude ended every \
+         reply with a DEVMODE block listing which of your domains base loaded and why; your replies now end without it. To \
+         see what base adds without the block, run `base log matches`. To turn developer mode back on, {} (while it is \
+         on, base does not update itself). To undo this change, run `base doctor --restore \"{}\"`.",
         set_to(tier, file, true),
         backup.display()
     )
 }
 
-fn linked_line(tier: &Tier, file: &Path) -> String {
-    let or_command = if tier.label == "global" { " (or base config set devmode.enabled false)" } else { "" };
+pub(super) fn linked_line(tier: &Tier, file: &Path) -> String {
+    let or_command = if tier.label == "global" { ", or run `base config set devmode.enabled false`" } else { "" };
     format!(
-        "upgrade: developer mode is still on in {}, a link, so the upgrade left it · to turn it off: set enabled = false \
-         under [devmode] in that file{or_command}",
+        "{} Developer mode is still on. We left {} as it is because it is a link to another file. To turn it off, set \
+         `enabled = false` under `[devmode]` in that file{or_command}.",
+        super::LEAD,
         file.display()
     )
 }
 
-fn failed_line(tier: &Tier, file: &Path, why: &str) -> String {
+pub(super) fn failed_line(tier: &Tier, file: &Path, why: &str) -> String {
     format!(
-        "upgrade: developer mode was left on in {}: {why} · to turn it off: {}",
+        "{} We could not turn developer mode off in {}: {why}. It is still on. To turn it off, {}.",
+        super::LEAD,
         file.display(),
         set_to(tier, file, false)
     )

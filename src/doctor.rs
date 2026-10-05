@@ -839,9 +839,12 @@ pub fn format_human(report: &DoctorReport) -> String {
             for (g, n) in &t.foreign_graphs {
                 out.push_str(&format!("       {n} · {g}\n"));
             }
-            for (g, why) in &t.foreign_left {
+            // BO-30: what it most likely is and what the person can do. No command re-homes it, so none is named.
+            for (g, _) in &t.foreign_left {
                 out.push_str(&format!(
-                    "       --fix leaves {g} where it is: {why}; a person decides whose records they are\n"
+                    "       base found data saved under what looks like this workspace's earlier folder name ({g}). It \
+                     is probably yours from before the folder was renamed. base will not move it by itself, because \
+                     only you can say whose it is.\n"
                 ));
             }
             // The one bounded extra line auk ruled in scope. Fires ONLY for the
@@ -962,9 +965,12 @@ pub fn format_human(report: &DoctorReport) -> String {
             {
                 // The repair's own doing, by no more than it recorded: not a loss (BO-26, lynx's U4 ruling). Anything
                 // beyond it, or a snapshot with no record, keeps the warning below.
+                // In a person's words (BO-30). "Nothing was lost" holds: the backup is the graph from before that
+                // repair, so it holds every line the repair took out.
                 out.push_str(&format!(
-                    "   backup: {} lines, taken before base's own repair, which took {took} lines out (records moved to \
-                     where they belong, duplicate lines dropped); the graph is {shrink} lines smaller [{}]\n",
+                    "   backup: {} lines, made just before base cleaned up your base data. The cleanup took {took} lines \
+                     out (other workspaces' entries set aside, repeated lines dropped), so your data is {shrink} lines \
+                     smaller, and nothing was lost [{}]\n",
                     b.backup_line_count, b.path,
                 ));
             } else if b.line_delta < 0 {

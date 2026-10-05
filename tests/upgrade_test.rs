@@ -19,6 +19,8 @@ use seed::{run_base, run_hook, Seed, NS};
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The first words of every line the upgrade prints (BO-30): base and this version.
+const LEAD: &str = concat!("base ", env!("CARGO_PKG_VERSION"), ":");
 /// The starter pack 0.14.2 to 0.15.2 installed.
 const PACK_0142: &str = include_str!("../src/starter-commands/0.14.2.toml");
 /// The starter pack this build ships.
@@ -121,7 +123,7 @@ fn start_with(s: &Seed, env: &[(&str, &str)]) -> String {
 
 /// The lines session start printed about an upgrade.
 fn upgrade_lines(out: &str) -> Vec<String> {
-    out.lines().filter(|l| l.trim_start().starts_with("upgrade:")).map(|l| l.trim().to_string()).collect()
+    out.lines().filter(|l| l.trim_start().starts_with(LEAD)).map(|l| l.trim().to_string()).collect()
 }
 
 fn doctor(s: &Seed) -> String {
@@ -186,9 +188,10 @@ fn upgrade_runs_store_repair_once() {
     let second = start(&s);
     let lines = upgrade_lines(&second);
     assert!(
-        lines.iter().any(|l| l.starts_with("upgrade: the workspace store for")
-            && l.contains("1 record(s) of other workspaces (2 quads) moved to .base/foreign-*.nq")
-            && l.contains(&format!("undo: base doctor --restore \"{}", s.ws.join(".base").display()))),
+        lines.iter().any(|l| l.contains(
+            "We set aside 1 entry that belongs to another workspace we could not find on this computer. It is saved in a \
+             separate file in this workspace's .base folder, so nothing was lost, but it no longer shows up here."
+        ) && l.contains(&format!("To undo it, run `base doctor --restore \"{}", s.ws.join(".base").display()))),
         "{second}"
     );
     let third = start(&s);
@@ -224,8 +227,8 @@ fn upgrade_repair_failure_leaves_store() {
     let lines = upgrade_lines(&start(&s));
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(
-        lines[0].contains("did not finish on the workspace tier")
-            && lines[0].contains("not tried again automatically; by hand: base doctor --fix --yes"),
+        lines[0].contains("The cleanup of this workspace's base data did not finish:")
+            && lines[0].contains("base will not try again by itself. To run it yourself: `base doctor --fix --yes`."),
         "{lines:?}"
     );
     assert!(upgrade_lines(&start(&s)).is_empty(), "said once");
@@ -286,11 +289,16 @@ fn upgrade_path_triggers_need_no_command() {
     assert!(!report.contains("written relative"), "{report}");
 
     let lines = upgrade_lines(&start(&s));
-    assert!(lines.iter().any(|l| l.contains("2 path trigger(s) in the workspace domains.toml written as their full paths")), "{lines:?}");
     assert!(
-        lines.iter().any(|l| l.contains("path triggers 0.15 left inert now fire")
-            && l.contains(&format!("`{}` on `notes` (2 projects)", full("Documents")))
-            && l.ends_with("base domain paths --suggest")),
+        lines.iter().any(|l| l.contains("Your rules tied to folders and files now spell out the whole path (2 in this workspace's domains.toml)")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains(&format!(
+            "The rules of `notes` tied to `{}` now load for files in that folder that sit outside the 2 projects in it. 0.15 \
+             ignored a folder that held more than one project.",
+            full("Documents")
+        )) && l.ends_with("To narrow them, run `base domain paths --suggest`.")),
         "{lines:?}"
     );
     assert!(upgrade_lines(&start(&s)).is_empty());
@@ -336,8 +344,8 @@ fn starter_command_updated_when_unedited() {
 
         let lines = upgrade_lines(&start(&s));
         assert!(
-            lines.iter().any(|l| l.contains("*handoff, *base in the global commands.toml updated to this version's text")
-                && l.contains("undo: base doctor --restore")),
+            lines.iter().any(|l| l.contains("Your *handoff and *base commands in your global commands.toml now have this version's text.")
+                && l.contains("To undo it, run `base doctor --restore \"")),
             "{lines:?}"
         );
         assert!(upgrade_lines(&start(&s)).is_empty());
@@ -367,8 +375,9 @@ fn edited_starter_command_left_with_one_line() {
     assert_eq!(
         lines,
         [format!(
-            "upgrade: your *base command still uses the old rule add line; {VERSION}'s rule add takes --keywords and --fires-on \
-             (this version's *base: base commands show base --shipped)"
+            "{LEAD} Your *base command still has the old rule add line. We left it as it is because you changed that command. \
+             Inside a Claude Code session, rule add now needs --keywords and --fires-on; to see this version's *base, run \
+             `base commands show base --shipped`."
         )]
     );
     assert!(upgrade_lines(&start(&s)).is_empty());
@@ -424,18 +433,25 @@ fn upgrade_announces_once() {
     assert!(upgrade_lines(&first).is_empty(), "{first}");
 
     let lines = upgrade_lines(&start(&s));
-    for want in ["the workspace store for", "global base.toml", "global commands.toml", "workspace domains.toml"] {
+    // Each change with its way back: the restore of the backup taken before it, and for the installer's max_chars, which
+    // 0.16 reads nowhere, the setting that sets a lower limit again (BO-30, lynx's G0 ruling on row 1).
+    for (want, way_back) in [
+        ("this workspace's .base folder", "run `base doctor --restore \""),
+        ("characters of your saved notes", "run `base config set budget.memory_chars 2000`."),
+        ("your global commands.toml", "run `base doctor --restore \""),
+        ("this workspace's domains.toml", "run `base doctor --restore \""),
+    ] {
         let line = lines.iter().find(|l| l.contains(want)).unwrap_or_else(|| panic!("no line for {want}: {lines:?}"));
-        assert!(line.contains("undo: base doctor --restore \""), "{line}");
+        assert!(line.contains(way_back), "{line}");
     }
     for _ in 0..2 {
         assert!(upgrade_lines(&start(&s)).is_empty(), "printed once");
     }
 
     // The undo printed for commands.toml puts the file back as it was.
-    let line = lines.iter().find(|l| l.contains("global commands.toml")).unwrap();
-    let backup = line.rsplit("undo: base doctor --restore \"").next().unwrap().trim_end_matches('"');
-    let (code, out, err) = run_base(&s, &["doctor", "--restore", backup]);
+    let line = lines.iter().find(|l| l.contains("your global commands.toml")).unwrap();
+    let backup = restore_path(line);
+    let (code, out, err) = run_base(&s, &["doctor", "--restore", &backup]);
     assert_eq!(code, 0, "{out}{err}");
     assert_eq!(read(&gbl(&s).join("commands.toml")), commands, "restored");
 }
@@ -455,6 +471,33 @@ fn f16_installer_value_follows_default() {
     write(&toml, "[signal]\nmax_chars = 2001\n");
     let (_, out, _) = run_base(&s, &["doctor", "--fix", "--yes"]);
     assert!(out.contains("[signal] max_chars = 2001 -> [budget] memory_chars = 2001"), "{out}");
+}
+
+/// BO-30, lynx's G0 ruling on row 1: 0.16 reads the installer's old `max_chars` nowhere, so a restore of base.toml is no
+/// way back to a smaller memory block. The line names the setting that is, and that command, run as printed, sets it.
+#[test]
+fn installer_limit_line_names_a_way_back_that_works() {
+    let s = home("limit");
+    write(
+        &gbl(&s).join("base.toml"),
+        "# base config\n[signal]\nenabled = true\nmax_chars = 2000          # injection budget per session-start (truncates past it)\n",
+    );
+    upgraded(&s);
+    start(&s);
+    let lines = upgrade_lines(&start(&s));
+    let line = lines.iter().find(|l| l.contains("characters of your saved notes")).unwrap_or_else(|| panic!("{lines:?}"));
+    assert!(!line.contains("--restore"), "{line}");
+    let command = line.split('`').nth(1).expect("the command, in backticks");
+    assert_eq!(command, "base config set budget.memory_chars 2000");
+    let (_, before, _) = run_base(&s, &["config", "get", "budget.memory_chars"]);
+    assert_eq!(before.trim(), "4000 (default)", "control: the upgrade left 0.16's default");
+    let args: Vec<&str> = command.split(' ').skip(1).collect();
+    let (code, out, err) = run_base(&s, &args);
+    assert_eq!(code, 0, "{out}{err}");
+    let (_, after, _) = run_base(&s, &["config", "get", "budget.memory_chars"]);
+    assert_eq!(after.trim(), "2000", "the printed command set the lower limit");
+    let report = doctor(&s);
+    assert!(report.contains("Verdict: HEALTHY") && !report.contains("legacy: [signal] max_chars"), "{report}");
 }
 
 /// Q4: `base doctor --restore` takes only a backup base made; anything else is refused with the reason and left alone.
@@ -593,8 +636,8 @@ fn linked_config_files_are_never_written() {
     }
     let lines = upgrade_lines(&start(&s));
     assert!(
-        lines.iter().any(|l| l.contains("the global commands.toml is a link, so it was left as it is")
-            && l.contains("base commands show <name> --shipped")),
+        lines.iter().any(|l| l.contains("We left your global commands.toml as it is because it is a link to another file.")
+            && l.contains("`base commands show <name> --shipped`")),
         "{lines:?}"
     );
     assert!(!lines.iter().any(|l| l.contains("domains.toml")), "{lines:?}");
@@ -632,7 +675,10 @@ fn a_retried_tier_says_each_line_once() {
     let mut rec = record(&ws_store);
     let saved: Vec<String> =
         rec["announce"].as_array().expect("lines waiting").iter().map(|l| l.as_str().unwrap().to_string()).collect();
-    assert!(saved.iter().any(|l| l.contains("left inert now fire")), "control: the Q2b line is waiting: {saved:?}");
+    assert!(
+        saved.iter().any(|l| l.contains("0.15 ignored a folder that held more than one project")),
+        "control: the Q2b line is waiting: {saved:?}"
+    );
     rec["version"] = serde_json::Value::String(String::new());
     write(&ws_store.join("upgrade.json"), &rec.to_string());
 
@@ -676,7 +722,11 @@ fn doctor_tells_the_repairs_own_shrink_from_a_loss() {
     upgraded(&s);
     start(&s);
     let after = doctor(&s);
-    assert!(after.contains("taken before base's own repair, which took 2 lines out"), "{after}");
+    assert!(
+        after.contains("made just before base cleaned up your base data. The cleanup took 2 lines out")
+            && after.contains("so your data is 2 lines smaller, and nothing was lost"),
+        "{after}"
+    );
     assert!(!after.contains("possible data loss"), "{after}");
 
     // One more line gone than the repair took: a loss, and said so.
@@ -710,8 +760,11 @@ fn doctor_says_why_a_graph_is_left_in_place() {
 
     let report = doctor(&s);
     assert!(
-        report.contains(&format!("--fix leaves {NS}graph/ws/old-name where it is: 21 quads, at least this workspace's own 18"))
-            && report.contains("a person decides whose records they are"),
+        report.contains(&format!(
+            "base found data saved under what looks like this workspace's earlier folder name ({NS}graph/ws/old-name). It \
+             is probably yours from before the folder was renamed. base will not move it by itself, because only you can \
+             say whose it is."
+        )),
         "{report}"
     );
     assert!(report.contains("Verdict: UNHEALTHY"), "{report}");
@@ -759,9 +812,9 @@ fn upgrade_from_0_15_2_keeps_overdue_reminders() {
     let first = start(&s);
     for (_, name, days) in &reminders[..2] {
         let line = first.lines().find(|l| l.contains(name)).unwrap_or_else(|| panic!("{name} left DUE NOW:\n{first}"));
-        assert!(line.contains(&format!("archives {in_two_days} unless reset")), "{days}-day reminder: {line}");
+        assert!(line.contains(&format!("archives {in_two_days} unless snoozed")), "{days}-day reminder: {line}");
     }
-    assert!(!first.contains("reminder: archived"), "nothing is archived at the first start:\n{first}");
+    assert!(!first.contains("We archived your reminder"), "nothing is archived at the first start:\n{first}");
     let graph = read(&ws_graph(&s));
     assert!(!graph.contains("graph/ws/gone"), "control: the repair moved the foreign records out");
     assert_eq!(graph.matches(&format!("<{NS}warnedAt>")).count(), 2, "both warnings recorded beside the repair");
@@ -793,10 +846,10 @@ fn devmode_paragraph(out: &str) -> Option<String> {
     lines.next().map(str::to_string)
 }
 
-/// The backup a paragraph's `base doctor --restore` names.
-fn restore_path(paragraph: &str) -> String {
-    let (_, tail) = paragraph.rsplit_once("base doctor --restore \"").expect("the paragraph names a restore");
-    tail.trim_end_matches('"').to_string()
+/// The backup a line's `base doctor --restore "<backup>"` names.
+fn restore_path(line: &str) -> String {
+    let (_, tail) = line.rsplit_once("base doctor --restore \"").expect("the line names a restore");
+    tail.split('"').next().expect("the backup").to_string()
 }
 
 /// One prompt in the session the starts belong to.
@@ -901,7 +954,7 @@ fn devmode_off_line_is_on_the_first_screen() {
     assert!(lines[1].starts_with("DEVELOPER MODE TURNED OFF"), "first under the header:\n{out}");
     let paragraph = devmode_paragraph(&out).expect("the paragraph");
     assert_eq!(lines[2], paragraph);
-    assert!(paragraph.ends_with('"') && paragraph.contains("base doctor --restore \""), "whole:\n{paragraph}");
+    assert!(paragraph.ends_with("\"`.") && paragraph.contains("`base doctor --restore \""), "whole:\n{paragraph}");
     let full = read(&s.ws.join(".base").join("hook-output").join("bo26-session").join("session-start.md"));
     assert!(!upgrade_lines(&full).is_empty(), "control: the upgrade had its own lines this start:\n{full}");
     assert!(upgrade_lines(&out).is_empty(), "control: the budget cut them to one line:\n{out}");
@@ -941,11 +994,11 @@ fn devmode_off_line_names_how_to_turn_it_back_on() {
     let paragraph = devmode_paragraph(&out).unwrap_or_else(|| panic!("no paragraph:\n{out}"));
     for want in [
         "turned developer mode off",
-        "The 0.15 installer had turned it on for every user",
-        "a DEVMODE block listing the domains and rules base injected",
-        "To see what base injects without it: base log matches.",
-        "To turn it back on: base config set devmode.enabled true (while it is on, base does not update itself).",
-        "To undo this change: base doctor --restore \"",
+        "The 0.15 installer turned it on for everyone",
+        "a DEVMODE block listing which of your domains base loaded and why; your replies now end without it.",
+        "To see what base adds without the block, run `base log matches`.",
+        "To turn developer mode back on, run `base config set devmode.enabled true` (while it is on, base does not update itself).",
+        "To undo this change, run `base doctor --restore \"",
     ] {
         assert!(paragraph.contains(want), "{want:?} missing:\n{paragraph}");
     }
@@ -1042,7 +1095,8 @@ fn linked_base_toml_is_left_with_a_line() {
     assert!(devmode_paragraph(&out).is_none(), "{out}");
     let lines = upgrade_lines(&out);
     assert!(
-        lines.iter().any(|l| l.contains("developer mode is still on in") && l.contains("a link, so the upgrade left it")),
+        lines.iter().any(|l| l.contains("Developer mode is still on. We left")
+            && l.contains("as it is because it is a link to another file.")),
         "{lines:?}"
     );
     assert!(upgrade_lines(&start(&s)).is_empty(), "once");

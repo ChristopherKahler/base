@@ -86,7 +86,7 @@ printf '%s updated 0.13.17 -> %s (background)\n' "$(date -Iseconds)" "$VER" > "$
 BASE_HOME="$H4" BASE_NO_AUTO_UPDATE=1 "$B" hook session-start > "$OUT/upd.raw" 2>&1
 grep -q "^base is installed\.$" "$OUT/upd.raw" \
   && bad "welcomed a home that was mid-upgrade" || ok "no welcome on an upgrade"
-grep -q "base updated to $VER" "$OUT/upd.raw" \
+grep -q "base updated itself to $VER" "$OUT/upd.raw" \
   && ok "the update notice printed instead" || bad "neither message printed"
 echo
 

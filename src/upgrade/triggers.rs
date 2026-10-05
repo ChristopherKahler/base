@@ -224,9 +224,19 @@ fn rewrite_text(text: &str, map: &BTreeMap<(String, String), String>) -> Result<
     Ok((next, changed))
 }
 
+/// A trigger 0.15.2 left inert that fires now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Firing {
+    /// As written in the file.
+    pub trigger: String,
+    pub domain: String,
+    /// The registered projects under it.
+    pub projects: usize,
+}
+
 /// The triggers in `file` that 0.15.2 left inert and that fire now (Q2b): rooted, on a domain that injects, holding two
-/// or more registered projects by name, 0.15.2's rule (F29). As `` `trigger` on `domain` (N projects)``.
-pub fn newly_firing(file: &Path, root: &Path, ctx: &matcher::TriggerContext) -> Vec<String> {
+/// or more registered projects by name, 0.15.2's rule (F29).
+pub fn newly_firing(file: &Path, root: &Path, ctx: &matcher::TriggerContext) -> Vec<Firing> {
     let mut out = Vec::new();
     for d in crate::domain::load_domains_file(file, Some(root)).iter().filter(|d| d.auto_inject) {
         for t in &d.paths {
@@ -238,7 +248,7 @@ pub fn newly_firing(file: &Path, root: &Path, ctx: &matcher::TriggerContext) -> 
                 }
             }
             if names.len() >= 2 {
-                out.push(format!("`{t}` on `{}` ({} projects)", d.name, names.len()));
+                out.push(Firing { trigger: t.clone(), domain: d.name.clone(), projects: names.len() });
             }
         }
     }

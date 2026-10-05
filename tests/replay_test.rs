@@ -2046,20 +2046,23 @@ fn replay_upgrade_needs_no_command_on_the_corpus_store() {
         });
         let (code, out, err) = seed::run_hook(&s, "session-start", &payload, &[("BASE_NO_SPAWN", "1")]);
         assert_eq!(code, 0, "{err}");
-        out.lines().filter(|l| l.trim_start().starts_with("upgrade:")).map(String::from).collect::<Vec<String>>()
+        out.lines()
+            .filter(|l| l.trim_start().starts_with(concat!("base ", env!("CARGO_PKG_VERSION"), ":")))
+            .map(String::from)
+            .collect::<Vec<String>>()
     };
     assert!(start().is_empty(), "the first session start prints before the upgrade runs");
     let after = doctor();
     for gone in ["legacy: [signal] max_chars", "`base doctor --fix` plans the repair of", "possible data loss"] {
         assert!(!after.contains(gone), "{gone:?} is still asked for after the upgrade:\n{after}");
     }
-    assert!(after.contains("taken before base's own repair"), "the repair's own shrink, said plainly:\n{after}");
+    assert!(after.contains("made just before base cleaned up your base data"), "the repair's own shrink, said plainly:\n{after}");
     let commands = std::fs::read_to_string(gbl.join("commands.toml")).expect("commands.toml");
     assert!(commands.contains("--fires-on"), "the starter *base follows the upgrade");
     let lines = start();
-    assert!(lines.iter().any(|l| l.contains("global base.toml")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("characters of your saved notes")), "{lines:?}");
     assert!(lines.iter().any(|l| l.contains("global commands.toml")), "{lines:?}");
-    assert!(lines.iter().all(|l| !l.contains("undo") || l.contains("undo: base doctor --restore \"")), "{lines:?}");
+    assert!(lines.iter().all(|l| !l.contains("To undo") || l.contains(", run `base doctor --restore \"")), "{lines:?}");
     assert!(start().is_empty(), "each change is said once");
     println!("replay upgrade: {} lines once, doctor asks for nothing after one session start", lines.len());
 }
@@ -2140,13 +2143,14 @@ fn replay_overdue_reminders_are_warned_before_they_archive() {
         assert_eq!(code, 0, "{err}");
         (out, last_record(&s, "session-start"))
     };
-    let archived = |out: &str| out.lines().filter(|l| l.starts_with("reminder: archived ")).map(String::from).collect::<Vec<_>>();
+    let archived =
+        |out: &str| out.lines().filter(|l| l.starts_with("base: We archived your reminder ")).map(String::from).collect::<Vec<_>>();
     let in_two_days = (chrono::Local::now() + chrono::Duration::days(2)).format("%Y-%m-%d").to_string();
     for run in 0..2 {
         let (out, record) = start();
         for (_, name) in &case.reminders[..2] {
             let line = out.lines().find(|l| l.contains(name.as_str())).unwrap_or_else(|| panic!("start {run}: {name} left DUE NOW:\n{out}"));
-            assert!(line.contains(&format!("archives {in_two_days} unless reset")), "start {run}: {line}");
+            assert!(line.contains(&format!("archives {in_two_days} unless snoozed")), "start {run}: {line}");
         }
         assert!(archived(&out).is_empty(), "start {run} archived something:\n{out}");
         assert_eq!(record["first_screen_ok"], true, "start {run}: the first screen fits: {record}");
@@ -2175,7 +2179,7 @@ fn replay_overdue_reminders_are_warned_before_they_archive() {
     let lines = archived(&third);
     assert_eq!(lines.len(), 2, "{third}");
     for (i, line) in lines.iter().enumerate() {
-        assert!(line.ends_with(&format!("undo: base reminder unarchive replay-reminder-{i}")), "{line}");
+        assert!(line.ends_with(&format!("To bring it back, run `base reminder unarchive replay-reminder-{i}`.")), "{line}");
     }
     let (fourth, _) = start();
     assert!(archived(&fourth).is_empty(), "said once:\n{fourth}");

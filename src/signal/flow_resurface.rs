@@ -365,7 +365,7 @@ pub fn reminder_scan(cwd: &Path, ns: &NamespaceConfig) -> Result<DueNow> {
                 && let Some(on) = crud::reminder::archives_on(when, warned.as_deref())
             {
                 line.push_str(&format!(
-                    " · archives {on} unless reset: base reminder snooze {n} <duration>"
+                    " · archives {on} unless snoozed: base reminder snooze {n} <duration>"
                 ));
                 warns = true;
             }
