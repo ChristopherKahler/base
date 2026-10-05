@@ -435,10 +435,12 @@ fn first_sentence_end(s: &str) -> usize {
 }
 
 /// One held-back rule as the list shows it: the block that holds it (its `base hooks show` name) and its [`title`].
+/// `at` is the rule's place in its block, so two rules whose titles read the same are still two rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
     pub block: String,
     pub title: String,
+    pub at: usize,
 }
 
 /// The held-back list's first line (BO-31, G0 Q2): how many rules did not fit and what Claude does about them.
@@ -493,13 +495,14 @@ pub fn held_back_list(held: &[Held], room: usize, budget_bytes: usize) -> Option
     if all.len() <= room {
         return Some((all, held.len()));
     }
+    // Every prefix is tried: titling a block's last untitled rule drops that block's entry from the count line, which
+    // can be longer than the title, so a longer prefix can fit where a shorter one did not.
     let mut best = None;
     for shown in 0..held.len() {
         let text = render(shown);
-        if text.len() > room {
-            break;
+        if text.len() <= room {
+            best = Some((text, shown));
         }
-        best = Some((text, shown));
     }
     best
 }
@@ -644,11 +647,11 @@ impl Fitted {
         for u in drop_order(&self.blocks).into_iter().rev() {
             match u {
                 Unit::Block(i) if !self.kept[i] => out.extend(
-                    self.blocks[i].titles.iter().map(|t| Held { block: self.blocks[i].id.clone(), title: t.clone() }),
+                    self.blocks[i].titles.iter().enumerate().map(|(at, t)| Held { block: self.blocks[i].id.clone(), title: t.clone(), at }),
                 ),
                 Unit::Part(b, j) if !self.parts_kept[b][j] => {
                     if let Some(t) = &self.blocks[b].parts[j].title {
-                        out.push(Held { block: self.blocks[b].id.clone(), title: t.clone() });
+                        out.push(Held { block: self.blocks[b].id.clone(), title: t.clone(), at: j });
                     }
                 }
                 _ => {}
@@ -684,9 +687,10 @@ impl Fitted {
 /// they cover, then each block's `base hooks show` command with its rules' [`title`]s, most relevant first, as many as
 /// fit, then the count of the rest. The list fits inside the same budget: the blocks are fitted again with room left
 /// for it, at most one part in [`TITLE_SHARE`] of the budget, so it may hold back more full text and never pushes the
-/// output past the budget. That second fit is kept only when its list shows at least one title, and more titles than
-/// the full rules it cost (rules the first fit printed whole that it withholds); otherwise the first fit stands, with the list only when one showing a
-/// title fits in the room it left. Which rules match, how they rank, every budget, and the output of a prompt that
+/// output past the budget. That second fit is kept only when its list gains more than it cost: new titles (of rules the
+/// first fit neither printed whole nor titled in its own room) against the rules and other blocks the first printed
+/// whole and it does not; otherwise the first fit stands, with the list only when one showing a title fits in the room
+/// it left. Which rules match, how they rank, every budget, and the output of a prompt that
 /// withholds no rule are unchanged, byte for byte.
 pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -> Fitted {
     let first = fit_within(header, blocks.clone(), budget_bytes, budget_bytes, key);
@@ -697,17 +701,41 @@ pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -
     // What the list would take with every title; the second fit leaves that much room, at most the share.
     let wanted = held_back_list(&held, usize::MAX, budget_bytes).map_or(0, |(text, _)| text.len() + 2);
     let reserve = wanted.min(budget_bytes / TITLE_SHARE);
+    // The first fit as it would print with a list in the room it already left: the titles it shows cost nothing.
+    let first_listed = with_list(first.clone());
+    let free: &[Held] = first_listed.as_ref().map_or(&[], |f| &held[..f.titled]);
     let second = fit_within(header, blocks, budget_bytes.saturating_sub(reserve), budget_bytes, key);
-    // The full rules the second fit cost: the ones it withholds that the first fit printed whole. Which rules, not how
-    // many: the second fit can trade a matched rule for a lower one that fits where it did not, and that costs one.
-    let cost = second.held_back().iter().filter(|h| !held.contains(h)).count();
-    // The second fit is kept only when its list shows more titles than that cost, and at least one: room bought with
-    // full text and spent on a count line alone (a small budget) is a pure loss. Otherwise the first fit stands, with a
-    // list only when one with a title fits in the room it left.
-    match with_list(second) {
-        Some(f) if f.titled > cost => f,
-        _ => with_list(first.clone()).unwrap_or(first),
+    // What the second fit cost: each rule the first fit printed whole that it withholds (which rules, not how many: it
+    // can trade a matched rule for a lower one that fits where it did not), and each block or part that is not a rule
+    // (a context block, a decision, a relay block) that the first printed and it does not.
+    let held_second = second.held_back();
+    let cost = held_second.iter().filter(|h| !held.contains(h)).count() + untitled_lost(&first, &second);
+    // What it gained: titles of rules the first fit neither printed whole nor titled. A title of a rule it just took
+    // out of full text, or one the first fit's own list already shows, is no gain. The second fit is kept only when
+    // that gain is more than the cost; otherwise the first fit stands, with its list when one with a title fits.
+    if let Some(f) = with_list(second) {
+        let gain = held_second[..f.titled].iter().filter(|h| held.contains(h) && !free.contains(h)).count();
+        if gain > cost {
+            return f;
+        }
     }
+    first_listed.unwrap_or(first)
+}
+
+/// The blocks and parts with no title (anything but a rule) that `first` printed and `second` does not. The two fits
+/// are of the same blocks in the same order.
+fn untitled_lost(first: &Fitted, second: &Fitted) -> usize {
+    let mut lost = 0;
+    for (i, b) in first.blocks.iter().enumerate() {
+        if b.is_ranked() {
+            lost += (0..b.parts.len())
+                .filter(|&j| b.parts[j].title.is_none() && first.parts_kept[i][j] && !second.parts_kept[i][j])
+                .count();
+        } else if b.titles.is_empty() && first.kept[i] && !second.kept[i] {
+            lost += 1;
+        }
+    }
+    lost
 }
 
 /// `fitted` with the held-back list after its last block, when one showing at least one title fits in the room left.
@@ -1713,23 +1741,51 @@ mod tests {
             let f = fit(HEADER, list(), budget, KEY);
             let old = fit_within(HEADER, list(), budget, budget, KEY);
             assert!(f.text.len() <= budget, "{budget}: {} bytes:\n{}", f.text.len(), f.text);
-            match &f.list {
-                None => {
-                    assert_eq!(f.text, old.text, "{budget}: no list, so the output of before");
-                    without += 1;
-                }
-                Some(_) => {
-                    // Which rules lost their full text, not how many: a swap of a higher rule for a lower one costs one.
-                    let now = printed_rule_ids(&f);
-                    let lost = printed_rule_ids(&old).iter().filter(|id| !now.contains(id)).count();
-                    assert!(f.titled >= 1 && f.titled > lost, "{budget}: {lost} full rules lost for {} titles:\n{}", f.titled, f.text);
-                    with += 1;
-                    traded += usize::from(lost > 0);
-                }
+            if f.list.is_none() {
+                assert_eq!(f.text, old.text, "{budget}: no list, so the output of before");
+                without += 1;
+                continue;
             }
+            assert!(f.titled >= 1, "{budget}: a list always shows a title:\n{}", f.text);
+            with += 1;
+            let old_listed = with_list(old.clone());
+            if f.text == old_listed.as_ref().unwrap_or(&old).text {
+                continue;
+            }
+            // The second fit won: what it cost (rules by id, not by count, and the context block) must be less than the
+            // titles it adds for rules the old fit neither printed whole nor titled in its own room.
+            let now = printed_rule_ids(&f);
+            let lost_rules = printed_rule_ids(&old).iter().filter(|id| !now.contains(id)).count();
+            let lost_context = usize::from(kept_ids(&old).contains(&"hooks-context") && !kept_ids(&f).contains(&"hooks-context"));
+            let old_held = old.held_back();
+            let free = &old_held[..old_listed.as_ref().map_or(0, |l| l.titled)];
+            let gain = f.held_back()[..f.titled].iter().filter(|h| old_held.contains(h) && !free.contains(h)).count();
+            assert!(gain > lost_rules + lost_context, "{budget}: {gain} new titles for {lost_rules} rules and {lost_context} context:\n{}", f.text);
+            traded += usize::from(lost_rules + lost_context > 0);
         }
         assert!(with > 0 && without > 0, "control: both outcomes occur ({with} with a list, {without} without)");
         assert!(traded > 0, "control: some budgets trade full text for titles");
+    }
+
+    /// BO-31 (code review): a block that is not rules is a cost too. The first fit drops only the one bracket rule; making
+    /// room for its title would drop the matched domain's context block, a trade of one block for one title, so the old
+    /// fit stands and the context prints.
+    #[test]
+    fn a_list_never_trades_a_context_block_for_one_title() {
+        let list = || {
+            blocks(vec![
+                ranked_titled("hooks-rules", Priority::Matched, &[2.0, 1.0], 300),
+                block("hooks-context", Priority::Context, 600),
+                rules_block("bracket-rules", Priority::Bracket, 1, 400),
+            ])
+        };
+        let old = fit_within(HEADER, list(), 1500, 1500, KEY);
+        assert_eq!(dropped_ids(&old), ["bracket-rules"], "control: the old fit drops only the bracket rule:
+{}", old.text);
+        let f = fit(HEADER, list(), 1500, KEY);
+        assert!(kept_ids(&f).contains(&"hooks-context"), "the context block was traded for a title:
+{}", f.text);
+        assert_eq!(f.text, old.text, "{}", f.text);
     }
 
     /// BO-31 (Z1, G0 Q1): a title is the rule's line on one line, its number or dash kept, ended at its first sentence,

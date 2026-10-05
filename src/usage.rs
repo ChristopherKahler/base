@@ -940,6 +940,8 @@ pub struct RuleNow {
     pub injects: bool,
     /// Its bytes as the prompt hook prints it, its reason included (BO-31).
     pub bytes: usize,
+    /// One of its own matchers is a place (`base rule add --path`): it loads with that file, not with its domain (BO-31).
+    pub has_place: bool,
 }
 
 impl RuleNow {
@@ -951,8 +953,10 @@ impl RuleNow {
 
 /// Every rule of every domain, once each, in the domains' order.
 pub fn rules_now(domains: &[DomainDef], store: Option<&Store>, config: &BaseConfig) -> Vec<RuleNow> {
-    let converted: HashSet<String> =
-        crate::domain::rules::rules_with_matchers(store, config, domains).into_iter().map(|c| c.rule.id).collect();
+    let converted: HashMap<String, bool> = crate::domain::rules::rules_with_matchers(store, config, domains)
+        .into_iter()
+        .map(|c| (c.rule.id, c.matchers.iter().any(|m| m.place.is_some())))
+        .collect();
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
     for d in domains {
@@ -961,7 +965,8 @@ pub fn rules_now(domains: &[DomainDef], store: Option<&Store>, config: &BaseConf
                 continue;
             }
             out.push(RuleNow {
-                own_matchers: converted.contains(&r.id),
+                own_matchers: converted.contains_key(&r.id),
+                has_place: converted.get(&r.id).copied().unwrap_or(false),
                 bytes: r.rendered.len(),
                 id: r.id,
                 domain: d.name.clone(),
@@ -1377,7 +1382,7 @@ pub fn build(i: &Inputs) -> Section {
     held_back.sort_by(|a, b| b.withheld.cmp(&a.withheld).then_with(|| b.bytes.cmp(&a.bytes)).then_with(|| a.rule.cmp(&b.rule)));
     let mut longest: Vec<Longest> = rules
         .iter()
-        .filter(|r| r.bytes > LONG_RULE_BYTES)
+        .filter(|r| r.injects && r.bytes > LONG_RULE_BYTES)
         .map(|r| Longest { rule: r.short(), domain: r.domain.clone(), text: r.text.clone(), bytes: r.bytes, advice: fit_advice(r) })
         .collect();
     longest.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.rule.cmp(&b.rule)));
@@ -1385,13 +1390,14 @@ pub fn build(i: &Inputs) -> Section {
     Section { log: Some(log), dead, too_new, noisy, ignored, average, review, held_back, longest, detector, limits }
 }
 
-/// What to suggest for a rule that does not fit (BO-31, Z2): move a rule of an always-on domain to the domain it is
-/// about; give a path to a rule that names a file and has none of its own; otherwise shorten it.
+/// What to suggest for a rule that does not fit (BO-31, Z2): move a rule that reaches every session (an always-on
+/// domain's, with no matchers of its own) to the domain it is about; give a path to a rule that names a file and has no
+/// path of its own; otherwise shorten it.
 fn fit_advice(r: &RuleNow) -> FitAdvice {
-    if r.always {
+    if r.always && !r.own_matchers {
         return FitAdvice::Move { domain: r.domain.clone() };
     }
-    if !r.own_matchers
+    if !r.has_place
         && let Some(file) = named_file(&r.text)
     {
         return FitAdvice::Path { file };
@@ -1426,6 +1432,10 @@ pub fn named_file(text: &str) -> Option<String> {
             continue;
         }
         let is_path = token.contains('/') || token.contains('\\');
+        // `Node.js`, `Vue.js`: a capitalised name with a script extension is a product, not a file.
+        if !is_path && stem.starts_with(char::is_uppercase) && matches!(ext, "js" | "ts") {
+            continue;
+        }
         if is_path || EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
             return Some(token.to_string());
         }
@@ -1912,6 +1922,19 @@ pub fn stats_for(cwd: &Path, config: &BaseConfig, domain: Option<&str>) -> Stats
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BO-31 (Z2, code review): the file a rule names, for the "give it a path" advice: a path with a file name, a line
+    /// reference, a bare name with a common extension; never a folder, a version, a web address or a product name.
+    #[test]
+    fn named_file_finds_files_not_versions_or_products() {
+        assert_eq!(named_file("Edit src/hook/mod.rs with care.").as_deref(), Some("src/hook/mod.rs"));
+        assert_eq!(named_file("see config.rs:36 first").as_deref(), Some("config.rs"));
+        assert_eq!(named_file("keep commands.toml in step").as_deref(), Some("commands.toml"));
+        assert_eq!(named_file("`~/.local/bin/tool.sh` runs it").as_deref(), Some("~/.local/bin/tool.sh"));
+        for none in ["ship v0.16.0 tonight", "use e.g. a list", "read https://example.com/a.md", "Prefer Node.js streams", "the ~/.tool folder"] {
+            assert_eq!(named_file(none), None, "{none}");
+        }
+    }
 
     #[test]
     fn args_are_quoted_only_when_a_shell_needs_it() {
