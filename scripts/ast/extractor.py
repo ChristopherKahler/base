@@ -228,6 +228,25 @@ def _workspace_globs(workspace_file: Path) -> list[str]:
     return globs
 
 
+def _workspace_package_dirs(root: Path, pattern: str) -> tuple[list[Path], str | None]:
+    """The folders one `packages:` entry names, or none and the reason it was skipped.
+
+    #172: `.` (also `./` or an empty entry) is the workspace root itself, which
+    pnpm accepts for a single-package workspace and `Path.glob` rejects. What
+    else `Path.glob` rejects, and with which exception, differs by Python
+    version (`ValueError`, `IndexError`, `AttributeError`, `NotImplementedError`
+    for an absolute pattern), so any failure skips the entry instead of
+    stopping the map.
+    """
+    p = pattern.strip()
+    if p in ("", ".", "./", ".\\"):
+        return [root], None
+    try:
+        return list(root.glob(p)), None
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        return [], f"{type(exc).__name__}: {exc}"
+
+
 def _load_workspace_packages(start_dir: Path) -> dict[str, Path]:
     root = _find_workspace_root(start_dir)
     if root is None:
@@ -236,9 +255,22 @@ def _load_workspace_packages(start_dir: Path) -> dict[str, Path]:
     if key in _WORKSPACE_PACKAGE_CACHE:
         return _WORKSPACE_PACKAGE_CACHE[key]
 
+    import multiprocessing
+
     packages: dict[str, Path] = {}
     for pattern in _workspace_globs(root / "pnpm-workspace.yaml"):
-        for package_dir in root.glob(pattern):
+        package_dirs, skipped = _workspace_package_dirs(root, pattern)
+        # One notice per entry per run: only the main process says it (each pool
+        # worker loads the workspace again with its own cache), and `extract()`
+        # loads the target's workspace up front so the main process always does.
+        # `# Skipped ` lines are what `.last-notices` keeps for the next session.
+        if skipped and multiprocessing.parent_process() is None:
+            print(
+                f"# Skipped the pnpm-workspace.yaml entry '{pattern}' in {root}: it is not a folder "
+                f"pattern base can read, so the packages it names are left out of the code map.",
+                file=sys.stderr,
+            )
+        for package_dir in package_dirs:
             manifest = package_dir / "package.json"
             if not manifest.is_file():
                 continue
@@ -8352,6 +8384,13 @@ def extract(
     if cache_root is not None:
         root = cache_root
     root = root.resolve()
+    # Loaded here, in the main process, so an unusable `packages:` entry is
+    # announced once even when the pool's workers are the ones resolving (#172).
+    # Only when there are JS/TS files: they are the ones whose imports resolve
+    # through the workspace, and they skip the cache, so the load happens for
+    # them anyway; a run without them loads nothing.
+    if any(p.suffix in _JS_CACHE_BYPASS_SUFFIXES for p in paths):
+        _load_workspace_packages(root)
 
     effective_root = cache_root or root
     total = len(paths)

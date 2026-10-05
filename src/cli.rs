@@ -155,6 +155,9 @@ pub enum Commands {
         action: ForkAction,
     },
     /// Sync file-owned data into the graph
+    ///
+    /// Exit codes: 0, every file was synced. 3, partial: the files it names could not be synced and were skipped, and
+    /// every other file was synced. 1, the sync failed and nothing was written. 2, it did not start (bad arguments).
     Sync {
         /// Only re-extract files changed since last sync
         #[arg(long)]
@@ -166,9 +169,13 @@ pub enum Commands {
         #[arg(long)]
         target: Option<String>,
         /// Unattended: proceed past the extractor's file-count safety threshold
-        /// without asking (what the hooks pass — nobody is there to answer)
+        /// without asking (what the hooks pass — nobody is there to answer).
+        /// The AST build is then stopped after 15 minutes, unless --no-time-limit is given
         #[arg(long)]
         yes: bool,
+        /// With --ast --yes: build with no time limit, for a tree too big to finish in 15 minutes (the hooks never pass it)
+        #[arg(long)]
+        no_time_limit: bool,
         /// Repair missing edges (backfill decision→domain, milestone→project, task→project links)
         #[arg(long)]
         repair: bool,
@@ -1264,7 +1271,8 @@ fn reminder_slug(cwd: &std::path::Path, arg: &str) -> String {
 /// Parse a relative duration like "30s", "3m", "2h", "1d".
 fn parse_duration(s: &str) -> anyhow::Result<chrono::Duration> {
     let s = s.trim();
-    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    // At the last character, not the last byte: `3分` would split inside the `分`.
+    let (num, unit) = s.split_at(s.char_indices().last().map_or(0, |(i, _)| i));
     let n: i64 = num
         .parse()
         .map_err(|_| anyhow::anyhow!("bad duration number in '{s}'"))?;
@@ -1951,6 +1959,10 @@ fn outside_workspace_note(cwd: &std::path::Path) {
 fn project_error_prefix(e: &anyhow::Error) -> &'static str {
     if e.downcast_ref::<crud::project::Refused>().is_some() { "Error" } else { "Failed" }
 }
+
+/// `base sync`'s exit code when some files could not be extracted and every other file was written (#162). Not 2: that
+/// is what clap and base use for a run that did not start.
+const SYNC_PARTIAL: i32 = 3;
 
 fn die(prefix: &str, e: impl std::fmt::Display) -> ! {
     eprintln!("{prefix}: {e:#}");
@@ -3305,7 +3317,7 @@ pub fn run() {
         },
 
         // ─── Sync ────────────────────────────────────────
-        Some(Commands::Sync { incremental, ast, target, yes, repair }) => {
+        Some(Commands::Sync { incremental, ast, target, yes, no_time_limit, repair }) => {
             if repair {
                 // The lines print after the write has landed: a repair that is on
                 // stdout is on disk.
@@ -3380,39 +3392,56 @@ pub fn run() {
                 // often print to nobody.
                 let last_error = ast_ttl.with_file_name(".last-error");
                 let base_ast_dir = ast_ttl.parent().map(|p| p.to_path_buf());
+                // `None`: an unattended build stopped at its time limit (#174).
                 let status = if yes {
-                    extractor
-                        .stdin(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::piped());
-                    extractor.output().map(|o| {
-                        if o.status.success() {
-                            // #66: `--yes` pipes stderr, so on success the
-                            // extractor's own notices — the file count, every
-                            // skipped file, the app-root attribution count —
-                            // used to be captured and dropped. Echo them.
-                            base::hook::automap::echo_extractor_notices(&o.stderr);
-                            // #89: and write them down. Every background refresh
-                            // — the Stop hook's `spawn_sync`, a first contact,
-                            // the WSL delegate, the git hook — runs THIS command
-                            // with `--yes` and discards its output, so the child
-                            // recording its own notices is what reaches all four
-                            // without any of them changing.
-                            if let Some(dir) = base_ast_dir.as_deref() {
-                                base::hook::automap::record_notices(dir, &o.stderr);
+                    use base::hook::automap::{limit_for, run_unattended, unattended_limit, Unattended};
+                    // Every `--yes` run gets the time limit (#174) unless `--no-time-limit` lifts it; the hooks never pass that.
+                    let limit = limit_for(yes, no_time_limit);
+                    run_unattended(&mut extractor, limit).map(|outcome| match outcome {
+                        Unattended::Ended(status, stderr) => {
+                            if status.success() {
+                                // #66: `--yes` pipes stderr, so on success the
+                                // extractor's own notices — the file count, every
+                                // skipped file, the app-root attribution count —
+                                // used to be captured and dropped. Echo them.
+                                base::hook::automap::echo_extractor_notices(&stderr);
+                                // #89: and write them down. Every background refresh
+                                // — the Stop hook's `spawn_sync`, a first contact,
+                                // the WSL delegate, the git hook — runs THIS command
+                                // with `--yes` and discards its output, so the child
+                                // recording its own notices is what reaches all four
+                                // without any of them changing.
+                                if let Some(dir) = base_ast_dir.as_deref() {
+                                    base::hook::automap::record_notices(dir, &stderr);
+                                }
+                            } else {
+                                let _ = std::fs::write(&last_error, base::hook::automap::stderr_tail(&stderr));
                             }
-                        } else {
-                            let _ = std::fs::write(&last_error, base::hook::automap::stderr_tail(&o.stderr));
+                            Some(status)
                         }
-                        o.status
+                        Unattended::Stopped(stderr) => {
+                            let _ = std::fs::write(
+                                &last_error,
+                                base::hook::automap::stopped_record(limit.unwrap_or_else(unattended_limit), &stderr),
+                            );
+                            None
+                        }
                     })
                 } else {
-                    extractor.status()
+                    extractor.status().map(Some)
                 };
 
                 // Whatever happened, this build is over: the hooks may start the next.
                 let _ = std::fs::remove_file(ast_ttl.with_file_name(".building"));
                 match status {
-                    Ok(s) if s.success() => {
+                    Ok(None) => {
+                        eprintln!(
+                            "base stopped the code map build for {target_dir} after {} because it was stuck. \
+                             A map from an earlier build, if there is one, is still there.",
+                            base::hook::automap::spoken(base::hook::automap::unattended_limit())
+                        );
+                    }
+                    Ok(Some(s)) if s.success() => {
                         let _ = std::fs::remove_file(&last_error);
                         println!("AST extraction complete → {}", ast_ttl.display());
                         // Register a pointer to this map in the workspace graph so
@@ -3430,7 +3459,7 @@ pub fn run() {
                             }
                         }
                     }
-                    Ok(s) => {
+                    Ok(Some(s)) => {
                         eprintln!("AST extraction exited with code {:?}", s.code());
                         if !yes {
                             let _ = std::fs::write(&last_error, format!("extractor exited with code {:?}\n", s.code()));
@@ -3445,12 +3474,33 @@ pub fn run() {
                     }
                 }
             } else {
-                match base::extract::sync(&cwd, &config, incremental) {
-                    Ok(report) => {
+                let report = base::extract::sync(&cwd, &config, incremental);
+                // #164: a link into an excluded path is skipped and said, once per link.
+                for line in report.as_ref().map(|r| r.excluded_links.as_slice()).unwrap_or_default() {
+                    eprintln!("{line}");
+                }
+                match report {
+                    Ok(report) if report.unextractable.is_empty() => {
                         println!(
                             "Sync complete: {} scanned, {} extracted, {} skipped",
                             report.scanned, report.extracted, report.skipped
                         );
+                    }
+                    Ok(report) => {
+                        // #162: every other file is written; the ones named were not, and the exit code says so.
+                        for file in &report.unextractable {
+                            eprintln!("{file}");
+                        }
+                        let n = report.unextractable.len();
+                        let (files, it) = if n == 1 { ("1 file was".to_string(), "it") } else { (format!("{n} files were"), "them") };
+                        println!(
+                            "Sync partial: {} scanned, {} extracted, {} skipped. {files} not synced (named above); the graph \
+                             still has what it held for {it} before. Fix {it}, then run base sync again.",
+                            report.scanned, report.extracted, report.skipped
+                        );
+                        // `exit` skips destructors: the files that were written still refresh the rule index.
+                        drop(_refresh_index);
+                        std::process::exit(SYNC_PARTIAL);
                     }
                     Err(e) => die("Sync failed", e),
                 }
@@ -5816,6 +5866,14 @@ mod tests {
     fn rebuilds_index(args: &[&str]) -> bool {
         let cli = Cli::try_parse_from(std::iter::once("base").chain(args.iter().copied())).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         changes_prompt_matching(&cli.command)
+    }
+
+    /// A duration whose unit is a multi-byte character is refused, not split inside that character.
+    #[test]
+    fn a_duration_ending_in_a_multibyte_character_is_an_error_not_a_panic() {
+        assert!(parse_duration("3分").is_err());
+        assert!(parse_duration("").is_err());
+        assert_eq!(parse_duration(" 90s ").unwrap(), chrono::Duration::seconds(90), "control: a valid duration still parses");
     }
 
     /// K7e (BO-18): the commands that change what a prompt can be served, or replace or move the graph holding it,

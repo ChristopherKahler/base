@@ -574,7 +574,12 @@ fn rel_to_root(root: &Path, p: &str) -> Option<String> {
     let norm = |s: &str| s.replace('\\', "/").trim_end_matches('/').to_string();
     let p = norm(&p.replace("\\\\", "\\"));
     let r = norm(&root.to_string_lossy());
-    if !r.is_empty() && p.len() > r.len() && p[..r.len()].eq_ignore_ascii_case(&r) && p.as_bytes()[r.len()] == b'/' {
+    // `get`, as in `under`: the root's length can land inside a multi-byte character of `p`.
+    if !r.is_empty()
+        && p.len() > r.len()
+        && p.get(..r.len()).is_some_and(|head| head.eq_ignore_ascii_case(&r))
+        && p.as_bytes()[r.len()] == b'/'
+    {
         return Some(p[r.len() + 1..].to_string());
     }
     // Already relative: no drive letter, no leading slash, no UNC.
@@ -1090,6 +1095,14 @@ mod tests {
         // Outside the tier: not comparable with a record's relative path.
         assert_eq!(rel_to_root(root, "/home/chriskahler/basemode"), None);
         assert_eq!(rel_to_root(root, "D:/elsewhere"), None);
+    }
+
+    #[test]
+    fn rel_to_root_with_a_multibyte_char_at_the_root_length_is_a_miss_not_a_panic() {
+        // The root is 6 bytes; byte 6 of the path is the middle of `é`.
+        let root = Path::new("C:/a/b");
+        assert_eq!(rel_to_root(root, "C:/a/é/x"), None);
+        assert_eq!(rel_to_root(root, "C:/a/b/é").as_deref(), Some("é"), "control: the same root still strips");
     }
 
     #[test]
