@@ -898,13 +898,14 @@ mod tests {
                 }
             }
             // Where it came from, first: base and this version, the reminder pass's `base:`, or the paragraph's own
-            // first words.
+            // first words. The text itself, not `LEAD`, so a lead-in changed back to anything else is caught.
+            let upgrade_lead = format!("base {VERSION}: ");
             let lead = if row.starts_with("17") {
                 "base: "
             } else if row.starts_with("12") {
                 "base "
             } else {
-                LEAD
+                upgrade_lead.as_str()
             };
             assert!(line.starts_with(lead), "row {row}: does not start with {lead:?}:\n{line}");
             assert!(line.ends_with('.'), "row {row}: not a finished sentence:\n{line}");
