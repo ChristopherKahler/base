@@ -376,7 +376,7 @@ pub fn partial_line(block: &PromptBlock, withheld: usize, bytes: usize, key: &st
     )
 }
 
-/// The most characters a held-back rule's [`title`] takes, its number included (BO-31, lynx's G0 ruling on Q1).
+/// The most characters a held-back rule's [`title`] takes, its number included (BO-31, G0 Q1).
 pub const TITLE_CHARS: usize = 100;
 /// The held-back list takes at most one part in this many of the budget (BO-31, G0 Q3): showing titles may hold back
 /// more full text, and this bounds how much.
