@@ -97,6 +97,56 @@ fn unattended_ast_run_stops_at_its_limit() {
     assert!(!alive(pid), "grandchild {pid} outlived the stopped build");
 }
 
+/// The extractor writes its map and exits, but leaves a process holding its stderr: the build is done, so it ends in
+/// seconds with the map kept, and the leftover is stopped, instead of waiting out that process or the limit.
+#[test]
+fn a_finished_build_does_not_wait_for_what_it_left_running() {
+    const LEAVES_ONE: &str = r##"import subprocess, sys
+from pathlib import Path
+out = Path(sys.argv[sys.argv.index("--out") + 1])
+out.parent.mkdir(parents=True, exist_ok=True)
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+(out.parent / "leftover.pid").write_text(str(child.pid))
+out.write_text("# a map\n")
+print("# Extracting 1 files from somewhere", file=sys.stderr, flush=True)
+"##;
+    let home = tempfile::tempdir().unwrap();
+    let app = home.path().join("dev").join("app");
+    std::fs::create_dir_all(app.join(".git")).unwrap();
+    std::fs::write(app.join("a.py"), "def f():\n    pass\n").unwrap();
+    let scripts = app.join("scripts").join("ast");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::write(scripts.join("onto_ast.py"), LEAVES_ONE).unwrap();
+
+    let started = Instant::now();
+    let out = Command::new(BIN)
+        .args(["sync", "--ast", "--yes", "--target"])
+        .arg(&app)
+        .current_dir(&app)
+        .env("BASE_HOME", home.path())
+        .env("BASE_AST_LIMIT_SECS", "120")
+        .env("BASE_AST_SKIP_REGISTER", "1")
+        .env("BASE_NO_AUTO_UPDATE", "1")
+        .env_remove("CLAUDECODE")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let took = started.elapsed();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(took < Duration::from_secs(60), "it waited for the leftover: {took:?}\n{err}");
+    assert!(stdout.contains("AST extraction complete"), "{stdout}\n{err}");
+    let base_ast = app.join(".base-ast");
+    assert!(base_ast.join("ast.ttl").is_file(), "the map it wrote is kept");
+    assert!(!base_ast.join(".last-error").exists(), "a finished build is not a failure");
+    let pid: u32 = std::fs::read_to_string(base_ast.join("leftover.pid")).unwrap().trim().parse().unwrap();
+    let gone_by = Instant::now() + Duration::from_secs(10);
+    while alive(pid) && Instant::now() < gone_by {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(!alive(pid), "the leftover {pid} was not stopped");
+}
+
 #[test]
 fn a_stopped_refresh_shows_at_session_start_even_with_a_map() {
     // SAFETY: single-process test env; nothing here may spawn a build.

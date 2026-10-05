@@ -328,7 +328,7 @@ fn discover_files(cwd: &Path, sync_config: &crate::config::SyncConfig) -> (Vec<P
                     && real != rel
                     && excluded(&real)
                 {
-                    let (link, leads_to) = first_link(cwd, &rel, root);
+                    let (link, leads_to) = first_link(cwd, &rel, root).unwrap_or_else(|| (rel.clone(), real.clone()));
                     through.entry(link).or_insert((leads_to, 0)).1 += 1;
                     continue;
                 }
@@ -362,9 +362,9 @@ fn resolved_rel(file: &Path, root: &Path, dirs: &mut HashMap<PathBuf, Option<Pat
     Some(crate::crud::normalize_path_sep(&real.to_string_lossy()))
 }
 
-/// The first link (or junction) on the walked path `rel`, and where it leads, for the warning. The file itself when no
-/// folder on the way is one.
-fn first_link(cwd: &Path, rel: &str, root: &Path) -> (String, String) {
+/// The first link (or junction) on the walked path `rel`, and where it leads, for the warning. `None` when nothing on
+/// the way reads as a link.
+fn first_link(cwd: &Path, rel: &str, root: &Path) -> Option<(String, String)> {
     let mut walked = PathBuf::new();
     for part in rel.split('/') {
         walked.push(part);
@@ -372,11 +372,11 @@ fn first_link(cwd: &Path, rel: &str, root: &Path) -> (String, String) {
         if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
             let to = crate::config::resolved_under(&at, root)
                 .map(|p| crate::crud::normalize_path_sep(&p.to_string_lossy()))
-                .unwrap_or_else(|| crate::config::resolve(&at).map_or_else(String::new, |p| p.display().to_string()));
-            return (crate::crud::normalize_path_sep(&walked.to_string_lossy()), to);
+                .or_else(|| crate::config::resolve(&at).map(|p| p.display().to_string()))?;
+            return Some((crate::crud::normalize_path_sep(&walked.to_string_lossy()), to));
         }
     }
-    (rel.to_string(), String::new())
+    None
 }
 
 /// Check if a file is up-to-date (mtime <= lastExtracted).

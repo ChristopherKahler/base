@@ -693,7 +693,7 @@ const STUCK: &str = " because it was stuck.";
 /// A span the way a person says it: "10 minutes", "1 minute", "3 seconds".
 pub fn spoken(span: Duration) -> String {
     let s = span.as_secs();
-    let (n, unit) = if s >= 60 && s % 60 == 0 { (s / 60, "minute") } else { (s, "second") };
+    let (n, unit) = if s >= 60 && s.is_multiple_of(60) { (s / 60, "minute") } else { (s, "second") };
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
@@ -761,8 +761,10 @@ pub fn run_unattended(cmd: &mut Command, limit: Duration) -> std::io::Result<Una
     };
     match ended {
         Some(status) => {
-            // It ended; if something it started still holds stderr past the limit, that is stopped too.
-            if closed.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).is_err() {
+            // It ended, so its work is done. Something it started that still holds stderr is a leftover: a short grace
+            // for the last bytes, then it is stopped rather than waited for.
+            let grace = Duration::from_secs(2).min(deadline.saturating_duration_since(std::time::Instant::now()));
+            if closed.recv_timeout(grace).is_err() {
                 tree.stop(&mut child);
                 let _ = closed.recv_timeout(Duration::from_secs(2));
             }
