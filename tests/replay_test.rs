@@ -2183,3 +2183,95 @@ fn replay_overdue_reminders_are_warned_before_they_archive() {
     assert!(case.reminders[..2].iter().all(|(_, n)| listed.contains(n.as_str())), "kept as archived:\n{listed}");
     println!("replay reminders: 2 of 2 overdue kept and warned at 2 starts, archived with 2 undo lines at the third, 0 lines at the fourth");
 }
+
+/// BO-28 (build rule 13), on a corpus store an older base ran in whose global base.toml carries the 0.15 installer's
+/// `[devmode]` line: the first session start says nothing and its prompts still carry the DEVMODE block; the second turns
+/// developer mode off and prints the paragraph first under the header, inside the first screen, and its prompts carry no
+/// block; the third prints nothing, and doctor repeats the paragraph. The same store with the value set by command is
+/// left on, with no line.
+#[test]
+fn replay_upgrade_turns_the_installers_devmode_off_once() {
+    let case = cases().into_iter().next().expect("a corpus case");
+    // The prompt hook prints the DEVMODE block only on a prompt that matched a domain: three prompts naming a keyword of
+    // the corpus's seeded domains.
+    let corpus_prompts: Vec<String> =
+        ["what is the seed0 status", "where did alpha1 land", "is gamma2 next"].map(String::from).to_vec();
+    // The block, or the pointer line the prompt budget leaves when it drops the block.
+    let carries_devmode = |out: &str| out.contains("DEVMODE=true") || out.contains("withheld devmode");
+    let mut on_before = 0;
+    let mut on_after = 0;
+    for (tag, set_by_command) in [("bo28-devmode", false), ("bo28-devmode-set", true)] {
+        let s = write_case_as(&case, tag);
+        let gbl = s.home.join(".base-gbl");
+        std::fs::write(gbl.join(".hooks-wired-0.15.2"), "").expect("an older base's stamp");
+        let toml = gbl.join("base.toml");
+        let mut text = std::fs::read_to_string(&toml).expect("the corpus base.toml");
+        text.push_str("\n[devmode]\nenabled = true            # false = no diagnostic block\n");
+        std::fs::write(&toml, &text).expect("the 0.15 installer's devmode line");
+        if set_by_command {
+            let (code, out, err) = run_base(&s, &["config", "set", "devmode.enabled", "true"]);
+            assert_eq!(code, 0, "{out}{err}");
+        }
+        let hook = |prompt: Option<&str>| {
+            let mut payload = serde_json::json!({
+                "cwd": s.ws.display().to_string(), "hook_event_name": "SessionStart", "source": "startup", "session_id": "bo28-replay",
+            });
+            let name = match prompt {
+                Some(p) => {
+                    payload["hook_event_name"] = serde_json::Value::from("UserPromptSubmit");
+                    payload["prompt"] = serde_json::Value::from(p);
+                    "user-prompt-submit"
+                }
+                None => "session-start",
+            };
+            let (code, out, err) = seed::run_hook(&s, name, &payload, &[("BASE_NO_SPAWN", "1")]);
+            assert_eq!(code, 0, "{name}: {err}");
+            (out, err)
+        };
+        let heading = |out: &str| out.lines().filter(|l| l.starts_with("DEVELOPER MODE TURNED OFF")).count();
+
+        let (first, _) = hook(None);
+        assert_eq!(heading(&first), 0, "{tag}: the first start says nothing:\n{first}");
+        for p in &corpus_prompts {
+            assert!(carries_devmode(&hook(Some(p)).0), "{tag}: on until the start that says so");
+        }
+        let (second, err) = hook(None);
+        let after: Vec<bool> = corpus_prompts.iter().map(|p| carries_devmode(&hook(Some(p)).0)).collect();
+        let (third, _) = hook(None);
+        assert_eq!(heading(&third), 0, "{tag}: said once:\n{third}");
+        if set_by_command {
+            assert_eq!(heading(&second), 0, "{tag}: a value set by command gets no line:\n{second}");
+            assert!(after.iter().all(|on| *on), "{tag}: a value set by command stays on");
+            continue;
+        }
+        on_before = corpus_prompts.len();
+        on_after = after.iter().filter(|on| **on).count();
+        let lines: Vec<&str> = second.lines().collect();
+        assert!(lines.len() > 2 && lines[1].starts_with("DEVELOPER MODE TURNED OFF"), "first under the header:\n{second}");
+        assert!(units(&lines[..3].join("\n")) <= 1990, "inside the first screen:\n{second}");
+        // lynx's ruling: on this one start the paragraph may push the rest of the first screen (header, Pinned, DUE
+        // NOW: everything above HANDOFFS) past the bar, by its own block and no more; the run counts as fitting and
+        // its record names the block.
+        // What the paragraph adds there: its two lines, the blank line after them, and step 1's exception in the
+        // instructions (the same allowance session start gives the emitter).
+        let screen = second.split("\nHANDOFFS").next().unwrap_or(&second);
+        let added = units(&format!("{}\n{}\n\n", lines[1], lines[2])) + units(" except the developer mode paragraph above");
+        assert!(units(screen).saturating_sub(added) <= 1990, "the screen without the paragraph fits:\n{second}");
+        assert!(!err.contains("more than the first"), "no overflow reported:\n{err}");
+        let rows = std::fs::read_to_string(s.ws.join(".base").join("hook-output.jsonl")).expect("hook-output.jsonl");
+        let row: serde_json::Value = rows
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["hook"] == "session-start")
+            .nth(1)
+            .expect("the second start's row");
+        assert_eq!(row["first_screen_ok"], true, "{row}");
+        if row["first_screen_len_u16"].as_u64().unwrap_or(0) > 1990 {
+            assert_eq!(row["first_screen_excused"], "devmode-off", "{row}");
+        }
+        assert_eq!(on_after, 0, "off from the start that says so");
+        let doctor = run_base(&s, &["doctor"]).1;
+        assert!(doctor.contains(lines[2]), "doctor repeats the paragraph:\n{doctor}");
+    }
+    println!("replay devmode: prompts carrying DEVMODE {on_before} of {on_before} before the start that says so, {on_after} after");
+}

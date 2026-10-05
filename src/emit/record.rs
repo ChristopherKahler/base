@@ -40,7 +40,7 @@ pub fn record_of(r: &Rendered, hook: &str, session_id: Option<&str>) -> serde_js
         .iter()
         .map(|w| serde_json::json!({ "block": w.block, "items": w.items, "reason": w.reason.as_str() }))
         .collect();
-    serde_json::json!({
+    let mut row = serde_json::json!({
         "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
         "hook": hook,
         "session_id": session_id,
@@ -56,7 +56,12 @@ pub fn record_of(r: &Rendered, hook: &str, session_id: Option<&str>) -> serde_js
         "over_budget": r.over_budget,
         "first_screen_ok": r.first_screen_ok,
         "withheld": withheld,
-    })
+    });
+    // Only on the run that has one (BO-28): a length past the limit beside `first_screen_ok: true` names its reason.
+    if let Some(block) = &r.first_screen_excused {
+        row["first_screen_excused"] = serde_json::Value::from(block.as_str());
+    }
+    row
 }
 
 /// The record of one prompt-hook emission, from what [`super::prompt::fit`] decided.
