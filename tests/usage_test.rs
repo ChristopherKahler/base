@@ -752,7 +752,6 @@ fn doctor_names_rules_held_back_most_often() {
     fx.log(&log);
 
     let (code, section, out) = fx.section();
-    let shorten = |rule: &str| format!("base rule propose --rule {rule} --text \"...\"");
     let (sp, sf, sm) = (short("GLOBAL", R_PLAIN), short("tools", R_FILE), short("notes", R_MEMO));
     assert_eq!(
         list_under(&section, "   held back for space"),
@@ -760,19 +759,17 @@ fn doctor_names_rules_held_back_most_often() {
             "   held back for space (matched a message but did not fit in its 10,000-byte limit, last 30 days): 3".to_string(),
             format!(
                 "     {sp} \"Answer in plain words.\"   held back 5 times, in full 1 time · 22 bytes · it is in GLOBAL, so every \
-                 session gets it: if it is about one project, move it to that project's domain, or shorten it: {}",
-                shorten(&sp)
+                 session gets it: if it is about one project, move it to that project's domain, or shorten it to one or two \
+                 sentences (base rule list --domain GLOBAL shows it)"
             ),
             format!(
                 "     {sf} \"Run the linter before you edit src/hook/...\"   held back 3 times, in full 0 times · 60 bytes · it names \
                  src/hook/mod.rs: if it is about work on that file, give it a path so it loads only with that file (base rule \
-                 add --path), or shorten it: {}",
-                shorten(&sf)
+                 add --path), or shorten it to one or two sentences (base rule list --domain tools shows it)"
             ),
             format!(
                 "     {sm} \"Date every memo.\"   held back 1 time, in full 0 times · 16 bytes · shorten it to one or two \
-                 sentences: {}",
-                shorten(&sm)
+                 sentences where it is written (base rule list --domain notes shows it)"
             ),
         ],
         "full:\n{out}"
@@ -809,15 +806,55 @@ fn doctor_names_the_longest_rules() {
             "   longest rules (over 500 bytes of the 10,000 a message can carry): 2".to_string(),
             format!(
                 "     {s600} \"Keep builds short. xxxxxxxxxxxxxxxxxxxxx...\"   600 bytes · it is in GLOBAL, so every session gets \
-                 it: if it is about one project, move it to that project's domain, or shorten it: base rule propose --rule \
-                 {s600} --text \"...\""
+                 it: if it is about one project, move it to that project's domain, or shorten it to one or two sentences (base \
+                 rule list --domain GLOBAL shows it)"
             ),
             format!(
-                "     {s520} \"Keep notes short. xxxxxxxxxxxxxxxxxxxxxx...\"   520 bytes · shorten it to one or two sentences: \
-                 base rule propose --rule {s520} --text \"...\""
+                "     {s520} \"Keep notes short. xxxxxxxxxxxxxxxxxxxxxx...\"   520 bytes · shorten it to one or two sentences where \
+                 it is written (base rule list --domain tools shows it)"
             ),
         ],
         "full:\n{out}"
     );
     assert!(!section.contains(&short("tools", &r500)), "500 bytes is not over 500");
+}
+
+/// BO-31, lynx's G0 condition 1: the command doctor's advice names works typed in a terminal with no Claude session
+/// (no session id, no `CLAUDECODE`, stdin not a terminal) and shows the rule where it is written. And why it is not
+/// `base rule propose --rule <domain>.<id> --text "..."`: without `--from-turn` that refuses to run without `--example`,
+/// and with one it files a keyword gap, not a rewrite, for a rule no session was served, so `base rule review` would
+/// offer the wrong change.
+#[test]
+fn doctor_advice_command_runs_in_a_terminal() {
+    let fx = Fixture::new("advice-cmd", "");
+    let plain = rid("GLOBAL", R_PLAIN);
+    let mut log = Log::default();
+    for i in 0..3 {
+        log.prompt(ago(1, i), &format!("a{i}"), 1, "answer plainly", &[("GLOBAL", "always", None)], &[], &[("rule", plain.as_str(), "budget", "global-rules")]);
+    }
+    fx.log(&log);
+    let (code, out, err) = fx.base(&["domain", "sync"]);
+    assert_eq!(code, 0, "base domain sync: {out}{err}");
+
+    let (_, section, _) = fx.section();
+    let line = list_under(&section, "   held back for space").into_iter().nth(1).unwrap_or_else(|| panic!("no held-back line:\n{section}"));
+    let command = line
+        .rsplit_once(" (")
+        .and_then(|(_, rest)| rest.strip_suffix(" shows it)"))
+        .unwrap_or_else(|| panic!("no command in: {line}"));
+    assert_eq!(command, "base rule list --domain GLOBAL", "{line}");
+    let args: Vec<&str> = command.split_whitespace().skip(1).collect();
+    let (code, out, err) = fx.base(&args);
+    assert_eq!(code, 0, "{command}: {out}{err}");
+    assert!(out.contains(R_PLAIN), "{command} shows the rule:\n{out}");
+
+    // The rewrite proposal is not a terminal command for this.
+    let sp = short("GLOBAL", R_PLAIN);
+    let (code, out, err) = fx.base(&["rule", "propose", "--rule", &sp, "--text", "Use plain words."]);
+    assert_ne!(code, 0, "propose without --from-turn or --example: {out}");
+    assert!(err.contains("--example"), "{err}");
+    let (code, out, err) = fx.base(&["rule", "propose", "--rule", &sp, "--text", "Use plain words.", "--example", "answer plainly"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (_, review, _) = fx.base(&["rule", "review"]);
+    assert!(review.contains("keyword gap") && !review.contains("rewrite"), "filed as a keyword gap, not a rewrite:\n{review}");
 }

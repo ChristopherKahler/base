@@ -1110,6 +1110,7 @@ pub enum FitAdvice {
 pub struct HeldBack {
     /// `<domain>.<id>`.
     pub rule: String,
+    pub domain: String,
     pub text: String,
     /// Times held back for the budget, and times printed in full, in the window.
     pub withheld: usize,
@@ -1122,6 +1123,7 @@ pub struct HeldBack {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Longest {
     pub rule: String,
+    pub domain: String,
     pub text: String,
     pub bytes: usize,
     pub advice: FitAdvice,
@@ -1363,6 +1365,7 @@ pub fn build(i: &Inputs) -> Section {
             let c = scan.counts(&Key::Rule(r.id.clone()));
             (c.withheld_window > 0).then(|| HeldBack {
                 rule: r.short(),
+                domain: r.domain.clone(),
                 text: r.text.clone(),
                 withheld: c.withheld_window,
                 served: c.served_window,
@@ -1375,7 +1378,7 @@ pub fn build(i: &Inputs) -> Section {
     let mut longest: Vec<Longest> = rules
         .iter()
         .filter(|r| r.bytes > LONG_RULE_BYTES)
-        .map(|r| Longest { rule: r.short(), text: r.text.clone(), bytes: r.bytes, advice: fit_advice(r) })
+        .map(|r| Longest { rule: r.short(), domain: r.domain.clone(), text: r.text.clone(), bytes: r.bytes, advice: fit_advice(r) })
         .collect();
     longest.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.rule.cmp(&b.rule)));
 
@@ -1485,6 +1488,11 @@ pub fn cmd_replay_decision_drop(slug: &str, keyword: &str) -> String {
     format!("base rule replay --decision {} --drop-keyword {}", arg(slug), arg(keyword))
 }
 
+/// Where a rule is written: every rule of `domain`, both tiers (BO-31).
+pub fn cmd_rule_list(domain: &str) -> String {
+    format!("base rule list --domain {}", arg(domain))
+}
+
 pub fn cmd_propose_rewrite(rule: &str) -> String {
     format!("base rule propose --rule {} --text \"...\"", arg(rule))
 }
@@ -1513,6 +1521,8 @@ pub fn next_step_examples() -> Vec<String> {
         cmd_replay_drop("tools", "$HOME it's"),
         cmd_replay_decision_drop("global.keep-notes-short", "notes"),
         cmd_propose_rewrite("tools.1a2b3c4d"),
+        cmd_rule_list("tools"),
+        cmd_rule_list("two words"),
         cmd_decision_update("global.keep-notes-short"),
         cmd_decision_supersede("global.keep-notes-short"),
         CMD_DOCTOR_JSON.to_string(),
@@ -1675,7 +1685,7 @@ pub fn render(s: &Section) -> String {
             h.served,
             plural(h.served, "time", "times"),
             thousands(h.bytes),
-            advice_text(&h.advice, &h.rule)
+            advice_text(&h.advice, &h.domain)
         ));
     }
     more_line(&mut out, s.held_back.len());
@@ -1691,7 +1701,7 @@ pub fn render(s: &Section) -> String {
             r.rule,
             clip(&r.text, 40),
             thousands(r.bytes),
-            advice_text(&r.advice, &r.rule)
+            advice_text(&r.advice, &r.domain)
         ));
     }
     more_line(&mut out, s.longest.len());
@@ -1700,19 +1710,23 @@ pub fn render(s: &Section) -> String {
     out
 }
 
-/// One rule's advice as the held-back and longest lines end (BO-31, Z2): what to do, then the command that shortens it.
-fn advice_text(a: &FitAdvice, rule: &str) -> String {
-    let shorten = cmd_propose_rewrite(rule);
+/// One rule's advice as the held-back and longest lines end (BO-31, Z2): what to do, in words, and the command that
+/// shows the rule where it is written. No one command shortens or moves a rule from a terminal: `base rule propose`
+/// files a rewrite only for a rule served in the current session (lynx's G0 condition 1, tested in
+/// `doctor_advice_command_runs_in_a_terminal`), a rule added with `base rule add` is replaced with `base rule add` and
+/// `base rule remove`, and a rule written in `domains.toml` is edited there.
+fn advice_text(a: &FitAdvice, domain: &str) -> String {
+    let shown = cmd_rule_list(domain);
     match a {
         FitAdvice::Move { domain } => format!(
             "it is in {domain}, so every session gets it: if it is about one project, move it to that project's domain, \
-             or shorten it: {shorten}"
+             or shorten it to one or two sentences ({shown} shows it)"
         ),
         FitAdvice::Path { file } => format!(
             "it names {file}: if it is about work on that file, give it a path so it loads only with that file \
-             (base rule add --path), or shorten it: {shorten}"
+             (base rule add --path), or shorten it to one or two sentences ({shown} shows it)"
         ),
-        FitAdvice::Shorten => format!("shorten it to one or two sentences: {shorten}"),
+        FitAdvice::Shorten => format!("shorten it to one or two sentences where it is written ({shown} shows it)"),
     }
 }
 
