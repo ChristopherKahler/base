@@ -812,10 +812,17 @@ fn prompt(s: &Seed) -> String {
     out
 }
 
+/// A workspace domain [`prompt`] matches. The prompt hook prints the DEVMODE block only on a prompt that matched a
+/// domain, so without one a prompt says nothing about developer mode either way.
+fn with_matching_domain(s: &Seed) {
+    write(&s.ws.join(".base").join("domains.toml"), "[[domain]]\nname = \"builds\"\nprompt_keywords = [\"build\"]\n");
+}
+
 /// A home an older base ran in whose global base.toml is the 0.15 installer's.
 fn home_015(tag: &str) -> Seed {
     let s = home(tag);
     write(&gbl(&s).join("base.toml"), BASE_TOML_015);
+    with_matching_domain(&s);
     upgraded(&s);
     s
 }
@@ -856,11 +863,13 @@ fn user_set_devmode_is_kept() {
     let s = home("devmode-kept");
     let toml = gbl(&s).join("base.toml");
     write(&toml, BASE_TOML_015);
+    with_matching_domain(&s);
     let (code, out, err) = run_base(&s, &["config", "set", "devmode.enabled", "true"]);
     assert_eq!(code, 0, "{out}{err}");
     let by_command = read(&toml);
     assert!(!by_command.contains("# false = no diagnostic block"), "control: the command wrote the file again:\n{by_command}");
     let by_hand = home("devmode-hand");
+    with_matching_domain(&by_hand);
     write(&gbl(&by_hand).join("base.toml"), "[devmode]\nenabled = true            # mine, kept on on purpose\n");
     for (s, kept) in [(&s, by_command), (&by_hand, read(&gbl(&by_hand).join("base.toml")))] {
         upgraded(s);

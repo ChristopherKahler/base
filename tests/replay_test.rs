@@ -2192,7 +2192,10 @@ fn replay_overdue_reminders_are_warned_before_they_archive() {
 #[test]
 fn replay_upgrade_turns_the_installers_devmode_off_once() {
     let case = cases().into_iter().next().expect("a corpus case");
-    let corpus_prompts: Vec<String> = prompts().into_iter().take(3).collect();
+    // The prompt hook prints the DEVMODE block only on a prompt that matched a domain: three prompts naming a keyword of
+    // the corpus's seeded domains.
+    let corpus_prompts: Vec<String> =
+        ["what is the seed0 status", "where did alpha1 land", "is gamma2 next"].map(String::from).to_vec();
     // The block, or the pointer line the prompt budget leaves when it drops the block.
     let carries_devmode = |out: &str| out.contains("DEVMODE=true") || out.contains("withheld devmode");
     let mut on_before = 0;

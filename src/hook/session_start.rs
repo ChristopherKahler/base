@@ -380,10 +380,7 @@ fn push_devmode_off(config: &BaseConfig, cwd: &Path, out: &mut SessionOutput) {
     }
     let paragraphs = crate::upgrade::devmode::at_session_start(cwd);
     if !paragraphs.is_empty() {
-        let text = format!("{}
-{}
-", crate::upgrade::devmode::HEADER, paragraphs.join("
-"));
+        let text = format!("{}\n{}\n", crate::upgrade::devmode::HEADER, paragraphs.join("\n"));
         out.push("devmode-off", &text, paragraphs.len());
     }
 }
