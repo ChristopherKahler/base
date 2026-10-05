@@ -637,7 +637,12 @@ fn render(
 
     let output = lines.join("\n");
     if output.len() > char_budget {
-        let cut = output[..char_budget].rfind('\n').unwrap_or(char_budget);
+        // The budget counts bytes; labels come from notes and can put it inside a character.
+        let mut budget = char_budget;
+        while !output.is_char_boundary(budget) {
+            budget -= 1;
+        }
+        let cut = output[..budget].rfind('\n').unwrap_or(budget);
         format!("{}\n... (truncated at ~{token_budget}-token budget)", &output[..cut])
     } else {
         output
@@ -996,6 +1001,17 @@ mod seed_tests {
 
     fn node(label: &str, ntype: &str) -> Node {
         Node { label: label.into(), ntype: ntype.into(), source: String::new(), summary: String::new(), touched: String::new() }
+    }
+
+    #[test]
+    fn a_budget_inside_a_multibyte_label_cuts_at_a_character() {
+        // 10 tokens is a 30-byte budget; `NODE ` is 5 bytes and every `é` 2, so byte 30 is inside one.
+        let mut nodes = HashMap::new();
+        nodes.insert("a".to_string(), node(&"é".repeat(40), ""));
+        let visited: HashSet<String> = ["a".to_string()].into();
+        let out = render(&nodes, &visited, &[], &["a".to_string()], 10);
+        assert!(out.starts_with(&format!("NODE {}", "é".repeat(12))), "{out}");
+        assert!(out.contains("truncated at ~10-token budget"), "{out}");
     }
 
     type Maps = (HashMap<String, Node>, HashMap<String, Vec<(String, String)>>);

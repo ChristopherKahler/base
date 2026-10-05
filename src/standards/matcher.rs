@@ -369,16 +369,16 @@ fn distill_failure(failure: &str, cap: usize) -> String {
     if f.len() <= cap {
         return f.to_string();
     }
+    // The cap counts bytes: back off to a character first, or the sentence search
+    // below slices inside one.
+    let mut end = cap;
+    while !f.is_char_boundary(end) {
+        end -= 1;
+    }
     // Cut at the last sentence end before the cap; fall back to a hard cut.
-    match f[..cap].rfind ('.') {
+    match f[..end].rfind('.') {
         Some(i) if i > 40 => f[..=i].to_string(),
-        _ => {
-            let mut end = cap;
-            while !f.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}…", &f[..end])
-        }
+        _ => format!("{}…", &f[..end]),
     }
 }
 
@@ -701,5 +701,12 @@ mod tests {
 
         let short = "Short failure.";
         assert_eq!(distill_failure(short, 220), short);
+    }
+
+    #[test]
+    fn distill_failure_with_the_cap_inside_a_character_cuts_before_it() {
+        // 219 ASCII bytes, then `é` at bytes 219 and 220: the 220-byte cap lands inside it.
+        let long = format!("{}{}", "a".repeat(219), "é".repeat(20));
+        assert_eq!(distill_failure(&long, 220), format!("{}…", "a".repeat(219)));
     }
 }

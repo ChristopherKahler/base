@@ -4,7 +4,8 @@ pub mod paul_json;
 pub mod paul_md;
 pub mod paul_toml;
 
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
@@ -18,6 +19,42 @@ pub struct SyncReport {
     pub scanned: usize,
     pub extracted: usize,
     pub skipped: usize,
+    /// Files whose triples do not parse, so nothing of theirs was written or removed (#162). The sync went on past them;
+    /// it is partial when this is not empty.
+    pub unextractable: Vec<Unextractable>,
+    /// One line per link that leads into a path `sync.exclude` excludes: the files under it were not read (#164).
+    pub excluded_links: Vec<String>,
+}
+
+/// A file the sync could not extract, and the first value that stopped it.
+pub struct Unextractable {
+    /// The file, relative to the workspace.
+    pub file: String,
+    /// The predicate the bad value was for (`relatedTo`), or empty when no single triple fails alone.
+    pub field: String,
+    /// The value as the file gave it, as near as the triple shows it: an entity's name, or a literal's text.
+    pub value: String,
+    /// The parser's message, for a reader of the code; the line a person sees does not carry it.
+    pub error: String,
+}
+
+/// The line `base sync` prints for it.
+impl std::fmt::Display for Unextractable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.field.is_empty() {
+            write!(
+                f,
+                "base sync skipped {}: base could not store it in the graph. Check its frontmatter, then run base sync again.",
+                self.file
+            )
+        } else {
+            write!(
+                f,
+                "base sync skipped {}: its {} value \"{}\" cannot be stored in the graph. Change that value in the file, then run base sync again.",
+                self.file, self.field, self.value
+            )
+        }
+    }
 }
 
 /// Run sync: scan workspace files, extract metadata to graph.
@@ -39,14 +76,16 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
 
     let prefixes = crud::prefixes(ns);
 
+    // Walk workspace for matching files
+    let (files, excluded_links) = discover_files(cwd, &config.sync);
+
     let mut report = SyncReport {
         scanned: 0,
         extracted: 0,
         skipped: 0,
+        unextractable: Vec::new(),
+        excluded_links,
     };
-
-    // Walk workspace for matching files
-    let files = discover_files(cwd, &config.sync);
 
     for file_path in &files {
         report.scanned += 1;
@@ -157,44 +196,61 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
             continue;
         };
 
+        // INSERT fresh triples
+        let now = crud::now_iso();
+        let p = &ns.prefix;
+        let mut insert_body = String::new();
+        let mut entity_iris: Vec<String> = Vec::new();
+        // Each triple as written, so a file that does not parse can be traced to the value that stopped it.
+        let mut lines: Vec<(&str, &str, String)> = Vec::new();
+        for (pred, val) in &triples {
+            // ENTITY@@{iri}@@{pred} triples get their own subject IRI
+            if let Some(rest) = pred.strip_prefix("ENTITY@@") {
+                if let Some((iri, actual_pred)) = rest.split_once("@@") {
+                    let line = format!("    <{iri}> {actual_pred} {val} .\n");
+                    insert_body.push_str(&line);
+                    lines.push((actual_pred, val.as_str(), line));
+                    if !entity_iris.contains(&iri.to_string()) {
+                        entity_iris.push(iri.to_string());
+                    }
+                }
+            } else {
+                let line = format!("    <{file_iri}> {pred} {val} .\n");
+                insert_body.push_str(&line);
+                lines.push((pred.as_str(), val.as_str(), line));
+            }
+        }
+        insert_body.push_str(&format!(
+            "    <{file_iri}> {p}:lastExtracted \"{now}\"^^xsd:dateTime .\n"
+        ));
+        let insert_sparql = format!(
+            "{prefixes}\nINSERT DATA {{\n  GRAPH <{graph_iri}> {{\n{insert_body}  }}\n}}"
+        );
+        // #162: parsed BEFORE anything of this file is deleted. A file whose triples do not parse is skipped and named,
+        // and its earlier triples stay; one such file used to end the whole sync here, with every file before it
+        // unwritten. A store error after a clean parse is not the file's fault and still stops the sync.
+        let update = match oxigraph::sparql::Update::parse(&insert_sparql, None) {
+            Ok(update) => update,
+            Err(e) => {
+                report.unextractable.push(unextractable(&rel_path, &prefixes, &graph_iri, &lines, &e.to_string()));
+                continue;
+            }
+        };
+
         // DELETE existing triples for this file IRI (idempotent re-extraction)
         let delete_sparql = format!(
             "{prefixes}\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{file_iri}> ?p ?o }} }}"
         );
         let _ = store.update(&delete_sparql);
 
-        // INSERT fresh triples
-        let now = crud::now_iso();
-        let p = &ns.prefix;
-        let mut insert_body = String::new();
-        let mut entity_iris: Vec<String> = Vec::new();
-        for (pred, val) in &triples {
-            // ENTITY@@{iri}@@{pred} triples get their own subject IRI
-            if let Some(rest) = pred.strip_prefix("ENTITY@@") {
-                if let Some((iri, actual_pred)) = rest.split_once("@@") {
-                    insert_body.push_str(&format!("    <{iri}> {actual_pred} {val} .\n"));
-                    if !entity_iris.contains(&iri.to_string()) {
-                        entity_iris.push(iri.to_string());
-                    }
-                }
-            } else {
-                insert_body.push_str(&format!("    <{file_iri}> {pred} {val} .\n"));
-            }
-        }
-        insert_body.push_str(&format!(
-            "    <{file_iri}> {p}:lastExtracted \"{now}\"^^xsd:dateTime .\n"
-        ));
         // Clean up old entity triples for entities owned by this document
         for entity_iri in &entity_iris {
             let del_entity = format!("{prefixes}\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{entity_iri}> ?p ?o }} }}");
             let _ = store.update(&del_entity);
         }
 
-        let insert_sparql = format!(
-            "{prefixes}\nINSERT DATA {{\n  GRAPH <{graph_iri}> {{\n{insert_body}  }}\n}}"
-        );
         store
-            .update(&insert_sparql)
+            .update(update)
             .with_context(|| format!("inserting triples for {rel_path}"))?;
 
         report.extracted += 1;
@@ -212,15 +268,46 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
     Ok(report)
 }
 
+/// Name the first triple of a file that does not parse on its own: its predicate's local name and its value.
+fn unextractable(file: &str, prefixes: &str, graph_iri: &str, lines: &[(&str, &str, String)], error: &str) -> Unextractable {
+    let alone = |line: &str| format!("{prefixes}\nINSERT DATA {{ GRAPH <{graph_iri}> {{\n{line}}} }}");
+    // What a person wrote, as near as the triple shows it: the name at the end of an entity's link, or a literal's text.
+    let shown = |val: &str| match (val.strip_prefix('<').and_then(|v| v.strip_suffix('>')), val.strip_prefix('"')) {
+        (Some(iri), _) => iri.rsplit('/').next().unwrap_or(iri).to_string(),
+        (None, Some(lit)) => lit.split('"').next().unwrap_or(lit).to_string(),
+        (None, None) => val.to_string(),
+    };
+    let bad = lines.iter().find_map(|(pred, val, line)| {
+        oxigraph::sparql::Update::parse(&alone(line), None)
+            .err()
+            .map(|e| (pred.rsplit([':', '#', '/']).next().unwrap_or(pred).to_string(), shown(val), e.to_string()))
+    });
+    match bad {
+        Some((field, value, error)) => Unextractable { file: file.to_string(), field, value, error },
+        None => Unextractable { file: file.to_string(), field: String::new(), value: String::new(), error: error.to_string() },
+    }
+}
+
 /// Build a file IRI from a relative path.
 pub fn file_iri_from_path(ns: &NamespaceConfig, rel_path: &str) -> String {
     let slug = crate::crud::slugify(rel_path);
     format!("{}document/{}", ns.uri, slug)
 }
 
-/// Discover files matching include patterns, excluding exclude patterns.
-fn discover_files(cwd: &Path, sync_config: &crate::config::SyncConfig) -> Vec<std::path::PathBuf> {
+/// Discover files matching include patterns, excluding exclude patterns. Also returns one warning line per link that
+/// led into an excluded path.
+///
+/// #164: the glob follows links and junctions, so the exclude test on the path as walked let `notes/alias -> ../private`
+/// carry `private/` into the graph. Each file's resolved path, relative to the resolved workspace, gets the same test.
+/// A link that resolves outside the workspace is followed as before: exclude patterns name paths inside it.
+fn discover_files(cwd: &Path, sync_config: &crate::config::SyncConfig) -> (Vec<PathBuf>, Vec<String>) {
     let mut files = Vec::new();
+    let excluded = |rel: &str| sync_config.exclude.iter().any(|ex| rel.contains(ex.trim_end_matches('/')));
+    let root = crate::config::resolve(cwd);
+    // Each directory is resolved once; a file costs one `lstat`, and only a file that is itself a link is resolved.
+    let mut dirs: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+    // link as walked → (where it leads, whether it is a folder, the files not read through it)
+    let mut through: BTreeMap<String, (String, bool, BTreeSet<PathBuf>)> = BTreeMap::new();
 
     for pattern in &sync_config.include {
         let full_pattern = format!("{}/{}", cwd.display(), pattern);
@@ -233,20 +320,73 @@ fn discover_files(cwd: &Path, sync_config: &crate::config::SyncConfig) -> Vec<st
                 let rel = crate::crud::normalize_path_sep(
                     &entry.strip_prefix(cwd).unwrap_or(&entry).to_string_lossy(),
                 );
-                let excluded = sync_config
-                    .exclude
-                    .iter()
-                    .any(|ex| rel.contains(ex.trim_end_matches('/')));
-                if !excluded && entry.is_file() {
-                    files.push(entry);
+                if excluded(&rel) || !entry.is_file() {
+                    continue;
                 }
+                if let Some(root) = &root
+                    && let Some(real) = resolved_rel(&entry, root, &mut dirs)
+                    && real != rel
+                    && excluded(&real)
+                {
+                    let (link, leads_to) = first_link(cwd, &rel, root).unwrap_or_else(|| (rel.clone(), real.clone()));
+                    let folder = cwd.join(&link).is_dir();
+                    through.entry(link).or_insert((leads_to, folder, BTreeSet::new())).2.insert(entry);
+                    continue;
+                }
+                files.push(entry);
             }
         }
     }
 
     files.sort();
     files.dedup();
-    files
+    let warnings = through
+        .into_iter()
+        .map(|(link, (to, folder, skipped))| match (folder, skipped.len()) {
+            (false, _) => format!(
+                "base sync skipped {link}: it links to {to}, which sync.exclude keeps out of the graph, so it was not read."
+            ),
+            (true, 1) => format!(
+                "base sync skipped {link}: it links into {to}, which sync.exclude keeps out of the graph, so the 1 file \
+                 under it was not read."
+            ),
+            (true, n) => format!(
+                "base sync skipped {link}: it links into {to}, which sync.exclude keeps out of the graph, so the {n} files \
+                 under it were not read."
+            ),
+        })
+        .collect();
+    (files, warnings)
+}
+
+/// Where `file` really is, relative to the resolved workspace `root`, with `/` separators. `None` when it resolves outside
+/// the workspace (or cannot be resolved).
+fn resolved_rel(file: &Path, root: &Path, dirs: &mut HashMap<PathBuf, Option<PathBuf>>) -> Option<String> {
+    let real = if std::fs::symlink_metadata(file).is_ok_and(|m| m.file_type().is_symlink()) {
+        crate::config::resolved_under(file, root)?
+    } else {
+        let dir = file.parent()?;
+        let real_dir = dirs.entry(dir.to_path_buf()).or_insert_with(|| crate::config::resolved_under(dir, root));
+        real_dir.as_ref()?.join(file.file_name()?)
+    };
+    Some(crate::crud::normalize_path_sep(&real.to_string_lossy()))
+}
+
+/// The first link (or junction) on the walked path `rel`, and where it leads, for the warning. `None` when nothing on
+/// the way reads as a link.
+fn first_link(cwd: &Path, rel: &str, root: &Path) -> Option<(String, String)> {
+    let mut walked = PathBuf::new();
+    for part in rel.split('/') {
+        walked.push(part);
+        let at = cwd.join(&walked);
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            let to = crate::config::resolved_under(&at, root)
+                .map(|p| crate::crud::normalize_path_sep(&p.to_string_lossy()))
+                .or_else(|| crate::config::resolve(&at).map(|p| p.display().to_string()))?;
+            return Some((crate::crud::normalize_path_sep(&walked.to_string_lossy()), to));
+        }
+    }
+    None
 }
 
 /// Check if a file is up-to-date (mtime <= lastExtracted).

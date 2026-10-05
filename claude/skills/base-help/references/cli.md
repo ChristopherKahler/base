@@ -1797,6 +1797,8 @@ Options:
 ```text
 Sync file-owned data into the graph
 
+Exit codes: 0, every file was synced. 3, partial: the files it names could not be synced and were skipped, and every other file was synced. 1, the sync failed and nothing was written. 2, it did not start (bad arguments).
+
 Usage: base sync [OPTIONS]
 
 Options:
@@ -1810,13 +1812,16 @@ Options:
           Target directory for AST extraction (defaults to cwd)
 
       --yes
-          Unattended: proceed past the extractor's file-count safety threshold without asking (what the hooks pass — nobody is there to answer)
+          Unattended: proceed past the extractor's file-count safety threshold without asking (what the hooks pass — nobody is there to answer). The AST build is then stopped after 15 minutes, unless --no-time-limit is given
+
+      --no-time-limit
+          With --ast --yes: build with no time limit, for a tree too big to finish in 15 minutes (the hooks never pass it)
 
       --repair
           Repair missing edges (backfill decision→domain, milestone→project, task→project links)
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base domain
