@@ -201,13 +201,13 @@ fn the_session_start_hook_still_announces_what_it_wired() {
     mkdir(home.join(".base-gbl"));
     mkdir(home.join(".claude"));
 
-    // An install from before the Stop hook existed: four of the five.
+    // An install from before the Stop hook existed, so before SessionEnd (BO-17) too: four of the six.
     let four: Vec<String> = base::install::HOOK_TABLE
         .iter()
-        .filter(|(event, _)| *event != "Stop")
+        .filter(|(event, _)| *event != "Stop" && *event != "SessionEnd")
         .map(|(event, cmd)| format!(r#""{event}":[{{"hooks":[{{"type":"command","command":"{cmd}"}}]}}]"#))
         .collect();
-    assert_eq!(four.len(), 4, "seeded four of the five");
+    assert_eq!(four.len(), 4, "seeded four of the six");
     std::fs::write(
         home.join(".claude").join("settings.json"),
         format!("{{\"hooks\":{{{}}}}}", four.join(",")),
@@ -219,7 +219,7 @@ fn the_session_start_hook_still_announces_what_it_wired() {
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     assert!(
-        stdout.contains("[hooks] wired base hook Stop"),
+        stdout.contains("[hooks] wired base hook Stop, SessionEnd"),
         "the session-start notice named nothing.\nstdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -328,7 +328,7 @@ fn skip_hooks_holds_when_claude_code_is_already_installed() {
     let settings = home.join(".claude").join("settings.json");
     let stamp = home
         .join(".base-gbl")
-        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")));
+        .join(base::install::hooks_wired_stamp());
     assert!(!settings.exists(), "the precondition, stated rather than assumed");
     assert!(!stamp.exists(), "and this version is unstamped, which is what arms the seam");
 
@@ -377,7 +377,7 @@ fn uninstall_does_not_create_a_settings_file_on_its_way_to_emptying_one() {
     let settings = home.join(".claude").join("settings.json");
     let stamp = home
         .join(".base-gbl")
-        .join(format!(".hooks-wired-{}", env!("CARGO_PKG_VERSION")));
+        .join(base::install::hooks_wired_stamp());
     assert!(!settings.exists(), "the precondition, stated rather than assumed");
     assert!(!stamp.exists(), "and this version is unstamped, which is what arms the seam");
 
@@ -455,4 +455,191 @@ fn a_second_install_over_the_first_leaves_settings_json_byte_identical() {
         String::from_utf8_lossy(&before),
         String::from_utf8_lossy(&after)
     );
+}
+
+// ─── BO-15: the CORRECTED line, C3 for every user ───────────
+
+/// Example 5. `base install` offers one line for the user's CLAUDE.md so the AI marks a corrected reply. Yes (here
+/// `--corrections-line`, the unattended answer) puts it just above the BASE CLI section, outside the span a section
+/// refresh rewrites, and a second install leaves one copy. No (`--no-corrections-line`) writes nothing and records the
+/// answer, and session start carries the line instead. With no terminal and no flag nothing is written or recorded. A
+/// CLAUDE.md that already asks for a marker (Chris's T2 holds `UPDATED:`, D10) is never given the line.
+#[test]
+fn install_offers_corrected_line() {
+    const LINE: &str = "When the user corrects you, start that reply with \"CORRECTED: <what you got wrong>\".";
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("unpacked");
+    let binary = unpack_fake_archive(&archive);
+    seed_local_skill(tmp.path());
+    let claude_md = |home: &Path| std::fs::read_to_string(home.join(".claude").join("CLAUDE.md")).unwrap_or_default();
+    let answer = |home: &Path| std::fs::read_to_string(home.join(".base-gbl").join(".corrections-line")).ok();
+    let shown = |out: &std::process::Output| {
+        format!("stdout:\n{}\nstderr:\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+
+    // Yes.
+    let yes = mkdir(tmp.path().join("yes"));
+    let out = run_base(&binary, &archive, &yes, &["install", "--no-starter-commands", "--corrections-line"]);
+    let md = claude_md(&yes);
+    let line_at = md.find(LINE).unwrap_or_else(|| panic!("the line was not written\n{md}\n{}", shown(&out)));
+    let section_at = md.find("## BASE CLI").expect("the BASE CLI section");
+    assert!(line_at < section_at, "the line sits above the section, outside what a refresh rewrites:\n{md}");
+    assert_eq!(answer(&yes).as_deref().map(str::trim), Some("added"));
+    let again = run_base(&binary, &archive, &yes, &["install", "--no-starter-commands", "--corrections-line"]);
+    assert_eq!(claude_md(&yes).matches(LINE).count(), 1, "one copy after a second install\n{}", shown(&again));
+
+    // No: nothing written, the answer kept, and session start carries the line.
+    let no = mkdir(tmp.path().join("no"));
+    let out = run_base(&binary, &archive, &no, &["install", "--no-starter-commands", "--no-corrections-line"]);
+    assert!(!claude_md(&no).contains(LINE), "declined, yet written\n{}", shown(&out));
+    assert_eq!(answer(&no).as_deref().map(str::trim), Some("declined"));
+    let start = run_base(&binary, &mkdir(no.join("work")), &no, &["hook", "session-start"]);
+    assert!(
+        String::from_utf8_lossy(&start.stdout).contains(LINE),
+        "a declined user's session start carries the line\n{}",
+        shown(&start)
+    );
+
+    // No terminal, no flag: nothing written, nothing recorded.
+    let quiet = mkdir(tmp.path().join("quiet"));
+    let out = run_base(&binary, &archive, &quiet, &["install", "--no-starter-commands"]);
+    assert!(!claude_md(&quiet).contains(LINE), "written without an answer\n{}", shown(&out));
+    assert_eq!(answer(&quiet), None, "recorded without an answer");
+
+    // Covered: Chris's T2 asks for UPDATED:, so the line is never added (D10).
+    let t2 = mkdir(tmp.path().join("t2"));
+    mkdir(t2.join(".claude"));
+    std::fs::write(t2.join(".claude").join("CLAUDE.md"), "When you change position, print UPDATED: <why>.\n").unwrap();
+    let out = run_base(&binary, &archive, &t2, &["install", "--no-starter-commands", "--corrections-line"]);
+    assert!(!claude_md(&t2).contains(LINE), "a CLAUDE.md that asks for a marker was given the line\n{}", shown(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("already asks"), "{}", shown(&out));
+    let start = run_base(&binary, &mkdir(t2.join("work")), &t2, &["hook", "session-start"]);
+    assert!(!String::from_utf8_lossy(&start.stdout).contains(LINE), "covered, yet carried\n{}", shown(&start));
+}
+
+// ─── BO-27, V1: developer mode is off on a fresh install ─────────
+
+/// `base hook <event>` with `payload` on stdin, as Claude Code drives it, plus `env`. No relay title, tab or session
+/// variable from the shell running the tests reaches it.
+fn run_hook_in(
+    binary: &Path,
+    cwd: &Path,
+    home: &Path,
+    event: &str,
+    payload: &serde_json::Value,
+    env: &[(&str, &str)],
+) -> std::process::Output {
+    use std::io::Write as _;
+    let mut child = Command::new(binary)
+        .args(["hook", event])
+        .current_dir(cwd)
+        .env("BASE_HOME", home)
+        .env("BASE_NO_AUTO_UPDATE", "1")
+        .env("BASE_AST_NO_SPAWN", "1")
+        .env_remove("BASE_RELAY_AS")
+        .env_remove("BASE_NO_WAKE_NUDGE")
+        .env_remove("BASE_NO_AUTONAME")
+        .env_remove("WT_SESSION")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CLAUDECODE")
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawning base hook {event}: {e}"));
+    child.stdin.take().expect("stdin").write_all(payload.to_string().as_bytes()).expect("stdin written");
+    let out = child.wait_with_output().expect("base finishes");
+    assert_ne!(out.status.code(), Some(STATUS_STACK_OVERFLOW), "VOID: #129 on hook {event}");
+    out
+}
+
+/// `[devmode] enabled` in the home's global `base.toml`, read as TOML.
+fn devmode_of(home: &Path) -> Option<bool> {
+    let text = std::fs::read_to_string(home.join(".base-gbl").join("base.toml")).ok()?;
+    let parsed: toml::Value = toml::from_str(&text).ok()?;
+    parsed.get("devmode")?.get("enabled")?.as_bool()
+}
+
+fn text_of(out: &std::process::Output) -> String {
+    format!("stdout:\n{}\nstderr:\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+}
+
+/// V1, Example 1: the installer writes `[devmode] enabled = false`, keeps the comment that says how to turn it on, and
+/// a fresh home's first session start and prompt carry no DEVMODE block and no relay line. Control: with devmode turned
+/// on the same prompt carries the block, so its absence is the setting and not a hook that printed nothing. Before
+/// BO-27 the template wrote `true`, and every prompt of every fresh install told the AI to end each reply with a
+/// diagnostic block.
+#[test]
+fn fresh_install_writes_devmode_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("unpacked");
+    let binary = unpack_fake_archive(&archive);
+    seed_local_skill(tmp.path());
+    let home = mkdir(tmp.path().join("home"));
+
+    let out = run_base(&binary, &archive, &home, &["install", "--no-starter-commands"]);
+    assert!(out.status.success(), "install failed\n{}", text_of(&out));
+    let toml_text = std::fs::read_to_string(home.join(".base-gbl").join("base.toml")).expect("the template was written");
+    assert_eq!(devmode_of(&home), Some(false), "the template writes developer mode off:\n{toml_text}");
+    assert!(toml_text.contains("base config set devmode.enabled true"), "it still says how to turn it on:\n{toml_text}");
+    let get = run_base(&binary, &home, &home, &["config", "get", "devmode.enabled"]);
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "false", "{}", text_of(&get));
+
+    let work = mkdir(home.join("work"));
+    let session = "bo27-fresh";
+    let start_payload = serde_json::json!({
+        "cwd": work.display().to_string(), "hook_event_name": "SessionStart", "source": "startup", "session_id": session,
+    });
+    let prompt_payload = serde_json::json!({
+        "cwd": work.display().to_string(), "hook_event_name": "UserPromptSubmit",
+        "prompt": "what changed in the build since yesterday", "session_id": session,
+    });
+    let start = run_hook_in(&binary, &work, &home, "session-start", &start_payload, &[]);
+    let prompt = run_hook_in(&binary, &work, &home, "user-prompt-submit", &prompt_payload, &[]);
+    let (start_out, prompt_out) =
+        (String::from_utf8_lossy(&start.stdout).into_owned(), String::from_utf8_lossy(&prompt.stdout).into_owned());
+    assert!(!start_out.is_empty(), "control: the first session start printed\n{}", text_of(&start));
+    assert!(!prompt_out.contains("DEVMODE"), "a fresh install's prompt carries the DEVMODE block:\n{prompt_out}");
+    for (what, out) in [("session start", &start_out), ("prompt", &prompt_out)] {
+        assert!(!out.lines().any(|l| l.starts_with("relay:")), "a fresh install's {what} carries a relay line:\n{out}");
+    }
+
+    let set = run_base(&binary, &home, &home, &["config", "set", "devmode.enabled", "true"]);
+    assert!(set.status.success(), "{}", text_of(&set));
+    let on = run_hook_in(&binary, &work, &home, "user-prompt-submit", &prompt_payload, &[]);
+    assert!(String::from_utf8_lossy(&on.stdout).contains("DEVMODE"), "control: devmode on prints it\n{}", text_of(&on));
+}
+
+/// V1: a `base.toml` that already has developer mode on keeps it, through a second install and through the upgrade
+/// pass the first session start on a new build runs (BO-26). Control: that pass did rewrite this file (it removes the
+/// 0.15 installer's `[signal] max_chars = 2000`), so the kept value is not a file nobody touched.
+#[test]
+fn install_keeps_an_existing_devmode_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("unpacked");
+    let binary = unpack_fake_archive(&archive);
+    seed_local_skill(tmp.path());
+    let home = mkdir(tmp.path().join("home"));
+    let gbl = mkdir(home.join(".base-gbl"));
+    let toml_path = gbl.join("base.toml");
+    std::fs::write(&toml_path, "# my settings\n[devmode]\nenabled = true\n\n[signal]\nmax_chars = 2000\n").unwrap();
+
+    let out = run_base(&binary, &archive, &home, &["install", "--no-starter-commands"]);
+    assert!(out.status.success(), "install failed\n{}", text_of(&out));
+    let after_install = std::fs::read_to_string(&toml_path).unwrap();
+    assert_eq!(devmode_of(&home), Some(true), "install changed an existing devmode value:\n{after_install}");
+    assert!(after_install.contains("[devmode]\nenabled = true\n"), "{after_install}");
+
+    // The home an older base ran in: the stamp its session start left. The upgrade runs before the hook returns.
+    std::fs::write(gbl.join(".hooks-wired-0.15.2"), "").unwrap();
+    let work = mkdir(home.join("work"));
+    let payload = serde_json::json!({
+        "cwd": work.display().to_string(), "hook_event_name": "SessionStart", "source": "startup", "session_id": "bo27-up",
+    });
+    let start = run_hook_in(&binary, &work, &home, "session-start", &payload, &[("BASE_NO_SPAWN", "1")]);
+    assert!(start.status.success(), "{}", text_of(&start));
+    let after_upgrade = std::fs::read_to_string(&toml_path).unwrap();
+    assert!(!after_upgrade.contains("max_chars = 2000"), "control: the upgrade pass rewrote base.toml:\n{after_upgrade}");
+    assert_eq!(devmode_of(&home), Some(true), "the upgrade pass changed devmode:\n{after_upgrade}");
 }

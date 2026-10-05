@@ -3,6 +3,7 @@
 //! on `[protocol] enabled` in base.toml (set by os-config in the global tier and
 //! inherited by every scaffolded workspace via the config overlay).
 
+pub mod migrate;
 pub mod reconcile;
 pub mod touch;
 

@@ -204,6 +204,23 @@ pub fn walk(
     is_transient: &dyn Fn(&str) -> bool,
     head_of: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(Resolved, Vec<Record>)> {
+    walk_filtered(maps, ns, prompt, already_served, is_transient, head_of, &|_| false)
+}
+
+/// [`walk`], with `withheld` naming records this prompt must not be served though the walk reaches them:
+/// a global decision none of whose keywords is in the prompt (BO-03, F5). Asked of a NEIGHBOUR after the
+/// superseded substitution, so it judges the record that would be listed. A withheld record is skipped, not
+/// substituted, and still walked through, so what lies beyond it is reached as before. A seed is never listed
+/// as a record, so it is not asked.
+pub fn walk_filtered(
+    maps: &GraphMaps,
+    ns: &NamespaceConfig,
+    prompt: &str,
+    already_served: &HashSet<String>,
+    is_transient: &dyn Fn(&str) -> bool,
+    head_of: &dyn Fn(&str) -> Option<String>,
+    withheld: &dyn Fn(&str) -> bool,
+) -> Vec<(Resolved, Vec<Record>)> {
     let (nodes, adj) = maps;
     let mut out = Vec::new();
     // Records already in front of the reader this prompt: what the domain blocks
@@ -277,7 +294,7 @@ pub fn walk(
                     // substitution, or two stale records sharing one head arrive
                     // as the same line twice.
                     let nb = &head_of(nb).unwrap_or_else(|| nb.clone());
-                    if is_transient(nb) || !emitted.insert(nb.clone()) {
+                    if is_transient(nb) || withheld(nb) || !emitted.insert(nb.clone()) {
                         continue;
                     }
                     found.push(Record {
@@ -332,17 +349,21 @@ pub fn walk(
 ///
 /// A store that will not project returns NO names rather than an error: this is an
 /// injection layer, and a prompt that fails to gain context must still be a prompt.
+///
+/// `withheld` names records this text must not be served (BO-03, F5): a global decision the text does not name by
+/// keyword, or one this session was already given. See [`walk_filtered`].
 pub fn walk_from_text(
     store: &oxigraph::store::Store,
     cwd: &Path,
     config: &BaseConfig,
     text: &str,
     already_served: &HashSet<String>,
+    withheld: &dyn Fn(&str) -> bool,
 ) -> Vec<(Resolved, Vec<Record>)> {
     let Ok(maps) = crate::graph_query::maps_from_store(store, cwd, &config.namespace, false) else {
         return Vec::new();
     };
-    walk(
+    walk_filtered(
         &maps,
         &config.namespace,
         text,
@@ -359,6 +380,8 @@ pub fn walk_from_text(
             let head = crate::supersede::resolve_head(store, &config.namespace, bare);
             (head != bare).then(|| format!("<{head}>"))
         },
+        // F5. `graph_query` ids are `<iri>`, the form `GlobalDecisions` keys on.
+        withheld,
     )
 }
 
@@ -370,10 +393,18 @@ fn label_of(nodes: &HashMap<String, Node>, id: &str) -> String {
 /// records the budget dropped, so devmode can say what was cut rather than
 /// letting it vanish.
 pub fn render(walked: &[(Resolved, Vec<Record>)], budget: usize) -> (String, usize) {
+    let (out, dropped, _) = render_counted(walked, budget);
+    (out, dropped)
+}
+
+/// [`render`], and how many records of each name it wrote, in `walked` order: the records past that count were
+/// dropped by the budget. The prompt hook's match log names both (K1, BO-13).
+pub fn render_counted(walked: &[(Resolved, Vec<Record>)], budget: usize) -> (String, usize, Vec<usize>) {
     let mut out = String::new();
     let mut dropped = 0usize;
+    let mut written: Vec<usize> = vec![0; walked.len()];
 
-    for (r, records) in walked {
+    for (j, (r, records)) in walked.iter().enumerate() {
         if records.is_empty() {
             continue;
         }
@@ -400,10 +431,11 @@ pub fn render(walked: &[(Resolved, Vec<Record>)], budget: usize) -> (String, usi
         if wrote == 0 {
             continue;
         }
+        written[j] = wrote;
         block.push_str("</base-context>\n");
         out.push_str(&block);
     }
-    (out, dropped)
+    (out, dropped, written)
 }
 
 #[cfg(test)]

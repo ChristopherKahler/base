@@ -143,14 +143,14 @@ fn the_prompt_hook_serves_only_the_rule_that_is_new() {
         crud::rule::add(root, &ns(), "probe", "SECOND RULE", None).unwrap();
 
         let ev = |n: u32| serde_json::json!({ "prompt": format!("probe {n}"), "session_id": "sid-p" });
-        let one = user_prompt_submit::handle(&config, root, &ev(1)).unwrap();
+        let one = user_prompt_submit::handle(&config, root, &ev(1), &mut String::new()).unwrap();
         assert_eq!(
             one.rules_injected, 2,
             "positive control: the first matching prompt carries both rules"
         );
 
         crud::rule::add(root, &ns(), "probe", "THIRD RULE", None).unwrap();
-        let two = user_prompt_submit::handle(&config, root, &ev(2)).unwrap();
+        let two = user_prompt_submit::handle(&config, root, &ev(2), &mut String::new()).unwrap();
         assert_eq!(
             two.rules_injected, 1,
             "the second prompt carries ONE rule, the new one. Before F9 the block hash \

@@ -37,7 +37,8 @@ fn home() -> tempfile::TempDir {
 
 fn base(root: &Path) -> Command {
     let mut c = Command::new(BIN);
-    c.current_dir(root).env("BASE_HOME", root).env("BASE_NO_AUTO_UPDATE", "1");
+    // `CLAUDECODE=1` (a run inside Claude Code) makes `rule add` require keywords and a test prompt (BO-15).
+    c.current_dir(root).env("BASE_HOME", root).env("BASE_NO_AUTO_UPDATE", "1").env_remove("CLAUDECODE");
     c
 }
 

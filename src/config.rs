@@ -46,16 +46,83 @@ fn global_tier_root() -> Option<PathBuf> {
 /// The workspace tier keeps the walk and keeps refusing when it finds nothing:
 /// there, no known correct location exists, which is the whole reason
 /// `crud::require_base_for_write` never auto-creates (issue #8).
+///
+/// The walk never stops at the global tier's own `.base` (BO-11, F22a). A shell
+/// parked in `~/.base-gbl/handoffs` or `~/.base-gbl/forks`, where the handoff and
+/// fork docs live, found `~/.base-gbl/.base` first and wrote the global tier while
+/// the operator was inside the workspace at `~`: 59 open handoffs and forks leaked
+/// that way on Chris's machine, every one stamped `graph/ws/base-gbl`. Now the walk
+/// passes it and finds the workspace around it. Only a folder inside the global
+/// root that no workspace encloses still resolves the global tier when that tier
+/// exists, as before: outside every workspace, that is the tier it is in. With no
+/// global tier on disk yet it resolves nothing and the write is refused, as before
+/// (issue #8): nothing here creates the global tier without `-g`.
+///
+/// The global `.base` is recognised however the path is spelled: a cwd in another
+/// letter case, or in a `\\?\` or 8.3 form, names the same folder on Windows, and a
+/// plain comparison would let the leak through for it.
 pub fn find_workspace_base(cwd: &Path) -> Option<PathBuf> {
-    if let Some(root) = global_tier_root()
+    let root = global_tier_root();
+    if let Some(root) = &root
         && cwd == root
     {
         return global_base_dir();
     }
-    walk_up(cwd, |dir| {
+    let global = global_base_dir();
+    let is_global = |base: &Path| {
+        let Some(g) = global.as_deref() else {
+            return false;
+        };
+        // Resolving a path is a system call and this walk runs on every hook, so only a `.base` whose folder could be
+        // the global root (named `.base-gbl` in any case, or an 8.3 short name) is resolved.
+        let could_be = base
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(".base-gbl") || n.contains('~'));
+        base == g || (could_be && same_dir(base, g))
+    };
+    let found = walk_up(cwd, |dir| {
         let base = dir.join(".base");
-        base.is_dir().then_some(base)
-    })
+        (base.is_dir() && !is_global(&base)).then_some(base)
+    });
+    if found.is_none()
+        && let (Some(root), Some(global)) = (&root, &global)
+        && global.is_dir()
+        && is_within(cwd, root)
+    {
+        return Some(global.clone());
+    }
+    found
+}
+
+/// `a` and `b` name one folder: equal as written, or once both are resolved (letter
+/// case, `\\?\` and 8.3 forms on Windows). Resolving needs both to exist.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+}
+
+/// `path` is `root` or inside it, as written or once both are resolved.
+fn is_within(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+        || matches!((path.canonicalize(), root.canonicalize()), (Ok(x), Ok(y)) if x.starts_with(&y))
+}
+
+/// The workspace that encloses the global tier's root folder, if any.
+///
+/// Standing in `~/.base-gbl` itself is not asking for the global tier; `-g` is. But
+/// that folder is also the path `-g` swaps cwd for, which [`find_workspace_base`]
+/// answers with the global tier. So `cli::tier_cwd` routes a cwd that IS the
+/// global root, without `-g`, through this: the folder above it, when a workspace
+/// holds it (BO-11, F22a). `None` when no workspace encloses the root, where the
+/// global tier is the right answer.
+pub fn workspace_around_global_root(cwd: &Path) -> Option<PathBuf> {
+    let root = global_tier_root()?;
+    if cwd != root {
+        return None;
+    }
+    let parent = root.parent()?;
+    find_workspace_base(parent).map(|_| parent.to_path_buf())
 }
 
 /// Walk up from `start` (inclusive), returning the first ancestor for which
@@ -237,6 +304,10 @@ pub struct BaseConfig {
     #[serde(default)]
     pub signal: SignalConfig,
     #[serde(default)]
+    pub budget: BudgetConfig,
+    #[serde(default)]
+    pub session_start: SessionStartConfig,
+    #[serde(default)]
     pub bracket: BracketConfig,
     #[serde(default)]
     pub devmode: DevmodeConfig,
@@ -257,6 +328,8 @@ pub struct BaseConfig {
     #[serde(default)]
     pub protocol: ProtocolConfig,
     #[serde(default)]
+    pub defer: DeferConfig,
+    #[serde(default)]
     pub standards: StandardsConfig,
     #[serde(default)]
     pub relay: RelayConfig,
@@ -264,6 +337,309 @@ pub struct BaseConfig {
     pub workspace: Vec<WorkspaceEntry>,
     #[serde(default)]
     pub rules: RulesConfig,
+    #[serde(default)]
+    pub log: LogConfig,
+    #[serde(default)]
+    pub doctor: DoctorConfig,
+    #[serde(default)]
+    pub corrections: CorrectionsConfig,
+    #[serde(default)]
+    pub tune: TuneConfig,
+    /// `[match]` (BO-18). `match` is a Rust keyword, hence the field's name.
+    #[serde(default, rename = "match")]
+    pub matching: MatchConfig,
+    /// `[shadow]` (BO-20, K9).
+    #[serde(default)]
+    pub shadow: ShadowConfig,
+}
+
+// ─── Shadow Config (BO-20: K9) ───────────────────────────────
+
+/// `[shadow]`: how a candidate matcher run beside the live one is judged (K9, `base shadow`). Nothing runs until someone
+/// starts a shadow (`base shadow start`); with none started these keys are read by nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowConfig {
+    /// K9d: a candidate run that takes longer than this many milliseconds is stopped for that event, and the row says
+    /// it was skipped.
+    #[serde(default = "default_shadow_max_ms")]
+    pub max_ms: u64,
+    /// K9f: typed prompts the candidate must have run on before it can be promoted.
+    #[serde(default = "default_shadow_min_prompts")]
+    pub min_prompts: usize,
+    /// K9f with lynx's Q5 ruling: promoted only when its wins are at least this many times its losses, zero losses
+    /// counting as one (so the default needs at least 3 wins).
+    #[serde(default = "default_shadow_win_ratio")]
+    pub win_ratio: f64,
+    /// K9i: promote at the next session start once the conditions hold. `false`: session start says it is ready once,
+    /// and `base shadow promote` does it.
+    #[serde(default = "default_true")]
+    pub auto_promote: bool,
+    /// K9g: typed prompts watched after a promotion before it is judged.
+    #[serde(default = "default_shadow_watch_prompts")]
+    pub watch_prompts: usize,
+    /// K9g with lynx's Q6 ruling: rolled back only when corrections per 100 prompts over the watch exceed the 100 before
+    /// by more than this many standard deviations of the noise two windows of `watch_prompts` show at the before rate.
+    #[serde(default = "default_shadow_rollback_sd")]
+    pub rollback_sd: f64,
+}
+
+fn default_shadow_max_ms() -> u64 { 50 }
+fn default_shadow_min_prompts() -> usize { 200 }
+fn default_shadow_win_ratio() -> f64 { 3.0 }
+fn default_shadow_watch_prompts() -> usize { 100 }
+fn default_shadow_rollback_sd() -> f64 { 2.5 }
+
+impl Default for ShadowConfig {
+    fn default() -> Self {
+        Self {
+            max_ms: default_shadow_max_ms(),
+            min_prompts: default_shadow_min_prompts(),
+            win_ratio: default_shadow_win_ratio(),
+            auto_promote: default_true(),
+            watch_prompts: default_shadow_watch_prompts(),
+            rollback_sd: default_shadow_rollback_sd(),
+        }
+    }
+}
+
+// ─── Match Config (BO-18: K7, D9) ────────────────────────────
+
+/// `[match]`: how a prompt is scored against the rules and global decisions it could be served (K7, BM25). A rule a
+/// keyword or a touched path brings is always served, as before; scoring ranks every candidate so a tight budget sheds
+/// the weakest first, and, when `min_score` is set, serves a rule no keyword brought whose score reaches it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatchConfig {
+    /// Score and rank with BM25. `false` serves keyword-only, exactly as before BO-18 (a rollback, and BO-20's other
+    /// side).
+    #[serde(default = "default_true")]
+    pub bm25: bool,
+    /// The BM25 score at which a rule no keyword or path brought is served. Another scale from `[rules]
+    /// topic_min_score`, which judges rules with matchers of their own on their phrase weights.
+    ///
+    /// NO DEFAULT (lynx's Q7 ruling on BO-18): unset, no rule is served on its score alone. On a real store no threshold
+    /// separated the rules a prompt was about from the rest: the scores grow with the prompt's length, and the rules
+    /// they admitted shared only common words with it. BO-20 measures what would.
+    #[serde(default)]
+    pub min_score: Option<f32>,
+    /// BO-20's first admission fix (lynx's Q7 ruling on BO-18): a rule admitted on its score is judged on a score whose
+    /// every term weighs as much less as the term is common in the user's own last 1,000 typed prompts (`need`, `want`,
+    /// `session` weigh little). Off by default; it acts as off while `[log] prompt_text` keeps no text to count.
+    #[serde(default)]
+    pub prompt_idf: bool,
+    /// BO-20's second: a rule is admitted on its score only when it shares at least this many distinct terms with the
+    /// prompt, or one two-word term. 1, the default, narrows nothing.
+    #[serde(default = "default_min_terms")]
+    pub min_terms: usize,
+    /// BO-20's third: a rule is admitted on its score only at or over this share of the prompt's best rule score
+    /// (0.5: half of it). Unset by default.
+    #[serde(default)]
+    pub relative: Option<f32>,
+}
+
+fn default_min_terms() -> usize { 1 }
+
+impl MatchConfig {
+    /// Does a BM25 score of `score` serve a rule no keyword or path brought: only when `min_score` is set and reached.
+    pub fn admits(&self, score: f32) -> bool {
+        reaches(self.min_score, score)
+    }
+
+    /// The setting each key holds, as `base.toml` would carry it: every `[match]` key, `None` for one unset. The one
+    /// list `base shadow` snapshots, compares and writes (BO-20, K9a).
+    pub fn keys(&self) -> Vec<(&'static str, Option<toml::Value>)> {
+        vec![
+            ("bm25", Some(toml::Value::Boolean(self.bm25))),
+            ("min_score", self.min_score.map(|v| toml::Value::Float(f64::from(v)))),
+            ("prompt_idf", Some(toml::Value::Boolean(self.prompt_idf))),
+            ("min_terms", Some(toml::Value::Integer(self.min_terms as i64))),
+            ("relative", self.relative.map(|v| toml::Value::Float(f64::from(v)))),
+        ]
+    }
+}
+
+/// A BM25 score above zero that reaches `min`, when there is one: the one threshold test the prompt hook, `select` and
+/// `base rule test` share (BO-18).
+pub fn reaches(min: Option<f32>, score: f32) -> bool {
+    min.is_some_and(|min| score > 0.0 && score >= min)
+}
+
+impl Default for MatchConfig {
+    fn default() -> Self {
+        Self { bm25: default_true(), min_score: None, prompt_idf: false, min_terms: default_min_terms(), relative: None }
+    }
+}
+
+// ─── Tune Config (BO-16: K6 replay; BO-17 adds its cadence keys, D7) ───
+
+/// `[tune]`: how a proposed rule change is checked before anyone approves it (K6), and when the rule pass
+/// (`base tune`, BO-17) is due (D7). `base rule replay` and `base rule review` run a change over the user's own recent
+/// prompts and say which would start or stop serving it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuneConfig {
+    /// How many of the match log's most recent prompts a replay runs over.
+    #[serde(default = "default_replay_prompts")]
+    pub replay_prompts: usize,
+    /// A change whose rule would be served on more than this share of the replayed prompts is flagged TOO BROAD.
+    #[serde(default = "default_broad_share")]
+    pub broad_share: f32,
+    /// D7a: flagged corrections since the last pass that make a rule pass due. The next typed prompt carries one line
+    /// asking the AI to run `base tune`.
+    #[serde(default = "default_tune_corrections")]
+    pub corrections: u32,
+    /// D7b: typed prompts with no pass before the safety net fires, when at least one correction or one prompt that
+    /// matched no domain was logged since.
+    #[serde(default = "default_tune_turns")]
+    pub turns: u32,
+}
+
+fn default_replay_prompts() -> usize { 500 }
+fn default_broad_share() -> f32 { 0.25 }
+fn default_tune_corrections() -> u32 { 3 }
+fn default_tune_turns() -> u32 { 15 }
+
+impl Default for TuneConfig {
+    fn default() -> Self {
+        Self {
+            replay_prompts: default_replay_prompts(),
+            broad_share: default_broad_share(),
+            corrections: default_tune_corrections(),
+            turns: default_tune_turns(),
+        }
+    }
+}
+
+// ─── Corrections Config (BO-15: K3, C1 to C4, D4, D10) ───────
+
+/// `[corrections]`: how base notices that the user corrected the AI (K3). No one signal decides (D4): a phrase in the
+/// prompt (C1), what the user did (C2: an interrupt, a refused tool call, a file the AI wrote changed by someone else,
+/// the same request again) and the AI's own marker at the start of a reply line (C3) each flag a turn, and a flagged
+/// prompt carries one line asking the AI to confirm (C4). See `crate::corrections`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorrectionsConfig {
+    /// C1 to C4, the signal rows in the match log and the session-start line for a CLAUDE.md that asks for no marker.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// C1: words and phrases that flag a prompt as a possible correction, matched as whole words with case ignored.
+    /// They only flag; the AI decides (C4).
+    #[serde(default = "default_correction_phrases")]
+    pub phrases: Vec<String>,
+    /// C3: what the AI writes at the start of a reply line when the user corrected it. `UPDATED:` and `CORRECTED:`
+    /// mean it was wrong, `MISREAD:` that it misunderstood the ask, `DEFERRED:` that it held its position (a
+    /// disagreement, never proposed as a rule). A marker added here reads as "wrong".
+    #[serde(default = "default_correction_markers")]
+    pub markers: Vec<String>,
+    /// C2: two human prompts in a row that share at least this share of their content words (Jaccard, both prompts
+    /// four content words or more) are the same request again.
+    #[serde(default = "default_repeat_similarity")]
+    pub repeat_similarity: f32,
+}
+
+/// The default C1 phrases: the scope's list (D12), swearing included.
+pub const DEFAULT_CORRECTION_PHRASES: &[&str] = &[
+    "no,", "wrong", "that's not", "not what i asked", "i told you", "i've said", "i said", "again", "quit",
+    "stop doing", "don't", "never", "why did you", "fuck", "fucking", "fucked", "shit", "bullshit", "damn", "dammit",
+    "goddamn", "wtf", "ffs", "crap",
+];
+
+/// The default C3 markers: base's own for every user (Round 2), then Chris's T2 set (D10).
+pub const DEFAULT_CORRECTION_MARKERS: &[&str] = &["CORRECTED:", "UPDATED:", "MISREAD:", "DEFERRED:"];
+
+fn default_correction_phrases() -> Vec<String> {
+    DEFAULT_CORRECTION_PHRASES.iter().map(|s| (*s).to_string()).collect()
+}
+fn default_correction_markers() -> Vec<String> {
+    DEFAULT_CORRECTION_MARKERS.iter().map(|s| (*s).to_string()).collect()
+}
+fn default_repeat_similarity() -> f32 { 0.5 }
+
+impl Default for CorrectionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            phrases: default_correction_phrases(),
+            markers: default_correction_markers(),
+            repeat_similarity: default_repeat_similarity(),
+        }
+    }
+}
+
+// ─── Doctor Config (F23) ─────────────────────────────────────
+
+/// `[doctor]`: what `base doctor` reports as stale, and how it reads the match log for the rules and decisions that
+/// need attention (BO-19, K8, F14c). Every key has a default, so a base.toml written before BO-19 parses as before.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorConfig {
+    /// A project's next step older than this many days is flagged (F23b; D12's "N days", 14 by lynx's pick).
+    #[serde(default = "default_stale_next_days")]
+    pub stale_next_days: i64,
+    /// A rule not served in this many days is dead (K8b). Also the window of the noisy list and the detector line.
+    #[serde(default = "default_dead_days")]
+    pub dead_days: u64,
+    /// A rule or decision served and then corrected at least this many times is ignored (K8b), when its share of
+    /// servings corrected is also at least twice the log's average (`usage::IGNORED_TIMES_AVERAGE`, lynx's gate-4 ruling).
+    #[serde(default = "default_ignored_after")]
+    pub ignored_after: usize,
+    /// F14c: a decision served at least this many times, and unchanged for `review_days`, is listed as "still true?".
+    #[serde(default = "default_review_served")]
+    pub review_served: usize,
+    /// F14c: days with no `base decision update` before a decision served `review_served` times is listed.
+    #[serde(default = "default_review_days")]
+    pub review_days: i64,
+}
+
+fn default_stale_next_days() -> i64 { 14 }
+fn default_dead_days() -> u64 { 30 }
+fn default_ignored_after() -> usize { 3 }
+fn default_review_served() -> usize { 20 }
+fn default_review_days() -> i64 { 60 }
+
+impl Default for DoctorConfig {
+    fn default() -> Self {
+        Self {
+            stale_next_days: default_stale_next_days(),
+            dead_days: default_dead_days(),
+            ignored_after: default_ignored_after(),
+            review_served: default_review_served(),
+            review_days: default_review_days(),
+        }
+    }
+}
+
+// ─── Log Config (D14) ────────────────────────────────────────
+
+/// `[log]`: how long base keeps what it derived from a session's prompts (D14, 2026-10-01: 90 days, three of the
+/// 30-day windows after which K8 calls a rule dead).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogConfig {
+    /// Days a session's own hook-output folder (`.base/hook-output/<session id>/`: its full session start, its last
+    /// prompt's output, its letters) is kept after it was last written. Session start removes older ones (BO-06,
+    /// F11e). Read as at least 1, so a session start never removes the folder of a session still running today.
+    ///
+    /// The match log's rows (`.base/match-log.jsonl`, K1) are kept as long: session start removes rows dated more than
+    /// this many calendar days ago (BO-13, K1e).
+    #[serde(default = "default_prompt_days")]
+    pub prompt_days: u64,
+    /// How much of each prompt a match-log row keeps (K1c): `full` (the default: the prompt, secrets scrubbed),
+    /// `matched` (only the words that matched a keyword or a topic rule) or `off` (no text). Any other value reads as
+    /// `off`. See [`LogConfig::prompt_text_mode`].
+    #[serde(default = "default_prompt_text")]
+    pub prompt_text: String,
+}
+
+fn default_prompt_days() -> u64 { 90 }
+fn default_prompt_text() -> String { "full".to_string() }
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self { prompt_days: default_prompt_days(), prompt_text: default_prompt_text() }
+    }
+}
+
+impl LogConfig {
+    /// `prompt_text` as the match log reads it.
+    pub fn prompt_text_mode(&self) -> crate::emit::match_log::PromptText {
+        crate::emit::match_log::PromptText::parse(&self.prompt_text)
+    }
 }
 
 // ─── Rules Config (spec Part H, commit 4) ───────────────────
@@ -400,26 +776,126 @@ pub struct BracketConfig {
 ///
 /// The tiered buckets are additive with `always`, not exclusive: at DEPLETED a
 /// prompt receives `always` + `depleted`.
+///
+/// EACH RULE IS SENT ONCE PER SESSION (BO-03, F3). A rule goes out on the first prompt
+/// where its tier applies and never again in that session, a tier change included; an
+/// edited rule text is a new rule and goes out once more. Before BO-03 the whole block
+/// went again on every tier change (K1, 2026-09-12), so `always` repeated at each tier.
+/// And a rule whose `covered_by` text is in a CLAUDE.md file Claude Code loads is not
+/// sent at all: the reader already has it ([`crate::claude_md`]).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BracketRules {
-    /// Injected with every tier's block, ahead of that tier's own entries, so the
-    /// permanent rules keep a stable position whatever the tier.
-    ///
-    /// NOT every prompt. K1 (Chris, 2026-09-12) ruled the whole block is served once
-    /// when it first applies and again only when the bracket changes tier. The older
-    /// wording here — "injected every prompt", "survives because it is re-sent" —
-    /// described the behaviour this key had before that ruling, and a comment left
-    /// contradicting the code is how the next reader restores the behaviour.
+    /// Injected at every tier, ahead of that tier's own entries, once per session.
     #[serde(default)]
-    pub always: Vec<String>,
+    pub always: Vec<BracketRule>,
     #[serde(default)]
-    pub fresh: Vec<String>,
+    pub fresh: Vec<BracketRule>,
     #[serde(default)]
-    pub moderate: Vec<String>,
+    pub moderate: Vec<BracketRule>,
     #[serde(default)]
-    pub depleted: Vec<String>,
+    pub depleted: Vec<BracketRule>,
     #[serde(default)]
-    pub critical: Vec<String>,
+    pub critical: Vec<BracketRule>,
+}
+
+/// One bracket rule: its text, and the CLAUDE.md text that makes sending it pointless.
+///
+/// Written either as a plain string, which is every rule written before BO-03, or as a table:
+///
+/// ```toml
+/// always = [
+///   "A rule with no marker.",
+///   { text = "T1 — Never hedge in prose ...", covered_by = "### T1 — Confidence is numeric, never prose" },
+///   { text = "T3/T4 — Adjacent: drain still applies ...", covered_by = ["### T3 —", "### T4 —"] },
+/// ]
+/// ```
+///
+/// `covered_by` is one line of text or a list of them. The rule is covered, and not sent, when EVERY
+/// listed text is in some CLAUDE.md file Claude Code loads for the session (F3). A rule that restates two
+/// CLAUDE.md sections lists both, so losing either section brings the rule back. An empty or blank marker
+/// covers nothing: an empty string is inside every file, and treating it as found would silence the rule
+/// on every machine.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BracketRule {
+    pub text: String,
+    pub covered_by: Vec<String>,
+}
+
+impl BracketRule {
+    /// The markers that can match: trimmed, blanks dropped.
+    pub fn markers(&self) -> impl Iterator<Item = &str> {
+        self.covered_by.iter().map(|m| m.trim()).filter(|m| !m.is_empty())
+    }
+
+    /// True when every marker is in `loaded` and there is at least one. `loaded` is the text of the
+    /// CLAUDE.md files Claude Code loads, as [`crate::claude_md::loaded_text`] reads them.
+    pub fn covered_in(&self, loaded: &str) -> bool {
+        let mut markers = self.markers().peekable();
+        markers.peek().is_some() && markers.all(|m| loaded.contains(m))
+    }
+}
+
+impl From<&str> for BracketRule {
+    fn from(text: &str) -> Self {
+        BracketRule { text: text.to_string(), covered_by: Vec::new() }
+    }
+}
+
+impl From<String> for BracketRule {
+    fn from(text: String) -> Self {
+        BracketRule { text, covered_by: Vec::new() }
+    }
+}
+
+/// A marker list as TOML may write it: one string or an array of them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Markers {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// A bracket rule as TOML may write it: a plain string, or a table with `text` and `covered_by`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawBracketRule {
+    Text(String),
+    Table {
+        text: String,
+        #[serde(default)]
+        covered_by: Option<Markers>,
+    },
+}
+
+impl<'de> Deserialize<'de> for BracketRule {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match RawBracketRule::deserialize(d)? {
+            RawBracketRule::Text(text) => BracketRule { text, covered_by: Vec::new() },
+            RawBracketRule::Table { text, covered_by } => BracketRule {
+                text,
+                covered_by: match covered_by {
+                    None => Vec::new(),
+                    Some(Markers::One(m)) => vec![m],
+                    Some(Markers::Many(ms)) => ms,
+                },
+            },
+        })
+    }
+}
+
+impl Serialize for BracketRule {
+    /// The shape it was read in: a plain string when there is no marker, so a config written before BO-03
+    /// serializes as it was written.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        if self.covered_by.is_empty() {
+            return s.serialize_str(&self.text);
+        }
+        let mut t = s.serialize_struct("BracketRule", 2)?;
+        t.serialize_field("text", &self.text)?;
+        t.serialize_field("covered_by", &self.covered_by)?;
+        t.end()
+    }
 }
 
 impl BracketRules {
@@ -588,10 +1064,17 @@ pub struct GraphConfig {
     /// nobody straggles; off is for an operator who wants to run it by hand.
     #[serde(default = "default_true")]
     pub auto_migrate: bool,
+    /// Backup snapshots kept per tier, newest first (F24b). Every snapshot rotates the oldest out past this number,
+    /// and `base doctor --fix` removes the rest. Read as at least 1, so the snapshot just taken always survives.
+    #[serde(default = "default_keep_backups")]
+    pub keep_backups: usize,
 }
 
 fn default_compact_threshold_mb() -> u64 { 12 }
 fn default_compact_cooldown_hours() -> i64 { 24 }
+/// F24b's default. Before 0.16.0 every tier kept ten (`store::BACKUP_KEEP`): 708 MB on the measured machine.
+pub const DEFAULT_KEEP_BACKUPS: usize = 3;
+fn default_keep_backups() -> usize { DEFAULT_KEEP_BACKUPS }
 
 impl Default for GraphConfig {
     fn default() -> Self {
@@ -600,6 +1083,7 @@ impl Default for GraphConfig {
             compact_threshold_mb: default_compact_threshold_mb(),
             compact_cooldown_hours: default_compact_cooldown_hours(),
             auto_migrate: true,
+            keep_backups: default_keep_backups(),
         }
     }
 }
@@ -735,10 +1219,90 @@ pub struct StageDef {
     pub context_doc: Option<String>,
 }
 
+// ─── Defer Config (spec Part C, Part H) ─────────────────────
+
+/// Deferred state for handoffs, forks, tasks and milestones (spec Part C). Deferred means open but
+/// paused: not listed at session start, one command away, and counted on the block it left.
+///
+/// `enabled` is FALSE in code. That is the interim default ruled on 2026-09-15 (lane 3 verdicts,
+/// AMENDMENTS B): an existing install and every test seed keep today's behaviour until they opt in.
+/// Whether any install writes it true is flag 3, which is Chris's. Projects keep `[protocol] enabled`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeferConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `"global"`: every type uses `global_days`. `"asset"`, unset, or any other value: each type
+    /// uses its own `[defer.days]` value, then `global_days`, then 10 (spec Part H, LOCKED).
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub global_days: Option<i64>,
+    #[serde(default)]
+    pub days: DeferDays,
+}
+
+/// One duration per type (spec Part H). The graph has no Fork type: a fork is an `ops:Handoff` whose
+/// `kind` literal is `"fork"`, and it reads `fork`; every other handoff reads `handoff`. That is the
+/// test `handoff_show::open_handoffs` already uses, so the key follows what the operator sees.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeferDays {
+    #[serde(default)]
+    pub handoff: Option<i64>,
+    #[serde(default)]
+    pub fork: Option<i64>,
+    #[serde(default)]
+    pub task: Option<i64>,
+    #[serde(default)]
+    pub milestone: Option<i64>,
+    /// Absent: `[protocol] stale_days`, which the project engine has always read (spec G6).
+    #[serde(default)]
+    pub project: Option<i64>,
+}
+
+/// The record types deferral resolves a duration for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferKind {
+    Handoff,
+    Fork,
+    Task,
+    Milestone,
+    Project,
+}
+
+/// The days used when neither the type nor `global_days` says (spec Part H).
+pub const DEFER_DAYS_FALLBACK: i64 = 10;
+
+impl BaseConfig {
+    /// Whole days before an untouched record of `kind` is deferred, in spec Part H's order. `mode =
+    /// "global"` gives every type `global_days`, then 10. Any other mode, or none, reads the type's own
+    /// `[defer.days]` value, then `global_days`, then 10. A project with no key of its own reads
+    /// `[protocol] stale_days` instead, which the project engine has always read (spec G6).
+    pub fn defer_days(&self, kind: DeferKind) -> i64 {
+        let d = &self.defer;
+        if d.mode.as_deref() == Some("global") {
+            return d.global_days.unwrap_or(DEFER_DAYS_FALLBACK);
+        }
+        let own = match kind {
+            DeferKind::Handoff => d.days.handoff,
+            DeferKind::Fork => d.days.fork,
+            DeferKind::Task => d.days.task,
+            DeferKind::Milestone => d.days.milestone,
+            DeferKind::Project => {
+                return d.days.project.unwrap_or(self.protocol.stale_days as i64);
+            }
+        };
+        own.or(d.global_days).unwrap_or(DEFER_DAYS_FALLBACK)
+    }
+}
+
 // ─── Signal Config ───────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalConfig {
+    /// LEGACY, read by nothing. It capped three small signals, exempted the four largest and
+    /// counted bytes; `[budget] session_start_chars` replaced it (spec A8). Kept so an existing
+    /// `base.toml` still loads it and `base doctor` can name it as legacy. It is not the session
+    /// start budget: 2,000 would cut the map itself.
     #[serde(default = "default_max_chars")]
     pub max_chars: usize,
     #[serde(default = "default_signal_enabled")]
@@ -759,6 +1323,165 @@ impl Default for SignalConfig {
             max_chars: default_max_chars(),
             enabled: default_signal_enabled(),
             scope: default_signal_scope(),
+        }
+    }
+}
+
+// ─── Budget Config ───────────────────────────────────────────
+
+/// How much each hook event may print, in BYTES: the unit the host counts. Output over the
+/// host's limit is saved to a file and Claude sees a 2,000-character preview of it, so base
+/// measures and trims before it prints. The limit was measured on Claude Code 2.1.287, 2026-10-01,
+/// by `base doctor --measure`, which re-measures it on whatever Claude Code runs.
+///
+/// THE UNIT IN THIS PARAGRAPH WAS FALSE UNTIL 2026-09-20 AND IT MISLED THREE SESSIONS. It read
+/// "UTF-16 code units: the unit Claude Code's limit counts", on the belief that the host is
+/// JavaScript and its limit is a JS string length. Nobody had measured it. A probe of 13,000
+/// box-drawing characters - 39,000 bytes but only 13,000 UTF-16 units - PERSISTED, where a UTF-16
+/// limit predicts it arrives whole. The host counts bytes.
+///
+/// Read today by session start: `session_start_bytes`, `first_screen_chars` and
+/// `write_full_output`; by the memory signal: `memory_chars`; by the prompt hook: `prompt_bytes`.
+/// `pre_tool_bytes` and `post_tool_chars` are read by nothing yet; the tool hooks take them in
+/// their own commits. `base doctor --measure` writes `session_start_bytes`, `prompt_bytes`,
+/// `pre_tool_bytes` and `measured_on` from what the running Claude Code delivers (BO-02).
+///
+/// `first_screen_chars` and `memory_chars` ARE GENUINELY UTF-16 AND KEEP THEIR NAMES. They are
+/// READABILITY limits - how much a reader takes in - not delivery ones, so the host's unit does
+/// not apply to them. Mixed and honest beats uniform and lying.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    /// Session start's budget, in BYTES.
+    ///
+    /// RENAMED WITH ITS UNIT, IN THE SAME COMMIT. It was `session_start_chars` and it measured
+    /// UTF-16 code units; the host was measured counting bytes on 2026-09-20. A key renamed before
+    /// its unit changes, or after, is a lie for the window in between — so the two move together.
+    /// The old spelling keeps working as an alias, because an operator who tuned it must not be
+    /// silently returned to the default; `legacy_budget_keys` says so once per run.
+    #[serde(default = "default_session_start_bytes", alias = "session_start_chars")]
+    pub session_start_bytes: usize,
+    /// The prompt hook's budget, in BYTES. Same rename, same reason — its unit changed earlier the
+    /// same day and the key went on saying `chars` until now.
+    #[serde(default = "default_prompt_bytes", alias = "prompt_chars")]
+    pub prompt_bytes: usize,
+    /// Which renamed keys THIS config was actually written with, in the operator's own spelling.
+    ///
+    /// NOT DESERIALIZED, AND IT CANNOT BE. `serde(alias)` lands both spellings in one field and
+    /// then cannot say which one it saw, so the struct is exactly the wrong place to ask. `load`
+    /// fills this from the RAW merged table, before `try_into` erases the distinction.
+    ///
+    /// WHAT IT IS FOR: an overflow notice must send the operator to the key that is in THEIR file.
+    /// Naming the current spelling to someone who legitimately still has the old one points them
+    /// at a key they do not have.
+    #[serde(skip)]
+    pub legacy_spellings: Vec<String>,
+    /// The hook budget keys the config sets by hand with no `measured_on` beside them, in the operator's spelling.
+    ///
+    /// WHY (BO-02 review). `measured_on` defaults to the version the shipped defaults were measured on, so a file
+    /// that pins `session_start_bytes = 9000` (every install before BO-02 got that line from the template) and says
+    /// nothing about `measured_on` would read as measured on today's host. Not deserialized: filled by `load` from
+    /// the raw merged table, like `legacy_spellings`.
+    #[serde(skip)]
+    pub unmeasured_keys: Vec<String>,
+    /// The pre-tool hook's budget, in BYTES: what `base doctor --measure` measured the host delivering through
+    /// pre-tool's `additionalContext`. Read by no hook yet; the pre-tool hook takes it in its own build order.
+    ///
+    /// RENAMED WITH ITS UNIT (BO-02), for the reason `session_start_bytes` gives: it was `pre_tool_chars`, and the
+    /// number written here is now a measured byte count. The old spelling still sets it.
+    #[serde(default = "default_pre_tool_bytes", alias = "pre_tool_chars")]
+    pub pre_tool_bytes: usize,
+    #[serde(default = "default_post_tool_chars")]
+    pub post_tool_chars: usize,
+    /// The header, the instructions and due-now items must fit inside this many units (spec A5).
+    #[serde(default = "default_first_screen_chars")]
+    pub first_screen_chars: usize,
+    /// The memory block's own budget (board ruling R6), inside session start's: whole notes,
+    /// corrections first and newest first, then one line counting the rest and naming
+    /// `base learn --list`.
+    #[serde(default = "default_memory_chars")]
+    pub memory_chars: usize,
+    /// The Claude Code version the defaults were measured on. The limit is the host's and can move.
+    #[serde(default = "default_measured_on")]
+    pub measured_on: String,
+    /// Write the untrimmed session start before printing (spec A6), and the prompt hook's untrimmed output: to the
+    /// session's own `.base/hook-output/<session>/` and to the workspace's latest copies `last-session-start.md` and
+    /// `last-prompt-submit.md` (BO-06, F11). False writes none of them; the letters file is written either way.
+    #[serde(default = "default_true")]
+    pub write_full_output: bool,
+}
+
+// THE THREE HOOK BUDGETS AND `measured_on` ARE A MEASUREMENT, NOT A CHOICE (F6c, BO-02). `base doctor --measure` on
+// Claude Code 2.1.287, 2026-10-01, 7 Haiku calls per hook: session start, prompt submit and pre-tool each delivered a
+// 10,000-byte payload whole and cut a 10,500-byte one to the 2,000-character preview. Rounded down to 500: 10,000.
+// Two 7,000-byte hooks on one prompt event both arrived whole, so the limit is per hook, not per event. When Claude
+// Code moves, `base doctor` says so; re-measure, then move all four together. Before this they were 9,000 / 4,000 /
+// 2,500 on 2.1.278, and the 4,000 had no host limit behind it.
+pub const MEASURED_HOOK_BYTES: usize = 10_000;
+pub const MEASURED_ON: &str = "2.1.287";
+
+fn default_session_start_bytes() -> usize { MEASURED_HOOK_BYTES }
+fn default_prompt_bytes() -> usize { MEASURED_HOOK_BYTES }
+fn default_pre_tool_bytes() -> usize { MEASURED_HOOK_BYTES }
+fn default_post_tool_chars() -> usize { 1000 }
+fn default_first_screen_chars() -> usize { 2000 }
+fn default_memory_chars() -> usize { 4000 }
+fn default_measured_on() -> String { MEASURED_ON.into() }
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            session_start_bytes: default_session_start_bytes(),
+            prompt_bytes: default_prompt_bytes(),
+            legacy_spellings: Vec::new(),
+            unmeasured_keys: Vec::new(),
+            pre_tool_bytes: default_pre_tool_bytes(),
+            post_tool_chars: default_post_tool_chars(),
+            first_screen_chars: default_first_screen_chars(),
+            memory_chars: default_memory_chars(),
+            measured_on: default_measured_on(),
+            write_full_output: default_true(),
+        }
+    }
+}
+
+// ─── Session Start Config ────────────────────────────────────
+
+/// What session start lists (spec Part H, B4-B6). Counts of lines, not a size: the size is `[budget]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStartConfig {
+    /// Handoffs listed, newest created first. Never more than 10: spec B4 letters them A to J.
+    #[serde(default = "default_handoffs_shown")]
+    pub handoffs_shown: usize,
+    /// The only order built is `created_desc`, newest created first (spec B4). Any other value is
+    /// named on stderr and the list is still newest first.
+    #[serde(default = "default_handoffs_sort")]
+    pub handoffs_sort: String,
+    /// One handoff per project, the newest, with the older open ones counted on its line (spec B5).
+    #[serde(default = "default_true")]
+    pub one_per_project: bool,
+    /// Forks listed under the fork count, newest first (spec B6).
+    #[serde(default = "default_forks_shown")]
+    pub forks_shown: usize,
+    /// A project whose `lastActive` falls inside this many days is recent: PROJECTS lists it, and
+    /// TASKS and MILESTONES list the working items linked to it, which is what session start calls
+    /// in progress (spec B6, board ruling R4).
+    #[serde(default = "default_recent_project_days")]
+    pub recent_project_days: i64,
+}
+
+fn default_handoffs_shown() -> usize { 10 }
+fn default_handoffs_sort() -> String { "created_desc".into() }
+fn default_forks_shown() -> usize { 3 }
+fn default_recent_project_days() -> i64 { 7 }
+
+impl Default for SessionStartConfig {
+    fn default() -> Self {
+        Self {
+            handoffs_shown: default_handoffs_shown(),
+            handoffs_sort: default_handoffs_sort(),
+            one_per_project: default_true(),
+            forks_shown: default_forks_shown(),
+            recent_project_days: default_recent_project_days(),
         }
     }
 }
@@ -866,6 +1589,110 @@ impl std::fmt::Display for ConfigFault {
 /// `post_tool_use.rs` records that "stderr stays stderr -- those lines are
 /// operator diagnostics, not model context". A config warning must never be
 /// able to change one byte of hook stdout, and a test asserts exactly that.
+/// A `[budget]` key whose UNIT changed and which was therefore renamed. The old spelling still
+/// parses and its value is still used — this only tells the operator to move on.
+///
+/// DELIBERATELY NOT A [`ConfigFault`]. That type already had the once-per-process latch and was the
+/// obvious host, but its `Display` appends "base is running on DEFAULT settings, not yours", which
+/// is FALSE here: the legacy value IS being honoured. Reusing it would have shipped a message that
+/// lies in order to save writing a second path, which is the defect class this change is part of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyBudgetKey {
+    pub old: &'static str,
+    pub new: &'static str,
+}
+
+impl std::fmt::Display for LegacyBudgetKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "base: [budget] {} was renamed to {} when its unit changed from UTF-16 units to bytes. \
+Your value is still being used. Rename the key in base.toml to stop seeing this.",
+            self.old, self.new
+        )
+    }
+}
+
+impl BudgetConfig {
+    /// The spelling of `new` that the operator will actually find in their own `base.toml`.
+    ///
+    /// WHY NOT SIMPLY `new`, WHICH IS THE OBVIOUS FIX AND IS WRONG IN THE OTHER DIRECTION. An
+    /// operator who legitimately still has the old spelling set would be sent to edit a key that
+    /// is not in their file. The correct behaviour depends on what is actually there, not on what
+    /// we assume - the same principle the unit itself had to learn.
+    pub fn key_as_written<'a>(&self, new: &'a str) -> &'a str {
+        RENAMED_BUDGET_KEYS
+            .iter()
+            .find(|k| k.new == new && self.legacy_spellings.iter().any(|s| s == k.old))
+            .map_or(new, |k| k.old)
+    }
+}
+
+/// Every `[budget]` key that was renamed with its unit: old spelling, new spelling.
+pub const RENAMED_BUDGET_KEYS: &[LegacyBudgetKey] = &[
+    LegacyBudgetKey { old: "session_start_chars", new: "session_start_bytes" },
+    LegacyBudgetKey { old: "prompt_chars", new: "prompt_bytes" },
+    LegacyBudgetKey { old: "pre_tool_chars", new: "pre_tool_bytes" },
+];
+
+/// Which renamed keys the merged config actually spells the old way.
+///
+/// Read off the RAW table rather than the deserialized struct on purpose: `serde(alias)` makes both
+/// spellings land in one field and then cannot say which one it saw, so the struct is exactly the
+/// wrong place to ask.
+fn legacy_budget_keys(merged: &toml::value::Table) -> Vec<LegacyBudgetKey> {
+    let Some(toml::Value::Table(budget)) = merged.get("budget") else {
+        return Vec::new();
+    };
+    RENAMED_BUDGET_KEYS
+        .iter()
+        .filter(|k| budget.contains_key(k.old))
+        .cloned()
+        .collect()
+}
+
+/// The hook budget keys, in every spelling, that a measurement covers.
+const HOOK_BUDGET_KEYS: [&str; 6] = [
+    "session_start_bytes",
+    "session_start_chars",
+    "prompt_bytes",
+    "prompt_chars",
+    "pre_tool_bytes",
+    "pre_tool_chars",
+];
+
+/// The hook budget keys the merged config sets with no `measured_on` beside them. See
+/// [`BudgetConfig::unmeasured_keys`].
+fn unmeasured_budget_keys(merged: &toml::value::Table) -> Vec<String> {
+    let Some(toml::Value::Table(budget)) = merged.get("budget") else {
+        return Vec::new();
+    };
+    if budget.contains_key("measured_on") {
+        return Vec::new();
+    }
+    HOOK_BUDGET_KEYS.iter().filter(|k| budget.contains_key(**k)).map(|k| k.to_string()).collect()
+}
+
+/// The one advisory this process gets, with its own latch.
+static LEGACY_KEYS_REPORTED: std::sync::Once = std::sync::Once::new();
+
+fn report_legacy_budget_keys(keys: &[LegacyBudgetKey], latch: &std::sync::Once) -> bool {
+    if keys.is_empty() {
+        return false;
+    }
+    let mut spoke = false;
+    latch.call_once(|| {
+        for k in keys {
+            // stderr, because stdout is what the budget governs: an advisory about the budget must
+            // not be charged against it, and `emit` states that stderr is outside every budget by
+            // construction.
+            eprintln!("{k}");
+        }
+        spoke = true;
+    });
+    spoke
+}
+
 fn report_config_faults_once(faults: &[ConfigFault]) {
     report_config_faults(faults, &FAULTS_REPORTED);
 }
@@ -907,6 +1734,36 @@ fn report_config_faults(faults: &[ConfigFault], latch: &std::sync::Once) -> bool
     spoke
 }
 
+/// A key base still parses and no longer reads, found in one `base.toml`, with what replaced it (spec A8, G6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyKey {
+    pub file: PathBuf,
+    pub section: &'static str,
+    pub key: &'static str,
+    pub replacement: &'static str,
+}
+
+impl LegacyKey {
+    /// The advisory `base doctor` prints.
+    pub fn sentence(&self) -> String {
+        format!(
+            "legacy: [{}] {} in {} is read by nothing; {}",
+            self.section,
+            self.key,
+            self.file.display(),
+            self.replacement
+        )
+    }
+}
+
+/// Every legacy key this build knows: section, key, and what replaced it. One table, so the migration (rank 09) adds
+/// its rows here rather than keeping a second list.
+const LEGACY_KEYS: &[(&str, &str, &str)] = &[(
+    "signal",
+    "max_chars",
+    "session start's budget is [budget] session_start_bytes and the memory block's is [budget] memory_chars",
+)];
+
 impl BaseConfig {
     /// Load config: global `~/.base-gbl/base.toml` as base, workspace `.base/base.toml` overlaid on top.
     /// Workspace sections override global at the key level; missing sections inherit from global.
@@ -932,12 +1789,10 @@ impl BaseConfig {
     pub fn load_reporting(cwd: &Path) -> (Self, Vec<ConfigFault>) {
         let mut faults = Vec::new();
 
-        let Some(home) = crate::home::home_root() else {
+        let Some([global_path, ws_path]) = Self::base_toml_paths(cwd) else {
             faults.push(ConfigFault::HomeUnresolvable);
             return (Self::default(), faults);
         };
-        let global_path = home.join(".base-gbl").join("base.toml");
-        let ws_path = cwd.join(".base").join("base.toml");
 
         let global = Self::read_table(&global_path, &mut faults);
         let workspace = Self::read_table(&ws_path, &mut faults);
@@ -960,8 +1815,23 @@ impl BaseConfig {
             (None, None) => return (Self::default(), faults),
         };
 
+        // Before `try_into` consumes the table: after deserialization the alias has erased which
+        // spelling was used.
+        let legacy = legacy_budget_keys(&merged);
+        report_legacy_budget_keys(&legacy, &LEGACY_KEYS_REPORTED);
+        let unmeasured = unmeasured_budget_keys(&merged);
+
         match toml::Value::Table(merged).try_into() {
-            Ok(config) => (config, faults),
+            Ok(config) => {
+                // Carry the operator's own spellings past the point where `serde(alias)` erases
+                // them, so a notice can name the key that is in their file rather than the one we
+                // would prefer they had.
+                let mut config: Self = config;
+                config.budget.legacy_spellings =
+                    legacy.iter().map(|k| k.old.to_string()).collect();
+                config.budget.unmeasured_keys = unmeasured;
+                (config, faults)
+            }
             Err(e) => {
                 faults.push(ConfigFault::Mismatched {
                     paths: sources,
@@ -1001,6 +1871,46 @@ impl BaseConfig {
                 None
             }
         }
+    }
+
+    /// The two `base.toml` files [`BaseConfig::load_reporting`] reads, global first, so every reader of them resolves
+    /// the same two paths. `None` without a home.
+    fn base_toml_paths(cwd: &Path) -> Option<[PathBuf; 2]> {
+        let home = crate::home::home_root()?;
+        Some([
+            home.join(".base-gbl").join("base.toml"),
+            cwd.join(".base").join("base.toml"),
+        ])
+    }
+
+    /// Every legacy key present in either `base.toml` (spec A8, G6), once per file that carries it. A file that
+    /// cannot be read or parsed yields nothing here: [`BaseConfig::load_reporting`] is what reports it.
+    pub fn legacy_keys(cwd: &Path) -> Vec<LegacyKey> {
+        let Some(paths) = Self::base_toml_paths(cwd) else {
+            return Vec::new();
+        };
+        let mut reported_by_load = Vec::new();
+        let mut out = Vec::new();
+        for path in paths {
+            let Some(table) = Self::read_table(&path, &mut reported_by_load) else {
+                continue;
+            };
+            for &(section, key, replacement) in LEGACY_KEYS {
+                let present = table
+                    .get(section)
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|t| t.contains_key(key));
+                if present {
+                    out.push(LegacyKey {
+                        file: path.clone(),
+                        section,
+                        key,
+                        replacement,
+                    });
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1115,6 +2025,63 @@ mod tests {
     /// whose default is true, because `get` reads the file and the file says
     /// nothing until you have overridden it.
     #[test]
+    fn the_budget_keys_default_to_spec_part_h_and_read_back_when_set() {
+        // F6c: the three hook budgets ship as the value measured on Claude Code 2.1.287, recorded beside them.
+        for key in ["session_start_bytes", "prompt_bytes", "pre_tool_bytes"] {
+            assert_eq!(default_value("budget", key), Some(toml::Value::Integer(10_000)), "{key}");
+        }
+        assert_eq!(default_value("budget", "measured_on"), Some(toml::Value::String("2.1.287".into())));
+        assert_eq!(default_value("budget", "first_screen_chars"), Some(toml::Value::Integer(2000)));
+        assert_eq!(default_value("budget", "write_full_output"), Some(toml::Value::Boolean(true)));
+        let cfg: BaseConfig =
+            toml::from_str("[budget]\nsession_start_bytes = 1234\n").expect("a budget section parses");
+        assert_eq!(cfg.budget.session_start_bytes, 1234);
+        assert_eq!(cfg.budget.prompt_bytes, 10_000, "an unset key keeps its default");
+
+        // THE LEGACY SPELLING MUST STILL SET THE VALUE. Renaming a key an operator may have tuned
+        // is only honest if the old name keeps working; retiring it silently would return them to
+        // the default without saying so.
+        let cfg: BaseConfig =
+            toml::from_str("[budget]\nsession_start_chars = 1234\n").expect("the legacy key parses");
+        assert_eq!(cfg.budget.session_start_bytes, 1234, "the legacy alias still sets the value");
+        let cfg: BaseConfig =
+            toml::from_str("[budget]\nprompt_chars = 777\n").expect("the legacy key parses");
+        assert_eq!(cfg.budget.prompt_bytes, 777, "the legacy alias still sets the value");
+        // BO-02 renamed pre-tool's key with its unit; the old spelling still sets it.
+        let cfg: BaseConfig =
+            toml::from_str("[budget]\npre_tool_chars = 555\n").expect("the legacy key parses");
+        assert_eq!(cfg.budget.pre_tool_bytes, 555, "the legacy alias still sets the value");
+
+        // And the raw-table scan names exactly the keys spelled the old way.
+        let table: toml::value::Table =
+            toml::from_str("[budget]\nsession_start_chars = 1\nprompt_bytes = 2\npre_tool_chars = 3\n").expect("table");
+        let found: Vec<&str> = legacy_budget_keys(&table).iter().map(|k| k.old).collect();
+        assert_eq!(found, vec!["session_start_chars", "pre_tool_chars"], "only the old spellings are reported");
+        // Rank 04 adds the memory block's own key; the assertions above are unchanged.
+        assert_eq!(default_value("budget", "memory_chars"), Some(toml::Value::Integer(4000)));
+        let cfg: BaseConfig =
+            toml::from_str("[budget]\nmemory_chars = 321\n").expect("a budget section parses");
+        assert_eq!(cfg.budget.memory_chars, 321);
+        assert_eq!(cfg.budget.session_start_bytes, 10_000, "an unset key keeps its default");
+    }
+
+    #[test]
+    fn the_session_start_keys_default_to_spec_part_h_and_read_back_when_set() {
+        assert_eq!(default_value("session_start", "handoffs_shown"), Some(toml::Value::Integer(10)));
+        assert_eq!(
+            default_value("session_start", "handoffs_sort"),
+            Some(toml::Value::String("created_desc".into()))
+        );
+        assert_eq!(default_value("session_start", "one_per_project"), Some(toml::Value::Boolean(true)));
+        assert_eq!(default_value("session_start", "forks_shown"), Some(toml::Value::Integer(3)));
+        assert_eq!(default_value("session_start", "recent_project_days"), Some(toml::Value::Integer(7)));
+        let cfg: BaseConfig = toml::from_str("[session_start]\nforks_shown = 5\n")
+            .expect("a session_start section parses");
+        assert_eq!(cfg.session_start.forks_shown, 5);
+        assert_eq!(cfg.session_start.handoffs_shown, 10, "an unset key keeps its default");
+    }
+
+    #[test]
     fn default_value_answers_for_a_key_the_file_never_mentions() {
         assert_eq!(default_value("update", "auto"), Some(toml::Value::Boolean(true)));
         assert_eq!(
@@ -1136,6 +2103,30 @@ mod tests {
         // Explicit opt-out is honored.
         let c: BaseConfig = toml::from_str("[update]\nauto = false\n").unwrap();
         assert!(!c.update.auto);
+    }
+
+    /// BO-02 review: a hook budget set by hand with no `measured_on` beside it is recorded as unmeasured, so doctor
+    /// cannot vouch for it with the default `measured_on`. Every install before BO-02 has `session_start_bytes = 9000`
+    /// from the template and nothing else in `[budget]`.
+    #[test]
+    fn hook_budgets_set_with_no_measured_on_are_recorded_as_unmeasured() {
+        let table = |s: &str| -> toml::value::Table { toml::from_str(s).expect("table") };
+        assert_eq!(unmeasured_budget_keys(&table("[budget]\nsession_start_bytes = 9000\n")), ["session_start_bytes"]);
+        assert_eq!(unmeasured_budget_keys(&table("[budget]\nprompt_chars = 4000\nmemory_chars = 1\n")), ["prompt_chars"]);
+        assert!(unmeasured_budget_keys(&table("[budget]\nprompt_bytes = 1\nmeasured_on = \"2.1.287\"\n")).is_empty());
+        assert!(unmeasured_budget_keys(&table("[budget]\nmemory_chars = 1\n")).is_empty(), "not a hook budget");
+        assert!(unmeasured_budget_keys(&table("[signal]\nenabled = true\n")).is_empty());
+
+        // And `load` carries it through to the struct doctor reads.
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let gbl = tmp.path().join(".base-gbl");
+            std::fs::create_dir_all(&gbl).unwrap();
+            std::fs::write(gbl.join("base.toml"), "[budget]\nsession_start_bytes = 9000\n").unwrap();
+            let budget = BaseConfig::load(tmp.path()).budget;
+            assert_eq!(budget.unmeasured_keys, ["session_start_bytes"]);
+            assert_eq!(budget.measured_on, MEASURED_ON, "the default fills in, which is why the list is needed");
+        });
     }
 
     // ─── Global tier resolution ──────────────────────────────
@@ -1182,6 +2173,75 @@ mod tests {
             std::fs::create_dir_all(&deep).unwrap();
 
             assert_eq!(find_workspace_base(&deep), Some(ws.join(".base")));
+        });
+    }
+
+    /// BO-11 (F22a): a folder inside the global root, where the handoff and fork docs live, is inside the workspace
+    /// at home when home is one, and the walk passes the global tier's own `.base` to find it. The root itself stays
+    /// the global tier: it is the path `-g` swaps cwd for, and `workspace_around_global_root` is what routes a plain
+    /// cwd there to the workspace.
+    #[test]
+    fn a_folder_inside_the_global_root_resolves_the_workspace_around_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let root = tmp.path().join(".base-gbl");
+            let docs = root.join("handoffs");
+            std::fs::create_dir_all(root.join(".base")).unwrap();
+            std::fs::create_dir_all(&docs).unwrap();
+            std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+
+            assert_eq!(find_workspace_base(&docs), Some(tmp.path().join(".base")));
+            assert_eq!(find_workspace_base(&root), Some(root.join(".base")), "the -g path is still the global tier");
+            assert_eq!(workspace_around_global_root(&root), Some(tmp.path().to_path_buf()));
+            assert_eq!(workspace_around_global_root(&docs), None, "only the root itself is rerouted");
+        });
+    }
+
+    /// With no workspace around it, a folder inside the global root resolves the global tier, as it always did:
+    /// outside every workspace, that is the tier it is in.
+    #[test]
+    fn a_folder_inside_the_global_root_with_no_workspace_around_it_is_the_global_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let root = tmp.path().join(".base-gbl");
+            let docs = root.join("forks");
+            std::fs::create_dir_all(root.join(".base")).unwrap();
+            std::fs::create_dir_all(&docs).unwrap();
+
+            assert_eq!(find_workspace_base(&docs), Some(root.join(".base")));
+            assert_eq!(workspace_around_global_root(&root), None);
+        });
+    }
+
+    /// Review finding 1: with no global tier on disk yet and no workspace around it, a folder inside the global root
+    /// resolves nothing, so the write is refused as it always was (issue #8), rather than creating the global tier
+    /// without `-g`.
+    #[test]
+    fn a_folder_inside_a_global_root_with_no_tier_yet_resolves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let docs = tmp.path().join(".base-gbl").join("handoffs");
+            std::fs::create_dir_all(&docs).unwrap();
+            assert!(!tmp.path().join(".base-gbl").join(".base").exists(), "precondition: no global tier yet");
+            assert_eq!(find_workspace_base(&docs), None);
+        });
+    }
+
+    /// Review finding 5: Windows paths are case-blind, so a cwd spelled in another case is still inside the global
+    /// root, and the walk must still pass the global tier's `.base` to reach the workspace around it.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_inside_the_global_root_spelled_in_another_case_still_resolves_the_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(tmp.path(), || {
+            let root = tmp.path().join(".base-gbl");
+            std::fs::create_dir_all(root.join(".base")).unwrap();
+            std::fs::create_dir_all(root.join("forks")).unwrap();
+            std::fs::create_dir_all(tmp.path().join(".base")).unwrap();
+            let shouted = PathBuf::from(tmp.path().join(".BASE-GBL").join("FORKS").display().to_string());
+            assert!(shouted.is_dir(), "control: the volume is case-blind, so the shouted path exists");
+            let found = find_workspace_base(&shouted).expect("a workspace");
+            assert!(same_dir(&found, &tmp.path().join(".base")), "the workspace around it, got {}", found.display());
         });
     }
 

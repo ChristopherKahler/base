@@ -1,0 +1,63 @@
+# base starter star commands
+#
+# Star commands are prompt-level behavior switches: type `*handoff` in a Claude
+# Code session and this command's rules inject for that turn. They are plain
+# TOML — edit them, delete them, add your own. `base commands list` shows what
+# is loaded; `base commands show <name>` prints one in full.
+#
+# This is the starter pack: the four that pay off immediately. Everything else
+# is depth you add once these are habit.
+#
+# Tier: this file is the GLOBAL tier (~/.base-gbl/commands.toml) — it applies in
+# every workspace. A workspace can override any command by name in
+# {workspace}/.base/commands.toml.
+
+[[command]]
+name = "handoff"
+description = "End this session so the next one resumes exactly where you left off"
+rules = [
+  "HANDOFF MODE — execute now, no confirmation needed. The operator asked for a handoff; producing it IS the approval.",
+  "STEP 1 — WORKSPACE: the handoff belongs to the project you are working in. If no `.base/` exists at the project root, run `base scaffold` in the project directory FIRST. The current project is always the target — never write a handoff to the global tier unless the operator explicitly asked for a global one (`base handoff create -g ...`).",
+  "STEP 2 — WRITE THE DOC: synthesize it from THIS session and Write it to {workspace}/.base/handoffs/{YYYY-MM-DD-HHMM}-{project-slug}.md. Sections, in order: a one-line title; a Created timestamp; 'Pick this up' (a short orientation paragraph — what this is and where things stand); 'What was done'; 'In progress'; 'Next actions' (prioritized); 'Key files' (path, then why it matters); 'Open questions'. Write enough that a session with zero context needs nothing else. If the project uses PAUL and a `.paul/` directory exists, run the /paul:handoff flow instead to produce the doc, capture its path, and continue to STEP 3 — producing a doc is only half the job.",
+  "STEP 3 — REGISTER IT: run `base handoff create --project \"<project>\" --doc \"<absolute-doc-path>\"`. This is what makes it resurface at the next session start. An unregistered doc is just a file nobody opens. The slug defaults to the doc's basename; pass `--slug \"<name>\"` only to override. Registering archives any prior open handoff for the same project, so re-running is safe and idempotent.",
+  "STEP 4 — VERIFY, THEN REPORT: run `base handoff list` and confirm the project has exactly one open handoff pointing at your doc path. If it is missing, STEP 3 did not take — rerun it. Do not paste the document body back into the response. Report the project name, the absolute doc path, and that verification passed.",
+  "Project name: infer from the PAUL project if present, else the workspace directory, else the session's subject. Pick the most specific stable name — it is the key the handoff resurfaces under.",
+]
+
+[[command]]
+name = "fork"
+description = "Park side-work that came up, without derailing what you are doing"
+rules = [
+  "FORK MODE — execute now, no confirmation needed.",
+  "A fork is for work that surfaced mid-session and should NOT be done now: a bug you noticed, a refactor worth doing later, a question worth chasing. It is not a handoff. A handoff ends a session; a fork parks a branch of work while the session continues.",
+  "STEP 1 — WORKSPACE: if no `.base/` exists at the project root, run `base scaffold` in the project directory FIRST. The current project is the target — never write a fork to the global tier unless the operator explicitly asked (`base fork create -g ...`).",
+  "STEP 2 — WRITE THE SPEC: Write it to {workspace}/.base/forks/{short-kebab-title}.md. It is a forward build-spec, not a note: 'What this is' (one paragraph a cold session can act on), 'Why it was deferred', 'Where the work starts' (files, functions, line numbers), 'Acceptance' (how you know it is done). Enough that picking it up needs no memory of this session.",
+  "STEP 3 — REGISTER IT: run `base fork create --project \"<project>\" --doc \"<absolute-doc-path>\"`. The slug is the doc basename — keep the filename and the title aligned. Multiple forks can be open at once; forks do not archive each other the way handoffs do.",
+  "STEP 4 — VERIFY: run `base fork list`, confirm yours is open and points at the doc, then report the title and path in one line and RETURN TO WHAT YOU WERE DOING. The whole point of a fork is that it costs the current task nothing.",
+]
+
+[[command]]
+name = "base"
+description = "Sweep this session's decisions, tasks, and learnings into the graph"
+rules = [
+  "SYNC MODE — execute now, no confirmation needed.",
+  "Re-read this session and route what is durable into the graph. Skip anything already recorded — check with `base recall --keyword \"<term>\"` or `base decision search --keyword \"<term>\"` before writing a duplicate.",
+  "DECISIONS — an architectural, tooling, or process choice that was actually settled: `base decision log --domain <domain> --decision \"...\" --rationale \"...\"`. The rationale is the part that matters; a decision without its reasoning gets re-litigated in three weeks. Only log what was decided, never what was merely discussed.",
+  "LEARNINGS — a correction, an insight, or a gotcha that cost real time: `base learn --text \"...\" --domain <domain> --type insight|correction|decision`. Prefer the specific over the general: 'the migration lock is held by the read replica, not the primary' beats 'be careful with migrations'.",
+  "RULES — a standing instruction that should fire whenever the context matches, not just once: `base rule add --domain <domain> --text \"...\"`. Rules are the things you would otherwise repeat every session.",
+  "TASKS — work that was named but not finished: `base task add -p <project> -n \"...\"`. Close what got done: `base task done <slug>`.",
+  "If no `.base/` exists here, run `base scaffold` first — otherwise these writes have no workspace to land in and will refuse rather than silently discard.",
+  "REPORT: list what you wrote, one line each, grouped by kind. If nothing was durable, say so plainly — an honest 'nothing new to record' beats manufacturing entries.",
+]
+
+[[command]]
+name = "end"
+description = "Close out the session cleanly — sweep the graph, park side-work, write the handoff"
+rules = [
+  "END MODE — run all three, in this order, no confirmation needed. This is the one-shot close-out.",
+  "1. Run the `*base` flow: sweep this session's decisions, learnings, rules, and task state into the graph.",
+  "2. Run the `*fork` flow for each piece of side-work that surfaced and was deliberately not done. None is a valid answer — do not manufacture forks.",
+  "3. Run the `*handoff` flow: write and REGISTER the handoff so the next session resumes from it.",
+  "VERIFY before reporting: `base handoff list` shows exactly one open handoff for this project, and `base fork list` shows any forks you just created. A close-out that did not register anything is a close-out that did not happen.",
+  "FINAL REPORT — short, one line each: what went into the graph, what was parked, where the handoff lives. Then stop. Do not start new work after an *end.",
+]

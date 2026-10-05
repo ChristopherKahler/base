@@ -101,7 +101,7 @@ fn the_tool_hook_serves_at_the_tier_the_prompt_hook_computed() {
 
         let tpath = transcript(root, 250);
         let prompt = serde_json::json!({ "prompt": "probe", "session_id": "sid-tier", "transcript_path": tpath });
-        let served = user_prompt_submit::handle(&config, root, &prompt).unwrap();
+        let served = user_prompt_submit::handle(&config, root, &prompt, &mut String::new()).unwrap();
         assert_eq!(served.rules_injected, 1, "positive control: the prompt hook serves the rule once");
 
         // Positive control that the PERCENT path was taken, read off the record the prompt hook wrote. Without

@@ -1,0 +1,98 @@
+# The replay corpus's domains (tests/replay_test.rs), written as the workspace's domains.toml.
+# Synthetic. The always-on domain and the keyword domains reproduce what fills the prompt hook on a
+# real machine: long always-on rules, and rules that match words the corpus prompts use. Loud enough
+# that some prompts overflow the prompt budget, so the budget check is not vacuous.
+#
+# BO-14 (K2): five rules carry test prompts, every one of them a corpus prompt, so
+# `replay_rule_tests_agree_with_the_prompt_hook` can hold `base rule test` to what the prompt hook printed for it.
+
+[[domain]]
+name = "global"
+mode = "always"
+rules = [
+  { text = "Never give time estimates on projects or features unless the operator asks and real grounding exists: measured velocity on comparable work, a scoped task list, or actual history. Describe scope, dependencies and external calendar gates instead.", fires_on = ["show me handoff C"] },
+  "Never publish a hosted page unless the operator literally asks for one. Deliverables are regular files on disk, and their paths go in the report.",
+  "Relay pings stay under about 800 characters; longer ones write to the inbox file but never render on the operator's card. Split into numbered pings.",
+  "Read before reasoning. Never state anything about this machine, its code, config or prior decisions from inference. Name the file read or the command run for every claim. If a fact the answer depends on cannot be checked, ask before proceeding.",
+]
+
+[[domain]]
+name = "hooks"
+prompt_keywords = ["hook", "injections", "session start", "first screen", "hook output"]
+rules = [
+  "Session start's first screen is the header, the instruction block and DUE NOW, and it must fit 2,000 UTF-16 units. Anything that grows it is paid for there.",
+  { text = "The prompt hook cuts at its byte budget and names the full-output file in its notice. A cut is reported, never silent.", fires_on = ["we're having issues with the user prompt submit hook being cut off at a high rate; how are the injections doing", "why did the first screen overflow on session start"], quiet_on = ["what reminders do i need"] },
+  "Measure hook output on a copy of the real store in a fake home, never on the live store.",
+]
+
+[[domain]]
+name = "reminders"
+prompt_keywords = ["reminder", "reminders", "due now", "snooze", "archive"]
+rules = [
+  { text = "A handled reminder is archived, never removed: archive keeps it, remove deletes it.", fires_on = ["what reminders do i need", "archive the reminder about the invoice"], quiet_on = ["draft the morning update for Client A on ProjectV"] },
+  "DUE NOW numbers its lines; base reminder archive and snooze take that number from the last session start.",
+]
+
+[[domain]]
+name = "client-work"
+prompt_keywords = ["client", "owner", "morning update", "projectv", "projectr", "dealer"]
+rules = [
+  { text = "Client-owner updates lead with what the owner sees, then why. Asks for other people go to them; the owner gets a notice.", fires_on = ["draft the morning update for Client A on ProjectV", "how do I tell the client owner the export is late"], quiet_on = ["what reminders do i need"] },
+  "The client's technical decisions belong to the builder. The client is asked only for business information and access.",
+  "Every document for a client owner is written for any reader and never addressed to them.",
+  "Client data never leaves this machine. Scrub names before anything goes into a public repository.",
+]
+
+[[domain]]
+name = "build-process"
+prompt_keywords = ["PR", "CI", "test suite", "build order", "orchestrator", "decision", "counts"]
+rules = [
+  { text = "One bounded item per session. A session builds exactly its build order and does not start the next one.", fires_on = ["review the PR for the session start hook and check CI on both platforms"], quiet_on = ["snooze B 3d"] },
+  "The gate is the PR's CI run on both platforms, every number with its denominator, every excluded or ignored test named.",
+  "No install, tag, release or merge without the operator's word. Pushing the branch and opening a PR is part of finishing.",
+  "Guards are not edited to make a PR pass. A change to a guard file needs its reason in the PR body.",
+  "The orchestrator verifies a PR from CI with gh, never from a build session's report.",
+]
+
+# BO-02: two large keyword domains. The shipped prompt budget is now the 10,000 bytes measured on the host, so the
+# corpus needs blocks big enough to matter at that size: `ledger` alone is larger than the old 4,000-byte cap and must
+# print whole (the operator's real always-on rules block is the same shape at 9,372 bytes), and a prompt matching
+# `ledger`, `payroll` and `hooks` together overflows 10,000, so the budget checks still have something to drop.
+[[domain]]
+name = "ledger"
+prompt_keywords = ["ledger", "journal entry", "reconcile"]
+rules = [
+  "A journal entry balances before it is posted: total debits equal total credits to the cent. An entry that does not balance is rejected with both totals and the difference named, and it is never posted with a suspense line added to make it fit. The preparer fixes the entry where it was made, not in the ledger afterwards, so the trail shows one entry and not an entry plus its repair.",
+  "Every posted entry carries its source document: the invoice, the receipt, the bank line or the approval it rests on, attached or referenced by a stable identifier. An entry with no source is held in draft until one is attached, however small the amount, because an auditor samples small entries as readily as large ones and an unsupported line costs more to defend later than to support now.",
+  "Reconciliation runs account by account against an outside statement: the bank, the card issuer, the payment processor or the lender. The reconciled balance is the statement's balance plus items in transit, each named with its date and amount, and an unexplained difference is reported as a number with its sign, never written off to a miscellaneous account to close the month on time.",
+  "A closed period stays closed. A correction to a closed month is a new entry in the open month that names the period it corrects and why, so the closed figures that were reported stay reproducible. Reopening a period to edit history is done only with a written approval that names the entries changed, and the approval is attached to the reopening itself.",
+  "Accruals reverse on the first day of the next period, automatically, so an expense is never counted twice when its invoice arrives. Each accrual names the vendor, the service, the period and the basis of the estimate, and an accrual still open after two periods is reviewed by name rather than carried forward silently from month to month.",
+  "Revenue is recognised when it is earned, not when cash arrives: a deposit for future work is a liability until the work is delivered, and a delivered order that is unpaid is a receivable. The ledger never moves an amount from deferred revenue to revenue without the delivery record that earns it, and partial delivery earns a part in proportion, stated.",
+  "Intercompany balances agree on both sides at every close. When one entity records a charge to another, the other records the matching entry in the same period, and the two balances are compared before either set of books is closed. A mismatch is resolved by the side that made the error, with a note naming the original entries on both sides of the pair.",
+  "Fixed assets are capitalised above the threshold in the policy and expensed below it, and the threshold is applied to the whole purchase, not to each line of an invoice split to fall under it. Each asset carries its in-service date, its useful life and its method, and depreciation is posted every period from that schedule, never estimated at year end in one entry.",
+  "Foreign currency entries record the transaction currency, the amount, the rate and the source of the rate on the day of the transaction. Balances held in another currency are revalued at the period-end rate, and the gain or loss is posted to its own account so that a currency movement is never mistaken for an operating result when the figures are read.",
+  "Account codes come from the chart of accounts as it stands; a new account is added to the chart first, with a description of what belongs in it and what does not, and only then used. An entry posted to a retired account is moved to its successor by a dated entry, and the chart keeps the retired code with a pointer so old reports still resolve.",
+  "Bank feeds are imported, never retyped. A line that the feed cannot match is matched by hand with the reason recorded beside it, and a duplicate import is detected by the bank's own transaction identifier rather than by amount and date, because two genuine payments of the same amount on the same day are common and must both survive the import.",
+  "Sales tax collected is a liability, not revenue, and it is posted to the jurisdiction it was collected for. The return for each period is prepared from the ledger, and the ledger balance for each jurisdiction equals the amount filed plus any amount still due, with the difference explained line by line before the return is submitted to the authority.",
+  "Petty cash and expense claims post against receipts with the business purpose written on each claim. A claim without a receipt is allowed only under the policy's limit and with a signed statement in place of the receipt, and repeated claims under the limit from one person in one week are reviewed together rather than one by one as they arrive.",
+  "Month-end close follows the checklist in its order: cut-off, accruals, reconciliations, revaluation, intercompany, review, lock. Each step records who did it and when, and the period is locked only after the review step has signed off on the trial balance, so a figure reported to the owner is always a figure that the review has already seen and accepted.",
+]
+
+[[domain]]
+name = "payroll"
+prompt_keywords = ["payroll", "pay run"]
+rules = [
+  "A pay run is calculated from approved timesheets and approved salary records only; a change made after approval waits for the next run unless it is approved again for this one, with the approver named. The calculation is reviewed against the previous run, and any person whose pay moved by more than the policy's threshold is checked by name before payment.",
+  "Gross pay, each deduction and net pay are posted to the ledger as one entry per run, with the deductions on their own liability accounts until they are paid over. The liability balances are reconciled to the amounts remitted each period, and a balance that does not clear is reported with the run it came from and the deduction it belongs to.",
+  "Payroll changes need two people: one to enter a new hire, a rate change or a bank account change, and another to approve it. Nobody approves a change to their own record, and a bank account change is confirmed through a channel the person used before the change, never through contact details supplied in the request that asked for the change.",
+  "Withholding follows the tables in force on the pay date, not the work date, and the version of the tables used is recorded with the run. A correction for a past period is calculated under that period's tables and paid in the current run as a separate line, so the person's statement shows the original figure and the correction side by side.",
+  "Leave balances accrue each run from the policy rate and the hours worked, and a balance is never edited directly; an adjustment is an entry with its reason. Leave paid out on departure is calculated from the balance on the last day worked, and the payout is reviewed against the accrual history before the final pay is released to the person.",
+  "Final pay is calculated on the last day worked and paid by the date the law requires, whichever is earlier than the next regular run. The final calculation lists every element: salary to date, leave paid out, deductions, and any amount owed back, and the person receives the list with the payment rather than a single figure with no breakdown.",
+  "Contractors are paid against invoices, not through payroll, and the classification of each person as contractor or employee is reviewed when their terms change. An invoice from a contractor who has worked set hours under direction for a long period is flagged for review before payment rather than paid and questioned later in an audit.",
+  "Payroll records are kept for the period the law requires and are readable only by the people who run and approve payroll. An export of payroll data for any other purpose removes identifiers that the purpose does not need, and the export is logged with who asked for it, why, and when it is to be deleted at the end of its use.",
+  "Benefit deductions follow the enrolment on file for the pay date, and an enrolment change takes effect from the date the plan sets, not from the date it was keyed. A deduction taken under an old enrolment is refunded or recovered in the next run as its own line, and the plan provider receives the same correction in the same period.",
+  "Overtime is paid from approved hours at the rate the policy sets for the day and the hours worked, and hours approved after the cut-off are paid in the next run as their own line. A run that pays overtime above the policy's weekly limit for one person is held for that person until the approver confirms the hours by name.",
+  "Bonuses and commissions are paid from a schedule that names the plan, the period and the figures the amount is calculated from. A manual bonus outside any plan needs a second approval and a written reason, and it is taxed as a supplemental payment under the rules in force on the pay date, which the run records beside it.",
+  "A garnishment order is applied in the order and to the limit the order sets, from the first run after it is received, and the amount withheld is remitted to the named recipient by the date the order requires. The person receives a statement of each amount withheld and remitted, and the order's end date is checked on every run.",
+  "The payroll bank account is funded before the pay date for the net pay of the run plus a margin set in the policy, and the funding is reconciled to the payments that cleared. A payment that is returned is investigated the same day, and the person is paid again by another method only after their details have been confirmed.",
+]

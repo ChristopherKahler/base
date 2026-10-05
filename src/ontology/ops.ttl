@@ -95,6 +95,10 @@ ops:PaulProject   rdf:type rdfs:Class ;
                   rdfs:label "PaulProject" ;
                   rdfs:comment "A PAUL-managed project indexed read-only from paul.json" .
 
+ops:RuleProposal  rdf:type rdfs:Class ;
+                  rdfs:label "RuleProposal" ;
+                  rdfs:comment "A change to the rules proposed from a user's correction (base rule propose, BO-15), pending review: a keyword gap, a rewrite or a new rule" .
+
 ops:Note          rdf:type rdfs:Class ;
                   rdfs:label "Note" ;
                   rdfs:comment "A structured memory entry with relational edges (base learn)" .
@@ -175,6 +179,20 @@ ops:blockedBy     rdf:type rdf:Property ;
 ops:nextAction    rdf:type rdf:Property ;
                   rdfs:range xsd:string .
 
+ops:nextActionAt  rdf:type rdf:Property ;
+                  rdfs:range xsd:dateTime ;
+                  rdfs:comment "When the next step was written; doctor flags old ones (F23)" .
+
+ops:parentProject rdf:type rdf:Property ;
+                  rdfs:domain ops:Project ;
+                  rdfs:range ops:Project ;
+                  rdfs:comment "The project this one sits inside; set explicitly, never derived from folders (D13)" .
+
+ops:nested        rdf:type rdf:Property ;
+                  rdfs:domain ops:Project ;
+                  rdfs:range xsd:boolean ;
+                  rdfs:comment "Work in this project also carries its parent's rules (D13); false when absent" .
+
 ops:revenue       rdf:type rdf:Property ;
                   rdfs:range xsd:string ;
                   rdfs:comment "Revenue description (e.g. '$33/mo recurring')" .
@@ -193,6 +211,11 @@ ops:rationale     rdf:type rdf:Property ;
 ops:recall        rdf:type rdf:Property ;
                   rdfs:range xsd:string ;
                   rdfs:comment "Recall/trigger context for a decision" .
+
+ops:decisionKeyword rdf:type rdf:Property ;
+                  rdfs:domain ops:Decision ;
+                  rdfs:range xsd:string ;
+                  rdfs:comment "A word or phrase that serves this decision on a prompt containing it; a decision of an always-on domain with none is served at session start only (BO-03, F5)" .
 
 ops:ruleText      rdf:type rdf:Property ;
                   rdfs:domain ops:Rule ;
@@ -218,6 +241,10 @@ ops:triggerPath   rdf:type rdf:Property ;
                   rdfs:domain ops:Domain ;
                   rdfs:range xsd:string ;
                   rdfs:comment "A path glob that activates this domain" .
+
+ops:alias         rdf:type rdf:Property ;
+                  rdfs:range xsd:string ;
+                  rdfs:comment "A name this project or domain had before `base project rename`; commands that name it reach the record" .
 
 ops:hasDecision   rdf:type rdf:Property ;
                   rdfs:domain ops:Domain ;
@@ -344,11 +371,15 @@ ops:handoffDoc    rdf:type rdf:Property ;
 
 ops:project       rdf:type rdf:Property ;
                   rdfs:range xsd:string ;
-                  rdfs:comment "Project name a handoff belongs to (one open handoff per project)" .
+                  rdfs:comment "Project name a handoff belongs to (one open handoff per project and lane)" .
 
 ops:kind          rdf:type rdf:Property ;
                   rdfs:range xsd:string ;
                   rdfs:comment "Flow-doc kind: \"handoff\" (continuity, archive-prior) or \"fork\" (parallel side-work, additive)" .
+
+ops:lane          rdf:type rdf:Property ;
+                  rdfs:range xsd:string ;
+                  rdfs:comment "Handoff lane: --lane, else the author's codename. A new handoff archives only the earlier one in its project and lane" .
 
 ops:action        rdf:type rdf:Property ;
                   rdfs:comment "LedgerEntry action (plan, apply, unify)" .
@@ -444,3 +475,135 @@ ops:tasksCompleted rdf:type rdf:Property ;
 
 ops:filesModified rdf:type rdf:Property ;
                   rdfs:comment "Files a PAUL plan modifies" .
+
+# ─── Rule proposals (BO-15, K3) ───────────────────────────
+# One correction, sorted, waiting for review: ops:proposal/p-NNNN.
+
+ops:proposalId    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The proposal's id, p-NNNN" .
+
+ops:proposalKind  rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "keyword-gap, rewrite or new-rule" .
+
+ops:meaning       rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "What the AI's marker said: wrong, misread, unmarked or manual" .
+
+ops:targetKind    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "What the proposal changes: domain, rule or decision" .
+
+ops:targetId      rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The domain's name, <domain>.<id> for a rule, a decision's slug" .
+
+ops:targetDomain  rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The domain the target belongs to" .
+
+ops:targetText    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "What the target says now" .
+
+ops:proposedText  rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "A new rule's wording, or a rewrite's" .
+
+ops:proposedKeyword rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "One keyword the proposal adds" .
+
+ops:firesOn       rdf:type rdf:Property ;
+                  rdfs:comment "A prompt that must serve the rule (BO-14), or a proposal's first such test" .
+
+ops:triggerPrompt rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The prompt that corrected the AI, secrets scrubbed" .
+
+ops:markerLine    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The line the AI's reply started with its marker (UPDATED:, CORRECTED:, MISREAD:)" .
+
+ops:signal        rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "One correction signal that fired, as printed: C1 phrase, C2 interrupt, C3 UPDATED" .
+
+ops:fromSession   rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The session the correction came from" .
+
+ops:fromTitle     rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "That session's relay codename, when it had one" .
+
+ops:fromTurn      rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The prompt number of the correcting turn" .
+
+ops:candidate     rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "A rule or decision the sort considered, with its score" .
+
+ops:fingerprint   rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "Kind, target and change, hashed: a rejected proposal is never offered again (BO-16)" .
+
+ops:turnKey       rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "Session and prompt, hashed: one proposal per turn" .
+
+# ─── Rule proposal review (BO-16, K5) ─────────────────────
+# base rule review: status pending -> approved, rejected or edited.
+
+ops:reviewedAt    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "When the proposal was approved, rejected or edited" .
+
+ops:rejectReason  rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "Why the user rejected it (base rule review --reject <id> --reason)" .
+
+ops:editedText    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "The wording the user applied instead of the proposed one" .
+
+ops:editedKeyword rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "One keyword the user applied instead of the proposed ones" .
+
+ops:appliedTo     rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "Where the approved change was written: domains.toml or the graph, and its tier" .
+
+# ─── The rule pass (BO-17, K4) ────────────────────────────
+# base tune: proposals from patterns across sessions (drop keyword, merge, split, retire), and a retired rule.
+
+ops:proposalOrigin rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "Who wrote it: correction (base rule propose, one turn) or tune (the rule pass)" .
+
+ops:evidence      rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "One line of what the rule pass saw behind the proposal" .
+
+ops:droppedKeyword rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "One keyword a drop-keyword proposal takes away" .
+
+ops:mergeTarget   rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "A merge's second rule, <domain>.<id>" .
+
+ops:secondText    rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "A split's second rule: its wording" .
+
+ops:secondKeyword rdf:type rdf:Property ;
+                  rdfs:domain ops:RuleProposal ;
+                  rdfs:comment "A split's second rule: one of its keywords" .
+
+ops:retiredAt     rdf:type rdf:Property ;
+                  rdfs:domain ops:Rule ;
+                  rdfs:comment "When the rule was retired: no hook serves it, it stays listed, and base rule unretire brings it back" .

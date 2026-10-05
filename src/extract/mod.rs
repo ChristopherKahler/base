@@ -105,15 +105,32 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
                     let del_old = format!("{prefixes}\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{file_iri}> ?p ?o }} }}");
                     let _ = store.update(&del_old);
 
-                    // Delete existing project triples (idempotent re-extract)
-                    let del_proj = format!("{prefixes}\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{project_iri}> ?p ?o }} }}");
+                    // Delete existing project triples (idempotent re-extract), except the parent link and `nested`,
+                    // which the operator sets and nothing re-derives (D13).
+                    let p = &ns.prefix;
+                    let del_proj = format!(
+                        "{prefixes}\nDELETE {{ GRAPH <{graph_iri}> {{ <{project_iri}> ?p ?o }} }} \
+                         WHERE {{ GRAPH <{graph_iri}> {{ <{project_iri}> ?p ?o \
+                         FILTER(?p NOT IN ({p}:parentProject, {p}:nested)) }} }}"
+                    );
                     let _ = store.update(&del_proj);
 
-                    // Insert triples under the project IRI
+                    // Insert triples under the project IRI. The project's folder is the one holding `.paul`, stored
+                    // absolute (F25b): the paul.json file's own path is no folder, and storing it made
+                    // `project paths --suggest` flag the project and a sync undo the folder it set.
                     let now = crud::now_iso();
                     let p = &ns.prefix;
+                    let folder = rel_path
+                        .replace('\\', "/")
+                        .strip_suffix("/.paul/paul.json")
+                        .and_then(|f| crate::crud::project::PathRoots::new(cwd, ns).from_cli(f));
+                    let path_pred = format!("{p}:path");
                     let mut body = String::new();
                     for (pred, val) in &t {
+                        let val = match (&folder, *pred == path_pred) {
+                            (Some(f), true) => format!("\"{}\"", crate::crud::escape_sparql_literal(f)),
+                            _ => val.clone(),
+                        };
                         body.push_str(&format!("    <{project_iri}> {pred} {val} .\n"));
                     }
                     body.push_str(&format!("    <{project_iri}> {p}:lastExtracted \"{now}\"^^xsd:dateTime .\n"));

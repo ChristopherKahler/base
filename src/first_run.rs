@@ -226,11 +226,12 @@ Working in a workspace
 
 Running more than one session
 
-  Relay is on. Every session gets a codename and a wake contract, and all of it
-  stays in ~/.base-gbl/.base/relay-inbox/ on this machine.
+  Relay is on. Every session gets a codename; base relay arm prints the inbox
+  watcher that lets a ping wake it. All of it stays in
+  ~/.base-gbl/.base/relay-inbox/ on this machine.
 
   base config set relay.enabled false      turn it off
-  base config set relay.wake_nudge false   keep pings, drop the arming block
+  base config set relay.wake_nudge false   keep pings, drop the watcher reminder
 
 Star commands
 

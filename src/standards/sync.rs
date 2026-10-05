@@ -6,7 +6,7 @@ use crate::config::BaseConfig;
 use crate::crud;
 
 use crate::changelog::Change;
-use super::{StandardDef, StandardsFile, SyncSource, TriggerDef};
+use super::{AppliesTo, StandardDef, StandardsFile, SyncSource, TriggerDef};
 
 // ─── Sync: protocols.md → standards.toml → graph ─────────────
 //
@@ -116,6 +116,8 @@ pub fn sync_standards(
                         severity: "medium".into(),
                         controls: proto.controls,
                         source,
+                        applies_to: AppliesTo::default(),
+                        scope_from_seed: false,
                         triggers: TriggerDef::default(),
                         stacks: Default::default(),
                     });
@@ -348,6 +350,8 @@ fn std_seed(
         severity: severity.into(),
         controls: Vec::new(),
         source: format!("midas:protocols.md#{id}"),
+        applies_to: AppliesTo::default(),
+        scope_from_seed: false,
         triggers,
         stacks: stacks
             .iter()
@@ -360,9 +364,32 @@ fn svec(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
+/// Deploy and CI configuration: the files a deploy-time standard is about beyond code. Workflow YAML, Dockerfiles,
+/// compose files, platform configs and `.env` files are not code, so without this a standard about them would stop
+/// at code files (F26b).
+const DEPLOY_CONFIG: &[&str] = &[
+    ".github/workflows/**", ".gitlab-ci.yml", "Jenkinsfile", "Dockerfile*", "*.dockerfile", "docker-compose*",
+    "railway.json", "railway.toml", "fly.toml", "Procfile", ".env*",
+];
+
+/// Code files plus deploy and CI configuration (F26a): A1, A3, A5 and A12, the standards whose triggers name those
+/// files.
+fn code_and_deploy_config(extra: &[&str]) -> AppliesTo {
+    AppliesTo {
+        code: true,
+        paths: DEPLOY_CONFIG.iter().chain(extra).map(|s| s.to_string()).collect(),
+        ..AppliesTo::default()
+    }
+}
+
+fn scoped(mut s: StandardDef, applies_to: AppliesTo) -> StandardDef {
+    s.applies_to = applies_to;
+    s
+}
+
 pub fn seed_file() -> StandardsFile {
     let standards = vec![
-        std_seed(
+        scoped(std_seed(
             "A1",
             "Reverse-proxy TLS trust",
             "Set trustProxies('*') (or the stack equivalent) + force HTTPS in production whenever the app runs behind a TLS-terminating edge.",
@@ -384,7 +411,7 @@ pub fn seed_file() -> StandardsFile {
                 ("express", "app.set('trust proxy', true) behind any TLS-terminating edge."),
                 ("django", "SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https') behind any TLS-terminating edge."),
             ],
-        ),
+        ), code_and_deploy_config(&[])),
         std_seed(
             "A2",
             "CSRF survives session rotation",
@@ -402,7 +429,7 @@ pub fn seed_file() -> StandardsFile {
                 ("django", "Django forms/middleware CSRF with rotating token — never a snapshotted static token."),
             ],
         ),
-        std_seed(
+        scoped(std_seed(
             "A3",
             "Browser smoke gate is mandatory",
             "Every pipeline runs a headless-browser smoke that logs in, walks every route, and fails on console errors, mixed content, non-2xx same-origin XHR, and an empty app mount.",
@@ -415,7 +442,7 @@ pub fn seed_file() -> StandardsFile {
                 ..Default::default()
             },
             &[],
-        ),
+        ), code_and_deploy_config(&[])),
         std_seed(
             "A4",
             "Explicit spawn environment for child processes",
@@ -436,7 +463,7 @@ pub fn seed_file() -> StandardsFile {
                 ("laravel", "Symfony Process with an explicit env array + setTimeout() — never ambient inheritance."),
             ],
         ),
-        std_seed(
+        scoped(std_seed(
             "A5",
             "Secrets never touch code, logs, or the session",
             "Provision secrets interactively (hidden prompts, one token at a time). Inject via env only. Never echo, never commit, never paste into an agent session.",
@@ -449,7 +476,7 @@ pub fn seed_file() -> StandardsFile {
                 ..Default::default()
             },
             &[],
-        ),
+        ), code_and_deploy_config(&["**/secrets/**"])),
         std_seed(
             "A6",
             "Config over code for provider endpoints",
@@ -538,7 +565,7 @@ pub fn seed_file() -> StandardsFile {
                 ("django", "os.environ.get('X') or default — never .get('X', default); an empty string is 'set' and defeats the second arg."),
             ],
         ),
-        std_seed(
+        scoped(std_seed(
             "A12",
             "Single-service constraint awareness",
             "Know your platform's structural limits before designing the deploy architecture — e.g., Railway volumes attach to ONE service.",
@@ -553,7 +580,7 @@ pub fn seed_file() -> StandardsFile {
                 ..Default::default()
             },
             &[],
-        ),
+        ), code_and_deploy_config(&[])),
         // Catalog extra — security-controls.md domain 6 distilled to the
         // edit-time rule. Not a protocols.md section; sync never overwrites it.
         {
@@ -595,14 +622,15 @@ pub fn list_standards(cwd: &Path) {
         eprintln!("No standards configured. Run `base standards sync` to bootstrap from MIDAS.");
         return;
     }
-    println!("| ID | Severity | Title | Lang | Content | Semantic | Paths | Stacks |");
-    println!("|----|----------|-------|------|---------|----------|-------|--------|");
+    println!("| ID | Severity | Title | Applies to | Lang | Content | Semantic | Paths | Stacks |");
+    println!("|----|----------|-------|------------|------|---------|----------|-------|--------|");
     for s in &standards {
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             s.id,
             s.severity,
             s.title,
+            scope_text(s),
             s.triggers.languages.len(),
             s.triggers.content.len(),
             s.triggers.semantic.len(),
@@ -627,6 +655,32 @@ pub fn list_standards(cwd: &Path) {
     }
 }
 
+/// What a standard applies to, in words: its declaration, or the default when it has none (F26).
+pub fn scope_text(s: &StandardDef) -> String {
+    let a = &s.applies_to;
+    let mut parts: Vec<String> = Vec::new();
+    if a.code {
+        parts.push("code files".into());
+    }
+    if !a.extensions.is_empty() {
+        parts.push(format!("extensions {}", a.extensions.join(", ")));
+    }
+    let languages: Vec<&str> = a.languages.iter().chain(&s.triggers.languages).map(String::as_str).collect();
+    if !languages.is_empty() {
+        parts.push(format!("languages {}", languages.join(", ")));
+    }
+    if !a.paths.is_empty() {
+        parts.push(format!("paths {}", a.paths.join(", ")));
+    }
+    if parts.is_empty() {
+        "code files (nothing declared)".into()
+    } else if s.scope_from_seed {
+        format!("{} (the shipped seed's; declare applies_to to change it)", parts.join("; "))
+    } else {
+        parts.join("; ")
+    }
+}
+
 pub fn get_standard(cwd: &Path, id: &str) {
     let standards = super::load_standards(cwd);
     match standards.iter().find(|s| s.id.eq_ignore_ascii_case(id)) {
@@ -634,6 +688,7 @@ pub fn get_standard(cwd: &Path, id: &str) {
             println!("Standard: {} — {}", s.id, s.title);
             println!("Severity: {}", s.severity);
             println!("Source: {}", s.source);
+            println!("Applies to: {}", scope_text(s));
             println!("Rule: {}", s.rule);
             println!("Failure: {}", s.failure);
             if !s.controls.is_empty() {
@@ -678,6 +733,15 @@ pub fn test_standard_match(config: &BaseConfig, cwd: &Path, file: &str, content:
         ctx.stack.unwrap_or("-"),
         ctx.classes.join(", "),
     );
+
+    let out_of_scope: Vec<&str> = standards
+        .iter()
+        .filter(|s| !super::matcher::in_scope(s, &ctx))
+        .map(|s| s.id.as_str())
+        .collect();
+    if !out_of_scope.is_empty() {
+        println!("Not about this kind of file (applies_to): {}", out_of_scope.join(", "));
+    }
 
     let mut scored: Vec<(&StandardDef, u32)> = standards
         .iter()

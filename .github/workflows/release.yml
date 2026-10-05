@@ -1,5 +1,14 @@
 name: Release
 
+# A tag push starts this, and the tag comes from `scripts/release.sh X.Y.Z --tag`.
+# main is protected, so the release commit reaches it through a PR: `--push` opens
+# that PR from release/vX.Y.Z, and `--tag` tags the PR's merge commit only once it
+# merged with every check green. Never tag by hand.
+#
+# Every job has timeout-minutes (30 for the build, 15 for the rest; the longest leg
+# of v0.15.2, the Windows build, took 6m16s), so a hang fails the job instead of
+# running for GitHub's six hours. `scripts/ci_guards.py timeouts` checks every
+# workflow file for it.
 on:
   push:
     tags:
@@ -14,6 +23,7 @@ jobs:
   # src/help_docs.rs holds the coach to the CLI; refuse to build if it fails.
   docs-gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -47,6 +57,7 @@ jobs:
             binary: base
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -98,6 +109,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -142,6 +154,7 @@ jobs:
   notify-docs:
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Dispatch to basemode-docs
         env:

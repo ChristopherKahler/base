@@ -119,7 +119,7 @@ fn prompt(root: &Path, cfg: &BaseConfig, text: &str, used: Option<u64>) -> usize
         std::fs::write(&path, format!("{line}\n")).unwrap();
         event["transcript_path"] = json!(path.display().to_string());
     }
-    user_prompt_submit::handle(cfg, root, &event).unwrap().rules_injected
+    user_prompt_submit::handle(cfg, root, &event, &mut String::new()).unwrap().rules_injected
 }
 
 /// The record's entries for one rule in this workspace, as (scope, tier). An empty scope is a topic or always rule.

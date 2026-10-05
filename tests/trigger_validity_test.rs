@@ -1,15 +1,15 @@
-//! F29 step 6 — trigger-data validity (fork `base-injection-scope`, G0 amendment). A path
-//! trigger that is unrooted, or a prefix of two or more registered projects' paths, is a
-//! broadcast: doctor names it per tier and counts it against health (a), `add-trigger`
-//! refuses it with the same sentence and writes nothing (b), and the matcher treats it as
-//! inert while devmode names it (c). Red on 0.14.0, where every one of these was accepted
-//! and fired.
+//! Trigger-data validity, as D1 (0.16.0, BO-10) has it. Until 0.16.0 a path trigger over two or more registered
+//! projects was a "broadcast": inert, and doctor advised narrowing it or setting `auto_inject = false` (F29 step 6).
+//! D1 rules out both. A trigger that holds registered projects other than its own project's children is BROAD: doctor
+//! names it per tier with the projects and counts it against health, with no `auto_inject` advice (a); `add-trigger`
+//! refuses it, naming them, and writes nothing (b); the matcher no longer treats it as inert, so devmode's `inert:`
+//! list carries only triggers that cannot fire at all (c).
 
 use std::path::Path;
 
 use base::config::NamespaceConfig;
 use base::crud;
-use base::domain::matcher::{inert_triggers, TriggerFault};
+use base::domain::matcher::{faulty_triggers, inert_triggers, TriggerFault};
 
 const GLOBAL_DOMAINS: &str = r#"
 [[domain]]
@@ -18,16 +18,22 @@ mode = "always"
 rules = ["Never lie"]
 
 [[domain]]
-name = "vintrix"
+name = "notes"
 mode = "triggered"
 paths = ["Documents"]
-rules = ["Twelve thousand a month and ten percent"]
+rules = ["The notes rule"]
 
 [[domain]]
-name = "meet-caddy"
+name = "drafts"
 mode = "triggered"
-paths = ["Documents/Meet Caddy"]
-rules = ["Never say a floor out loud"]
+paths = ["Documents/Studio/drafts"]
+rules = ["The drafts rule"]
+
+[[domain]]
+name = "globbed"
+mode = "triggered"
+paths = ["*.md"]
+rules = ["The glob rule"]
 "#;
 
 fn home() -> tempfile::TempDir {
@@ -53,17 +59,18 @@ fn register(root: &Path, name: &str, rel: &str) {
     crud::project::add(root, &ns(), name, "active", Some(&path)).unwrap();
 }
 
-/// Three projects under `Documents`, one of them under `Documents/Meet Caddy`.
+/// Three projects under `Documents`, one of them under `Documents/Studio`.
 fn register_three(root: &Path) {
-    register(root, "agentic-os", "Documents/agentic-os");
-    register(root, "first-client-kit", "Documents/first-client-kit");
-    register(root, "renda-group", "Documents/Meet Caddy/renda-group");
+    register(root, "alpha-app", "Documents/alpha-app");
+    register(root, "beta-app", "Documents/beta-app");
+    register(root, "studio", "Documents/Studio");
 }
 
-/// (a) doctor names the trigger, the domain and the projects it covers, per tier, and the
-/// verdict is UNHEALTHY; a home where every trigger covers at most one project is clean.
+/// (a) doctor names a broad trigger, the domain and the projects it holds, per tier, as advice: since BO-26 (lynx's G0
+/// ruling on Q2) a broad trigger fires and is not counted against the verdict; a trigger on a folder inside a project,
+/// holding none, is not named; no line advises `auto_inject = false`.
 #[test]
-fn doctor_names_a_trigger_that_covers_two_or_more_registered_projects() {
+fn doctor_names_a_trigger_that_holds_registered_projects() {
     let tmp = home();
     base::home::with_thread_home(tmp.path(), || {
         let root = tmp.path();
@@ -71,32 +78,36 @@ fn doctor_names_a_trigger_that_covers_two_or_more_registered_projects() {
         let report = base::doctor::diagnose(root);
         let human = base::doctor::format_human(&report);
         assert!(
-            human.contains("global tier: path trigger `Documents` on `vintrix` covers 3 registered projects ("),
+            human.contains(
+                "global tier: path trigger `Documents` on `notes` holds 3 registered projects (alpha-app, beta-app, studio): \
+                 a trigger must be one project's own folder or a file (base domain paths --suggest proposes one)"
+            ),
             "{human}"
         );
-        for name in ["agentic-os", "first-client-kit", "renda-group"] {
-            assert!(human.contains(name), "{human}");
-        }
-        assert!(human.contains("narrow it or set auto_inject = false"), "{human}");
-        assert!(!human.contains("on `meet-caddy`"), "one project under it, live: {human}");
-        assert!(!report.healthy, "an inert trigger is a fault, not an advisory");
+        assert!(!human.contains("path trigger `Documents/Studio/drafts`"), "a folder inside one project holds none: {human}");
+        assert!(!human.contains("auto_inject = false"), "D1: never the fix\n{human}");
+        // BO-26 replaced "a broad trigger is a fault, not an advisory": it is advice, and only a trigger that cannot fire
+        // is a fault (this home's unrooted `*.md` still is).
+        assert!(!report.trigger_faults.iter().any(|f| f.contains("`Documents`")), "{:?}", report.trigger_faults);
+        assert!(report.trigger_faults.iter().any(|f| f.contains("`*.md` on `globbed` is not a rooted path")), "{:?}", report.trigger_faults);
+        assert!(report.trigger_advice.iter().any(|a| a.contains("path trigger `Documents` on `notes` holds 3")), "{:?}", report.trigger_advice);
     });
 
     let tmp = home();
     base::home::with_thread_home(tmp.path(), || {
         let root = tmp.path();
-        register(root, "agentic-os", "Documents/agentic-os");
+        std::fs::write(root.join(".base-gbl").join("domains.toml"), "[[domain]]\nname = \"notes\"\npaths = [\"Documents\"]\n").unwrap();
+        register(root, "studio", "Documents/Studio");
         let report = base::doctor::diagnose(root);
         let human = base::doctor::format_human(&report);
-        assert!(!human.contains("path trigger"), "{human}");
-        assert!(report.healthy, "{human}");
+        assert!(human.contains("path trigger `Documents` on `notes` holds 1 registered project (studio)"), "one is enough: {human}");
     });
 }
 
-/// (b) `add-trigger --path` refuses a broadcast and an unrooted trigger with the sentence,
-/// and domains.toml is untouched; a trigger over one project is accepted.
+/// (b) `add-trigger --path` refuses a broad path and an unrooted one, and domains.toml is untouched; a folder
+/// inside a project is accepted and stored as its full path.
 #[test]
-fn add_trigger_refuses_an_inert_trigger_and_writes_nothing() {
+fn add_trigger_refuses_a_broad_trigger_and_writes_nothing() {
     let tmp = home();
     base::home::with_thread_home(tmp.path(), || {
         let root = tmp.path();
@@ -106,7 +117,7 @@ fn add_trigger_refuses_an_inert_trigger_and_writes_nothing() {
 
         let err = base::domain::add_trigger(root, false, "broad", None, Some("Documents")).unwrap_err();
         let text = format!("{err:#}");
-        assert!(text.starts_with("path trigger `Documents` on `broad` covers 3 registered projects ("), "{text}");
+        assert!(text.ends_with("contains 3 registered projects (alpha-app, beta-app, studio). A trigger must be one project's own folder or a file."), "{text}");
         assert!(err.downcast_ref::<base::domain::TriggerRefused>().is_some(), "typed, so project add can tell");
 
         let err = base::domain::add_trigger(root, false, "glob", None, Some("*.md")).unwrap_err();
@@ -118,16 +129,17 @@ fn add_trigger_refuses_an_inert_trigger_and_writes_nothing() {
         assert_eq!(std::fs::read_to_string(&toml_path).unwrap(), before, "nothing written on refusal");
         assert!(!base::domain::load_domains(root).iter().any(|d| d.name == "broad" || d.name == "glob"));
 
-        base::domain::add_trigger(root, false, "narrow", None, Some("Documents/Meet Caddy/renda-group")).unwrap();
+        base::domain::add_trigger(root, false, "narrow", None, Some("Documents/Studio/drafts")).unwrap();
         let narrow = base::domain::load_domains(root).into_iter().find(|d| d.name == "narrow").unwrap();
-        assert_eq!(narrow.paths, vec!["Documents/Meet Caddy/renda-group".to_string()]);
+        let full = crud::project::absolute_path(&root.join("Documents/Studio/drafts").display().to_string(), None, None).unwrap();
+        assert_eq!(narrow.paths, vec![full], "stored as its full path (P3)");
     });
 }
 
-/// (b) `project add` under a path that covers other registered projects registers the
-/// project, creates no domain, and does not fail.
+/// (b) `project add` under a path that holds other registered projects registers the project, creates no domain,
+/// and does not fail.
 #[test]
-fn project_add_under_a_broadcast_path_registers_the_project_and_no_domain() {
+fn project_add_under_a_broad_path_registers_the_project_and_no_domain() {
     let tmp = home();
     base::home::with_thread_home(tmp.path(), || {
         let root = tmp.path();
@@ -141,11 +153,10 @@ fn project_add_under_a_broadcast_path_registers_the_project_and_no_domain() {
     });
 }
 
-/// (c) the matcher's own account of inert triggers — the list the prompt hook prints one
-/// `inert:` line from in devmode, and doctor reads per tier — names the broadcast and the
-/// projects it covers, and nothing else.
+/// (c) the matcher's own account: the broad trigger is a fault doctor reads, with its projects, and NOT inert; the
+/// `inert:` list devmode prints holds only the trigger that cannot fire.
 #[test]
-fn the_inert_trigger_list_names_the_broadcast_and_its_projects() {
+fn a_broad_trigger_is_a_fault_and_only_an_unrooted_one_is_inert() {
     let tmp = home();
     base::home::with_thread_home(tmp.path(), || {
         let root = tmp.path();
@@ -153,16 +164,12 @@ fn the_inert_trigger_list_names_the_broadcast_and_its_projects() {
         let domains = base::domain::load_domains(root);
         let ctx = base::domain::trigger_context(root);
         let inert = inert_triggers(&domains, &ctx);
-        assert_eq!(inert.len(), 1, "{inert:?}");
-        let (domain, trigger, fault) = &inert[0];
-        assert_eq!((*domain, *trigger), ("vintrix", "Documents"));
-        match fault {
-            TriggerFault::Covers(names) => {
-                let mut names = names.clone();
-                names.sort();
-                assert_eq!(names, vec!["agentic-os", "first-client-kit", "renda-group"]);
-            }
-            other => panic!("expected Covers, got {other:?}"),
-        }
+        assert_eq!(inert.iter().map(|(d, t, _)| (*d, *t)).collect::<Vec<_>>(), vec![("globbed", "*.md")]);
+        let faults = faulty_triggers(&domains, &ctx);
+        let broad: Vec<_> = faults.iter().filter(|(_, _, f)| matches!(f, TriggerFault::Broad(_))).collect();
+        assert_eq!(broad.len(), 1, "{faults:?}");
+        let (domain, trigger, fault) = broad[0];
+        assert_eq!((*domain, *trigger), ("notes", "Documents"));
+        assert_eq!(fault, &TriggerFault::Broad(vec!["alpha-app".into(), "beta-app".into(), "studio".into()]));
     });
 }

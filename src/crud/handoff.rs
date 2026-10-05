@@ -6,6 +6,7 @@ use oxigraph::store::Store;
 
 use crate::config::NamespaceConfig;
 use crate::crud;
+use crate::crud::{all_tier_files, tier_label_of_file};
 
 /// Resolve the target graph file + graph IRI for a write.
 ///
@@ -22,53 +23,6 @@ fn write_tier(cwd: &Path, ns: &NamespaceConfig) -> Result<(PathBuf, String)> {
     )?;
     let ws_slug = crud::workspace_slug(cwd);
     Ok((base.join("graph.nq"), crud::workspace_graph_iri(ns, &ws_slug)))
-}
-
-/// Every existing graph file across tiers — used for tier-agnostic mutations
-/// (snooze/archive) so a handoff is updated wherever it lives.
-///
-/// Takes `gbl_root` rather than resolving the home directory itself. This
-/// function is why the fork exists: reaching for the home directory here meant
-/// every test that archived a fixture handoff rewrote the operator's real
-/// global graph. As a parameter the compiler will not let a caller — test or
-/// otherwise — forget to say which root it means.
-fn all_tier_files(gbl_root: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if let Some(home) = gbl_root {
-        let gbl = home.join(".base-gbl").join(".base").join("graph.nq");
-        if gbl.exists() {
-            files.push(gbl);
-        }
-    }
-    if let Some(base) = crate::config::find_workspace_base(cwd) {
-        let ws = base.join("graph.nq");
-        if ws.exists() {
-            files.push(ws);
-        }
-    }
-    // Dedupe by canonical path. Under `-g` the global tier IS the workspace, so
-    // both entries resolve to one file and the UPDATE ran twice on it — visible
-    // in production as two identical archive lines in changes.jsonl at the same
-    // second (global feed, 2026-09-07 15:07:48).
-    let mut seen: Vec<PathBuf> = Vec::new();
-    files.retain(|f| {
-        let key = f.canonicalize().unwrap_or_else(|_| f.clone());
-        if seen.contains(&key) {
-            false
-        } else {
-            seen.push(key);
-            true
-        }
-    });
-    files
-}
-
-/// Which tier `file` belongs to, for the operator-facing line.
-fn tier_label(file: &Path, gbl_root: Option<&Path>) -> &'static str {
-    match gbl_root {
-        Some(h) if file.starts_with(h.join(".base-gbl")) => "global tier",
-        _ => "workspace tier",
-    }
 }
 
 /// Does `file` hold this handoff/fork at all?
@@ -118,20 +72,6 @@ fn mutate_file_if_holds(
     })
 }
 
-/// Load one graph file, run a SPARQL UPDATE, write back atomically.
-fn mutate_file(path: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<()> {
-    let full = format!("{}\n{}", crud::prefixes(ns), sparql);
-    // Locked, load inside: four builders registering inside twelve seconds is
-    // how #71-#74 were filed, and every one of those writes reported success.
-    crate::store::locked_update(
-        path,
-        &full,
-        crate::store::Scope::Target,
-        crate::store::Intent::Knowledge,
-    )
-    .with_context(|| format!("handoff update failed: {full}"))
-}
-
 /// Derive a flow-doc slug from its doc path basename (no extension).
 /// `/abs/path/FORK-COMMAND-SPEC.md` → `FORK-COMMAND-SPEC`. Used VERBATIM (no
 /// slugify/lowercase) so the doc filename and the graph slug are the SAME string
@@ -169,53 +109,287 @@ pub struct CreateOutcome {
     pub slug: String,
     /// The tier this create wrote to: "workspace tier" or "global tier".
     pub tier: String,
+    /// The lane the new handoff was filed in, and where that name came from.
+    /// `None` when nothing named one: then it shares the lane of every other
+    /// handoff on the project that has none (BO-11, F18a).
+    pub lane: Option<Lane>,
     /// Every prior handoff this create archived, as (slug, tier), across every
     /// tier (`auk`'s Q2 ruling). Empty when the project had no prior open or
-    /// deferred continuity handoff anywhere.
+    /// deferred continuity handoff in this lane anywhere.
     pub archived: Vec<(String, String)>,
+    /// The project's open or deferred handoffs in other lanes, which this create
+    /// left alone, as (slug, lane). Before BO-11 the first of these to be found
+    /// was archived, in every tier, and nobody was told.
+    pub left_open: Vec<(String, Option<String>)>,
 }
 
-/// The prior continuity handoffs for `project` in one graph file: status `open`
-/// or `deferred` (E4), never a fork.
+/// A handoff's lane: the line of work it belongs to. A new handoff archives only
+/// the earlier open handoff on its project in the same lane (BO-11, F18a). Sessions
+/// `auk`, `plover`, `grebe` and `finch` all wrote handoffs for `base-0160`, and each
+/// new one archived another session's, in every tier, with no undo; so they stopped
+/// registering them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lane {
+    pub name: String,
+    pub from: LaneFrom,
+}
+
+/// Where a lane's name came from, in the order `create` looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneFrom {
+    /// `--lane <name>`: a lane several sessions hand back and forth.
+    Flag,
+    /// The doc's front matter `by:`.
+    DocBy,
+    /// The codename in a `<date>-<codename>-<project>` slug, the name the
+    /// `*handoff` flow gives every doc, matched against the relay's titles.
+    Slug,
+    /// The relay title of the session running the create.
+    RelayTitle,
+}
+
+impl LaneFrom {
+    pub fn describe(self) -> &'static str {
+        match self {
+            LaneFrom::Flag => "--lane",
+            LaneFrom::DocBy => "the doc's by: field",
+            LaneFrom::Slug => "the codename in the slug",
+            LaneFrom::RelayTitle => "this session's relay title",
+        }
+    }
+}
+
+/// What `create` needs from outside the graph to name a new handoff's lane. The
+/// CLI gathers it; [`create`] passes none of it, so a library caller gets the
+/// lane the doc's `by:` names, or none.
+#[derive(Debug, Default, Clone)]
+pub struct LaneInputs {
+    /// `--lane`.
+    pub flag: Option<String>,
+    /// The relay title of the session running the create.
+    pub relay_title: Option<String>,
+    /// Every relay title on this machine: what a codename in a slug is matched against.
+    pub titles: Vec<String>,
+}
+
+/// The `by:` field of the doc at `doc_path`, when it has front matter that names one.
+fn doc_by(doc_path: &str) -> Option<String> {
+    let text = std::fs::read_to_string(doc_path).ok()?;
+    crate::extract::frontmatter::parse_frontmatter(&text)?
+        .into_iter()
+        .find(|(key, _)| key == "by")
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// `slug` without its leading `YYYY-MM-DD-` and the `HHMM-` after it, if any. `None`
+/// when the slug does not start with a date.
+fn after_date(slug: &str) -> Option<&str> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = slug.splitn(4, '-');
+    let (y, m, d, rest) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if !(y.len() == 4 && m.len() == 2 && d.len() == 2 && digits(y) && digits(m) && digits(d)) {
+        return None;
+    }
+    match rest.split_once('-') {
+        Some((hhmm, after)) if hhmm.len() == 4 && digits(hhmm) => Some(after),
+        _ => Some(rest),
+    }
+}
+
+/// The codename a `<date>-<codename>-<project>` slug was written by: the longest
+/// relay title that the part after the date is, or starts with followed by `-`.
+/// Matched against real titles rather than cut at the first hyphen, because a
+/// codename can hold one (`otter-bo11` is not `otter`). `None` when the slug has no
+/// date or no title fits; a wrong guess here would archive another session's
+/// handoff, which is the bug this exists to stop.
+fn slug_codename(slug: &str, titles: &[String]) -> Option<String> {
+    let rest = after_date(slug)?.to_ascii_lowercase();
+    titles
+        .iter()
+        .map(|title| title.trim().to_ascii_lowercase())
+        .filter(|title| !title.is_empty())
+        .filter(|title| rest == *title || rest.starts_with(&format!("{title}-")))
+        .max_by_key(|title| title.len())
+}
+
+/// The new handoff's lane: `--lane`, else the doc's `by:`, else the codename in its
+/// slug, else the relay title of the session running the create.
+fn lane_of_new(inputs: &LaneInputs, doc_path: &str, slug: &str) -> Option<Lane> {
+    let named = |name: Option<String>, from: LaneFrom| {
+        name.map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .map(|name| Lane { name, from })
+    };
+    named(inputs.flag.clone(), LaneFrom::Flag)
+        .or_else(|| named(doc_by(doc_path), LaneFrom::DocBy))
+        .or_else(|| named(slug_codename(slug, &inputs.titles), LaneFrom::Slug))
+        .or_else(|| named(inputs.relay_title.clone(), LaneFrom::RelayTitle))
+}
+
+/// Two lanes are one lane when both are unnamed, or both carry the same name, case aside.
+fn same_lane(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
+}
+
+/// A prior continuity handoff on the project, with the lane it is in.
+struct Prior {
+    slug: String,
+    lane: Option<String>,
+}
+
+/// The prior continuity handoffs for `project` in one loaded graph: status `open`
+/// or `deferred` (E4), never a fork, each with its lane.
 ///
 /// Forks share the Handoff type and the project but are additive side-work, so
-/// they are excluded here exactly as they are in `create`'s archive step. A file
-/// that cannot be read is an error, never an empty answer: `create` prints "in any
-/// tier", and decides what an unreadable tier costs.
-fn prior_handoffs_in(file: &Path, ns: &NamespaceConfig, project: &str) -> Result<Vec<String>> {
-    let store = crate::store::load_or_empty(file)?;
+/// they are excluded here exactly as they are in `create`'s archive step. A lane
+/// is the one recorded on the handoff; a handoff written before lanes existed
+/// takes it from its doc's `by:`, then from the codename in its slug, and has
+/// none when neither names one.
+fn priors_in(store: &Store, ns: &NamespaceConfig, project: &str, titles: &[String]) -> Result<Vec<Prior>> {
     let p = &ns.prefix;
     let esc = crud::escape_sparql_literal(project);
     let q = format!(
-        "{}\nSELECT ?h WHERE {{ GRAPH ?g {{ ?h a {p}:Handoff ; {p}:project \"{esc}\" ; {p}:status ?s .\n\
+        "{}\nSELECT ?h ?lane ?doc WHERE {{ GRAPH ?g {{ ?h a {p}:Handoff ; {p}:project \"{esc}\" ; {p}:status ?s .\n\
            FILTER(?s IN (\"open\", \"deferred\"))\n\
            OPTIONAL {{ ?h {p}:kind ?kind }}\n\
-           FILTER(!BOUND(?kind) || ?kind != \"fork\") }} }}",
+           FILTER(!BOUND(?kind) || ?kind != \"fork\")\n\
+           OPTIONAL {{ ?h {p}:lane ?lane }}\n\
+           OPTIONAL {{ ?h {p}:handoffDoc ?doc }} }} }}",
         crud::prefixes(ns)
     );
-    let QueryResults::Solutions(solutions) = crate::store::query(&store, &q)? else {
+    let QueryResults::Solutions(solutions) = crate::store::query(store, &q)? else {
         return Ok(Vec::new());
     };
-    let mut out: Vec<String> = solutions
-        .filter_map(|sol| sol.ok())
-        .filter_map(|sol| sol.get("h").map(|term| crud::term_display(term.as_ref())))
-        .map(|iri| iri.rsplit('/').next().unwrap_or(&iri).to_string())
-        .collect();
-    out.sort();
-    out.dedup();
-    Ok(out)
+    // slug -> (recorded lane, doc), first value of each kept.
+    let mut rows: std::collections::BTreeMap<String, (Option<String>, Option<String>)> = Default::default();
+    for sol in solutions.filter_map(|sol| sol.ok()) {
+        let Some(h) = sol.get("h").map(|term| crud::term_display(term.as_ref())) else {
+            continue;
+        };
+        let slug = h.rsplit('/').next().unwrap_or(&h).to_string();
+        let get = |k: &str| sol.get(k).map(|t| crud::term_display(t.as_ref())).filter(|v| !v.trim().is_empty());
+        let row = rows.entry(slug).or_default();
+        if row.0.is_none() {
+            row.0 = get("lane");
+        }
+        if row.1.is_none() {
+            row.1 = get("doc");
+        }
+    }
+    Ok(rows
+        .into_iter()
+        .map(|(slug, (recorded, doc))| {
+            let lane = recorded
+                .or_else(|| doc.as_deref().and_then(doc_by))
+                .or_else(|| slug_codename(&slug, titles));
+            Prior { slug, lane }
+        })
+        .collect())
 }
 
-/// Register a handoff pointing at a resume document. Archives the project's prior
-/// open or deferred continuity handoff in every tier (one open handoff per
-/// project, E4), then inserts the new one with `resurfaceAt = now` so it surfaces
-/// next session start. Slug defaults to the doc basename (doc==slug protocol);
-/// pass `slug` to override. Re-registering the same slug re-points it
-/// idempotently (no duplicate triples).
+/// The UPDATE that archives exactly `slugs`, wherever in the file they are still
+/// open or deferred continuity handoffs of `project`. Empty when there is nothing
+/// to archive. The project and fork checks are the ones `priors_in` chose by, so a
+/// record at the same IRI in another named graph of the file (another workspace's,
+/// for another project, or a fork) is never caught by the IRI alone.
+fn archive_slugs_update(ns: &NamespaceConfig, slugs: &[String], project: &str) -> String {
+    if slugs.is_empty() {
+        return String::new();
+    }
+    let p = &ns.prefix;
+    let esc = crud::escape_sparql_literal(project);
+    let iris: Vec<String> = slugs
+        .iter()
+        .map(|slug| format!("<{}>", crud::build_iri(ns, "handoff", slug)))
+        .collect();
+    format!(
+        "DELETE {{ GRAPH ?g {{ ?h {p}:status ?s }} }}\n\
+         INSERT {{ GRAPH ?g {{ ?h {p}:status \"archived\" }} }}\n\
+         WHERE  {{ GRAPH ?g {{ ?h a {p}:Handoff ; {p}:project \"{esc}\" ; {p}:status ?s .\n\
+           FILTER(?s IN (\"open\", \"deferred\"))\n\
+           OPTIONAL {{ ?h {p}:kind ?kind }}\n\
+           FILTER(!BOUND(?kind) || ?kind != \"fork\")\n\
+           FILTER(?h IN ({})) }} }}",
+        iris.join(", ")
+    )
+}
+
+/// The three clock fields of a handoff or fork, as the lexical `xsd:dateTime` values a copy carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Dates {
+    created: String,
+    resurface: String,
+    last_active: String,
+}
+
+impl Dates {
+    fn now() -> Self {
+        let now = crud::now_iso();
+        Dates { created: now.clone(), resurface: now.clone(), last_active: now }
+    }
+}
+
+/// The dates of `slug`'s open or deferred copy in a tier other than `written`, when one holds it: the newest copy by
+/// `createdAt` when several do. A create of a slug that only another tier holds is a MOVE (BO-11's re-register path; the F22b sweep's
+/// moves), and a move keeps the record's dates (F22c): before BO-12 every moved record got `now` and jumped to the top
+/// of session start as if it were new.
 ///
-/// `cwd` picks the tier to write. `standing_cwd` is where the operator stands,
-/// and every tier is found from there: under `-g` the CLI routes `cwd` to the
-/// global tier, and discovery from it could never see the workspace (rank 08, R3).
+/// Reads only the lines whose subject is the record, so a create does not parse the global graph to learn three dates.
+/// A tier that cannot be read gives nothing here; the create's own archive step names it.
+fn dates_elsewhere(gbl_root: Option<&Path>, standing_cwd: &Path, written: &Path, ns: &NamespaceConfig, slug: &str) -> Option<Dates> {
+    let key = |f: &Path| f.canonicalize().unwrap_or_else(|_| f.to_path_buf());
+    let written = key(written);
+    let iri = crud::build_iri(ns, "handoff", slug);
+    let subject = format!("<{iri}> ");
+    let field = |store: &Store, local: &str| -> Option<String> {
+        let s = oxigraph::model::NamedNodeRef::new(&iri).ok()?;
+        let p = format!("{}{local}", ns.uri);
+        let p = oxigraph::model::NamedNodeRef::new(&p).ok()?;
+        store.quads_for_pattern(Some(s.into()), Some(p), None, None).filter_map(|q| q.ok()).find_map(|q| match q.object {
+            oxigraph::model::Term::Literal(l) => Some(l.value().to_string()),
+            _ => None,
+        })
+    };
+    let mut best: Option<Dates> = None;
+    for file in all_tier_files(gbl_root, standing_cwd) {
+        if key(&file) == written {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        let lines: String = text.lines().filter(|l| l.starts_with(&subject)).map(|l| format!("{l}\n")).collect();
+        if lines.is_empty() {
+            continue;
+        }
+        let store = Store::new().ok()?;
+        if store.load_from_reader(oxigraph::io::RdfFormat::NQuads, lines.as_bytes()).is_err() {
+            continue;
+        }
+        // Only a live copy is being moved. An archived one with the same name is an old record, and a new handoff that
+        // happens to reuse its doc name must not take its age and defer at once (code review, finding 4).
+        if !matches!(field(&store, "status").as_deref(), Some("open" | "deferred")) {
+            continue;
+        }
+        let Some(created) = field(&store, "createdAt") else { continue };
+        let found = Dates {
+            resurface: field(&store, "resurfaceAt").unwrap_or_else(|| created.clone()),
+            last_active: field(&store, "lastActive").unwrap_or_else(|| created.clone()),
+            created,
+        };
+        let at = |d: &Dates| chrono::DateTime::parse_from_rfc3339(&d.created).ok();
+        if best.as_ref().is_none_or(|b| at(&found) > at(b)) {
+            best = Some(found);
+        }
+    }
+    best
+}
+
+/// Register a handoff pointing at a resume document, with no lane input beyond
+/// the doc's own `by:` (see [`create_in_lane`]).
 pub fn create(
     gbl_root: Option<&Path>,
     cwd: &Path,
@@ -225,75 +399,136 @@ pub fn create(
     doc_path: &str,
     slug: Option<&str>,
 ) -> Result<CreateOutcome> {
-    let now = crud::now_iso();
+    create_in_lane(gbl_root, cwd, standing_cwd, ns, project, doc_path, slug, &LaneInputs::default())
+}
+
+/// Register a handoff pointing at a resume document. Archives the earlier open
+/// or deferred continuity handoff for the same project in the same lane, in every
+/// tier (one open handoff per project and lane: E4, narrowed by BO-11's F18a), then
+/// inserts the new one with `resurfaceAt = now` so it surfaces next session start.
+/// Other lanes' handoffs are left open and listed. Slug defaults to the doc
+/// basename (doc==slug protocol); pass `slug` to override. Re-registering the same
+/// slug re-points it idempotently (no duplicate triples).
+///
+/// `cwd` picks the tier to write. `standing_cwd` is where the operator stands,
+/// and every tier is found from there: under `-g` the CLI routes `cwd` to the
+/// global tier, and discovery from it could never see the workspace (rank 08, R3).
+#[allow(clippy::too_many_arguments)]
+pub fn create_in_lane(
+    gbl_root: Option<&Path>,
+    cwd: &Path,
+    standing_cwd: &Path,
+    ns: &NamespaceConfig,
+    project: &str,
+    doc_path: &str,
+    slug: Option<&str>,
+    inputs: &LaneInputs,
+) -> Result<CreateOutcome> {
     let slug = resolve_doc_slug(slug, doc_path)?;
     let iri = crud::build_iri(ns, "handoff", &slug);
     let (path, graph) = write_tier(cwd, ns)?;
     let p = &ns.prefix;
+    // F22c: a slug another tier holds and this one does not is being moved here, and keeps its dates. Read before the
+    // lock (three lines of another file); whether THIS tier holds it is decided inside the lock, below.
+    let carried = dates_elsewhere(gbl_root, standing_cwd, &path, ns, &slug);
+    let lane = lane_of_new(inputs, doc_path, &slug);
+    let lane_name = lane.as_ref().map(|l| l.name.as_str());
     // The project this handoff names, as the IRI its domain hangs off (kite F7b).
     let project_iri = crud::build_iri(ns, "project", &crud::slugify(project));
-    // `prior_handoffs_in` escapes the name itself. Handed the escaped copy, it
-    // searched for a different literal whenever the name held a quote or a backslash.
+    // `priors_in` escapes the name itself. Handed the escaped copy, it searched
+    // for a different literal whenever the name held a quote or a backslash.
     let project_name = project;
     let project = crud::escape_sparql_literal(project);
     let doc = crud::escape_sparql_literal(doc_path);
+    let lane_triple = lane_name
+        .map(|name| format!("             {p}:lane \"{}\" ;\n", crud::escape_sparql_literal(name)))
+        .unwrap_or_default();
 
-    // 1. Archive the project's prior open or deferred *continuity* handoff (E4), in
-    //    every tier that holds one. `GRAPH ?g`: a tier file can hold another
-    //    workspace's named graph, and the read that names what was archived
-    //    matches any graph too, so the list and the write agree. Forks
-    //    (kind = "fork") share the Handoff type + project but are additive
-    //    side-work — never archived, in any tier. In the tier being written the new
-    //    slug is left out, because step 2 re-points it there; in another tier it
-    //    is an older copy and is archived (`auk`'s ruling D1).
-    let archive_prior = |exclude: &str| {
-        format!(
-            "DELETE {{ GRAPH ?g {{ ?h {p}:status ?s }} }}\n\
-             INSERT {{ GRAPH ?g {{ ?h {p}:status \"archived\" }} }}\n\
-             WHERE  {{ GRAPH ?g {{ ?h a {p}:Handoff ; {p}:project \"{project}\" ; {p}:status ?s .\n\
-               FILTER(?s IN (\"open\", \"deferred\"))\n\
-               OPTIONAL {{ ?h {p}:kind ?kind }}\n\
-               FILTER(!BOUND(?kind) || ?kind != \"fork\"){exclude} }} }}"
-        )
-    };
-    let archive_prior_here = archive_prior(&format!("\n           FILTER(?h != <{iri}>)"));
-    let archive_prior_elsewhere = archive_prior("");
-
-    // 2. Clean any existing node at this exact slug so re-registration re-points
-    //    it instead of layering duplicate status/timestamp triples.
+    // Clean any existing node at this exact slug so re-registration re-points
+    // it instead of layering duplicate status/timestamp triples.
     let clean_target = format!(
         "DELETE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }}"
     );
 
-    // 3. Insert the new handoff.
-    let insert = format!(
-        "INSERT DATA {{ GRAPH <{graph}> {{\n\
-           <{iri}> rdf:type {p}:Handoff ;\n\
-             {p}:name \"{project}\" ;\n\
-             {p}:project \"{project}\" ;\n\
-             {p}:handoffDoc \"{doc}\" ;\n\
-             {p}:kind \"handoff\" ;\n\
-             {p}:status \"open\" ;\n\
-             {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
-             {p}:resurfaceAt \"{now}\"^^xsd:dateTime ;\n\
-             {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
-         }} }}"
-    );
+    // The new handoff, with `now` for its clock unless it is moving here from another tier (F22c).
+    let insert = |d: &Dates| {
+        format!(
+            "INSERT DATA {{ GRAPH <{graph}> {{\n\
+               <{iri}> rdf:type {p}:Handoff ;\n\
+                 {p}:name \"{project}\" ;\n\
+                 {p}:project \"{project}\" ;\n\
+                 {p}:handoffDoc \"{doc}\" ;\n\
+                 {p}:kind \"handoff\" ;\n\
+             {lane_triple}\
+                 {p}:status \"open\" ;\n\
+                 {p}:createdAt \"{}\"^^xsd:dateTime ;\n\
+                 {p}:resurfaceAt \"{}\"^^xsd:dateTime ;\n\
+                 {p}:lastActive \"{}\"^^xsd:dateTime .\n\
+             }} }}",
+            d.created, d.resurface, d.last_active
+        )
+    };
 
-    // 4. The handoff takes the domain of the project it names, in the same write.
+    // The handoff takes the domain of the project it names, in the same write.
     let inherit = crate::domain::link::inherit_update(ns, &graph, &iri, &project_iri);
 
-    // Ask before writing, in every tier: the archive step is a bulk UPDATE that
-    // leaves no trace of WHICH handoff it closed, so the names are read while they
-    // are still open or deferred. A re-register of the same slug is not a prior
-    // handoff in the tier it re-points. A tier being written that cannot be read
-    // is a plain error, and nothing is written.
-    let tier = tier_label(&path, gbl_root);
-    let mut archived: Vec<(String, String)> = prior_handoffs_in(&path, ns, project_name)?
-        .into_iter()
-        .filter(|prior| *prior != slug)
-        .map(|prior| (prior, tier.to_string()))
-        .collect();
+    // Archive the project's earlier open or deferred *continuity* handoffs in this
+    // lane (E4, F18a), in every tier that holds one. Which ones is decided from the
+    // graph loaded inside the same lock as the write, so the names printed are the
+    // names archived. Forks (kind = "fork") share the Handoff type and project but
+    // are additive side-work: never archived, in any tier. In the tier being
+    // written the new slug is left out, because the insert re-points it there; in
+    // another tier it is an older copy of this very handoff and is archived
+    // whatever lane it reads as (`auk`'s ruling D1).
+    let mut left_open: Vec<(String, Option<String>)> = Vec::new();
+    let mut split = |priors: Vec<Prior>, here: bool| -> Vec<String> {
+        let mut archive = Vec::new();
+        for prior in priors {
+            if prior.slug == slug {
+                if !here {
+                    archive.push(prior.slug);
+                }
+            } else if same_lane(prior.lane.as_deref(), lane_name) {
+                archive.push(prior.slug);
+            } else if !left_open.iter().any(|(s, _)| *s == prior.slug) {
+                left_open.push((prior.slug, prior.lane));
+            }
+        }
+        archive
+    };
+
+    // The tier being written goes first, in one write with the new node, so a
+    // failure in another tier leaves one extra open handoff and says so, never an
+    // archived handoff with nothing registered in its place. A tier being written
+    // that cannot be read is a plain error, and nothing is written.
+    let tier = tier_label_of_file(&path, gbl_root);
+    let archived_here = crate::store::with_graph_lock(&path, || {
+        let store = crate::store::load_or_empty(&path)?;
+        let archive = split(priors_in(&store, ns, project_name, &inputs.titles)?, true);
+        let archive_update = archive_slugs_update(ns, &archive, project_name);
+        // Held here already: a re-register re-points it, and surfaces it at the next session start as it always has.
+        let dates = match &carried {
+            Some(d) if !store_holds(&store, ns, &slug) => d.clone(),
+            _ => Dates::now(),
+        };
+        let insert = insert(&dates);
+        let statements: Vec<&str> = [archive_update.as_str(), &clean_target, &insert, &inherit]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        let full = format!("{}\n{}", crud::prefixes(ns), statements.join(";\n"));
+        crate::store::update_and_write(
+            &store,
+            &path,
+            &full,
+            crate::store::Scope::Target,
+            crate::store::Intent::Knowledge,
+        )
+        .with_context(|| format!("handoff update failed: {full}"))?;
+        Ok(archive)
+    })?;
+    let mut archived: Vec<(String, String)> =
+        archived_here.into_iter().map(|prior| (prior, tier.to_string())).collect();
     // What an error after the write says first: the handoff is registered, and
     // what it archived in its own tier, so no archive goes unmentioned (#71).
     let registered = if archived.is_empty() {
@@ -302,55 +537,66 @@ pub fn create(
         let names: Vec<String> = archived.iter().map(|(prior, t)| format!("{prior} ({t})")).collect();
         format!("registered '{slug}' in the {tier} and archived {}", names.join(", "))
     };
+
     // Every other tier, found from where the operator stands. Only a tier that
-    // holds a prior handoff is written: the global graph is shared by every live
-    // session. A tier that cannot be read must not stop the handoff being
-    // registered (`auk`'s ruling D5): it is skipped, and named after the write.
+    // holds a prior handoff in this lane is written: the global graph is shared by
+    // every live session. A tier that cannot be read must not stop the handoff
+    // being registered (`auk`'s ruling D5): it is skipped, and named at the end.
     let key = |f: &Path| f.canonicalize().unwrap_or_else(|_| f.to_path_buf());
     let written = key(&path);
-    let mut elsewhere: Vec<PathBuf> = Vec::new();
     let mut unreadable: Vec<String> = Vec::new();
     for file in all_tier_files(gbl_root, standing_cwd) {
         if key(&file) == written {
             continue;
         }
-        let label = tier_label(&file, gbl_root);
-        match prior_handoffs_in(&file, ns, project_name) {
-            Ok(priors) if priors.is_empty() => {}
-            Ok(priors) => {
-                archived.extend(priors.into_iter().map(|prior| (prior, label.to_string())));
-                elsewhere.push(file);
+        let label = tier_label_of_file(&file, gbl_root);
+        // Look without the lock first: most creates find nothing to archive in another tier, and the global graph's
+        // lock is shared by every live session.
+        let priors = match crate::store::load_or_empty(&file)
+            .and_then(|store| priors_in(&store, ns, project_name, &inputs.titles))
+        {
+            Ok(priors) => priors,
+            Err(e) => {
+                unreadable.push(format!(
+                    "could not read the {label} at {} to look for a prior handoff there: {e:#}",
+                    file.display()
+                ));
+                continue;
             }
-            Err(e) => unreadable.push(format!(
-                "could not read the {label} at {} to look for a prior handoff there: {e:#}",
-                file.display()
-            )),
+        };
+        if split(priors, false).is_empty() {
+            continue;
         }
-    }
-
-    // The tier being written goes first, in one write with the new node, so a
-    // failure in another tier leaves one extra open handoff and says so, never an
-    // archived handoff with nothing registered in its place.
-    mutate_file(
-        &path,
-        ns,
-        &format!("{archive_prior_here};\n{clean_target};\n{insert};\n{inherit}"),
-    )?;
-    for file in &elsewhere {
-        mutate_file(file, ns, &archive_prior_elsewhere).with_context(|| {
-            format!(
-                "{registered}, but archiving the prior handoff in the {} failed",
-                tier_label(file, gbl_root)
-            )
-        })?;
+        // Something to archive: decide again from the graph loaded inside the lock, so the names printed are the
+        // names archived.
+        let archive = crate::store::with_graph_lock(&file, || {
+            let store = crate::store::load_or_empty(&file)?;
+            let archive = split(priors_in(&store, ns, project_name, &inputs.titles)?, false);
+            if !archive.is_empty() {
+                let full = format!("{}\n{}", crud::prefixes(ns), archive_slugs_update(ns, &archive, project_name));
+                crate::store::update_and_write(
+                    &store,
+                    &file,
+                    &full,
+                    crate::store::Scope::Target,
+                    crate::store::Intent::Knowledge,
+                )?;
+            }
+            Ok(archive)
+        })
+        .with_context(|| format!("{registered}, but archiving the prior handoff in the {label} failed"))?;
+        archived.extend(archive.into_iter().map(|prior| (prior, label.to_string())));
     }
     if !unreadable.is_empty() {
         anyhow::bail!("{registered}, but {}", unreadable.join("; and "));
     }
+    left_open.retain(|(slug, _)| !archived.iter().any(|(a, _)| a == slug));
     Ok(CreateOutcome {
         slug,
         tier: tier.to_string(),
+        lane,
         archived,
+        left_open,
     })
 }
 
@@ -366,11 +612,25 @@ pub fn create_fork(
     doc_path: &str,
     slug: Option<&str>,
 ) -> Result<String> {
-    let now = crud::now_iso();
+    create_fork_in(None, cwd, cwd, ns, project, doc_path, slug)
+}
+
+/// [`create_fork`], looking in every tier found from `standing_cwd` for a copy of the slug: one that only another tier
+/// holds is being moved here and keeps its dates (F22c), the way [`create_in_lane`] does it for a handoff.
+pub fn create_fork_in(
+    gbl_root: Option<&Path>,
+    cwd: &Path,
+    standing_cwd: &Path,
+    ns: &NamespaceConfig,
+    project: &str,
+    doc_path: &str,
+    slug: Option<&str>,
+) -> Result<String> {
     let slug = resolve_doc_slug(slug, doc_path)?;
     let iri = crud::build_iri(ns, "handoff", &slug);
     let (path, graph) = write_tier(cwd, ns)?;
     let p = &ns.prefix;
+    let carried = dates_elsewhere(gbl_root, standing_cwd, &path, ns, &slug);
     // The project this handoff names, as the IRI its domain hangs off (kite F7b).
     let project_iri = crud::build_iri(ns, "project", &crud::slugify(project));
     let project = crud::escape_sparql_literal(project);
@@ -379,24 +639,45 @@ pub fn create_fork(
 
     // Additive: no archive-prior. A re-create of the same slug re-points it
     // (idempotent) by deleting any existing node at this IRI first.
-    let insert = format!(
-        "DELETE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }};\n\
-         INSERT DATA {{ GRAPH <{graph}> {{\n\
-           <{iri}> rdf:type {p}:Handoff ;\n\
-             {p}:name \"{name}\" ;\n\
-             {p}:project \"{project}\" ;\n\
-             {p}:handoffDoc \"{doc}\" ;\n\
-             {p}:kind \"fork\" ;\n\
-             {p}:status \"open\" ;\n\
-             {p}:createdAt \"{now}\"^^xsd:dateTime ;\n\
-             {p}:resurfaceAt \"{now}\"^^xsd:dateTime ;\n\
-             {p}:lastActive \"{now}\"^^xsd:dateTime .\n\
-         }} }}"
-    );
+    let insert = |d: &Dates| {
+        format!(
+            "DELETE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }} WHERE {{ GRAPH <{graph}> {{ <{iri}> ?dp ?do }} }};\n\
+             INSERT DATA {{ GRAPH <{graph}> {{\n\
+               <{iri}> rdf:type {p}:Handoff ;\n\
+                 {p}:name \"{name}\" ;\n\
+                 {p}:project \"{project}\" ;\n\
+                 {p}:handoffDoc \"{doc}\" ;\n\
+                 {p}:kind \"fork\" ;\n\
+                 {p}:status \"open\" ;\n\
+                 {p}:createdAt \"{}\"^^xsd:dateTime ;\n\
+                 {p}:resurfaceAt \"{}\"^^xsd:dateTime ;\n\
+                 {p}:lastActive \"{}\"^^xsd:dateTime .\n\
+             }} }}",
+            d.created, d.resurface, d.last_active
+        )
+    };
 
     // The fork takes the domain of the project it names, in the same write (kite F7b).
     let inherit = crate::domain::link::inherit_update(ns, &graph, &iri, &project_iri);
-    mutate_file(&path, ns, &format!("{insert};\n{inherit}"))?;
+    // Locked, load inside: four builders registering inside twelve seconds is how #71-#74 were filed, and every one of
+    // those writes reported success. Whether this tier already holds the slug decides the dates (F22c), so it is read
+    // from the graph the write replaces.
+    crate::store::with_graph_lock(&path, || {
+        let store = crate::store::load_or_empty(&path)?;
+        let dates = match &carried {
+            Some(d) if !store_holds(&store, ns, &slug) => d.clone(),
+            _ => Dates::now(),
+        };
+        let full = format!("{}\n{};\n{inherit}", crud::prefixes(ns), insert(&dates));
+        crate::store::update_and_write(
+            &store,
+            &path,
+            &full,
+            crate::store::Scope::Target,
+            crate::store::Intent::Knowledge,
+        )
+        .with_context(|| format!("handoff update failed: {full}"))
+    })?;
     Ok(slug)
 }
 
@@ -408,12 +689,13 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
     };
     let p = &ns.prefix;
     let sparql = format!(
-        "{pfx}\nSELECT ?h ?project ?status ?resurfaceAt WHERE {{\n\
+        "{pfx}\nSELECT ?h ?project ?status ?resurfaceAt ?lastActive WHERE {{\n\
            GRAPH ?g {{\n\
              ?h a {p}:Handoff ;\n\
                {p}:project ?project ;\n\
                {p}:status ?status .\n\
              OPTIONAL {{ ?h {p}:resurfaceAt ?resurfaceAt }}\n\
+             OPTIONAL {{ ?h {p}:lastActive ?lastActive }}\n\
              OPTIONAL {{ ?h {p}:kind ?kind }}\n\
              FILTER(!BOUND(?kind) || ?kind != \"fork\")\n\
            }}\n\
@@ -431,7 +713,7 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
                 };
                 let h = get("h");
                 let slug = h.rsplit('/').next().unwrap_or(&h).to_string();
-                vec![slug, get("project"), get("status"), get("resurfaceAt")]
+                vec![slug, get("project"), get("status"), get("resurfaceAt"), get("lastActive")]
             })
             .collect();
 
@@ -440,10 +722,10 @@ pub fn list(cwd: &Path, ns: &NamespaceConfig) -> Result<()> {
             return Ok(());
         }
 
-        println!("| slug | project | status | resurfaceAt |");
-        println!("|------|---------|--------|-------------|");
+        println!("| slug | project | status | resurfaceAt | lastActive |");
+        println!("|------|---------|--------|-------------|------------|");
         for row in &rows {
-            println!("| {} | {} | {} | {} |", row[0], row[1], row[2], row[3]);
+            println!("| {} | {} | {} | {} | {} |", row[0], row[1], row[2], row[3], row[4]);
         }
     }
     Ok(())
@@ -538,6 +820,134 @@ pub fn archive(
     apply_to_tiers(gbl_root, cwd, ns, slug, &sparql)
 }
 
+/// What `unarchive` found for the slug in one tier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unarchived {
+    /// "workspace tier" or "global tier".
+    pub tier: String,
+    /// The status the record had there before.
+    pub before: String,
+    pub outcome: UnarchiveOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnarchiveOutcome {
+    /// Archived, and now open again.
+    Reopened,
+    /// Archived, and left so: another tier holds the same slug open, or holds a newer copy. Two tiers can hold one
+    /// slug when it was registered in one and then the other, and `create` archives the older copy (ruling D1).
+    LeftArchived,
+    /// Not archived here (open, deferred), so there was nothing to undo.
+    NotArchived,
+}
+
+/// Undo an archive (BO-11, F18c): set an archived handoff or fork back to `open`,
+/// in the tier that holds it, and mark it active now so the defer pass does not park
+/// it again on the spot (the deferral fields an archived deferred handoff kept go
+/// too, as `deferred::revive_handoff` clears them). An empty vec means no tier holds
+/// the slug at all.
+///
+/// When two tiers hold the slug, only the newest copy (by `createdAt`, else the
+/// tier `cwd` writes to) is reopened, and nothing is while any tier holds it open:
+/// the other is the older copy `create` archived as a duplicate, and reopening it
+/// would make the handoff open twice, once in the global tier where every project
+/// sees it.
+///
+/// Until this existed an archive could not be undone, so a handoff archived by
+/// another session's create was lost for good (F18).
+pub fn unarchive(
+    gbl_root: Option<&Path>,
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    slug: &str,
+) -> Result<Vec<Unarchived>> {
+    let iri = crud::build_iri(ns, "handoff", slug);
+    let p = &ns.prefix;
+    let now = crud::now_iso();
+    let held_q = format!(
+        "{}\nSELECT ?s ?created WHERE {{ GRAPH ?g {{ <{iri}> a {p}:Handoff ; {p}:status ?s .\n\
+           OPTIONAL {{ <{iri}> {p}:createdAt ?created }} }} }}",
+        crud::prefixes(ns)
+    );
+    let reopen = format!(
+        "{}\nDELETE {{ GRAPH ?g {{ <{iri}> {p}:status \"archived\" . <{iri}> {p}:lastActive ?la .\n\
+                                <{iri}> {p}:deferredReason ?why . <{iri}> {p}:deferredAt ?at }} }}\n\
+         INSERT {{ GRAPH ?g {{ <{iri}> {p}:status \"open\" . <{iri}> {p}:lastActive \"{now}\"^^xsd:dateTime }} }}\n\
+         WHERE  {{ GRAPH ?g {{ <{iri}> a {p}:Handoff ; {p}:status \"archived\" }}\n\
+           OPTIONAL {{ GRAPH ?g {{ <{iri}> {p}:lastActive ?la }} }}\n\
+           OPTIONAL {{ GRAPH ?g {{ <{iri}> {p}:deferredReason ?why }} }}\n\
+           OPTIONAL {{ GRAPH ?g {{ <{iri}> {p}:deferredAt ?at }} }} }}",
+        crud::prefixes(ns)
+    );
+    // (statuses, newest createdAt) of the slug in one loaded graph; `None` when it does not hold it.
+    let held = |store: &Store| -> Result<Option<(Vec<String>, String)>> {
+        let QueryResults::Solutions(solutions) = crate::store::query(store, &held_q)? else {
+            return Ok(None);
+        };
+        let (mut statuses, mut created) = (Vec::new(), String::new());
+        for sol in solutions.filter_map(|sol| sol.ok()) {
+            if let Some(s) = sol.get("s").map(|t| crud::term_display(t.as_ref())) {
+                statuses.push(s);
+            }
+            if let Some(c) = sol.get("created").map(|t| crud::term_display(t.as_ref())) {
+                created = created.max(c);
+            }
+        }
+        statuses.sort();
+        statuses.dedup();
+        Ok((!statuses.is_empty()).then_some((statuses, created)))
+    };
+
+    // Read every tier first, without its lock; only the tier written is locked.
+    let target_tier = crate::config::find_workspace_base(cwd).map(|b| b.join("graph.nq"));
+    let mut seen: Vec<(PathBuf, String, Vec<String>, String)> = Vec::new();
+    for file in all_tier_files(gbl_root, cwd) {
+        let tier = tier_label_of_file(&file, gbl_root).to_string();
+        let store = crate::store::load_or_empty(&file)?;
+        if let Some((statuses, created)) = held(&store)? {
+            seen.push((file, tier, statuses, created));
+        }
+    }
+    // The newest copy: latest createdAt, a tie going to the tier `cwd` writes to.
+    let newest = seen
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            a.3.cmp(&b.3).then_with(|| (target_tier.as_ref() == Some(&a.0)).cmp(&(target_tier.as_ref() == Some(&b.0))))
+        })
+        .map(|(i, _)| i);
+    let open_somewhere = seen.iter().any(|(_, _, statuses, _)| statuses.iter().any(|s| s != "archived"));
+    let mut found = Vec::new();
+    for (i, (file, tier, statuses, _)) in seen.iter().enumerate() {
+        let archived = statuses.iter().any(|s| s == "archived");
+        let outcome = if !archived {
+            UnarchiveOutcome::NotArchived
+        } else if open_somewhere || Some(i) != newest {
+            UnarchiveOutcome::LeftArchived
+        } else {
+            // Decide again inside the lock, from the graph the write is made to.
+            let reopened = crate::store::with_graph_lock(file, || {
+                let store = crate::store::load_or_empty(file)?;
+                let still = held(&store)?.is_some_and(|(s, _)| s.iter().any(|s| s == "archived"));
+                if still {
+                    crate::store::update_and_write(
+                        &store,
+                        file,
+                        &reopen,
+                        crate::store::Scope::Target,
+                        crate::store::Intent::Knowledge,
+                    )
+                    .with_context(|| format!("unarchive failed in the {tier}: {reopen}"))?;
+                }
+                Ok(still)
+            })?;
+            if reopened { UnarchiveOutcome::Reopened } else { UnarchiveOutcome::NotArchived }
+        };
+        found.push(Unarchived { tier: tier.clone(), before: statuses.join(", "), outcome });
+    }
+    Ok(found)
+}
+
 /// Run `sparql` against every tier file that actually holds `slug`, and return
 /// the tier labels that changed.
 ///
@@ -545,7 +955,7 @@ pub fn archive(
 /// is the whole of #72's observable: 0.14.1 ran the UPDATE over each tier file
 /// and printed `archived` unconditionally, so a no-op and a real archive were
 /// indistinguishable from the outside.
-fn apply_to_tiers(
+pub(crate) fn apply_to_tiers(
     gbl_root: Option<&Path>,
     cwd: &Path,
     ns: &NamespaceConfig,
@@ -555,7 +965,7 @@ fn apply_to_tiers(
     let mut changed = Vec::new();
     for f in all_tier_files(gbl_root, cwd) {
         if mutate_file_if_holds(&f, ns, slug, sparql)? {
-            changed.push(tier_label(&f, gbl_root).to_string());
+            changed.push(tier_label_of_file(&f, gbl_root).to_string());
         }
     }
     Ok(changed)
@@ -565,6 +975,46 @@ fn apply_to_tiers(
 pub fn searched_tiers(gbl_root: Option<&Path>, cwd: &Path) -> Vec<String> {
     all_tier_files(gbl_root, cwd)
         .iter()
-        .map(|f| format!("{} ({})", f.display(), tier_label(f, gbl_root)))
+        .map(|f| format!("{} ({})", f.display(), tier_label_of_file(f, gbl_root)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn titles(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn after_date_drops_the_date_and_the_time_when_there_is_one() {
+        assert_eq!(after_date("2026-09-20-2100-auk-base-0160"), Some("auk-base-0160"));
+        assert_eq!(after_date("2026-09-21-plover-queries-toml"), Some("plover-queries-toml"));
+        assert_eq!(after_date("auk-base-0160"), None);
+        assert_eq!(after_date("2026-9-20-auk"), None);
+        assert_eq!(after_date("2026-09-20"), None);
+    }
+
+    #[test]
+    fn the_codename_in_a_slug_is_the_longest_title_that_fits() {
+        let known = titles(&["otter", "otter-bo11", "auk", "chris"]);
+        assert_eq!(slug_codename("2026-10-02-2300-otter-bo11-base-0160", &known).as_deref(), Some("otter-bo11"));
+        assert_eq!(slug_codename("2026-10-01-1200-otter-base-0160", &known).as_deref(), Some("otter"));
+        assert_eq!(slug_codename("2026-09-20-2100-AUK-base-0160", &known).as_deref(), Some("auk"));
+        assert_eq!(slug_codename("2026-09-20-2100-auk", &known).as_deref(), Some("auk"), "the whole rest");
+        // Not a title, not at the start, or no date: no lane, never a guess.
+        assert_eq!(slug_codename("2026-09-20-2100-grebe-base-0160", &known), None);
+        assert_eq!(slug_codename("2026-09-20-2100-base-auk-0160", &known), None);
+        assert_eq!(slug_codename("2026-09-20-2100-auklet-base", &known), None, "a title is a whole word");
+        assert_eq!(slug_codename("auk-base-0160", &known), None);
+    }
+
+    #[test]
+    fn lanes_match_by_name_case_aside_and_unnamed_only_with_unnamed() {
+        assert!(same_lane(Some("dealer-crawl"), Some("Dealer-Crawl")));
+        assert!(same_lane(None, None));
+        assert!(!same_lane(Some("auk"), None));
+        assert!(!same_lane(Some("auk"), Some("plover")));
+    }
 }

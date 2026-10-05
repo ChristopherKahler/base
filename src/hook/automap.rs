@@ -83,6 +83,14 @@ const CODE_EXTS: &[&str] = &[
     "bash", "zsh", "vue", "svelte", "astro", "r", "f90", "pas", "m", "mm", "v", "sv",
 ];
 
+/// Whether a file extension (no dot, any case) is one of the languages the code map covers. One list for every
+/// question of that kind: the AST hint's "is this a code search" (F20) and an unscoped standard's "is this a code
+/// file" (F26b) read it, as does [`has_code_files`]. Markdown and JSON are extracted too, but as documents, not code.
+pub fn is_code_ext(ext: &str) -> bool {
+    let ext = ext.trim_start_matches('.');
+    CODE_EXTS.iter().any(|c| c.eq_ignore_ascii_case(ext))
+}
+
 /// Folders directly under home that are a cloud drive's root, not a project.
 const CLOUD_ROOTS: &[&str] = &[
     "OneDrive", "Dropbox", "Google Drive", "GoogleDrive", "iCloud Drive", "iCloudDrive", "Nextcloud", "Box",
@@ -628,12 +636,8 @@ pub fn delegate_wsl_contact(paths: &[String]) {
         }
         let _ = std::fs::write(&marker, p.as_bytes());
         let script = wsl_script(p);
-        let _ = Command::new("wsl")
-            .args(["-e", "sh", "-lc", &script])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        // `detached::spawn` (BO-26, U7): not the tool hook's own pipes, or Claude Code waits for `wsl` to finish.
+        let _ = crate::detached::spawn(Command::new("wsl").args(["-e", "sh", "-lc", &script]));
     }
 }
 
@@ -816,12 +820,38 @@ fn fixture_components(root: &Path, home: &Path) -> Vec<String> {
     if let Ok(rest) = root.strip_prefix(home) {
         return lower_components(rest);
     }
-    if let (Ok(r), Ok(h)) = (std::fs::canonicalize(root), std::fs::canonicalize(home))
-        && let Ok(rest) = r.strip_prefix(&h)
-    {
+    if let Ok(rest) = canonical_through_existing(root).strip_prefix(canonical_through_existing(home)) {
         return lower_components(rest);
     }
     lower_components(root)
+}
+
+/// `p` canonicalised through its nearest existing ancestor, with the part that does not exist yet
+/// joined back on unchanged.
+///
+/// A path that does not exist cannot be canonicalised, and comparing it raw against a canonical
+/// ancestor fails whenever the existing part is spelled two ways: `%TEMP%` in 8.3 short form
+/// (`C:\Users\RUNNER~1\AppData\Local\Temp`, any Windows user name over eight characters) against
+/// its long spelling, or a symlinked directory against its target. Found by the first Windows CI
+/// run (BO-00, 2026-10-01): two automap sandbox tests failed on `windows-latest` and passed on a
+/// machine whose user name is five characters; the same two failed there with `TEMP` set to a
+/// short form, with the same values.
+fn canonical_through_existing(p: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(p) {
+        return real;
+    }
+    let mut existing = p.to_path_buf();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(name) = existing.file_name().map(|n| n.to_os_string()) {
+        if !existing.pop() {
+            break;
+        }
+        missing.push(name);
+        if let Ok(real) = std::fs::canonicalize(&existing) {
+            return missing.iter().rev().fold(real, |acc, n| acc.join(n));
+        }
+    }
+    p.to_path_buf()
 }
 
 /// `/mnt/c/Users/<name>` — a Windows home seen from a WSL hook, which its own
@@ -894,7 +924,7 @@ fn under_any(root: &Path, roots: &[(PathBuf, &'static str)]) -> Option<&'static 
 /// compared raw when it does not, since a candidate root need not exist yet.
 fn is_under(root: &Path, anc: &Path) -> bool {
     let norm = |p: &Path| {
-        let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let real = canonical_through_existing(p);
         let s = real.to_string_lossy().replace('\\', "/");
         // On Windows `canonicalize` answers in verbatim form (`\\?\C:\...`,
         // `\\?\UNC\host\share\...`) and a path that does not exist yet stays
@@ -1236,10 +1266,61 @@ fn spawn_sync(app_root: &Path, register: bool) {
     if !register {
         cmd.env("BASE_AST_SKIP_REGISTER", "1");
     }
-    let _ = cmd
-        .current_dir(app_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    // `detached::spawn` (BO-26, U7): on Windows the build would otherwise hold the hook's stdout open, and the hook's
+    // caller would wait for the whole build (measured: end of file at 1.9 s for a hook that exited at 0.05 s).
+    let _ = crate::detached::spawn(cmd.current_dir(app_root));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A path that does not exist yet, under an 8.3 short spelling of a directory that does, is under
+    /// that directory's long spelling, and the other way round. The control fails, rather than
+    /// passing for nothing, on a volume that gives no short names.
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_path_under_an_8_3_short_name_is_under_the_long_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = tmp.path().join("a-directory-name-longer-than-eight");
+        std::fs::create_dir_all(&long).unwrap();
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!(
+                "(New-Object -ComObject Scripting.FileSystemObject).GetFolder('{}').ShortPath",
+                long.display()
+            ))
+            .output()
+            .expect("powershell runs");
+        let short = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let tail = short.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        assert!(
+            tail.contains('~'),
+            "control: no 8.3 short form for {} (got {short:?}), so this cannot exercise the short spelling",
+            long.display()
+        );
+        let missing = short.join("not-yet").join("created");
+        assert!(!missing.exists(), "control: the path must not exist");
+        assert!(is_under(&missing, &long), "{missing:?} is not under {long:?}");
+        assert!(is_under(&long.join("not-yet"), &short), "the long spelling is not under the short one");
+        assert!(
+            !is_under(&missing, &long.with_file_name("a-directory-name-longer")),
+            "control: a name that is only a prefix is not an ancestor"
+        );
+    }
+
+    /// The same on Unix, where the second spelling of an existing directory is a symlink to it.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_path_under_a_symlinked_directory_is_under_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let missing = link.join("not-yet").join("created");
+        assert!(!missing.exists(), "control: the path must not exist");
+        assert!(is_under(&missing, &real), "{missing:?} is not under {real:?}");
+        assert!(!is_under(&missing, &tmp.path().join("re")), "control: a name that is only a prefix is not an ancestor");
+    }
 }

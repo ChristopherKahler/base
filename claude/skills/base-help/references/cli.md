@@ -10,27 +10,36 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base hook`
 - `base hooks`
 - `base hooks manifest`
+- `base hooks show`
+- `base log`
+- `base log matches`
+- `base log corrections`
 - `base ast` (alias: a)
 - `base ast query` (alias: q)
 - `base ast list` (alias: l)
 - `base ast ensure`
 - `base project` (alias: p)
 - `base project add` (alias: a)
+- `base project deferred`
 - `base project list` (alias: l)
 - `base project get`
 - `base project peer`
 - `base project repath`
 - `base project update` (alias: u)
+- `base project paths`
 - `base project move`
 - `base project delete`
+- `base project rename`
 - `base milestone` (alias: m)
 - `base milestone add` (alias: a)
+- `base milestone deferred`
 - `base milestone list` (alias: l)
 - `base milestone get`
 - `base milestone update` (alias: u)
 - `base milestone delete`
 - `base task` (alias: t)
 - `base task add` (alias: a)
+- `base task deferred`
 - `base task list` (alias: l)
 - `base task get`
 - `base task update` (alias: u)
@@ -40,6 +49,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base decision` (alias: d)
 - `base decision log`
 - `base decision search`
+- `base decision show`
 - `base decision delete`
 - `base decision update` (alias: u)
 - `base entity` (alias: e)
@@ -54,17 +64,26 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base reminder` (alias: r)
 - `base reminder add`
 - `base reminder list`
+- `base reminder snooze`
+- `base reminder archive`
+- `base reminder unarchive`
 - `base reminder remove`
 - `base handoff`
 - `base handoff create`
 - `base handoff list`
+- `base handoff show`
+- `base handoff deferred`
 - `base handoff snooze`
 - `base handoff archive`
+- `base handoff unarchive`
 - `base fork`
 - `base fork create`
 - `base fork list`
+- `base fork show`
+- `base fork deferred`
 - `base fork snooze`
 - `base fork archive`
+- `base fork unarchive`
 - `base sync`
 - `base domain`
 - `base domain add-trigger`
@@ -74,6 +93,7 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base domain create`
 - `base domain remove`
 - `base domain remove-trigger`
+- `base domain paths`
 - `base standards` (alias: std)
 - `base standards sync`
 - `base standards list`
@@ -95,11 +115,26 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base relay done`
 - `base relay tasks`
 - `base relay sessions`
+- `base relay arm`
 - `base learn`
 - `base recall`
 - `base changes`
+- `base tune`
+- `base shadow`
+- `base shadow start`
+- `base shadow stop`
+- `base shadow report`
+- `base shadow promote`
+- `base shadow rollback`
 - `base rule`
 - `base rule add`
+- `base rule propose`
+- `base rule replay`
+- `base rule review`
+- `base rule unretire`
+- `base rule update`
+- `base rule test`
+- `base rule stats`
 - `base rule list`
 - `base rule remove`
 - `base install`
@@ -109,6 +144,8 @@ Use it for exact syntax. `commands.md` groups the same surface by what is safe t
 - `base uninstall`
 - `base dashboard` (alias: dash)
 - `base scaffold`
+- `base defer`
+- `base defer migrate`
 - `base reconcile`
 - `base workspace`
 - `base workspace sync`
@@ -166,6 +203,7 @@ Usage: base [COMMAND]
 Commands:
   hook             Handle Claude Code hook events (session-start, post-tool-use, user-prompt-submit)
   hooks            Publish base's hook wiring for an external installer (JSON)
+  log              Read base's own logs: `base log matches` shows what prompts and file touches matched
   ast              Query AST codebase graph (entities, calls, imports) [aliases: a]
   project          Manage projects [aliases: p]
   milestone        Manage milestones (epics within a project) [aliases: m]
@@ -183,6 +221,8 @@ Commands:
   learn            Graph-backed structured memory
   recall           Search notes by keyword, domain, or slug
   changes          Read the graph change log — every successful graph write, as JSON
+  tune             The rule pass: read the sessions since the last pass and write rule proposals for base rule review (keyword gap, rewrite, new rule, drop keyword, merge, split, retire). Nothing is applied. Uses headless Claude on Haiku
+  shadow           Shadow mode: run a candidate matcher beside the live one on every prompt and file touch, judge it by the corrections that follow, and promote it or roll it back. Nothing runs until a shadow is started
   rule             Manage rules in the graph (add, list, remove)
   install          Install base globally: build, symlink, create ~/.base-gbl, wire hooks, write manifest
   getting-started  What to read once base is installed: workspaces, relay, star commands, CARL
@@ -191,6 +231,7 @@ Commands:
   uninstall        Uninstall base: remove hooks from settings.json, remove binary, remove CLAUDE.md section
   dashboard        Launch the Command Center Dashboard (local web UI) [aliases: dash]
   scaffold         Scaffold a new workspace: create .base/, write configs, register globally
+  defer            Deferral upgrade migration (rank 09): preview, apply, or roll back
   reconcile        Reconcile project active/deferred state from real folder last-touch
   workspace        Registered-workspace registry (sync CLAUDE.md from base.toml)
   operator         Operator identity profile (init, show)
@@ -242,6 +283,7 @@ Usage: base hooks <COMMAND>
 
 Commands:
   manifest  Print the hook command table as JSON, for an installer outside base
+  show      Print one block of this session's last prompt-hook output, exactly as the hook built it. A block the [budget] dropped names this command on its pointer line. With no block, list the last prompt's blocks
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -257,6 +299,89 @@ Print the hook command table as JSON, for an installer outside base
 Usage: base hooks manifest
 
 Options:
+  -h, --help
+          Print help
+```
+
+## base hooks show
+
+```text
+Print one block of this session's last prompt-hook output, exactly as the hook built it. A block the [budget] dropped names this command on its pointer line. With no block, list the last prompt's blocks
+
+Usage: base hooks show [OPTIONS] [BLOCK]
+
+Arguments:
+  [BLOCK]
+          The block's name, as the pointer line gives it (e.g. global-context, relay-wake)
+
+Options:
+      --session <SESSION>
+          Session id override (defaults to CLAUDE_CODE_SESSION_ID)
+
+  -h, --help
+          Print help
+```
+
+## base log
+
+```text
+Read base's own logs: `base log matches` shows what prompts and file touches matched
+
+Usage: base log <COMMAND>
+
+Commands:
+  matches      What each prompt and file touch matched, by what, and what was served and cut: the last rows of .base/match-log.jsonl, oldest first
+  corrections  What base noticed as possible corrections: a session's signal rows, or a transcript read turn by turn as the hooks read it
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base log matches
+
+```text
+What each prompt and file touch matched, by what, and what was served and cut: the last rows of .base/match-log.jsonl, oldest first
+
+Usage: base log matches [OPTIONS]
+
+Options:
+      --last <LAST>
+          How many rows
+          
+          [default: 20]
+
+      --session <SESSION>
+          Only this session's rows (an id, or the start of one)
+
+      --rule <RULE>
+          Only rows that served or cut this rule or decision (its id, or the start of one, as --json shows it)
+
+      --json
+          Print the rows as JSON, one per line
+
+  -h, --help
+          Print help
+```
+
+## base log corrections
+
+```text
+What base noticed as possible corrections: a session's signal rows, or a transcript read turn by turn as the hooks read it
+
+Usage: base log corrections [OPTIONS]
+
+Options:
+      --session <SESSION>
+          This session's rows (an id, or the start of one); the default is the session running the command
+
+      --transcript <TRANSCRIPT>
+          Read this transcript turn by turn instead of the logged rows
+
+      --json
+          Print JSON, one object per line
+
   -h, --help
           Print help
 ```
@@ -348,15 +473,18 @@ Manage projects
 Usage: base project <COMMAND>
 
 Commands:
-  add     Add a new project [aliases: a]
-  list    List projects (defaults to the current workspace; cross-awareness via flags) [aliases: l]
-  get     Show a specific project (accepts slug or display name)
-  peer    Make a project also surface in another workspace (additive peerWorkspace edge)
-  repath  Re-point a project's folder path (graph + domain trigger) after it moves
-  update  Update a project (accepts slug or display name) [aliases: u]
-  move    Re-home a project to another workspace graph (node + tasks + domain + decisions/rules/notes). AST regenerates at the destination. PREVIEW unless --yes
-  delete  Delete a project. Refuses a non-empty project unless --force (which cascade- deletes tasks/milestones/decisions/rules). PREVIEW unless --yes
-  help    Print this message or the help of the given subcommand(s)
+  add       Add a new project [aliases: a]
+  deferred  List deferred projects: open but paused, not listed at session start
+  list      List projects (defaults to the current workspace; cross-awareness via flags) [aliases: l]
+  get       Show a specific project (accepts slug or display name)
+  peer      Make a project also surface in another workspace (additive peerWorkspace edge)
+  repath    Re-point a project's folder path (graph + domain trigger) after it moves
+  update    Update a project (accepts slug or display name) [aliases: u]
+  paths     Find each project's real folder: --suggest proposes one, with the evidence, for every project whose folder is missing, not a folder, too broad or contradicted by its own docs; --apply writes a reviewed list
+  move      Re-home a project to another workspace graph (node + tasks + domain + decisions/rules/notes). AST regenerates at the destination. PREVIEW unless --yes
+  delete    Delete a project. Refuses a non-empty project unless --force (which cascade- deletes tasks/milestones/decisions/rules). PREVIEW unless --yes
+  rename    Rename a project and its same-named domain in every tier (records, rules, decisions, tasks, domains.toml). The old name stays an alias: commands that name it still reach the project. PREVIEW unless --yes
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -378,11 +506,31 @@ Options:
           [default: active]
 
   -p, --path <PATH>
-          Project path (workspace-relative). If omitted and [protocol] is enabled, the folder is derived from the protocol stage and auto-created
+          Project folder: absolute, or relative to the workspace root; stored absolute. If omitted and [protocol] is enabled, the folder is derived from the protocol stage and auto-created
 
       --stage <STAGE>
           Protocol lifecycle stage the project starts in (default: first stage)
 
+      --parent <PARENT>
+          The project this one sits inside (a registered project's slug)
+
+      --nested <NESTED>
+          true: work in this project also carries its parent's rules (default false)
+          
+          [possible values: true, false]
+
+  -h, --help
+          Print help
+```
+
+## base project deferred
+
+```text
+List deferred projects: open but paused, not listed at session start
+
+Usage: base project deferred
+
+Options:
   -h, --help
           Print help
 ```
@@ -490,7 +638,45 @@ Options:
           
 
       --next-action <NEXT_ACTION>
+          The project's next step; records when it was written
+
+      --path <PATH>
+          The project's folder: absolute, or relative to the workspace root; stored absolute. Its domain's path trigger moves with it
+
+      --parent <PARENT>
+          The project this one sits inside (a registered project's slug); `none` removes the link
+
+      --nested <NESTED>
+          true: work in this project also carries its parent's rules; false: it does not (the default)
           
+          [possible values: true, false]
+
+  -h, --help
+          Print help
+```
+
+## base project paths
+
+```text
+Find each project's real folder: --suggest proposes one, with the evidence, for every project whose folder is missing, not a folder, too broad or contradicted by its own docs; --apply writes a reviewed list
+
+Usage: base project paths [OPTIONS] <--suggest|--apply <APPLY>>
+
+Options:
+      --suggest
+          List the suggestions (writes nothing)
+
+      --out <OUT>
+          With --suggest: also write them as a list to review and pass to --apply
+
+      --apply <APPLY>
+          Set each project in a reviewed list (`slug = "folder"` lines) to its folder
+
+      --dry-run
+          With --apply: say what would change and write nothing
+
+      --json
+          Emit JSON instead of a table
 
   -h, --help
           Print help
@@ -546,6 +732,28 @@ Options:
           Print help
 ```
 
+## base project rename
+
+```text
+Rename a project and its same-named domain in every tier (records, rules, decisions, tasks, domains.toml). The old name stays an alias: commands that name it still reach the project. PREVIEW unless --yes
+
+Usage: base project rename [OPTIONS] <OLD> <NEW>
+
+Arguments:
+  <OLD>
+          The project's slug or display name now
+
+  <NEW>
+          The new name: lowercase letters, digits and dashes
+
+Options:
+      --yes
+          Apply the rename (without it, prints the plan and writes nothing)
+
+  -h, --help
+          Print help
+```
+
 ## base milestone
 
 ```text
@@ -554,12 +762,13 @@ Manage milestones (epics within a project)
 Usage: base milestone <COMMAND>
 
 Commands:
-  add     Add a milestone to a project [aliases: a]
-  list    List milestones (optionally filtered by project) [aliases: l]
-  get     Show a specific milestone
-  update  Update a milestone [aliases: u]
-  delete  Delete a milestone. Tasks are DETACHED to project-level by default; --force cascade-deletes them. PREVIEW unless --yes
-  help    Print this message or the help of the given subcommand(s)
+  add       Add a milestone to a project [aliases: a]
+  deferred  List deferred milestones: open but paused, not listed at session start
+  list      List milestones (optionally filtered by project) [aliases: l]
+  get       Show a specific milestone
+  update    Update a milestone [aliases: u]
+  delete    Delete a milestone. Tasks are DETACHED to project-level by default; --force cascade-deletes them. PREVIEW unless --yes
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -583,6 +792,18 @@ Options:
   -d, --description <DESCRIPTION>
           
 
+  -h, --help
+          Print help
+```
+
+## base milestone deferred
+
+```text
+List deferred milestones: open but paused, not listed at session start
+
+Usage: base milestone deferred
+
+Options:
   -h, --help
           Print help
 ```
@@ -676,14 +897,15 @@ Manage tasks
 Usage: base task <COMMAND>
 
 Commands:
-  add     Add a task to a project (optionally under a milestone) [aliases: a]
-  list    List tasks (filter by project, milestone, or label) [aliases: l]
-  get     Show a specific task (all fields; accepts slug or display name)
-  update  Update a task's mutable fields (accepts slug or display name) [aliases: u]
-  delete  Delete a task node + its edges. PREVIEW unless --yes
-  done    Mark a task as completed
-  tag     Attach/detach free-form labels on a task (the dashboard's tagging facet)
-  help    Print this message or the help of the given subcommand(s)
+  add       Add a task to a project (optionally under a milestone) [aliases: a]
+  deferred  List deferred tasks: open but paused, not listed at session start
+  list      List tasks (filter by project, milestone, or label) [aliases: l]
+  get       Show a specific task (all fields; accepts slug or display name)
+  update    Update a task's mutable fields (accepts slug or display name) [aliases: u]
+  delete    Delete a task node + its edges. PREVIEW unless --yes
+  done      Mark a task as completed
+  tag       Attach/detach free-form labels on a task (the dashboard's tagging facet)
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -710,6 +932,18 @@ Options:
   -m, --milestone <MILESTONE>
           Milestone slug to group this task under
 
+  -h, --help
+          Print help
+```
+
+## base task deferred
+
+```text
+List deferred tasks: open but paused, not listed at session start
+
+Usage: base task deferred
+
+Options:
   -h, --help
           Print help
 ```
@@ -866,6 +1100,7 @@ Usage: base decision [OPTIONS] <COMMAND>
 Commands:
   log     Log a new decision
   search  Search decisions by keyword
+  show    Show one decision by its {domain}.{decision} slug
   delete  Delete decisions matching a keyword
   update  Update a decision in place, addressed by its stable {domain}.{decision} slug [aliases: u]
   help    Print this message or the help of the given subcommand(s)
@@ -923,6 +1158,25 @@ Options:
           Print help
 ```
 
+## base decision show
+
+```text
+Show one decision by its {domain}.{decision} slug
+
+Usage: base decision show [OPTIONS] <SLUG>
+
+Arguments:
+  <SLUG>
+          Decision slug ({domain}.{decision})
+
+Options:
+      --json
+          Emit JSON instead of the human field list
+
+  -h, --help
+          Print help
+```
+
 ## base decision delete
 
 ```text
@@ -961,6 +1215,9 @@ Options:
 
   -s, --status <STATUS>
           
+
+      --keywords <KEYWORDS>
+          Comma-separated words or phrases that replace the decision's keywords ("" clears them). A decision of an always-on domain such as GLOBAL reaches a prompt only when the prompt contains one of them; with none it is shown at session start only
 
   -h, --help
           Print help
@@ -1139,10 +1396,13 @@ Manage reminders
 Usage: base reminder <COMMAND>
 
 Commands:
-  add     Add a reminder (provide one of --in, --at, or --due)
-  list    List all reminders
-  remove  Remove a reminder (hard delete)
-  help    Print this message or the help of the given subcommand(s)
+  add        Add a reminder (provide one of --in, --at, or --due)
+  list       List reminders
+  snooze     Move a reminder's surface time forward from now: 30s, 3m, 2h, 1d
+  archive    Archive a reminder: it stops surfacing and is kept. `remove` deletes
+  unarchive  Bring an archived reminder back: it surfaces from its own time, or from now if that has passed
+  remove     Remove a reminder (hard delete)
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -1176,9 +1436,63 @@ Options:
 ## base reminder list
 
 ```text
-List all reminders
+List reminders
 
-Usage: base reminder list
+Usage: base reminder list [OPTIONS]
+
+Options:
+      --archived
+          List archived reminders instead of the live ones
+
+  -h, --help
+          Print help
+```
+
+## base reminder snooze
+
+```text
+Move a reminder's surface time forward from now: 30s, 3m, 2h, 1d
+
+Usage: base reminder snooze <SLUG> <DURATION>
+
+Arguments:
+  <SLUG>
+          The reminder's slug, or its number in the last session start's DUE NOW
+
+  <DURATION>
+          
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base reminder archive
+
+```text
+Archive a reminder: it stops surfacing and is kept. `remove` deletes
+
+Usage: base reminder archive <SLUG>
+
+Arguments:
+  <SLUG>
+          The reminder's slug, or its number in the last session start's DUE NOW
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base reminder unarchive
+
+```text
+Bring an archived reminder back: it surfaces from its own time, or from now if that has passed
+
+Usage: base reminder unarchive <SLUG>
+
+Arguments:
+  <SLUG>
+          The reminder's slug (`base reminder list --archived` prints it)
 
 Options:
   -h, --help
@@ -1209,11 +1523,14 @@ Manage session handoffs (resume docs surfaced at session start)
 Usage: base handoff [OPTIONS] <COMMAND>
 
 Commands:
-  create   Register a handoff doc (archives the project's prior open or deferred handoff in every tier)
-  list     List handoffs across global + workspace tiers
-  snooze   Snooze a handoff for N days (hide until then)
-  archive  Archive a handoff (stop resurfacing)
-  help     Print this message or the help of the given subcommand(s)
+  create     Register a handoff doc (archives the earlier open or deferred handoff in the same project and lane, in every tier; other lanes' handoffs stay open)
+  list       List handoffs across global + workspace tiers
+  show       Find one open or deferred handoff and print its doc path. Takes a letter from the last session start (A-J), a key from `base handoff deferred` (D1, D2, ...), a slug, a project name, or a few words. A deferred match comes back to open, the only write it makes. Several matches are listed and none is picked (exit 2); no match exits 1
+  deferred   List deferred handoffs: open but paused, so session start does not list them. Each line carries a key (D1, D2, ...) that `base handoff show` takes, and the command that brings it back
+  snooze     Snooze a handoff for N days (hide until then)
+  archive    Archive a handoff (stop resurfacing; `unarchive` undoes it)
+  unarchive  Undo an archive: set an archived handoff back to open, in the tier that holds it
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -g, --global
@@ -1226,7 +1543,7 @@ Options:
 ## base handoff create
 
 ```text
-Register a handoff doc (archives the project's prior open or deferred handoff in every tier)
+Register a handoff doc (archives the earlier open or deferred handoff in the same project and lane, in every tier; other lanes' handoffs stay open)
 
 Usage: base handoff create [OPTIONS] --project <PROJECT> --doc <DOC>
 
@@ -1240,6 +1557,9 @@ Options:
       --slug <SLUG>
           Graph slug / title to summon it by (default: doc basename)
 
+      --lane <LANE>
+          The lane this handoff continues, for a lane several sessions hand back and forth. Default: the author's codename (the doc's by:, else the codename in a <date>-<codename>-<project> slug, else this session's relay title)
+
   -h, --help
           Print help
 ```
@@ -1250,6 +1570,34 @@ Options:
 List handoffs across global + workspace tiers
 
 Usage: base handoff list
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base handoff show
+
+```text
+Find one open or deferred handoff and print its doc path. Takes a letter from the last session start (A-J), a key from `base handoff deferred` (D1, D2, ...), a slug, a project name, or a few words. A deferred match comes back to open, the only write it makes. Several matches are listed and none is picked (exit 2); no match exits 1
+
+Usage: base handoff show <QUERY>...
+
+Arguments:
+  <QUERY>...
+          A letter, a slug, a project name, or loose words
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base handoff deferred
+
+```text
+List deferred handoffs: open but paused, so session start does not list them. Each line carries a key (D1, D2, ...) that `base handoff show` takes, and the command that brings it back
+
+Usage: base handoff deferred
 
 Options:
   -h, --help
@@ -1278,9 +1626,25 @@ Options:
 ## base handoff archive
 
 ```text
-Archive a handoff (stop resurfacing)
+Archive a handoff (stop resurfacing; `unarchive` undoes it)
 
 Usage: base handoff archive <SLUG>
+
+Arguments:
+  <SLUG>
+          
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base handoff unarchive
+
+```text
+Undo an archive: set an archived handoff back to open, in the tier that holds it
+
+Usage: base handoff unarchive <SLUG>
 
 Arguments:
   <SLUG>
@@ -1299,11 +1663,14 @@ Manage parallel side-work forks (build-specs surfaced at session start)
 Usage: base fork [OPTIONS] <COMMAND>
 
 Commands:
-  create   Register a fork build-spec (additive — does not archive sibling forks)
-  list     List forks across global + workspace tiers
-  snooze   Snooze a fork for N days (hide until then)
-  archive  Archive a fork (stop resurfacing)
-  help     Print this message or the help of the given subcommand(s)
+  create     Register a fork build-spec (additive — does not archive sibling forks)
+  list       List forks across global + workspace tiers
+  show       Find one fork by its title, project or a few words and print its doc path. A deferred fork it finds comes back to open. Several matches are listed and none is picked (exit 2); no match exits 1
+  deferred   List deferred forks: open but paused. Each line carries a key `base fork show` takes
+  snooze     Snooze a fork for N days (hide until then)
+  archive    Archive a fork (stop resurfacing; `unarchive` undoes it)
+  unarchive  Undo an archive: set an archived fork back to open, in the tier that holds it
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -g, --global
@@ -1346,6 +1713,34 @@ Options:
           Print help
 ```
 
+## base fork show
+
+```text
+Find one fork by its title, project or a few words and print its doc path. A deferred fork it finds comes back to open. Several matches are listed and none is picked (exit 2); no match exits 1
+
+Usage: base fork show <QUERY>...
+
+Arguments:
+  <QUERY>...
+          A key from `base fork deferred`, a title, a project name, or loose words
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base fork deferred
+
+```text
+List deferred forks: open but paused. Each line carries a key `base fork show` takes
+
+Usage: base fork deferred
+
+Options:
+  -h, --help
+          Print help
+```
+
 ## base fork snooze
 
 ```text
@@ -1368,9 +1763,25 @@ Options:
 ## base fork archive
 
 ```text
-Archive a fork (stop resurfacing)
+Archive a fork (stop resurfacing; `unarchive` undoes it)
 
 Usage: base fork archive <SLUG>
+
+Arguments:
+  <SLUG>
+          
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base fork unarchive
+
+```text
+Undo an archive: set an archived fork back to open, in the tier that holds it
+
+Usage: base fork unarchive <SLUG>
 
 Arguments:
   <SLUG>
@@ -1423,6 +1834,7 @@ Commands:
   create          Create a new domain in domains.toml
   remove          Remove a domain from domains.toml
   remove-trigger  Remove a keyword or path trigger from a domain
+  paths           Make every path trigger an exact path, in both tiers: --suggest proposes one per domain (a project's domain gets its project's folder; relative triggers are written out), --apply writes a reviewed list
   help            Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1592,6 +2004,38 @@ Options:
           Print help (see a summary with '-h')
 ```
 
+## base domain paths
+
+```text
+Make every path trigger an exact path, in both tiers: --suggest proposes one per domain (a project's domain gets its project's folder; relative triggers are written out), --apply writes a reviewed list
+
+Usage: base domain paths [OPTIONS] <--suggest|--apply <APPLY>>
+
+Options:
+      --global
+          Act on the global tier (~/.base-gbl) instead of the workspace you are in.
+          
+          Without it the write commands resolve the workspace, as `add-trigger` alone always did. Before #18 the other three ignored where you stood.
+
+      --suggest
+          List the proposals (writes nothing)
+
+      --out <OUT>
+          With --suggest: also write them as a list to review and pass to --apply
+
+      --apply <APPLY>
+          Set each listed domain's paths (and auto_inject) from a reviewed list
+
+      --dry-run
+          With --apply: say what would change and write nothing
+
+      --json
+          Emit JSON instead of text
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
 ## base standards
 
 ```text
@@ -1692,10 +2136,11 @@ Commands:
   export    Export the spool as inbox.nq (read-only graph snapshot)
   dispose   End-of-milestone teardown — the store is disposable by design
   task      Relay a briefed task to a live titled session. It auto-fires in that session's hooks (loud) until picked up — cross-workspace via the global tier
-  ping      Instant message to a live titled session — no doc, no done-ceremony. Screams in the receiver's hooks mid-turn; their reply ping clears it
+  ping      Instant message to a live titled session — no doc, no done-ceremony. Shown in the receiver's next prompt, or at once by its inbox watcher; their reply ping clears it
   done      Mark a relayed task done — clears the inbox alert and closes the graph mirror
-  tasks     List inbound relay tasks across all live sessions
+  tasks     List inbound relay tasks and pings across all live sessions, each with its message
   sessions  List titled sessions in the global registry (liveness for `*task` targets)
+  arm       Print what to start this session's inbox watcher with: the Monitor tool's fields, the re-arm step, the status line
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1785,6 +2230,12 @@ Options:
 
       --peek
           Peek without consuming
+
+      --all
+          Include messages already seen (the hooks hide a sender's older messages behind its newest one)
+
+      --from <FROM>
+          Only messages from this sender
 
       --project <PROJECT>
           
@@ -1952,7 +2403,7 @@ Options:
 ## base relay ping
 
 ```text
-Instant message to a live titled session — no doc, no done-ceremony. Screams in the receiver's hooks mid-turn; their reply ping clears it
+Instant message to a live titled session — no doc, no done-ceremony. Shown in the receiver's next prompt, or at once by its inbox watcher; their reply ping clears it
 
 Usage: base relay ping [OPTIONS] --to <TO> --msg <MSG>
 
@@ -1992,11 +2443,14 @@ Options:
 ## base relay tasks
 
 ```text
-List inbound relay tasks across all live sessions
+List inbound relay tasks and pings across all live sessions, each with its message
 
-Usage: base relay tasks
+Usage: base relay tasks [OPTIONS]
 
 Options:
+      --from <FROM>
+          Only items from this sender
+
   -h, --help
           Print help
 ```
@@ -2009,6 +2463,21 @@ List titled sessions in the global registry (liveness for `*task` targets)
 Usage: base relay sessions
 
 Options:
+  -h, --help
+          Print help
+```
+
+## base relay arm
+
+```text
+Print what to start this session's inbox watcher with: the Monitor tool's fields, the re-arm step, the status line
+
+Usage: base relay arm [OPTIONS]
+
+Options:
+      --as <TITLE>
+          The title to watch (defaults to every title this session holds)
+
   -h, --help
           Print help
 ```
@@ -2110,6 +2579,145 @@ Options:
           Print help (see a summary with '-h')
 ```
 
+## base tune
+
+```text
+The rule pass: read the sessions since the last pass and write rule proposals for base rule review (keyword gap, rewrite, new rule, drop keyword, merge, split, retire). Nothing is applied. Uses headless Claude on Haiku
+
+Usage: base tune [OPTIONS]
+
+Options:
+      --dry-run
+          Show what it would read and how many Haiku calls it would make; call nothing, write nothing
+
+      --session <SESSION>
+          Read this session instead of the ones due (repeatable)
+
+      --transcript <TRANSCRIPT>
+          Read this transcript as a session instead of the ones due (repeatable)
+
+      --store
+          Run the store check (merge, split, drop keyword, retire) even when it ran in the last day
+
+      --max-calls <MAX_CALLS>
+          Haiku calls this pass makes at most; sessions past it wait for the next pass
+          
+          [default: 10]
+
+  -h, --help
+          Print help
+```
+
+## base shadow
+
+```text
+Shadow mode: run a candidate matcher beside the live one on every prompt and file touch, judge it by the corrections that follow, and promote it or roll it back. Nothing runs until a shadow is started
+
+Usage: base shadow <COMMAND>
+
+Commands:
+  start     Start a candidate beside live: a matcher (--matcher, with any of the admission settings) or pending proposals (--from-proposals). One at a time; live is snapshotted as it is
+  stop      End the running candidate without promoting it; live is unchanged and its rows stay
+  report    The candidate against live since it started: events, where they differ, wins, losses, and whether it can be promoted. Read only
+  promote   Make the candidate live now, whatever the report says; or name an earlier version to make it live again
+  rollback  Undo the last promotion: the version live had before it is restored
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base shadow start
+
+```text
+Start a candidate beside live: a matcher (--matcher, with any of the admission settings) or pending proposals (--from-proposals). One at a time; live is snapshotted as it is
+
+Usage: base shadow start [OPTIONS]
+
+Options:
+      --matcher <MATCHER>
+          The candidate's matcher: bm25, or keyword-only ([match] bm25 = false)
+          
+          [possible values: bm25, keyword-only]
+
+      --min-score <MIN_SCORE>
+          The candidate's [match] min_score: a rule no keyword brought is served at this BM25 score
+
+      --prompt-idf
+          The candidate weighs each term of a score admission down by how common it is in your last 1,000 typed prompts ([match] prompt_idf)
+
+      --min-terms <MIN_TERMS>
+          The candidate admits a rule on its score only when it shares this many distinct terms with the prompt, or one two-word term ([match] min_terms)
+
+      --relative <RELATIVE>
+          The candidate admits a rule on its score only at or over this share of the prompt's best rule score, 0.5 for half ([match] relative)
+
+      --from-proposals <FROM_PROPOSALS>
+          Pending proposals to run as the candidate, comma-separated: p-0001,p-0002
+
+  -h, --help
+          Print help
+```
+
+## base shadow stop
+
+```text
+End the running candidate without promoting it; live is unchanged and its rows stay
+
+Usage: base shadow stop
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base shadow report
+
+```text
+The candidate against live since it started: events, where they differ, wins, losses, and whether it can be promoted. Read only
+
+Usage: base shadow report [OPTIONS]
+
+Options:
+      --json
+          Emit JSON, every added and dropped rule listed
+
+  -h, --help
+          Print help
+```
+
+## base shadow promote
+
+```text
+Make the candidate live now, whatever the report says; or name an earlier version to make it live again
+
+Usage: base shadow promote [OPTIONS] [VERSION]
+
+Arguments:
+  [VERSION]
+          A version base shadow report or session start named (keyword-0002, bm25-0003)
+
+Options:
+      --broad-ok
+          Apply a proposal its replay flags TOO BROAD (show the user the replay first)
+
+  -h, --help
+          Print help
+```
+
+## base shadow rollback
+
+```text
+Undo the last promotion: the version live had before it is restored
+
+Usage: base shadow rollback
+
+Options:
+  -h, --help
+          Print help
+```
+
 ## base rule
 
 ```text
@@ -2118,10 +2726,17 @@ Manage rules in the graph (add, list, remove)
 Usage: base rule [OPTIONS] <COMMAND>
 
 Commands:
-  add     Add a rule to a domain in the graph
-  list    List rules for a domain from the graph
-  remove  Remove a rule by index from a domain
-  help    Print this message or the help of the given subcommand(s)
+  add       Add a rule to a domain in the graph
+  propose   Turn a correction into a pending rule proposal: read the turn (the prompt, the AI's marker, the signals) and sort it as a keyword gap, a rewrite or a new rule
+  replay    Run a rule change over your recent prompts in the match log before it is approved: the prompts that would start or stop serving it, and its share of all of them (TOO BROAD above [tune] broad_share)
+  review    Review the pending rule proposals, each with the prompts behind it and its replay: one key each on a terminal (a approve, e edit, r reject, s skip, q stop), or one of the flags
+  unretire  Serve a retired rule again: clear the retirement an approved retire proposal made
+  update    Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
+  test      Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
+  stats     Each rule's numbers from the match log: times served in the last [doctor] dead_days days and in all, times a correction followed in the same or the next turn, and the day it was last served. Read only
+  list      List rules for a domain from the graph
+  remove    Remove a rule by index from a domain
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -g, --global
@@ -2164,6 +2779,9 @@ Options:
       --place <PLACE>
           A folder, or a file the rule names (repeatable). Makes it a place rule
 
+      --path <PATH>
+          A file or folder the rule is scoped to (repeatable): stored as its full path, the rule fires only when that file or something under that folder is touched. For a project's domain it lies inside the project
+
       --tool <TOOL>
           A tool name, MCP tools included (repeatable). Makes it an action rule
 
@@ -2172,6 +2790,242 @@ Options:
 
       --words <WORDS>
           Topic words and phrases, comma-separated: "ping chris, relay ping". Makes it a topic rule
+
+      --keywords <KEYWORDS>
+          Words from the user's prompt that should bring this rule back, comma-separated: the rule's own topic words, as --words. Required with --fires-on inside a Claude Code session (CLAUDECODE=1). A rule with words of its own is served on them, and on the paths it names with --path, never through its domain's keywords or folder: for a rule about file work, give --path as well
+
+      --fires-on <FIRES_ON>
+          A prompt that must serve this rule (repeatable, at most 3); `base rule test` checks it
+
+      --quiet-on <QUIET_ON>
+          A prompt that must not serve this rule (repeatable, at most 2); `base rule test` checks it
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule propose
+
+```text
+Turn a correction into a pending rule proposal: read the turn (the prompt, the AI's marker, the signals) and sort it as a keyword gap, a rewrite or a new rule
+
+Usage: base rule propose [OPTIONS]
+
+Options:
+      --from-turn
+          Read the correction from this session's turn: its last prompt typed by a person, and the reply after it
+
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+      --text <TEXT>
+          The rule's wording: required for a new rule, the new wording for a rewrite
+
+      --keywords <KEYWORDS>
+          Words from the prompt that should bring the rule back, comma-separated (suggested from the prompt when left out)
+
+      --example <EXAMPLE>
+          The prompt the change must serve on, its first fires_on test (default: the turn's prompt)
+
+      --rule <RULE>
+          The rule the correction is about, as `base rule list` prints it: <domain>.<id>
+
+      --decision <DECISION>
+          The decision the correction is about: its slug
+
+      --new
+          No rule or decision base holds fits: propose a new rule
+
+      --domain <DOMAIN>
+          The domain a new rule goes into (default: one the prompt matched, else the closest record's)
+
+      --dry-run
+          Print the proposal and write nothing
+
+      --transcript <TRANSCRIPT>
+          Read this transcript instead of this session's
+
+      --prompt <PROMPT>
+          The n-th prompt typed by a person in the transcript, instead of the last
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule replay
+
+```text
+Run a rule change over your recent prompts in the match log before it is approved: the prompts that would start or stop serving it, and its share of all of them (TOO BROAD above [tune] broad_share)
+
+Usage: base rule replay [OPTIONS] [PROPOSAL]
+
+Arguments:
+  [PROPOSAL]
+          A proposal's id, p-0007
+
+Options:
+      --domain <DOMAIN>
+          Change this domain's prompt keywords
+
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+      --rule <RULE>
+          Change this rule's own topic words: <domain>.<id>, as `base rule list` prints it
+
+      --decision <DECISION>
+          Change this decision's own keywords: its slug
+
+      --add-keyword <ADD_KEYWORD>
+          A keyword to add (repeatable, or a comma list)
+
+      --drop-keyword <DROP_KEYWORD>
+          A keyword to drop (repeatable, or a comma list)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule review
+
+```text
+Review the pending rule proposals, each with the prompts behind it and its replay: one key each on a terminal (a approve, e edit, r reject, s skip, q stop), or one of the flags
+
+Usage: base rule review [OPTIONS]
+
+Options:
+      --approve <APPROVE>
+          Apply this proposal and mark it approved
+
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+      --reject <REJECT>
+          Mark this proposal rejected: the same change is never proposed again
+
+      --reason <REASON>
+          With --reject: why
+
+      --edit <EDIT>
+          Apply this proposal with your changes (--text, --keywords) and mark it edited
+
+      --text <TEXT>
+          With --edit: the new wording
+
+      --keywords <KEYWORDS>
+          With --edit: the keywords, comma-separated, replacing the proposed ones
+
+      --broad-ok
+          With --approve or --edit: apply a change its replay flags TOO BROAD (show the user the replay first)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule unretire
+
+```text
+Serve a retired rule again: clear the retirement an approved retire proposal made
+
+Usage: base rule unretire [OPTIONS] <RULE>
+
+Arguments:
+  <RULE>
+          The rule, as `base rule list --include-superseded` prints it: <domain>.<id>
+
+Options:
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule update
+
+```text
+Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
+
+Usage: base rule update [OPTIONS] <RULE>
+
+Arguments:
+  <RULE>
+          The rule, as `base rule list` prints it: <domain>.<id> (the id, or its first 4 or more characters)
+
+Options:
+      --fires-on <FIRES_ON>
+          A prompt that must serve this rule (repeatable; a rule holds at most 3)
+
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+      --quiet-on <QUIET_ON>
+          A prompt that must not serve this rule (repeatable; a rule holds at most 2)
+
+      --clear-tests
+          Empty both test lists first, then add what is given
+
+      --protected
+          Mark the rule protected: a shadow candidate that loses it is never promoted automatically
+
+      --unprotected
+          Clear the protected mark
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule test
+
+```text
+Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
+
+Usage: base rule test [OPTIONS]
+
+Options:
+      --domain <DOMAIN>
+          Only this domain's rules
+
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+      --rule <RULE>
+          Only this rule: <domain>.<id> or <id>
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## base rule stats
+
+```text
+Each rule's numbers from the match log: times served in the last [doctor] dead_days days and in all, times a correction followed in the same or the next turn, and the day it was last served. Read only
+
+Usage: base rule stats [OPTIONS]
+
+Options:
+      --domain <DOMAIN>
+          Only this domain's rules
+
+  -g, --global
+          Target the global tier (~/.base-gbl/) instead of workspace.
+          
+          `global = true` so it works before OR after the subcommand. Without it the flag sat on the group alone, which is the workaround #55 had to document: `base rule --global remove ...`.
+
+      --json
+          Emit JSON instead of the table
 
   -h, --help
           Print help (see a summary with '-h')
@@ -2246,6 +3100,12 @@ Options:
       --no-starter-commands
           Skip the starter star commands without asking
 
+      --corrections-line
+          Add the line that asks the AI to start a corrected reply with CORRECTED: to ~/.claude/CLAUDE.md, without asking
+
+      --no-corrections-line
+          Leave CLAUDE.md without that line, without asking; session start carries it instead
+
   -h, --help
           Print help
 ```
@@ -2266,11 +3126,12 @@ Working in a workspace
 
 Running more than one session
 
-  Relay is on. Every session gets a codename and a wake contract, and all of it
-  stays in ~/.base-gbl/.base/relay-inbox/ on this machine.
+  Relay is on. Every session gets a codename; base relay arm prints the inbox
+  watcher that lets a ping wake it. All of it stays in
+  ~/.base-gbl/.base/relay-inbox/ on this machine.
 
   base config set relay.enabled false      turn it off
-  base config set relay.wake_nudge false   keep pings, drop the arming block
+  base config set relay.wake_nudge false   keep pings, drop the watcher reminder
 
 Star commands
 
@@ -2373,6 +3234,48 @@ Arguments:
 Options:
   -h, --help
           Print help
+```
+
+## base defer
+
+```text
+Deferral upgrade migration (rank 09): preview, apply, or roll back
+
+Usage: base defer <COMMAND>
+
+Commands:
+  migrate  Reset the activity clock on records that would otherwise defer on upgrade
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help
+```
+
+## base defer migrate
+
+```text
+Reset the activity clock on records that would otherwise defer on upgrade.
+
+With no flag this PREVIEWS and writes nothing. That is D1, and it survives K13: Part G holds two migrations and the rule migration next door already writes nothing until the operator approves (G4 step 3). K13 changed what this migration does, not whether it asks.
+
+Usage: base defer migrate [OPTIONS]
+
+Options:
+      --apply
+          Perform the reset. Without this nothing is written
+
+      --rollback
+          Restore every tier this migration wrote, from the snapshot taken before it wrote
+
+      --limit <LIMIT>
+          Stage it: touch at most N records
+
+      --older-than <OLDER_THAN>
+          Stage it: only records at least D days cold
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## base reconcile
@@ -2656,13 +3559,16 @@ Options:
 ```text
 Show details for a specific star command
 
-Usage: base commands show <NAME>
+Usage: base commands show [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
           Command name (case-insensitive, without *)
 
 Options:
+      --shipped
+          Show the command as this version of base ships it in the starter pack, not your own copy
+
   -h, --help
           Print help
 ```
@@ -2860,7 +3766,16 @@ Options:
           Self-heal: quarantine malformed lines and atomically rewrite the good set (backs up first)
 
       --restore [<RESTORE>]
-          Restore the workspace graph from a backup snapshot. Bare `--restore` lists snapshots
+          Put back a backup base made: a graph snapshot (`graph.nq.bak-*`) in a tier's .base, or a `<name>.toml.BAK-<date>-pre-<version>` an upgrade left beside a config file. A bare name is a workspace snapshot. Bare `--restore` lists the workspace's snapshots. Anything else is refused
+
+      --fix
+          Plan the repair of what doctor reports and change nothing: records of another workspace moved out, corrections linked to the one record they name (the rest stay corrections), supersession disagreements settled, `[signal] max_chars` migrated, each tier compacted and its backups cut to `[graph] keep_backups`. `--fix --yes` applies the plan, snapshotting each graph first
+
+      --yes
+          With `--fix`: apply the plan
+
+      --measure
+          Measure how much hook text the running Claude Code delivers to the model (session start, prompt submit, pre-tool) with headless `claude -p` calls on a cheap model, then write each hook's budget and `measured_on` to ~/.base-gbl/base.toml. Up to 12 calls per hook
 
   -h, --help
           Print help
@@ -2939,7 +3854,10 @@ Usage: base graph migrate [OPTIONS]
 
 Options:
       --dry-run
-          Show what would be linked, and by which source, without writing
+          Show what would be linked, and by which source, and the store repair `base doctor --fix` plans, without writing
+
+      --yes
+          Also apply the store repair (the one `base doctor --fix --yes` applies). Without it the repair is planned and printed, and only the domain links are written
 
   -h, --help
           Print help (see a summary with '-h')

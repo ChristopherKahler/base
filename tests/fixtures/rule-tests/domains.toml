@@ -1,0 +1,69 @@
+# The rule set CI runs `base rule test` against (K2e, BO-14): scripts/rule-test-fixture.sh in the `test` job, and
+# tests/rule_test_test.rs on both platforms. Every rule carries prompts that must serve it and prompts that must not,
+# chosen so each part of prompt matching has a case that fails if it breaks. A matcher change that breaks matching
+# fails the build. Synthetic: this repository is public.
+
+# Always-on: served on every prompt, whatever it says.
+[[domain]]
+name = "always-on"
+mode = "always"
+
+[[domain.rules]]
+text = "Answer first, then the reasoning."
+fires_on = ["what reminders do i need", "deploy the site"]
+
+# Keywords match as whole words, in any case: `base` is quiet on `database`.
+[[domain]]
+name = "base"
+prompt_keywords = ["base"]
+
+[[domain.rules]]
+text = "Read the code path end to end before the first edit."
+fires_on = ["update the base config", "Update the BASE config"]
+quiet_on = ["migrate the database tonight"]
+
+# A keyword of several words matches only as that phrase; a keyword with a hyphen matches as written.
+[[domain]]
+name = "hooks"
+prompt_keywords = ["user prompt submit", "pre-tool"]
+
+[[domain.rules]]
+text = "Measure hook output on a copy of the store, never the live one."
+fires_on = ["the user prompt submit hook is cut off", "how is the pre-tool hint doing"]
+quiet_on = ["submit the form for the user"]
+
+# An exclude vetoes the domain even when a keyword matched.
+[[domain]]
+name = "deploy"
+prompt_keywords = ["deploy"]
+exclude = ["dry run"]
+
+[[domain.rules]]
+text = "Deploy from main only, after CI is green."
+fires_on = ["deploy the site"]
+quiet_on = ["deploy as a dry run only"]
+
+# auto_inject = false keeps a domain out of every prompt, keyword or not.
+[[domain]]
+name = "archive"
+prompt_keywords = ["archive"]
+auto_inject = false
+
+[[domain.rules]]
+text = "Archive, never delete."
+quiet_on = ["archive the old notes"]
+
+# A rule with matchers of its own is served on its own score, never through its domain's keywords: the domain keyword
+# alone scores 0.5, under the 0.75 minimum, and its own phrase scores 1.0.
+[[domain]]
+name = "relay"
+prompt_keywords = ["relay"]
+
+[[domain.rules]]
+text = "Pings to the operator use line breaks."
+fires_on = ["ping chris when the build is done"]
+quiet_on = ["check the relay board"]
+
+  [[domain.rules.match]]
+  kind = "topic"
+  words = ["ping chris"]

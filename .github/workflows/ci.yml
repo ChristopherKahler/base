@@ -3,6 +3,21 @@ name: CI
 # Every pull request and every push to main runs the full test suite, which
 # includes the base-help coach gate (src/help_docs.rs). Until this existed,
 # nothing ran before a merge; the release workflow was the first test.
+#
+# The guards (BO-00, 2026-10-01). Each closes a way a false green reached a
+# report in the 0.16.0 round; scripts/ci_guards.py holds them and their selftest:
+#   - Windows runs the suite and strict clippy beside Linux. Until then every job
+#     ran ubuntu-latest, and the Windows suite hung on relay_wake_script_test.
+#   - Every job in every workflow file has timeout-minutes (30 for tests and
+#     builds, 15 for the rest), so a hang fails the job instead of running for
+#     hours. The `guards` job checks it (every file since BO-22, ci.yml before).
+#   - .github/ignored-tests.txt lists every #[ignore] with its reason.
+#   - .github/test-counts.txt holds how many tests pass on each platform; the
+#     count step fails on any difference, either way, and on any FAILED target.
+#   - The `cargo test` below may carry no skip, exclude or name filter.
+#   - No workflow file may contain the allowed-to-fail key, even in a comment.
+# Changing a guard file, a workflow or tests/replay_test.rs needs its reason in
+# the PR body (build rule 14).
 
 on:
   pull_request:
@@ -14,7 +29,14 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      # Both platforms report even when one fails: a Windows-only failure must
+      # not hide behind a cancelled Linux run, or the other way round.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         # `release.sh` reads `v$OLD..HEAD`, so the rehearsal below needs tags.
@@ -24,14 +46,64 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # bash on both runners (Git's bash on Windows), so the log is kept the same
+      # way on each. GitHub runs `shell: bash` with -o pipefail, so tee cannot
+      # hide cargo's exit code; the count step below fails on FAILED lines anyway.
       - name: cargo test
-        run: cargo test --no-fail-fast
-      # Cut a whole release in a throwaway clone. It runs here rather than in a
+        shell: bash
+        run: cargo test --no-fail-fast 2>&1 | tee cargo-test.log
+      # Runs after a failed test step too, so the run still says how many passed.
+      - name: test count matches .github/test-counts.txt
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: python scripts/ci_guards.py test-count --platform "${{ runner.os }}" --log cargo-test.log
+      # K2e (BO-14): `base rule test` over a fixture rule set that carries tests, so a matcher change that breaks
+      # prompt matching fails the build. A step in this job rather than a job of its own, so the required check names
+      # stay the same; the script's control run must exit 1, so the step is shown able to fail.
+      - name: base rule test on the fixture rule set
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: bash scripts/rule-test-fixture.sh
+      # Cut a whole release in a throwaway clone: prepare, push and open the PR,
+      # and every refusal of the tag step, against a local bare origin and a stub
+      # gh, so nothing reaches GitHub. It runs here rather than in a
       # job of its own because it reuses this one's target directory and cargo
       # registry; on its own it would pay for both again. 0.13.16's first
-      # attempt died on a step order every other test passed.
+      # attempt died on a step order every other test passed. Linux only: the
+      # script and the release it rehearses are Linux-built.
       - name: release rehearsal
+        if: runner.os == 'Linux'
         run: ./scripts/test-release-rehearsal.sh
+
+  # Checks on the tree itself, no build. --selftest runs first and is the
+  # control: every arm of every guard must pass where it should and fail,
+  # naming what it caught, where it should. Each guard runs even when one
+  # before it failed, so one red guard cannot hide another.
+  guards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: guards selftest
+        run: python scripts/ci_guards.py selftest
+      - name: every ignored test is on .github/ignored-tests.txt
+        if: ${{ !cancelled() }}
+        run: python scripts/ci_guards.py ignores
+      - name: no workflow allows a job to fail
+        if: ${{ !cancelled() }}
+        run: python scripts/ci_guards.py no-allowed-failure
+      - name: cargo test carries no test filter
+        if: ${{ !cancelled() }}
+        run: python scripts/ci_guards.py no-test-filters
+      - name: every job has a time limit
+        if: ${{ !cancelled() }}
+        run: python scripts/ci_guards.py timeouts
 
   # scripts/ast/test_*.py existed and passed and NOTHING RAN THEM (#85). A
   # full-tree grep for their names, for `pytest` and for `scripts/ast/test`
@@ -44,6 +116,7 @@ jobs:
   # here would reproduce the defect it was filed to fix.
   python-ast-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -115,6 +188,7 @@ jobs:
   # ships pwsh, which the Windows leg needs.
   release-invocations:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -125,14 +199,21 @@ jobs:
       # this runner is ubuntu — so the check reads `git check-attr`, not the checkout.
       - run: ./scripts/test-crlf-attributes.sh
 
-  # Required, not advisory. It was `continue-on-error: true` "until the three
+  # Required, not advisory. It was allowed to fail "until the three
   # pre-existing never_loop denies in src/crud are cleared" -- they are: a
   # repo-wide grep for never_loop matches zero lines, and the step itself has been
   # `success` on main (run 34200195605, job clippy, step 5). An advisory lint job
   # reports the RUN green whether the step passed or failed, which is how a real
-  # Windows failure sat on main unnoticed (#97, #108).
+  # Windows failure sat on main unnoticed (#97, #108). The key that allowed it is
+  # now refused in every workflow file by the `guards` job, so this comment no
+  # longer spells it.
   clippy:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

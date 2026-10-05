@@ -174,17 +174,54 @@ fn stop_never_writes_a_bare_block_to_stdout() {
 /// injections that already worked would have stopped working.
 #[test]
 fn the_events_that_deliver_plain_stdout_still_use_it() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/hook/mod.rs")).unwrap();
+    // NORMALISE THE LINE ENDINGS BEFORE SEARCHING. The arm delimiter below is written with `\n`,
+    // and `.gitattributes` carries no rule for `*.rs`, so on Windows `core.autocrlf` checks this
+    // source out as CRLF and `\n        }\n` matches NOTHING. `find` then returns None, `unwrap_or`
+    // hands back the whole rest of the file, and the arm "contains" `hookSpecificOutput` from a
+    // completely different arm further down - 21,828 characters swallowed instead of 2,670.
+    //
+    // THE TEST FAILED WHILE THE PRODUCT WAS CORRECT, and it fails that way on every Windows
+    // checkout while passing on Linux CI, which is the exact shape `.gitattributes` warns about in
+    // its own header comment for `*.sh`. Measured 2026-09-21 on the four-lane merge: the delimiter
+    // occurs 0 times in its LF form and 8 times in its CRLF form.
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/hook/mod.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
     let arm_of = |needle: &str| -> String {
         let start = src.find(needle).unwrap_or_else(|| panic!("arm {needle} not found"));
         let rest = &src[start..];
         let end = rest.find("\n        }\n").map(|i| i + start).unwrap_or(src.len());
         src[start..end].to_string()
     };
-    for arm in ["\"session-start\" =>", "\"user-prompt-submit\" =>"] {
-        let body = arm_of(arm);
-        assert!(body.contains("print!(\"{block}\")"), "{arm} must keep plain stdout — the host delivers it there");
-    }
+    // Rank 00 commit B: session start collects its blocks, the relay blocks with them, and prints
+    // the measured emission once, so the literal `print!("{block}")` left this arm. What the
+    // assertion is for is unchanged, plain stdout and no envelope, and it still fails if either goes.
+    let session_start = arm_of("\"session-start\" =>");
+    assert!(session_start.contains("print!("), "session-start must keep plain stdout — the host delivers it there");
+    assert!(!session_start.contains("hookSpecificOutput"), "session-start must not use the envelope");
+    // Rank 00 widened: user-prompt-submit collects its three contributions — the handler, the relay
+    // inbox push and the task tick — and prints the measured emission ONCE, so the literal
+    // `print!("{block}")` left this arm exactly as it left session start above. The property under
+    // test is unchanged and is now asserted more strictly than before: plain stdout, no envelope,
+    // and through THE single measured writer rather than any `print!` that happens to be in scope.
+    // Three sequential emitters is what this arm used to be, and it is what must not come back.
+    // BO-01 replaced the line-cutting `emit::print_measured` with `emit::prompt::print`, the writer of the fitted
+    // blocks. The property is unchanged: one measured writer, plain stdout.
+    let prompt = arm_of("\"user-prompt-submit\" =>");
+    assert!(
+        prompt.contains("emit::prompt::print("),
+        "user-prompt-submit must keep plain stdout, through the one measured writer — the host \
+         delivers plain stdout on this event"
+    );
+    assert!(
+        !prompt.contains("hookSpecificOutput"),
+        "user-prompt-submit must not use the envelope"
+    );
+    assert!(
+        !prompt.contains("print!("),
+        "user-prompt-submit must have exactly ONE writer: a bare `print!` beside the measured one \
+         is a second emitter blind to the first's spend, which is the defect rank 00 removed here"
+    );
     for arm in ["\"pre-tool-use\" =>", "\"post-tool-use\" =>"] {
         let body = arm_of(arm);
         assert!(body.contains("hookSpecificOutput"), "{arm} must use the envelope");

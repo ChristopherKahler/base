@@ -13,7 +13,7 @@ Their question: **$ARGUMENTS**
 
 This skill is portable and contains **no machine-specific facts**. Machine state lives in a local profile; universal knowledge lives in three reference files next to this one:
 
-- `${CLAUDE_SKILL_DIR}/references/qa.md`: 187 verified Q&A pairs, the primary answer source (the count grows whenever the close-the-loop rule below appends one)
+- `${CLAUDE_SKILL_DIR}/references/qa.md`: 214 verified Q&A pairs, the primary answer source (the count grows whenever the close-the-loop rule below appends one)
 - `${CLAUDE_SKILL_DIR}/references/commands.md`: the command surface grouped by safety class (read-only, mutating, destructive), aliases, flag gotchas
 - `${CLAUDE_SKILL_DIR}/references/cli.md`: the verbatim `--help` of every subcommand, generated from the binary at each release; the authority for an exact flag
 
@@ -82,7 +82,7 @@ A question that took real digging is exactly the question the next person will a
 >
 > Everything else (`ast query`, `recall`, `rule`, `relay`) is depth you can add later.
 
-If they are brand new ("how can this help me?", "what do I do with this?"), do not list features: walk them to a first win. (1) Add one rule to a domain they actually work in (`base rule add --domain X --text "..."`). (2) End today's session with `*end`. (3) Next session, point out what got injected automatically at the start. That loop, teach the graph then watch it come back on its own, is the whole product; everything else is depth.
+If they are brand new ("how can this help me?", "what do I do with this?"), do not list features: walk them to a first win. (1) Add one rule to a domain they actually work in (`base rule add --domain X --text "..." --keywords "a, b" --fires-on "<a prompt it should answer>"`; run from a Claude Code session, both are required). (2) End today's session with `*end`. (3) Next session, point out what got injected automatically at the start. That loop, teach the graph then watch it come back on its own, is the whole product; everything else is depth.
 
 Then ask what they want to go deeper on, and mention the top gap from the profile if there is one.
 

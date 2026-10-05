@@ -15,7 +15,8 @@
 use std::path::{Path, PathBuf};
 
 /// Which store a command is acting on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Tier {
     /// `{workspace}/.base/`
     Workspace,
@@ -98,7 +99,7 @@ pub fn graph_for(cwd: &Path, tier: Tier) -> Option<PathBuf> {
     }
 }
 
-fn global_domains_toml() -> PathBuf {
+pub(crate) fn global_domains_toml() -> PathBuf {
     crate::home::home_root()
         .unwrap_or_default()
         .join(".base-gbl")

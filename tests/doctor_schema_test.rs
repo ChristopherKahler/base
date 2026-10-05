@@ -73,11 +73,16 @@ fn an_unmigrated_tier_says_so_and_counts_its_orphans() {
     );
 
     let report = base::doctor::DoctorReport {
+        measured_on: base::doctor::MeasuredOn::Matches { version: "2.1.278".to_string() },
         tiers: vec![r],
         healthy: true,
         warnings: vec![],
         config_errors: vec![],
         trigger_faults: vec![],
+        trigger_advice: vec![],
+        hook_output: vec![],
+        next_steps: Vec::new(),
+        usage: Default::default(),
         seam: base::store::LOCK_SEAM_MARKER,
     };
     let human = base::doctor::format_human(&report);
@@ -100,11 +105,16 @@ fn a_migrated_tier_reports_its_schema_version_and_no_orphans() {
     assert!(r.domain_orphans.is_empty(), "{:?}", r.domain_orphans);
 
     let report = base::doctor::DoctorReport {
+        measured_on: base::doctor::MeasuredOn::Matches { version: "2.1.278".to_string() },
         tiers: vec![r],
         healthy: true,
         warnings: vec![],
         config_errors: vec![],
         trigger_faults: vec![],
+        trigger_advice: vec![],
+        hook_output: vec![],
+        next_steps: Vec::new(),
+        usage: Default::default(),
         seam: base::store::LOCK_SEAM_MARKER,
     };
     let human = base::doctor::format_human(&report);

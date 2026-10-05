@@ -1,0 +1,244 @@
+{
+  "about": "BO-15's correction detector cases. Each case is a short session (events, in Claude Code's real transcript shapes via tests/transcripts/mod.rs) and what the detector must find: `expect` maps a turn number (every prompt counts, task notifications too) to the exact signals of that turn as 'LAYER kind'; a turn not listed has none. `checks` lists the turns whose prompt carries the C4 line. Every text is made up. A case with `missed` is a correction the detector does not catch yet: `expect` and `checks` are what it finds today, `missed.turn` is the turn that corrects the AI and `missed.why` says how. BO-17's backstop saves such cases from real sessions on the user's machine only; the ones here are made up, modelled on the misses of BO-17's gate 4 (2026-10-02 sessions).",
+  "cases": [
+    {
+      "name": "c1-phrase-flags-a-later-prompt",
+      "events": [
+        {"prompt": "set up the release notes for the dashboard"},
+        {"text": "Here is a first draft of the release notes."},
+        {"prompt": "no, that's not what I asked for"},
+        {"text": "Rewriting them as a changelog."}
+      ],
+      "expect": {"2": ["C1 phrase"]},
+      "checks": [2]
+    },
+    {
+      "name": "c1-skips-a-sessions-first-prompt",
+      "events": [
+        {"prompt": "never commit to main and don't force push; set up the branch"},
+        {"text": "Branch made."}
+      ],
+      "expect": {},
+      "checks": []
+    },
+    {
+      "name": "c1-skips-a-task-notification",
+      "events": [
+        {"prompt": "start the build"},
+        {"text": "Started."},
+        {"notification": "build ping: that's wrong, the step failed again"},
+        {"text": "Noted."}
+      ],
+      "expect": {},
+      "checks": []
+    },
+    {
+      "name": "example-4-interrupt-then-a-plain-correction",
+      "events": [
+        {"prompt": "add the retry to the loader"},
+        {"edit": "C:/work/src/loader.rs"},
+        "interrupt_tool_use",
+        {"prompt": "use the other file"},
+        {"text": "Moving the retry to src/fetch.rs."}
+      ],
+      "expect": {"1": ["C2 interrupt"]},
+      "checks": [2]
+    },
+    {
+      "name": "a-plain-interrupt",
+      "events": [
+        {"prompt": "summarise the open tickets"},
+        {"text": "There are twelve open tickets"},
+        "interrupt",
+        {"prompt": "only the ones assigned to me"}
+      ],
+      "expect": {"1": ["C2 interrupt"]},
+      "checks": [2]
+    },
+    {
+      "name": "a-user-denial",
+      "events": [
+        {"prompt": "clean the build folder"},
+        "denial",
+        {"prompt": "do it with the cleanup script instead"},
+        {"text": "Running the script."}
+      ],
+      "expect": {"1": ["C2 denial"]},
+      "checks": [2]
+    },
+    {
+      "name": "a-rule-denial-is-not-the-user",
+      "events": [
+        {"prompt": "clean the build folder"},
+        "rule_denial",
+        {"text": "A project rule blocked that; using the script."},
+        {"prompt": "carry on"}
+      ],
+      "expect": {},
+      "checks": []
+    },
+    {
+      "name": "a-read-of-a-document-holding-the-strings",
+      "events": [
+        {"prompt": "read the detector notes"},
+        {"read": {"file": "C:/work/notes/detector.md", "content": "[Request interrupted by user]\nThe user doesn't want to proceed with this tool use.\nUPDATED: an example of a marker line"}},
+        {"text": "The notes describe three signals."},
+        {"prompt": "next step"}
+      ],
+      "expect": {},
+      "checks": []
+    },
+    {
+      "name": "t2-rule-text-in-injected-context-is-not-a-marker",
+      "events": [
+        {"instructions": "### T2: position changes are audited\n\nWhen you change a stated position, print exactly one of:\n\nUPDATED: <the new argument>\nMISREAD: <what I took you to mean>\nDEFERRED: <claim> held\n"},
+        {"prompt": "is the cache still warm"},
+        {"hook_context": "[BRACKET RULES]\nUPDATED: <the evidence that moved me>\nMISREAD: <what I misread>"},
+        {"reminder": "UPDATED: a reminder that quotes the rule"},
+        {"read": {"file": "C:/work/CLAUDE.md", "content": "UPDATED: <the new argument>"}},
+        {"text": "Yes. Your rules make me print `UPDATED:` or `MISREAD:` when I change position, and none applies here."},
+        {"text": "```\nUPDATED: what a marked reply would look like\n```\nNo marker is needed."},
+        {"prompt": "thanks"}
+      ],
+      "expect": {},
+      "checks": []
+    },
+    {
+      "name": "thinking-and-a-subagent-are-not-the-reply",
+      "events": [
+        {"prompt": "check the migration"},
+        {"thinking": "UPDATED: thinking about whether I was wrong"},
+        {"sidechain_text": "UPDATED: a subagent's own note"},
+        {"text": "The migration ran."},
+        {"prompt": "good"}
+      ],
+      "expect": {},
+      "checks": []
+    },
+    {
+      "name": "each-marker-in-its-own-turn",
+      "events": [
+        {"prompt": "which port does the server use"},
+        {"text": "It uses 8080."},
+        {"prompt": "check the config, it changed last week"},
+        {"text": "UPDATED: the config now sets 8443, so the server uses 8443."},
+        {"prompt": "and the proxy"},
+        {"text": "**CORRECTED:** the proxy forwards to 8443 as well."},
+        {"prompt": "I meant the staging proxy"},
+        {"text": "MISREAD: I read that as production. Staging forwards to 9000."},
+        {"prompt": "are you sure it is 9000"},
+        {"text": "DEFERRED: 9000 stands; the staging file was read today, no new evidence."}
+      ],
+      "expect": {"2": ["C3 UPDATED"], "3": ["C3 CORRECTED"], "4": ["C3 MISREAD"], "5": ["C3 DEFERRED"]},
+      "checks": []
+    },
+    {
+      "name": "the-same-request-again",
+      "events": [
+        {"prompt": "you can close down all of the infra for this, off for the weekend"},
+        {"text": "Closing down"},
+        "interrupt",
+        {"prompt": "close down all infra, off for weekend"},
+        {"text": "All of it is stopped."}
+      ],
+      "expect": {"1": ["C2 interrupt"], "2": ["C2 repeat"]},
+      "checks": [2]
+    },
+    {
+      "name": "a-file-the-ai-wrote-changed-before-the-next-reply",
+      "events": [
+        {"prompt": "write the plan for the import"},
+        {"write": "C:/work/notes/plan.md"},
+        {"text": "The plan is in notes/plan.md."},
+        {"prompt": "look at the plan once more"},
+        {"file_changed": "C:/work/notes/plan.md"},
+        {"text": "You moved step 3 first; following that order."}
+      ],
+      "expect": {"1": ["C2 file-edited"]},
+      "checks": [2]
+    },
+    {
+      "name": "example-1-shape",
+      "events": [
+        {"prompt": "what version is installed"},
+        {"text": "The installed release is 0.15.2."},
+        {"prompt": "The installed version is not 0.15.2. It is a local dev build of 0.16.0. Now, quit trying to correct me."},
+        {"text": "UPDATED: you built and installed base from your 0.16.0 dev tree; --version prints 0.15.2 only because the version is bumped at release."}
+      ],
+      "expect": {"2": ["C1 phrase", "C3 UPDATED"]},
+      "checks": [2]
+    },
+    {
+      "name": "missed-a-standing-rule-restated",
+      "events": [
+        {"prompt": "set up the deploy check for the docs site"},
+        {"text": "The check is ready. Do you want to merge it, or wait until you set the branch rules?"},
+        {"prompt": "Merging is your part, every time. Finish it yourself."},
+        {"text": "Merging it now."}
+      ],
+      "expect": {},
+      "checks": [],
+      "missed": {"turn": 2, "why": "the user restates a standing rule the AI broke by handing the work back"}
+    },
+    {
+      "name": "missed-a-preference-redirect",
+      "events": [
+        {"prompt": "add a way to export the report"},
+        {"text": "I built a dialog with a form: a file name, a format and an export button."},
+        {"prompt": "I'd rather a one-line command than a dialog"},
+        {"text": "Replacing the dialog with a command."}
+      ],
+      "expect": {},
+      "checks": [],
+      "missed": {"turn": 2, "why": "the user turns down the AI's design for the one they wanted"}
+    },
+    {
+      "name": "missed-no-without-a-comma",
+      "events": [
+        {"prompt": "restart the importer the usual way"},
+        {"text": "Restarting it with a fresh config I wrote just now."},
+        {"prompt": "No we restart it the documented way and keep the old config"},
+        {"text": "Using the documented restart and the old config."}
+      ],
+      "expect": {},
+      "checks": [],
+      "missed": {"turn": 2, "why": "the user overrules the AI's approach; the C1 phrase wants a comma after no"}
+    },
+    {
+      "name": "missed-makes-no-sense",
+      "events": [
+        {"prompt": "why can't the old printer take the large paper"},
+        {"text": "That printer model only takes letter size."},
+        {"prompt": "it prints posters every week, so that answer cannot be right"},
+        {"text": "It does take the large size; sending the poster now."}
+      ],
+      "expect": {},
+      "checks": [],
+      "missed": {"turn": 2, "why": "the user says the AI's claim contradicts a fact they know"}
+    },
+    {
+      "name": "missed-a-corrected-fact-list",
+      "events": [
+        {"prompt": "sort these books onto the shelves by subject"},
+        {"text": "Harbor Lights, Iron Road and Quiet Field look like novels, so they went on the fiction shelf."},
+        {"prompt": "iron road is a railway history and quiet field is a farming guide, the rest are novels"},
+        {"text": "Moving Iron Road to history and Quiet Field to farming."}
+      ],
+      "expect": {},
+      "checks": [],
+      "missed": {"turn": 2, "why": "the user corrects facts the AI guessed, with no correction word at all"}
+    },
+    {
+      "name": "missed-a-redirect-to-the-tool",
+      "events": [
+        {"prompt": "start two more workers on the build server"},
+        {"text": "Please approve the remote start in the dialog that just opened."},
+        {"prompt": "do it from the terminal with the right options instead"},
+        {"text": "Starting them from the command line."}
+      ],
+      "expect": {},
+      "checks": [],
+      "missed": {"turn": 2, "why": "the user redirects the AI to the method it should have used"}
+    }
+  ]
+}

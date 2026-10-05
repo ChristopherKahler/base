@@ -70,7 +70,10 @@ pub fn run(target: &Path) -> Result<()> {
 
 # [signal]             # session-start injection (active set, handoffs, reminders)
 # enabled = true
-# max_chars = 2000     # injection budget per session-start
+
+# [budget]             # what a hook may print, in bytes (the unit the host counts)
+# session_start_bytes = 10000
+# memory_chars = 4000  # the memory block inside it, in UTF-16: a readability limit
 
 # [flow]               # resurface scans: unblocked, deferred-due, recurring ideas
 # enabled = true
@@ -168,6 +171,18 @@ pub fn run(target: &Path) -> Result<()> {
         crate::hook::automap::RootPlan::Home => println!("⊘ (home is never mapped)"),
         crate::hook::automap::RootPlan::NeverMap(why) => println!("⊘ ({why} — never mapped)"),
         crate::hook::automap::RootPlan::Empty => println!("⊘ (no source files yet — the first session here maps it)"),
+    }
+
+    // Step 7 (BO-15, C3 for every user): the line asking the AI to start a corrected reply with CORRECTED:, asked on a
+    // terminal when the user's CLAUDE.md asks for no marker and nobody answered before. Unattended, nothing is written
+    // or printed: session start carries the line instead.
+    use crate::corrections::claude_md::{self as corrections_line, Choice, Offered};
+    let offered = match crate::home::home_root() {
+        Some(home) => corrections_line::offer(&home.join(".claude").join("CLAUDE.md"), Choice::Ask, corrections_line::ask_on_terminal),
+        None => Offered::Failed("no home folder to find CLAUDE.md in".to_string()),
+    };
+    if !matches!(offered, Offered::Covered | Offered::AnsweredBefore(_) | Offered::NotAsked) {
+        println!("7. {}", corrections_line::report(&offered));
     }
 
     println!("\n═══════════════════════════════════════");

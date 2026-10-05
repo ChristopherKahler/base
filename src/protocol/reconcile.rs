@@ -25,22 +25,24 @@
 //! Gated on `[protocol] enabled` for the *apply* path. The read-only [`plan`] is
 //! ungated so `base reconcile --dry-run` can preview before the protocol is enabled.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use oxigraph::model::Term;
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 
-use crate::config::{BaseConfig, NamespaceConfig};
+use crate::config::{BaseConfig, DeferKind, NamespaceConfig};
 use crate::crud;
+use crate::crud::deferred;
 use crate::store;
 
 /// Statuses that count as "working" — eligible to decay to `deferred` when cold.
 const WORKING_STATUSES: &[&str] = &["active", "in_progress", "planning", "not_started"];
 /// Statuses left strictly alone (done work shouldn't churn the graph).
-const TERMINAL_STATUSES: &[&str] = &["complete", "completed", "archived"];
+pub const TERMINAL_STATUSES: &[&str] = &["complete", "completed", "archived"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -110,7 +112,7 @@ pub fn reconcile(cwd: &Path, config: &BaseConfig) -> Result<ReconcileStats> {
         return Ok(ReconcileStats::default());
     };
     let roots = registered_roots(config);
-    let decisions = plan(&store, &config.namespace, &ws_root, &roots, config.protocol.stale_days as i64)?;
+    let decisions = plan(&store, &config.namespace, &ws_root, &roots, config.defer_days(DeferKind::Project))?;
     apply(&store, &config.namespace, &trig_path, &decisions)
 }
 
@@ -218,6 +220,7 @@ pub fn plan(
 pub fn apply(store: &Store, ns: &NamespaceConfig, trig_path: &Path, decisions: &[Decision]) -> Result<ReconcileStats> {
     let mut stats = ReconcileStats { scanned: decisions.len(), ..Default::default() };
     let p = &ns.prefix;
+    let now = crud::now_iso();
     let pfx = crud::prefixes(ns);
     let mut ops: Vec<String> = Vec::new();
 
@@ -235,6 +238,11 @@ pub fn apply(store: &Store, ns: &NamespaceConfig, trig_path: &Path, decisions: &
                 ops.push(crud::field_update(&d.g, &d.iri, &format!("{p}:status"), "\"deferred\""));
                 ops.push(crud::field_update(&d.g, &d.iri, &format!("{p}:deferredReason"),
                     &format!("\"auto: cold {days}d\"")));
+                // THE PAIR, copied from `apply_records`, which writes this on Defer and deletes it
+                // on Revive. Without it every row of `base project deferred` renders "date deferred
+                // not recorded" permanently — honest, and therefore never chased.
+                ops.push(crud::field_update(&d.g, &d.iri, &format!("{p}:deferredAt"),
+                    &format!("\"{now}\"^^xsd:dateTime")));
                 stats.deferred += 1;
             }
             Action::Revive => {
@@ -242,6 +250,17 @@ pub fn apply(store: &Store, ns: &NamespaceConfig, trig_path: &Path, decisions: &
                 ops.push(format!(
                     "DELETE {{ GRAPH <{g}> {{ <{s}> {p}:deferredReason ?r }} }}\n\
                      WHERE {{ GRAPH <{g}> {{ <{s}> {p}:deferredReason ?r }} }}",
+                    g = d.g, s = d.iri
+                ));
+                // THE OTHER HALF OF THE PAIR. Adding the Defer write without this leaves a revived
+                // project carrying a stale `deferredAt` that says deferred while `status` says
+                // active — one field reading the same in two states, arriving through the fix.
+                // A SEPARATE statement, not a second triple in the pattern above: a two-triple
+                // DELETE matches only when BOTH are present, and a project deferred before this
+                // change carries a reason and no date.
+                ops.push(format!(
+                    "DELETE {{ GRAPH <{g}> {{ <{s}> {p}:deferredAt ?a }} }}\n\
+                     WHERE {{ GRAPH <{g}> {{ <{s}> {p}:deferredAt ?a }} }}",
                     g = d.g, s = d.iri
                 ));
                 stats.revived += 1;
@@ -331,6 +350,366 @@ pub fn format_report(decisions: &[Decision], ws_root: &Path, stale_days: i64) ->
     s.push_str(&format!(
         "\nSummary: {} defer · {} revive · {} stay · {} unresolved · {} terminal · {} moved-needs-repath  (no graph writes)\n",
         defer.len(), revive.len(), hold.len(), nofolder.len(), terminal, moved
+    ));
+    s
+}
+
+// ─── Records: handoffs, forks, tasks and milestones (spec C5, lane 3 G0.3) ─────────
+
+/// Statuses a record never leaves by deferral: done, dropped or already closed.
+const RECORD_TERMINAL: &[&str] = &["archived", "complete", "completed", "deprecated"];
+
+/// One handoff, fork, task or milestone the deferral pass decided about.
+#[derive(Debug, Clone)]
+pub struct RecordDecision {
+    pub iri: String,
+    pub slug: String,
+    pub kind: DeferKind,
+    pub status: String,
+    /// Whole days on the clock `crud::deferred::clock` reads; `None` when the record carries no time.
+    pub days: Option<i64>,
+    /// The window `BaseConfig::defer_days` gives this kind.
+    pub window: i64,
+    pub action: Action,
+}
+
+#[derive(Debug, Default)]
+pub struct RecordStats {
+    pub scanned: usize,
+    pub deferred: usize,
+    pub revived: usize,
+}
+
+impl RecordStats {
+    pub fn changed(&self) -> bool {
+        self.deferred > 0 || self.revived > 0
+    }
+}
+
+/// Read-only: what the deferral pass would do with every handoff, fork, task and milestone in `store`.
+///
+/// Handoffs and forks defer and never revive on the clock. A Read of the doc moves `lastActive` (rank
+/// 03) and R7 rules that a Read does not revive, so reviving on a fresh clock would revive it one session
+/// later. Only `show` or a new registration brings one back.
+///
+/// Tasks and milestones revive on the clock, because it moves only on a deliberate base command, and only
+/// when the pass deferred them (`deferredReason` starting `auto:`): `task update --status deferred`
+/// stamps `lastActive` itself, so reviving an operator's own deferral would undo it next session start.
+///
+/// Decided on EVERY value a record carries, never on the order the store returns rows (F1): a subject holding two
+/// values for one field comes back as one row per combination. A terminal status wins over any other; two statuses,
+/// or two record types, are ambiguous and held, never written; a future value of `resurfaceAt` pins; the clock is the
+/// newest `lastActive` and the newest passed `resurfaceAt`; and revival needs every `deferredReason` to start `auto:`.
+/// A handoff carrying `kind "fork"` is a fork, whatever other `kind` it carries, which is how `base fork deferred`
+/// and `base handoff deferred` list it (`crud::deferred::kind_filter`).
+///
+/// Never deferred: a terminal status, `blocked` (someone is waiting on it), a record carrying a due date
+/// (rank 07 moves it to DUE), a snoozed one (C7), and one with no clock at all, which is never deferred
+/// blind.
+pub fn plan_records(store: &Store, config: &BaseConfig, now: DateTime<Local>) -> Result<Vec<RecordDecision>> {
+    let ns = &config.namespace;
+    let p = &ns.prefix;
+    let select = format!(
+        "{pfx}\n\
+         SELECT ?e ?type ?status ?kind ?lastActive ?resurfaceAt ?why ?due WHERE {{\n\
+           GRAPH ?g {{\n\
+             ?e a ?type ;\n\
+               {p}:status ?status .\n\
+             FILTER(?type IN ({p}:Handoff, {p}:Task, {p}:Milestone))\n\
+             OPTIONAL {{ ?e {p}:kind ?kind }}\n\
+             OPTIONAL {{ ?e {p}:lastActive ?lastActive }}\n\
+             OPTIONAL {{ ?e {p}:resurfaceAt ?resurfaceAt }}\n\
+             OPTIONAL {{ ?e {p}:deferredReason ?why }}\n\
+             OPTIONAL {{ ?e {p}:due ?due }}\n\
+           }}\n\
+         }}",
+        pfx = crud::prefixes(ns)
+    );
+    let QueryResults::Solutions(solutions) = store::query(store, &select)? else {
+        return Ok(Vec::new());
+    };
+    let full = |t: Option<&Term>| -> Option<String> {
+        t.map(|term| match term {
+            Term::NamedNode(n) => n.as_str().to_string(),
+            Term::Literal(l) => l.value().to_string(),
+            other => other.to_string(),
+        })
+    };
+    // F1: every value of every field is gathered before anything is decided, so no single row decides.
+    let mut subjects: BTreeMap<String, Values> = BTreeMap::new();
+    for sol in solutions.filter_map(|r| r.ok()) {
+        let Some(iri) = full(sol.get("e")) else {
+            continue;
+        };
+        let v = subjects.entry(iri).or_default();
+        v.types.extend(full(sol.get("type")));
+        v.statuses.extend(full(sol.get("status")));
+        v.kinds.extend(full(sol.get("kind")));
+        v.last_active.extend(full(sol.get("lastActive")));
+        v.resurface_at.extend(full(sol.get("resurfaceAt")));
+        v.reasons.extend(full(sol.get("why")));
+        v.dues.extend(full(sol.get("due")));
+    }
+    let mut out = Vec::new();
+    for (iri, v) in subjects {
+        let kind = if v.types.iter().any(|t| t.ends_with("#Handoff")) {
+            if v.kinds.contains("fork") {
+                DeferKind::Fork
+            } else {
+                DeferKind::Handoff
+            }
+        } else if v.types.iter().any(|t| t.ends_with("#Task")) {
+            DeferKind::Task
+        } else {
+            DeferKind::Milestone
+        };
+        let status = v.statuses.iter().cloned().collect::<Vec<_>>().join(" + ");
+        let window = config.defer_days(kind);
+        let days = deferred::clock_of(
+            v.last_active.iter().map(String::as_str),
+            v.resurface_at.iter().map(String::as_str),
+            now,
+        )
+        .map(|t| deferred::days_since(t, now));
+        let handoff_like = matches!(kind, DeferKind::Handoff | DeferKind::Fork);
+        let dated = v.dues.iter().any(|d| !d.trim().is_empty());
+
+        let action = if v.statuses.iter().any(|s| RECORD_TERMINAL.contains(&s.as_str())) {
+            Action::Terminal
+        } else if v.statuses.len() != 1 || v.types.len() != 1 {
+            // Two working statuses, or two record types: ambiguous, and an ambiguous record is never written.
+            Action::Hold
+        } else if status == "blocked" || dated {
+            Action::Hold
+        } else if v.resurface_at.iter().any(|r| deferred::is_snoozed(Some(r.as_str()), now)) {
+            Action::Pinned
+        } else {
+            match days {
+                None => Action::Hold,
+                Some(d) if status == deferred::DEFERRED => {
+                    let auto = !v.reasons.is_empty() && v.reasons.iter().all(|r| r.starts_with(deferred::AUTO));
+                    if !handoff_like && auto && d < window {
+                        Action::Revive
+                    } else {
+                        Action::Hold
+                    }
+                }
+                Some(d) => {
+                    let working = !handoff_like || status == "open";
+                    if working && d >= window {
+                        Action::Defer
+                    } else {
+                        Action::Hold
+                    }
+                }
+            }
+        };
+        let slug = iri.rsplit('/').next().unwrap_or(&iri).to_string();
+        out.push(RecordDecision { iri, slug, kind, status, days, window, action });
+    }
+    Ok(out)
+}
+
+/// Every value one subject carries for each field [`plan_records`] reads, gathered from all of its rows (F1).
+#[derive(Default)]
+struct Values {
+    types: BTreeSet<String>,
+    statuses: BTreeSet<String>,
+    kinds: BTreeSet<String>,
+    last_active: BTreeSet<String>,
+    resurface_at: BTreeSet<String>,
+    reasons: BTreeSet<String>,
+    dues: BTreeSet<String>,
+}
+
+/// Apply one tier file's record plan to `store` and write the file once. The caller holds the file's
+/// lock and loaded `store` inside it. Returns how many were deferred and how many revived.
+pub fn apply_records(
+    store: &Store,
+    ns: &NamespaceConfig,
+    file: &Path,
+    decisions: &[RecordDecision],
+) -> Result<(usize, usize)> {
+    let p = &ns.prefix;
+    let pfx = crud::prefixes(ns);
+    let now = crud::now_iso();
+    let mut ops: Vec<String> = Vec::new();
+    let (mut n_deferred, mut n_revived) = (0usize, 0usize);
+    for d in decisions {
+        let s = &d.iri;
+        match d.action {
+            Action::Defer => {
+                let days = d.days.unwrap_or_default();
+                ops.push(format!(
+                    "DELETE {{ GRAPH ?g {{ <{s}> {p}:status ?old .\n\
+                                           <{s}> {p}:deferredReason ?w .\n\
+                                           <{s}> {p}:deferredAt ?a }} }}\n\
+                     INSERT {{ GRAPH ?g {{ <{s}> {p}:status \"deferred\" .\n\
+                                           <{s}> {p}:deferredReason \"auto: cold {days}d\" .\n\
+                                           <{s}> {p}:deferredAt \"{now}\"^^xsd:dateTime }} }}\n\
+                     WHERE  {{ GRAPH ?g {{ <{s}> {p}:status ?old }}\n\
+                       OPTIONAL {{ GRAPH ?g {{ <{s}> {p}:deferredReason ?w }} }}\n\
+                       OPTIONAL {{ GRAPH ?g {{ <{s}> {p}:deferredAt ?a }} }} }}"
+                ));
+                n_deferred += 1;
+            }
+            Action::Revive => {
+                ops.push(format!(
+                    "DELETE {{ GRAPH ?g {{ <{s}> {p}:status \"deferred\" .\n\
+                                           <{s}> {p}:deferredReason ?w .\n\
+                                           <{s}> {p}:deferredAt ?a }} }}\n\
+                     INSERT {{ GRAPH ?g {{ <{s}> {p}:status \"active\" }} }}\n\
+                     WHERE  {{ GRAPH ?g {{ <{s}> {p}:status \"deferred\" }}\n\
+                       OPTIONAL {{ GRAPH ?g {{ <{s}> {p}:deferredReason ?w }} }}\n\
+                       OPTIONAL {{ GRAPH ?g {{ <{s}> {p}:deferredAt ?a }} }} }}"
+                ));
+                n_revived += 1;
+            }
+            _ => {}
+        }
+    }
+    if ops.is_empty() {
+        return Ok((0, 0));
+    }
+    // The lock lives with the WRITE, as it does in `apply` (lock_tripwire_test): re-entrant, so the
+    // `reconcile_records` caller that already holds it pays nothing.
+    store::with_graph_lock(file, || {
+        store::mutate_and_write(store, file, "", store::Scope::Wide, store::Intent::Knowledge, |st| {
+            for op in &ops {
+                st.update(&format!("{pfx}\n{op}"))
+                    .with_context(|| format!("deferral update failed: {op}"))?;
+            }
+            Ok(Some(ops.join(";\n")))
+        })
+    })?;
+    Ok((n_deferred, n_revived))
+}
+
+/// Every tier file's record plan, read without a lock, for `base reconcile --dry-run`.
+pub fn plan_all_records(
+    gbl_root: Option<&Path>,
+    cwd: &Path,
+    config: &BaseConfig,
+) -> Result<Vec<(&'static str, Vec<RecordDecision>)>> {
+    let now = Local::now();
+    let mut out = Vec::new();
+    for file in crud::all_tier_files(gbl_root, cwd) {
+        let tier = crud::tier_label_of_file(&file, gbl_root);
+        let store = store::load_graph(&file)?;
+        out.push((tier, plan_records(&store, config, now)?));
+    }
+    Ok(out)
+}
+
+/// Run the deferral pass over every tier file and APPLY it (spec C5). Gated on `[defer] enabled`.
+///
+/// Plans on an unlocked load, because the post-tool hook locks every tier file on every tool call. Only a
+/// tier with at least one decision takes the lock, reloads inside it, plans again and writes, so in the
+/// steady state no session start takes the global lock at all.
+pub fn reconcile_records(gbl_root: Option<&Path>, cwd: &Path, config: &BaseConfig) -> Result<RecordStats> {
+    let mut stats = RecordStats::default();
+    if !config.defer.enabled {
+        return Ok(stats);
+    }
+    // THE RANK 09 MIGRATION GATE WAS REMOVED HERE, 2026-09-19. This comment is its headstone and
+    // not its deletion: a reader who remembers `migration_pending` has to find out that it went and
+    // why, rather than find a file that never had it.
+    //
+    // The gate withheld `Defer` while the upgrade migration read PENDING, so that a legacy install
+    // could not mass-defer before its operator had previewed. Chris supplied the design intent that
+    // removes the premise: DEFERRING IS NOT DELETION. A deferred record stops surfacing, stays
+    // listable and queryable, and every listed row prints its own revive command
+    // (`crud::deferred::list`, wired for all five kinds). So the day-one sweep the gate existed to
+    // prevent is the feature working correctly, and the gate was blocking a correct outcome.
+    //
+    // The machine-wide claim it read went with it. An absent marker could not tell a fresh install
+    // from a legacy one without `mark_fresh_install`, which is also gone. `base defer migrate`
+    // survives as an OPT-IN way to reset `lastActive`; nothing gates on it any more.
+    //
+    // The verbs this pass may write. Both of them, unconditionally.
+    let writable = |a: Action| matches!(a, Action::Revive | Action::Defer);
+    let now = Local::now();
+    for file in crud::all_tier_files(gbl_root, cwd) {
+        let first = plan_records(&store::load_graph(&file)?, config, now)?;
+        // `scanned` counts every record this pass PLANNED, including the ones it then declines to
+        // write. It is not a count of records acted on — `deferred` and `revived` are that count.
+        stats.scanned += first.len();
+        if !first.iter().any(|d| writable(d.action)) {
+            continue;
+        }
+        let (d, r) = store::with_graph_lock(&file, || {
+            let store = store::load_graph(&file)?;
+            // THE FILTER GOES ON THE PLAN RECOMPUTED INSIDE THE LOCK, never on `first` (`auk`, same
+            // ruling). The outer read is only a cheap pre-check; the two can disagree, and that
+            // disagreement is the whole reason this recompute exists.
+            let plan: Vec<RecordDecision> = plan_records(&store, config, now)?
+                .into_iter()
+                .filter(|d| writable(d.action))
+                .collect();
+            apply_records(&store, &config.namespace, &file, &plan)
+        })?;
+        stats.deferred += d;
+        stats.revived += r;
+    }
+    Ok(stats)
+}
+
+/// The record half of `base reconcile --dry-run`: every WOULD DEFER and WOULD REVIVE line, by tier and
+/// type, and a count of everything else.
+///
+/// **A ZERO-VISITED RUN MUST NOT RENDER AS A COMPLETED PLAN.** With no tier file to read, this used to
+/// print the same header, the same `(nothing would change)` and the same `Summary: 0 defer · 0 revive ·
+/// 0 stay` that a real pass over a real graph prints. Run from outside a workspace the caller correctly
+/// warns `no workspace graph found` and then **the very next line states a finished plan over nothing**
+/// — and the confident zero is the sentence a reader takes away, not the warning above it.
+///
+/// Found by `plover` as scope row W4, 2026-09-21, and reproduced here on `finch/measured-on-drift`, so
+/// it is not confined to one branch. **The warning is correct and stays; only the summary was the
+/// defect.** Silencing the warning to make the total honest would fix the wrong half.
+///
+/// The summary also names **how many tiers it actually read**, because a count that hides its
+/// denominator is the same defect one level down.
+pub fn format_records_report(config: &BaseConfig, plans: &[(&'static str, Vec<RecordDecision>)]) -> String {
+    if plans.is_empty() {
+        return "\nDeferral dry-run — NO TIER FILE WAS READ, so nothing was planned. This is not a \
+                result: it is the absence of one. Run from inside a base workspace, or check that the \
+                home tier exists.\n"
+            .to_string();
+    }
+    let mut s = format!(
+        "\nDeferral dry-run — handoffs, forks, tasks, milestones ([defer] enabled = {}; a dry run plans either way)\n",
+        config.defer.enabled
+    );
+    let (mut defer, mut revive, mut other) = (0usize, 0usize, 0usize);
+    for (tier, plan) in plans {
+        for d in plan {
+            let word = deferred::nouns(d.kind).0;
+            let days = d.days.unwrap_or_default();
+            match d.action {
+                Action::Defer => {
+                    defer += 1;
+                    s.push_str(&format!(
+                        "  {tier} · {word} · WOULD DEFER · {} · untouched {days}d (window {}d)\n",
+                        d.slug, d.window
+                    ));
+                }
+                Action::Revive => {
+                    revive += 1;
+                    s.push_str(&format!(
+                        "  {tier} · {word} · WOULD REVIVE · {} · touched {days}d ago (window {}d)\n",
+                        d.slug, d.window
+                    ));
+                }
+                _ => other += 1,
+            }
+        }
+    }
+    if defer + revive == 0 {
+        s.push_str("  (nothing would change)\n");
+    }
+    s.push_str(&format!(
+        "Summary: {defer} defer · {revive} revive · {other} stay, across {} tier(s) read (no graph writes)\n",
+        plans.len()
     ));
     s
 }
@@ -446,6 +825,44 @@ fn collect_rows(store: &Store, sparql: &str) -> Result<Vec<Row>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── W4: a run that read nothing must not render as a completed plan ──
+    //
+    // The pair is the point. Leg one is the defect; leg two is the case it must
+    // stay distinguishable from. One without the other proves nothing: suppress
+    // the summary unconditionally and leg one passes while base goes silent on a
+    // real empty graph, which is the same defect wearing the other sign.
+
+    #[test]
+    fn a_dry_run_that_read_no_tier_says_so_instead_of_counting_to_zero() {
+        let out = format_records_report(&BaseConfig::default(), &[]);
+        assert!(
+            out.contains("NO TIER FILE WAS READ"),
+            "a zero-visited run must name itself. Got:\n{out}"
+        );
+        assert!(
+            !out.contains("Summary:"),
+            "a run that read nothing must not print a summary at all. Got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_that_read_a_tier_and_found_nothing_still_summarises() {
+        let plans = vec![("home", Vec::new())];
+        let out = format_records_report(&BaseConfig::default(), &plans);
+        assert!(
+            out.contains("Summary:"),
+            "a real pass over a real tier still reports, even at zero. Got:\n{out}"
+        );
+        assert!(
+            out.contains("1 tier(s) read"),
+            "the summary names the size of the set it visited. Got:\n{out}"
+        );
+        assert!(
+            !out.contains("NO TIER FILE WAS READ"),
+            "a tier that was read is not an absent one. Got:\n{out}"
+        );
+    }
 
     #[test]
     fn project_root_strips_paul_state_path() {

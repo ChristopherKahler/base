@@ -29,7 +29,15 @@ param(
     # Build only (cargo build --release); do not `cargo install` onto PATH.
     [switch]$SkipInstall,
     # Skip running `base install` after a successful build.
-    [switch]$NoPostInstall
+    [switch]$NoPostInstall,
+    # The commit this source came from, stamped into `base --version`.
+    #
+    # Required when building a COPIED tree: the Windows flow copies the repo
+    # without `.git`, so the build cannot work the commit out for itself and
+    # `base --version` will honestly report `(build unknown)`. That is safe but
+    # useless for telling two installs apart, which is the whole reason the
+    # stamp exists. Pass the sha you copied from.
+    [string]$BuildSha
 )
 
 $ErrorActionPreference = 'Stop'
@@ -149,6 +157,13 @@ if ($clippyVersion) {
 
 # ── 4. Build / install ─────────────────────────────────────────────────────
 if ($SkipInstall) {
+    if ($BuildSha) {
+        $env:BASE_BUILD_SHA = $BuildSha
+        Write-Step "Stamping build sha $BuildSha into --version"
+    } elseif (-not (Test-Path (Join-Path $PSScriptRoot '..' '.git'))) {
+        Write-Warning "No -BuildSha and no .git: 'base --version' will report '(build unknown)'."
+    }
+
     Write-Step "Building base (cargo build --release)"
     cargo build --release --locked
     if ($LASTEXITCODE -ne 0) { Fail "cargo build failed (exit $LASTEXITCODE)." }

@@ -41,8 +41,12 @@ pub const MESSAGE_TYPES: &[&str] = &[
     "answer",
 ];
 
-/// Heartbeats older than this render as DEAD on the board.
-pub const DEAD_AFTER_SECS: i64 = 15 * 60;
+/// A seat that has made no tool call for longer than this renders as idle.
+///
+/// MUST stay above the wake-monitor re-arm cycle (30 min). At 15 min a
+/// correctly parked seat sat past the threshold for most of every cycle, so
+/// the label fired during normal operation rather than on a fault.
+pub const IDLE_AFTER_SECS: i64 = 45 * 60;
 /// Default advisory-claim TTL.
 pub const DEFAULT_CLAIM_TTL_SECS: i64 = 60 * 60;
 
@@ -95,6 +99,81 @@ pub struct Registry {
 pub struct Claims {
     #[serde(default)]
     pub claims: BTreeMap<String, Claim>,
+}
+
+/// A relay side effect held back until the text announcing it is printed: marking a message seen, deleting a reply
+/// once announced, recording a ping as delivered, stamping a wake-nudge throttle.
+///
+/// BO-01. The prompt hook fits its output to a byte budget AFTER the relay blocks are built, and may drop one whole.
+/// Delivery used to consume as it rendered, so a dropped block's messages were marked seen, its replies deleted and
+/// its wake nudge throttled, and the reader never saw them. The prompt hook now runs these only for the blocks it
+/// printed; a dropped block stays pending and arrives at the next tool call or prompt. Every other caller runs them
+/// at once, as before.
+pub type Commit = Box<dyn FnOnce()>;
+
+/// Run held-back relay side effects.
+pub fn run_commits(commits: Vec<Commit>) {
+    for commit in commits {
+        commit();
+    }
+}
+
+/// One relay block as a hook builds it: the text, the side effects to run only if it is printed (BO-01), and how many
+/// messages, tasks or titles it carries, counted where they are rendered rather than guessed from its lines (a message
+/// body may itself begin `relay: `).
+pub struct Part {
+    pub text: String,
+    pub commits: Vec<Commit>,
+    pub items: usize,
+}
+
+impl Part {
+    /// Run the side effects and keep the text: for the hooks that print a part whole.
+    pub fn commit(self) -> String {
+        run_commits(self.commits);
+        self.text
+    }
+}
+
+/// True when this hook process runs in a harness that has said it cannot keep an inbox watcher (`BASE_NO_WAKE_NUDGE`,
+/// the documented opt-out for Agent SDK runs and workers with no Monitor tool). Only such a run is given new relay
+/// items on a tool call (BO-04, lynx's amendment to F13b): it has no other way to hear a question mid-run. Interactive
+/// sessions never are; `BASE_RELAY_AS` does not mark one, because the operator's own launchers set it on every
+/// interactive session.
+pub fn monitorless() -> bool {
+    std::env::var_os("BASE_NO_WAKE_NUDGE").is_some()
+}
+
+/// A sender whose messages are each a thread of their own, so nothing it sends supersedes anything else: no title at
+/// all, or the placeholder a session with no title is recorded under. Two unrelated scripts both recorded as
+/// `unregistered` are not one conversation.
+pub fn threadless(from: &str) -> bool {
+    from.trim().is_empty() || from.starts_with(UNREGISTERED)
+}
+
+/// BO-04, F13c, in one place for both delivery paths: of the items in one thread (one sender within one receiver's
+/// inbox), only the newest is shown. `keys[i]` is item i's thread, or `None` for an item that is never superseded.
+/// Items are oldest first. Returns, per item, the index of the newer item it is hidden behind, or `None` when shown.
+pub fn superseded_by<K: Eq + std::hash::Hash>(keys: &[Option<K>]) -> Vec<Option<usize>> {
+    let mut newest: std::collections::HashMap<&K, usize> = std::collections::HashMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        if let Some(k) = k {
+            newest.insert(k, i);
+        }
+    }
+    keys.iter()
+        .enumerate()
+        .map(|(i, k)| k.as_ref().and_then(|k| Some(newest[k]).filter(|&n| n != i)))
+        .collect()
+}
+
+/// The line under a shown message that hid `n` older ones from `from`, naming the command that still lists them, so a
+/// hidden message is never lost silently (lynx's condition 1 on F13c).
+pub fn hidden_line(n: usize, from: &str, command: &str) -> String {
+    format!(
+        "({n} earlier message{} from {from} hidden, this one is newer: {command})\n",
+        if n == 1 { "" } else { "s" }
+    )
 }
 
 // ─── Store handle ────────────────────────────────────────────
@@ -300,19 +379,23 @@ impl RelayStore {
         titles
     }
 
-    /// Unseen messages addressed to `title`. Does NOT mark seen.
-    pub fn pending_for(&self, title: &str) -> Vec<Message> {
+    /// Every message addressed to `title` from another sender, seen or not, oldest first.
+    pub fn addressed(&self, title: &str) -> Vec<Message> {
         let reg = self.load_registry();
         let entry = reg.sessions.get(title);
         let session_id = entry.and_then(|e| e.session_id.as_deref());
         let phase = entry.and_then(|e| e.phase.as_deref());
-        let seen = self.load_seen(title);
         self.all_messages()
             .into_iter()
             .filter(|m| m.from != title)
             .filter(|m| Self::addressed_to(m, title, session_id, phase))
-            .filter(|m| !seen.contains(&m.id))
             .collect()
+    }
+
+    /// Unseen messages addressed to `title`. Does NOT mark seen.
+    pub fn pending_for(&self, title: &str) -> Vec<Message> {
+        let seen = self.load_seen(title);
+        self.addressed(title).into_iter().filter(|m| !seen.contains(&m.id)).collect()
     }
 
     pub fn mark_seen(&self, title: &str, ids: &[String]) -> Result<()> {
@@ -561,6 +644,24 @@ pub fn resolve_store(cwd: &Path, project: Option<&str>) -> Result<RelayStore> {
     }
 }
 
+/// Every relay title this machine knows: the global session registry, its title history, and the registry of each
+/// relay store found from `cwd`. A codename in a handoff slug is matched against these (BO-11). The global registry
+/// alone is not enough: on Chris's machine it held 42 titles while the workspace's store held 291, and most old
+/// handoffs were written by sessions only the store still names.
+pub fn known_titles(cwd: &Path) -> Vec<String> {
+    let mut titles: Vec<String> = session_registry::list().into_iter().map(|e| e.title).collect();
+    titles.extend(session_registry::history_titles());
+    if let Some(root) = relay_root(cwd) {
+        for project in list_projects(&root) {
+            let store = RelayStore { root: root.join(&project), project };
+            titles.extend(store.load_registry().sessions.into_values().map(|e| e.title));
+        }
+    }
+    titles.sort();
+    titles.dedup();
+    titles
+}
+
 pub fn list_projects(relay_root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(relay_root) else {
         return Vec::new();
@@ -577,6 +678,15 @@ pub fn list_projects(relay_root: &Path) -> Vec<String> {
 /// The current session id, as exposed to Bash tool subprocesses.
 pub fn env_session_id() -> Option<String> {
     std::env::var("CLAUDE_CODE_SESSION_ID").ok().filter(|s| !s.is_empty())
+}
+
+/// The session sending as `origin`, recorded on what it sends (BO-05, F12d): this process's session when it holds that
+/// title now, else empty. A process sending as a title it does not hold (a script's `--from chris`) records nothing, so
+/// a notice about what it sent goes to that title's holder.
+pub fn sending_session(origin: &str) -> String {
+    env_session_id()
+        .filter(|sid| session_registry::resolve(origin).is_some_and(|e| &e.session_id == sid))
+        .unwrap_or_default()
 }
 
 // ─── Helpers ─────────────────────────────────────────────────
@@ -657,6 +767,73 @@ pub fn age_str(ts: &str) -> String {
     }
 }
 
+/// When a relay item was sent, as a reader names it: `14:05` today, `10-01 14:05` before today, `?` unreadable. The
+/// hooks show pings with this rather than an age, which goes stale the moment it is printed (BO-04).
+pub fn clock(ts: &str) -> String {
+    let Some(t) = parse_ts(ts) else {
+        return "?".into();
+    };
+    if t.date_naive() == chrono::Local::now().date_naive() {
+        t.format("%H:%M").to_string()
+    } else {
+        t.format("%m-%d %H:%M").to_string()
+    }
+}
+
+/// The one word the operator's surfaces use for a session row's liveness, and
+/// the single place the threshold is applied. Extracted verbatim from
+/// `board.rs`'s inline derivation so both surfaces stop deriving it separately
+/// and a row cannot contradict itself between two columns.
+pub fn liveness_word(last_heartbeat: &str) -> &'static str {
+    match parse_ts(last_heartbeat) {
+        Some(t) if (chrono::Local::now() - t).num_seconds() < IDLE_AFTER_SECS => "live",
+        // A stale heartbeat means the seat has not acted recently. It never
+        // means the seat is gone: nothing in this module removes a session row.
+        Some(_) => "idle",
+        // A heartbeat we cannot read is not evidence of anything.
+        None => "unknown",
+    }
+}
+
+/// The "Last seen" cell. A live seat shows the bare age, as it always has.
+pub fn liveness_label(last_heartbeat: &str) -> String {
+    match liveness_word(last_heartbeat) {
+        "live" => age_str(last_heartbeat),
+        w => format!("{w} ({})", age_str(last_heartbeat)),
+    }
+}
+
+/// The "Last seen" cell for a BOARD row, which needs one fact `liveness_label`
+/// does not have: which session actually holds this title right now.
+///
+/// A store row is keyed on the TITLE, not the session. When a seat retires its
+/// row stays behind, and the next seat to take that title refreshes the
+/// heartbeat without rewriting the binding. The row then reads fresh while
+/// pointing at a session that ended weeks ago.
+pub fn row_liveness(
+    row_session: Option<&str>,
+    live_session: Option<&str>,
+    last_heartbeat: &str,
+) -> String {
+    match (row_session, live_session) {
+        // The row was written by a session that no longer holds this title.
+        // Its age is true about THAT session, and a reader will take it for
+        // this one, so the age is not reported at all. Report the observable,
+        // refuse the inference.
+        (Some(row), Some(live)) if row != live => {
+            format!("row from another session ({})", short_id(row))
+        }
+        _ => liveness_label(last_heartbeat),
+    }
+}
+
+/// First segment of a session uuid — enough to recognise, short enough for a
+/// table cell.
+fn short_id(session: &str) -> &str {
+    session.split('-').next().unwrap_or(session)
+}
+
+
 fn escape_nq(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
@@ -700,9 +877,112 @@ pub(crate) fn scrub_shell_env() {
     });
 }
 
+/// The prefix a ping carries when its sender holds no relay title.
+///
+/// A literal, because the CLI matches on it to decide whether to warn, and a
+/// typo in either copy would silence the warning without failing anything.
+pub const UNREGISTERED: &str = "unregistered";
+
+/// The sender title a ping is recorded under. **NEVER EMPTY, and that is the
+/// whole point of this function existing.**
+///
+/// It used to be empty in three separate cases: `--from ""`, a session holding
+/// no title, and a session whose id resolved to no title. The hub files a ping
+/// under a thread named after its sender, so an empty sender produced a thread
+/// file called `.jsonl` — a **dotfile**. Both `ls` and a `*.jsonl` glob skip
+/// leading-dot names, so every routine listing of that directory read clean
+/// while **492 nameless pings to `chris` accumulated in it between 2026-08-20
+/// and 2026-09-18** (62 on the win side, 430 on the wsl side, measured
+/// 2026-09-21). They stayed readable only because every session writes its own
+/// codename into the message text by convention. The field meant to carry it
+/// was empty every time.
+///
+/// **Delivery is preserved deliberately.** Refusing the send would break a child
+/// that pings before it registers, which is a real boot sequence. The ping goes
+/// through; it just carries something that identifies the sender instead of
+/// nothing. An unattributable ping that arrives is worse than a named one that
+/// arrives, and better than a refused one that does not.
+///
+/// An explicit `--from` that is empty or whitespace falls through rather than
+/// short-circuiting, because `--from ""` was one of the three ways in.
+pub fn resolve_origin(
+    explicit: Option<&str>,
+    titles: &[String],
+    session_id: Option<&str>,
+) -> String {
+    if let Some(f) = explicit.map(str::trim).filter(|f| !f.is_empty()) {
+        return f.to_string();
+    }
+    if let Some(t) = titles.iter().map(|t| t.trim()).find(|t| !t.is_empty()) {
+        return t.to_string();
+    }
+    match session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        // Eight characters is what the registry prints and what a reader
+        // recognises; `chars()` rather than a byte slice so a non-ASCII id
+        // cannot panic on a split boundary.
+        Some(sid) => format!("{UNREGISTERED}-{}", sid.chars().take(8).collect::<String>()),
+        None => UNREGISTERED.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── resolve_origin: one named leg per way an empty sender used to get in ──
+
+    #[test]
+    fn an_explicit_sender_wins_when_it_is_a_real_name() {
+        let t = vec!["registered".to_string()];
+        assert_eq!(resolve_origin(Some("typed"), &t, Some("sess-1")), "typed");
+    }
+
+    #[test]
+    fn an_empty_explicit_sender_falls_through_to_the_registered_title() {
+        // `--from ""` was one of the three ways in: it used to short-circuit as
+        // vec![""] and be taken as the sender verbatim.
+        let t = vec!["registered".to_string()];
+        assert_eq!(resolve_origin(Some(""), &t, Some("sess-1")), "registered");
+        assert_eq!(resolve_origin(Some("   "), &t, Some("sess-1")), "registered");
+    }
+
+    #[test]
+    fn a_blank_title_in_the_registry_is_skipped_not_used() {
+        let t = vec![String::new(), "real".to_string()];
+        assert_eq!(resolve_origin(None, &t, Some("sess-1")), "real");
+    }
+
+    #[test]
+    fn no_title_at_all_is_attributed_to_the_session_not_to_nothing() {
+        assert_eq!(
+            resolve_origin(None, &[], Some("44f77c06-799f-43c2")),
+            "unregistered-44f77c06"
+        );
+    }
+
+    #[test]
+    fn no_title_and_no_session_id_still_names_itself() {
+        assert_eq!(resolve_origin(None, &[], None), "unregistered");
+        assert_eq!(resolve_origin(None, &[], Some("  ")), "unregistered");
+    }
+
+    #[test]
+    fn the_property_that_matters_is_that_it_is_never_empty() {
+        // The 492 records came from an empty string reaching the hub. No input
+        // combination may produce one.
+        let blank = [String::new(), "  ".to_string()];
+        for explicit in [None, Some(""), Some("  ")] {
+            for titles in [&[][..], &blank[..]] {
+                for sid in [None, Some(""), Some("sess")] {
+                    let got = resolve_origin(explicit, titles, sid);
+                    assert!(
+                        !got.trim().is_empty(),
+                        "empty sender from explicit={explicit:?} titles={titles:?} sid={sid:?}"
+                    );
+                }
+            }
+        }
+    }
 
     fn store(dir: &Path) -> RelayStore {
         let s = RelayStore {
@@ -909,5 +1189,136 @@ mod tests {
 
         let root = relay_root(&wt).expect("worktree should resolve main relay root");
         assert_eq!(root, main.join(".base").join("relay"));
+    }
+
+    /// Chris, 2026-09-20, verbatim: "I dont care about retired sessions, I dont
+    /// want idles being labeled dead. period."
+    ///
+    /// A stale heartbeat means the seat has not made a tool call recently. It
+    /// does NOT mean the session is gone: there is no code path in `src/relay`
+    /// that removes a session row (the only `.remove(` is `claims.remove`), so
+    /// a row that exists was never dead. Measured 2026-09-20: the board printed
+    /// `DEAD (16h)` for `auk` beside `Watching OK` while its wake sentinel was
+    /// 0s old, and a ping sent to it landed seconds later.
+    #[test]
+    fn an_idle_seat_is_never_labelled_dead() {
+        let fresh = now_iso();
+        let stale = (chrono::Local::now() - chrono::Duration::hours(16))
+            .format("%Y-%m-%dT%H:%M:%S%z")
+            .to_string();
+
+        assert_eq!(liveness_word(&fresh), "live", "a fresh heartbeat is live");
+        assert_eq!(
+            liveness_word(&stale), "idle",
+            "a stale heartbeat is IDLE, never dead"
+        );
+
+        let label = liveness_label(&stale);
+        assert!(
+            !label.to_uppercase().contains("DEAD"),
+            "an idle seat was labelled dead: {label}"
+        );
+        assert!(
+            label.starts_with("idle ("),
+            "expected `idle (<age>)`, got `{label}`"
+        );
+
+        // A live seat keeps the bare age it has always shown.
+        assert_eq!(liveness_label(&fresh), age_str(&fresh));
+
+        // An unreadable heartbeat is UNKNOWN. A reader that cannot see must say
+        // so, never report a death it did not measure.
+        assert_eq!(liveness_word("not-a-timestamp"), "unknown");
+        assert!(!liveness_label("not-a-timestamp").to_uppercase().contains("DEAD"));
+    }
+
+    /// The threshold must sit ABOVE the wake-monitor re-arm cycle, or a
+    /// correctly parked seat reads idle for most of every cycle and the label
+    /// fires during normal operation rather than on a fault. Measured
+    /// 2026-09-20: the threshold was 15 min against a 30 min cycle.
+    #[test]
+    fn the_idle_threshold_clears_the_wake_rearm_cycle() {
+        const WAKE_REARM_SECS: i64 = 30 * 60;
+
+        // A const block, not a plain assert!: both sides are constants, so a
+        // runtime assertion here is folded away and clippy is right to call it
+        // out (assertions_on_constants). In a const block the same invariant
+        // fails the BUILD rather than a test run, which is strictly stronger —
+        // the threshold cannot be lowered under the re-arm cycle at all.
+        const _: () = assert!(
+            IDLE_AFTER_SECS > WAKE_REARM_SECS,
+            "IDLE_AFTER_SECS must exceed the 30-minute wake re-arm cycle, or a \
+             correctly parked seat reads idle for most of every cycle"
+        );
+
+        // A seat that acted one full re-arm cycle ago is still live.
+        let one_cycle_ago = (chrono::Local::now()
+            - chrono::Duration::seconds(WAKE_REARM_SECS + 60))
+            .format("%Y-%m-%dT%H:%M:%S%z")
+            .to_string();
+        assert_eq!(liveness_word(&one_cycle_ago), "live");
+    }
+
+    /// RANK B. A board row is keyed on the TITLE. When a seat retires its row
+    /// stays behind, and the next seat to claim that title refreshes the
+    /// heartbeat without rewriting the session binding.
+    ///
+    /// Measured 2026-09-20: the `auk` row in
+    /// `.base/relay/skyrim-companion/registry.json` carried session
+    /// `8ae4d5d3-6838-47e1-a519-350605f76907` and rendered "last seen 7s,
+    /// Watching yes", while the live `auk` was `ffe5735e-...`. Chris reads a
+    /// healthy row and learns nothing is wrong. ABSENT IS VISIBLE;
+    /// PRESENT-AND-WRONG IS NOT.
+    ///
+    /// Inherits the ruled principle rather than inventing one: report the
+    /// observable, refuse the inference. The age is true about a DIFFERENT
+    /// session, so it is not reported as this one's.
+    #[test]
+    fn a_row_bound_to_a_dead_session_does_not_report_that_sessions_age() {
+        let fresh = now_iso();
+
+        let stale = row_liveness(Some("8ae4d5d3"), Some("ffe5735e"), &fresh);
+        assert!(
+            !stale.contains("live"),
+            "a row from another session must not read as live: {stale}"
+        );
+        assert!(
+            stale.contains("8ae4d5d3") || stale.to_lowercase().contains("other session"),
+            "the mismatch must be stated, not papered over: {stale}"
+        );
+        assert_ne!(
+            stale,
+            liveness_label(&fresh),
+            "a mismatched row must not render the same cell as a matching one"
+        );
+
+        // A row that DOES hold the title renders exactly as before. The fix
+        // must not disturb the ordinary case.
+        assert_eq!(
+            row_liveness(Some("ffe5735e"), Some("ffe5735e"), &fresh),
+            liveness_label(&fresh)
+        );
+    }
+
+    /// Negative control for RANK B: with nothing to compare against there is no
+    /// mismatch to report, so the ordinary cell stands. A reader that flagged
+    /// every row would be as useless as one that flagged none.
+    #[test]
+    fn a_row_with_nothing_to_compare_against_is_not_flagged() {
+        let fresh = now_iso();
+
+        // No live binding for the title: nothing to disagree with.
+        assert_eq!(row_liveness(Some("abc"), None, &fresh), liveness_label(&fresh));
+
+        // Neither side is bound: nothing to disagree with.
+        assert_eq!(row_liveness(None, None, &fresh), liveness_label(&fresh));
+
+        // DIFFERENT CASE FROM THE OTHER TWO, and deliberately so (auk, 2026-09-20).
+        // A live session DOES hold this title; only the row cannot be tied to
+        // it. The age is reported because it is true about the TITLE being
+        // active, which is what the column claims. It is not a statement about
+        // which session wrote the row, and no mismatch has been observed —
+        // an unbound row is not evidence of a stale one.
+        assert_eq!(row_liveness(None, Some("abc"), &fresh), liveness_label(&fresh));
     }
 }

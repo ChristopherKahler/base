@@ -11,7 +11,7 @@ use base::scope;
 #[derive(Parser)]
 #[command(
     name = "base",
-    version,
+    version = base::BUILD_VERSION,
     about = "BASE — Proactive context-injection engine for Claude Code",
     after_help = "Drop-in plugin commands (from extensions): run `base ext list`\n\n\
                   Docs: https://docs.basemode.ai\n\
@@ -26,6 +26,48 @@ pub struct Cli {
 pub enum HooksAction {
     /// Print the hook command table as JSON, for an installer outside base
     Manifest,
+    /// Print one block of this session's last prompt-hook output, exactly as the hook built it. A block the
+    /// [budget] dropped names this command on its pointer line. With no block, list the last prompt's blocks.
+    Show {
+        /// The block's name, as the pointer line gives it (e.g. global-context, relay-wake)
+        block: Option<String>,
+        /// Session id override (defaults to CLAUDE_CODE_SESSION_ID)
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LogAction {
+    /// What each prompt and file touch matched, by what, and what was served and cut: the last rows of
+    /// .base/match-log.jsonl, oldest first
+    Matches {
+        /// How many rows
+        #[arg(long, default_value_t = 20)]
+        last: usize,
+        /// Only this session's rows (an id, or the start of one)
+        #[arg(long)]
+        session: Option<String>,
+        /// Only rows that served or cut this rule or decision (its id, or the start of one, as --json shows it)
+        #[arg(long)]
+        rule: Option<String>,
+        /// Print the rows as JSON, one per line
+        #[arg(long)]
+        json: bool,
+    },
+    /// What base noticed as possible corrections: a session's signal rows, or a transcript read turn by turn as the
+    /// hooks read it
+    Corrections {
+        /// This session's rows (an id, or the start of one); the default is the session running the command
+        #[arg(long)]
+        session: Option<String>,
+        /// Read this transcript turn by turn instead of the logged rows
+        #[arg(long, conflicts_with = "session")]
+        transcript: Option<String>,
+        /// Print JSON, one object per line
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -39,6 +81,11 @@ pub enum Commands {
     Hooks {
         #[command(subcommand)]
         action: HooksAction,
+    },
+    /// Read base's own logs: `base log matches` shows what prompts and file touches matched
+    Log {
+        #[command(subcommand)]
+        action: LogAction,
     },
     /// Query AST codebase graph (entities, calls, imports)
     #[command(visible_alias = "a")]
@@ -219,6 +266,31 @@ pub enum Commands {
         #[arg(long)]
         cursor: bool,
     },
+    /// The rule pass: read the sessions since the last pass and write rule proposals for base rule review (keyword gap,
+    /// rewrite, new rule, drop keyword, merge, split, retire). Nothing is applied. Uses headless Claude on Haiku
+    Tune {
+        /// Show what it would read and how many Haiku calls it would make; call nothing, write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Read this session instead of the ones due (repeatable)
+        #[arg(long)]
+        session: Vec<String>,
+        /// Read this transcript as a session instead of the ones due (repeatable)
+        #[arg(long)]
+        transcript: Vec<String>,
+        /// Run the store check (merge, split, drop keyword, retire) even when it ran in the last day
+        #[arg(long)]
+        store: bool,
+        /// Haiku calls this pass makes at most; sessions past it wait for the next pass
+        #[arg(long, default_value_t = base::corrections::tune_pass::DEFAULT_MAX_CALLS)]
+        max_calls: usize,
+    },
+    /// Shadow mode: run a candidate matcher beside the live one on every prompt and file touch, judge it by the
+    /// corrections that follow, and promote it or roll it back. Nothing runs until a shadow is started
+    Shadow {
+        #[command(subcommand)]
+        action: ShadowAction,
+    },
     /// Manage rules in the graph (add, list, remove)
     Rule {
         /// Target the global tier (~/.base-gbl/) instead of workspace.
@@ -248,6 +320,12 @@ pub enum Commands {
         /// Skip the starter star commands without asking
         #[arg(long, conflicts_with = "starter_commands")]
         no_starter_commands: bool,
+        /// Add the line that asks the AI to start a corrected reply with CORRECTED: to ~/.claude/CLAUDE.md, without asking
+        #[arg(long)]
+        corrections_line: bool,
+        /// Leave CLAUDE.md without that line, without asking; session start carries it instead
+        #[arg(long, conflicts_with = "corrections_line")]
+        no_corrections_line: bool,
     },
     /// What to read once base is installed: workspaces, relay, star commands, CARL
     #[command(long_about = base::first_run::GETTING_STARTED)]
@@ -286,6 +364,11 @@ pub enum Commands {
     Scaffold {
         /// Target directory (defaults to cwd)
         path: Option<String>,
+    },
+    /// Deferral upgrade migration (rank 09): preview, apply, or roll back
+    Defer {
+        #[command(subcommand)]
+        action: DeferAction,
     },
     /// Reconcile project active/deferred state from real folder last-touch
     Reconcile {
@@ -341,9 +424,37 @@ pub enum Commands {
         /// Self-heal: quarantine malformed lines and atomically rewrite the good set (backs up first)
         #[arg(long)]
         repair: bool,
-        /// Restore the workspace graph from a backup snapshot. Bare `--restore` lists snapshots.
+        /// Put back a backup base made: a graph snapshot (`graph.nq.bak-*`) in a tier's .base, or a
+        /// `<name>.toml.BAK-<date>-pre-<version>` an upgrade left beside a config file. A bare name is a workspace
+        /// snapshot. Bare `--restore` lists the workspace's snapshots. Anything else is refused.
         #[arg(long, num_args = 0..=1)]
         restore: Option<Option<String>>,
+        /// Plan the repair of what doctor reports and change nothing: records of another workspace moved out,
+        /// corrections linked to the one record they name (the rest stay corrections), supersession disagreements
+        /// settled, `[signal] max_chars` migrated, each tier compacted and its backups cut to `[graph] keep_backups`.
+        /// `--fix --yes` applies the plan, snapshotting each graph first.
+        #[arg(long, conflicts_with_all = ["repair", "restore"])]
+        fix: bool,
+        /// With `--fix`: apply the plan.
+        #[arg(long, requires = "fix")]
+        yes: bool,
+        /// Measure how much hook text the running Claude Code delivers to the model (session start, prompt submit,
+        /// pre-tool) with headless `claude -p` calls on a cheap model, then write each hook's budget and
+        /// `measured_on` to ~/.base-gbl/base.toml. Up to 12 calls per hook.
+        #[arg(long, conflicts_with_all = ["json", "repair", "restore", "fix"])]
+        measure: bool,
+        /// Internal: `emit` prints one measure payload. The hooks `--measure` registers run it.
+        #[arg(requires = "measure", value_parser = ["emit"], hide = true)]
+        measure_step: Option<String>,
+        /// Internal (`--measure emit`): the hook the payload is for.
+        #[arg(long, requires = "measure_step", hide = true)]
+        hook: Option<String>,
+        /// Internal (`--measure emit`): the payload's size in bytes.
+        #[arg(long, requires = "measure_step", hide = true)]
+        bytes: Option<usize>,
+        /// Internal (`--measure emit`): the payload's nonce.
+        #[arg(long, requires = "measure_step", hide = true)]
+        nonce: Option<String>,
     },
     /// First-class graph maintenance (atomic, backs up first — never hand-edit graph.nq)
     Graph {
@@ -391,9 +502,14 @@ pub enum GraphAction {
     /// unhealthy when the hook tried — telling an operator about a problem they
     /// cannot then act on is worse than not telling them. Repair, then run this.
     Migrate {
-        /// Show what would be linked, and by which source, without writing.
+        /// Show what would be linked, and by which source, and the store repair `base doctor --fix` plans, without
+        /// writing.
         #[arg(long)]
         dry_run: bool,
+        /// Also apply the store repair (the one `base doctor --fix --yes` applies). Without it the repair is planned
+        /// and printed, and only the domain links are written.
+        #[arg(long, conflicts_with = "dry_run")]
+        yes: bool,
     },
     /// Apply inbound fact ops (JSON on stdin) into the local graph.
     ///
@@ -518,6 +634,29 @@ pub enum SecretAction {
 }
 
 #[derive(Subcommand)]
+pub enum DeferAction {
+    /// Reset the activity clock on records that would otherwise defer on upgrade.
+    ///
+    /// With no flag this PREVIEWS and writes nothing. That is D1, and it survives K13: Part G holds
+    /// two migrations and the rule migration next door already writes nothing until the operator
+    /// approves (G4 step 3). K13 changed what this migration does, not whether it asks.
+    Migrate {
+        /// Perform the reset. Without this nothing is written.
+        #[arg(long)]
+        apply: bool,
+        /// Restore every tier this migration wrote, from the snapshot taken before it wrote.
+        #[arg(long)]
+        rollback: bool,
+        /// Stage it: touch at most N records.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Stage it: only records at least D days cold.
+        #[arg(long)]
+        older_than: Option<i64>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum WorkspaceAction {
     /// Regenerate the registered-workspaces block in ~/.claude/CLAUDE.md from base.toml
     Sync,
@@ -611,6 +750,9 @@ pub enum CommandAction {
     Show {
         /// Command name (case-insensitive, without *)
         name: String,
+        /// Show the command as this version of base ships it in the starter pack, not your own copy
+        #[arg(long)]
+        shipped: bool,
     },
     /// Add a new star command to commands.toml
     Add {
@@ -711,14 +853,22 @@ pub enum ProjectAction {
         name: String,
         #[arg(short, long, default_value = "active")]
         status: String,
-        /// Project path (workspace-relative). If omitted and [protocol] is enabled,
-        /// the folder is derived from the protocol stage and auto-created.
+        /// Project folder: absolute, or relative to the workspace root; stored absolute. If omitted and
+        /// [protocol] is enabled, the folder is derived from the protocol stage and auto-created.
         #[arg(short, long)]
         path: Option<String>,
         /// Protocol lifecycle stage the project starts in (default: first stage).
         #[arg(long)]
         stage: Option<String>,
+        /// The project this one sits inside (a registered project's slug)
+        #[arg(long)]
+        parent: Option<String>,
+        /// true: work in this project also carries its parent's rules (default false)
+        #[arg(long)]
+        nested: Option<bool>,
     },
+    /// List deferred projects: open but paused, not listed at session start
+    Deferred,
     /// List projects (defaults to the current workspace; cross-awareness via flags)
     #[command(visible_alias = "l")]
     List {
@@ -767,8 +917,39 @@ pub enum ProjectAction {
         status: Option<String>,
         #[arg(short, long)]
         blocked_by: Option<String>,
+        /// The project's next step; records when it was written
         #[arg(long)]
         next_action: Option<String>,
+        /// The project's folder: absolute, or relative to the workspace root; stored absolute.
+        /// Its domain's path trigger moves with it.
+        #[arg(long)]
+        path: Option<String>,
+        /// The project this one sits inside (a registered project's slug); `none` removes the link
+        #[arg(long)]
+        parent: Option<String>,
+        /// true: work in this project also carries its parent's rules; false: it does not (the default)
+        #[arg(long)]
+        nested: Option<bool>,
+    },
+    /// Find each project's real folder: --suggest proposes one, with the evidence, for every project whose
+    /// folder is missing, not a folder, too broad or contradicted by its own docs; --apply writes a reviewed list
+    #[command(group(clap::ArgGroup::new("mode").required(true).args(["suggest", "apply"])))]
+    Paths {
+        /// List the suggestions (writes nothing)
+        #[arg(long)]
+        suggest: bool,
+        /// With --suggest: also write them as a list to review and pass to --apply
+        #[arg(long, requires = "suggest")]
+        out: Option<std::path::PathBuf>,
+        /// Set each project in a reviewed list (`slug = "folder"` lines) to its folder
+        #[arg(long)]
+        apply: Option<std::path::PathBuf>,
+        /// With --apply: say what would change and write nothing
+        #[arg(long, requires = "apply")]
+        dry_run: bool,
+        /// Emit JSON instead of a table
+        #[arg(long)]
+        json: bool,
     },
     /// Re-home a project to another workspace graph (node + tasks + domain +
     /// decisions/rules/notes). AST regenerates at the destination. PREVIEW unless --yes.
@@ -800,6 +981,17 @@ pub enum ProjectAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Rename a project and its same-named domain in every tier (records, rules, decisions, tasks, domains.toml).
+    /// The old name stays an alias: commands that name it still reach the project. PREVIEW unless --yes.
+    Rename {
+        /// The project's slug or display name now
+        old: String,
+        /// The new name: lowercase letters, digits and dashes
+        new: String,
+        /// Apply the rename (without it, prints the plan and writes nothing)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -815,6 +1007,8 @@ pub enum MilestoneAction {
         #[arg(short, long)]
         description: Option<String>,
     },
+    /// List deferred milestones: open but paused, not listed at session start
+    Deferred,
     /// List milestones (optionally filtered by project)
     #[command(visible_alias = "l")]
     List {
@@ -870,6 +1064,8 @@ pub enum TaskAction {
         #[arg(short, long)]
         milestone: Option<String>,
     },
+    /// List deferred tasks: open but paused, not listed at session start
+    Deferred,
     /// List tasks (filter by project, milestone, or label)
     #[command(visible_alias = "l")]
     List {
@@ -966,6 +1162,14 @@ pub enum DecisionAction {
         #[arg(long)]
         json: bool,
     },
+    /// Show one decision by its {domain}.{decision} slug
+    Show {
+        /// Decision slug ({domain}.{decision})
+        slug: String,
+        /// Emit JSON instead of the human field list
+        #[arg(long)]
+        json: bool,
+    },
     /// Delete decisions matching a keyword
     Delete {
         /// Keyword to match against decision names
@@ -985,6 +1189,11 @@ pub enum DecisionAction {
         recall: Option<String>,
         #[arg(short, long)]
         status: Option<String>,
+        /// Comma-separated words or phrases that replace the decision's keywords ("" clears them). A decision
+        /// of an always-on domain such as GLOBAL reaches a prompt only when the prompt contains one of them;
+        /// with none it is shown at session start only.
+        #[arg(long)]
+        keywords: Option<String>,
     },
 }
 
@@ -1037,6 +1246,19 @@ pub enum GoalAction {
         #[arg(long)]
         target: Option<String>,
     },
+}
+
+/// `arg` as a reminder slug. A number the last session start printed in DUE NOW becomes the slug it
+/// printed under, and the line says which, so the reminder acted on is never a guess; anything else
+/// is taken as the slug itself.
+fn reminder_slug(cwd: &std::path::Path, arg: &str) -> String {
+    match crud::handoff_show::reminder_number(cwd, arg) {
+        Some(r) => {
+            println!("DUE NOW {arg} is '{}' (session start at {})", r.slug, r.written_at);
+            r.slug
+        }
+        None => arg.to_string(),
+    }
 }
 
 /// Parse a relative duration like "30s", "3m", "2h", "1d".
@@ -1092,15 +1314,36 @@ pub enum ReminderAction {
         #[arg(long = "in")]
         in_dur: Option<String>,
     },
-    /// List all reminders
-    List,
+    /// List reminders
+    List {
+        /// List archived reminders instead of the live ones
+        #[arg(long)]
+        archived: bool,
+    },
+    /// Move a reminder's surface time forward from now: 30s, 3m, 2h, 1d
+    Snooze {
+        /// The reminder's slug, or its number in the last session start's DUE NOW
+        slug: String,
+        duration: String,
+    },
+    /// Archive a reminder: it stops surfacing and is kept. `remove` deletes.
+    Archive {
+        /// The reminder's slug, or its number in the last session start's DUE NOW
+        slug: String,
+    },
+    /// Bring an archived reminder back: it surfaces from its own time, or from now if that has passed
+    Unarchive {
+        /// The reminder's slug (`base reminder list --archived` prints it)
+        slug: String,
+    },
     /// Remove a reminder (hard delete)
     Remove { slug: String },
 }
 
 #[derive(Subcommand)]
 pub enum HandoffAction {
-    /// Register a handoff doc (archives the project's prior open or deferred handoff in every tier)
+    /// Register a handoff doc (archives the earlier open or deferred handoff in the same project and lane, in every
+    /// tier; other lanes' handoffs stay open)
     Create {
         #[arg(long)]
         project: String,
@@ -1109,13 +1352,32 @@ pub enum HandoffAction {
         /// Graph slug / title to summon it by (default: doc basename)
         #[arg(long)]
         slug: Option<String>,
+        /// The lane this handoff continues, for a lane several sessions hand back and forth. Default: the author's
+        /// codename (the doc's by:, else the codename in a <date>-<codename>-<project> slug, else this session's
+        /// relay title)
+        #[arg(long)]
+        lane: Option<String>,
     },
     /// List handoffs across global + workspace tiers
     List,
+    /// Find one open or deferred handoff and print its doc path. Takes a letter from the last session
+    /// start (A-J), a key from `base handoff deferred` (D1, D2, ...), a slug, a project name, or a few
+    /// words. A deferred match comes back to open, the only write it makes. Several matches are listed
+    /// and none is picked (exit 2); no match exits 1.
+    Show {
+        /// A letter, a slug, a project name, or loose words
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+    },
+    /// List deferred handoffs: open but paused, so session start does not list them. Each line
+    /// carries a key (D1, D2, ...) that `base handoff show` takes, and the command that brings it back.
+    Deferred,
     /// Snooze a handoff for N days (hide until then)
     Snooze { slug: String, days: i64 },
-    /// Archive a handoff (stop resurfacing)
+    /// Archive a handoff (stop resurfacing; `unarchive` undoes it)
     Archive { slug: String },
+    /// Undo an archive: set an archived handoff back to open, in the tier that holds it
+    Unarchive { slug: String },
 }
 
 #[derive(Subcommand)]
@@ -1132,12 +1394,76 @@ pub enum ForkAction {
     },
     /// List forks across global + workspace tiers
     List,
+    /// Find one fork by its title, project or a few words and print its doc path. A deferred fork
+    /// it finds comes back to open. Several matches are listed and none is picked (exit 2); no match
+    /// exits 1.
+    Show {
+        /// A key from `base fork deferred`, a title, a project name, or loose words
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+    },
+    /// List deferred forks: open but paused. Each line carries a key `base fork show` takes.
+    Deferred,
     /// Snooze a fork for N days (hide until then)
     Snooze { slug: String, days: i64 },
-    /// Archive a fork (stop resurfacing)
+    /// Archive a fork (stop resurfacing; `unarchive` undoes it)
     Archive { slug: String },
+    /// Undo an archive: set an archived fork back to open, in the tier that holds it
+    Unarchive { slug: String },
 }
 
+/// `base shadow` (BO-20, K9).
+#[derive(Subcommand)]
+pub enum ShadowAction {
+    /// Start a candidate beside live: a matcher (--matcher, with any of the admission settings) or pending proposals
+    /// (--from-proposals). One at a time; live is snapshotted as it is
+    Start {
+        /// The candidate's matcher: bm25, or keyword-only ([match] bm25 = false)
+        #[arg(long, value_parser = ["bm25", "keyword-only"], required_unless_present = "from_proposals")]
+        matcher: Option<String>,
+        /// The candidate's [match] min_score: a rule no keyword brought is served at this BM25 score
+        #[arg(long)]
+        min_score: Option<f32>,
+        /// The candidate weighs each term of a score admission down by how common it is in your last 1,000 typed
+        /// prompts ([match] prompt_idf)
+        #[arg(long)]
+        prompt_idf: bool,
+        /// The candidate admits a rule on its score only when it shares this many distinct terms with the prompt, or one
+        /// two-word term ([match] min_terms)
+        #[arg(long)]
+        min_terms: Option<usize>,
+        /// The candidate admits a rule on its score only at or over this share of the prompt's best rule score, 0.5 for
+        /// half ([match] relative)
+        #[arg(long)]
+        relative: Option<f32>,
+        /// Pending proposals to run as the candidate, comma-separated: p-0001,p-0002
+        #[arg(long, value_delimiter = ',', conflicts_with_all = ["matcher", "min_score", "prompt_idf", "min_terms", "relative"])]
+        from_proposals: Vec<String>,
+    },
+    /// End the running candidate without promoting it; live is unchanged and its rows stay
+    Stop,
+    /// The candidate against live since it started: events, where they differ, wins, losses, and whether it can be
+    /// promoted. Read only
+    Report {
+        /// Emit JSON, every added and dropped rule listed
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make the candidate live now, whatever the report says; or name an earlier version to make it live again
+    Promote {
+        /// A version base shadow report or session start named (keyword-0002, bm25-0003)
+        version: Option<String>,
+        /// Apply a proposal its replay flags TOO BROAD (show the user the replay first)
+        #[arg(long)]
+        broad_ok: bool,
+    },
+    /// Undo the last promotion: the version live had before it is restored
+    Rollback,
+}
+
+// `rule add`'s flags (P7 added `--path`) make its variant the large one. Parsed once per process, so the size costs
+// nothing, and boxing a clap variant would only make the match below harder to read.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum RuleAction {
     /// Add a rule to a domain in the graph
@@ -1160,6 +1486,10 @@ pub enum RuleAction {
         /// A folder, or a file the rule names (repeatable). Makes it a place rule
         #[arg(long)]
         place: Vec<String>,
+        /// A file or folder the rule is scoped to (repeatable): stored as its full path, the rule fires only when
+        /// that file or something under that folder is touched. For a project's domain it lies inside the project
+        #[arg(long)]
+        path: Vec<String>,
         /// A tool name, MCP tools included (repeatable). Makes it an action rule
         #[arg(long)]
         tool: Vec<String>,
@@ -1169,6 +1499,146 @@ pub enum RuleAction {
         /// Topic words and phrases, comma-separated: "ping chris, relay ping". Makes it a topic rule
         #[arg(long)]
         words: Option<String>,
+        /// Words from the user's prompt that should bring this rule back, comma-separated: the rule's own topic
+        /// words, as --words. Required with --fires-on inside a Claude Code session (CLAUDECODE=1). A rule with words
+        /// of its own is served on them, and on the paths it names with --path, never through its domain's keywords
+        /// or folder: for a rule about file work, give --path as well
+        #[arg(long)]
+        keywords: Option<String>,
+        /// A prompt that must serve this rule (repeatable, at most 3); `base rule test` checks it
+        #[arg(long)]
+        fires_on: Vec<String>,
+        /// A prompt that must not serve this rule (repeatable, at most 2); `base rule test` checks it
+        #[arg(long)]
+        quiet_on: Vec<String>,
+    },
+    /// Turn a correction into a pending rule proposal: read the turn (the prompt, the AI's marker, the signals) and
+    /// sort it as a keyword gap, a rewrite or a new rule
+    Propose {
+        /// Read the correction from this session's turn: its last prompt typed by a person, and the reply after it
+        #[arg(long)]
+        from_turn: bool,
+        /// The rule's wording: required for a new rule, the new wording for a rewrite
+        #[arg(long)]
+        text: Option<String>,
+        /// Words from the prompt that should bring the rule back, comma-separated (suggested from the prompt when left out)
+        #[arg(long)]
+        keywords: Option<String>,
+        /// The prompt the change must serve on, its first fires_on test (default: the turn's prompt)
+        #[arg(long)]
+        example: Option<String>,
+        /// The rule the correction is about, as `base rule list` prints it: <domain>.<id>
+        #[arg(long, conflicts_with_all = ["decision", "new"])]
+        rule: Option<String>,
+        /// The decision the correction is about: its slug
+        #[arg(long, conflicts_with = "new")]
+        decision: Option<String>,
+        /// No rule or decision base holds fits: propose a new rule
+        #[arg(long)]
+        new: bool,
+        /// The domain a new rule goes into (default: one the prompt matched, else the closest record's)
+        #[arg(long)]
+        domain: Option<String>,
+        /// Print the proposal and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Read this transcript instead of this session's
+        #[arg(long, requires = "from_turn")]
+        transcript: Option<String>,
+        /// The n-th prompt typed by a person in the transcript, instead of the last
+        #[arg(long, requires = "from_turn")]
+        prompt: Option<u32>,
+    },
+    /// Run a rule change over your recent prompts in the match log before it is approved: the prompts that would
+    /// start or stop serving it, and its share of all of them (TOO BROAD above [tune] broad_share)
+    Replay {
+        /// A proposal's id, p-0007
+        #[arg(conflicts_with_all = ["domain", "rule", "decision", "add_keyword", "drop_keyword"])]
+        proposal: Option<String>,
+        /// Change this domain's prompt keywords
+        #[arg(long, conflicts_with_all = ["rule", "decision"])]
+        domain: Option<String>,
+        /// Change this rule's own topic words: <domain>.<id>, as `base rule list` prints it
+        #[arg(long, conflicts_with = "decision")]
+        rule: Option<String>,
+        /// Change this decision's own keywords: its slug
+        #[arg(long)]
+        decision: Option<String>,
+        /// A keyword to add (repeatable, or a comma list)
+        #[arg(long)]
+        add_keyword: Vec<String>,
+        /// A keyword to drop (repeatable, or a comma list)
+        #[arg(long)]
+        drop_keyword: Vec<String>,
+    },
+    /// Review the pending rule proposals, each with the prompts behind it and its replay: one key each on a terminal
+    /// (a approve, e edit, r reject, s skip, q stop), or one of the flags
+    Review {
+        /// Apply this proposal and mark it approved
+        #[arg(long, conflicts_with_all = ["reject", "edit"])]
+        approve: Option<String>,
+        /// Mark this proposal rejected: the same change is never proposed again
+        #[arg(long, conflicts_with = "edit")]
+        reject: Option<String>,
+        /// With --reject: why
+        #[arg(long, requires = "reject")]
+        reason: Option<String>,
+        /// Apply this proposal with your changes (--text, --keywords) and mark it edited
+        #[arg(long)]
+        edit: Option<String>,
+        /// With --edit: the new wording
+        #[arg(long, requires = "edit")]
+        text: Option<String>,
+        /// With --edit: the keywords, comma-separated, replacing the proposed ones
+        #[arg(long, requires = "edit")]
+        keywords: Option<String>,
+        /// With --approve or --edit: apply a change its replay flags TOO BROAD (show the user the replay first)
+        #[arg(long)]
+        broad_ok: bool,
+    },
+    /// Serve a retired rule again: clear the retirement an approved retire proposal made
+    Unretire {
+        /// The rule, as `base rule list --include-superseded` prints it: <domain>.<id>
+        rule: String,
+    },
+    /// Add test prompts to a rule, where it lives (its domains.toml entry or its graph record)
+    Update {
+        /// The rule, as `base rule list` prints it: <domain>.<id> (the id, or its first 4 or more characters)
+        rule: String,
+        /// A prompt that must serve this rule (repeatable; a rule holds at most 3)
+        #[arg(long)]
+        fires_on: Vec<String>,
+        /// A prompt that must not serve this rule (repeatable; a rule holds at most 2)
+        #[arg(long)]
+        quiet_on: Vec<String>,
+        /// Empty both test lists first, then add what is given
+        #[arg(long)]
+        clear_tests: bool,
+        /// Mark the rule protected: a shadow candidate that loses it is never promoted automatically
+        #[arg(long, conflicts_with = "unprotected")]
+        protected: bool,
+        /// Clear the protected mark
+        #[arg(long)]
+        unprotected: bool,
+    },
+    /// Run every rule's test prompts through the prompt hook's matching: exit 1 on a miss or a false fire
+    Test {
+        /// Only this domain's rules
+        #[arg(long)]
+        domain: Option<String>,
+        /// Only this rule: <domain>.<id> or <id>
+        #[arg(long)]
+        rule: Option<String>,
+    },
+    /// Each rule's numbers from the match log: times served in the last [doctor] dead_days days and in all, times a
+    /// correction followed in the same or the next turn, and the day it was last served. Read only
+    Stats {
+        /// Only this domain's rules
+        #[arg(long)]
+        domain: Option<String>,
+        /// Emit JSON instead of the table
+        #[arg(long)]
+        json: bool,
     },
     /// List rules for a domain from the graph
     List {
@@ -1232,6 +1702,26 @@ pub enum DomainAction {
         keyword: Option<String>,
         #[arg(long)]
         path: Option<String>,
+    },
+    /// Make every path trigger an exact path, in both tiers: --suggest proposes one per domain (a project's domain
+    /// gets its project's folder; relative triggers are written out), --apply writes a reviewed list
+    #[command(group(clap::ArgGroup::new("mode").required(true).args(["suggest", "apply"])))]
+    Paths {
+        /// List the proposals (writes nothing)
+        #[arg(long)]
+        suggest: bool,
+        /// With --suggest: also write them as a list to review and pass to --apply
+        #[arg(long, requires = "suggest")]
+        out: Option<std::path::PathBuf>,
+        /// Set each listed domain's paths (and auto_inject) from a reviewed list
+        #[arg(long)]
+        apply: Option<std::path::PathBuf>,
+        /// With --apply: say what would change and write nothing
+        #[arg(long, requires = "apply")]
+        dry_run: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1303,6 +1793,12 @@ pub enum RelayAction {
         /// Peek without consuming
         #[arg(long)]
         peek: bool,
+        /// Include messages already seen (the hooks hide a sender's older messages behind its newest one)
+        #[arg(long)]
+        all: bool,
+        /// Only messages from this sender
+        #[arg(long)]
+        from: Option<String>,
         #[arg(long)]
         project: Option<String>,
     },
@@ -1384,7 +1880,7 @@ pub enum RelayAction {
         from: Option<String>,
     },
     /// Instant message to a live titled session — no doc, no done-ceremony.
-    /// Screams in the receiver's hooks mid-turn; their reply ping clears it.
+    /// Shown in the receiver's next prompt, or at once by its inbox watcher; their reply ping clears it.
     Ping {
         /// Target session's registered title
         #[arg(long)]
@@ -1404,10 +1900,20 @@ pub enum RelayAction {
         /// Task slug
         slug: String,
     },
-    /// List inbound relay tasks across all live sessions
-    Tasks,
+    /// List inbound relay tasks and pings across all live sessions, each with its message
+    Tasks {
+        /// Only items from this sender
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// List titled sessions in the global registry (liveness for `*task` targets)
     Sessions,
+    /// Print what to start this session's inbox watcher with: the Monitor tool's fields, the re-arm step, the status line
+    Arm {
+        /// The title to watch (defaults to every title this session holds)
+        #[arg(long = "as")]
+        title: Option<String>,
+    },
 }
 
 /// Resolve a user identifier (slug, display name, or mixed) to a canonical slug.
@@ -1438,6 +1944,12 @@ fn outside_workspace_note(cwd: &std::path::Path) {
     if base::config::find_workspace_base(cwd).is_none() {
         eprintln!("(no workspace here: searched the global tier only; run `base scaffold` in a project folder to create one)");
     }
+}
+
+/// `Error` for a project change refused before anything was written (F25c: `Error: loop: ...`), `Failed` for a
+/// write that went wrong.
+fn project_error_prefix(e: &anyhow::Error) -> &'static str {
+    if e.downcast_ref::<crud::project::Refused>().is_some() { "Error" } else { "Failed" }
 }
 
 fn die(prefix: &str, e: impl std::fmt::Display) -> ! {
@@ -1488,13 +2000,47 @@ fn no_global_config() -> ! {
     )
 }
 
+/// `base handoff unarchive` and `base fork unarchive` (BO-11, F18c): one line per tier that held the slug, and a
+/// failure when nothing was archived, so a no-op never reads as success (#72).
+fn unarchive_cli(noun: &str, cwd: &std::path::Path, ns: &base::config::NamespaceConfig, slug: &str) {
+    let home = base::home::home_root();
+    let found = match crud::handoff::unarchive(home.as_deref(), cwd, ns, slug) {
+        Ok(found) => found,
+        Err(e) => die("Failed", e),
+    };
+    if found.is_empty() {
+        die(
+            "Failed",
+            format!(
+                "no {noun} '{slug}' in either tier — nothing was unarchived. Searched:\n  {}",
+                crud::handoff::searched_tiers(home.as_deref(), cwd).join("\n  ")
+            ),
+        );
+    }
+    use crud::handoff::UnarchiveOutcome;
+    for t in &found {
+        match t.outcome {
+            UnarchiveOutcome::Reopened => println!("unarchived {slug} ({}): status archived -> open", t.tier),
+            UnarchiveOutcome::LeftArchived => println!(
+                "left {slug} ({}): still archived; another tier holds it open or holds a newer copy",
+                t.tier
+            ),
+            UnarchiveOutcome::NotArchived => println!("left {slug} ({}): status {}, not archived", t.tier, t.before),
+        }
+    }
+    if !found.iter().any(|t| t.outcome == UnarchiveOutcome::Reopened) {
+        die("Failed", format!("{noun} '{slug}' was not unarchived in any tier; nothing changed"));
+    }
+}
+
 /// Which tier a write targets: `-g/--global` swaps cwd for `~/.base-gbl`, so
 /// the global tier is something you opt into rather than something you land in
 /// (issue #8). Without the flag, tier-bound writes resolve from cwd and fail
 /// loudly outside a workspace instead of silently discarding.
 fn tier_cwd(cwd: &std::path::Path, global: bool) -> std::path::PathBuf {
     if !global {
-        return cwd.to_path_buf();
+        // Standing in `~/.base-gbl` without `-g` writes the workspace around it, not the global tier (BO-11, F22a).
+        return base::config::workspace_around_global_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
     }
     match base::home::home_root() {
         Some(h) => h.join(".base-gbl"),
@@ -1502,8 +2048,96 @@ fn tier_cwd(cwd: &std::path::Path, global: bool) -> std::path::PathBuf {
     }
 }
 
+/// The commands that change a rule, a domain's keywords, a rule's test prompts or a global decision's keywords, or that
+/// replace or move the graph holding them: each rebuilds the rule index (BO-18, K7e). Reading commands do not, nor a
+/// preview, nor `decision log` without `--supersedes` (a new decision has no keywords, so no scoring text), nor
+/// `base sync --ast` or `--repair`, which the hooks run after every turn and which touch no rule. The index is the cwd's
+/// tier's; another workspace's is rebuilt at its next session start.
+fn changes_prompt_matching(command: &Option<Commands>) -> bool {
+    match command {
+        Some(Commands::Rule { action, .. }) => matches!(
+            action,
+            RuleAction::Add { .. }
+                | RuleAction::Update { .. }
+                | RuleAction::Remove { .. }
+                | RuleAction::Unretire { .. }
+                | RuleAction::Review { .. }
+        ),
+        Some(Commands::Decision { action, .. }) => matches!(
+            action,
+            DecisionAction::Log { supersedes: Some(_), .. } | DecisionAction::Update { .. } | DecisionAction::Delete { .. }
+        ),
+        Some(Commands::Domain { action, .. }) => matches!(
+            action,
+            DomainAction::AddTrigger { .. }
+                | DomainAction::Sync { .. }
+                | DomainAction::Create { .. }
+                | DomainAction::Remove { .. }
+                | DomainAction::RemoveTrigger { .. }
+                | DomainAction::Paths { .. }
+        ),
+        Some(Commands::Graph { action }) => matches!(
+            action,
+            GraphAction::Supersede { .. }
+                | GraphAction::ApplyOps { .. }
+                | GraphAction::Purge { .. }
+                | GraphAction::Migrate { .. }
+                | GraphAction::Move { yes: true, dry_run: false, .. }
+        ),
+        Some(Commands::Project { action }) => matches!(
+            action,
+            ProjectAction::Rename { yes: true, .. }
+                | ProjectAction::Move { yes: true, dry_run: false, .. }
+                | ProjectAction::Delete { yes: true, .. }
+        ),
+        Some(Commands::Doctor { fix: true, yes: true, .. })
+        | Some(Commands::Doctor { repair: true, .. })
+        | Some(Commands::Doctor { restore: Some(Some(_)), .. })
+        | Some(Commands::Sync { ast: false, repair: false, .. }) => true,
+        _ => false,
+    }
+}
+
+/// Rebuilds the rule index when the command that holds it ends (see [`changes_prompt_matching`]).
+struct RefreshIndexOnExit {
+    config: BaseConfig,
+    cwd: std::path::PathBuf,
+}
+
+impl Drop for RefreshIndexOnExit {
+    fn drop(&mut self) {
+        base::domain::score_index::refresh_for(&self.config, &self.cwd);
+        // BO-20: a BM25 candidate beside a keyword-only live, the prompt-IDF counts, a proposals candidate's own index.
+        base::shadow::run::refresh_indexes(&self.config, &self.cwd);
+    }
+}
+
 pub fn run() {
     let cli = Cli::parse();
+
+    // `base doctor --measure emit` is the hook a measure call registers, and its stdout IS the measurement: exactly
+    // the payload, nothing before or after. So it runs before `ensure_hooks_wired` below and before the config load,
+    // and touches nothing else.
+    if let Some(Commands::Doctor { measure_step: Some(_), hook, bytes, nonce, .. }) = &cli.command {
+        let (Some(hook), Some(bytes), Some(nonce)) = (hook, bytes, nonce) else {
+            eprintln!("base doctor --measure emit: needs --hook, --bytes and --nonce");
+            std::process::exit(2);
+        };
+        match base::measure::emit(hook, *bytes, nonce) {
+            Ok(text) => {
+                use std::io::Write;
+                let mut stdout = std::io::stdout().lock();
+                if stdout.write_all(text.as_bytes()).and_then(|()| stdout.flush()).is_err() {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("base doctor --measure emit: {e:#}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
 
     // #93: `ensure_hooks_wired` had exactly one caller — the session-start hook
     // — so a home whose hooks were never wired had no path back: no hook fires,
@@ -1559,10 +2193,24 @@ pub fn run() {
             std::process::exit(1);
         }
     };
+
+    // A hook event goes to the dispatcher before the config load below. The dispatcher loads its own config from the
+    // cwd the host reports, so this load was never used by a hook; and inside one of base's own headless calls a hook
+    // must print nothing at all (F27, BO-08), while this load prints any config fault it finds.
+    if let Some(Commands::Hook { event }) = &cli.command {
+        hook::dispatch(event);
+        return;
+    }
     let config = BaseConfig::load(&cwd);
 
+    // K7e (BO-18): a command that changes what a prompt can be served, or how it scores, rebuilds the rule index the
+    // prompt hook ranks by when it ends, early returns included (`die` exits before it, on a failure).
+    let _refresh_index = changes_prompt_matching(&cli.command).then(|| RefreshIndexOnExit { config: config.clone(), cwd: cwd.clone() });
+
     match cli.command {
-        Some(Commands::Hook { event }) => hook::dispatch(&event),
+        // Dispatched above, before the config load. Reaching this arm means that early return moved, and every base hook
+        // would silently do nothing, so it fails loudly instead.
+        Some(Commands::Hook { .. }) => unreachable!("hook events are dispatched before the config load"),
 
         // ─── Hooks manifest ─────────────────────────────────
         // Machine-readable only: stdout is one JSON object, because the sole
@@ -1574,6 +2222,95 @@ pub fn run() {
                     serde_json::to_string_pretty(&base::install::hooks_manifest())
                         .unwrap_or_else(|_| "{}".into())
                 );
+            }
+            // The command every prompt-hook pointer line names (BO-01). It reads the session's own blocks file,
+            // so another session's prompt in the same workspace can never answer for this one.
+            HooksAction::Show { block, session } => {
+                let session = session.or_else(|| {
+                    std::env::var("CLAUDE_CODE_SESSION_ID").ok().filter(|s| !s.is_empty())
+                });
+                let Some(dir) = base::crud::handoff_show::session_start_dir(&cwd) else {
+                    eprintln!("base hooks show: no .base here or in the global tier");
+                    std::process::exit(1);
+                };
+                match base::emit::prompt::show(&dir, session.as_deref(), block.as_deref()) {
+                    Ok(shown) => {
+                        if let Some(note) = shown.note {
+                            eprintln!("base hooks show: {note}");
+                        }
+                        print!("{}", shown.stdout);
+                    }
+                    Err(why) => {
+                        eprintln!("base hooks show: {why}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
+
+        // The match log's reader (K1f, BO-13). It reads the tier the hooks write for this folder: the workspace's
+        // .base, else the global one.
+        Some(Commands::Log { action }) => match action {
+            LogAction::Matches { last, session, rule, json } => {
+                let Some(dir) = base::crud::handoff_show::session_start_dir(&cwd) else {
+                    eprintln!("base log matches: no .base here or in the global tier");
+                    std::process::exit(1);
+                };
+                let filter = base::emit::match_log::Filter { session, rule };
+                match base::emit::match_log::last_rows(&dir, last, &filter) {
+                    Ok(rows) if rows.is_empty() => {
+                        eprintln!(
+                            "base log matches: no rows in {}",
+                            dir.join(base::emit::match_log::FILE).display()
+                        );
+                    }
+                    Ok(rows) if json => {
+                        for row in &rows {
+                            println!("{}", serde_json::to_string(row).unwrap_or_default());
+                        }
+                    }
+                    Ok(rows) => {
+                        print!("{}", base::emit::match_log::format_rows(&rows, chrono::Local::now().date_naive()));
+                    }
+                    Err(why) => {
+                        eprintln!("base log matches: {why}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            // BO-15: the correction signals, logged by the hooks or read from a transcript the same way.
+            LogAction::Corrections { session, transcript, json } => {
+                if let Some(path) = transcript {
+                    let events = match base::domain::transcript::read_all(std::path::Path::new(&path)) {
+                        Ok(e) => e,
+                        Err(e) => die("base log corrections", format!("{path}: {e}")),
+                    };
+                    let turns = base::corrections::turns(events, &config.corrections);
+                    if json {
+                        for t in &turns {
+                            println!("{}", base::corrections::turn_json(t));
+                        }
+                    } else {
+                        print!("{}", base::corrections::render_turns(&turns, &path));
+                    }
+                } else {
+                    let Some(sid) = session.or_else(base::relay::env_session_id) else {
+                        die("base log corrections", "no session: give --session <id> or --transcript <path>");
+                    };
+                    let rows: Vec<base::emit::match_log::Row> = base::corrections::propose::session_rows(&cwd, &sid)
+                        .into_iter()
+                        .filter(|r| r.event == "signal")
+                        .collect();
+                    if rows.is_empty() {
+                        eprintln!("base log corrections: no signal rows for session {sid}");
+                    } else if json {
+                        for row in &rows {
+                            println!("{}", serde_json::to_string(row).unwrap_or_default());
+                        }
+                    } else {
+                        print!("{}", base::emit::match_log::format_rows(&rows, chrono::Local::now().date_naive()));
+                    }
+                }
             }
         },
 
@@ -1639,8 +2376,20 @@ pub fn run() {
 
         // ─── Project ─────────────────────────────────────
         Some(Commands::Project { action }) => match action {
-            ProjectAction::Add { name, status, path, stage } => {
+            ProjectAction::Add { name, status, path, stage, parent, nested } => {
                 let slug = crud::slugify(&name);
+                // BO-24: an old name still reads as the renamed project, so a new project under it would never be reached.
+                if let Some(now) = crud::rename::renamed_to(&cwd, &config.namespace, &slug) {
+                    die("Error", format!("'{name}' is an old name of project '{now}' (renamed); pick another name"));
+                }
+                // F25c: a parent that names no project, or would close a loop, is refused before anything is written.
+                let parent = match parent.as_deref() {
+                    Some(p) => match crud::project::check_parent(&cwd, &config.namespace, &slug, p) {
+                        Ok(s) => Some(s),
+                        Err(e) => die(project_error_prefix(&e), e),
+                    },
+                    None => None,
+                };
                 // Explicit --path wins; otherwise the protocol provisions the folder.
                 let provisioned = if path.is_none() {
                     match crud::project::provision_folder(&cwd, &config.protocol, &name, &slug, stage.as_deref()) {
@@ -1655,7 +2404,30 @@ pub fn run() {
                 match resolved_path {
                     Some(rp) => match crud::project::add_with_stage(&cwd, &config.namespace, &name, &status, Some(&rp), resolved_stage.as_deref()) {
                         Ok(slug) => {
+                            // The path as stored (F25b): absolute, whatever was typed.
+                            let rp = crud::project::PathRoots::new(&cwd, &config.namespace).from_cli(&rp).unwrap_or(rp);
                             println!("Project '{name}' created (slug: {slug}, path: {rp})");
+                            if parent.is_some() || nested.is_some() {
+                                let change = crud::project::ProjectUpdate {
+                                    parent: parent.clone().map(crud::project::ParentChange::Set),
+                                    nested,
+                                    ..Default::default()
+                                };
+                                match crud::project::apply_update(&cwd, &config.namespace, &slug, &change) {
+                                    Ok(o) => {
+                                        if let Some(p) = &parent {
+                                            println!("   parent: {p}");
+                                        }
+                                        if let Some(n) = nested {
+                                            println!("   nested: {n}");
+                                        }
+                                        for w in &o.warnings {
+                                            eprintln!("warning: {w}");
+                                        }
+                                    }
+                                    Err(e) => die(project_error_prefix(&e), e),
+                                }
+                            }
                             // A registered project is an app: its code map starts
                             // now, not at the next session start.
                             let folder = {
@@ -1673,6 +2445,9 @@ pub fn run() {
                     },
                     None => die("Failed", anyhow::anyhow!("--path is required, or enable [protocol] with a stage in base.toml")),
                 }
+            }
+            ProjectAction::Deferred => {
+                if let Err(e) = crud::deferred::list(base::home::home_root().as_deref(), &cwd, &config, base::config::DeferKind::Project) { die("Error", e); }
             }
             ProjectAction::List { all, workspace, unscoped, json } => {
                 if !json {
@@ -1723,13 +2498,47 @@ pub fn run() {
                     }
                 }
             }
-            ProjectAction::Update { slug, status, blocked_by, next_action } => {
+            ProjectAction::Update { slug, status, blocked_by, next_action, path, parent, nested } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug) {
-                    match crud::project::update(&cwd, &config.namespace, &s, status.as_deref(), blocked_by.as_deref(), next_action.as_deref()) {
-                        Ok(()) => println!("Project '{s}' updated"),
-                        Err(e) => die("Failed", e),
+                    let change = crud::project::ProjectUpdate {
+                        status: status.as_deref(),
+                        blocked_by: blocked_by.as_deref(),
+                        next_action: next_action.as_deref(),
+                        path: path.as_deref(),
+                        parent: parent.map(|p| {
+                            if p.eq_ignore_ascii_case("none") {
+                                crud::project::ParentChange::Clear
+                            } else {
+                                crud::project::ParentChange::Set(p)
+                            }
+                        }),
+                        nested,
+                    };
+                    match crud::project::apply_update(&cwd, &config.namespace, &s, &change) {
+                        Ok(o) => {
+                            println!("Project '{s}' updated");
+                            if let Some(r) = &o.repath {
+                                let from = r.old_path.as_deref().unwrap_or("(none)");
+                                let dom = if r.domain_changed { format!(", domain '{}' trigger updated", r.name) } else { String::new() };
+                                println!("   path: {from} → {}{dom}", r.new_path);
+                            }
+                            for w in &o.warnings {
+                                eprintln!("warning: {w}");
+                            }
+                        }
+                        Err(e) => die(project_error_prefix(&e), e),
                     }
                 }
+            }
+            ProjectAction::Paths { suggest, out, apply, dry_run, json } => {
+                let r = if suggest {
+                    crud::project_paths::suggest_cmd(&cwd, &config, out.as_deref(), json)
+                } else if let Some(file) = apply {
+                    crud::project_paths::apply_cmd(&cwd, &config, &file, dry_run, json)
+                } else {
+                    unreachable!("clap requires --suggest or --apply")
+                };
+                if let Err(e) = r { die(project_error_prefix(&e), e); }
             }
             ProjectAction::Move { slug, to, dry_run, no_ast, yes } => {
                 if let Some(s) = resolve(&cwd, &config.namespace, "project", &slug) {
@@ -1779,6 +2588,23 @@ pub fn run() {
                     }
                 }
             }
+            ProjectAction::Rename { old, new, yes } => {
+                let plan = match crud::rename::plan(&cwd, &config.namespace, &old, &new, yes) {
+                    Ok(p) => p,
+                    Err(e) => die(project_error_prefix(&e), e),
+                };
+                let report = crud::rename::describe(&plan);
+                let result = if yes { Some(crud::rename::apply(&plan)) } else { None };
+                let (from, to) = (plan.old.clone(), plan.new.clone());
+                // The plan holds the rename lock and both graph locks; `die` exits without running destructors, so
+                // they are released here, before any exit, or every later write would wait out a dead lock.
+                drop(plan);
+                match result {
+                    None => print!("PREVIEW (nothing written; add --yes to rename)\n{report}"),
+                    Some(Ok(())) => print!("RENAMED {from} -> {to}\n{report}"),
+                    Some(Err(e)) => die("Failed", e),
+                }
+            }
         },
 
         // ─── Milestone ──────────────────────────────────
@@ -1792,6 +2618,9 @@ pub fn run() {
                     Ok(slug) => println!("Milestone '{name}' created (slug: {slug})"),
                     Err(e) => die("Failed", e),
                 }
+            }
+            MilestoneAction::Deferred => {
+                if let Err(e) = crud::deferred::list(base::home::home_root().as_deref(), &cwd, &config, base::config::DeferKind::Milestone) { die("Error", e); }
             }
             MilestoneAction::List { project, json } => {
                 let ps = match project.as_deref() {
@@ -1864,6 +2693,9 @@ pub fn run() {
                     Ok(slug) => println!("Task '{name}' created (slug: {slug})"),
                     Err(e) => die("Failed", e),
                 }
+            }
+            TaskAction::Deferred => {
+                if let Err(e) = crud::deferred::list(base::home::home_root().as_deref(), &cwd, &config, base::config::DeferKind::Task) { die("Error", e); }
             }
             TaskAction::List { project, milestone, label, json } => {
                 let ps = match project.as_deref() {
@@ -1964,9 +2796,12 @@ pub fn run() {
 
         // ─── Decision ────────────────────────────────────
         Some(Commands::Decision { global, action }) => {
-            let cwd = tier_cwd(&cwd, global);
+            // Where the operator stands, before `-g` routes the command: an old domain name is read from here (BO-24).
+            let standing_cwd = &cwd;
+            let cwd = tier_cwd(standing_cwd, global);
             match action {
                 DecisionAction::Log { domain, decision, rationale, recall, supersedes } => {
+                    let domain = domain::canonical_name(standing_cwd, &domain);
                     match crud::decision::log_with(&cwd, &config.namespace, &domain, &decision, &rationale, recall.as_deref(), supersedes.as_deref()) {
                         Ok(slug) => println!("Decision logged (slug: {slug})"),
                         Err(e) => die("Failed", e),
@@ -1980,6 +2815,14 @@ pub fn run() {
                     };
                     if let Err(e) = r { die("Error", e); }
                 }
+                DecisionAction::Show { slug, json } => {
+                    let Some(s) = resolve(&cwd, &config.namespace, "decision", &slug) else {
+                        std::process::exit(1);
+                    };
+                    if let Err(e) = crud::decision::show(&cwd, &config.namespace, &s, json) {
+                        die("Error", e);
+                    }
+                }
                 DecisionAction::Delete { keyword } => {
                     // Show what will be deleted first
                     if let Err(e) = crud::decision::search(&cwd, &config.namespace, &keyword) {
@@ -1992,13 +2835,19 @@ pub fn run() {
                         }
                     }
                 }
-                DecisionAction::Update { slug, name, rationale, recall, status } => {
+                DecisionAction::Update { slug, name, rationale, recall, status, keywords } => {
                     if let Some(s) = resolve(&cwd, &config.namespace, "decision", &slug) {
-                        match crud::decision::update(
+                        let keywords = keywords.as_deref().map(base::domain::global_decisions::parse_keywords);
+                        match crud::decision::update_with(
                             &cwd, &config.namespace, &s,
                             name.as_deref(), rationale.as_deref(), recall.as_deref(), status.as_deref(),
+                            keywords.as_deref(),
                         ) {
-                            Ok(()) => println!("Decision '{s}' updated"),
+                            Ok(()) => match &keywords {
+                                Some(k) if k.is_empty() => println!("Decision '{s}' updated · keywords cleared"),
+                                Some(k) => println!("Decision '{s}' updated · keywords: {}", k.join(", ")),
+                                None => println!("Decision '{s}' updated"),
+                            },
                             Err(e) => die("Failed", e),
                         }
                     }
@@ -2009,6 +2858,8 @@ pub fn run() {
         // ─── Entity ──────────────────────────────────────
         Some(Commands::Entity { action }) => match action {
             EntityAction::Add { name, entity_type, domain, project } => {
+                let domain = domain::canonical_name(&cwd, &domain);
+                let project = project.map(|p| domain::canonical_name(&cwd, &p));
                 match crud::entity::add(&cwd, &config.namespace, &name, &entity_type, &domain, project.as_deref()) {
                     Ok(slug) => println!("Entity '{name}' created (slug: {slug}, domain: {domain})"),
                     Err(e) => die("Failed", e),
@@ -2054,9 +2905,23 @@ pub fn run() {
             let standing_cwd = &cwd;
             let cwd = tier_cwd(standing_cwd, global);
             match action {
-                HandoffAction::Create { project, doc, slug } => {
+                HandoffAction::Create { project, doc, slug, lane } => {
+                    // An old project name files the handoff under the renamed project (BO-24, R4).
+                    let project = domain::canonical_name(standing_cwd, &project);
                     let gbl = base::home::home_root();
-                    match crud::handoff::create(
+                    let relay_title = std::env::var("BASE_RELAY_AS")
+                        .ok()
+                        .filter(|t| !t.trim().is_empty())
+                        .or_else(|| {
+                            base::relay::env_session_id()
+                                .and_then(|sid| base::relay::session_registry::title_of(&sid))
+                        });
+                    let inputs = crud::handoff::LaneInputs {
+                        flag: lane,
+                        relay_title,
+                        titles: base::relay::known_titles(standing_cwd),
+                    };
+                    match crud::handoff::create_in_lane(
                         gbl.as_deref(),
                         &cwd,
                         standing_cwd,
@@ -2064,6 +2929,7 @@ pub fn run() {
                         &project,
                         &doc,
                         slug.as_deref(),
+                        &inputs,
                     ) {
                         Ok(out) => {
                             // First line unchanged: scripts and the *end flow read it.
@@ -2071,19 +2937,71 @@ pub fn run() {
                                 "Handoff for '{project}' registered (slug: {})",
                                 out.slug
                             );
-                            // Every archive, in every tier, on its own line with its tier (`auk`'s Q2 ruling).
-                            // 0.14.1 archived silently (#71); 0.15.2 archived one tier and only named the other.
+                            match &out.lane {
+                                Some(l) => println!("lane: {} (from {})", l.name, l.from.describe()),
+                                None => println!(
+                                    "lane: none (no --lane, no by: in the doc, no codename in the slug, no relay title)"
+                                ),
+                            }
+                            // Every archive, in every tier, on its own line with its tier (`auk`'s Q2 ruling), and
+                            // a line when there was none (F18b). 0.14.1 archived silently (#71); 0.15.2 archived
+                            // one tier and only named the other.
                             if out.archived.is_empty() {
-                                println!("no prior open or deferred handoff for '{project}' in any tier");
+                                let whose = match &out.lane {
+                                    Some(l) if l.from == crud::handoff::LaneFrom::Flag => format!("in lane {}", l.name),
+                                    Some(l) => format!("by {}", l.name),
+                                    None => "with no lane".to_string(),
+                                };
+                                println!("archived: nothing (no earlier open handoff {whose} on {project})");
                             }
                             for (prior, tier) in &out.archived {
-                                println!("archived prior handoff: {prior} ({tier})");
+                                println!("archived: {prior} ({tier})");
+                            }
+                            if !out.left_open.is_empty() {
+                                let others: Vec<String> = out
+                                    .left_open
+                                    .iter()
+                                    .map(|(s, l)| format!("{s} ({})", l.as_deref().unwrap_or("no lane")))
+                                    .collect();
+                                println!("left open, other lanes: {}", others.join(", "));
                             }
                         }
                         Err(e) => die("Failed", e),
                     }
                 }
                 HandoffAction::List => { if let Err(e) = crud::handoff::list(&cwd, &config.namespace) { die("Error", e); } }
+                HandoffAction::Show { query } => {
+                    match crud::handoff_show::resolve(
+                        base::home::home_root().as_deref(),
+                        &cwd,
+                        &config.namespace,
+                        &config.session_start,
+                        false,
+                        &query.join(" "),
+                    ) {
+                        Ok(mut found) => {
+                            // A deferred one-match comes back to open; nothing else writes (AMENDMENTS C).
+                            if let Err(e) = found.revive_if_deferred(
+                                base::home::home_root().as_deref(),
+                                &cwd,
+                                &config.namespace,
+                            ) {
+                                die("Failed", e);
+                            }
+                            print!("{}", found.render(chrono::Local::now()));
+                            let code = found.exit_code();
+                            if code != 0 {
+                                use std::io::Write as _;
+                                let _ = std::io::stdout().flush();
+                                std::process::exit(code);
+                            }
+                        }
+                        Err(e) => die("Failed", e),
+                    }
+                }
+                HandoffAction::Deferred => {
+                    if let Err(e) = crud::deferred::list(base::home::home_root().as_deref(), &cwd, &config, base::config::DeferKind::Handoff) { die("Error", e); }
+                }
                 HandoffAction::Snooze { slug, days } => {
                     match crud::handoff::snooze(
                         base::home::home_root().as_deref(),
@@ -2141,20 +3059,60 @@ pub fn run() {
                         Err(e) => die("Failed", e),
                     }
                 }
+                HandoffAction::Unarchive { slug } => unarchive_cli("handoff", &cwd, &config.namespace, &slug),
             }
         }
 
         // ─── Fork ────────────────────────────────────────
         Some(Commands::Fork { global, action }) => {
-            let cwd = tier_cwd(&cwd, global);
+            let standing_cwd = &cwd;
+            let cwd = tier_cwd(standing_cwd, global);
             match action {
                 ForkAction::Create { project, doc, slug } => {
-                    match crud::handoff::create_fork(&cwd, &config.namespace, &project, &doc, slug.as_deref()) {
+                    let project = domain::canonical_name(standing_cwd, &project);
+                    let gbl = base::home::home_root();
+                    match crud::handoff::create_fork_in(
+                        gbl.as_deref(),
+                        &cwd,
+                        standing_cwd,
+                        &config.namespace,
+                        &project,
+                        &doc,
+                        slug.as_deref(),
+                    ) {
                         Ok(slug) => println!("Fork '{slug}' registered for '{project}'"),
                         Err(e) => die("Failed", e),
                     }
                 }
                 ForkAction::List => { if let Err(e) = crud::handoff::list_forks(&cwd, &config.namespace) { die("Error", e); } }
+                ForkAction::Show { query } => {
+                    let home = base::home::home_root();
+                    match crud::handoff_show::resolve(
+                        home.as_deref(),
+                        &cwd,
+                        &config.namespace,
+                        &config.session_start,
+                        true,
+                        &query.join(" "),
+                    ) {
+                        Ok(mut found) => {
+                            if let Err(e) = found.revive_if_deferred(home.as_deref(), &cwd, &config.namespace) {
+                                die("Failed", e);
+                            }
+                            print!("{}", found.render(chrono::Local::now()));
+                            let code = found.exit_code();
+                            if code != 0 {
+                                use std::io::Write as _;
+                                let _ = std::io::stdout().flush();
+                                std::process::exit(code);
+                            }
+                        }
+                        Err(e) => die("Failed", e),
+                    }
+                }
+                ForkAction::Deferred => {
+                    if let Err(e) = crud::deferred::list(base::home::home_root().as_deref(), &cwd, &config, base::config::DeferKind::Fork) { die("Error", e); }
+                }
                 ForkAction::Snooze { slug, days } => {
                     match crud::handoff::snooze(
                         base::home::home_root().as_deref(),
@@ -2212,20 +3170,132 @@ pub fn run() {
                         Err(e) => die("Failed", e),
                     }
                 }
+                ForkAction::Unarchive { slug } => unarchive_cli("fork", &cwd, &config.namespace, &slug),
             }
         }
         // ─── Reminder ────────────────────────────────────
         Some(Commands::Reminder { action }) => match action {
             ReminderAction::Add { name, due, at, in_dur } => {
                 match resolve_surface_at(due.as_deref(), at.as_deref(), in_dur.as_deref()) {
-                    Ok(surface_at) => match crud::reminder::add(&cwd, &config.namespace, &name, &surface_at, due.as_deref()) {
-                        Ok(slug) => println!("Reminder '{name}' set — surfaces at session start on/after {surface_at} (slug: {slug})"),
+                    Ok(surface_at) => match crud::reminder::set(
+                        base::home::home_root().as_deref(),
+                        &cwd,
+                        &config.namespace,
+                        &name,
+                        &surface_at,
+                        due.as_deref(),
+                    ) {
+                        // A name a tier already holds moves that reminder's one clock (BO-27, V5): an archived one is
+                        // revived, never left archived behind a "set".
+                        Ok((slug, outcome, stored)) => {
+                            let what = match outcome {
+                                crud::reminder::SetOutcome::Created => "set",
+                                crud::reminder::SetOutcome::Moved => "moved (it already existed; its date changed)",
+                                crud::reminder::SetOutcome::Revived => "revived (it was archived)",
+                            };
+                            println!("Reminder '{stored}' {what} — surfaces at session start on/after {surface_at} (slug: {slug})")
+                        }
                         Err(e) => die("Failed", e),
                     },
                     Err(e) => die("Invalid time", e),
                 }
             }
-            ReminderAction::List => { if let Err(e) = crud::reminder::list(&cwd, &config.namespace) { die("Error", e); } }
+            ReminderAction::List { archived } => {
+                if let Err(e) = crud::reminder::list(
+                    base::home::home_root().as_deref(),
+                    &cwd,
+                    &config.namespace,
+                    archived,
+                ) {
+                    die("Error", e);
+                }
+            }
+            ReminderAction::Snooze { slug, duration } => {
+                let slug = reminder_slug(&cwd, &slug);
+                let d = match parse_duration(&duration) {
+                    Ok(d) => d,
+                    Err(e) => die("Invalid duration", e),
+                };
+                let at = chrono::Local::now() + d;
+                match crud::reminder::snooze(
+                    base::home::home_root().as_deref(),
+                    &cwd,
+                    &config.namespace,
+                    &slug,
+                    &at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+                    &at.format("%Y-%m-%d").to_string(),
+                ) {
+                    // An empty vec means no tier held the slug. Printing success here is
+                    // #72's observable: a no-op and a real snooze look identical outside.
+                    Ok(changed) if changed.is_empty() => die(
+                        "Failed",
+                        format!(
+                            "no reminder '{slug}' in any tier — nothing was snoozed. Searched:\n  {}",
+                            crud::reminder::searched_tiers(
+                                base::home::home_root().as_deref(),
+                                &cwd
+                            )
+                            .join("\n  ")
+                        ),
+                    ),
+                    Ok(changed) => {
+                        for tier in changed {
+                            println!("Reminder '{slug}' snoozed ({tier})");
+                        }
+                    }
+                    Err(e) => die("Failed", e),
+                }
+            }
+            ReminderAction::Archive { slug } => {
+                let slug = reminder_slug(&cwd, &slug);
+                match crud::reminder::archive(
+                    base::home::home_root().as_deref(),
+                    &cwd,
+                    &config.namespace,
+                    &slug,
+                    None,
+                ) {
+                    Ok(changed) if changed.is_empty() => die(
+                        "Failed",
+                        format!(
+                            "no reminder '{slug}' in any tier — nothing was archived. Searched:\n  {}",
+                            crud::reminder::searched_tiers(
+                                base::home::home_root().as_deref(),
+                                &cwd
+                            )
+                            .join("\n  ")
+                        ),
+                    ),
+                    Ok(changed) => {
+                        for tier in changed {
+                            println!("Reminder '{slug}' archived ({tier})");
+                        }
+                    }
+                    Err(e) => die("Failed", e),
+                }
+            }
+            ReminderAction::Unarchive { slug } => {
+                use crud::reminder::Unarchived;
+                let home = base::home::home_root();
+                match crud::reminder::unarchive(home.as_deref(), &cwd, &config.namespace, &slug) {
+                    Ok(Unarchived::NotFound) => die(
+                        "Failed",
+                        format!(
+                            "no reminder '{slug}' in any tier — nothing was unarchived. Searched:\n  {}",
+                            crud::reminder::searched_tiers(home.as_deref(), &cwd).join("\n  ")
+                        ),
+                    ),
+                    Ok(Unarchived::NotArchived) => {
+                        println!("Reminder '{slug}' is not archived; nothing changed (base reminder list shows it)")
+                    }
+                    Ok(Unarchived::Restored { tiers, surface_at }) => {
+                        for tier in tiers {
+                            println!("Reminder '{slug}' unarchived ({tier}) — surfaces at session start on/after {surface_at}");
+                        }
+                    }
+                    Err(e) => die("Failed", e),
+                }
+            }
             ReminderAction::Remove { slug } => {
                 match crud::reminder::remove(&cwd, &config.namespace, &slug) {
                     Ok(()) => println!("Reminder '{slug}' removed"),
@@ -2390,13 +3460,38 @@ pub fn run() {
         // ─── Domain ──────────────────────────────────────
         Some(Commands::Domain { global, action }) => match action {
             DomainAction::AddTrigger { domain: name, keyword, path } => {
+                let name = domain::canonical_name(&cwd, &name);
                 if keyword.is_none() && path.is_none() {
                     eprintln!("Provide --keyword and/or --path");
                     return;
                 }
                 match domain::add_trigger(&cwd, global, &name, keyword.as_deref(), path.as_deref()) {
-                    Ok(c) => println!("Trigger added to domain '{name}' ({} tier)", c.tier.label()),
+                    Ok(c) => {
+                        println!("Trigger added to domain '{name}' ({} tier)", c.tier.label());
+                        // P3: say the full path stored, since a relative one was expanded.
+                        if let Some(full) = path.as_deref().and_then(|p| domain::trigger_spelling(&cwd, global, p)) {
+                            println!("  path: {full}");
+                        }
+                        // K2, "on every config change": the domain's rule tests, when it has any.
+                        if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &name) {
+                            println!("{line}");
+                        }
+                    }
+                    Err(e) if e.downcast_ref::<domain::TriggerRefused>().is_some() => die("Error", e),
                     Err(e) => die("Failed", e),
+                }
+            }
+            DomainAction::Paths { suggest, out, apply, dry_run, json } => {
+                let r = if suggest {
+                    domain::paths::suggest_cmd(&cwd, out.as_deref(), json)
+                } else if let Some(file) = apply {
+                    domain::paths::apply_cmd(&cwd, &file, dry_run, json)
+                } else {
+                    unreachable!("clap requires --suggest or --apply")
+                };
+                if let Err(e) = r {
+                    let prefix = if e.downcast_ref::<domain::paths::Refused>().is_some() { "Error" } else { "Failed" };
+                    die(prefix, e);
                 }
             }
             DomainAction::List => domain::list_domains(&cwd, &config.namespace),
@@ -2410,14 +3505,25 @@ pub fn run() {
             }
             DomainAction::Create { name, keyword, path } => {
                 match domain::create_domain(&cwd, global, &name, keyword.as_deref(), path.as_deref()) {
-                    Ok(c) => println!("Domain '{name}' created ({} tier)", c.tier.label()),
+                    Ok(c) => {
+                        println!("Domain '{name}' created ({} tier)", c.tier.label());
+                        // K2: a domain created again over rules that kept their tests.
+                        if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &name) {
+                            println!("{line}");
+                        }
+                    }
+                    Err(e) if e.downcast_ref::<domain::TriggerRefused>().is_some() => die("Error", e),
                     Err(e) => die("Failed", e),
                 }
             }
             DomainAction::Remove { name } => {
                 match domain::remove_domain(&cwd, global, &name) {
                     Ok(c) if !c.is_noop() => {
-                        println!("Domain '{name}' removed ({} tier)", c.tier.label())
+                        println!("Domain '{name}' removed ({} tier)", c.tier.label());
+                        // K2: the rules it held keep their tests; their fires_on now miss, and this says so.
+                        if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &name) {
+                            println!("{line}");
+                        }
                     }
                     // #52. This said "not found" about a domain that exists in
                     // the other tier, and exited 0. Name the tier searched, name
@@ -2435,13 +3541,17 @@ pub fn run() {
                 }
             }
             DomainAction::RemoveTrigger { domain: name, keyword, path } => {
+                let name = domain::canonical_name(&cwd, &name);
                 if keyword.is_none() && path.is_none() {
                     eprintln!("Provide --keyword and/or --path to remove");
                     return;
                 }
                 match domain::remove_trigger(&cwd, global, &name, keyword.as_deref(), path.as_deref()) {
                     Ok(c) if !c.is_noop() => {
-                        println!("Trigger removed from domain '{name}' ({} tier)", c.tier.label())
+                        println!("Trigger removed from domain '{name}' ({} tier)", c.tier.label());
+                        if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &name) {
+                            println!("{line}");
+                        }
                     }
                     // #18. This reported success whether or not anything went,
                     // and with a same-named domain in the other tier it edited
@@ -2555,6 +3665,31 @@ pub fn run() {
                                 Err(e) => die("Register failed", e),
                             }
                         }
+                        // `resolve_store` already fails LOUD on a missing store,
+                        // naming it and listing the ones that exist. A catch-all
+                        // arm used to eat that error and print the cheerful line
+                        // below, so three seats registered against a store that
+                        // did not exist and were told only that they had
+                        // succeeded at something else. Surface it, and name the
+                        // consequence the error itself cannot know.
+                        //
+                        // THE MESSAGE DESCRIBES WHAT THIS COMMAND DID, NOT WHAT
+                        // THE BOARD CONTAINS. An earlier version asserted the
+                        // caller "is NOT on `base relay board`" — which is FALSE
+                        // for anyone already in the store from an earlier bare
+                        // register, exactly the operator who is already fine
+                        // (grebe hit this on 2026-09-20). The command knows what
+                        // it did; it has not read the board and must not claim
+                        // to have.
+                        Err(e) if project.is_some() => {
+                            eprintln!("{e:#}");
+                            eprintln!(
+                                "This command did NOT join '{title}' to this workspace's relay store, so \
+                                 it added nothing to `base relay board`, the operator's hub view. It \
+                                 registered globally only. To join the store, run it with no --project: \
+                                 base relay register --as {title}"
+                            );
+                        }
                         _ => println!(
                             "Registered '{title}' globally{}. Other sessions can now relay to you: *task {title} …",
                             sid.as_deref()
@@ -2562,14 +3697,13 @@ pub fn run() {
                                 .unwrap_or_else(|| " (no session binding — hook delivery needs CLAUDE_CODE_SESSION_ID)".into())
                         ),
                     }
-                    // Wake contract, in-band: registration is often a boot
-                    // sequence's last tool call, so the arming block must ride
-                    // the register output itself — a hook nudge on the NEXT
-                    // tool call never fires if the session goes idle here.
-                    if !base::relay::wake::is_watching(&title)
-                        && let Some(block) = base::relay::wake::arm_block(&title)
+                    // The watcher setup, in-band: registration is often a boot sequence's last tool call, so what
+                    // `base relay arm` prints rides the register output itself when this title has no watcher
+                    // running today's script. A hook line on the NEXT prompt never fires if the session goes idle here.
+                    if !base::relay::wake::is_current(&title)
+                        && let Some(text) = base::relay::wake::arm_text(&title)
                     {
-                        println!("\n{block}");
+                        println!("\n{text}");
                     }
                 }
                 RelayAction::Send { to, mtype, msg, from, refs, project } => {
@@ -2591,12 +3725,13 @@ pub fn run() {
                                     continue;
                                 };
                                 let notify = base::relay::task_inbox::InboxTask {
-                                    slug: format!("notify-{}-{}", m.id, t),
+                                    slug: base::relay::task_inbox::notify_slug(&m.id, &t),
                                     summary: format!("[{}] {}", m.mtype, m.msg),
                                     doc: String::new(),
                                     from: sender.clone(),
                                     to_title: t.clone(),
                                     to_session: entry.session_id.clone(),
+                                    from_session: relay::sending_session(&sender),
                                     priority: "high".into(),
                                     created: base::relay::now_iso(),
                                     status: "pending".into(),
@@ -2604,6 +3739,8 @@ pub fn run() {
                                     last_alert_ts: String::new(),
                                     kind: "notify".into(),
                                     refs: refs.clone(),
+                                    spool_store: store.root.to_string_lossy().into_owned(),
+                                    spool_id: m.id.clone(),
                                 };
                                 match base::relay::task_inbox::enqueue(&config.namespace, &notify) {
                                     Ok(_) => woken += 1,
@@ -2611,19 +3748,24 @@ pub fn run() {
                                 }
                             }
                             if woken > 0 {
-                                println!("Wake notify → {woken} inbox(es); fires on the receiver's monitor or next tool call.");
+                                println!("Wake notify → {woken} inbox(es); fires on the receiver's watcher or next prompt.");
                             }
                         }
                         Err(e) => die("Send failed", e),
                     }
                 }
-                RelayAction::Poll { for_title, peek, project } => {
+                RelayAction::Poll { for_title, peek, all, from, project } => {
                     let store = match relay::resolve_store(&cwd, project.as_deref()) {
                         Ok(s) => s,
                         Err(e) => die("Relay", e),
                     };
                     let Some(title) = need_identity(&store, for_title) else { return };
-                    let pending = store.pending_for(&title);
+                    // `--all` reads seen messages too: the hooks hide a sender's older messages behind its newest one
+                    // and name this command as where they can still be read (BO-04, F13c).
+                    let pending: Vec<_> = if all { store.addressed(&title) } else { store.pending_for(&title) }
+                        .into_iter()
+                        .filter(|m| from.as_deref().is_none_or(|f| m.from == f))
+                        .collect();
                     if pending.is_empty() {
                         println!("No pending messages for '{title}'.");
                         return;
@@ -2742,11 +3884,13 @@ pub fn run() {
                         })
                     });
                     let slug = crud::slugify(&slug);
+                    let origin = origin.unwrap_or_default();
                     let task = base::relay::task_inbox::InboxTask {
                         slug: slug.clone(),
                         summary,
                         doc: doc.unwrap_or_default(),
-                        from: origin.unwrap_or_default(),
+                        from_session: relay::sending_session(&origin),
+                        from: origin,
                         to_title: to.clone(),
                         to_session: entry.session_id.clone(),
                         priority: priority.unwrap_or_else(|| "high".into()),
@@ -2756,6 +3900,8 @@ pub fn run() {
                         last_alert_ts: String::new(),
                         kind: "task".into(),
                         refs: Vec::new(),
+                        spool_store: String::new(),
+                        spool_id: String::new(),
                     };
                     match base::relay::task_inbox::enqueue(&config.namespace, &task) {
                         Ok(path) => println!(
@@ -2780,7 +3926,7 @@ pub fn run() {
                     } else if !base::relay::wake::is_watching(&to) {
                         eprintln!(
                             "Note: '{to}' has no live wake monitor ({}) — if idle it will NOT wake; \
-                             the ping lands on its next tool call or prompt.",
+                             the ping lands on its next prompt.",
                             base::relay::wake::watch_cell(&to)
                         );
                     }
@@ -2792,11 +3938,16 @@ pub fn run() {
                             .map(|sid| relay::session_registry::titles_for(&sid))
                             .unwrap_or_default(),
                     };
-                    let origin = my_titles.first().cloned().unwrap_or_default();
-                    if origin.is_empty() {
+                    let origin = relay::resolve_origin(
+                        from.as_deref(),
+                        &my_titles,
+                        relay::env_session_id().as_deref(),
+                    );
+                    if origin.starts_with(relay::UNREGISTERED) {
                         eprintln!(
-                            "Warning: this session has no relay title — the receiver cannot ping back. \
-                             Register one: base relay register --as <title>"
+                            "Warning: this session has no relay title, so the ping is attributed to \
+                             {origin} and the receiver cannot ping back. Register one: \
+                             base relay register --as <title>"
                         );
                     }
                     // Chris's output-style contract applies to his pipe
@@ -2844,14 +3995,19 @@ pub fn run() {
                     // Replying? Any pending inbound ping FROM the target in OUR
                     // inbox means this send is the answer — clear those now, and
                     // mark this ping a reply so it can't demand its own ack.
+                    // A reply answers everything that sender sent up to their newest ping, in the spool too, so an
+                    // earlier message from them is never shown after this (BO-04, F13c). A ping that answers nothing
+                    // marks nothing.
                     let answered =
-                        base::relay::task_inbox::clear_pings_from(&config.namespace, &to, &my_titles);
+                        base::relay::task_inbox::answer_from(&config.namespace, &cwd, &to, &my_titles);
                     let kind = if answered > 0 { "reply" } else { "ping" };
                     let id = base::relay::ping_slug();
+                    // F12a: addressed to the session that holds the title now, and only that session is shown it.
                     let ping = base::relay::task_inbox::InboxTask {
                         slug: id.clone(),
                         summary: msg.clone(),
                         doc: String::new(),
+                        from_session: relay::sending_session(&origin),
                         from: origin,
                         to_title: to.clone(),
                         to_session: entry.session_id.clone(),
@@ -2862,13 +4018,15 @@ pub fn run() {
                         last_alert_ts: String::new(),
                         kind: kind.into(),
                         refs,
+                        spool_store: String::new(),
+                        spool_id: String::new(),
                     };
                     match base::relay::task_inbox::enqueue(&config.namespace, &ping) {
                         Ok(_) if answered > 0 => println!(
-                            "Ping (reply) → {to}: \"{msg}\" — cleared {answered} inbound ping(s); fires on their next tool call."
+                            "Ping (reply) → {to}: \"{msg}\" — cleared {answered} inbound ping(s); fires on their watcher or next prompt."
                         ),
                         Ok(_) => println!(
-                            "Ping → {to}: \"{msg}\" — fires on their next tool call; clears when they ping back."
+                            "Ping → {to}: \"{msg}\" — fires on their watcher or next prompt; clears when they ping back."
                         ),
                         Err(e) => die("Relay ping failed", e),
                     }
@@ -2884,8 +4042,43 @@ pub fn run() {
                         Err(e) => die("Relay done failed", e),
                     }
                 }
-                RelayAction::Tasks => {
-                    let tasks = base::relay::task_inbox::list_all();
+                RelayAction::Arm { title } => {
+                    let titles: Vec<String> = match title {
+                        Some(t) => vec![t],
+                        None => relay::env_session_id()
+                            .map(|sid| relay::session_registry::titles_for(&sid))
+                            .unwrap_or_default(),
+                    };
+                    if titles.is_empty() {
+                        die(
+                            "Relay arm",
+                            anyhow::anyhow!(
+                                "this session holds no relay title. Register first: base relay register --as <title>, \
+                                 or name one: base relay arm --as <title>"
+                            ),
+                        );
+                    }
+                    for (i, t) in titles.iter().enumerate() {
+                        let Some(text) = base::relay::wake::arm_text(t) else {
+                            die("Relay arm", anyhow::anyhow!("no home directory, so there is no inbox to watch"));
+                        };
+                        if i > 0 {
+                            println!();
+                        }
+                        if base::relay::wake::is_current(t) {
+                            println!(
+                                "A watcher for '{t}' is running this script now. Start one only if it is not this \
+                                 session's.\n"
+                            );
+                        }
+                        print!("{text}");
+                    }
+                }
+                RelayAction::Tasks { from } => {
+                    let tasks: Vec<_> = base::relay::task_inbox::list_all()
+                        .into_iter()
+                        .filter(|t| from.as_deref().is_none_or(|f| t.from == f))
+                        .collect();
                     if tasks.is_empty() {
                         println!("No inbound relay tasks.");
                     } else {
@@ -2902,7 +4095,7 @@ pub fn run() {
                     } else {
                         println!("Titled sessions ({}):", sessions.len());
                         for e in &sessions {
-                            let live = if e.alive() { "live" } else { "DEAD" };
+                            let live = relay::liveness_word(&e.last_heartbeat);
                             let ws = if e.workspace.is_empty() { "-" } else { e.workspace.as_str() };
                             println!(
                                 "  {title}  [{live} · {age}]  ws:{ws}  session:{sid}",
@@ -2916,28 +4109,324 @@ pub fn run() {
             }
         }
 
+        // ─── Tune (BO-17, K4) ─────────────────────────────
+        // A command the AI runs in its turn, never a hook (K4c): the prompt hook's `rule pass due` line and session
+        // start's catch-up line only ask for it.
+        Some(Commands::Tune { dry_run, session, transcript, store, max_calls }) => {
+            use base::corrections::tune_pass;
+            let args = tune_pass::Args { dry_run, sessions: session, transcripts: transcript, store, max_calls };
+            let mut judge = tune_pass::Haiku::new();
+            let running = base::relay::env_session_id();
+            match tune_pass::run(&config, &cwd, &args, &mut judge, running.as_deref()) {
+                Ok(report) => print!("{}", tune_pass::render(&report)),
+                Err(msg) => die("Error", msg),
+            }
+        }
+
+        // ─── Shadow (BO-20, K9) ───────────────────────────
+        Some(Commands::Shadow { action }) => {
+            use base::shadow;
+            let out = match action {
+                ShadowAction::Start { matcher, min_score, prompt_idf, min_terms, relative, from_proposals } => {
+                    let what = if !from_proposals.is_empty() {
+                        shadow::Start::Proposals(from_proposals)
+                    } else {
+                        shadow::Start::Matcher {
+                            bm25: matcher.as_deref() == Some("bm25"),
+                            min_score,
+                            prompt_idf,
+                            min_terms,
+                            relative,
+                        }
+                    };
+                    shadow::start(&config, &cwd, &what)
+                }
+                ShadowAction::Stop => shadow::stop(),
+                ShadowAction::Report { json } => shadow::report::run(&config, &cwd, json),
+                ShadowAction::Promote { version, broad_ok } => shadow::promote::by_hand(&config, &cwd, version.as_deref(), broad_ok),
+                ShadowAction::Rollback => shadow::promote::rollback_by_hand(&config, &cwd),
+            };
+            match out {
+                Ok(text) => print!("{text}"),
+                Err(msg) => die("Error", msg),
+            }
+        }
+
         // ─── Rule ─────────────────────────────────────────
         Some(Commands::Rule { global, action }) => {
             let rule_cwd = tier_cwd(&cwd, global);
             match action {
-                RuleAction::Add { domain: name, text, rationale, supersedes, kind, place, tool, command, words } => {
+                RuleAction::Add { domain: name, text, rationale, supersedes, kind, place, path, tool, command, words, keywords, fires_on, quiet_on } => {
+                    // K3 (BO-15): a rule the AI adds inside a Claude Code session arrives with triggers and a test.
+                    // `--words` is the same list as `--keywords`, so either one carries the triggers.
+                    let no_words = |w: &Option<String>| w.as_deref().is_none_or(|k| k.trim().is_empty());
+                    if std::env::var("CLAUDECODE").is_ok_and(|v| v == "1")
+                        && ((no_words(&keywords) && no_words(&words)) || fires_on.is_empty())
+                    {
+                        die(
+                            "Error",
+                            "base rule add inside a Claude Code session (CLAUDECODE=1) needs --keywords \"a, b\" (words \
+                             from the user's prompt that should bring this rule back) and --fires-on \"<that prompt>\" \
+                             (its first test), so every rule an AI adds arrives with triggers and a test. A rule with \
+                             words of its own is served on them and on the paths it names with --path, never through \
+                             its domain's keywords or folder: for a rule about file work, give --path <file or folder> \
+                             as well. Nothing was written.",
+                        );
+                    }
+                    // `--keywords` is the same list `--words` takes; both given, both count.
+                    let words = match (words, keywords) {
+                        (Some(w), Some(k)) => Some(format!("{w}, {k}")),
+                        (w, k) => w.or(k),
+                    };
+                    let name = domain::canonical_name(&cwd, &name);
+                    // P7: a --path is a place written as its full path, checked to lie inside the domain's project.
+                    let mut place = place;
+                    match crud::rule::scoped_places(&cwd, &name, &path) {
+                        Ok(full) => place.extend(full),
+                        Err(msg) => die("Error", msg),
+                    }
                     // F11: matchers are captured when the rule is created. A kind that needs a value it was not
                     // given is refused here, never stored as a matcher that cannot fire.
                     let matchers = match domain::rules::matchers_from_flags(&kind, &place, &tool, &command, words.as_deref()) {
                         Ok(m) => m,
                         Err(msg) => die("Failed", msg),
                     };
-                    match crud::rule::add_with_matchers(&rule_cwd, &config.namespace, &name, &text, rationale.as_deref(), supersedes.as_deref(), &matchers) {
+                    // K2b: test prompts go in with the rule, under K2a's caps.
+                    let mut tests = domain::rules::RuleTests::default();
+                    for p in &fires_on {
+                        tests.add("firesOn", p);
+                    }
+                    for p in &quiet_on {
+                        tests.add("quietOn", p);
+                    }
+                    if let Err(msg) = domain::rule_test::check_caps("the rule", &tests) {
+                        die("Error", msg);
+                    }
+                    match crud::rule::add_with_tests(&rule_cwd, &config.namespace, &name, &text, rationale.as_deref(), supersedes.as_deref(), &matchers, &tests) {
                         Ok(index) => {
-                            println!("Rule {index} added to domain '{name}'");
+                            let id = domain::rules::rule_id(&name, &text);
+                            println!("Rule {index} added to domain '{name}' [{}]", domain::rule_test::short_ref(&name, &id));
                             if !matchers.is_empty() {
                                 println!("  match: {}", domain::rules::describe_matchers(&matchers));
+                            }
+                            if !tests.is_empty() {
+                                println!("  tests: {}", domain::rule_test::tests_line(&tests));
+                            }
+                            // K2, "on every config change": the domain's tests, when it has any.
+                            if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &name) {
+                                println!("{line}");
                             }
                         }
                         Err(e) => die("Failed", e),
                     }
                 }
+                RuleAction::Propose { from_turn, text, keywords, example, rule, decision, new, domain, dry_run, transcript, prompt } => {
+                    // K3 (BO-15): one correction, sorted, kept for review. Read and written from where the session
+                    // stands; `-g` does not move it.
+                    let args = base::corrections::propose::Args {
+                        from_turn,
+                        text,
+                        keywords,
+                        example,
+                        rule,
+                        decision,
+                        new,
+                        domain,
+                        dry_run,
+                        transcript,
+                        prompt,
+                    };
+                    match base::corrections::propose::run(&config, &cwd, &args) {
+                        Ok(p) => print!("{}", base::corrections::propose::render(&p, dry_run)),
+                        Err(msg) => die("Error", msg),
+                    }
+                }
+                RuleAction::Replay { proposal, domain: dom, rule, decision, add_keyword, drop_keyword } => {
+                    // K6 (BO-16): a change, from a proposal or from the flags, run over the match log's recent prompts.
+                    use base::domain::replay::{self, Change, Target};
+                    let split = |v: &[String]| -> Vec<String> {
+                        v.iter().flat_map(|k| base::domain::global_decisions::parse_keywords(k)).collect()
+                    };
+                    let (header, change) = match proposal {
+                        Some(id) => {
+                            let want = base::corrections::review::normalize_id(&id);
+                            let Some(p) = base::corrections::review::load(&config, &rule_cwd).into_iter().find(|p| p.id == want) else {
+                                die("Error", format!("no proposal {want} in this workspace or the global tier (base rule review lists them)"))
+                            };
+                            let change = p.change().unwrap_or_else(|e| die("Error", e));
+                            (format!("proposal {} · {} · {}", p.id, p.kind_label(), change.describe()), change)
+                        }
+                        None => {
+                            let target = match (dom, rule, decision) {
+                                (Some(d), _, _) => Target::Domain(domain::canonical_name(&cwd, &d)),
+                                (_, Some(r), _) => Target::Rule(r),
+                                (_, _, Some(s)) => Target::Decision(s),
+                                _ => die("Error", "give a proposal id, or --domain, --rule or --decision with --add-keyword or --drop-keyword"),
+                            };
+                            let change = Change::keywords(target, split(&add_keyword), split(&drop_keyword));
+                            if change.add.is_empty() && change.drop.is_empty() {
+                                die("Error", "give --add-keyword \"...\" or --drop-keyword \"...\"");
+                            }
+                            (change.describe(), change)
+                        }
+                    };
+                    match replay::run(&config, &rule_cwd, &change) {
+                        Ok(o) => print!("{}", replay::render(&header, &o)),
+                        Err(msg) => die("Error", msg),
+                    }
+                }
+                RuleAction::Review { approve, reject, reason, edit, text, keywords, broad_ok } => {
+                    // K5 (BO-16): the queue. One key per proposal on a terminal; one flag for the AI or a script.
+                    use base::corrections::review::{self, Action};
+                    let action = match (approve, reject, edit) {
+                        (Some(id), _, _) => Action::Approve { id, broad_ok },
+                        (_, Some(id), _) => Action::Reject { id, reason },
+                        (_, _, Some(id)) => Action::Edit { id, text, keywords, broad_ok },
+                        _ => Action::List,
+                    };
+                    if matches!(action, Action::List) && review::on_terminal() {
+                        review::interactive(&config, &rule_cwd);
+                    } else {
+                        match review::run(&config, &rule_cwd, &action) {
+                            Ok(out) => print!("{out}"),
+                            Err(msg) => die("Error", msg),
+                        }
+                    }
+                }
+                RuleAction::Unretire { rule } => match base::corrections::review::unretire(&config, &rule_cwd, &rule) {
+                    Ok(out) => print!("{out}"),
+                    Err(msg) => die("Error", msg),
+                },
+                RuleAction::Update { rule, fires_on, quiet_on, clear_tests, protected, unprotected } => {
+                    let (want_domain, id) = crud::rule::parse_rule_ref(&rule).unwrap_or_else(|msg| die("Error", msg));
+                    let want_domain = want_domain.map(|d| domain::canonical_name(&cwd, &d));
+                    let tests_given = !fires_on.is_empty() || !quiet_on.is_empty() || clear_tests;
+                    if !tests_given && !protected && !unprotected {
+                        die("Error", "give --fires-on, --quiet-on, --clear-tests, --protected or --unprotected");
+                    }
+                    let found = crud::rule::find(&cwd, &config.namespace, want_domain.as_deref(), &id).unwrap_or_else(|e| die("Failed", e));
+                    let found = match found.as_slice() {
+                        [] => die("Error", format!("no rule '{rule}' in either tier (ids come from base rule list --domain <domain>)")),
+                        [one] => one,
+                        many => {
+                            let names: Vec<String> = many.iter().map(|f| domain::rule_test::short_ref(&f.domain, &f.id)).collect();
+                            die("Error", format!("'{rule}' fits {} rules: {}; give more of the id", many.len(), names.join(", ")))
+                        }
+                    };
+                    let short = domain::rule_test::short_ref(&found.domain, &found.id);
+                    if found.homes.is_empty() {
+                        let why = match found.copies.iter().find(|c| c.starts_with("ext:")) {
+                            Some(ext) => format!("{short} comes from the extension {ext}, so its tests cannot be stored with it"),
+                            None => format!("{short} is a synced copy of a domains.toml line that is no longer there, so it has nowhere to keep tests"),
+                        };
+                        die("Error", why);
+                    }
+                    // One tier, never both: the workspace's (the global tier's when the workspace holds none), or the
+                    // global tier's with -g, so one tier's prompts never land in the other.
+                    let homes = found.homes_for(global);
+                    if homes.is_empty() {
+                        die("Error", format!("{short} is not in the global tier, only in the workspace; run it without -g"));
+                    }
+                    // BO-20 (K9f): the protected mark is kept where the rule's tests are.
+                    if protected || unprotected {
+                        let targets: Vec<&crud::rule::TestHome> = homes.iter().map(|(h, _)| h).collect();
+                        match crud::rule::store_protected(&config.namespace, found, &targets, protected) {
+                            Ok(wrote) if wrote.is_empty() => {
+                                die("Error", format!("{short} changed after it was read, and nothing was stored; run the command again"))
+                            }
+                            Ok(wrote) if protected => println!(
+                                "Rule {short} is protected: a shadow candidate that loses it is never promoted automatically (in {})",
+                                wrote.join(", ")
+                            ),
+                            Ok(wrote) => println!("Rule {short} is no longer protected (in {})", wrote.join(", ")),
+                            Err(e) => die("Failed", e),
+                        }
+                        if !tests_given {
+                            return;
+                        }
+                    }
+                    let mut tests = domain::rules::RuleTests::default();
+                    if !clear_tests {
+                        for (_, t) in &homes {
+                            tests.merge(t);
+                        }
+                    }
+                    for p in &fires_on {
+                        tests.add("firesOn", p);
+                    }
+                    for p in &quiet_on {
+                        tests.add("quietOn", p);
+                    }
+                    let tests = tests.sorted();
+                    if let Err(msg) = domain::rule_test::check_caps(&short, &tests) {
+                        die("Error", msg);
+                    }
+                    let targets: Vec<&crud::rule::TestHome> = homes.iter().map(|(h, _)| h).collect();
+                    match crud::rule::store_tests(&config.namespace, found, &targets, &tests) {
+                        Ok(wrote) if wrote.is_empty() => {
+                            die("Error", format!("{short} changed after it was read, and nothing was stored; run the command again"))
+                        }
+                        Ok(wrote) => {
+                            println!("Rule {short} tests: {} (in {})", domain::rule_test::tests_line(&tests), wrote.join(", "));
+                            if let Some(line) = domain::rule_test::after_change_line(&config, &cwd, &found.domain) {
+                                println!("{line}");
+                            }
+                        }
+                        Err(e) => die("Failed", e),
+                    }
+                }
+                RuleAction::Test { domain: want_domain, rule } => {
+                    use domain::rule_test::Filter;
+                    let filter = match (want_domain, rule) {
+                        (d_flag, Some(r)) => match crud::rule::parse_rule_ref(&r) {
+                            Ok((d_ref, id)) => {
+                                // `--domain` narrows a bare id; a <domain>.<id> naming another domain is a mistake, not a choice.
+                                let d_flag = d_flag.map(|d| domain::canonical_name(&cwd, &d));
+                                let d_ref = d_ref.map(|d| domain::canonical_name(&cwd, &d));
+                                if let (Some(a), Some(b)) = (&d_flag, &d_ref)
+                                    && base::crud::slugify(a) != base::crud::slugify(b)
+                                {
+                                    eprintln!("Error: --domain {a} and --rule {r} name different domains");
+                                    std::process::exit(2);
+                                }
+                                Filter::Rule { domain: d_ref.or(d_flag), id }
+                            }
+                            Err(msg) => {
+                                eprintln!("Error: {msg}");
+                                std::process::exit(2);
+                            }
+                        },
+                        (Some(d), None) => Filter::Domain(domain::canonical_name(&cwd, &d)),
+                        (None, None) => Filter::All,
+                    };
+                    // From where the operator stands, as the prompt hook reads it: `--global` stands in the global tier.
+                    let bench = domain::rule_test::Bench::load(&config, &rule_cwd);
+                    match bench.run(&filter) {
+                        Ok(report) => {
+                            print!("{}", report.render());
+                            if report.failed() {
+                                std::process::exit(1);
+                            }
+                        }
+                        // Exit 2, not 1: the run did not start, which a script must not read as a failed test.
+                        Err(msg) => {
+                            eprintln!("Error: {msg}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                RuleAction::Stats { domain: want_domain, json } => {
+                    // From where the operator stands, as `rule test` reads it: `--global` stands in the global tier.
+                    let want_domain = want_domain.map(|d| domain::canonical_name(&cwd, &d));
+                    let stats = base::usage::stats_for(&rule_cwd, &config, want_domain.as_deref());
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&stats).unwrap_or_else(|_| "{}".into()));
+                    } else {
+                        print!("{}", base::usage::render_stats(&stats));
+                    }
+                }
                 RuleAction::List { domain: name, include_superseded } => {
+                    let name = domain::canonical_name(&cwd, &name);
                     // #53. Without --global this shows BOTH tiers, because the
                     // hook injects both and no single command used to print
                     // what the agent actually receives. --global keeps the
@@ -2954,6 +4443,7 @@ pub fn run() {
                     }
                 }
                 RuleAction::Remove { domain: name, index } => {
+                    let name = domain::canonical_name(&cwd, &name);
                     let tier = if global { "global" } else { "workspace" };
                     let other = if global { "workspace" } else { "global" };
                     match crud::rule::remove(&rule_cwd, &config.namespace, &name, index) {
@@ -2974,6 +4464,9 @@ pub fn run() {
 
         // ─── Learn ────────────────────────────────────────
         Some(Commands::Learn { global, text, r#type, domain, project, entity, supersedes, mention, context, remove, update, list }) => {
+            // An old domain or project name reads as the renamed one, judged from where the operator stands (BO-24).
+            let domain = domain.map(|d| base::domain::canonical_name(&cwd, &d));
+            let project = project.map(|p| base::domain::canonical_name(&cwd, &p));
             let cwd = tier_cwd(&cwd, global);
             if list {
                 if let Err(e) = crud::note::list_notes(&cwd, &config.namespace, if r#type != "insight" { Some(&r#type) } else { None }, domain.as_deref()) {
@@ -3033,6 +4526,7 @@ pub fn run() {
         // ─── Recall ─────────────────────────────────────────
         Some(Commands::Recall { keyword, domain, include_superseded, slug }) => {
             outside_workspace_note(&cwd);
+            let domain = domain.map(|d| base::domain::canonical_name(&cwd, &d));
             // Note IRIs to stamp lastRead on (usage signal for `base graph purge --stale`).
             // Resolved BEFORE printing so an explicit recall marks what it surfaced.
             let mut surfaced: Vec<String> = Vec::new();
@@ -3129,14 +4623,19 @@ pub fn run() {
         }
 
         // ─── Install ─────────────────────────────────────────
-        Some(Commands::Install { carl, skip_hooks, full, starter_commands, no_starter_commands }) => {
+        Some(Commands::Install { carl, skip_hooks, full, starter_commands, no_starter_commands, corrections_line, no_corrections_line }) => {
             let carl_path = carl.as_ref().map(std::path::Path::new);
             let starter = match (starter_commands, no_starter_commands) {
                 (true, _) => base::install::StarterCommands::Yes,
                 (_, true) => base::install::StarterCommands::No,
                 _ => base::install::StarterCommands::Ask,
             };
-            if let Err(e) = base::install::run(carl_path, skip_hooks, full, starter) {
+            let corrections = match (corrections_line, no_corrections_line) {
+                (true, _) => base::corrections::claude_md::Choice::Yes,
+                (_, true) => base::corrections::claude_md::Choice::No,
+                _ => base::corrections::claude_md::Choice::Ask,
+            };
+            if let Err(e) = base::install::run(carl_path, skip_hooks, full, starter, corrections) {
                 eprintln!("Install failed: {e}");
             }
         }
@@ -3192,6 +4691,69 @@ pub fn run() {
             }
         }
 
+        // ─── Deferral upgrade migration (rank 09) ─────────────
+        Some(Commands::Defer { action }) => match action {
+            DeferAction::Migrate { apply, rollback, limit, older_than } => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let Some(root) = base::protocol::migrate::marker_root(&cwd) else {
+                    eprintln!(
+                        "base: no base directory here, so there is no install to migrate. \
+                         Run `base scaffold` first."
+                    );
+                    return;
+                };
+                // Two writes in opposite directions in one command is never what was meant, and
+                // guessing which one wins is how an operator loses a tier. Refuse and name both.
+                if apply && rollback {
+                    eprintln!("base: --apply and --rollback do the opposite of each other; pass one.");
+                    return;
+                }
+                if rollback {
+                    match base::protocol::migrate::rollback(&root) {
+                        Ok(n) => println!("base: defer migrate — rolled back {n} tier(s) from the pre-migration snapshot."),
+                        Err(e) => eprintln!("base: defer migrate --rollback failed: {e}"),
+                    }
+                    return;
+                }
+                let home = base::home::home_root();
+                let plan = match base::protocol::migrate::plan(home.as_deref(), &cwd, &config) {
+                    Ok(p) => p.stage(limit, older_than),
+                    Err(e) => {
+                        eprintln!("base: defer migrate plan failed: {e}");
+                        return;
+                    }
+                };
+                if !apply {
+                    print!("{}", base::protocol::migrate::format_plan(&plan));
+                    return;
+                }
+                // The four cases are reported as four DIFFERENT sentences. Two of them write
+                // nothing and they must never read alike: one means there was nothing to do, the
+                // other means the filter excluded everything and the migration is still waiting.
+                match base::protocol::migrate::apply(&root, &plan, &config) {
+                    Ok(base::protocol::migrate::Applied::NothingToDo) => println!(
+                        "base: defer migrate — nothing to reset. Every clock already reads a real touch."
+                    ),
+                    Ok(base::protocol::migrate::Applied::Complete(out)) => println!(
+                        "base: defer migrate — COMPLETE. Reset the activity clock on {} record(s) across \
+                         {} tier(s). Roll back with `base defer migrate --rollback`.",
+                        out.reset,
+                        out.snapshots.len()
+                    ),
+                    Ok(base::protocol::migrate::Applied::Partial { done, full, .. }) => println!(
+                        "base: defer migrate — PARTIAL: {done} of {full} record(s) reset. The migration is \
+                         STILL PENDING and automatic deferral stays blocked, so the {} you did not take \
+                         will NOT defer. Run it again to continue, or `base defer migrate --rollback`.",
+                        full - done
+                    ),
+                    Err(e) => {
+                        eprintln!("base: defer migrate --apply refused: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
+
         // ─── Reconcile ────────────────────────────────────────
         Some(Commands::Reconcile { dry_run }) => {
             let config = base::config::BaseConfig::load(&cwd);
@@ -3207,7 +4769,7 @@ pub fn run() {
             match base::protocol::reconcile::open_workspace(&cwd) {
                 None => eprintln!("base: no workspace graph found (run from inside a base workspace)"),
                 Some((store, trig_path, ws_root)) => {
-                    let stale = config.protocol.stale_days as i64;
+                    let stale = config.defer_days(base::config::DeferKind::Project);
                     let roots = base::protocol::reconcile::registered_roots(&config);
                     match base::protocol::reconcile::plan(&store, &config.namespace, &ws_root, &roots, stale) {
                         Err(e) => eprintln!("base: reconcile plan failed: {e}"),
@@ -3227,6 +4789,25 @@ pub fn run() {
                             }
                         }
                     }
+                }
+            }
+            // The record half: handoffs, forks, tasks and milestones, in every tier (spec C5). A dry run
+            // plans with [defer] off, as the project half always has, so it can be previewed first.
+            let home = base::home::home_root();
+            if dry_run {
+                match base::protocol::reconcile::plan_all_records(home.as_deref(), &cwd, &config) {
+                    Ok(plans) => print!("{}", base::protocol::reconcile::format_records_report(&config, &plans)),
+                    Err(e) => eprintln!("base: deferral plan failed: {e}"),
+                }
+            } else if !config.defer.enabled {
+                eprintln!("base: [defer] not enabled — refusing to defer handoffs, forks, tasks or milestones. Preview with `base reconcile --dry-run`.");
+            } else {
+                match base::protocol::reconcile::reconcile_records(home.as_deref(), &cwd, &config) {
+                    Ok(s) => println!(
+                        "base: defer — {} deferred, {} revived ({} records scanned)",
+                        s.deferred, s.revived, s.scanned
+                    ),
+                    Err(e) => eprintln!("base: defer failed: {e}"),
                 }
             }
         }
@@ -3441,8 +5022,13 @@ pub fn run() {
                     println!("\n{} command(s) available. Type *NAME in a prompt to activate.", commands.len());
                 }
             }
-            CommandAction::Show { name } => {
-                let commands = command::load_commands(&cwd);
+            CommandAction::Show { name, shipped } => {
+                // `--shipped` (BO-26): the starter pack's text, which an upgraded user compares their own copy with.
+                let commands = if shipped {
+                    command::shipped_command(&name).into_iter().collect()
+                } else {
+                    command::load_commands(&cwd)
+                };
                 match commands.iter().find(|c| c.name.eq_ignore_ascii_case(&name)) {
                     Some(cmd) => {
                         println!("*{}", cmd.name);
@@ -3454,6 +5040,7 @@ pub fn run() {
                             println!("  {i}. {rule}");
                         }
                     }
+                    None if shipped => eprintln!("base ships no command '{name}' in its starter pack."),
                     None => eprintln!("Command '{name}' not found. Run `base commands list` to see available."),
                 }
             }
@@ -3862,21 +5449,45 @@ pub fn run() {
         },
 
         // ─── Doctor ───────────────────────────────────────────
-        Some(Commands::Doctor { json, repair, restore }) => {
+        Some(Commands::Doctor { json, repair, restore, measure, fix, yes, .. }) => {
             if !json {
                 outside_workspace_note(&cwd);
             }
             // Parser-independent: every branch must run BECAUSE the graph is broken.
-            if let Some(which) = restore {
-                // --restore: workspace tier only (operator's corruptible graph).
-                let Some(base_dir) = base::config::find_workspace_base(&cwd) else {
-                    eprintln!("doctor --restore: no workspace .base/ found from {}", cwd.display());
+            if measure {
+                // F6: the budgets come from what this host delivers, measured, not from a number carried forward.
+                let Some(host) = base::doctor::host_claude_version() else {
+                    eprintln!("base doctor --measure: `claude --version` did not answer with a version; is Claude Code on PATH?");
                     std::process::exit(1);
                 };
-                let ws = base_dir.join("graph.nq");
+                let exe = match std::env::current_exe() {
+                    Ok(p) => p,
+                    Err(e) => die("base doctor --measure: cannot find this binary for the measure hook", e),
+                };
+                // The runner is dropped, and its scratch directory removed, before anything below can
+                // `process::exit`, which skips destructors.
+                let outcome = base::measure::ClaudeRunner::new(exe).and_then(|mut runner| {
+                    base::measure::run(&cwd, &mut runner, &host, &mut std::io::stdout())
+                });
+                match outcome {
+                    Ok(base::measure::Outcome::Written) => {}
+                    Ok(base::measure::Outcome::NotWritten) => std::process::exit(1),
+                    Err(e) => die("base doctor --measure", e),
+                }
+            } else if let Some(which) = restore {
+                // --restore: a backup base made, in either tier (BO-26, Q4); a bare name or a bare `--restore` is the
+                // workspace's.
+                let base_dir = base::config::find_workspace_base(&cwd);
+                let need_ws = || -> std::path::PathBuf {
+                    base_dir.clone().unwrap_or_else(|| {
+                        eprintln!("doctor --restore: no workspace .base/ found from {}", cwd.display());
+                        std::process::exit(1);
+                    })
+                };
                 match which {
                     // Bare `--restore` → list available snapshots, mutate nothing.
                     None => {
+                        let ws = need_ws().join("graph.nq");
                         let baks = base::doctor::list_backups(&ws);
                         if json {
                             let rows: Vec<_> = baks
@@ -3894,13 +5505,47 @@ pub fn run() {
                             println!("\nRestore with: base doctor --restore <path>");
                         }
                     }
-                    // `--restore <name|path>` → resolve, snapshot current, swap in.
+                    // `--restore <name|path>` → resolve, refuse anything base did not make, snapshot current, swap in.
                     Some(arg) => {
                         let candidate = std::path::Path::new(&arg);
                         let backup = if candidate.is_absolute() {
                             candidate.to_path_buf()
                         } else {
-                            base_dir.join(&arg)
+                            need_ws().join(&arg)
+                        };
+                        let ws = match base::doctor::restorable(&cwd, &backup) {
+                            Ok(base::doctor::Restorable::Graph { graph }) => graph,
+                            Ok(base::doctor::Restorable::Config { file }) => {
+                                match base::doctor::restore_config(&file, &backup) {
+                                    Ok(aside) => {
+                                        let aside = aside.map(|a| a.display().to_string());
+                                        if json {
+                                            println!(
+                                                "{}",
+                                                serde_json::json!({
+                                                    "restored": file.display().to_string(),
+                                                    "from": backup.display().to_string(),
+                                                    "replaced_copy": aside,
+                                                })
+                                            );
+                                        } else {
+                                            println!("Restored {} from {}", file.display(), backup.display());
+                                            if let Some(a) = aside {
+                                                println!("  the file it replaced is at {a}");
+                                            }
+                                        }
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("doctor --restore failed: {e:#}");
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                            Err(why) => {
+                                eprintln!("doctor --restore: {why}");
+                                std::process::exit(1);
+                            }
                         };
                         match base::doctor::restore_tier(&ws, &backup) {
                             Ok(()) => {
@@ -3934,6 +5579,17 @@ pub fn run() {
                             }
                         }
                     }
+                }
+            } else if fix {
+                // --fix: the one repair the upgrade path runs too (F15e). Plans, or with --yes applies.
+                let report = base::fix::run(&cwd, yes);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
+                } else {
+                    print!("{}", base::fix::format_human(&report));
+                }
+                if report.has_errors() {
+                    std::process::exit(1);
                 }
             } else if repair {
                 // --repair: quarantine bad lines + atomic rewrite of the good set.
@@ -4005,7 +5661,7 @@ pub fn run() {
                     std::process::exit(1);
                 }
             },
-            GraphAction::Migrate { dry_run } => {
+            GraphAction::Migrate { dry_run, yes } => {
                 if dry_run {
                     print!("{}", base::migrate::format_dry_run(&cwd, &config.namespace));
                 } else {
@@ -4023,6 +5679,12 @@ pub fn run() {
                     } else {
                         print!("{notice}");
                     }
+                }
+                // The store repair, through the one function `base doctor --fix` calls (F15e).
+                let report = base::migrate::upgrade(&cwd, yes);
+                print!("{}", base::fix::format_as(&report, "base graph migrate"));
+                if report.has_errors() {
+                    std::process::exit(1);
                 }
             }
             GraphAction::Purge { stale, apply, days } => {
@@ -4143,5 +5805,113 @@ pub fn run() {
         Some(Commands::External(args)) => base::plugin::dispatch(&args, &cwd),
 
         None => eprintln!("No command provided. Run `base --help` for usage."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn rebuilds_index(args: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(std::iter::once("base").chain(args.iter().copied())).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        changes_prompt_matching(&cli.command)
+    }
+
+    /// K7e (BO-18): the commands that change what a prompt can be served, or replace or move the graph holding it,
+    /// rebuild the rule index when they end; previews, reads, and the AST and edge syncs the hooks run after every turn
+    /// do not.
+    #[test]
+    fn the_rule_index_is_rebuilt_by_matching_changes_only() {
+        for args in [
+            &["sync"][..],
+            &["sync", "--incremental"],
+            &["domain", "sync"],
+            &["rule", "add", "--domain", "tools", "--text", "Name the folder."],
+            &["doctor", "--repair"],
+            &["doctor", "--restore", "graph.nq.bak-1"],
+            &["doctor", "--fix", "--yes"],
+            &["graph", "move", "--select", "domain:tools", "--to", "other", "--yes"],
+            &["project", "move", "tools", "--to", "other", "--yes"],
+            &["project", "delete", "tools", "--yes"],
+        ] {
+            assert!(rebuilds_index(args), "{args:?} changes prompt matching");
+        }
+        for args in [
+            &["sync", "--ast", "--yes", "--target", "."][..],
+            &["sync", "--repair"],
+            &["doctor"],
+            &["doctor", "--restore"],
+            &["doctor", "--fix"],
+            &["graph", "move", "--select", "domain:tools", "--to", "other"],
+            &["graph", "move", "--select", "domain:tools", "--to", "other", "--yes", "--dry-run"],
+            &["project", "delete", "tools"],
+            &["rule", "list", "--domain", "tools"],
+            &["rule", "stats"],
+            &["rule", "stats", "--domain", "tools", "--json"],
+        ] {
+            assert!(!rebuilds_index(args), "{args:?} changes nothing a prompt is served");
+        }
+    }
+
+    /// A command line split as bash splits it: on spaces; a double-quoted run kept whole, `\"` inside it a quote; a
+    /// single-quoted run kept whole and as written; a backslash outside quotes keeps the character after it.
+    fn shell_words(line: &str) -> Vec<String> {
+        let (mut out, mut word, mut quoted, mut single, mut any) = (Vec::new(), String::new(), false, false, false);
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' if !quoted => {
+                    single = !single;
+                    any = true;
+                }
+                c if single => word.push(c),
+                '\\' if quoted && chars.peek() == Some(&'"') => word.push(chars.next().unwrap_or('"')),
+                '\\' if !quoted => {
+                    if let Some(next) = chars.next() {
+                        word.push(next);
+                    }
+                }
+                '"' => {
+                    quoted = !quoted;
+                    any = true;
+                }
+                c if c.is_whitespace() && !quoted => {
+                    if any || !word.is_empty() {
+                        out.push(std::mem::take(&mut word));
+                    }
+                    any = false;
+                }
+                c => word.push(c),
+            }
+        }
+        if any || !word.is_empty() {
+            out.push(word);
+        }
+        out
+    }
+
+    /// BO-19 (lynx's G0 condition): every next step `base doctor`'s usage section and `base rule stats` print parses
+    /// with this binary's own parser, each form built by the functions the section prints with.
+    #[test]
+    fn every_usage_next_step_parses() {
+        assert_eq!(shell_words("a \"b c\" d"), ["a", "b c", "d"]);
+        assert_eq!(shell_words("x '$HOME it'\\''s' y"), ["x", "$HOME it's", "y"]);
+        let mut keywords = Vec::new();
+        for line in base::usage::next_step_examples() {
+            let words = shell_words(&line);
+            assert_eq!(words[0], "base", "{line}");
+            match Cli::try_parse_from(&words) {
+                Err(e) => panic!("{line} does not parse: {e}"),
+                Ok(Cli { command: Some(Commands::Rule { action: RuleAction::Replay { drop_keyword, .. }, .. }), .. }) => {
+                    keywords.extend(drop_keyword)
+                }
+                Ok(_) => {}
+            }
+        }
+        // A keyword a shell would act on reaches the command as written.
+        for kw in ["user prompt submit", "a&b|*.rs", "$HOME it's"] {
+            assert!(keywords.iter().any(|k| k == kw), "{kw:?} not read back: {keywords:?}");
+        }
     }
 }

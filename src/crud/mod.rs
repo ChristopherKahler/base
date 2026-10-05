@@ -1,14 +1,19 @@
+pub mod alias;
 pub mod ast_map;
 pub mod ast_query;
 pub mod decision;
+pub mod deferred;
 pub mod semantic;
 pub mod supersede;
 pub mod entity;
 pub mod goal;
 pub mod handoff;
+pub mod handoff_show;
 pub mod milestone;
 pub mod note;
 pub mod project;
+pub mod project_paths;
+pub mod rename;
 pub mod rule;
 pub mod reminder;
 pub mod task;
@@ -287,14 +292,59 @@ pub fn load_and_mutate(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result
     })
 }
 
-/// Load workspace graph and run a SPARQL SELECT query.
-pub fn load_and_query(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<QueryResults> {
+/// Load the workspace graph [`load_and_query`] reads, for a caller that runs more than one query
+/// over one load.
+pub fn load_workspace_graph(cwd: &Path) -> Result<Store> {
     let base_dir = crate::config::find_workspace_base(cwd)
         .context("no .base/ directory found. Use --global for global rules, or run `base scaffold` to create a workspace.")?;
-    let trig_path = base_dir.join("graph.nq");
-    let store = crate::store::load_graph(&trig_path)?;
+    crate::store::load_graph(&base_dir.join("graph.nq"))
+}
+
+/// Load workspace graph and run a SPARQL SELECT query.
+///
+/// Reads ONE tier: the workspace above `cwd`. A caller that must see records from
+/// either tier wants [`load_merged_and_query`]. All 30 remaining call sites of this
+/// function read a single tier, so all 30 carry that limit latent; they move across
+/// on their own evidence, one at a time, not in a sweep.
+pub fn load_and_query(cwd: &Path, ns: &NamespaceConfig, sparql: &str) -> Result<QueryResults> {
+    let store = load_workspace_graph(cwd)?;
     let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
     crate::store::query(&store, &full_sparql)
+}
+
+/// Load BOTH tiers into one store and run a SPARQL SELECT query.
+///
+/// The cross-tier sibling of [`load_and_query`]. `store::load_merged` already merges
+/// the global and workspace graphs, already fails open when one is missing, and
+/// already degrades to a lenient per-tier load when one tier will not parse, so a
+/// corrupt tier costs its own bad lines instead of the whole read. `flow_resurface`
+/// has called it for three of its scans all along; this is the seam, not a new one.
+///
+/// Errors when NEITHER tier has a graph, rather than returning zero rows. Absent and
+/// empty are different states, and a query that matches nothing because nothing was
+/// read is the one that reads as a confident "there is none".
+///
+/// Uses [`crate::store::query`], not `query_union`. base's own queries wrap their
+/// patterns in `GRAPH ?g {{ ... }}`, so they already match named graphs explicitly.
+/// `query_union` would return the very same rows here, because an explicit `GRAPH ?g`
+/// is unaffected by a union default graph — but it would tell every later reader that
+/// this query was written by a user, which is false. A correct result carrying a false
+/// signal is worth refusing.
+pub fn load_merged_and_query(
+    cwd: &Path,
+    ns: &NamespaceConfig,
+    sparql: &str,
+) -> Result<Option<(QueryResults, crate::store::TierRead)>> {
+    let Some((store, tiers)) = crate::store::load_merged_reporting(cwd) else {
+        // ABSENT is a state, not an error. The first version of this function
+        // returned Err here, which was the right placeholder while nothing could
+        // render the difference: an Err at least refused to answer, where zero
+        // rows would have answered wrongly. Now that a caller CAN render it,
+        // a state the caller can act on beats an error string it cannot.
+        return Ok(None);
+    };
+    let full_sparql = format!("{}\n{}", prefixes(ns), sparql);
+    Ok(Some((crate::store::query(&store, &full_sparql)?, tiers)))
 }
 
 
@@ -351,6 +401,11 @@ pub fn resolve_slug(cwd: &Path, ns: &NamespaceConfig, entity_type: &str, input: 
         .context("no .base/ directory found. Use --global for global rules, or run `base scaffold` to create a workspace.")?;
     let trig_path = base_dir.join("graph.nq");
     let store = crate::store::load_graph(&trig_path)?;
+    resolve_slug_in(&store, ns, entity_type, input)
+}
+
+/// [`resolve_slug`] over a store the caller already loaded.
+pub fn resolve_slug_in(store: &oxigraph::store::Store, ns: &NamespaceConfig, entity_type: &str, input: &str) -> Result<String> {
     let pfx = prefixes(ns);
     let p = &ns.prefix;
     let type_name = capitalize_first(entity_type);
@@ -359,7 +414,7 @@ pub fn resolve_slug(cwd: &Path, ns: &NamespaceConfig, entity_type: &str, input: 
     if !input.contains(' ') {
         let iri = build_iri(ns, entity_type, input);
         let ask = format!("{pfx}\nASK WHERE {{ GRAPH ?g {{ <{iri}> a {p}:{type_name} }} }}");
-        if let Ok(QueryResults::Boolean(true)) = crate::store::query(&store, &ask) {
+        if let Ok(QueryResults::Boolean(true)) = crate::store::query(store, &ask) {
             return Ok(input.to_string());
         }
     }
@@ -369,7 +424,7 @@ pub fn resolve_slug(cwd: &Path, ns: &NamespaceConfig, entity_type: &str, input: 
     if slugified != input {
         let iri2 = build_iri(ns, entity_type, &slugified);
         let ask2 = format!("{pfx}\nASK WHERE {{ GRAPH ?g {{ <{iri2}> a {p}:{type_name} }} }}");
-        if let Ok(QueryResults::Boolean(true)) = crate::store::query(&store, &ask2) {
+        if let Ok(QueryResults::Boolean(true)) = crate::store::query(store, &ask2) {
             return Ok(slugified);
         }
     }
@@ -385,12 +440,23 @@ pub fn resolve_slug(cwd: &Path, ns: &NamespaceConfig, entity_type: &str, input: 
            }}\n\
          }} LIMIT 1"
     );
-    if let QueryResults::Solutions(solutions) = crate::store::query(&store, &sel)? {
+    if let QueryResults::Solutions(solutions) = crate::store::query(store, &sel)? {
         for row in solutions.filter_map(|r| r.ok()) {
             if let Some(term) = row.get("iri") {
                 let display = term_display(term.into());
                 return Ok(display);
             }
+        }
+    }
+
+    // Try 4 (BO-24, R4): a name from before `base project rename`, the project or domain itself or a `{name}.{rest}`
+    // record keyed by it. Last, so a record that really carries the name always wins over an alias.
+    if let Some((old, new, rewritten)) = alias::rewrite(store, ns, input) {
+        let iri = build_iri(ns, entity_type, &rewritten);
+        let ask = format!("{pfx}\nASK WHERE {{ GRAPH ?g {{ <{iri}> a {p}:{type_name} }} }}");
+        if let Ok(QueryResults::Boolean(true)) = crate::store::query(store, &ask) {
+            alias::notice(&old, &new);
+            return Ok(rewritten);
         }
     }
 
@@ -584,6 +650,59 @@ fn missing_parent_edges(
     }
 
     Ok(repairs)
+}
+
+// ─── tier file walk (shared by crud::handoff and hook::post_tool_use) ───
+
+/// Every existing graph file across tiers — used for tier-agnostic mutations
+/// (snooze/archive) so a handoff is updated wherever it lives.
+///
+/// Takes `gbl_root` rather than resolving the home directory itself. This
+/// function is why the fork exists: reaching for the home directory here meant
+/// every test that archived a fixture handoff rewrote the operator's real
+/// global graph. As a parameter the compiler will not let a caller — test or
+/// otherwise — forget to say which root it means.
+pub(crate) fn all_tier_files(gbl_root: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Some(home) = gbl_root {
+        let gbl = home.join(".base-gbl").join(".base").join("graph.nq");
+        if gbl.exists() {
+            files.push(gbl);
+        }
+    }
+    if let Some(base) = crate::config::find_workspace_base(cwd) {
+        let ws = base.join("graph.nq");
+        if ws.exists() {
+            files.push(ws);
+        }
+    }
+    // Dedupe by canonical path. Under `-g` the global tier IS the workspace, so
+    // both entries resolve to one file and the UPDATE ran twice on it — visible
+    // in production as two identical archive lines in changes.jsonl at the same
+    // second (global feed, 2026-09-07 15:07:48).
+    let mut seen: Vec<PathBuf> = Vec::new();
+    files.retain(|f| {
+        let key = f.canonicalize().unwrap_or_else(|_| f.clone());
+        if seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    });
+    files
+}
+
+
+/// Which tier `file` belongs to, for the operator-facing line.
+/// NOTE ON THE NAME: `tier_label` already exists in this module and answers which tier
+/// a WRITE is about to touch, returning an owned `String`. This one answers which tier a
+/// given graph FILE belongs to. Two questions, so two names.
+pub(crate) fn tier_label_of_file(file: &Path, gbl_root: Option<&Path>) -> &'static str {
+    match gbl_root {
+        Some(h) if file.starts_with(h.join(".base-gbl")) => "global tier",
+        _ => "workspace tier",
+    }
 }
 
 #[cfg(test)]

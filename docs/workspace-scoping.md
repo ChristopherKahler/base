@@ -90,7 +90,7 @@ the reset supersedes it.
 ## Requirements
 
 1. **Default = current workspace.** From inside a registered workspace, `base project list`
-   and session-start `[Active Projects]` return only projects whose home workspace is the
+   and the session-start `PROJECTS` block return only projects whose home workspace is the
    current one (home derived from `#path`, not the named-graph stamp).
 2. **Cross-awareness preserved, one step away.** A flag (`--all`) returns the global union;
    `--workspace <name>` targets another workspace. Session-start may show a compact
@@ -118,7 +118,7 @@ from `#path`**, not by named graph:
 - `--unscoped` = projects with no `#path` or no registry match
 
 **Scope surface = full working set, not just projects (decision 2026-06-24).** The
-`active_awareness` signal and `[Pick up where you left off]` scope handoffs + recent
+`active_awareness` signal and the session-start `HANDOFFS` block scope handoffs + recent
 memory/decisions by tier/home the same way, so a project-less workspace (e.g. Extendly)
 still resumes from its tier-local handoffs and notes instead of an empty list. Nested repos
 become visible only via a deliberate `base project add` — no auto-discovery.
@@ -181,8 +181,8 @@ All three open questions were resolved with the operator before planning. Logged
   a project with a `peerWorkspace` edge to the current workspace appears in the default view.
 - `base project peer <slug> --workspace <name>` adds the edge; the project then surfaces in
   both its home workspace and the named peer.
-- Session-start `[Active Projects]` is workspace-scoped, with a one-line cross-workspace
-  pointer.
+- The session-start `PROJECTS` block is workspace-scoped, with a one-line cross-workspace
+  count.
 - Write-routing: a session-start in any CWD lands each project's triples in its `#path`-derived
   home graph; re-running session-start does not re-contaminate (idempotent). (`reslot` migration
   is optional — deprioritized in favor of the planned reset.)

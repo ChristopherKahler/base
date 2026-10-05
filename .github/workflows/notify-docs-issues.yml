@@ -14,6 +14,8 @@ permissions: {}
 jobs:
   dispatch:
     runs-on: ubuntu-latest
+    # Every job in every workflow file has one; scripts/ci_guards.py timeouts checks it.
+    timeout-minutes: 15
     steps:
       - name: Dispatch to basemode-docs
         env:

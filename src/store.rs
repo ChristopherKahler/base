@@ -531,10 +531,113 @@ pub fn load_graphs(paths: &[&Path]) -> Result<Store> {
     Ok(store)
 }
 
+/// One tier that did not read cleanly.
+#[derive(Debug, Clone)]
+pub struct TierFault {
+    /// The graph file this fault is about.
+    pub path: std::path::PathBuf,
+    /// `Some(n)`: the tier loaded and `n` malformed lines were skipped.
+    /// `None`: the tier could not be opened at all and contributed NOTHING.
+    ///
+    /// The two are different states and keeping them apart is the point of this
+    /// type. The warning this replaced was gated on the line count, so a tier
+    /// that failed to OPEN contributed zero lines — and when every tier failed
+    /// that way the count was zero, the gate stayed shut, and a graph nothing
+    /// could read came back as an empty one in silence. Branch on the variant,
+    /// never on a summed count.
+    pub skipped_lines: Option<usize>,
+}
+
+/// What a merged read actually managed to read, handed back as a VALUE.
+///
+/// [`load_merged`] reports a damaged tier by printing to stderr and returns the
+/// same `Some(store)` either way, so a caller cannot tell a clean read from a
+/// degraded one and cannot say so in what it renders. **Evidence that leaves as
+/// a side effect is invisible to the code that has to decide what to tell the
+/// operator.** This type is that evidence, returned.
+///
+/// Modelled on `crud::handoff::searched_tiers`, which hands back the list of
+/// what it looked at so the caller can name it in a not-found sentence — and
+/// carrying the correction that pattern needs. This names TIERS. It says nothing
+/// about OTHER WORKSPACES, which were never opened at all. A caller may conclude
+/// "workspace X and the global tier". It may never conclude "everything on this
+/// machine".
+#[derive(Debug, Clone, Default)]
+pub struct TierRead {
+    /// Every tier file that was opened and contributed. A tier with skipped
+    /// lines still contributed, so it appears here AND in `degraded`.
+    pub read: Vec<std::path::PathBuf>,
+    /// Every tier that did not read cleanly.
+    pub degraded: Vec<TierFault>,
+}
+
+impl TierRead {
+    /// True when every tier in scope read cleanly.
+    ///
+    /// This is the health question. Ask it here, never by comparing a line count
+    /// against zero.
+    pub fn is_clean(&self) -> bool {
+        self.degraded.is_empty()
+    }
+
+    /// Malformed lines skipped across the tiers that still loaded.
+    ///
+    /// NOT a health check. This is 0 both when nothing was wrong and when a tier
+    /// could not be opened at all, which is exactly the confusion that made the
+    /// old warning miss its worst case. Use [`TierRead::is_clean`].
+    pub fn skipped_lines(&self) -> usize {
+        self.degraded.iter().filter_map(|f| f.skipped_lines).sum()
+    }
+
+    /// Tiers that contributed nothing because they could not be opened.
+    pub fn unreadable(&self) -> usize {
+        self.degraded.iter().filter(|f| f.skipped_lines.is_none()).count()
+    }
+
+    /// One operator-facing sentence naming what went wrong, or that nothing did.
+    pub fn summary(&self) -> String {
+        let lines = self.skipped_lines();
+        let unreadable = self.unreadable();
+        match (lines, unreadable) {
+            (0, 0) => "every tier read cleanly".to_string(),
+            (0, u) => format!("{u} tier(s) could not be read at all and contributed nothing"),
+            (l, 0) => format!("skipped {l} malformed line(s) across {} tier(s)", self.degraded.len()),
+            (l, u) => format!(
+                "skipped {l} malformed line(s), and {u} tier(s) could not be read at all and contributed nothing"
+            ),
+        }
+    }
+}
+
 /// Load a merged graph from global (~/.base-gbl/.base/graph.nq) and workspace tiers
 /// into one store so SPARQL queries span all tiers. Returns None only if neither
 /// graph exists (fail-open). Call ONCE per hook invocation and share the store.
+///
+/// Prints to stderr when a tier read badly, because its callers cannot see a
+/// value. A caller that must ACT on a damaged tier — render it, or decide
+/// differently because of it — wants [`load_merged_reporting`] instead.
 pub fn load_merged(cwd: &Path) -> Option<Store> {
+    let (store, report) = load_merged_reporting(cwd)?;
+    if !report.is_clean() {
+        // Gated on the FAULT, not on the line count. The gate this replaced was
+        // `if total_bad > 0`: a tier that could not be OPENED contributed no
+        // lines, so when every tier failed that way the count was zero and this
+        // printed nothing at all, while returning a store nothing had been read
+        // into. A graph the process could not read rendered as a graph with
+        // nothing in it.
+        eprintln!("graph: {} — run `base doctor --repair`", report.summary());
+    }
+    Some(store)
+}
+
+/// [`load_merged`], with what it managed to read handed back beside the store.
+///
+/// Same resolution, same fail-open rule, same lenient fallback. The only
+/// difference is that the degraded-read fact comes back as a [`TierRead`]
+/// instead of going to stderr, so a caller can put it in what it renders.
+/// This one prints nothing; reporting is the caller's to do, which is the
+/// whole point.
+pub fn load_merged_reporting(cwd: &Path) -> Option<(Store, TierRead)> {
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
 
     if let Some(home) = crate::home::home_root() {
@@ -557,9 +660,10 @@ pub fn load_merged(cwd: &Path) -> Option<Store> {
 
     let path_refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
 
-    // Fast path: strict multi-tier load.
+    // Fast path: strict multi-tier load. It is all-or-nothing, so its success is
+    // proof every tier read cleanly and the report is empty by construction.
     if let Ok(store) = load_graphs(&path_refs) {
-        return Some(store);
+        return Some((store, TierRead { read: paths, degraded: Vec::new() }));
     }
 
     // Strict parse failed in some tier. READS degrade rather than die: fall back to
@@ -570,25 +674,28 @@ pub fn load_merged(cwd: &Path) -> Option<Store> {
     // away. Counted, because it happened.
     GRAPH_LOADS.fetch_add(1, Ordering::Relaxed);
     let store = Store::new().ok()?;
-    let mut total_bad = 0usize;
-    let mut bad_tiers = 0usize;
+    let mut report = TierRead::default();
     for path in &paths {
         match load_lenient_into(&store, path) {
             Ok(bad) if !bad.is_empty() => {
-                total_bad += bad.len();
-                bad_tiers += 1;
+                report.read.push(path.clone());
+                report.degraded.push(TierFault {
+                    path: path.clone(),
+                    skipped_lines: Some(bad.len()),
+                });
             }
-            Ok(_) => {}
-            Err(_) => bad_tiers += 1,
+            Ok(_) => report.read.push(path.clone()),
+            // Unrecoverable IO: the file could not be opened, so this tier
+            // contributed NOTHING. Recorded as its own state rather than as
+            // zero bad lines, which is indistinguishable from a clean read.
+            Err(_) => report.degraded.push(TierFault {
+                path: path.clone(),
+                skipped_lines: None,
+            }),
         }
     }
-    if total_bad > 0 {
-        eprintln!(
-            "graph: skipped {total_bad} malformed line(s) across {bad_tiers} tier(s) — run `base doctor --repair`"
-        );
-    }
     strip_ledger(&store);
-    Some(store)
+    Some((store, report))
 }
 
 /// Load a Turtle file (e.g. ast.ttl) into an existing store's default graph.
@@ -1043,8 +1150,10 @@ fn write_back_inner<W: Write>(
 const RENAME_ATTEMPTS: usize = 5;
 const RENAME_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(15);
 
-/// `fs::rename`, retried only while the error is the transient lock family.
-fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+/// `fs::rename`, retried only while the error is the transient lock family. Shared with the
+/// session-start full-output write (`emit::write_full_output`), which meets the same Windows
+/// handles on a file Claude reads.
+pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut delay = RENAME_BASE_DELAY;
     let mut last: Option<std::io::Error> = None;
 
@@ -1120,13 +1229,78 @@ fn dump_and_validate<W: Write>(
     Ok(())
 }
 
-/// Max backup snapshots to retain per graph file before rotating out the oldest.
-const BACKUP_KEEP: usize = 10;
+/// How many backup snapshots a graph file keeps: `[graph] keep_backups` as the file's own tier reads it
+/// (`<root>/.base/graph.nq` reads `<root>`'s config, the global tier `~/.base-gbl`'s), at least 1 so the snapshot just
+/// taken always survives (F24b). It was a fixed 10 until 0.16.0, and doctor then told the operator to prune by hand.
+pub fn keep_backups_for(path: &Path) -> usize {
+    let root = path.parent().and_then(Path::parent).unwrap_or(path);
+    crate::config::BaseConfig::load(root).graph.keep_backups.max(1)
+}
+
+/// One `{fname}.bak*` snapshot beside a graph file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backup {
+    pub path: PathBuf,
+    pub modified: std::time::SystemTime,
+    pub bytes: u64,
+}
+
+/// Every `{fname}.bak*` snapshot beside `path`, newest first: by modification time, then by name, so a tie under a
+/// coarse clock orders the same way on every run. Only base's own lowercase `.bak` names count; a copy an operator made
+/// by hand under another name (`graph.nq.BAK-…`, `graph.nq.torn-…`) is not base's to rotate.
+pub fn backups(path: &Path) -> Vec<Backup> {
+    let (Some(parent), Some(fname)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return Vec::new();
+    };
+    let prefix = format!("{fname}.bak");
+    let Ok(rd) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Backup> = rd
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)))
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            Some(Backup { path: e.path(), modified: meta.modified().ok()?, bytes: meta.len() })
+        })
+        .collect();
+    out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| b.path.cmp(&a.path)));
+    out
+}
+
+/// The snapshots [`prune_backups`] would remove: all but the newest `keep`, with `protect` (a snapshot just taken)
+/// counted among the kept whatever its time says.
+pub fn backups_past(path: &Path, keep: usize, protect: Option<&Path>) -> Vec<Backup> {
+    let mut all = backups(path);
+    if let Some(p) = protect
+        && let Some(i) = all.iter().position(|b| b.path == p)
+    {
+        let b = all.remove(i);
+        all.insert(0, b);
+    }
+    all.into_iter().skip(keep.max(1)).collect()
+}
+
+/// Remove every snapshot past the newest `keep` (see [`backups_past`]). Returns the ones removed; one that cannot be
+/// removed is logged to stderr and left, never an error, because a backup that survives costs disk and nothing else.
+pub fn prune_backups(path: &Path, keep: usize, protect: Option<&Path>) -> Vec<Backup> {
+    backups_past(path, keep, protect)
+        .into_iter()
+        .filter(|b| match fs::remove_file(&b.path) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("graph: failed to rotate out backup {}: {e}", b.path.display());
+                false
+            }
+        })
+        .collect()
+}
 
 /// Snapshot `path` to a sibling `{fname}.bak-{op}-{stamp}` before a mutating op,
-/// then prune the oldest `{fname}.bak*` snapshots beyond [`BACKUP_KEEP`]. This moves
-/// the hand-run `cp` backup convention into the binary (GRAPH-DURABILITY.md §4 Layer 1)
-/// and is the single backup path for repair / restore / compact / purge.
+/// then prune the oldest `{fname}.bak*` snapshots past `[graph] keep_backups`
+/// ([`keep_backups_for`]). This moves the hand-run `cp` backup convention into the
+/// binary (GRAPH-DURABILITY.md §4 Layer 1) and is the single backup path for
+/// repair / restore / compact / purge / fix.
 /// Returns the new snapshot path. Err only if the copy fails; rotation failure is
 /// non-fatal (logged to stderr, snapshot still returned Ok).
 pub fn snapshot(path: &Path, op: &str) -> Result<PathBuf> {
@@ -1140,58 +1314,11 @@ pub fn snapshot(path: &Path, op: &str) -> Result<PathBuf> {
         format!("failed to snapshot {} → {}", path.display(), backup.display())
     })?;
 
-    rotate_backups(path, fname, &backup);
+    // The just-written snapshot always counts among the kept, whatever its time says: mtime ties are routine under
+    // coarse FS granularity and rapid auto-compaction snapshots, and losing the freshest backup is the worst failure
+    // mode for a durability layer.
+    prune_backups(path, keep_backups_for(path), Some(&backup));
     Ok(backup)
-}
-
-/// Keep the newest [`BACKUP_KEEP`] `{fname}.bak*` snapshots; delete the rest.
-/// `just_written` (the snapshot the caller just created) always ranks newest so
-/// rotation can never prune it — mtime ties are routine under coarse FS granularity
-/// and rapid auto-compaction snapshots, and losing the freshest backup is the worst
-/// failure mode for a durability layer. Non-fatal: any IO error is logged and skipped.
-fn rotate_backups(path: &Path, fname: &str, just_written: &Path) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    let prefix = format!("{fname}.bak");
-    let Ok(rd) = fs::read_dir(parent) else {
-        return;
-    };
-
-    let mut baks: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    for entry in rd.flatten() {
-        let p = entry.path();
-        let is_bak = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with(&prefix))
-            .unwrap_or(false);
-        if !is_bak {
-            continue;
-        }
-        if let Some(mt) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
-            baks.push((mt, p));
-        }
-    }
-
-    if baks.len() <= BACKUP_KEEP {
-        return;
-    }
-    // Newest first. The just-written snapshot is forced to the front so it survives
-    // rotation regardless of mtime; filename is a deterministic tiebreak for the rest.
-    baks.sort_by(|a, b| {
-        let a_new = a.1 == just_written;
-        let b_new = b.1 == just_written;
-        b_new
-            .cmp(&a_new)
-            .then(b.0.cmp(&a.0))
-            .then(b.1.cmp(&a.1))
-    });
-    for (_, p) in baks.into_iter().skip(BACKUP_KEEP) {
-        if let Err(e) = fs::remove_file(&p) {
-            eprintln!("graph: failed to rotate out backup {}: {e}", p.display());
-        }
-    }
 }
 
 // ─── Write serialization ─────────────────────────────────────
@@ -1380,6 +1507,98 @@ pub fn lock_graph_bulk(graph: &Path) -> Result<GraphLockGuard> {
 /// to tell which bound produced it, or the two bounds are indistinguishable in
 /// the field.
 fn lock_graph_waiting(graph: &Path, wait: std::time::Duration) -> Result<GraphLockGuard> {
+    lock_graph_with(graph, wait, create_lock_file)
+}
+
+/// The production open: an exclusive create, so exactly one process gets the file.
+fn create_lock_file(lock: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock)
+}
+
+/// What one failed attempt to create the lock file means.
+#[derive(Debug, PartialEq, Eq)]
+enum LockOpenFailure {
+    /// The file exists: another writer holds the lock. Wait, reaping it if stale.
+    Held,
+    /// The transient lock family ([`crate::changelog::is_transient_lock`]). Waited
+    /// out like a held lock, never reaped: there may be no file to read a pid from.
+    /// The one exception is a folder that refuses every new file; see
+    /// [`TRANSIENT_PROBE_AFTER`].
+    ///
+    /// The case that put it here (BO-23): on Windows, creating a file another
+    /// writer has just deleted, while that delete is still pending, fails with
+    /// `PermissionDenied` (os error 5), not `AlreadyExists`. Eight threads taking
+    /// and releasing one lock hit that window; main's CI run 36977848361 lost a
+    /// write to it in `concurrent_writers_do_not_lose_rows`.
+    Transient,
+    /// Anything else is a real failure (a read-only volume, a missing folder), and
+    /// waiting would only turn a clear error into a slow one.
+    Fatal,
+}
+
+/// Classify a failed lock open. The family test is the store's one predicate,
+/// shared with `rename_with_retry` and the change-log append, never a copy.
+fn classify_lock_open_failure(e: &std::io::Error) -> LockOpenFailure {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        LockOpenFailure::Held
+    } else if crate::changelog::is_transient_lock(e) {
+        LockOpenFailure::Transient
+    } else {
+        LockOpenFailure::Fatal
+    }
+}
+
+/// Transient failures in a row before the lock asks whether its folder accepts new
+/// files at all.
+///
+/// The family is waited out because, on Windows, it is usually another writer's
+/// delete still pending on the lock file, which clears in an attempt or two. But
+/// the same family holds a real permission fault: on Linux `EACCES` from a folder
+/// this user cannot write, on Windows an ACL that denies it. Waited out, that
+/// fault cost the full bound on every attempt, and `post_tool_use` takes this lock
+/// for every tier on every tool call, so a stall of 10 s per call per tier. After
+/// five in a row (about 75 ms of backoff) one probe file beside the lock decides:
+/// a folder that takes it is waiting on this one file, so the wait goes on to the
+/// deadline; a folder that refuses it fails now, naming the fault.
+const TRANSIENT_PROBE_AFTER: u32 = 5;
+
+/// Whether the lock's folder lets this process create a new file: a probe file
+/// beside the lock, removed at once. It goes through the loop's own open, so the
+/// tests reach both answers.
+///
+/// A name collision counts as yes. The only file by that name is another thread of
+/// this process probing (or one it left behind), and either way the folder took it.
+fn folder_accepts_new_files(
+    lock: &Path,
+    open: &mut impl FnMut(&Path) -> std::io::Result<fs::File>,
+) -> bool {
+    let mut name = lock
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".probe-{}", std::process::id()));
+    let probe = lock.with_file_name(name);
+    match open(&probe) {
+        Ok(fh) => {
+            drop(fh);
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(e) => e.kind() == std::io::ErrorKind::AlreadyExists,
+    }
+}
+
+/// [`lock_graph_waiting`] with the open passed in. Production passes
+/// [`create_lock_file`]; the tests pass an open that fails first, which is the only
+/// way to reach the Windows delete-pending window without depending on timing.
+fn lock_graph_with(
+    graph: &Path,
+    wait: std::time::Duration,
+    mut open: impl FnMut(&Path) -> std::io::Result<fs::File>,
+) -> Result<GraphLockGuard> {
     let lock = lock_path(graph);
     if let Some(parent) = lock.parent() {
         fs::create_dir_all(parent)
@@ -1396,12 +1615,9 @@ fn lock_graph_waiting(graph: &Path, wait: std::time::Duration) -> Result<GraphLo
 
     let deadline = std::time::Instant::now() + wait;
     let mut backoff = std::time::Duration::from_millis(5);
+    let mut transient_streak = 0u32;
     loop {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-        {
+        let e = match open(&lock) {
             Ok(mut fh) => {
                 let _ = writeln!(fh, "{}", std::process::id());
                 HELD_LOCKS.with(|h| h.borrow_mut().push(lock.clone()));
@@ -1410,26 +1626,52 @@ fn lock_graph_waiting(graph: &Path, wait: std::time::Duration) -> Result<GraphLo
                     reentrant: false,
                 });
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(e) => e,
+        };
+        // What a timeout carries as its cause: the OS error after a transient
+        // failure, nothing after a held lock (the message already says it).
+        let cause = match classify_lock_open_failure(&e) {
+            LockOpenFailure::Held => {
+                transient_streak = 0;
                 if reap_stale_lock(&lock) {
                     continue;
                 }
-                if std::time::Instant::now() >= deadline {
-                    anyhow::bail!(
-                        "timed out after {}s ({} bound) waiting for the graph lock {} — another \
-                         base process is writing this graph. Nothing was written.",
-                        wait.as_secs(),
-                        if wait == LOCK_WAIT_BULK { "bulk" } else { "hot-path" },
-                        lock.display()
-                    );
-                }
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(std::time::Duration::from_millis(100));
+                None
             }
-            Err(e) => {
+            LockOpenFailure::Transient => {
+                transient_streak += 1;
+                if transient_streak == TRANSIENT_PROBE_AFTER
+                    && !folder_accepts_new_files(&lock, &mut open)
+                {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "taking the graph lock {}: its folder refuses new files too, so this \
+                             is a permission fault, not another writer",
+                            lock.display()
+                        )
+                    });
+                }
+                Some(e)
+            }
+            LockOpenFailure::Fatal => {
                 return Err(e).with_context(|| format!("taking the graph lock {}", lock.display()));
             }
+        };
+        if std::time::Instant::now() >= deadline {
+            let timeout = format!(
+                "timed out after {}s ({} bound) waiting for the graph lock {} — another \
+                 base process is writing this graph. Nothing was written.",
+                wait.as_secs(),
+                if wait == LOCK_WAIT_BULK { "bulk" } else { "hot-path" },
+                lock.display()
+            );
+            return Err(match cause {
+                Some(e) => anyhow::Error::new(e).context(timeout),
+                None => anyhow::anyhow!(timeout),
+            });
         }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(100));
     }
 }
 
@@ -1463,6 +1705,56 @@ fn reap_stale_lock(lock: &Path) -> bool {
     }
 }
 
+/// Take the lock file `lock` WITHOUT waiting, for a command that refuses to run beside another run of itself rather
+/// than queue behind it (`project rename`, BO-24 R7). `Ok(None)` while a live process holds it. A holder that is
+/// gone is reaped at once, whatever the file's age: only that one command takes this file, so a dead pid in it is
+/// a crashed run, never a slow one.
+pub fn try_lock(lock: &Path) -> Result<Option<GraphLockGuard>> {
+    if let Some(parent) = lock.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating directory for lock {}", lock.display()))?;
+    }
+    if HELD_LOCKS.with(|h| h.borrow().iter().any(|p| p == lock)) {
+        return Ok(Some(GraphLockGuard { path: lock.to_path_buf(), reentrant: true }));
+    }
+    for _ in 0..2 {
+        match create_lock_file(lock) {
+            Ok(mut fh) => {
+                // A lock nobody can name is one nobody can reap safely: without its pid it is not taken.
+                if let Err(e) = writeln!(fh, "{}", std::process::id()) {
+                    drop(fh);
+                    let _ = fs::remove_file(lock);
+                    return Err(e).with_context(|| format!("writing this process's id into the lock {}", lock.display()));
+                }
+                HELD_LOCKS.with(|h| h.borrow_mut().push(lock.to_path_buf()));
+                return Ok(Some(GraphLockGuard { path: lock.to_path_buf(), reentrant: false }));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let gone = match lock_pid(lock) {
+                    Some(pid) => !holder_is_alive(pid),
+                    // No pid: a run between its create and its write, or one that died there. Gone once it is older
+                    // than any write takes, the bound the graph lock reaps by.
+                    None => fs::metadata(lock)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                        .is_some_and(|age| age > LOCK_STALE),
+                };
+                if !gone {
+                    return Ok(None);
+                }
+                let _ = fs::remove_file(lock);
+            }
+            Err(e) => return Err(e).with_context(|| format!("taking the lock {}", lock.display())),
+        }
+    }
+    Ok(None)
+}
+
+/// The pid written in a lock file, for a refusal that names who holds it.
+pub fn lock_holder(lock: &Path) -> Option<u32> {
+    lock_pid(lock)
+}
+
 /// Whether this thread currently holds a graph lock. The tripwire reads it.
 pub fn holds_graph_lock() -> bool {
     HELD_LOCKS.with(|h| !h.borrow().is_empty())
@@ -1493,6 +1785,126 @@ pub fn load_or_empty(path: &Path) -> Result<Store> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----------------------------------------------------------------------
+    // The envelope's prerequisite: a merged read hands back what it read.
+    //
+    // Predictions registered before the run:
+    //   P1 RED before, GREEN after -- load_merged_reporting does not exist yet
+    //   P2 RED before, GREEN after -- same
+    //   P3 RED before, GREEN after -- same, and it is the gate defect's own test
+    //   P4 GREEN both sides -- control, load_merged's fail-open rule is untouched
+    // ----------------------------------------------------------------------
+
+    /// Build a workspace at `root/ws` and a global tier at `root/.base-gbl`,
+    /// each with the graph text given, and return the workspace path.
+    fn two_tiers(root: &std::path::Path, global: Option<&str>, workspace: Option<&str>) -> std::path::PathBuf {
+        if let Some(text) = global {
+            let d = root.join(".base-gbl").join(".base");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("graph.nq"), text).unwrap();
+        }
+        let ws = root.join("ws");
+        if let Some(text) = workspace {
+            let d = ws.join(".base");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("graph.nq"), text).unwrap();
+        }
+        ws
+    }
+
+    const GOOD: &str = "<http://t.local/s> <http://t.local/p> \"v\" <http://t.local/g> .\n";
+
+    /// P1. A clean read reports itself clean, and names the tiers it opened.
+    #[test]
+    fn a_clean_merged_read_reports_every_tier_and_no_fault() {
+        let root = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(root.path(), || {
+            let ws = two_tiers(root.path(), Some(GOOD), Some(GOOD));
+            let (_store, report) = load_merged_reporting(&ws).expect("both tiers exist");
+            assert!(report.is_clean(), "a clean read must report clean: {report:?}");
+            assert_eq!(report.read.len(), 2, "both tiers must be named as read: {report:?}");
+            assert_eq!(report.skipped_lines(), 0);
+            assert_eq!(report.unreadable(), 0);
+            assert_eq!(report.summary(), "every tier read cleanly");
+        });
+    }
+
+    /// P2. A malformed line comes back as a VALUE, not only on stderr.
+    /// This is the whole prerequisite: without it no caller can render the fact.
+    #[test]
+    fn a_malformed_line_comes_back_as_a_value() {
+        let root = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(root.path(), || {
+            let broken = format!("{GOOD}this line is not a quad\n");
+            let ws = two_tiers(root.path(), Some(GOOD), Some(&broken));
+            let (_store, report) = load_merged_reporting(&ws).expect("both tiers exist");
+            assert!(!report.is_clean(), "a skipped line must not read as clean: {report:?}");
+            assert_eq!(report.skipped_lines(), 1, "the count must reach the caller: {report:?}");
+            assert_eq!(report.unreadable(), 0, "the tier loaded, it was not unreadable: {report:?}");
+            assert!(
+                report.summary().contains("skipped 1 malformed line"),
+                "summary must name the count; got {:?}",
+                report.summary()
+            );
+        });
+    }
+
+    /// P3. A tier that cannot be OPENED is its own state, not zero bad lines.
+    ///
+    /// This is the defect's own test. The old warning was gated on the line
+    /// count, and an unopenable tier contributes no lines -- so a read that
+    /// recovered NOTHING reported exactly what a clean read reports.
+    #[cfg(unix)]
+    #[test]
+    fn a_tier_that_cannot_be_opened_is_a_fault_even_though_it_skipped_no_lines() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(root.path(), || {
+            // Workspace tier is malformed, so the strict load fails and the
+            // lenient fallback runs. Global tier is then made unreadable.
+            let ws = two_tiers(root.path(), Some(GOOD), Some("not a quad\n"));
+            let gbl = root.path().join(".base-gbl").join(".base").join("graph.nq");
+            std::fs::set_permissions(&gbl, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            let opened = std::fs::File::open(&gbl).is_err();
+            std::fs::set_permissions(&gbl, std::fs::Permissions::from_mode(0o644)).ok();
+            if !opened {
+                // Running as root, or a filesystem that ignores the mode. The
+                // arm cannot observe what it exists to observe, so it must not
+                // report a pass. VOID, stated, rather than a silent green.
+                eprintln!("VOID: this environment can open a 0o000 file; the arm proves nothing");
+                return;
+            }
+            std::fs::set_permissions(&gbl, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            let (_store, report) = load_merged_reporting(&ws).expect("both tiers exist");
+            std::fs::set_permissions(&gbl, std::fs::Permissions::from_mode(0o644)).ok();
+
+            assert_eq!(report.unreadable(), 1, "an unopenable tier must be its own state: {report:?}");
+            assert!(!report.is_clean(), "an unopenable tier must not read as clean: {report:?}");
+            assert!(
+                report.summary().contains("could not be read at all"),
+                "summary must say the tier contributed nothing; got {:?}",
+                report.summary()
+            );
+        });
+    }
+
+    /// P4. Control. `load_merged`'s fail-open rule is unchanged: None only when
+    /// neither tier has a graph, Some otherwise.
+    #[test]
+    fn load_merged_still_returns_none_only_when_neither_tier_exists() {
+        let root = tempfile::tempdir().unwrap();
+        crate::home::with_thread_home(root.path(), || {
+            let empty = two_tiers(root.path(), None, None);
+            std::fs::create_dir_all(empty.join(".base")).unwrap();
+            assert!(load_merged(&empty).is_none(), "no graph in either tier must be None");
+
+            let ws = two_tiers(root.path(), Some(GOOD), None);
+            assert!(load_merged(&ws).is_some(), "a global tier alone must still load");
+        });
+    }
 
     /// The claim `tests/write_back_test.rs` can no longer make: the two entry
     /// points into the seam produce identical bytes.
@@ -1676,24 +2088,37 @@ mod tests {
     fn snapshot_rotates_to_keep_limit() {
         let dir = tempfile::tempdir().unwrap();
         let p = write_file(dir.path(), "graph.nq", "<http://x/s> <http://x/p> <http://x/o> .\n");
-        // 12 pre-existing backups → snapshot adds a 13th, rotation prunes to 10.
+        // 12 pre-existing backups → snapshot adds a 13th, rotation prunes to `[graph] keep_backups`, which this loose
+        // file's tier reads as the default (a test build resolves no real home).
         for i in 0..12 {
             write_file(dir.path(), &format!("graph.nq.bak-old-{i:02}"), "x\n");
         }
         let new_bak = snapshot(&p, "test").unwrap();
         assert!(new_bak.exists(), "new snapshot written");
+        let left = backups(&p);
+        assert_eq!(left.len(), crate::config::DEFAULT_KEEP_BACKUPS, "rotation keeps exactly keep_backups snapshots");
+        assert!(left.iter().any(|b| b.path == new_bak), "the snapshot just taken survives its own rotation");
+    }
 
-        let count = fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .map(|n| n.starts_with("graph.nq.bak"))
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(count, 10, "rotation keeps exactly BACKUP_KEEP snapshots");
+    /// F24b: the number comes from the tier's own config. A workspace `.base/base.toml` overlays the global one, so it
+    /// decides here whatever the home says.
+    #[test]
+    fn snapshot_keeps_the_tiers_configured_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("ws").join(".base");
+        fs::create_dir_all(&base).unwrap();
+        write_file(&base, "base.toml", "[graph]\nkeep_backups = 5\n");
+        let p = write_file(&base, "graph.nq", "<http://x/s> <http://x/p> <http://x/o> .\n");
+        for i in 0..8 {
+            write_file(&base, &format!("graph.nq.bak-old-{i:02}"), "x\n");
+        }
+        // Hand-made copies under other names are not base's backups and are never rotated.
+        write_file(&base, "graph.nq.BAK-by-hand", "x\n");
+        write_file(&base, "graph.nq.torn-20260921", "x\n");
+        assert_eq!(keep_backups_for(&p), 5);
+        snapshot(&p, "test").unwrap();
+        assert_eq!(backups(&p).len(), 5);
+        assert!(base.join("graph.nq.BAK-by-hand").exists() && base.join("graph.nq.torn-20260921").exists());
     }
 
     #[test]
@@ -1823,5 +2248,340 @@ mod tests {
             "a NotFound burned the retry budget ({elapsed:?}) — the \
              is_transient_lock early return is not being taken"
         );
+    }
+
+    // ─── BO-23 graph lock: the transient lock family is contention ───────
+    //
+    // The lock loop is driven through `lock_graph_with` and an open that fails on
+    // purpose, so none of these depend on two writers meeting in a race window.
+
+    /// The error Windows returns for a create on a file whose delete is pending.
+    fn access_denied() -> std::io::Error {
+        std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+    }
+
+    /// A graph path in a fresh folder, and the folder that keeps it alive.
+    fn lock_target() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join(".base").join("graph.nq");
+        (dir, graph)
+    }
+
+    #[test]
+    fn lock_open_failure_is_classified_by_the_shared_predicate() {
+        use std::io::{Error, ErrorKind};
+
+        assert_eq!(
+            classify_lock_open_failure(&Error::from(ErrorKind::AlreadyExists)),
+            LockOpenFailure::Held
+        );
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::Interrupted, ErrorKind::WouldBlock] {
+            assert_eq!(
+                classify_lock_open_failure(&Error::from(kind)),
+                LockOpenFailure::Transient,
+                "{kind:?}"
+            );
+        }
+        for kind in [ErrorKind::NotFound, ErrorKind::ReadOnlyFilesystem, ErrorKind::StorageFull] {
+            assert_eq!(
+                classify_lock_open_failure(&Error::from(kind)),
+                LockOpenFailure::Fatal,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            classify_lock_open_failure(&Error::other("not a lock error")),
+            LockOpenFailure::Fatal
+        );
+
+        // The raw codes the OS actually returns, as the store meets them.
+        #[cfg(windows)]
+        {
+            // ACCESS_DENIED (the delete-pending case), SHARING_VIOLATION, LOCK_VIOLATION.
+            for code in [5, 32, 33] {
+                assert_eq!(
+                    classify_lock_open_failure(&Error::from_raw_os_error(code)),
+                    LockOpenFailure::Transient,
+                    "os error {code}"
+                );
+            }
+            // FILE_EXISTS, the create_new collision itself.
+            assert_eq!(
+                classify_lock_open_failure(&Error::from_raw_os_error(80)),
+                LockOpenFailure::Held
+            );
+            // WRITE_PROTECT: a read-only volume fails at once.
+            assert_eq!(
+                classify_lock_open_failure(&Error::from_raw_os_error(19)),
+                LockOpenFailure::Fatal
+            );
+        }
+        #[cfg(unix)]
+        {
+            // EACCES, EBUSY.
+            for code in [13, 16] {
+                assert_eq!(
+                    classify_lock_open_failure(&Error::from_raw_os_error(code)),
+                    LockOpenFailure::Transient,
+                    "errno {code}"
+                );
+            }
+            // EEXIST.
+            assert_eq!(
+                classify_lock_open_failure(&Error::from_raw_os_error(17)),
+                LockOpenFailure::Held
+            );
+            // EROFS: a read-only volume fails at once.
+            assert_eq!(
+                classify_lock_open_failure(&Error::from_raw_os_error(30)),
+                LockOpenFailure::Fatal
+            );
+        }
+    }
+
+    #[test]
+    fn graph_lock_retries_access_denied_as_contention() {
+        let (_dir, graph) = lock_target();
+        let mut calls = 0;
+        let guard = lock_graph_with(&graph, LOCK_WAIT, |lock| {
+            calls += 1;
+            if calls == 1 {
+                Err(access_denied())
+            } else {
+                create_lock_file(lock)
+            }
+        })
+        .expect("an access-denied first attempt must be waited out, not returned");
+
+        assert_eq!(calls, 2, "the second attempt is the one that takes the lock");
+        let lock = lock_path(&graph);
+        assert_eq!(lock_pid(&lock), Some(std::process::id()), "the lock holds this pid");
+        assert!(holds_graph_lock());
+        drop(guard);
+        assert!(!lock.exists(), "the guard released the lock");
+        assert!(!holds_graph_lock());
+    }
+
+    /// The lock file alone refuses (its delete pending, or a handle on it), in a
+    /// folder that takes new files: waited out to the deadline, past the probe.
+    #[test]
+    fn graph_lock_times_out_on_persistent_access_denied() {
+        let (_dir, graph) = lock_target();
+        let lock = lock_path(&graph);
+        let (mut lock_opens, mut probes) = (0u32, 0u32);
+        // 300 ms: long enough to pass the probe (about 75 ms of backoff) and keep going.
+        let err = lock_graph_with(&graph, std::time::Duration::from_millis(300), |path| {
+            if path == lock.as_path() {
+                lock_opens += 1;
+                Err(access_denied())
+            } else {
+                probes += 1;
+                create_lock_file(path)
+            }
+        })
+        .err()
+        .expect("an access-denied that never clears must fail at the deadline");
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with("timed out after 0s (hot-path bound) waiting for the graph lock")
+                && message.ends_with("Nothing was written."),
+            "the failure is the timeout message, got: {message}"
+        );
+        assert!(
+            !message.contains("taking the graph lock"),
+            "the access-denied was returned at once instead of waited out: {message}"
+        );
+        assert!(
+            lock_opens > TRANSIENT_PROBE_AFTER,
+            "the open was tried {lock_opens} time(s); it must go on past the probe"
+        );
+        assert_eq!(probes, 1, "the folder is probed once");
+        let leftovers: Vec<_> = fs::read_dir(lock.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "the probe was left behind: {leftovers:?}");
+        // The OS error is kept as the cause.
+        let cause = err.chain().nth(1).expect("the OS error is the cause").to_string();
+        assert!(cause.contains(&access_denied().to_string()), "cause: {cause}");
+        assert!(!holds_graph_lock());
+    }
+
+    /// A folder that refuses every new file is a permission fault (Linux `EACCES`
+    /// on a folder this user cannot write, a Windows ACL), not contention: it fails
+    /// after the probe, never at the 10 s bound, and says what it is.
+    #[test]
+    fn graph_lock_fails_when_the_folder_refuses_new_files() {
+        let (_dir, graph) = lock_target();
+        let lock = lock_path(&graph);
+        let (mut lock_opens, mut probes) = (0u32, 0u32);
+        let err = lock_graph_with(&graph, LOCK_WAIT, |path| {
+            if path == lock.as_path() {
+                lock_opens += 1;
+            } else {
+                probes += 1;
+            }
+            Err(access_denied())
+        })
+        .err()
+        .expect("a folder that refuses every file must fail");
+
+        assert_eq!(lock_opens, TRANSIENT_PROBE_AFTER, "tries before the probe");
+        assert_eq!(probes, 1, "one probe decides");
+        let message = err.to_string();
+        assert!(
+            message.starts_with("taking the graph lock") && message.contains("permission fault"),
+            "got: {message}"
+        );
+        assert!(!message.contains("timed out"), "waited out the bound: {message}");
+        let cause = err.chain().nth(1).expect("the OS error is the cause").to_string();
+        assert!(cause.contains(&access_denied().to_string()), "cause: {cause}");
+    }
+
+    #[test]
+    fn graph_lock_fails_fast_outside_the_lock_family() {
+        let (_dir, graph) = lock_target();
+        let mut calls = 0;
+        // The full hot-path wait: had this error been retried, it would show as calls > 1.
+        let err = lock_graph_with(&graph, LOCK_WAIT, |_| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem))
+        })
+        .err()
+        .expect("an error outside the lock family must fail");
+        assert_eq!(calls, 1, "an error outside the lock family was retried");
+        assert!(
+            err.to_string().starts_with("taking the graph lock"),
+            "got: {err:#}"
+        );
+
+        // A lock folder that cannot be created still fails at once, before any open.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"").unwrap();
+        let graph = file.join(".base").join("graph.nq");
+        let mut opened = false;
+        let err = lock_graph_with(&graph, LOCK_WAIT, |lock| {
+            opened = true;
+            create_lock_file(lock)
+        })
+        .err()
+        .expect("a lock folder under a file cannot be created");
+        assert!(!opened, "the open ran although the folder could not be made");
+        assert!(
+            err.to_string().starts_with("creating directory for lock"),
+            "got: {err:#}"
+        );
+    }
+
+    /// The transient arm never reaps. A lock file that would be reaped on the held
+    /// arm (older than LOCK_STALE, holder gone) must survive an access-denied wait.
+    #[test]
+    fn graph_lock_does_not_reap_on_access_denied() {
+        let (_dir, graph) = lock_target();
+        let lock = lock_path(&graph);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        // u32::MAX is no running process on either platform.
+        std::fs::write(&lock, format!("{}\n", u32::MAX)).unwrap();
+        let old = std::time::SystemTime::now() - LOCK_STALE * 2;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let _ = lock_graph_with(&graph, std::time::Duration::from_millis(30), |_| {
+            Err(access_denied())
+        })
+        .err()
+        .expect("the open always fails");
+        assert!(lock.exists(), "the transient arm reaped a lock file");
+        assert_eq!(lock_pid(&lock), Some(u32::MAX), "the lock file was replaced");
+    }
+
+    /// The graph lock, `rename_with_retry` and the change-log append decide "is this
+    /// the lock family" with one function, `changelog::is_transient_lock`. A copy of
+    /// the list in any of them is a second thing to drift, so this reads the code.
+    #[test]
+    fn transient_lock_family_is_one_predicate() {
+        /// The body of the top-level `fn <name>(` in `src`, comment lines removed.
+        fn body_of(src: &str, name: &str) -> String {
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let start = code
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("fn {name} not found"));
+            let end = code[start..]
+                .find("\n}")
+                .unwrap_or_else(|| panic!("fn {name} has no closing brace at column 0"));
+            code[start..start + end].to_string()
+        }
+
+        let store = include_str!("store.rs");
+        let changelog = include_str!("changelog.rs");
+
+        for (file, src, name) in [
+            ("store.rs", store, "classify_lock_open_failure"),
+            ("store.rs", store, "rename_with_retry"),
+            ("changelog.rs", changelog, "append_line"),
+        ] {
+            let body = body_of(src, name);
+            assert!(
+                body.contains("is_transient_lock("),
+                "{file} fn {name} does not call is_transient_lock:\n{body}"
+            );
+            assert!(
+                !body.contains("PermissionDenied") && !body.contains("raw_os_error"),
+                "{file} fn {name} names lock-family errors itself instead of calling the predicate:\n{body}"
+            );
+        }
+        // The graph lock reaches the classification, and nothing else decides.
+        let lock_loop = body_of(store, "lock_graph_with");
+        assert!(lock_loop.contains("classify_lock_open_failure(&e)"), "{lock_loop}");
+        assert!(!lock_loop.contains("ErrorKind::"), "the lock loop matches error kinds itself:\n{lock_loop}");
+
+        // One definition of the family list. Only code outside the test modules is
+        // counted: this test's own string would otherwise count as a definition.
+        let defs = [store, changelog]
+            .iter()
+            .map(|s| s.split("#[cfg(test)]").next().unwrap().matches("fn is_transient_lock(").count())
+            .sum::<usize>();
+        assert_eq!(defs, 1, "is_transient_lock is defined {defs} times");
+        // And the predicate still behaves as the family the lock now waits on.
+        assert!(crate::changelog::is_transient_lock(&access_denied()));
+    }
+
+    /// BO-24 (`project rename`, R7): the non-waiting lock refuses a live holder, takes the place of a dead one at
+    /// once, and treats a file with no pid as held until it is older than LOCK_STALE, then as gone.
+    #[test]
+    fn try_lock_refuses_a_live_holder_and_reaps_a_gone_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("project-rename.lock");
+        let age = |l: &Path, by: std::time::Duration| {
+            fs::OpenOptions::new().write(true).open(l).unwrap().set_modified(std::time::SystemTime::now() - by).unwrap();
+        };
+
+        // This test's own process is alive.
+        std::fs::write(&lock, format!("{}
+", std::process::id())).unwrap();
+        assert!(try_lock(&lock).unwrap().is_none(), "a live holder is refused");
+
+        // u32::MAX is no running process on either platform.
+        std::fs::write(&lock, format!("{}
+", u32::MAX)).unwrap();
+        let guard = try_lock(&lock).unwrap().expect("a dead holder is reaped at once");
+        assert_eq!(lock_holder(&lock), Some(std::process::id()), "the lock now names this process");
+        drop(guard);
+        assert!(!lock.exists(), "dropping the guard removes the lock");
+
+        std::fs::write(&lock, "").unwrap();
+        assert!(try_lock(&lock).unwrap().is_none(), "a fresh lock with no pid may be a run about to write it");
+        age(&lock, LOCK_STALE * 2);
+        assert!(try_lock(&lock).unwrap().is_some(), "an old lock with no pid is gone");
     }
 }

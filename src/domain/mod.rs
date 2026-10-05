@@ -1,7 +1,13 @@
+pub mod bm25;
+pub mod global_decisions;
 pub mod link;
 pub mod matcher;
+pub mod paths;
 pub mod query;
+pub mod replay;
+pub mod rule_test;
 pub mod rules;
+pub mod score_index;
 pub mod session;
 pub mod sync;
 pub mod transcript;
@@ -30,6 +36,16 @@ pub enum RuleEntry {
         /// matchers round-trips unchanged.
         #[serde(default, rename = "match", skip_serializing_if = "Vec::is_empty")]
         matchers: Vec<crate::domain::rules::Matcher>,
+        /// Prompts that must serve this rule, and prompts that must not (K2a, `base rule test`). Not written back when
+        /// empty, so a file with no tests round-trips unchanged.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fires_on: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        quiet_on: Vec<String>,
+        /// BO-20 (K9f): a shadow candidate that loses this rule is never promoted automatically. Set with `base rule
+        /// update <rule> --protected`; not written back when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        protected: bool,
     },
 }
 
@@ -65,6 +81,31 @@ impl RuleEntry {
             RuleEntry::Detailed { matchers, .. } => matchers,
         }
     }
+
+    /// The rule's test prompts (K2a): those that must serve it, and those that must not. Empty for a bare string.
+    pub fn tests(&self) -> (&[String], &[String]) {
+        match self {
+            RuleEntry::Bare(_) => (&[], &[]),
+            RuleEntry::Detailed { fires_on, quiet_on, .. } => (fires_on, quiet_on),
+        }
+    }
+
+    /// Marked protected (BO-20): a shadow candidate's loss on it blocks promotion.
+    pub fn protected(&self) -> bool {
+        matches!(self, RuleEntry::Detailed { protected: true, .. })
+    }
+
+    /// A table with nothing but its text goes back to a plain string, so a file round-trips as it was written.
+    fn plain_when_bare(self) -> Self {
+        match self {
+            RuleEntry::Detailed { text, rationale: None, matchers, fires_on, quiet_on, protected: false }
+                if matchers.is_empty() && fires_on.is_empty() && quiet_on.is_empty() =>
+            {
+                RuleEntry::Bare(text)
+            }
+            other => other,
+        }
+    }
 }
 
 impl From<&str> for RuleEntry {
@@ -91,6 +132,11 @@ pub fn render_rule(text: &str, rationale: Option<&str>) -> String {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DomainDef {
     pub name: String,
+    /// Names this domain had before `base project rename` (BO-24, R4). `--domain`, `domain get` and slug lookups
+    /// read one of them as this domain and say so. Not written back when empty, so a file without it round-trips
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     #[serde(default = "default_mode")]
     pub mode: String, // "always" | "triggered"
     /// `auto_inject = false` keeps this domain out of every automatic injection — the
@@ -178,9 +224,9 @@ impl DomainDef {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct DomainsFile {
+pub(crate) struct DomainsFile {
     #[serde(default)]
-    domain: Vec<DomainDef>,
+    pub(crate) domain: Vec<DomainDef>,
 }
 
 // ─── Loading (tiered: global → workspace) ────────────────────
@@ -260,10 +306,12 @@ pub fn load_domains_file(path: &Path, root: Option<&Path>) -> Vec<DomainDef> {
     }
 }
 
-/// The registered projects as the trigger rules see them: every `ops:Project` with a
-/// path, resolved against the tier its record lives in (the workspace root for the
-/// workspace graph, home for every other graph) in the shape `resolve_trigger`
-/// produces, so a trigger and a project path compare (F29 step 6).
+/// The registered projects as the path rules see them: every `ops:Project`, its folder
+/// resolved against the tier its record lives in (the workspace root for the workspace
+/// graph, home for every other graph) in the shape `resolve_trigger` produces, so a
+/// trigger and a project folder compare (F29 step 6), with its slug, its parent link and
+/// `nested` (D13). A project with no folder is listed with an empty one: it owns nothing,
+/// and it can still be a parent.
 pub fn registered_projects(
     store: &oxigraph::store::Store,
     ns: &crate::config::NamespaceConfig,
@@ -271,12 +319,15 @@ pub fn registered_projects(
 ) -> Vec<matcher::Registered> {
     let p = &ns.prefix;
     let sparql = format!(
-        "{}\nSELECT ?g ?name ?path WHERE {{ GRAPH ?g {{ ?proj a {p}:Project ; {p}:name ?name ; {p}:path ?path }} }}",
+        "{}\nSELECT ?g ?proj ?name ?path ?parent ?nested WHERE {{ GRAPH ?g {{ ?proj a {p}:Project ; {p}:name ?name . \
+         OPTIONAL {{ ?proj {p}:path ?path }} OPTIONAL {{ ?proj {p}:parentProject ?parent }} \
+         OPTIONAL {{ ?proj {p}:nested ?nested }} }} }}",
         crate::crud::prefixes(ns)
     );
     let ws_graph = crate::crud::workspace_graph_iri(ns, &crate::crud::workspace_slug(cwd));
     let ws_root = crate::config::find_workspace_base(cwd).and_then(|b| b.parent().map(|r| r.display().to_string()));
     let home = crate::home::home_root().map(|h| h.display().to_string());
+    let project_iri = crate::crud::build_iri(ns, "project", "");
     let mut out = Vec::new();
     if let Ok(oxigraph::sparql::QueryResults::Solutions(rows)) = crate::store::query(store, &sparql) {
         for row in rows.filter_map(|r| r.ok()) {
@@ -286,17 +337,26 @@ pub fn registered_projects(
                     _ => None,
                 })
             };
-            let (Some(name), Some(path)) = (lit("name"), lit("path")) else {
+            let named = |k: &str| {
+                row.get(k).and_then(|t| match t.into() {
+                    oxigraph::model::TermRef::NamedNode(n) => Some(n.as_str().to_string()),
+                    _ => None,
+                })
+            };
+            let Some(name) = lit("name") else {
                 continue;
             };
-            let graph = row.get("g").and_then(|t| match t.into() {
-                oxigraph::model::TermRef::NamedNode(n) => Some(n.as_str().to_string()),
-                _ => None,
-            });
+            let slug = named("proj")
+                .and_then(|iri| iri.strip_prefix(&project_iri).map(String::from))
+                .unwrap_or_else(|| crate::crud::slugify(&name));
+            let parent = named("parent").and_then(|iri| iri.strip_prefix(&project_iri).map(String::from));
+            let nested = lit("nested").is_some_and(|v| v == "true");
+            let graph = named("g");
             let root = if graph.as_deref() == Some(ws_graph.as_str()) { ws_root.as_deref() } else { home.as_deref() };
-            if let Some(resolved) = matcher::resolve_trigger(&path, root, home.as_deref()) {
-                out.push(matcher::Registered { name, path: resolved });
-            }
+            let path = lit("path")
+                .and_then(|path| matcher::resolve_trigger(&path, root, home.as_deref()))
+                .unwrap_or_default();
+            out.push(matcher::Registered { name, path, slug, parent, nested });
         }
     }
     out
@@ -351,17 +411,13 @@ pub fn add_trigger(
         }
     };
 
-    // A trigger that cannot fire is refused before anything is written (F29 step 6): an
-    // unrooted path, or one that covers two or more registered projects.
-    if let Some(p) = path {
-        // The tier root is the parent of the tier dir the file sits in: `~/.base-gbl/
-        // domains.toml` roots at home, `<ws>/.base/domains.toml` at the workspace.
-        let root = toml_path.parent().and_then(Path::parent).map(|r| r.display().to_string());
-        let ctx = trigger_context(cwd);
-        if let Some(fault) = matcher::trigger_fault(p, root.as_deref(), &ctx) {
-            return Err(TriggerRefused(matcher::fault_sentence(domain_name, p, &fault)).into());
-        }
-    }
+    // P3: stored as its full path, and refused before anything is written when it cannot
+    // be rooted or holds other registered projects (D1).
+    let path = match path {
+        Some(p) => Some(checked_trigger(cwd, &toml_path, domain_name, p)?),
+        None => None,
+    };
+    let place = place_in(&toml_path);
 
     // Find or create domain
     let domain = if let Some(pos) = file.domain.iter().position(|d| d.name == domain_name) {
@@ -369,6 +425,7 @@ pub fn add_trigger(
     } else {
         file.domain.push(DomainDef {
             name: domain_name.to_string(),
+            aliases: Vec::new(),
             mode: "triggered".to_string(),
             auto_inject: true,
             root: None,
@@ -393,10 +450,11 @@ pub fn add_trigger(
     {
         domain.prompt_keywords.push(kw.to_string());
     }
+    // One trigger per place: `Documents/x` already written relative is the same trigger.
     if let Some(p) = path
-        && !domain.paths.contains(&p.to_string())
+        && !domain.paths.iter().any(|x| place(x).is_some_and(|px| Some(px) == place(&p)))
     {
-        domain.paths.push(p.to_string());
+        domain.paths.push(p);
     }
 
     // Atomic write via temp + rename
@@ -406,6 +464,207 @@ pub fn add_trigger(
     std::fs::rename(&tmp_path, &toml_path)?;
 
     Ok(tier::Changed { tier, count: 1 })
+}
+
+/// The full path `add-trigger` stores for `raw` in the tier `global` picks (P3), for the CLI to say what it wrote.
+pub fn trigger_spelling(cwd: &Path, global: bool, raw: &str) -> Option<String> {
+    let (toml_path, _) = tier::domains_toml_for_write(cwd, global);
+    let home = crate::home::home_root();
+    crate::crud::project::absolute_path(raw, toml_path.parent().and_then(Path::parent), home.as_deref())
+}
+
+/// The place a trigger in the domains.toml at `toml_path` names, resolved against that file's tier root, for
+/// comparing two spellings of one trigger.
+fn place_in(toml_path: &Path) -> impl Fn(&str) -> Option<String> {
+    let root = toml_path.parent().and_then(Path::parent).map(|r| r.display().to_string());
+    let home = crate::home::home_root().map(|h| h.display().to_string());
+    move |t: &str| matcher::resolve_trigger(t, root.as_deref(), home.as_deref())
+}
+
+/// `raw` as the full path a path trigger of `domain` is stored as (P3), or the refusal. Relative input is the tier
+/// root's, which is where a relative trigger in that file has always resolved: the workspace root, or home for the
+/// global tier; `~` is home. Refused, before anything is written, when it cannot be rooted (a glob, an empty path),
+/// or when it holds registered projects other than the domain's own project and its children (D1): the refusal
+/// names them and the domain's own folder.
+fn checked_trigger(cwd: &Path, toml_path: &Path, domain: &str, raw: &str) -> anyhow::Result<String> {
+    let root = toml_path.parent().and_then(Path::parent);
+    let home = crate::home::home_root();
+    let t = raw.trim();
+    let unrooted = || TriggerRefused(matcher::fault_sentence(domain, raw, &matcher::TriggerFault::Unrooted));
+    if t.contains(['*', '?']) {
+        return Err(unrooted().into());
+    }
+    let Some(full) = crate::crud::project::absolute_path(t, root, home.as_deref()) else {
+        return Err(unrooted().into());
+    };
+    let ctx = trigger_context(cwd);
+    let Some(resolved) = matcher::resolve_trigger(&full, None, ctx.home.as_deref()) else {
+        return Err(unrooted().into());
+    };
+    let broad = matcher::trigger_breadth(&resolved, domain, &ctx);
+    if broad.is_empty() {
+        return Ok(full);
+    }
+    let own = crate::crud::slugify(domain);
+    let folder = ctx.registered.iter().find(|r| r.slug == own && !r.path.is_empty());
+    // The domain's own project folder, holding a project not linked to it as a child: the fix is the link.
+    if folder.is_some_and(|f| matcher::path_under(&resolved, &f.path) && matcher::path_under(&f.path, &resolved)) {
+        return Err(TriggerRefused(format!(
+            "{full} is {domain}'s folder and also holds {} that {domain} is not the parent of: link each one first \
+             (base project update <slug> --parent {own}), then add the trigger.",
+            matcher::count_projects(&broad)
+        ))
+        .into());
+    }
+    let mut msg = format!(
+        "{full} contains {}. A trigger must be one project's own folder or a file.",
+        matcher::count_projects(&broad)
+    );
+    if let Some(folder) = folder {
+        let spelled = crate::crud::project::absolute_path(&folder.path, None, None).unwrap_or_else(|| folder.path.clone());
+        msg.push_str(&format!(" {domain}'s folder is {spelled}."));
+    }
+    Err(TriggerRefused(msg).into())
+}
+
+/// Set each listed domain's whole path list, and its `auto_inject`, in the domains.toml at `toml_path`: one read, one
+/// atomic write (`base domain paths --apply`, P6). A domain the file does not hold is an error, and nothing is written.
+pub fn set_paths(toml_path: &Path, entries: &[(String, Vec<String>, bool)]) -> anyhow::Result<()> {
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(toml_path)?)?;
+    for (name, paths, auto_inject) in entries {
+        let Some(d) = file.domain.iter_mut().find(|d| d.name == *name) else {
+            anyhow::bail!("no domain '{name}' in {}", toml_path.display());
+        };
+        d.paths = paths.clone();
+        d.auto_inject = *auto_inject;
+    }
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, toml_path)?;
+    Ok(())
+}
+
+/// Set one rule's test prompts in the domains.toml at `toml_path` (K2a, `base rule update`): the rule of `domain` whose
+/// [`rules::rule_id`] is `id`. One read, one atomic write. A plain-string rule becomes an inline table to hold them; a
+/// table left with nothing but its text goes back to a plain string.
+///
+/// The file is written back the way `add_trigger`, `remove_trigger` and `set_paths` write it, through
+/// `toml::to_string_pretty`: in a file base wrote, only that entry's line changes, and clearing the tests restores it
+/// byte for byte (both pinned by `rule_tests_stored_with_rule`). A file written by hand loses its comments and its own
+/// layout on the first write, as it does under every other domains.toml writer. `Ok(false)` when the file has no such
+/// rule; nothing is written.
+pub fn set_rule_tests(toml_path: &Path, domain: &str, id: &str, tests: &rules::RuleTests) -> anyhow::Result<bool> {
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(toml_path)?)?;
+    let want = crate::crud::slugify(domain);
+    let Some(d) = file.domain.iter_mut().find(|d| crate::crud::slugify(&d.name) == want) else {
+        return Ok(false);
+    };
+    let name = d.name.clone();
+    let Some(r) = d.rules.iter_mut().find(|r| rules::rule_id(&name, r.text()) == id) else {
+        return Ok(false);
+    };
+    let (fires_on, quiet_on) = (tests.fires_on.clone(), tests.quiet_on.clone());
+    let next = match std::mem::replace(r, RuleEntry::Bare(String::new())) {
+        RuleEntry::Bare(text) => {
+            RuleEntry::Detailed { text, rationale: None, matchers: Vec::new(), fires_on, quiet_on, protected: false }
+        }
+        RuleEntry::Detailed { text, rationale, matchers, protected, .. } => {
+            RuleEntry::Detailed { text, rationale, matchers, fires_on, quiet_on, protected }
+        }
+    };
+    // Nothing but its text left: a plain string again.
+    *r = next.plain_when_bare();
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, toml_path)?;
+    Ok(true)
+}
+
+/// Set one rule's matchers in the domains.toml at `toml_path` (BO-16, an approved keyword gap on a rule with words of
+/// its own): the rule of `domain` whose [`rules::rule_id`] is `id`. Written as [`set_rule_tests`] writes; a table left
+/// with nothing but its text goes back to a plain string. `Ok(false)` when the file has no such rule.
+pub fn set_rule_matchers(toml_path: &Path, domain: &str, id: &str, matchers: &[rules::Matcher]) -> anyhow::Result<bool> {
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(toml_path)?)?;
+    let want = crate::crud::slugify(domain);
+    let Some(d) = file.domain.iter_mut().find(|d| crate::crud::slugify(&d.name) == want) else {
+        return Ok(false);
+    };
+    let name = d.name.clone();
+    let Some(r) = d.rules.iter_mut().find(|r| rules::rule_id(&name, r.text()) == id) else {
+        return Ok(false);
+    };
+    let matchers = matchers.to_vec();
+    let next = match std::mem::replace(r, RuleEntry::Bare(String::new())) {
+        RuleEntry::Bare(text) => RuleEntry::Detailed {
+            text,
+            rationale: None,
+            matchers,
+            fires_on: Vec::new(),
+            quiet_on: Vec::new(),
+            protected: false,
+        },
+        RuleEntry::Detailed { text, rationale, fires_on, quiet_on, protected, .. } => {
+            RuleEntry::Detailed { text, rationale, matchers, fires_on, quiet_on, protected }
+        }
+    };
+    *r = next.plain_when_bare();
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, toml_path)?;
+    Ok(true)
+}
+
+/// Mark one rule of `domain` in the domains.toml at `toml_path` protected, or clear the mark (BO-20, `base rule update
+/// --protected`): the rule whose [`rules::rule_id`] is `id`, written as [`set_rule_tests`] writes. `Ok(false)` when the
+/// file has no such rule.
+pub fn set_rule_protected(toml_path: &Path, domain: &str, id: &str, protected: bool) -> anyhow::Result<bool> {
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(toml_path)?)?;
+    let want = crate::crud::slugify(domain);
+    let Some(d) = file.domain.iter_mut().find(|d| crate::crud::slugify(&d.name) == want) else {
+        return Ok(false);
+    };
+    let name = d.name.clone();
+    let Some(r) = d.rules.iter_mut().find(|r| rules::rule_id(&name, r.text()) == id) else {
+        return Ok(false);
+    };
+    let next = match std::mem::replace(r, RuleEntry::Bare(String::new())) {
+        RuleEntry::Bare(text) => RuleEntry::Detailed {
+            text,
+            rationale: None,
+            matchers: Vec::new(),
+            fires_on: Vec::new(),
+            quiet_on: Vec::new(),
+            protected,
+        },
+        RuleEntry::Detailed { text, rationale, matchers, fires_on, quiet_on, .. } => {
+            RuleEntry::Detailed { text, rationale, matchers, fires_on, quiet_on, protected }
+        }
+    };
+    *r = next.plain_when_bare();
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, toml_path)?;
+    Ok(true)
+}
+
+/// Remove one rule of `domain` from the domains.toml at `toml_path`, by its [`rules::rule_id`] (BO-16: a rewritten file
+/// rule moves to the graph, where the old wording is kept superseded). `Ok(false)` when the file has no such rule.
+pub fn remove_rule(toml_path: &Path, domain: &str, id: &str) -> anyhow::Result<bool> {
+    let mut file: DomainsFile = toml::from_str(&std::fs::read_to_string(toml_path)?)?;
+    let want = crate::crud::slugify(domain);
+    let Some(d) = file.domain.iter_mut().find(|d| crate::crud::slugify(&d.name) == want) else {
+        return Ok(false);
+    };
+    let name = d.name.clone();
+    let before = d.rules.len();
+    d.rules.retain(|r| rules::rule_id(&name, r.text()) != id);
+    if d.rules.len() == before {
+        return Ok(false);
+    }
+    let tmp = toml_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
+    std::fs::rename(&tmp, toml_path)?;
+    Ok(true)
 }
 
 /// Swap a path trigger on a domain: drop `old` (if present), add `new`. Used by
@@ -429,11 +688,17 @@ pub fn repath_trigger(
         return Ok(false);
     };
 
+    // By the place a trigger names, not its spelling: a project stored as `Documents/x` and moved to an absolute
+    // folder (F25b, 0.16.0) drops its `Documents/x` trigger whether it was written `Documents/x` or `C:/.../x`.
+    let root = base_dir.parent().map(|r| r.display().to_string());
+    let home = crate::home::home_root().map(|h| h.display().to_string());
+    let place = |t: &str| matcher::resolve_trigger(t, root.as_deref(), home.as_deref());
+    let same = |a: &str, b: &str| a == b || place(a).is_some_and(|pa| Some(pa) == place(b));
     let before = domain.paths.clone();
     if let Some(o) = old {
-        domain.paths.retain(|x| x != o);
+        domain.paths.retain(|x| !same(x, o));
     }
-    if !domain.paths.iter().any(|x| x == new) {
+    if !domain.paths.iter().any(|x| same(x, new)) {
         domain.paths.push(new.to_string());
     }
     if domain.paths == before {
@@ -469,14 +734,20 @@ pub fn create_domain(
     if file.domain.iter().any(|d| d.name.eq_ignore_ascii_case(domain_name)) {
         anyhow::bail!("Domain '{domain_name}' already exists");
     }
+    // R4: an old name still reads as the renamed domain everywhere, so a new domain under it would never be reached.
+    if let Some(d) = renamed_from(&load_domains(cwd), domain_name) {
+        anyhow::bail!("'{domain_name}' is an old name of domain '{}' (renamed); pick another name", d.name);
+    }
 
     let mut kws = Vec::new();
     if let Some(kw) = keyword { kws.push(kw.to_string()); }
+    // The same rule as `add-trigger` (P3): a full path, never one that holds other projects.
     let mut ps = Vec::new();
-    if let Some(p) = path { ps.push(p.to_string()); }
+    if let Some(p) = path { ps.push(checked_trigger(cwd, &toml_path, domain_name, p)?); }
 
     file.domain.push(DomainDef {
         name: domain_name.to_string(),
+        aliases: Vec::new(),
         mode: "triggered".to_string(),
         auto_inject: true,
         root: None,
@@ -556,8 +827,11 @@ pub fn remove_trigger(
         removed += before - domain.prompt_keywords.len();
     }
     if let Some(p) = path {
+        // By the place it names, so `Documents/x` removes the `C:/.../Documents/x` that add-trigger stored (P3).
+        let place = place_in(&toml_path);
+        let target = place(p);
         let before = domain.paths.len();
-        domain.paths.retain(|pp| pp != p);
+        domain.paths.retain(|pp| pp != p && (target.is_none() || place(pp) != target));
         removed += before - domain.paths.len();
     }
     if removed == 0 {
@@ -568,6 +842,157 @@ pub fn remove_trigger(
     std::fs::write(&tmp, toml::to_string_pretty(&file)?)?;
     std::fs::rename(&tmp, &toml_path)?;
     Ok(tier::Changed { tier, count: removed })
+}
+
+// ─── Rename (BO-24) ──────────────────────────────────────────
+
+/// The domain `name` is an old name of, among `domains`: one whose `aliases` hold it. `None` while a domain is still
+/// called `name`, so a real name always wins over an alias.
+pub fn renamed_from<'a>(domains: &'a [DomainDef], name: &str) -> Option<&'a DomainDef> {
+    let want = crate::crud::slugify(name);
+    if domains.iter().any(|d| d.name == name || crate::crud::slugify(&d.name) == want) {
+        return None;
+    }
+    domains.iter().find(|d| d.aliases.iter().any(|a| crate::crud::slugify(a) == want))
+}
+
+/// The domain to act on for a name the user typed (R4): the name itself, or, when it is an old name kept as an
+/// alias, the domain's name now, with one line on stderr saying so (`vintrix is now vintryx`). Reads the
+/// domains.toml files `load_domains` reads, never the graph: a file read, not a store load, on every `--domain`.
+pub fn canonical_name(cwd: &Path, name: &str) -> String {
+    match renamed_from(&load_domains(cwd), name) {
+        Some(d) => {
+            crate::crud::alias::notice(name, &d.name);
+            d.name.clone()
+        }
+        None => name.to_string(),
+    }
+}
+
+/// One domains.toml with `old` renamed to `new` (R2).
+#[derive(Debug)]
+pub struct TomlRename {
+    /// The whole file after the rename.
+    pub text: String,
+    /// The rules the renamed domain declares in this file.
+    pub declared_rules: usize,
+}
+
+/// `text` (a domains.toml) with the domain `old` renamed to `new` and `old` added to its `aliases` (R2, R4). Edited
+/// as text, so every other line, the comments and the order stay byte for byte; a file written by base's own
+/// serializer has the `[[domain]]` / `name = "..."` shape this reads. The result is parsed back and compared with
+/// the original domain by domain: anything changed besides that name and that alias list is refused, and nothing
+/// is returned to write. `Ok(None)` when the file holds no domain called `old`.
+pub fn rename_in_text(text: &str, old: &str, new: &str) -> anyhow::Result<Option<TomlRename>> {
+    let before: DomainsFile = toml::from_str(text)?;
+    // By slug, the key its records carry: `project add -n Vintrix` writes `name = "Vintrix"` for `domain/vintrix`.
+    let slug = |d: &DomainDef| crate::crud::slugify(&d.name);
+    let hits: Vec<usize> = (0..before.domain.len()).filter(|i| slug(&before.domain[*i]) == old).collect();
+    let target = match hits.as_slice() {
+        [] => return Ok(None),
+        [one] => *one,
+        many => anyhow::bail!(
+            "{} domains here are '{old}' once slugified ({}); rename them by hand",
+            many.len(),
+            many.iter().map(|i| before.domain[*i].name.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    if before.domain.iter().any(|d| slug(d) == new) {
+        anyhow::bail!("a domain is already called '{new}'");
+    }
+    let mut aliases = before.domain[target].aliases.clone();
+    if !aliases.iter().any(|a| crate::crud::slugify(a) == old) {
+        aliases.push(old.to_string());
+    }
+    aliases.retain(|a| crate::crud::slugify(a) != new);
+
+    // The `name` and `aliases` lines of the target's own table: after its `[[domain]]` header, before the next
+    // header of any kind (a `[[domain.rules.match]]` sub-table holds keys that are not the domain's).
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let (mut seen, mut in_target) = (0usize, false);
+    let (mut name_at, mut aliases_at) = (None, None);
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_target = false;
+            let header: String = t.split('#').next().unwrap_or("").chars().filter(|c| !c.is_whitespace()).collect();
+            if header == "[[domain]]" {
+                in_target = seen == target;
+                seen += 1;
+            }
+            continue;
+        }
+        if !in_target {
+            continue;
+        }
+        match toml_key(t) {
+            Some("name") => name_at = Some(i),
+            Some("aliases") => aliases_at = Some(i),
+            _ => {}
+        }
+    }
+    let unread = || anyhow::anyhow!("could not find domain '{old}' as a `[[domain]]` table with a `name = \"{old}\"` line; rename it by hand");
+    let name_at = name_at.ok_or_else(unread)?;
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let list = toml::Value::Array(aliases.iter().map(|a| toml::Value::String(a.clone())).collect()).to_string();
+
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    out[name_at] = with_value(lines[name_at], &toml::Value::String(new.to_string()).to_string()).ok_or_else(unread)?;
+    match aliases_at {
+        Some(i) => {
+            out[i] = with_value(lines[i], &list)
+                .ok_or_else(|| anyhow::anyhow!("domain '{old}' has an `aliases` list over more than one line; rename it by hand"))?;
+        }
+        None => {
+            let line = lines[name_at];
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let ending = if line.ends_with('\n') { "" } else { nl };
+            out.insert(name_at + 1, format!("{ending}{indent}aliases = {list}{}", if ending.is_empty() { nl } else { "" }));
+        }
+    }
+    let text_after = out.concat();
+
+    // The check that makes "byte for byte elsewhere" a refusal rather than a hope.
+    let after: DomainsFile = toml::from_str(&text_after)?;
+    let mut want = before.domain.clone();
+    want[target].name = new.to_string();
+    want[target].aliases = aliases;
+    let as_json = |d: &[DomainDef]| serde_json::to_value(d).unwrap_or_default();
+    if as_json(&want) != as_json(&after.domain) {
+        anyhow::bail!("renaming '{old}' in the text would change more than its name and aliases; rename it by hand");
+    }
+    Ok(Some(TomlRename { text: text_after, declared_rules: before.domain[target].rules.len() }))
+}
+
+/// The key of a `key = value` line, unquoted; `None` for a comment, a blank line or an array element.
+fn toml_key(line: &str) -> Option<&str> {
+    if line.starts_with('#') {
+        return None;
+    }
+    let (key, _) = line.split_once('=')?;
+    let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
+    (!key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')).then_some(key)
+}
+
+/// `line` (`key = value  # comment`) with its value replaced by `value`, keeping the key, the spacing, the comment
+/// and the line ending. `None` when the value is not a one-line string or array this can bound.
+fn with_value(line: &str, value: &str) -> Option<String> {
+    let eq = line.find('=')?;
+    let rest = &line[eq + 1..];
+    let lead = rest.len() - rest.trim_start().len();
+    let v = &rest[lead..];
+    let end = match v.chars().next()? {
+        q @ ('"' | '\'') => {
+            let close = v[1..].find(q)? + 1;
+            if v[1..close].contains('\\') {
+                return None;
+            }
+            close + 1
+        }
+        '[' => v.find(']')? + 1,
+        _ => return None,
+    };
+    Some(format!("{}{}{}{}", &line[..eq + 1], &rest[..lead], value, &v[end..]))
 }
 
 /// List all domains (for CLI output).
@@ -642,9 +1067,16 @@ pub fn rules_of(
 /// Show a specific domain's full config (for CLI output).
 pub fn get_domain(cwd: &Path, ns: &crate::config::NamespaceConfig, name: &str) {
     let domains = load_domains(cwd);
-    match domains.iter().find(|d| d.name == name) {
+    // R4: an old name shows the domain it is now, and says so.
+    let found = domains.iter().find(|d| d.name == name).or_else(|| {
+        renamed_from(&domains, name).inspect(|d| crate::crud::alias::notice(name, &d.name))
+    });
+    match found {
         Some(d) => {
             println!("Domain: {}", d.name);
+            if !d.aliases.is_empty() {
+                println!("Aliases: {}", d.aliases.join(", "));
+            }
             println!("Mode: {}", d.mode);
             if !d.prompt_keywords.is_empty() {
                 println!("Prompt Keywords: {}", d.prompt_keywords.join(", "));
@@ -793,6 +1225,43 @@ mod tests {
         assert_eq!(d.role.as_deref(), Some("You are a strategist."));
         assert_eq!(d.output_mode.as_deref(), Some("file"));
         assert_eq!(d.format.as_deref(), Some("Prefer tables."));
+    }
+
+    // ─── BO-24: rename_in_text ───────────────────────────────
+
+    #[test]
+    fn rename_in_text_is_none_for_a_file_without_the_domain() {
+        assert!(rename_in_text("[[domain]]\nname = \"a\"\n", "b", "c").unwrap().is_none());
+    }
+
+    #[test]
+    fn rename_in_text_back_to_an_old_name_swaps_the_alias() {
+        let text = "[[domain]]\nname = \"b\"\naliases = [\"a\"]  # kept\nmode = \"triggered\"\n";
+        let r = rename_in_text(text, "b", "a").unwrap().unwrap();
+        assert_eq!(r.text, "[[domain]]\nname = \"a\"\naliases = [\"b\"]  # kept\nmode = \"triggered\"\n");
+    }
+
+    #[test]
+    fn rename_in_text_handles_a_last_line_with_no_newline() {
+        let r = rename_in_text("[[domain]]\nname = \"a\"", "a", "b").unwrap().unwrap();
+        assert_eq!(r.text, "[[domain]]\nname = \"b\"\naliases = [\"a\"]");
+    }
+
+    #[test]
+    fn rename_in_text_refuses_what_it_cannot_bound() {
+        let multi = "[[domain]]\nname = \"a\"\naliases = [\n  \"z\",\n]\n";
+        let err = rename_in_text(multi, "a", "b").unwrap_err().to_string();
+        assert!(err.contains("more than one line"), "{err}");
+        let taken = "[[domain]]\nname = \"a\"\n\n[[domain]]\nname = \"b\"\n";
+        assert!(rename_in_text(taken, "a", "b").unwrap_err().to_string().contains("already called 'b'"));
+    }
+
+    #[test]
+    fn rename_in_text_reads_only_the_domain_table_not_its_sub_tables() {
+        let text = "[[domain]]\nname = \"a\"\n\n[[domain.rules]]\ntext = \"r\"\n\n[[domain]]\nname = \"c\"\n";
+        let r = rename_in_text(text, "a", "b").unwrap().unwrap();
+        assert_eq!(r.text, "[[domain]]\nname = \"b\"\naliases = [\"a\"]\n\n[[domain.rules]]\ntext = \"r\"\n\n[[domain]]\nname = \"c\"\n");
+        assert_eq!(r.declared_rules, 1);
     }
 
     #[test]

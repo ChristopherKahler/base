@@ -67,8 +67,23 @@ pub fn sparql_exclude_superseded(ns: &NamespaceConfig, var: &str) -> String {
     let p = &ns.prefix;
     // Trailing newline, matching `ontology::transient::sparql_exclude`, so the two
     // interpolate identically inside an arm: `{no_transient}{no_superseded}`.
-    format!("FILTER NOT EXISTS {{ ?{var} {p}:{PRED_SUPERSEDED_BY} ?{var}_supersededBy }}\n")
+    //
+    // A RETIRED RULE IS NOT LIVE EITHER (BO-17, lynx's G0 ruling on question 3). A rule the rule pass found dead is
+    // retired, never deleted: it carries `retiredAt`, and every reader that serves only the live version leaves it out
+    // here, beside the superseded ones, so no hook and no `select` serves it while `--include-superseded` still lists it.
+    // Only rules are ever retired, so the second filter excludes nothing else.
+    format!(
+        "FILTER NOT EXISTS {{ ?{var} {p}:{PRED_SUPERSEDED_BY} ?{var}_supersededBy }}\n\
+         FILTER NOT EXISTS {{ ?{var} {p}:{PRED_RETIRED_AT} ?{var}_retiredAt }}\n"
+    )
 }
+
+/// `rule ops:retiredAt <when>`: the rule pass retired it (BO-17). The edge every reader keys on; the writer also sets
+/// `ops:status "retired"` as a label, as a supersession sets `"superseded"`.
+pub const PRED_RETIRED_AT: &str = "retiredAt";
+
+/// The status label a retired rule carries.
+pub const STATUS_RETIRED: &str = "retired";
 
 /// The live end of `iri`'s supersession chain, or `iri` itself when nothing
 /// supersedes it.
@@ -173,6 +188,14 @@ pub fn link_update(ns: &NamespaceConfig, graph_iri: &str, old_iri: &str, new_iri
         \x20 <{old_iri}> {p}:status \"{STATUS_SUPERSEDED}\" .\n\
         }} }}"
     )
+}
+
+/// The inverse of [`link_update`] (BO-20: a shadow promotion's rollback): ONE `DELETE DATA` of exactly the three quads
+/// `link_update` writes into `graph_iri`, and nothing else. A status the old record carried before the link is not one
+/// of them (an `INSERT DATA` adds a quad beside it), so the store reads as it did before the link. Prefixed as
+/// `link_update` is: the caller puts `crud::prefixes` in front.
+pub fn unlink_update(ns: &NamespaceConfig, graph_iri: &str, old_iri: &str, new_iri: &str) -> String {
+    link_update(ns, graph_iri, old_iri, new_iri).replacen("INSERT DATA", "DELETE DATA", 1)
 }
 
 /// What `base doctor` reports about supersession on one tier.
@@ -336,10 +359,40 @@ mod tests {
         format!("<{u}{a}> <{u}{PRED_SUPERSEDED_BY}> <{u}{b}> <{g}> .\n")
     }
 
+    /// Every quad of `store` as N-Quads, sorted: two stores that dump the same hold the same quads.
+    fn dump(store: &Store) -> String {
+        let mut lines: Vec<String> = store.iter().map(|q| q.unwrap().to_string()).collect();
+        lines.sort();
+        lines.join("\n")
+    }
+
+    /// BO-20 (lynx's Q3 condition): `unlink_update` removes exactly the quads `link_update` wrote. A store linked and
+    /// then unlinked dumps byte for byte as before, the old record's own status included; the link itself wrote three.
+    #[test]
+    fn unlink_undoes_link_exactly() {
+        let ns = ns();
+        let u = &ns.uri;
+        let g = "http://example.org/graph/ws/seed";
+        let (old, new) = (format!("{u}rule/tools/cli-1"), format!("{u}rule/tools/cli-2"));
+        let store = store_with(&format!(
+            "<{old}> <{u}ruleText> \"Name the folder.\" <{g}> .\n<{old}> <{u}status> \"active\" <{g}> .\n<{new}> <{u}ruleText> \"Name the folder you write to.\" <{g}> .\n"
+        ));
+        let before = dump(&store);
+        let prefixes = crate::crud::prefixes(&ns);
+        store.update(&format!("{prefixes}\n{}", link_update(&ns, g, &old, &new))).unwrap();
+        assert_eq!(store.len().unwrap(), 6, "control: the link wrote its three quads");
+        store.update(&format!("{prefixes}\n{}", unlink_update(&ns, g, &old, &new))).unwrap();
+        assert_eq!(dump(&store), before, "unlinked, the store is as it was");
+    }
+
     #[test]
     fn the_exclusion_filter_binds_a_variable_derived_from_its_subject() {
         let f = sparql_exclude_superseded(&ns(), "n");
-        assert_eq!(f, "FILTER NOT EXISTS { ?n ops:supersededBy ?n_supersededBy }\n");
+        // BO-17: a retired rule is left out beside a superseded record, by its own edge.
+        assert_eq!(
+            f,
+            "FILTER NOT EXISTS { ?n ops:supersededBy ?n_supersededBy }\nFILTER NOT EXISTS { ?n ops:retiredAt ?n_retiredAt }\n"
+        );
         assert!(
             !f.contains("GRAPH"),
             "the filter carries no GRAPH group of its own — the caller must place it \

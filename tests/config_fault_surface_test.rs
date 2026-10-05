@@ -68,7 +68,30 @@ fn base(root: &Path) -> Command {
     let mut c = Command::new(BIN);
     c.current_dir(root)
         .env("BASE_HOME", root)
-        .env("BASE_NO_AUTO_UPDATE", "1");
+        .env("BASE_NO_AUTO_UPDATE", "1")
+        // BASE_NO_AUTONAME stops the relay naming the fake session. Without it
+        // session_registry::touch_with does its job and auto-assigns a codename to any
+        // unnamed session - correct behaviour, and it made the byte-identity test below
+        // fail every time. A named session renders the relay wake contract block, and
+        // that block embeds the run's own BASE_HOME path TWICE. This file compares two
+        // runs under two different temp roots, so the outputs differed by exactly those
+        // two paths and nothing else.
+        //
+        // IT IS NOT A LEAK, WHICH IS WHY IT COST SO LONG TO FIND. auk and I killed four
+        // hypotheses between us - CLAUDE_CODE_SESSION_ID, BASE_RELAY_AS, WT_SESSION, and
+        // two of those together - every one about a title being INHERITED. Isolation was
+        // working throughout: with the environment cleared base declines to inherit and
+        // assigns a FRESH name inside the temp home, and the block renders just the same.
+        // Measured: BASE_NO_AUTONAME=1 alone, both shell variables left in place, is
+        // green with zero blocks rendered.
+        //
+        // base::relay::scrub_shell_env covers the same contamination for unit tests and
+        // cannot reach here, because these tests spawn the real binary as a subprocess.
+        .env("BASE_NO_AUTONAME", "1")
+        // The second protection this rolled-its-own builder never knew it was missing
+        // (auk): the shared fixture at tests/seed/mod.rs sets it, this file does not, and
+        // a test that spawns an AST subprocess measures something it did not intend.
+        .env("BASE_AST_NO_SPAWN", "1");
     c
 }
 

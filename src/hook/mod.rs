@@ -1,3 +1,4 @@
+pub mod ast_hint;
 pub mod automap;
 pub mod flow;
 pub mod memory;
@@ -8,7 +9,7 @@ pub mod stop;
 pub mod user_prompt_submit;
 pub mod walk;
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::BaseConfig;
@@ -35,7 +36,7 @@ pub struct HookEventData {
     pub cwd: Option<String>,
     /// Pre-tool-use: AST file map was injected for this file
     pub ast_injected: bool,
-    /// Pre-tool-use: grep/find was intercepted with ast-hint
+    /// Pre-tool-use: an AST hint was given, which happens only on a code search (F20)
     pub grep_intercepted: bool,
     /// Post-tool-use: section-specific AST context was injected (partial read)
     pub section_context: bool,
@@ -69,7 +70,26 @@ fn extract_tool_context(event: &serde_json::Value) -> (Option<String>, Option<St
 }
 
 /// Entry point for all hook events. Fail-open: any error → stderr only, exit 0, empty stdout.
+///
+/// Inside one of base's own headless `claude -p` calls (`BASE_HEADLESS`, set by `llm`) every event returns here before
+/// anything is parsed, printed or written: no config, no log row, no session file, no relay title (F27, BO-08). The
+/// payload is still drained, unread, as every hook run drained it before: a prompt hook's payload carries the whole
+/// extraction prompt, and the host should never be left writing it into a pipe nobody reads.
 pub fn dispatch(event: &str) {
+    if crate::llm::headless() {
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+        return;
+    }
+    // Not a Claude Code hook: the background process the first session start on a new version starts (BO-26, U1). It has
+    // no payload and no hook-log row (a row with no payload would read as a failed hook), and stands in the folder it was
+    // started in.
+    if event == "upgrade" {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Err(e) = crate::upgrade::run(&cwd) {
+            eprintln!("base hook upgrade: {e:#}");
+        }
+        return;
+    }
     let outcome = run(event);
     let (success, data, error) = match &outcome.result {
         Ok(d) => (true, Some(d), None),
@@ -152,41 +172,94 @@ fn run_event(
 
     match event {
         "session-start" => {
-            session_start::handle(&config, &cwd, session_id.as_deref())?;
-            // Relay inbox push: pending messages addressed to this session
-            // (unregistered sessions get a one-line notice that a relay is live).
-            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true, false) {
-                print!("{block}");
+            // Everything session start says is collected, measured against
+            // `[budget] session_start_bytes`, and printed ONCE (rank 00). The untrimmed text
+            // goes to `.base/hook-output/<session>/session-start.md` and `.base/last-session-start.md`
+            // before anything prints (BO-06, F11).
+            let mut out = session_start::SessionOutput::new();
+            out.set_session(session_id.as_deref());
+            let handled = session_start::handle(&config, &cwd, session_id.as_deref(), &mut out);
+            if handled.is_ok() {
+                // Relay inbox push: pending messages addressed to this session, due now
+                // (unregistered sessions get a one-line notice that a relay is live, which
+                // ranks in the tail: an invitation to join is not due now).
+                if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), true) {
+                    let kind = if crate::relay::deliver::is_notice(&block) { "relay-notice" } else { "relay-inbox" };
+                    out.push(kind, &block, 1);
+                }
+                // Session-targeted task relay: refresh liveness + announce any tasks and pings for this
+                // session (new ones in full, unanswered ones listed in one line), as two blocks that rank
+                // apart: the items delivered to this session and the one-line watcher nudge (spec B1, BO-04).
+                if let Some(sid) = session_id.as_deref() {
+                    let (tasks, wake) = relay_task_parts(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::SessionStart);
+                    if let Some(block) = tasks {
+                        out.push("relay-tasks", &block, 1);
+                    }
+                    if let Some(block) = wake {
+                        out.push("relay-wake", &block, 1);
+                    }
+                }
             }
-            // Session-targeted task relay: refresh liveness + announce any tasks
-            // assigned to this session (loud, re-announced on each new session).
-            if let Some(sid) = session_id.as_deref()
-                && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::SessionStart, true)
+            // A handler error still prints what it collected first: those sites had printed
+            // before the error, and the unhealthy-graph warning is exactly what precedes one.
+            let rendered = out.finish(&config, &cwd);
+            // Rank 10 (spec A7): what is about to print is kept for `base doctor`, beside the full-output file, before
+            // the print and before `handled?`, so a session start whose handler failed is still on record.
+            if let Some(dir) = crate::crud::handoff_show::session_start_dir(&cwd) {
+                let record = crate::emit::record::record_of(
+                    &rendered,
+                    "session-start",
+                    session_id.as_deref(),
+                );
+                if let Err(why) = crate::emit::record::keep(&dir, &record) {
+                    eprintln!("base: session start could not keep its output record: {why}");
+                }
+            }
+            print!("{}", rendered.text);
+            // The match log's retention (K1e), after the print. The hook still exits only after it, so it is kept cheap:
+            // at most one rename a day and the deletion of archive files past `[log] prompt_days`; the log being
+            // appended to is never rewritten (see `match_log::retain`).
+            let _ = std::io::stdout().flush();
+            if let Some(dir) = crate::crud::handoff_show::session_start_dir(&cwd)
+                && let Err(why) = crate::emit::match_log::retain(&dir, config.log.prompt_days, chrono::Local::now())
             {
-                print!("{block}");
+                eprintln!("base: session start could not prune the match log: {why}");
             }
+            // BO-26 (U1): the upgrade, when this is the first session start on a new version, in a process of its own that
+            // outlives this hook, after the print and after this session's own writes. The next session start says what it
+            // did.
+            if handled.is_ok() {
+                crate::upgrade::after_session_start(&config, &cwd);
+            }
+            handled?;
             Ok(HookEventData { session_id, ..Default::default() })
         }
         "pre-tool-use" => {
-            let (mut data, mut context) = pre_tool_use::handle(&config, &cwd, stdin_json)?;
+            let (mut data, mut context, trace, kept) = pre_tool_use::handle_traced(&config, &cwd, stdin_json)?;
             let (tool_name, file_path) = extract_tool_context(stdin_json);
             data.tool_name = tool_name;
             data.file_path = file_path;
-            // Mid-turn task-relay scan: a pending task or ping fires loud
-            // immediately so an autonomous run picks it up without waiting for
-            // the next prompt.
-            if let Some(sid) = session_id.as_deref()
-                && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Tool, false)
-            {
-                context.push('\n');
-                context.push_str(&block);
-            }
-            // Mid-turn spool push: a question from a squad peer must interrupt
-            // the running turn, not queue behind a prompt boundary that an
-            // autonomous run may never hit.
-            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), false, true) {
-                context.push('\n');
-                context.push_str(&block);
+            // No relay text on a tool call (BO-04, F4 and F13b). Pings, tasks and the watcher nudge used to ride here
+            // too, so on 2026-10-01 ordinary Bash and ToolSearch calls carried the whole 3.4 KB wake contract and a
+            // "Reply RIGHT NOW" line, and a withdrawn message reappeared mid-turn. Relay content is delivered at
+            // session start and on the next prompt; a session that must hear a ping mid-turn runs the inbox watcher
+            // (`base relay arm`), whose Monitor wakes it.
+            //
+            // The one exception (lynx's amendment to F13b): a run that has said it cannot keep a watcher
+            // (`BASE_NO_WAKE_NUDGE`: Agent SDK runs, workers with no Monitor tool) has no other way to hear a question
+            // mid-run, so it is given NEW items once, in the same plain form, and never a watcher line or the script.
+            // Shown once across prompt and tool calls: what a tool call shows, the next prompt does not.
+            if crate::relay::monitorless() {
+                if let Some(sid) = session_id.as_deref()
+                    && let Some(part) = crate::relay::task_inbox::deliver_deferred(sid, crate::relay::task_inbox::Phase::Tool)
+                {
+                    context.push('\n');
+                    context.push_str(&with_star_commands(part.commit(), &cwd));
+                }
+                if let Some(block) = crate::relay::deliver::deliver_mid_turn(&cwd, session_id.as_deref()) {
+                    context.push('\n');
+                    context.push_str(&block);
+                }
             }
             // PreToolUse context only reaches the model through the JSON
             // envelope — plain stdout is transcript-only on this event.
@@ -199,6 +272,26 @@ fn run_event(
                     }
                 });
                 println!("{envelope}");
+            }
+            // The match log's row (K1), after the print, never in the way of it (K1g).
+            let _ = std::io::stdout().flush();
+            if let Some(dir) = crate::crud::handoff_show::session_start_dir(&cwd) {
+                // The shadow candidate (BO-20, K9b), after the print: what it would have served on this call. A call that
+                // touched no path and served nothing is not a file touch and writes no row, unless the candidate would
+                // have served something on it (a merge proposal can carry a rule's tool matcher onto another rule). A
+                // matcher candidate picks what live picks on a tool call (no `[match]` key reaches it): not run there.
+                let quiet = crate::emit::match_log::quiet_call(&trace);
+                let entry = kept
+                    .as_ref()
+                    .filter(|k| !quiet || k.active.version.is_proposals())
+                    .map(|k| crate::shadow::run::file(&config, k));
+                if !quiet || entry.as_ref().is_some_and(|e| !e.adds.is_empty()) {
+                    let mut row = crate::emit::match_log::tool_row(trace, session_id.as_deref());
+                    row.shadow = entry;
+                    if let Err(why) = crate::emit::match_log::append(&dir, &row) {
+                        eprintln!("base: the tool hook could not write its match log row: {why}");
+                    }
+                }
             }
             data.session_id = session_id;
             Ok(data)
@@ -227,39 +320,193 @@ fn run_event(
             Ok(data)
         }
         "user-prompt-submit" => {
-            let mut data = user_prompt_submit::handle(&config, &cwd, stdin_json)?;
-            // Relay inbox push for messages that arrived mid-session. Runs in
-            // the dispatcher (not the handler) so star-command and empty-prompt
-            // early returns can't swallow a pending delivery. Silent when
-            // unregistered — the session-start notice already ran.
-            if let Some(block) = crate::relay::deliver::deliver(&cwd, session_id.as_deref(), false, false) {
-                print!("{block}");
+            // Everything this event says is collected here as named blocks and printed ONCE, fitted to
+            // `[budget] prompt_bytes` (rank 00), exactly as session start does above.
+            //
+            // WHAT WAS WRONG, AND WHY MEASURING ONE EMITTER WOULD HAVE BEEN WORSE THAN MEASURING
+            // NONE. This arm used to hold THREE SEQUENTIAL EMITTERS, each blind to the others'
+            // spend: `handle` printed at its four return sites, then the relay inbox push printed,
+            // then the task tick printed. A budget cannot be enforced by any one of them, because
+            // none knows what the next two are about to add — and a writer reporting nothing withheld
+            // after seeing a third of the output is a POSITIVE CLAIM THAT NOTHING WAS LOST, made over
+            // output that overflows anyway. That reassurance is what stops anyone looking.
+            //
+            // Measured on Chris's install: 13.3 KB emitted here and 2 KB delivered, the whole relay
+            // wake contract and every global domain rule past the second lost inline, with no notice
+            // of any kind. The same session later emitted 26 KB — the overflow GROWS as a session
+            // does, so the trim is the mechanism and not a backstop.
+            //
+            // AND THEN THE ONE WRITER CUT LINES (BO-01). Rank 00's writer kept whole lines from the top
+            // until the budget ran out. On 2026-10-01 it stopped at line 37 of a 47-line wake script, and
+            // the order of the text — handler, relay, task tick — decided what survived, so the bracket
+            // rules went first and the rules matched to the prompt last. Now each part is a named block
+            // with a priority, the fit drops whole blocks lowest priority first, each leaves a pointer
+            // line, and the session records as shown only what was printed (D15).
+            // A shadow candidate (BO-20, K9b) decides on what `collect` read, so `collect` keeps it. With no shadow started
+            // this is one failed file open, and nothing below changes (the seamless upgrade).
+            let shadow = crate::shadow::active();
+            let mut sink = user_prompt_submit::PromptSink::default();
+            sink.keep_world = shadow.is_some();
+            let handled = user_prompt_submit::collect(&config, &cwd, stdin_json, &mut sink);
+            // Each relay block's side effects (messages marked seen, a reply deleted once announced, a ping
+            // recorded as delivered, the wake nudge throttled) are held back with the block's id and run only if
+            // that block is printed. A dropped relay block stays pending and arrives, whole, at the next tool call.
+            let mut relay_commits: Vec<(&'static str, Vec<crate::relay::Commit>)> = Vec::new();
+            // Both relay blocks stay gated on the handler succeeding, exactly as the `?` used to
+            // gate them: on an error neither used to run, and this is not the change that alters it.
+            if handled.is_ok() {
+                // Relay inbox push for messages that arrived mid-session. Runs in
+                // the dispatcher (not the handler) so star-command and empty-prompt
+                // early returns can't swallow a pending delivery. Silent when
+                // unregistered — the session-start notice already ran.
+                use crate::emit::prompt::{Priority, PromptBlock};
+                if let Some(part) = crate::relay::deliver::deliver_deferred(&cwd, session_id.as_deref(), false) {
+                    sink.blocks.push(PromptBlock::new("relay-inbox", Priority::Relay, &part.text, part.items, "message"));
+                    relay_commits.push(("relay-inbox", part.commits));
+                }
+                // Session-targeted task relay: refresh liveness + deliver new tasks and pings, then the
+                // watcher nudge as a block of its own, last in priority 3. Since BO-04 it is one line per title
+                // (it was the 3.4 KB wake contract), so it no longer competes with the pings above it.
+                if let Some(sid) = session_id.as_deref() {
+                    let (tasks, wake) = relay_task_parts_deferred(
+                        sid,
+                        &cwd,
+                        &config.relay,
+                        crate::relay::task_inbox::Phase::Prompt,
+                    );
+                    if let Some(part) = tasks {
+                        sink.blocks.push(PromptBlock::new("relay-tasks", Priority::Relay, &part.text, part.items, "item"));
+                        relay_commits.push(("relay-tasks", part.commits));
+                    }
+                    if let Some(part) = wake {
+                        sink.blocks.push(PromptBlock::new("relay-wake", Priority::Relay, &part.text, part.items, "watcher nudge"));
+                        relay_commits.push(("relay-wake", part.commits));
+                    }
+                }
             }
-            // Session-targeted task relay: refresh liveness + deliver assigned tasks.
-            if let Some(sid) = session_id.as_deref()
-                && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Prompt, true)
-            {
-                print!("{block}");
+            // Corrections (BO-15): C1 on this prompt, C2 and C3 in what the session wrote since the last read (a turn
+            // the user interrupted or refused ends with no Stop), and the C4 line first among the blocks of its rank
+            // when one fired. After `collect`, so every return site of the handler gets it. The rule pass's counts
+            // (BO-17) ride the same step, and its `rule pass due` line goes right after the C4 line. No LLM here
+            // (K4c): the line only asks the AI to run `base tune`.
+            let matched_domain = sink.trace.matched.iter().any(|m| m.by != "always");
+            let correction = crate::corrections::on_prompt(
+                &config,
+                &cwd,
+                stdin_json,
+                session_id.as_deref(),
+                sink.prompt_num,
+                &sink.prompt,
+                matched_domain,
+            );
+            if let Some(block) = correction.as_ref().and_then(|c| c.tune_block.clone()) {
+                sink.blocks.push_front(block);
             }
+            if let Some(block) = correction.as_ref().and_then(|c| c.block.clone()) {
+                sink.blocks.push_front(block);
+            }
+            // Live's list before its fit, for the shadow candidate's own fit (only while one runs), and how many blocks went
+            // first after the matching ran.
+            let front = sink
+                .blocks
+                .iter()
+                .filter(|b| b.id == crate::corrections::CHECK_BLOCK || b.id == crate::corrections::tune::DUE_BLOCK)
+                .count();
+            let pre_fit = shadow.as_ref().map(|_| (sink.blocks.clone(), sink.header.clone()));
+            // Fitted to `[budget] prompt_bytes` under the key the operator actually wrote; then D15: what will be
+            // printed is recorded as shown, and nothing else.
+            let (fitted, committed) = sink.fit_and_commit(&config);
+            for (id, commits) in relay_commits {
+                if fitted.kept_blocks().any(|b| b.id == id) {
+                    crate::relay::run_commits(commits);
+                }
+            }
+            // Keep what was measured, as session start does (rank 10). The untrimmed text and this session's
+            // blocks are written BEFORE the print, so every pointer line names a block `base hooks show` can
+            // already print. An empty emission leaves the previous full-output file alone.
+            let dir = crate::crud::handoff_show::session_start_dir(&cwd);
+            if let Some(d) = dir.as_ref() {
+                // The session's own `prompt-submit.md` and the workspace's latest copy (BO-06, F11), and neither when
+                // `[budget] write_full_output = false`: until BO-06 this wrote the workspace file whatever it said.
+                if config.budget.write_full_output && !fitted.full_text.is_empty() {
+                    let _ = crate::emit::session_files::write(
+                        d,
+                        session_id.as_deref(),
+                        crate::emit::session_files::PROMPT_FILE,
+                        crate::emit::record::PROMPT_FULL_FILE,
+                        &fitted.full_text,
+                    );
+                }
+                if let Some(sid) = session_id.as_deref()
+                    && let Some(why) = crate::emit::prompt::write_blocks(d, sid, &fitted).failure()
+                {
+                    eprintln!("base: the prompt hook could not keep its blocks for `base hooks show`: {why}");
+                }
+            }
+            // THE SINGLE EXIT. It runs before `handled?` for the same reason session start's does:
+            // the sites this replaced had already printed by the time an error could be seen, so
+            // dropping their text on an error would be a regression dressed as a refactor.
+            crate::emit::prompt::print(&fitted);
+            let _ = std::io::stdout().flush();
+            // The corrections state and its signal rows, after the print and never in the way of it: a C2 signal is
+            // answered only by a C4 line that printed.
+            if let Some(c) = correction {
+                let printed = fitted.kept_blocks().any(|b| b.id == crate::corrections::CHECK_BLOCK);
+                let tune_printed = fitted.kept_blocks().any(|b| b.id == crate::corrections::tune::DUE_BLOCK);
+                c.commit(printed, tune_printed);
+            }
+            if let Some(dir) = dir {
+                let record = crate::emit::record::record_of_prompt(&fitted, "user-prompt-submit", session_id.as_deref());
+                if let Err(why) = crate::emit::record::keep(&dir, &record) {
+                    eprintln!("base: the prompt hook could not keep its output record: {why}");
+                }
+                // The match log's row (K1): what matched, what the printed blocks served, what the budget, the topic
+                // cap and the walk cut. Written after the print and never in the way of it (K1g).
+                if !sink.prompt.is_empty() {
+                    // The shadow candidate (K9b), after the print and the flush: what it would have printed instead.
+                    let shadow_entry = match (&shadow, sink.kept.as_ref(), pre_fit) {
+                        (Some(active), Some(kept), Some((blocks, header))) => {
+                            Some(crate::shadow::run::prompt(&config, &cwd, active, kept, blocks, front, &header, &fitted))
+                        }
+                        _ => None,
+                    };
+                    let mut row = crate::emit::match_log::prompt_row(
+                        std::mem::take(&mut sink.trace),
+                        &fitted,
+                        config.budget.key_as_written("prompt_bytes"),
+                        session_id.as_deref(),
+                        &sink.prompt,
+                        sink.prompt_num,
+                        config.log.prompt_text_mode(),
+                    );
+                    row.shadow = shadow_entry;
+                    if let Err(why) = crate::emit::match_log::append(&dir, &row) {
+                        eprintln!("base: the prompt hook could not write its match log row: {why}");
+                    }
+                }
+            }
+            let mut data = handled?;
+            data.rules_injected = committed.rules;
+            data.bracket_rules_injected = committed.bracket_block;
             data.session_id = session_id;
             Ok(data)
         }
         "stop" => {
+            // Corrections (BO-15) first: C3 in what the turn's AI wrote, and the files it wrote, kept for the next
+            // prompt. Fail-open, so the code-map step below always runs.
+            crate::corrections::on_stop(&config, &cwd, stdin_json, session_id.as_deref());
             stop::handle(&config, &cwd)?;
-            // #76: Stop has no additive model-facing channel. This block used to go out
-            // as plain stdout, which the host captures and drops — and it was redundant
-            // as well as undeliverable, because the same open task is re-announced by the
-            // Phase::Prompt and Phase::Tool ticks the moment the session moves again.
-            //
-            // What a Stop hook CAN do is speak to the operator. `systemMessage` produces
-            // a `hook_system_message` record where plain stdout produces none, measured
-            // on Claude Code 2.1.263 with two Stop hooks on one event — and neither
-            // reached the model, which is the point: this line is for the person.
-            if let Some(sid) = session_id.as_deref()
-                && let Some(block) = relay_task_tick(sid, &cwd, &config.relay, crate::relay::task_inbox::Phase::Stop, false)
-            {
-                let envelope = serde_json::json!({ "systemMessage": block.trim() });
-                println!("{envelope}");
+            // No relay delivery at a turn's end (BO-04, F13b: relay content appears at session start and on a prompt
+            // only). This arm used to run the task tick and print its block as a `systemMessage` for the operator,
+            // and in doing so it recorded a new ping as delivered before any prompt had shown it to the model.
+            Ok(HookEventData { session_id, ..Default::default() })
+        }
+        "session-end" => {
+            // D7d (BO-17): mark the session ended for the next pass, and nothing else: no graph, no match log, no
+            // LLM. A hook must be fast, and most sessions never get here (a closed terminal fires nothing, D5), so the
+            // pass itself runs on evidence, on a turn count and at the next session start's catch-up.
+            if let Err(why) = crate::corrections::tune::mark_ended(stdin_json, session_id.as_deref(), &cwd) {
+                eprintln!("base: the SessionEnd hook could not mark the session ended: {why}");
             }
             Ok(HookEventData { session_id, ..Default::default() })
         }
@@ -271,61 +518,65 @@ fn run_event(
     })
 }
 
-/// Session-targeted task-relay tick: on boundary events (session-start, prompt)
-/// ensure this session has an auto-assigned codename and a fresh heartbeat, then
-/// deliver any tasks/pings assigned to it, returning the injection block. The
-/// caller decides the output channel — plain stdout on boundary events, the
-/// JSON additionalContext envelope on pre-tool-use.
+/// Star commands inside relayed pings resolve exactly like typed prompts (Chris directive 2026-08-17, spoken pings from
+/// the hub): scan the delivered block and append every matched command mode's rules.
+fn with_star_commands(block: String, cwd: &std::path::Path) -> String {
+    let commands = crate::command::load_commands(cwd);
+    let matched = crate::command::match_commands(&block, &commands);
+    if matched.is_empty() {
+        return block;
+    }
+    let extra: String = matched
+        .iter()
+        .map(|c| crate::command::format_command_output(c))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{block}\n{extra}")
+}
+
+/// Session-targeted task relay at a boundary (session start, prompt): ensure this session has an auto-assigned
+/// codename and a fresh heartbeat, then return its two halves, kept apart: the tasks and pings delivered to this
+/// session, and the one-line watcher nudge. Session start places them as two blocks.
 /// Fail-open — a broken inbox or registry never blocks the hook.
-fn relay_task_tick(
+fn relay_task_parts(
     session_id: &str,
     cwd: &std::path::Path,
     relay: &crate::config::RelayConfig,
     phase: crate::relay::task_inbox::Phase,
-    boundary: bool,
-) -> Option<String> {
-    if boundary {
-        // `[relay] enabled = false` stops the auto-codename; a session that
-        // registered itself still keeps its liveness fresh.
-        let _ = crate::relay::session_registry::touch_with(session_id, cwd, relay.enabled);
-    }
-    let delivered = crate::relay::task_inbox::deliver(session_id, phase);
-    // Star commands inside relayed pings resolve exactly like typed prompts
-    // (Chris directive 2026-08-17, spoken pings from the hub): scan the
-    // delivery block and append every matched command mode's rules.
-    let delivered = delivered.map(|block| {
-        let commands = crate::command::load_commands(cwd);
-        let matched = crate::command::match_commands(&block, &commands);
-        if matched.is_empty() {
-            block
-        } else {
-            let extra: String = matched
-                .iter()
-                .map(|c| crate::command::format_command_output(c))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("{block}\n{extra}")
-        }
+) -> (Option<String>, Option<String>) {
+    let (tasks, wake) = relay_task_parts_deferred(session_id, cwd, relay, phase);
+    (tasks.map(crate::relay::Part::commit), wake.map(crate::relay::Part::commit))
+}
+
+/// [`relay_task_parts`] with each half's inbox writes and nudge stamps held back as commits: the prompt hook runs a
+/// half's commits only if it prints that half (BO-01).
+type DeferredPart = Option<crate::relay::Part>;
+
+fn relay_task_parts_deferred(
+    session_id: &str,
+    cwd: &std::path::Path,
+    relay: &crate::config::RelayConfig,
+    phase: crate::relay::task_inbox::Phase,
+) -> (DeferredPart, DeferredPart) {
+    // `[relay] enabled = false` stops the auto-codename; a session that
+    // registered itself still keeps its liveness fresh.
+    let _ = crate::relay::session_registry::touch_with(session_id, cwd, relay.enabled);
+    let delivered = crate::relay::task_inbox::deliver_deferred(session_id, phase).map(|mut part| {
+        part.text = with_star_commands(part.text, cwd);
+        part
     });
-    // Wake contract: any of this session's titles with a stale .watching
-    // sentinel gets its Monitor arming block re-injected — forced at
-    // session-start, throttled mid-turn. Stop is excluded: arming belongs at
-    // starts of activity, not turn ends. `[relay] wake_nudge = false` (or
-    // `enabled = false`) never injects it.
-    let wake = (relay.enabled
-        && relay.wake_nudge
-        && !matches!(phase, crate::relay::task_inbox::Phase::Stop))
+    // Watcher nudge (BO-04, F4b): one line per title with no current inbox watcher, never the script. Once per
+    // session, and once more each time a watcher dies; session start always says it, since a fresh context has not
+    // seen it. `[relay] wake_nudge = false` (or `enabled = false`) never injects it.
+    let wake = (relay.enabled && relay.wake_nudge)
         .then(|| {
-            crate::relay::wake::arm_blocks_for(
+            crate::relay::wake::nudge_lines_deferred(
                 session_id,
                 matches!(phase, crate::relay::task_inbox::Phase::SessionStart),
             )
         })
         .flatten();
-    match (delivered, wake) {
-        (Some(d), Some(w)) => Some(format!("{d}\n{w}")),
-        (a, b) => a.or(b),
-    }
+    (delivered, wake)
 }
 
 /// The hook log is bounded by its own writer (#22): over this size the last

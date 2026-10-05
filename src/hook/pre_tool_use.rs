@@ -8,9 +8,10 @@ use crate::config::BaseConfig;
 use crate::crud;
 use crate::domain;
 use crate::domain::session::SessionState;
+use crate::emit::match_log::{Item, Matched, Trace};
 
 /// PreToolUse: see file path in tool call → match file_keywords + path triggers → inject rules BEFORE tool executes.
-/// Also: inject AST file map for source files, and redirect grep/find to ast query.
+/// Also: inject AST file map for source files, and point a code search at the code map that covers it (F20).
 ///
 /// Returns the injection text instead of printing it: Claude Code only feeds
 /// PreToolUse context to the model via the JSON `hookSpecificOutput.additionalContext`
@@ -21,8 +22,20 @@ pub fn handle(
     cwd: &Path,
     event: &serde_json::Value,
 ) -> Result<(super::HookEventData, String)> {
+    handle_traced(config, cwd, event).map(|(data, context, _, _)| (data, context))
+}
+
+/// [`handle`], and what the call matched and served, for the match log (K1, BO-13): the touched paths, each domain
+/// they brought in and by what, and every rule printed. The dispatcher writes the row after the output is printed.
+/// While a shadow runs (BO-20), also what the candidate decides on, which the dispatcher hands it after the print.
+pub fn handle_traced(
+    config: &BaseConfig,
+    cwd: &Path,
+    event: &serde_json::Value,
+) -> Result<(super::HookEventData, String, Trace, Option<FileKept>)> {
     let mut output = String::new();
     let mut data = super::HookEventData::default();
+    let mut trace = Trace { tool: event.get("tool_name").and_then(|v| v.as_str()).map(String::from), ..Trace::default() };
 
     // ─── Memory intercept (Write/Edit/Read on memory files) ──
     // Must be FIRST — if we intercept, we may block the tool call (exit 2).
@@ -35,21 +48,6 @@ pub fn handle(
         }
         // Not blocked: print enrichment and continue (dual-write mode)
         output.push_str(&message);
-        output.push('\n');
-    }
-
-    // ─── Grep/find intercept (Bash tool) ─────────────────────
-    if let Some(hint) = grep_intercept(event, cwd) {
-        output.push_str(&hint);
-        output.push('\n');
-        data.grep_intercepted = true;
-    }
-
-    // ─── Context-mode source file intercept ──────────────────
-    // When context-mode (ctx_batch_execute, ctx_execute) is used to scan
-    // source files, nudge toward base ast query first.
-    if let Some(hint) = context_mode_intercept(event, cwd) {
-        output.push_str(&hint);
         output.push('\n');
     }
 
@@ -74,6 +72,17 @@ pub fn handle(
     }
 
     let file_paths = extract_file_paths(event);
+    // P1: every path this call touches, absolute. The tool's own paths above feed the code maps, the standards and
+    // the rest exactly as before; this list decides which project's rules come with the call.
+    let named = touched_paths(event, cwd, crate::home::home_root().as_deref(), &file_paths);
+    // A Bash or PowerShell command that names no path touches the session's folder (Example 7), for the project and
+    // trigger match only: place rules and file keywords keep to what the call names.
+    let touched: Vec<String> = if named.is_empty() && tool_command(event).is_some() {
+        vec![cwd.display().to_string()]
+    } else {
+        named.clone()
+    };
+    trace.paths = touched.clone();
     // Single SessionState lifecycle for the whole hook — rule marks, domain dedup
     // marks and AST-injected marks share one instance, saved once at the end (Q3).
     let base_dir = crate::config::find_workspace_base(cwd);
@@ -82,6 +91,19 @@ pub fn handle(
         .map(SessionState::load)
         .unwrap_or_default();
     let mut session_dirty = false;
+
+    // ─── AST hint (F20) ──────────────────────────────────────
+    // A code search through Bash, PowerShell or context-mode is pointed at the code map that covers the folder it
+    // searches; nothing else is. The rules are in `ast_hint`. After Bash first contact above, so a no-map hint reads
+    // the build that contact just started.
+    let hint = crate::hook::ast_hint::hint(event, cwd, &mut session);
+    if let Some(text) = hint.text {
+        output.push_str(&text);
+        output.push('\n');
+        data.grep_intercepted = true;
+    }
+    session_dirty |= hint.marked;
+
     let domains = domain::load_domains(cwd);
     // Sync BEFORE the single graph load so the store sees fresh rules. Marker-gated,
     // a no-op when fresh; it ran only for a matched domain until F29, and the match
@@ -106,43 +128,42 @@ pub fn handle(
         event.get("session_id").and_then(|v| v.as_str()),
     );
 
-    // ─── Rules with matchers of their own (F4, F5; A2, A3) ──
-    // Every tool call reaches this, not only one that names a file: a Bash, PowerShell or MCP call carries no
-    // `file_path`, and that is where action rules fire (A3). Place rules match the tool's file path and every
-    // path its command names (F4). A rule with matchers of its own is served here and never through its domain's
-    // trigger (F1); a rule with none stays on the domain path below, exactly as before (K4, `auk`'s HARD RULE).
+    // ─── Rule serving: rules with matchers of their own, and the touched file's project ──
+    // One function, `serve_file` (BO-20, K9b), so a shadow candidate decides exactly as live does. What it read is kept
+    // in a `FileWorld`, and the candidate runs on it after the print, on the session as it was before this call.
     let converted = domain::rules::rules_with_matchers(graph_store.as_ref(), config, &domains);
-    let converted_ids: HashSet<&str> = converted.iter().map(|c| c.rule.id.as_str()).collect();
-    if !converted.is_empty() {
-        let tool = event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-        let command = tool_command(event);
-        let home = crate::home::home_root();
-        let home_str = home.as_ref().map(|h| h.display().to_string());
-        let mut paths: Vec<String> = file_paths.iter().filter_map(|p| p.to_str().map(String::from)).collect();
-        if let Some(cmd) = command {
-            let named = crate::hook::automap::bash_paths(cmd, cwd, home.as_deref());
-            paths.extend(named.iter().filter_map(|p| p.to_str().map(String::from)));
-        }
-        let keywords = HashMap::new();
-        let cx = domain::rules::SelectContext {
-            bracket: tier,
-            now: SessionState::now_secs(),
-            home: home_str.as_deref(),
-            keywords: &keywords,
-            rules: &config.rules,
-        };
-        let rule_event = domain::rules::Event::PreTool { tool, paths: &paths, command };
-        let selection = domain::rules::select(&converted, &rule_event, &mut session, &cx);
-        if !selection.served.is_empty() {
-            output.push_str(&domain::rules::render_selection(&selection));
-            data.rules_injected += selection.served.len();
-            session_dirty = true;
-        }
+    let trigger_ctx = (!touched.is_empty()).then(|| domain::matcher::TriggerContext {
+        home: crate::home::home_root().map(|h| h.display().to_string()),
+        registered: graph_store
+            .as_ref()
+            .map(|s| domain::registered_projects(s, &config.namespace, cwd))
+            .unwrap_or_default(),
+    });
+    let world = FileWorld {
+        store: graph_store,
+        domains,
+        converted,
+        tier,
+        tool: event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        command: tool_command(event).map(String::from),
+        cwd: cwd.to_path_buf(),
+        named: named.clone(),
+        touched: touched.clone(),
+        trigger_ctx,
+        rules: Default::default(),
+    };
+    let shadow = crate::shadow::active();
+    let shadow_session = shadow.as_ref().map(|_| session.clone());
+    let served = serve_file(config, &world, &FileView::live(&world), &mut session, None).unwrap_or_default();
+    if served.select_count > 0 {
+        output.push_str(&served.select_text);
+        data.rules_injected += served.select_count;
+        session_dirty = true;
     }
+    trace.served.extend(served.select_served.iter().cloned());
+    trace.cut.extend(served.select_cut.iter().cloned());
 
-    // ─── Domain rule injection (file path match) ─────────────
     if !file_paths.is_empty() {
-
         // Track apps whose files are being edited this turn so the Stop hook can
         // refresh exactly those code maps — not just the session-cwd app. This is
         // what keeps blast-radius injection current: edits this turn → map refresh
@@ -171,74 +192,25 @@ pub fn handle(
                 crate::hook::automap::ensure_first_map(&root);
             }
         }
+    }
 
-        let file_path_strings: Vec<String> = file_paths
-            .iter()
-            .filter_map(|p| p.to_str().map(String::from))
-            .collect();
-        let trigger_ctx = domain::matcher::TriggerContext {
-            home: crate::home::home_root().map(|h| h.display().to_string()),
-            registered: graph_store
-                .as_ref()
-                .map(|s| domain::registered_projects(s, &config.namespace, cwd))
-                .unwrap_or_default(),
-        };
-        let matched = match_by_file(&domains, &file_path_strings, &trigger_ctx);
-
-        for domain_def in &matched {
-            // Read the rules FIRST, then key the dedup on what came back.
-            //
-            // Until 0.16.0 this was the other way round: the key was
-            // `rules_hash(&domain_def.rendered_rules())`, which renders the TOML,
-            // and the payload was `query_rules_from_graph`, which reads the graph.
-            // A domain whose rules live only in the graph — which is every domain
-            // whose rules were added with `base rule add` — has an EMPTY
-            // `rendered_rules()`, so its key was a constant. The first tool call
-            // injected and marked it; every later call in that session computed the
-            // same constant and was suppressed, however the rules had changed. The
-            // reverse cost the other way: a domains.toml edit changed the key and
-            // re-injected text the reader had already seen.
-            //
-            // Reading before deciding costs one query on a domain that turns out to
-            // be deduped. That is the price of a key that describes the payload, and
-            // the defect it removes is a rule the operator added never arriving.
-            // A rule with matchers of its own left this path in 4d: it was served on them above (F1).
-            let rules: Vec<domain::rules::ServedRule> =
-                domain::rules::rules_for_domain(graph_store.as_ref(), config, domain_def)
-                    .into_iter()
-                    .filter(|r| !converted_ids.contains(r.id.as_str()))
-                    .collect();
-
-            // Dedup per RULE, not per domain block (F9). Before this the whole block
-            // was one unit, so adding a single rule to a seventeen-rule domain handed
-            // the reader all seventeen again, sixteen of which it had already been
-            // told this session. Measured live 2026-09-14: editing BASE-WORK-ORDER.md
-            // served all thirteen basemode rules, for an edit to a base work order.
-            //
-            // Scope is `None`, which means once per session and again on a tier
-            // change. Every rule left on this path has no matchers of its own, so it is
-            // serving through its domain's trigger, and K4 says an unconverted rule keeps
-            // exactly the behaviour it has today until an operator approves a conversion.
-            //
-            // `claim_rule` records as it decides, so this loop cannot claim a rule it
-            // then fails to render: everything that survives the filter is rendered.
-            let fresh: Vec<(usize, &domain::rules::ServedRule)> = rules
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| session.claim_rule(&r.id, r.content_hash, tier, None))
-                .collect();
-            if fresh.is_empty() && !rules.is_empty() {
-                data.suppressed += 1;
-                continue;
-            }
-            if !fresh.is_empty() {
-                session_dirty = true;
-            }
-            let rules_text =
-                domain::rules::render_block("FILE MATCH", &fresh, rules.len(), &domain_def.name);
-
+    // ─── Domain rule injection: the touched file's project (P2, D13) ─────
+    trace.matched.extend(served.matched.iter().cloned());
+    for fd in &served.domains {
+        let domain_def = &fd.def;
+        if fd.fresh.is_empty() && fd.all > 0 {
+            data.suppressed += 1;
+            continue;
+        }
+        if !fd.fresh.is_empty() {
+            session_dirty = true;
+        }
+        trace.served.extend(fd.fresh.iter().map(|(_, r)| Item::rule(&r.id, &domain_def.name)));
+        let fresh: Vec<(usize, &domain::rules::ServedRule)> = fd.fresh.iter().map(|(i, r)| (*i, r)).collect();
+        let rules_text = domain::rules::render_block_as("FILE MATCH", &fd.label, &fresh, fd.all, &domain_def.name);
+        {
             // Query-triggered injection for filepath-matched domains
-            let query_text = match (&graph_store, &domain_def.query) {
+            let mut query_text = match (&world.store, &domain_def.query) {
                 (Some(store), Some(query_name)) => {
                     let fmt = domain_def.query_format.as_deref().unwrap_or("list");
                     crate::domain::query::resolve_and_run_query(
@@ -247,6 +219,18 @@ pub fn handle(
                 }
                 _ => String::new(),
             };
+            // Once per session for the same output, as the rules are: with the session's folder standing in for a
+            // command that names no path, every shell call in a project would otherwise print it again.
+            if !query_text.is_empty() {
+                let key = format!("pre-tool-query:{}", domain_def.name);
+                let hash = domain::rules::content_hash(&query_text);
+                if session.is_injected(&key, hash) {
+                    query_text.clear();
+                } else {
+                    session.mark_injected(&key, hash);
+                    session_dirty = true;
+                }
+            }
 
             if !rules_text.is_empty() || !query_text.is_empty() {
                 if !rules_text.is_empty() {
@@ -262,7 +246,9 @@ pub fn handle(
                 session_dirty = true;
             }
         }
+    }
 
+    if !file_paths.is_empty() {
         // ─── Markdown authoring guidance (Write/Edit on .md) ─────
         let tool_name = event
             .get("tool_name")
@@ -330,7 +316,7 @@ pub fn handle(
         // ─── PAUL context injection (file change history) ───────
         // When editing a file that has FileChange/Decision history in the
         // graph, surface the decisions and changes that shaped it.
-        if let Some(store) = &graph_store {
+        if let Some(store) = &world.store {
             for fp in &file_paths {
                 if let Some(fp_str) = fp.to_str() {
                     let paul_ctx = query_paul_context(store, config, fp_str);
@@ -388,7 +374,11 @@ pub fn handle(
         }
 
     let context = output.trim_end().to_string();
-    Ok((data, context))
+    // What a shadow candidate decides on after the print (BO-20): only while one runs.
+    let live: std::collections::BTreeSet<String> =
+        trace.served.iter().filter(|i| i.kind == "rule").map(|i| i.id.clone()).collect();
+    let kept = shadow.zip(shadow_session).map(|(active, session)| FileKept { active, world, session, live });
+    Ok((data, context, trace, kept))
 }
 
 /// Content-version of a file for content-keyed dedup: a hash of its bytes (0 if
@@ -428,218 +418,353 @@ fn is_source_file(path: &str) -> bool {
     exts.iter().any(|ext| path.ends_with(ext))
 }
 
-/// Check if AST data has been extracted for the current workspace.
-/// ast.ttl IS the AST store (never merged into graph.nq — AUDIT C10),
-/// so its existence is the correct populated check.
+// ─── The rule serving, once (BO-20, K9b) ─────────────────────────
+
+/// What a tool call's rule serving reads: the store, the domains, the rules with matchers of their own, the tier, the
+/// tool and the paths. Kept while a shadow runs, so the candidate decides on the very same data after the print.
+pub struct FileWorld {
+    pub store: Option<oxigraph::store::Store>,
+    pub domains: Vec<domain::DomainDef>,
+    pub converted: Vec<domain::rules::Converted>,
+    pub tier: domain::session::Bracket,
+    pub tool: String,
+    pub command: Option<String>,
+    pub cwd: PathBuf,
+    /// Every path the call names.
+    pub named: Vec<String>,
+    /// The paths the project match reads: `named`, or the session's folder for a command that names none.
+    pub touched: Vec<String>,
+    /// `None` when the call touched nothing.
+    pub trigger_ctx: Option<domain::matcher::TriggerContext>,
+    /// Each domain's rules, read the first time a run asks.
+    pub rules: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<domain::rules::ServedRule>>>>,
+}
+
+impl FileWorld {
+    /// `d`'s rules (`rules_for_domain`), read once.
+    pub fn rules_of(&self, config: &BaseConfig, d: &domain::DomainDef) -> std::rc::Rc<Vec<domain::rules::ServedRule>> {
+        if let Some(r) = self.rules.borrow().get(&d.name) {
+            return std::rc::Rc::clone(r);
+        }
+        let r = std::rc::Rc::new(domain::rules::rules_for_domain(self.store.as_ref(), config, d));
+        self.rules.borrow_mut().insert(d.name.clone(), std::rc::Rc::clone(&r));
+        r
+    }
+}
+
+/// What a run serves with: live's domains and rules, or a proposals candidate's copies with their changes made.
+pub struct FileView<'a> {
+    pub domains: std::borrow::Cow<'a, [domain::DomainDef]>,
+    pub converted: std::borrow::Cow<'a, [domain::rules::Converted]>,
+    /// By domain name: the ids of the rules the changes take away, and the rules they add.
+    pub rule_edits: HashMap<String, (HashSet<String>, Vec<domain::rules::ServedRule>)>,
+}
+
+impl<'a> FileView<'a> {
+    pub fn live(w: &'a FileWorld) -> Self {
+        FileView {
+            domains: std::borrow::Cow::Borrowed(&w.domains),
+            converted: std::borrow::Cow::Borrowed(&w.converted),
+            rule_edits: HashMap::new(),
+        }
+    }
+}
+
+/// What a tool call's rule serving decided: `select`'s rules (rendered, logged and cut) and each matched domain's.
+#[derive(Default)]
+pub struct FileServed {
+    pub select_text: String,
+    pub select_count: usize,
+    pub select_served: Vec<Item>,
+    pub select_cut: Vec<crate::emit::match_log::Cut>,
+    pub matched: Vec<Matched>,
+    pub domains: Vec<FileDomain>,
+}
+
+impl FileServed {
+    /// The rule ids it would print.
+    pub fn printed(&self) -> std::collections::BTreeSet<String> {
+        let mut out: std::collections::BTreeSet<String> =
+            self.select_served.iter().filter(|i| i.kind == "rule").map(|i| i.id.clone()).collect();
+        out.extend(self.domains.iter().flat_map(|d| d.fresh.iter().map(|(_, r)| r.id.clone())));
+        out
+    }
+}
+
+/// One domain a tool call's paths brought in, and its rules due now.
+pub struct FileDomain {
+    pub def: domain::DomainDef,
+    /// Its name, and `(parent of <child>)` when it came as a nested parent (D13).
+    pub label: String,
+    /// The rules not yet shown this session, each with its place in the domain's list.
+    pub fresh: Vec<(usize, domain::rules::ServedRule)>,
+    /// How many rules the domain serves through its trigger.
+    pub all: usize,
+}
+
+/// What a running shadow candidate decides on after the tool hook's print (BO-20): the world, the session as it was
+/// before live's serving recorded anything in it, and the rule ids live printed.
+pub struct FileKept {
+    pub active: crate::shadow::Active,
+    pub world: FileWorld,
+    pub session: SessionState,
+    pub live: std::collections::BTreeSet<String>,
+}
+
+/// A tool call's rule serving (K9b's one function for the tool hook): the rules with matchers of their own `select`
+/// serves for this call (F4, F5; A2, A3), then the domains the touched paths bring (P2, D13), each with its rules not
+/// shown this session. Records in `session` as it decides, as `select` and `claim_rule` always have; live passes its
+/// session, a shadow candidate a copy. Past `deadline` it stops before reading a domain's rules ([`Slow`]).
 ///
-/// Resolution MUST go through `find_ast_ttl`, which checks the `.base-ast/`
-/// sidecar before the legacy `{ws}/.base/ast.ttl`. Hand-joining the legacy path
-/// here made this check unsatisfiable for every workspace mapped after the
-/// sidecar migration, so the "not yet populated" hint fired forever no matter
-/// how many times `base sync --ast` was run.
-fn ast_graph_populated(cwd: &Path) -> bool {
-    match crate::config::find_ast_ttl(cwd) {
-        Some(ast_path) => std::fs::metadata(&ast_path).map(|m| m.len() > 0).unwrap_or(false),
-        None => false,
-    }
-}
-
-/// Detect grep/find/rg in Bash commands and suggest ast query instead.
-fn grep_intercept(event: &serde_json::Value, cwd: &Path) -> Option<String> {
-    let tool_name = event.get("tool_name").and_then(|v| v.as_str())?;
-    if tool_name != "Bash" {
-        return None;
-    }
-
-    let command = event
-        .get("tool_input")
-        .and_then(|ti| ti.get("command"))
-        .and_then(|v| v.as_str())?;
-
-    // Intercept code search patterns (grep, rg, ag, ack, fd, find)
-    let is_code_search = command.starts_with("grep -r")
-        || command.starts_with("grep -rn")
-        || command.starts_with("grep -n")
-        || command.starts_with("grep -l")
-        || command.starts_with("grep -rl")
-        || command.contains("| grep")
-        || command.starts_with("rg ")
-        || command.starts_with("ag ")
-        || command.starts_with("ack ")
-        || command.starts_with("fd ")
-        || (command.starts_with("find ") && command.contains("-name"));
-
-    if !is_code_search {
-        return None;
-    }
-
-    // Try to extract the search term
-    let search_term = extract_search_term(command);
-
-    // Check if AST graph is populated — different message if not
-    if !ast_graph_populated(cwd) {
-        return Some(
-            "<ast-hint>\n\
-             AST graph not yet populated for this workspace.\n\
-             Would you like to index the codebase? Run:\n\
-               base sync --ast\n\
-             This takes ~10 seconds and indexes 35+ languages.\n\
-             Then use `base ast query` for code navigation instead of grep/find.\n\
-             </ast-hint>"
-                .to_string(),
-        );
-    }
-
-    let suggestion = if let Some(term) = search_term {
-        format!(
-            "<ast-hint>\n\
-             AST graph available for this workspace. Try:\n\
-               base ast query --contains \"{term}\"\n\
-             The graph knows file locations, line numbers, and call relationships.\n\
-             </ast-hint>"
-        )
-    } else {
-        "<ast-hint>\n\
-         AST graph available for this workspace. Try `base ast query` for code navigation.\n\
-         Modes: --contains <name>, --file <path>, --calls <name>, --imports <path>\n\
-         </ast-hint>"
-            .to_string()
-    };
-
-    Some(suggestion)
-}
-
-/// Best-effort extraction of search term from grep/rg/find commands.
-fn extract_search_term(command: &str) -> Option<String> {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-
-    // grep -r "term" or grep -rn "term"
-    if parts.first().map(|s| *s == "grep").unwrap_or(false) {
-        for part in parts.iter() {
-            // Skip flags
-            if part.starts_with('-') {
-                continue;
-            }
-            // Skip "grep" itself
-            if *part == "grep" {
-                continue;
-            }
-            // First non-flag, non-grep token is the pattern
-            let term = part.trim_matches('"').trim_matches('\'');
-            if !term.is_empty() && !term.starts_with('/') && !term.starts_with('.') {
-                return Some(term.to_string());
+/// [`Slow`]: crate::hook::user_prompt_submit::Slow
+pub fn serve_file(
+    config: &BaseConfig,
+    w: &FileWorld,
+    view: &FileView<'_>,
+    session: &mut SessionState,
+    deadline: crate::hook::user_prompt_submit::Deadline,
+) -> std::result::Result<FileServed, crate::hook::user_prompt_submit::Slow> {
+    let mut out = FileServed::default();
+    let converted: &[domain::rules::Converted] = &view.converted;
+    let converted_ids: HashSet<&str> = converted.iter().map(|c| c.rule.id.as_str()).collect();
+    // Every tool call reaches this, not only one that names a file: a Bash, PowerShell or MCP call carries no
+    // `file_path`, and that is where action rules fire (A3). Place rules match the tool's file path and every
+    // path its command names (F4). A rule with matchers of its own is served here and never through its domain's
+    // trigger (F1); a rule with none stays on the domain path below, exactly as before (K4, `auk`'s HARD RULE).
+    if !converted.is_empty() {
+        let home = crate::home::home_root();
+        let home_str = home.as_ref().map(|h| h.display().to_string());
+        // The touched paths (P1), plus every path-shaped word of the command whether it exists or not, which is what
+        // a place rule matched on before 0.16.0.
+        let mut paths: Vec<String> = w.named.clone();
+        if let Some(cmd) = w.command.as_deref() {
+            for p in crate::hook::automap::bash_paths(cmd, &w.cwd, home.as_deref()) {
+                if let Some(s) = p.to_str()
+                    && !paths.iter().any(|x| x == s)
+                {
+                    paths.push(s.to_string());
+                }
             }
         }
-    }
-
-    // rg "term"
-    if parts.first().map(|s| *s == "rg").unwrap_or(false)
-        && let Some(term) = parts.get(1) {
-            let t = term.trim_matches('"').trim_matches('\'');
-            if !t.starts_with('-') {
-                return Some(t.to_string());
-            }
+        let keywords = HashMap::new();
+        let cx = domain::rules::SelectContext {
+            bracket: w.tier,
+            now: SessionState::now_secs(),
+            home: home_str.as_deref(),
+            keywords: &keywords,
+            rules: &config.rules,
+            bm25: None,
+        };
+        let rule_event = domain::rules::Event::PreTool { tool: &w.tool, paths: &paths, command: w.command.as_deref() };
+        let selection = domain::rules::select(converted, &rule_event, session, &cx);
+        if !selection.served.is_empty() {
+            out.select_text = domain::rules::render_selection(&selection);
+            out.select_count = selection.served.len();
         }
+        out.select_served = domain::rules::served_items(&selection.served);
+        out.select_cut = domain::rules::cut_items(&selection);
+    }
+    let Some(trigger_ctx) = w.trigger_ctx.as_ref() else { return Ok(out) };
+    let matched = match_by_file(&view.domains, &w.touched, &w.named, trigger_ctx);
+    out.matched = matched.iter().map(|m| m.logged.clone()).collect();
+    for FileMatch { domain: domain_def, parent_of, .. } in &matched {
+        if !w.rules.borrow().contains_key(&domain_def.name) {
+            crate::hook::user_prompt_submit::in_time(deadline)?;
+        }
+        // Read the rules FIRST, then key the dedup on what came back.
+        //
+        // Until 0.16.0 this was the other way round: the key was
+        // `rules_hash(&domain_def.rendered_rules())`, which renders the TOML,
+        // and the payload was `query_rules_from_graph`, which reads the graph.
+        // A domain whose rules live only in the graph — which is every domain
+        // whose rules were added with `base rule add` — has an EMPTY
+        // `rendered_rules()`, so its key was a constant. The first tool call
+        // injected and marked it; every later call in that session computed the
+        // same constant and was suppressed, however the rules had changed. The
+        // reverse cost the other way: a domains.toml edit changed the key and
+        // re-injected text the reader had already seen.
+        //
+        // Reading before deciding costs one query on a domain that turns out to
+        // be deduped. That is the price of a key that describes the payload, and
+        // the defect it removes is a rule the operator added never arriving.
+        // A rule with matchers of its own left this path in 4d: it was served on them above (F1).
+        let base = w.rules_of(config, domain_def);
+        let rules: Vec<domain::rules::ServedRule> = match view.rule_edits.get(&domain_def.name) {
+            None => base.iter().filter(|r| !converted_ids.contains(r.id.as_str())).cloned().collect(),
+            Some((gone, added)) => base
+                .iter()
+                .filter(|r| !gone.contains(&r.id))
+                .cloned()
+                .chain(added.iter().cloned())
+                .filter(|r| !converted_ids.contains(r.id.as_str()))
+                .collect(),
+        };
 
-    None
+        // Dedup per RULE, not per domain block (F9). Before this the whole block
+        // was one unit, so adding a single rule to a seventeen-rule domain handed
+        // the reader all seventeen again, sixteen of which it had already been
+        // told this session. Measured live 2026-09-14: editing BASE-WORK-ORDER.md
+        // served all thirteen basemode rules, for an edit to a base work order.
+        //
+        // Scope is `None`, which means once per session and again on a tier
+        // change. Every rule left on this path has no matchers of its own, so it is
+        // serving through its domain's trigger, and K4 says an unconverted rule keeps
+        // exactly the behaviour it has today until an operator approves a conversion.
+        //
+        // `claim_rule` records as it decides, so this loop cannot claim a rule it
+        // then fails to render: everything that survives the filter is rendered.
+        let fresh: Vec<(usize, domain::rules::ServedRule)> = rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| session.claim_rule(&r.id, r.content_hash, w.tier, None))
+            .map(|(i, r)| (i, r.clone()))
+            .collect();
+        // D13: a parent's block says whose parent it is.
+        let label = match parent_of {
+            Some(child) => format!("{} (parent of {child})", domain_def.name),
+            None => domain_def.name.clone(),
+        };
+        out.domains.push(FileDomain { def: (*domain_def).clone(), label, fresh, all: rules.len() });
+    }
+    Ok(out)
 }
 
-/// Detect context-mode MCP tools scanning source files and nudge toward base ast query.
-/// Catches ctx_batch_execute and ctx_execute when commands reference source file patterns.
-fn context_mode_intercept(event: &serde_json::Value, cwd: &Path) -> Option<String> {
-    let tool_name = event.get("tool_name").and_then(|v| v.as_str())?;
-
-    // Match context-mode MCP tool names (plugin-namespaced)
-    let is_ctx_tool = tool_name.contains("ctx_batch_execute")
-        || tool_name.contains("ctx_execute")
-        || tool_name.contains("ctx_execute_file");
-
-    if !is_ctx_tool {
-        return None;
-    }
-
-    // Check if the tool input references source files
-    let input = event.get("tool_input")?;
-    let input_str = serde_json::to_string(input).unwrap_or_default();
-
-    // Look for source file extensions in the command/query text
-    let has_source_refs = [".rs", ".py", ".js", ".ts", ".go", ".tsx", ".jsx", ".vue", ".svelte"]
-        .iter()
-        .any(|ext| input_str.contains(ext));
-
-    // Also catch common code navigation commands
-    let has_nav_commands = ["cat ", "head ", "tail ", "find ", "grep ", "ls src", "ls ./src"]
-        .iter()
-        .any(|cmd| input_str.contains(cmd));
-
-    if !has_source_refs && !has_nav_commands {
-        return None;
-    }
-
-    if !ast_graph_populated(cwd) {
-        return Some(
-            "<ast-hint>\n\
-             AST graph not yet populated for this workspace.\n\
-             Would you like to index the codebase? Run:\n\
-               base sync --ast\n\
-             This takes ~10 seconds and indexes 35+ languages.\n\
-             Then use `base ast query` for code navigation instead of scanning files.\n\
-             </ast-hint>"
-                .to_string(),
-        );
-    }
-
-    Some(
-        "<ast-hint>\n\
-         BASE AST graph available. Before scanning source files, use:\n\
-           base ast query --file \"<filename>\"     (entity map for a file)\n\
-           base ast query --contains \"<name>\"     (find entities by name)\n\
-           base ast query --calls \"<function>\"     (call chain)\n\
-         The graph already knows the codebase structure — scan after, not before.\n\
-         </ast-hint>"
-            .to_string(),
-    )
-}
-
-/// Match domains by file path triggers and file_keywords against file content.
+/// The domains a tool call's touched paths bring in, in serving order, each with the project it is the nested parent
+/// of when that is why it came (D13): the touched file's project and the domains whose own trigger holds the file
+/// ([`domain::matcher::path_hits`], the one seam the prompt hook uses too), then the domains whose `file_keywords`
+/// appear in a touched path, then the parents, so a tight budget drops parent rules first.
+///
+/// `auto_inject = false` is honoured before any other test (F29 D3): this hook is the other automatic path. Always-on
+/// domains fire on the prompt, not here.
 fn match_by_file<'a>(
     domains: &'a [domain::DomainDef],
-    file_paths: &[String],
+    paths: &[String],
+    named: &[String],
     ctx: &domain::matcher::TriggerContext,
-) -> Vec<&'a domain::DomainDef> {
-    domains
-        .iter()
-        .filter(|d| {
-            // `auto_inject = false` is honoured before any other test (F29 D3): this
-            // hook is the other automatic path, and a tool call under `Documents`
-            // used to serve the same block the prompt hook serves.
-            if !d.auto_inject {
-                return false;
+) -> Vec<FileMatch<'a>> {
+    let eligible = |d: &domain::DomainDef| d.auto_inject && !d.is_always();
+    let mut direct: Vec<FileMatch<'a>> = Vec::new();
+    let mut parents: Vec<FileMatch<'a>> = Vec::new();
+    // The touched path goes in the log's entry only when the call touched more than one: the row names a lone one.
+    let which = |p: &str| (paths.len() > 1).then(|| p.to_string());
+    for hit in domain::matcher::path_hits(domains, paths, ctx) {
+        let d = &domains[hit.domain];
+        if !eligible(d) {
+            continue;
+        }
+        match hit.via {
+            domain::matcher::PathVia::Parent(child) => {
+                let logged = Matched { path: which(&hit.path), ..Matched::new(&d.name, "parent", Some(format!("{child} nested"))) };
+                parents.push(FileMatch { domain: d, parent_of: Some(child), logged });
             }
-            // Skip always-on (those fire on user-prompt-submit, not here)
-            if d.is_always() {
-                return false;
+            _ => {
+                let logged = Matched { path: which(&hit.path), ..Matched::new(&d.name, "path", Some(hit.value.clone())) };
+                direct.push(FileMatch { domain: d, parent_of: None, logged });
             }
+        }
+    }
+    // File keyword match: a keyword in a path the call names (lightweight: a full content scan would read the file).
+    for d in domains.iter().filter(|d| eligible(d)) {
+        let listed = direct.iter().chain(&parents).any(|m| std::ptr::eq(m.domain, d));
+        let file_kw_hit = d
+            .file_keywords
+            .iter()
+            .find(|kw| named.iter().any(|fp| fp.to_lowercase().contains(&kw.to_lowercase())));
+        if !listed && let Some(kw) = file_kw_hit {
+            direct.push(FileMatch { domain: d, parent_of: None, logged: Matched::new(&d.name, "file_keyword", Some(kw.clone())) });
+        }
+    }
+    direct.extend(parents);
+    direct
+}
 
-            // Path match: a touched file lies under a trigger resolved against the tier
-            // the domain came from — the one seam the prompt hook uses (F29), never a
-            // substring test.
-            let path_hit = d.paths.iter().any(|dp| {
-                domain::matcher::live_trigger(dp, d.root.as_deref(), ctx)
-                    .is_some_and(|t| file_paths.iter().any(|fp| domain::matcher::path_under(fp, &t)))
-            });
+/// A domain a tool call's paths brought in ([`match_by_file`]): the project it is the nested parent of, when that is
+/// why it came (D13), and its match-log entry (K1).
+struct FileMatch<'a> {
+    domain: &'a domain::DomainDef,
+    parent_of: Option<String>,
+    logged: Matched,
+}
 
-            // File keyword match: check if any file_keywords appear in the file paths
-            // (lightweight — full content scan would require reading the file)
-            let file_kw_hit = d.file_keywords.iter().any(|kw| {
-                file_paths
-                    .iter()
-                    .any(|fp| fp.to_lowercase().contains(&kw.to_lowercase()))
-            });
+/// Every path a tool call names, absolute, each once (P1): the tool's own file path (Read, Edit, Write, a notebook,
+/// a search's folder), a relative one joined to the session's folder; for Bash and PowerShell, every file or folder
+/// the command names ([`command_paths`]). The caller stands the session's folder in for a command that names none.
+fn touched_paths(event: &serde_json::Value, cwd: &Path, home: Option<&Path>, file_paths: &[PathBuf]) -> Vec<String> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in file_paths {
+        let abs = if domain::matcher::is_absolute(&p.to_string_lossy()) { p.clone() } else { cwd.join(p) };
+        push_unique(&mut out, abs);
+    }
+    if let Some(cmd) = tool_command(event) {
+        for p in command_paths(cmd, cwd, home) {
+            push_unique(&mut out, p);
+        }
+    }
+    out.iter().map(|p| p.display().to_string()).collect()
+}
 
-            path_hit || file_kw_hit
-        })
-        .collect()
+fn push_unique(out: &mut Vec<PathBuf>, p: PathBuf) {
+    if !out.contains(&p) {
+        out.push(p);
+    }
+}
+
+/// The files and folders a Bash or PowerShell command names (P1): each word of each command it runs, wrappers taken
+/// off and quotes honoured ([`domain::rules::command_parts`]), that resolves to a file or folder that exists, absolute
+/// or relative to the session's folder; a `cd` re-bases the relative words after it, and `--flag=value` is read as its
+/// value. At most 64 words are looked at, so a long heredoc costs a bounded number of lookups.
+fn command_paths(cmd: &str, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    const MAX_WORDS: usize = 64;
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut base = cwd.to_path_buf();
+    let mut looked = 0usize;
+    for part in domain::rules::command_parts(cmd) {
+        let Some(first) = part.first() else { continue };
+        if matches!(domain::rules::program_name(first).as_str(), "cd" | "pushd" | "chdir" | "set-location" | "sl") {
+            if let Some(dir) = part.get(1).and_then(|w| resolve_word(w, &base, home)).filter(|p| p.is_dir()) {
+                push_unique(&mut out, dir.clone());
+                base = dir;
+            }
+            continue;
+        }
+        for word in &part {
+            looked += 1;
+            if looked > MAX_WORDS {
+                return out;
+            }
+            let w = word.split_once('=').filter(|(k, _)| k.starts_with('-')).map_or(word.as_str(), |(_, v)| v);
+            if let Some(p) = resolve_word(w, &base, home).filter(|p| p.exists()) {
+                push_unique(&mut out, p);
+            }
+        }
+    }
+    out
+}
+
+/// A command word as the path it would name, before anyone checks it exists. Flags, URLs, variables, globs and
+/// redirections are not paths. A network or WSL share (`\\wsl.localhost\...`) is never looked at: from Windows,
+/// opening one starts the WSL machine. `~` is `home`; Git Bash's `/c/...` is `C:/...` on Windows.
+fn resolve_word(word: &str, base: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let t = word.trim().trim_end_matches([',', ';']);
+    if t.is_empty() || t.starts_with('-') || t.contains("://") || t.contains(['*', '?', '$', '{', '}', '`', '<', '>', '|']) {
+        return None;
+    }
+    let slashed = t.replace('\\', "/");
+    if slashed.starts_with("//") {
+        return None;
+    }
+    if t == "~" || slashed.starts_with("~/") {
+        return home.map(|h| h.join(slashed.trim_start_matches('~').trim_start_matches('/')));
+    }
+    if cfg!(windows)
+        && let Some(rest) = slashed.strip_prefix('/')
+        && let Some((drive, tail)) = rest.split_once('/')
+        && drive.len() == 1
+        && drive.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return Some(PathBuf::from(format!("{}:/{}", drive.to_ascii_uppercase(), tail)));
+    }
+    Some(if domain::matcher::is_absolute(t) { PathBuf::from(t) } else { base.join(t) })
 }
 
 
@@ -782,6 +907,13 @@ fn extract_file_paths(event: &serde_json::Value) -> Vec<PathBuf> {
     if let Some(fp) = event
         .get("tool_input")
         .and_then(|ti| ti.get("path"))
+        .and_then(|v| v.as_str())
+    {
+        paths.push(PathBuf::from(fp));
+    }
+    if let Some(fp) = event
+        .get("tool_input")
+        .and_then(|ti| ti.get("notebook_path"))
         .and_then(|v| v.as_str())
     {
         paths.push(PathBuf::from(fp));

@@ -81,22 +81,46 @@ pub struct ServedRule {
 /// Empty when nothing survived: a header with no rules under it costs the reader a
 /// line and tells them nothing.
 pub fn render_block(header: &str, shown: &[(usize, &ServedRule)], total: usize, domain: &str) -> String {
-    if shown.is_empty() {
+    render_block_as(header, domain, shown, total, domain)
+}
+
+/// [`render_block`] with its own text after the header, `[FILE MATCH: vintrix (parent of vintryx-dealer-registry)]`
+/// (D13), while the pointer line still names the domain.
+pub fn render_block_as(header: &str, label: &str, shown: &[(usize, &ServedRule)], total: usize, domain: &str) -> String {
+    let Some(lines) = block_lines(header, label, shown, total, domain) else {
         return String::new();
+    };
+    let mut out = format!("{}\n", lines.header);
+    for line in &lines.rules {
+        out.push_str(&format!("{line}\n"));
     }
-    let mut out = format!("[{header}: {domain}]\n");
-    for (i, rule) in shown {
-        out.push_str(&format!("  {i}. {}\n", rule.rendered));
-    }
-    let withheld = total.saturating_sub(shown.len());
-    if withheld > 0 {
-        // F16's shape. One line in place of the rules this session has already been
-        // told, which is the whole point of dedup per rule rather than per block.
-        out.push_str(&format!(
-            "  ({withheld} more {domain} rule(s) already served this session · all: base rule list --domain {domain})\n"
-        ));
+    if let Some(tail) = &lines.tail {
+        out.push_str(&format!("{tail}\n"));
     }
     out
+}
+
+/// [`render_block_as`]'s lines apart, for a ranked block (BO-18) whose rules the prompt budget may withhold one at a
+/// time: the header, one line per rule in `shown`'s order, and the "already served" line when there is one.
+pub struct BlockLines {
+    pub header: String,
+    pub rules: Vec<String>,
+    pub tail: Option<String>,
+}
+
+/// The lines of [`render_block_as`], or `None` when nothing is shown.
+pub fn block_lines(header: &str, label: &str, shown: &[(usize, &ServedRule)], total: usize, domain: &str) -> Option<BlockLines> {
+    if shown.is_empty() {
+        return None;
+    }
+    let rules = shown.iter().map(|(i, rule)| format!("  {i}. {}", rule.rendered)).collect();
+    let withheld = total.saturating_sub(shown.len());
+    // F16's shape. One line in place of the rules this session has already been
+    // told, which is the whole point of dedup per rule rather than per block.
+    let tail = (withheld > 0).then(|| {
+        format!("  ({withheld} more {domain} rule(s) already served this session · all: base rule list --domain {domain})")
+    });
+    Some(BlockLines { header: format!("[{header}: {label}]"), rules, tail })
 }
 
 /// Collapse whitespace so that a reflow of a rule in `domains.toml` is the same rule.
@@ -131,7 +155,7 @@ pub fn content_hash(rendered: &str) -> u64 {
     u64::from_be_bytes(b)
 }
 
-fn build(domain: &str, text: String, rationale: Option<String>, iri: Option<String>) -> ServedRule {
+pub(crate) fn build(domain: &str, text: String, rationale: Option<String>, iri: Option<String>) -> ServedRule {
     let rendered = domain::render_rule(&text, rationale.as_deref());
     ServedRule {
         id: rule_id(domain, &text),
@@ -482,6 +506,166 @@ pub fn matchers_from_flags(
     Ok(normalize_matchers(&out))
 }
 
+// ─── Test prompts (K2, BO-14) ────────────────────────────────────────────────
+
+/// The predicates a CLI rule's test prompts are stored under, as local names under the namespace prefix: flat literals
+/// on the rule, beside its matchers. A `domains.toml` rule keeps its tests in the file (`fires_on`, `quiet_on`) and sync
+/// does not copy them, since a synced copy can go stale.
+pub const TEST_PREDICATES: [&str; 2] = ["firesOn", "quietOn"];
+
+/// At most this many prompts that must serve a rule (K2a: "2 to 3").
+pub const MAX_FIRES_ON: usize = 3;
+/// At most this many prompts that must not serve a rule (K2a: "1 to 2").
+pub const MAX_QUIET_ON: usize = 2;
+
+/// A rule's test prompts (K2a): prompts that must serve it, and prompts that must not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleTests {
+    pub fires_on: Vec<String>,
+    pub quiet_on: Vec<String>,
+}
+
+impl RuleTests {
+    pub fn is_empty(&self) -> bool {
+        self.fires_on.is_empty() && self.quiet_on.is_empty()
+    }
+
+    /// Add one stored prompt under its predicate. Blank prompts and repeats are skipped.
+    pub fn add(&mut self, pred: &str, prompt: &str) {
+        let list = match pred {
+            "firesOn" => &mut self.fires_on,
+            "quietOn" => &mut self.quiet_on,
+            _ => return,
+        };
+        let prompt = prompt.trim();
+        if !prompt.is_empty() && !list.iter().any(|p| p == prompt) {
+            list.push(prompt.to_string());
+        }
+    }
+
+    /// Both lists sorted: the graph keeps no order, so every reader shows the same prompts in the same order.
+    pub fn sorted(mut self) -> Self {
+        self.fires_on.sort();
+        self.quiet_on.sort();
+        self
+    }
+
+    /// Add every prompt of `other`, skipping repeats.
+    pub fn merge(&mut self, other: &RuleTests) {
+        for p in &other.fires_on {
+            self.add("firesOn", p);
+        }
+        for p in &other.quiet_on {
+            self.add("quietOn", p);
+        }
+    }
+}
+
+/// A rule's test prompts as `(predicate, value)` pairs: the shape `base rule add` and `base rule update` write on a
+/// CLI rule. Blank prompts and repeats are left out.
+pub fn test_literals(fires_on: &[String], quiet_on: &[String]) -> Vec<(&'static str, String)> {
+    let mut t = RuleTests::default();
+    for p in fires_on {
+        t.add("firesOn", p);
+    }
+    for p in quiet_on {
+        t.add("quietOn", p);
+    }
+    t.fires_on
+        .into_iter()
+        .map(|p| ("firesOn", p))
+        .chain(t.quiet_on.into_iter().map(|p| ("quietOn", p)))
+        .collect()
+}
+
+/// A rule that carries test prompts: its domain and text, so `base rule test` can name it even when its domain is no
+/// longer in `domains.toml` (it then misses on every `fires_on`, which is the point).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredTests {
+    pub domain: String,
+    pub text: String,
+    pub tests: RuleTests,
+}
+
+/// Every rule's test prompts, by [`rule_id`], across both tiers' graphs and the `domains.toml` files `domains` came
+/// from.
+///
+/// Each kind of rule is read from where its tests live, and only there: a CLI rule's from its graph record (a rule with
+/// no `source`), a `domains.toml` rule's from the file. A synced copy is never read, so a copy left stale (the
+/// workspace graph holds copies of global-tier rules and is re-synced only when the workspace file changes) cannot
+/// bring back prompts the operator cleared. A rule declared in two places is one rule (the id is the text) and
+/// carries the tests of both. Superseded rules are left out: no prompt serves them.
+pub fn rule_tests(store: Option<&Store>, config: &BaseConfig, domains: &[DomainDef]) -> HashMap<String, StoredTests> {
+    let mut out: HashMap<String, StoredTests> = HashMap::new();
+    let mut put = |domain: &str, text: &str, pred: &str, value: &str| {
+        let e = out.entry(rule_id(domain, text)).or_insert_with(|| StoredTests {
+            domain: domain.to_string(),
+            text: text.to_string(),
+            tests: RuleTests::default(),
+        });
+        e.tests.add(pred, value);
+    };
+    if let Some(store) = store {
+        let ns = &config.namespace;
+        let p = &ns.prefix;
+        let pfx = crud::prefixes(ns);
+        // Inside the GRAPH group, beside the pattern it constrains, for the reason `from_graph` gives.
+        let no_superseded = crate::supersede::sparql_exclude_superseded(ns, "rule");
+        let sparql = format!(
+            "{pfx}\n\
+             SELECT ?domain ?text ?tp ?tv WHERE {{\n\
+               GRAPH ?g {{\n\
+                 ?domain {p}:hasRule ?rule .\n\
+                 ?rule {p}:ruleText ?text .\n\
+                 ?rule ?tp ?tv .\n\
+                 FILTER(?tp IN ({p}:firesOn, {p}:quietOn))\n\
+                 FILTER NOT EXISTS {{ ?rule {p}:source ?source }}\n\
+                 {no_superseded}\
+               }}\n\
+             }}"
+        );
+        let names: HashMap<String, &str> = domains
+            .iter()
+            .map(|d| (crud::build_iri(ns, "domain", &crud::slugify(&d.name)), d.name.as_str()))
+            .collect();
+        if let Ok(oxigraph::sparql::QueryResults::Solutions(rows)) = crate::store::query(store, &sparql) {
+            for row in rows.filter_map(|r| r.ok()) {
+                let term = |k: &str| {
+                    row.get(k).map(|t| match t.into() {
+                        TermRef::NamedNode(n) => n.as_str().to_string(),
+                        TermRef::Literal(l) => l.value().to_string(),
+                        _ => String::new(),
+                    })
+                };
+                let (Some(domain), Some(text), Some(tp), Some(tv)) = (term("domain"), term("text"), term("tp"), term("tv"))
+                else {
+                    continue;
+                };
+                let name = names
+                    .get(&domain)
+                    .map_or_else(|| domain.rsplit('/').next().unwrap_or_default().to_string(), |n| (*n).to_string());
+                let pred = tp.rsplit(['#', '/']).next().unwrap_or_default();
+                put(&name, &text, pred, &tv);
+            }
+        }
+    }
+    for d in domains {
+        for r in &d.rules {
+            let (fires_on, quiet_on) = r.tests();
+            for (pred, v) in test_literals(fires_on, quiet_on) {
+                put(&d.name, r.text(), pred, &v);
+            }
+        }
+    }
+    out.into_iter()
+        .map(|(id, mut s)| {
+            s.tests = std::mem::take(&mut s.tests).sorted();
+            (id, s)
+        })
+        .filter(|(_, s)| !s.tests.is_empty())
+        .collect()
+}
+
 /// One line naming a rule's matchers, for `base rule list` (F11: it "shows each rule's kinds and matchers").
 pub fn describe_matchers(matchers: &[Matcher]) -> String {
     matchers
@@ -756,11 +940,16 @@ fn names_file(place: &str) -> bool {
 
 /// Does a touched `path` lie in `place` (F4)?
 ///
-/// Folders are the default. A file is a matcher only when the rule names that file, and then the path's trailing
-/// segments must be the place's segments. A relative folder names that folder wherever it sits, so `ping-chat-hub`
-/// and `Documents/renda-group` match on whole path segments, never on a substring. A `~` or absolute folder is
-/// resolved and compared with `path_under`, the seam the domain matcher uses.
+/// A `~` or absolute place, file or folder, is resolved and compared with `path_under`, the seam the domain matcher
+/// uses: the path is that file, or lies in that folder. `base rule add --path` writes only these (P7). A relative
+/// place keeps its F4 meaning: a file is a matcher only when the rule names that file, and then the path's trailing
+/// segments must be the place's segments; a relative folder names that folder wherever it sits, so `ping-chat-hub`
+/// and `Documents/studio` match on whole path segments, never on a substring.
 pub fn place_hit(path: &str, place: &str, home: Option<&str>) -> bool {
+    let t = place.trim();
+    if domain::matcher::is_absolute(t) || t == "~" || t.starts_with("~/") || t.starts_with("~\\") {
+        return domain::matcher::resolve_trigger(t, None, home).is_some_and(|r| domain::matcher::path_under(path, &r));
+    }
     let (pc, ac) = (path_components(place), path_components(path));
     if pc.is_empty() || ac.is_empty() || pc.len() > ac.len() {
         return false;
@@ -768,10 +957,6 @@ pub fn place_hit(path: &str, place: &str, home: Option<&str>) -> bool {
     let same = |a: &[&str], b: &[&str]| a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y));
     if names_file(place) {
         return same(&ac[ac.len() - pc.len()..], pc.as_slice());
-    }
-    let t = place.trim();
-    if domain::matcher::is_absolute(t) || t == "~" || t.starts_with("~/") || t.starts_with("~\\") {
-        return domain::matcher::resolve_trigger(t, None, home).is_some_and(|r| domain::matcher::path_under(path, &r));
     }
     ac.windows(pc.len()).any(|w| same(w, pc.as_slice()))
 }
@@ -789,7 +974,7 @@ pub const TOPIC_TEXT_WORD: f32 = 0.25;
 pub const TOPIC_TEXT_CAP: f32 = 0.5;
 
 /// Words too common to carry a topic. Kept short: a long list starts deciding what a rule is about.
-const STOPWORDS: &[&str] = &[
+pub(crate) const STOPWORDS: &[&str] = &[
     "and", "are", "but", "can", "does", "for", "from", "get", "has", "have", "how", "its", "not", "that", "the",
     "then", "there", "they", "this", "use", "was", "what", "when", "where", "which", "why", "will", "with", "you",
     "your",
@@ -810,20 +995,39 @@ pub fn content_words(text: &str) -> HashSet<String> {
 /// Own words and domain keywords match as whole phrases with `contains_word`, so `ping chris` is one phrase, not two
 /// loose words. Text words match as a set, capped at [`TOPIC_TEXT_CAP`] in total.
 pub fn topic_score(prompt: &str, own_words: &[String], rule_text: &str, domain_keywords: &[String]) -> f32 {
+    topic_match(prompt, own_words, rule_text, domain_keywords).score
+}
+
+/// [`topic_score`] and the words that earned it, so the match log can keep what matched (K1c `matched`) without
+/// scoring again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopicMatch {
+    pub score: f32,
+    /// The own phrases, keyword phrases and rule-text words the prompt carried, sorted.
+    pub words: Vec<String>,
+}
+
+/// The one scorer behind [`topic_score`].
+pub fn topic_match(prompt: &str, own_words: &[String], rule_text: &str, domain_keywords: &[String]) -> TopicMatch {
     let lower = prompt.to_lowercase();
-    let phrases = |list: &[String]| {
+    let phrases = |list: &[String]| -> Vec<String> {
         list.iter()
             .map(|w| w.trim().to_lowercase())
             .filter(|w| !w.is_empty())
             .collect::<HashSet<_>>()
             .into_iter()
             .filter(|w| domain::matcher::contains_word(&lower, w))
-            .count() as f32
+            .collect()
     };
-    let text_hits = content_words(rule_text).intersection(&content_words(prompt)).count() as f32;
-    phrases(own_words) * TOPIC_OWN_PHRASE
-        + phrases(domain_keywords) * TOPIC_KEYWORD_PHRASE
-        + (text_hits * TOPIC_TEXT_WORD).min(TOPIC_TEXT_CAP)
+    let (own, keywords) = (phrases(own_words), phrases(domain_keywords));
+    let text: Vec<String> = content_words(rule_text).intersection(&content_words(prompt)).cloned().collect();
+    let score = own.len() as f32 * TOPIC_OWN_PHRASE
+        + keywords.len() as f32 * TOPIC_KEYWORD_PHRASE
+        + (text.len() as f32 * TOPIC_TEXT_WORD).min(TOPIC_TEXT_CAP);
+    let mut words: Vec<String> = own.into_iter().chain(keywords).chain(text).collect();
+    words.sort();
+    words.dedup();
+    TopicMatch { score, words }
 }
 
 // ─── Loading the rules that carry matchers ───────────────────────────────────
@@ -1003,6 +1207,57 @@ impl Why {
             Why::Always | Why::Topic(_) => None,
         }
     }
+
+    /// The match log's `by` (K1): `always`, `topic`, `place: <place>`, `action: <action>`.
+    pub fn label(&self) -> String {
+        match self {
+            Why::Always => "always".to_string(),
+            Why::Place(p) => format!("place: {p}"),
+            Why::Action(a) => format!("action: {a}"),
+            Why::Topic(_) => "topic".to_string(),
+        }
+    }
+
+    /// A topic rule's score; `None` for every other reason.
+    pub fn score(&self) -> Option<f32> {
+        match self {
+            Why::Topic(s) => Some(*s),
+            _ => None,
+        }
+    }
+}
+
+/// The match log's entries for what a selection served (K1).
+pub fn served_items(served: &[Served]) -> Vec<crate::emit::match_log::Item> {
+    served
+        .iter()
+        .map(|s| crate::emit::match_log::Item {
+            by: Some(s.why.label()),
+            score: s.why.score(),
+            ..crate::emit::match_log::Item::rule(&s.rule.id, &s.rule.domain)
+        })
+        .collect()
+}
+
+/// The match log's entries for what a selection cut and why (K1): `topic limit` under `topic_max`, `not matched`
+/// under `topic_min_score`.
+pub fn cut_items(selection: &Selection) -> Vec<crate::emit::match_log::Cut> {
+    selection
+        .cut
+        .iter()
+        .map(|c| {
+            let (reason, limit) = match c.reason {
+                CutReason::TopicLimit => ("topic limit", "topic_max"),
+                CutReason::NotMatched => ("not matched", "topic_min_score"),
+            };
+            let item = crate::emit::match_log::Item {
+                by: Some("topic".into()),
+                score: Some(c.score),
+                ..crate::emit::match_log::Item::rule(&c.id, &c.domain)
+            };
+            crate::emit::match_log::Cut::new(item, reason, limit)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1016,6 +1271,39 @@ pub struct Selection {
     pub served: Vec<Served>,
     /// Per domain, how many topic rules matched this prompt and were cut by `topic_max`: F6's pointer line.
     pub topic_withheld: Vec<(String, usize)>,
+    /// Every rule `select` scored and did not return, and why (K1, BO-13). The prompt budget, the third reason, is
+    /// decided later by the fit and is not here.
+    pub cut: Vec<CutRule>,
+    /// Every topic score above zero `select` computed, in rule order: served, cut, or not due because this session
+    /// was already shown the rule (K1's "the scores `select` used").
+    pub scores: Vec<Scored>,
+}
+
+/// Why `select` scored a rule and did not return it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutReason {
+    /// It matched and was due, and `[rules] topic_max` cut it.
+    TopicLimit,
+    /// It scored above zero and under `[rules] topic_min_score`.
+    NotMatched,
+}
+
+/// A rule [`select`] scored and did not return.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CutRule {
+    pub id: String,
+    pub domain: String,
+    pub reason: CutReason,
+    pub score: f32,
+}
+
+/// One topic score [`select`] computed, and the words that earned it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Scored {
+    pub id: String,
+    pub domain: String,
+    pub score: f32,
+    pub words: Vec<String>,
 }
 
 /// What [`select`] needs beyond the rules and the event.
@@ -1026,6 +1314,10 @@ pub struct SelectContext<'a> {
     /// Domain name to its `prompt_keywords`, for topic scoring.
     pub keywords: &'a HashMap<String, Vec<String>>,
     pub rules: &'a crate::config::RulesConfig,
+    /// The prompt's BM25 scores and `[match] min_score` (BO-18, K7d): topic hits are ranked by the score before
+    /// `topic_max` cuts, and, when `min_score` is set, a topic rule is also hit when its score reaches it. `None` (no
+    /// index, `[match] bm25 = false`, a tool call) selects exactly as before.
+    pub bm25: Option<(&'a crate::domain::score_index::Scores, Option<f32>)>,
 }
 
 /// The converted rules this event serves, deduped per rule and capped, recorded as shown (G0 section 3).
@@ -1035,6 +1327,22 @@ pub struct SelectContext<'a> {
 /// `topic_max` by score and count what the cap cut, per domain. Only then record what is returned, so a rule the
 /// cap cut is never marked as shown and arrives on a later prompt.
 pub fn select(converted: &[Converted], event: &Event<'_>, session: &mut SessionState, cx: &SelectContext<'_>) -> Selection {
+    let selection = select_unrecorded(converted, event, session, cx);
+    for served in &selection.served {
+        session.mark_rule_shown(&served.rule.id, served.rule.content_hash, cx.bracket, served.why.scope(), cx.now);
+    }
+    selection
+}
+
+/// [`select`] without recording anything. The prompt hook records a rule only once the block carrying it is printed
+/// (D15, BO-01): it fits its output to the budget after selecting, and a rule the budget dropped must still be due on
+/// the next prompt.
+pub fn select_unrecorded(
+    converted: &[Converted],
+    event: &Event<'_>,
+    session: &SessionState,
+    cx: &SelectContext<'_>,
+) -> Selection {
     let parts = match event {
         Event::PreTool { command: Some(c), .. } => command_parts(c),
         _ => Vec::new(),
@@ -1042,11 +1350,25 @@ pub fn select(converted: &[Converted], event: &Event<'_>, session: &mut SessionS
     let mut seen: HashSet<&str> = HashSet::new();
     let mut topics: Vec<(usize, Why)> = Vec::new();
     let mut others: Vec<(usize, Why)> = Vec::new();
+    let mut cut: Vec<CutRule> = Vec::new();
+    let mut scores: Vec<Scored> = Vec::new();
     for (i, c) in converted.iter().enumerate() {
         if !seen.insert(c.rule.id.as_str()) {
             continue;
         }
-        let Some(why) = first_hit(c, event, &parts, cx) else {
+        let (hit, topic) = first_hit(c, event, &parts, cx);
+        if let Some(t) = topic.filter(|t| t.score > 0.0) {
+            if hit.is_none() {
+                cut.push(CutRule {
+                    id: c.rule.id.clone(),
+                    domain: c.rule.domain.clone(),
+                    reason: CutReason::NotMatched,
+                    score: t.score,
+                });
+            }
+            scores.push(Scored { id: c.rule.id.clone(), domain: c.rule.domain.clone(), score: t.score, words: t.words });
+        }
+        let Some(why) = hit else {
             continue;
         };
         let reshow = match why {
@@ -1060,44 +1382,57 @@ pub fn select(converted: &[Converted], event: &Event<'_>, session: &mut SessionS
     }
 
     let score = |w: &Why| if let Why::Topic(s) = w { *s } else { 0.0 };
-    topics.sort_by(|a, b| score(&b.1).total_cmp(&score(&a.1)));
+    // BM25 first when the prompt was scored (BO-18), the topic score breaking ties; else the topic score, as before.
+    let bm25 = |i: usize| cx.bm25.map_or(0.0, |(s, _)| s.get(&converted[i].rule.id));
+    topics.sort_by(|a, b| bm25(b.0).total_cmp(&bm25(a.0)).then(score(&b.1).total_cmp(&score(&a.1))));
     let mut topic_withheld: Vec<(String, usize)> = Vec::new();
-    for (i, _) in topics.iter().skip(cx.rules.topic_max) {
-        let domain = &converted[*i].rule.domain;
-        match topic_withheld.iter_mut().find(|(d, _)| d == domain) {
+    for (i, why) in topics.iter().skip(cx.rules.topic_max) {
+        let rule = &converted[*i].rule;
+        match topic_withheld.iter_mut().find(|(d, _)| *d == rule.domain) {
             Some((_, n)) => *n += 1,
-            None => topic_withheld.push((domain.clone(), 1)),
+            None => topic_withheld.push((rule.domain.clone(), 1)),
         }
+        cut.push(CutRule { id: rule.id.clone(), domain: rule.domain.clone(), reason: CutReason::TopicLimit, score: score(why) });
     }
     topics.truncate(cx.rules.topic_max);
 
-    let mut served = Vec::new();
-    for (i, why) in others.into_iter().chain(topics) {
-        let rule = &converted[i].rule;
-        session.mark_rule_shown(&rule.id, rule.content_hash, cx.bracket, why.scope(), cx.now);
-        served.push(Served { rule: rule.clone(), why });
-    }
-    Selection { served, topic_withheld }
+    let served = others
+        .into_iter()
+        .chain(topics)
+        .map(|(i, why)| Served { rule: converted[i].rule.clone(), why })
+        .collect();
+    Selection { served, topic_withheld, cut, scores }
 }
 
-fn first_hit(c: &Converted, event: &Event<'_>, parts: &[Vec<String>], cx: &SelectContext<'_>) -> Option<Why> {
+/// The first reason `c` fires on this event, and, for a topic rule on a prompt, the score it was judged on (fired or
+/// not), so `select` can say what it scored without scoring twice.
+fn first_hit(
+    c: &Converted,
+    event: &Event<'_>,
+    parts: &[Vec<String>],
+    cx: &SelectContext<'_>,
+) -> (Option<Why>, Option<TopicMatch>) {
     let has = |k: Kind| c.matchers.iter().any(|m| m.kind == k);
     match event {
-        Event::SessionStart => has(Kind::Always).then_some(Why::Always),
+        Event::SessionStart => (has(Kind::Always).then_some(Why::Always), None),
         Event::Prompt { text } => {
             if has(Kind::Always) {
-                return Some(Why::Always);
+                return (Some(Why::Always), None);
             }
             if !has(Kind::Topic) {
-                return None;
+                return (None, None);
             }
             let own: Vec<String> =
                 c.matchers.iter().filter(|m| m.kind == Kind::Topic).flat_map(|m| m.words.iter().cloned()).collect();
             let keywords = cx.keywords.get(&c.rule.domain).map(Vec::as_slice).unwrap_or_default();
-            let s = topic_score(text, &own, &c.rule.text, keywords);
-            (s > 0.0 && s >= cx.rules.topic_min_score).then_some(Why::Topic(s))
+            let t = topic_match(text, &own, &c.rule.text, keywords);
+            let s = t.score;
+            // Its own words or its domain's keywords hit it as before; a BM25 score at `[match] min_score`, when one is
+            // set, also does (K7d), a second way in beside `topic_min_score`, which keeps its meaning.
+            let by_score = cx.bm25.is_some_and(|(scores, min)| crate::config::reaches(min, scores.get(&c.rule.id)));
+            (((s > 0.0 && s >= cx.rules.topic_min_score) || by_score).then_some(Why::Topic(s)), Some(t))
         }
-        Event::PreTool { tool, paths, .. } => c.matchers.iter().find_map(|m| match m.kind {
+        Event::PreTool { tool, paths, .. } => (c.matchers.iter().find_map(|m| match m.kind {
             Kind::Place => m
                 .place
                 .as_ref()
@@ -1110,7 +1445,7 @@ fn first_hit(c: &Converted, event: &Event<'_>, parts: &[Vec<String>], cx: &Selec
                 .or_else(|| m.command.as_ref().filter(|cmd| parts.iter().any(|part| command_hit(cmd, part))))
                 .map(|a| Why::Action(a.clone())),
             Kind::Always | Kind::Topic => None,
-        }),
+        }), None),
     }
 }
 
@@ -1119,7 +1454,30 @@ fn first_hit(c: &Converted, event: &Event<'_>, parts: &[Vec<String>], cx: &Selec
 ///
 /// Empty when nothing was served, which is also when nothing was withheld: the cap only withholds past `topic_max`.
 pub fn render_selection(selection: &Selection) -> String {
-    let mut groups: Vec<(String, Vec<&ServedRule>)> = Vec::new();
+    let mut out: String = selection_groups(selection).iter().map(|g| g.text.as_str()).collect();
+    for (domain, withheld) in &selection.topic_withheld {
+        out.push_str(&topic_withheld_line(domain, *withheld));
+    }
+    out
+}
+
+/// One header of [`render_selection`] and the rules under it.
+#[derive(Debug, Clone)]
+pub struct SelectionGroup {
+    /// Why every rule in the group was served; for a topic group, the first rule's score.
+    pub why: Why,
+    /// The domain of a topic group, whose header names it. `None` for every other kind.
+    pub topic_domain: Option<String>,
+    /// The header and its rules, exactly as [`render_selection`] prints them.
+    pub text: String,
+    pub served: Vec<Served>,
+}
+
+/// [`render_selection`]'s groups, apart: the prompt hook ranks a topic group and an `always` group differently (F2),
+/// and records each group's rules only if that group is printed (D15). F6's pointer lines are not in them; see
+/// [`topic_withheld_line`].
+pub fn selection_groups(selection: &Selection) -> Vec<SelectionGroup> {
+    let mut groups: Vec<(String, SelectionGroup)> = Vec::new();
     for served in &selection.served {
         let header = match &served.why {
             Why::Always => "[base rules · always]".to_string(),
@@ -1128,22 +1486,33 @@ pub fn render_selection(selection: &Selection) -> String {
             Why::Topic(_) => format!("[base rules · topic: {}]", served.rule.domain),
         };
         match groups.iter_mut().find(|(h, _)| *h == header) {
-            Some((_, rules)) => rules.push(&served.rule),
-            None => groups.push((header, vec![&served.rule])),
+            Some((_, g)) => g.served.push(served.clone()),
+            None => groups.push((
+                header,
+                SelectionGroup {
+                    why: served.why.clone(),
+                    topic_domain: matches!(served.why, Why::Topic(_)).then(|| served.rule.domain.clone()),
+                    text: String::new(),
+                    served: vec![served.clone()],
+                },
+            )),
         }
     }
-    let mut out = String::new();
-    for (header, rules) in groups {
-        out.push_str(&header);
-        out.push('\n');
-        for rule in rules {
-            out.push_str(&format!("  - {}\n", rule.rendered));
-        }
-    }
-    for (domain, withheld) in &selection.topic_withheld {
-        out.push_str(&format!("  ({withheld} more {domain} rules · all: base rule list --domain {domain})\n"));
-    }
-    out
+    groups
+        .into_iter()
+        .map(|(header, mut g)| {
+            g.text = format!("{header}\n");
+            for s in &g.served {
+                g.text.push_str(&format!("  - {}\n", s.rule.rendered));
+            }
+            g
+        })
+        .collect()
+}
+
+/// F6's pointer line for the topic rules of `domain` that `topic_max` cut.
+pub fn topic_withheld_line(domain: &str, withheld: usize) -> String {
+    format!("  ({withheld} more {domain} rules · all: base rule list --domain {domain})\n")
 }
 
 #[cfg(test)]

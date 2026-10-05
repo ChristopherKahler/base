@@ -365,9 +365,9 @@ pub fn migrate_tier(
     // first migration still snapshots, below.
     let is_delta = stamped;
 
-    // C1: snapshot first, sharing the `BACKUP_KEEP = 10` pool with compact — but
+    // C1: snapshot first, sharing the `[graph] keep_backups` pool with compact — but
     // only when there is data to protect. A pass that writes nothing but the stamp
-    // must not evict a compact backup from a pool of ten, which is what the
+    // must not evict a compact backup from that pool, which is what the
     // comment, `docs/graph-durability.md` and the outcome's own `backup: None`
     // have always claimed and what the code did not do (kite, PR #50).
     if !plan.is_empty() {
@@ -452,6 +452,17 @@ pub fn migrate_tiers(cwd: &Path, ns: &NamespaceConfig, trigger: Trigger) -> Vec<
         })
         .filter(|o| o.total_linked() > 0 || o.skipped_unhealthy)
         .collect()
+}
+
+/// The upgrade path's store repair (BO-12, F15e). A store upgraded from 0.15 carries what `base doctor` reports on one
+/// that never left 0.16: corrections with no link to the one record their text names (every other correction stays a
+/// correction, D18), another workspace's records, a supersession disagreement,
+/// legacy `[signal] max_chars`, graphs never compacted and ten backups a tier. The repair is [`crate::fix::run`], the
+/// function `base doctor --fix` calls, and nothing else, so the two cannot drift: `base graph migrate` plans it and
+/// `base graph migrate --yes` applies it. An upgrade applies it unasked, once per version and tier, in the background
+/// process the first session start on the new version starts ([`crate::upgrade`], BO-26), through [`crate::fix::run_tier`].
+pub fn upgrade(cwd: &Path, apply: bool) -> crate::fix::Report {
+    crate::fix::run(cwd, apply)
 }
 
 /// Workspace root (the dir holding `.base/`) then `~/.base-gbl`, de-duplicated.

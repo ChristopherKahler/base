@@ -1,32 +1,78 @@
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::Result;
 use oxigraph::sparql::{QueryResults, QuerySolution};
 
-use crate::config::{BaseConfig, WorkspaceEntry};
+use crate::config::{BaseConfig, DeferKind, WorkspaceEntry};
 use crate::crud;
 use crate::scope::{self, Home};
+use crate::signal::counts::Work;
 
-/// One working-set entity row from the graph.
+/// One working-set entity from the graph: a project, task or milestone in a working state.
 struct Wrow {
+    /// The entity's IRI as `crud::term_display` gives it, `project/alpha`. Owner links use the same form.
+    id: String,
     ty: String,
     name: String,
     status: String,
     next: String,
     blocked_by: String,
     path: String,
+    last_active: String,
+    /// Every entity linking this one with `hasTask` or `hasMilestone`.
+    owners: Vec<String>,
 }
 
-/// Active-awareness signal: the working set — every project/task NOT deferred or terminal.
-/// Protocol's reconcile is the single source of "deferred"; this renders what's left in a
-/// working state, **scoped to the current workspace**: projects homed elsewhere collapse
-/// into a one-line `elsewhere:` pointer, while the operator's own un-homed (path-less)
-/// projects stay visible. Priority 1 (highest — never dropped by budget cap).
+/// Active-awareness signal: the working set — every project, task and milestone NOT deferred or
+/// terminal. Protocol's reconcile is the single source of "deferred"; this renders what's left in a
+/// working state, **scoped to the current workspace**: projects homed elsewhere collapse into a
+/// one-line `elsewhere:` count, while the operator's own un-homed (path-less) projects stay visible.
+/// Priority 1.
 pub fn run(cwd: &Path, config: &BaseConfig) -> Result<String> {
+    Ok(run_sections(cwd, config)?
+        .sections
+        .into_iter()
+        .map(|s| s.text)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// One section of the working set: its block kind at session start, its text, how many rows it
+/// lists, and how many exist.
+pub struct Section {
+    pub kind: &'static str,
+    pub text: String,
+    pub shown: usize,
+    pub total: usize,
+    /// Records of this block's kind marked deferred: counted on its notice line, never listed (C8).
+    pub deferred: usize,
+}
+
+/// The working set's sections and the counts their first lines print (BO-06, F10). Session start's header and pulse
+/// read the same counts, so a block skipped as unchanged still has its numbers.
+#[derive(Default)]
+pub struct WorkingSet {
+    pub sections: Vec<Section>,
+    pub projects: Work,
+    pub tasks: Work,
+    pub milestones: Work,
+}
+
+/// A status that closes a record: counted as completed, never as working. The pulse always read `done` this way; until
+/// BO-06 the working set read it as working.
+const COMPLETED: [&str; 3] = ["complete", "completed", "done"];
+
+/// The working set as its sections, in order: projects, tasks, milestones, blocked (spec B6, board
+/// ruling R4). Each starts with its count and the command that lists all of it. PROJECTS lists the
+/// projects touched within `[session_start] recent_project_days`; TASKS and MILESTONES list the
+/// working ones a `hasTask` or `hasMilestone` link ties to one of those projects, which is what
+/// "in progress on recently touched projects" means here: no task status says "in progress".
+pub fn run_sections(cwd: &Path, config: &BaseConfig) -> Result<WorkingSet> {
     let ns = &config.namespace;
     let p = &ns.prefix;
     let sparql = format!(
-        "SELECT ?type ?name ?status ?nextAction ?blockedBy ?path WHERE {{\n\
+        "SELECT ?entity ?type ?name ?status ?nextAction ?blockedBy ?path ?lastActive ?taskOf ?milestoneOf WHERE {{\n\
            GRAPH ?g {{\n\
              ?entity a ?type ;\n\
                {p}:name ?name ;\n\
@@ -35,32 +81,76 @@ pub fn run(cwd: &Path, config: &BaseConfig) -> Result<String> {
              OPTIONAL {{ ?entity {p}:nextAction ?nextAction }}\n\
              OPTIONAL {{ ?entity {p}:blockedBy ?blockedBy }}\n\
              OPTIONAL {{ ?entity {p}:path ?path }}\n\
-             FILTER(?type IN ({p}:Project, {p}:App, {p}:Framework, {p}:TrackingProject, {p}:Task))\n\
-             FILTER(?status NOT IN (\"deferred\", \"complete\", \"completed\", \"archived\"))\n\
+             FILTER(?type IN ({p}:Project, {p}:App, {p}:Framework, {p}:TrackingProject, {p}:Task, {p}:Milestone))\n\
+             FILTER(?status != \"archived\")\n\
+             FILTER(?type IN ({p}:Project, {p}:App, {p}:Framework, {p}:TrackingProject) || ?status NOT IN (\"complete\", \"completed\", \"done\"))\n\
            }}\n\
+           OPTIONAL {{ GRAPH ?tg {{ ?taskOf {p}:hasTask ?entity }} }}\n\
+           OPTIONAL {{ GRAPH ?mg {{ ?milestoneOf {p}:hasMilestone ?entity }} }}\n\
          }}\n\
          ORDER BY DESC(?lastActive)"
     );
 
-    let results = crud::load_and_query(cwd, ns, &sparql)?;
+    // BOTH tiers. A task or milestone recorded globally lives in a file the
+    // workspace-only read never opens, so it rendered as though it did not exist --
+    // a shorter list, with nothing saying a tier went unread.
+    let Some((results, tiers)) = crud::load_merged_and_query(cwd, ns, &sparql)? else {
+        // ABSENT. No graph in either tier. This must NOT fall through to the
+        // ordinary empty rendering: "no graph was read" and "you have no work"
+        // are opposite claims, and before this they produced the same screen.
+        return Ok(WorkingSet {
+            sections: vec![Section {
+                kind: "working-set-scope",
+                text: ABSENT_LINE.to_string(),
+                shown: 0,
+                total: 0,
+                // ZERO BECAUSE THERE IS NOTHING TO COUNT, not because the count was
+                // skipped. `deferred` counts records of a listing block's own kind;
+                // this section lists nothing, it states the scope of what was read.
+                // On this arm no graph was read at all, so any other value would be
+                // a claim about records that were never seen.
+                deferred: 0,
+            }],
+            ..WorkingSet::default()
+        });
+    };
     let QueryResults::Solutions(solutions) = results else {
-        return Ok(String::new());
+        return Ok(WorkingSet::default());
     };
 
     let cell = |row: &QuerySolution, k: &str| {
         row.get(k).map(|t| crud::term_display(t.into())).unwrap_or_default()
     };
-    let rows: Vec<Wrow> = solutions
-        .filter_map(|r| r.ok())
-        .map(|row| Wrow {
-            ty: cell(&row, "type"),
-            name: cell(&row, "name"),
-            status: cell(&row, "status"),
-            next: cell(&row, "nextAction"),
-            blocked_by: cell(&row, "blockedBy"),
-            path: cell(&row, "path"),
-        })
-        .collect();
+    // One row per link comes back, so an entity with two owners is two rows: gather them.
+    let mut rows: Vec<Wrow> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for row in solutions.filter_map(|r| r.ok()) {
+        let id = cell(&row, "entity");
+        let i = match at.get(&id) {
+            Some(&i) => i,
+            None => {
+                at.insert(id.clone(), rows.len());
+                rows.push(Wrow {
+                    id,
+                    ty: cell(&row, "type"),
+                    name: cell(&row, "name"),
+                    status: cell(&row, "status"),
+                    next: cell(&row, "nextAction"),
+                    blocked_by: cell(&row, "blockedBy"),
+                    path: cell(&row, "path"),
+                    last_active: cell(&row, "lastActive"),
+                    owners: Vec::new(),
+                });
+                rows.len() - 1
+            }
+        };
+        for link in ["taskOf", "milestoneOf"] {
+            let owner = cell(&row, link);
+            if !owner.is_empty() && !rows[i].owners.contains(&owner) {
+                rows[i].owners.push(owner);
+            }
+        }
+    }
 
     let registry = scope::canonical_registry(&config.workspace);
     let canon_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
@@ -70,19 +160,74 @@ pub fn run(cwd: &Path, config: &BaseConfig) -> Result<String> {
     } else {
         scope::current_workspace(&canon_cwd, &registry)
     };
+    let days = config.session_start.recent_project_days;
+    let since = chrono::Utc::now() - chrono::Duration::days(days);
 
-    Ok(render_working_set(&rows, current.as_deref(), &registry))
+    let mut set = render_sections(&rows, current.as_deref(), &registry, days, since);
+    // The scope clause, on EVERY render and not only on not-found. Without it an
+    // empty working set says "nothing exists" when it can only honestly say
+    // "nothing in scope" -- and that is the sentence that makes EMPTY safe to
+    // show at all. It is a line of its own because session_start_layout_test
+    // matches the section headers with an exact `l == whole` comparison, so
+    // widening a header would break the layout contract to fix the honesty one.
+    set.sections.push(Section {
+        kind: "working-set-scope",
+        text: scope_line(current.as_deref(), &tiers),
+        shown: 0,
+        total: 0,
+        // Zero for the same reason as the ABSENT arm above: this section states
+        // what was read, it does not list records, so it has no deferred ones of
+        // its own. The listing sections each carry their own count.
+        deferred: 0,
+    });
+    Ok(set)
+}
+
+/// What the block says when NEITHER tier has a graph.
+///
+/// It does not recompute the paths `load_merged_reporting` looked for. Restating
+/// that resolution here would be a second copy of it, free to drift from the
+/// real one and to name a file the loader never opened.
+const ABSENT_LINE: &str = "WORKING SET: no graph was read \u{2014} no graph.nq in the global tier or in any workspace at or above this directory. This is NOT an empty working set.";
+
+/// One line naming what was in scope, and what was not.
+///
+/// The axes it covers AND the axes it does not, because naming only what it
+/// covers is what lets a half-blind envelope read as a handled case. It names
+/// the workspace and the tiers. It says other workspaces were not read. It
+/// claims the tier read was clean only when the loader said so.
+fn scope_line(current: Option<&str>, tiers: &crate::store::TierRead) -> String {
+    let where_ = match current {
+        Some(ws) => format!("workspace '{ws}' and the global tier"),
+        // No registered workspace under cwd, or `[signal] scope = "global"`.
+        None => "every tier that was readable, unscoped".to_string(),
+    };
+    if tiers.is_clean() {
+        format!("SCOPE: {where_}; other workspaces were not read")
+    } else {
+        format!(
+            "SCOPE: {where_}; other workspaces were not read \u{2014} AND THIS READ WAS INCOMPLETE: {}",
+            tiers.summary()
+        )
+    }
 }
 
 const PROJECT_TYPES: [&str; 4] = ["Project", "App", "Framework", "TrackingProject"];
 
-/// Pure: group + workspace-scope the rows into the rendered signal.
+/// Pure: group + workspace-scope the rows into the rendered sections.
 ///
-/// Briefing policy: show projects homed in the current workspace OR un-homed (path-less —
-/// the operator's own work, not foreign contamination); collapse projects homed in OTHER
-/// registered workspaces into a one-line `elsewhere:` pointer. When `current` is None (CWD
-/// under no registered workspace) nothing is scoped — the global view (today's behavior).
-fn render_working_set(rows: &[Wrow], current: Option<&str>, registry: &[WorkspaceEntry]) -> String {
+/// Briefing policy: count projects homed in the current workspace OR un-homed (path-less — the
+/// operator's own work, not foreign contamination); projects homed in OTHER registered workspaces
+/// become a one-line `elsewhere:` count. When `current` is None (CWD under no registered workspace)
+/// nothing is scoped — the global view. Tasks and milestones are not workspace-scoped: they carry no
+/// path of their own, so they reach a workspace only through a recent project they belong to.
+fn render_sections(
+    rows: &[Wrow],
+    current: Option<&str>,
+    registry: &[WorkspaceEntry],
+    days: i64,
+    since: chrono::DateTime<chrono::Utc>,
+) -> WorkingSet {
     let home_of = |path: &str| -> Home {
         let canon = if path.is_empty() { None } else { Some(scope::canonical_str(path)) };
         scope::home(canon.as_deref(), registry)
@@ -97,41 +242,54 @@ fn render_working_set(rows: &[Wrow], current: Option<&str>, registry: &[Workspac
         }
     };
     let is_project = |ty: &str| PROJECT_TYPES.contains(&ty);
+    let touched = |r: &Wrow| {
+        chrono::DateTime::parse_from_rfc3339(&r.last_active)
+            .is_ok_and(|dt| dt.with_timezone(&chrono::Utc) >= since)
+    };
+    // Deferred rows are read so each block can count them (C8). They are never listed and never counted
+    // as working: the notice line is the only place they appear. Completed rows are read so the pulse's
+    // completed count comes from the same rows as everything else (BO-06); nothing lists them.
+    let completed = |r: &Wrow| COMPLETED.contains(&r.status.as_str());
+    let working = |r: &Wrow| {
+        r.status != "blocked" && r.status != crud::deferred::DEFERRED && !completed(r)
+    };
+    let parked = |r: &Wrow| r.status == crud::deferred::DEFERRED;
 
-    let mut output = String::new();
+    let mut set = WorkingSet::default();
+    let mut sections: Vec<Section> = Vec::new();
 
-    // [Blocked] — scoped projects (tasks pass through; see [Active Tasks] note).
-    let blocked: Vec<&Wrow> = rows
-        .iter()
-        .filter(|r| r.status == "blocked" && (!is_project(&r.ty) || in_briefing(&r.path)))
-        .collect();
-    if !blocked.is_empty() {
-        output.push_str("[Blocked]\n");
-        for r in &blocked {
-            let reason = if r.blocked_by.is_empty() { "unknown" } else { &r.blocked_by };
-            output.push_str(&format!("- {}: {reason}\n", r.name));
-        }
-        output.push('\n');
-    }
-
-    // [Active Projects] — scoped to current workspace + un-homed.
-    let projects: Vec<&Wrow> = rows
-        .iter()
-        .filter(|r| r.status != "blocked" && is_project(&r.ty) && in_briefing(&r.path))
-        .collect();
-    if !projects.is_empty() {
-        output.push_str("[Active Projects]\n");
-        for r in &projects {
+    // PROJECTS — scoped to the current workspace + un-homed; the recent ones listed.
+    let scoped_project = |r: &Wrow| is_project(&r.ty) && in_briefing(&r.path);
+    let projects: Vec<&Wrow> = rows.iter().filter(|r| working(r) && scoped_project(r)).collect();
+    let recent: Vec<&Wrow> = projects.iter().copied().filter(|r| touched(r)).collect();
+    let recent_name: HashMap<&str, &str> =
+        recent.iter().map(|r| (r.id.as_str(), r.name.as_str())).collect();
+    // What the block's first line, the header and the pulse print. Counted here and nowhere else (BO-06, F10).
+    set.projects = Work {
+        active: projects.len(),
+        listed: recent.len(),
+        blocked: rows.iter().filter(|r| r.status == "blocked" && scoped_project(r)).count(),
+        completed: rows.iter().filter(|r| completed(r) && scoped_project(r)).count(),
+        deferred: rows.iter().filter(|r| parked(r) && scoped_project(r)).count(),
+    };
+    let parked_projects = set.projects.deferred;
+    if !projects.is_empty() || parked_projects > 0 {
+        let mut output = format!(
+            "PROJECTS ({} active, touched in {days} days: {}) · all: base project list --all\n",
+            set.projects.active,
+            set.projects.listed
+        );
+        for r in &recent {
             if r.next.is_empty() {
-                output.push_str(&format!("- {} ({})\n", r.name, r.status));
+                output.push_str(&format!("  {} ({})\n", r.name, r.status));
             } else {
-                output.push_str(&format!("- {} ({}) — next: {}\n", r.name, r.status, r.next));
+                output.push_str(&format!("  {} ({}) — next: {}\n", r.name, r.status, r.next));
             }
         }
-        // Cross-workspace pointer: projects homed in OTHER registered workspaces.
-        let mut elsewhere_ws: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        // Cross-workspace count: projects homed in OTHER registered workspaces.
+        let mut elsewhere_ws: BTreeSet<String> = BTreeSet::new();
         let mut elsewhere_n = 0usize;
-        for r in rows.iter().filter(|r| r.status != "blocked" && is_project(&r.ty)) {
+        for r in rows.iter().filter(|r| working(r) && is_project(&r.ty)) {
             if let Home::Workspace(w) = home_of(&r.path)
                 && current.map(|c| w.as_str() != c).unwrap_or(false) {
                     elsewhere_n += 1;
@@ -140,42 +298,127 @@ fn render_working_set(rows: &[Wrow], current: Option<&str>, registry: &[Workspac
         }
         if elsewhere_n > 0 {
             output.push_str(&format!(
-                "elsewhere: {elsewhere_n} active across {} workspace(s) — `base project list --all`\n",
+                "  elsewhere: {elsewhere_n} active across {} workspace(s)\n",
                 elsewhere_ws.len()
             ));
         }
-        output.push('\n');
-    }
-
-    // [Active Tasks] — NOT workspace-scoped yet (tasks carry no #path; needs a
-    // task→project home join — deferred follow-up).
-    let tasks: Vec<&Wrow> = rows
-        .iter()
-        .filter(|r| r.ty == "Task" && r.status != "blocked")
-        .collect();
-    if !tasks.is_empty() {
-        output.push_str("[Active Tasks]\n");
-        for r in &tasks {
-            output.push_str(&format!("- {} ({})\n", r.name, r.status));
+        if let Some(line) = crud::deferred::notice(DeferKind::Project, parked_projects) {
+            output.push_str(&format!("  {line}\n"));
         }
-        output.push('\n');
+        sections.push(Section {
+            kind: "projects",
+            text: output.trim_end().to_string(),
+            shown: set.projects.listed,
+            total: set.projects.active,
+            deferred: parked_projects,
+        });
     }
 
-    output.trim_end().to_string()
+    // TASKS and MILESTONES — every working one counted, the ones on a recent project listed.
+    for (kind, ty, title, command, defer_kind) in [
+        ("tasks", "Task", "TASKS", "base task list", DeferKind::Task),
+        ("milestones", "Milestone", "MILESTONES", "base milestone list", DeferKind::Milestone),
+    ] {
+        let all: Vec<&Wrow> = rows.iter().filter(|r| r.ty == ty && working(r)).collect();
+        let listed: Vec<(&Wrow, &str)> = all
+            .iter()
+            .filter_map(|r| {
+                r.owners
+                    .iter()
+                    .find_map(|o| recent_name.get(o.as_str()))
+                    .map(|project| (*r, *project))
+            })
+            .collect();
+        let work = Work {
+            active: all.len(),
+            listed: listed.len(),
+            blocked: rows.iter().filter(|r| r.ty == ty && r.status == "blocked").count(),
+            completed: rows.iter().filter(|r| r.ty == ty && completed(r)).count(),
+            deferred: rows.iter().filter(|r| r.ty == ty && parked(r)).count(),
+        };
+        if ty == "Task" {
+            set.tasks = work;
+        } else {
+            set.milestones = work;
+        }
+        if work.active == 0 && work.deferred == 0 {
+            continue;
+        }
+        let mut output = format!(
+            "{title} ({} active, on projects touched in {days} days: {}) · all: {command}\n",
+            work.active, work.listed
+        );
+        for (r, project) in &listed {
+            output.push_str(&format!("  {} · {project}\n", r.name));
+        }
+        if let Some(line) = crud::deferred::notice(defer_kind, work.deferred) {
+            output.push_str(&format!("  {line}\n"));
+        }
+        sections.push(Section {
+            kind,
+            text: output.trim_end().to_string(),
+            shown: work.listed,
+            total: work.active,
+            deferred: work.deferred,
+        });
+    }
+
+    // BLOCKED — scoped projects; tasks and milestones pass through.
+    let blocked: Vec<&Wrow> = rows
+        .iter()
+        .filter(|r| r.status == "blocked" && (!is_project(&r.ty) || in_briefing(&r.path)))
+        .collect();
+    if !blocked.is_empty() {
+        let mut output = format!("BLOCKED ({})\n", blocked.len());
+        for r in &blocked {
+            let reason = if r.blocked_by.is_empty() { "unknown" } else { &r.blocked_by };
+            output.push_str(&format!("  {}: {reason}\n", r.name));
+        }
+        sections.push(Section {
+            kind: "blocked",
+            text: output.trim_end().to_string(),
+            shown: blocked.len(),
+            total: blocked.len(),
+            deferred: 0,
+        });
+    }
+
+    set.sections = sections;
+    set
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn stamp(days_ago: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days_ago)).to_rfc3339()
+    }
+
+    fn week() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::days(7)
+    }
+
+    fn joined(rows: &[Wrow], current: Option<&str>, registry: &[WorkspaceEntry]) -> String {
+        render_sections(rows, current, registry, 7, week())
+            .sections
+            .into_iter()
+            .map(|s| s.text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn row(ty: &str, name: &str, path: &str) -> Wrow {
         Wrow {
+            id: format!("{}/{}", ty.to_lowercase(), name.to_lowercase()),
             ty: ty.into(),
             name: name.into(),
             status: "active".into(),
             next: String::new(),
             blocked_by: String::new(),
             path: path.into(),
+            last_active: stamp(0),
+            owners: Vec::new(),
         }
     }
     fn reg(paths: &[&str]) -> Vec<WorkspaceEntry> {
@@ -192,7 +435,7 @@ mod tests {
             row("Project", "ForeignA", "/ws/other/x"), // elsewhere → pointer
             row("Project", "ForeignB", "/ws/other/y"), // elsewhere → pointer
         ];
-        let out = render_working_set(&rows, Some("cur"), &registry);
+        let out = joined(&rows, Some("cur"), &registry);
         assert!(out.contains("HomeProj"), "current-homed shown");
         assert!(out.contains("Planning"), "un-homed shown");
         assert!(!out.contains("ForeignA"), "foreign hidden from the list");
@@ -207,8 +450,59 @@ mod tests {
     fn no_current_workspace_shows_everything() {
         let registry = reg(&["/ws/other"]);
         let rows = vec![row("Project", "ForeignA", "/ws/other/x")];
-        let out = render_working_set(&rows, None, &registry);
+        let out = joined(&rows, None, &registry);
         assert!(out.contains("ForeignA"), "global fallback shows all");
         assert!(!out.contains("elsewhere:"), "no pointer when unscoped");
+    }
+
+    /// Board R4 and spec B6. Every working item is counted; only the ones on a project touched
+    /// within the window are listed. Old, T2 and M2 are the controls: counted, never listed.
+    #[test]
+    fn sections_count_everything_and_list_what_is_on_recent_projects() {
+        let registry = reg(&[]);
+        let alpha = row("Project", "Alpha", "");
+        let mut old = row("Project", "Old", "");
+        old.last_active = stamp(30);
+        let mut stuck = row("Project", "Stuck", "");
+        stuck.status = "blocked".into();
+        stuck.blocked_by = "API keys".into();
+        let mut t1 = row("Task", "T1", "");
+        t1.owners = vec![alpha.id.clone()];
+        let mut t2 = row("Task", "T2", "");
+        t2.owners = vec![old.id.clone()];
+        let t3 = row("Task", "T3", "");
+        let mut m1 = row("Milestone", "M1", "");
+        m1.owners = vec![alpha.id.clone()];
+        let mut m2 = row("Milestone", "M2", "");
+        m2.owners = vec![old.id.clone()];
+        let mut shipped = row("Project", "Shipped", "");
+        shipped.status = "completed".into();
+        let mut closed = row("Task", "Closed", "");
+        closed.status = "done".into();
+        closed.owners = vec![alpha.id.clone()];
+        let rows = vec![alpha, old, stuck, t1, t2, t3, m1, m2, shipped, closed];
+
+        let set = render_sections(&rows, None, &registry, 7, week());
+        let counts: Vec<(&str, usize, usize)> =
+            set.sections.iter().map(|s| (s.kind, s.shown, s.total)).collect();
+        assert_eq!(
+            counts,
+            [("projects", 1, 2), ("tasks", 1, 3), ("milestones", 1, 2), ("blocked", 1, 1)]
+        );
+        // BO-06 (F10): the counts the header and the pulse print are the ones the blocks print. Completed records
+        // (`Shipped`, and `Closed` under the pulse's old synonym `done`) are counted as completed and listed nowhere.
+        let work = |active, listed, blocked, completed| Work { active, listed, blocked, completed, deferred: 0 };
+        assert_eq!(set.projects, work(2, 1, 1, 1));
+        assert_eq!(set.tasks, work(3, 1, 0, 1));
+        assert_eq!(set.milestones, work(2, 1, 0, 0));
+        let text = joined(&rows, None, &registry);
+        assert!(text.contains("PROJECTS (2 active, touched in 7 days: 1) · all: base project list --all"), "{text}");
+        assert!(text.contains("  Alpha (active)") && !text.contains("  Old (active)"), "{text}");
+        assert!(text.contains("TASKS (3 active, on projects touched in 7 days: 1) · all: base task list"), "{text}");
+        assert!(text.contains("  T1 · Alpha") && !text.contains("T2 ·") && !text.contains("T3 ·"), "{text}");
+        assert!(text.contains("MILESTONES (2 active, on projects touched in 7 days: 1) · all: base milestone list"), "{text}");
+        assert!(text.contains("  M1 · Alpha") && !text.contains("M2 ·"), "{text}");
+        assert!(text.contains("BLOCKED (1)\n  Stuck: API keys"), "{text}");
+        assert!(!text.contains("Shipped") && !text.contains("Closed"), "a completed record is listed: {text}");
     }
 }

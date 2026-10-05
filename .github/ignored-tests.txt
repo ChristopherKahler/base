@@ -1,0 +1,8 @@
+# Every #[ignore] in src/ and tests/ must be listed here with its reason. CI fails otherwise
+# (scripts/ci_guards.py ignores), and it fails on an entry whose test is no longer ignored.
+# Format: <file>:<test name> · <reason>
+# Changing this file needs its reason in the PR body (build rule 14).
+src/doorbell.rs:bench_absent_app_overhead_per_write · benchmark, run by hand
+tests/sync_gate_test.rs:bench_seam_cost_by_graph_size · benchmark, run by hand
+tests/write_back_test.rs:measure_store_len_cost_on_sixty_thousand_quads · measurement, run by hand with --ignored
+tests/measure_test.rs:measure_real_claude_code_delivers_a_small_payload · needs a real, logged-in Claude Code and spends one Haiku call (BO-02); run by hand with --ignored
