@@ -86,9 +86,11 @@ pub struct TierReport {
     /// so doctor offers `--fix` for foreign records only when this is above zero (BO-26, U4: an offer `--fix` does not
     /// keep reads as a command the user must run).
     pub foreign_to_move: usize,
-    /// The others: each graph `--fix` leaves in place, with why ([`crate::fix::left_in_place_reason`]). Still counted
-    /// against `healthy`, because a person must say whose records they are; doctor prints the reason beside the graph so
-    /// the verdict is not left unexplained (BO-26, lynx's U4 ruling).
+    /// The others: each graph `--fix` leaves in place, with why in a person's words (the two sizes that make it this
+    /// workspace's own data under an earlier folder name; `--fix` gives the same reason as
+    /// [`crate::fix::left_in_place_reason`]). Still counted against `healthy`, because a person must say whose records
+    /// they are; doctor prints the reason beside the graph so the verdict is not left unexplained (BO-26, lynx's U4
+    /// ruling; BO-30 for the words).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub foreign_left: Vec<(String, String)>,
     /// Named graphs `base` writes ON PURPOSE that belong to no workspace, so
@@ -466,7 +468,7 @@ pub fn diagnose_tier(tier: &str, path: &Path) -> TierReport {
             .foreign
             .iter()
             .filter(|(_, n)| crate::fix::left_in_place(*n, provenance.own))
-            .map(|(g, n)| (g.clone(), crate::fix::left_in_place_reason(*n, provenance.own)))
+            .map(|(g, n)| (g.clone(), format!("at least as large as this workspace's own data ({n} against {})", provenance.own)))
             .collect(),
         foreign_graphs: provenance.foreign,
         unscoped_graphs: provenance.unscoped,
@@ -839,9 +841,15 @@ pub fn format_human(report: &DoctorReport) -> String {
             for (g, n) in &t.foreign_graphs {
                 out.push_str(&format!("       {n} · {g}\n"));
             }
+            // BO-30: what it most likely is, why base thinks so, and what the person can do. A workspace's graph is named
+            // for its folder, so the graph's last part is that earlier folder name. No command re-homes it, so none is
+            // named.
             for (g, why) in &t.foreign_left {
+                let folder = g.rsplit('/').next().unwrap_or(g);
                 out.push_str(&format!(
-                    "       --fix leaves {g} where it is: {why}; a person decides whose records they are\n"
+                    "       base found data saved under what looks like this workspace's earlier folder name, `{folder}` \
+                     ({g}). It is {why}, so it is probably yours from before the folder was renamed. base will not \
+                     move it by itself, because only you can say whose it is.\n"
                 ));
             }
             // The one bounded extra line auk ruled in scope. Fires ONLY for the
@@ -962,9 +970,12 @@ pub fn format_human(report: &DoctorReport) -> String {
             {
                 // The repair's own doing, by no more than it recorded: not a loss (BO-26, lynx's U4 ruling). Anything
                 // beyond it, or a snapshot with no record, keeps the warning below.
+                // In a person's words (BO-30). "Nothing was lost" holds: the backup is the graph from before that
+                // repair, so it holds every line the repair took out.
                 out.push_str(&format!(
-                    "   backup: {} lines, taken before base's own repair, which took {took} lines out (records moved to \
-                     where they belong, duplicate lines dropped); the graph is {shrink} lines smaller [{}]\n",
+                    "   backup: {} lines, made just before base cleaned up your base data. The cleanup took {took} lines \
+                     out (other workspaces' entries moved out, repeated lines dropped), so your data is {shrink} lines \
+                     smaller, and nothing was lost [{}]\n",
                     b.backup_line_count, b.path,
                 ));
             } else if b.line_delta < 0 {

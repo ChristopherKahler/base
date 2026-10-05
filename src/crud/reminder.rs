@@ -536,10 +536,12 @@ pub struct AutoArchived {
 }
 
 impl AutoArchived {
-    /// The one line session start prints for it, with its undo (BO-27, V4), in the shape of an upgrade's lines.
+    /// The one line session start prints for it, with its undo (BO-27, V4), in the shape of an upgrade's lines: what
+    /// happened and why, that nothing is lost, and the command that brings it back (BO-30).
     pub fn line(&self) -> String {
         format!(
-            "reminder: archived '{}' ({}d overdue, warned {}) · undo: base reminder unarchive {}",
+            "base: We archived your reminder '{}': it was {} days overdue, and its warning first showed on {}. It is kept, \
+             not deleted. To bring it back, run `base reminder unarchive {}`.",
             self.name, self.days, self.warned_on, self.slug
         )
     }

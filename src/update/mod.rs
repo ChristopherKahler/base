@@ -838,14 +838,16 @@ fn notice_from_log(log: &str, version: &str) -> Option<String> {
 
     let anchor = version.replace('.', "-");
     let when = clock_time(stamp);
-    let how = match (mode, when) {
-        ("background", Some(hhmm)) => format!(", automatically at {hhmm}"),
-        ("background", None) => ", automatically".to_string(),
-        _ => String::new(),
+    // BO-30: in a person's words. An update has no way back to name (`base update` only goes forward), so the line says
+    // what happened and where to read what is new.
+    let did = match (mode, when) {
+        ("background", Some(hhmm)) => format!("updated itself to {version} at {hhmm}"),
+        ("background", None) => format!("updated itself to {version}"),
+        _ => format!("updated to {version}"),
     };
 
     Some(format!(
-        "base updated to {version} (from {}{how}).\nWhat changed: https://docs.basemode.ai/changelog#{anchor}",
+        "base {did} (from {}).\nWhat is new: https://docs.basemode.ai/changelog#{anchor}",
         from.trim()
     ))
 }
@@ -875,8 +877,8 @@ mod notice_tests {
         let n = notice_from_log(BG, "0.13.19").expect("should announce");
         assert_eq!(
             n,
-            "base updated to 0.13.19 (from 0.13.17, automatically at 06:07).\n\
-             What changed: https://docs.basemode.ai/changelog#0-13-19"
+            "base updated itself to 0.13.19 at 06:07 (from 0.13.17).\n\
+             What is new: https://docs.basemode.ai/changelog#0-13-19"
         );
     }
 
@@ -885,7 +887,7 @@ mod notice_tests {
         let line = "2026-09-06T06:07:32-05:00 updated 0.13.17 -> 0.13.19 (manual)";
         let n = notice_from_log(line, "0.13.19").expect("should announce");
         assert!(n.starts_with("base updated to 0.13.19 (from 0.13.17)."), "{n}");
-        assert!(!n.contains("automatically"), "{n}");
+        assert!(!n.contains("itself"), "{n}");
     }
 
     #[test]
@@ -922,7 +924,7 @@ mod notice_tests {
     fn a_stamp_we_did_not_write_degrades_to_no_clock_rather_than_a_wrong_one() {
         let line = "not-a-timestamp updated 0.13.17 -> 0.13.19 (background)";
         let n = notice_from_log(line, "0.13.19").expect("should still announce");
-        assert!(n.contains(", automatically)."), "{n}");
+        assert!(n.starts_with("base updated itself to 0.13.19 (from 0.13.17)."), "{n}");
         assert!(!n.contains(" at "), "{n}");
     }
 

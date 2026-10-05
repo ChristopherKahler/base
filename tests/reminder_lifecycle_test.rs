@@ -157,7 +157,7 @@ fn backdate_warned(seed: &seed::Seed, slug: &str, days: i64) {
 
 /// The lines session start printed about reminders the auto-archive pass archived.
 fn archive_lines(stdout: &str) -> Vec<&str> {
-    stdout.lines().filter(|l| l.starts_with("reminder: archived ")).collect()
+    stdout.lines().filter(|l| l.starts_with("base: We archived your reminder ")).collect()
 }
 
 /// Output is asserted non-empty before anything else: an empty stdout with a zero exit code
@@ -630,7 +630,7 @@ fn overdue_reminder_not_archived_before_its_warning_is_seen() {
     assert_eq!(code, 0, "session start failed: {stderr}");
     let line = line_with(&first, &late.name).unwrap_or_else(|| panic!("the 15-day reminder left DUE NOW:\n{first}"));
     assert!(
-        line.contains(&format!("archives {} unless reset", days_ahead(2))),
+        line.contains(&format!("archives {} unless snoozed", days_ahead(2))),
         "warned, with the two days still ahead of it: {line}"
     );
     assert_eq!(quads(&seed, &late.slug, "warnedAt").len(), 1, "the shown warning is recorded");
@@ -665,7 +665,12 @@ fn auto_archive_announces_once_with_undo() {
 
     let (_, archiving, _) = run_session_start(&seed, Some("bo27-v4b"));
     let undo = format!("base reminder unarchive {}", r.slug);
-    let expected = format!("reminder: archived '{}' (12d overdue, warned {}) · undo: {undo}", r.name, days_ago(2));
+    let expected = format!(
+        "base: We archived your reminder '{}': it was 12 days overdue, and its warning first showed on {}. It is kept, not \
+         deleted. To bring it back, run `{undo}`.",
+        r.name,
+        days_ago(2)
+    );
     assert_eq!(archive_lines(&archiving), vec![expected.as_str()], "{archiving}");
     let reason = quads(&seed, &r.slug, "archivedReason");
     let why = format!("auto: 12d past due, warned {}", days_ago(2));
