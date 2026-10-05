@@ -45,6 +45,31 @@ fn alive(pid: u32) -> bool {
     Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
+/// `base sync --ast --yes` on `app` with this limit, its output sent to files: what is timed is base's own exit, not
+/// how long something it started keeps the caller's pipes open (every unattended caller gives it no pipes at all).
+fn sync_ast(app: &std::path::Path, home: &std::path::Path, limit_secs: &str) -> (Duration, String, String) {
+    let logs = tempfile::tempdir().unwrap();
+    let (out_path, err_path) = (logs.path().join("out"), logs.path().join("err"));
+    let started = Instant::now();
+    Command::new(BIN)
+        .args(["sync", "--ast", "--yes", "--target"])
+        .arg(app)
+        .current_dir(app)
+        .env("BASE_HOME", home)
+        .env("BASE_AST_LIMIT_SECS", limit_secs)
+        .env("BASE_AST_SKIP_REGISTER", "1")
+        .env("BASE_NO_AUTO_UPDATE", "1")
+        .env_remove("CLAUDECODE")
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&out_path).unwrap())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .status()
+        .unwrap();
+    let took = started.elapsed();
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+    (took, read(&out_path), read(&err_path))
+}
+
 #[test]
 fn unattended_ast_run_stops_at_its_limit() {
     let home = tempfile::tempdir().unwrap();
@@ -59,21 +84,7 @@ fn unattended_ast_run_stops_at_its_limit() {
     std::fs::create_dir_all(&base_ast).unwrap();
     std::fs::write(base_ast.join(".building"), b"").unwrap();
 
-    let started = Instant::now();
-    let out = Command::new(BIN)
-        .args(["sync", "--ast", "--yes", "--target"])
-        .arg(&app)
-        .current_dir(&app)
-        .env("BASE_HOME", home.path())
-        .env("BASE_AST_LIMIT_SECS", "3")
-        .env("BASE_AST_SKIP_REGISTER", "1")
-        .env("BASE_NO_AUTO_UPDATE", "1")
-        .env_remove("CLAUDECODE")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    let took = started.elapsed();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let (took, _, err) = sync_ast(&app, home.path(), "3");
 
     assert!(took >= Duration::from_secs(3), "it waited for the limit, not less: {took:?}\n{err}");
     assert!(took < Duration::from_secs(60), "it ended at the limit, not when the 300 s sleep did: {took:?}\n{err}");
@@ -118,22 +129,7 @@ print("# Extracting 1 files from somewhere", file=sys.stderr, flush=True)
     std::fs::create_dir_all(&scripts).unwrap();
     std::fs::write(scripts.join("onto_ast.py"), LEAVES_ONE).unwrap();
 
-    let started = Instant::now();
-    let out = Command::new(BIN)
-        .args(["sync", "--ast", "--yes", "--target"])
-        .arg(&app)
-        .current_dir(&app)
-        .env("BASE_HOME", home.path())
-        .env("BASE_AST_LIMIT_SECS", "120")
-        .env("BASE_AST_SKIP_REGISTER", "1")
-        .env("BASE_NO_AUTO_UPDATE", "1")
-        .env_remove("CLAUDECODE")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    let took = started.elapsed();
-    let err = String::from_utf8_lossy(&out.stderr);
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (took, stdout, err) = sync_ast(&app, home.path(), "120");
     assert!(took < Duration::from_secs(60), "it waited for the leftover: {took:?}\n{err}");
     assert!(stdout.contains("AST extraction complete"), "{stdout}\n{err}");
     let base_ast = app.join(".base-ast");
