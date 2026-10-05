@@ -685,7 +685,7 @@ impl Fitted {
 /// fit, then the count of the rest. The list fits inside the same budget: the blocks are fitted again with room left
 /// for it, at most one part in [`TITLE_SHARE`] of the budget, so it may hold back more full text and never pushes the
 /// output past the budget. That second fit is kept only when its list shows at least one title, and more titles than
-/// the rules it withheld beyond the first fit; otherwise the first fit stands, with the list only when one showing a
+/// the full rules it cost (rules the first fit printed whole that it withholds); otherwise the first fit stands, with the list only when one showing a
 /// title fits in the room it left. Which rules match, how they rank, every budget, and the output of a prompt that
 /// withholds no rule are unchanged, byte for byte.
 pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -> Fitted {
@@ -698,12 +698,14 @@ pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -
     let wanted = held_back_list(&held, usize::MAX, budget_bytes).map_or(0, |(text, _)| text.len() + 2);
     let reserve = wanted.min(budget_bytes / TITLE_SHARE);
     let second = fit_within(header, blocks, budget_bytes.saturating_sub(reserve), budget_bytes, key);
-    let first_held = held.len();
-    // The second fit is kept only when its list shows more titles than the rules it withheld beyond the first fit's,
-    // and at least one: room bought with full text and spent on a count line alone (a small budget) is a pure loss.
-    // Otherwise the first fit stands, with a list only when one with a title fits in the room it left.
+    // The full rules the second fit cost: the ones it withholds that the first fit printed whole. Which rules, not how
+    // many: the second fit can trade a matched rule for a lower one that fits where it did not, and that costs one.
+    let cost = second.held_back().iter().filter(|h| !held.contains(h)).count();
+    // The second fit is kept only when its list shows more titles than that cost, and at least one: room bought with
+    // full text and spent on a count line alone (a small budget) is a pure loss. Otherwise the first fit stands, with a
+    // list only when one with a title fits in the room it left.
     match with_list(second) {
-        Some(f) if f.titled > f.held_back.saturating_sub(first_held) => f,
+        Some(f) if f.titled > cost => f,
         _ => with_list(first.clone()).unwrap_or(first),
     }
 }
@@ -1717,7 +1719,9 @@ mod tests {
                     without += 1;
                 }
                 Some(_) => {
-                    let lost = printed_rule_ids(&old).len().saturating_sub(printed_rule_ids(&f).len());
+                    // Which rules lost their full text, not how many: a swap of a higher rule for a lower one costs one.
+                    let now = printed_rule_ids(&f);
+                    let lost = printed_rule_ids(&old).iter().filter(|id| !now.contains(id)).count();
                     assert!(f.titled >= 1 && f.titled > lost, "{budget}: {lost} full rules lost for {} titles:\n{}", f.titled, f.text);
                     with += 1;
                     traded += usize::from(lost > 0);
