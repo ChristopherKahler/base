@@ -266,7 +266,8 @@ def _load_workspace_packages(start_dir: Path) -> dict[str, Path]:
         # `# Skipped ` lines are what `.last-notices` keeps for the next session.
         if skipped and multiprocessing.parent_process() is None:
             print(
-                f"# Skipped pnpm-workspace.yaml entry '{pattern}' in {root}: {skipped}",
+                f"# Skipped the pnpm-workspace.yaml entry '{pattern}' in {root}: it is not a folder "
+                f"pattern base can read, so the packages it names are left out of the code map.",
                 file=sys.stderr,
             )
         for package_dir in package_dirs:

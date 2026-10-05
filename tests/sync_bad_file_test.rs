@@ -79,9 +79,11 @@ fn one_bad_file_does_not_stop_the_sync() {
     let bad = &report.unextractable[0];
     assert_eq!(bad.file, "b.md");
     assert_eq!(bad.field, "relatedTo");
-    assert!(bad.value.contains("bad|value"), "the report carries the value: {}", bad.value);
-    let line = bad.to_string();
-    assert!(line.starts_with("sync: skipped b.md: relatedTo value "), "{line}");
+    assert_eq!(bad.value, "bad|value", "the value as the file gave it, not the link text");
+    assert_eq!(
+        bad.to_string(),
+        "base sync skipped b.md: its relatedTo value \"bad|value\" cannot be stored in the graph. Change that value in the file, then run base sync again."
+    );
     // b.md's earlier triples stay: nothing of a file that does not parse is deleted.
     assert_eq!(names(ws), ["A two", "B good", "C two"]);
 
@@ -141,6 +143,11 @@ fn a_partial_sync_exits_3_and_names_the_file() {
     write_md(&ws, "zz-bad.md", "related: bad|value");
     let (code, out, err) = run_sync(&ws, home.path());
     assert_eq!(code, 3, "partial\n{out}\n{err}");
-    assert!(out.contains("Sync partial: 2 scanned, 1 extracted, 0 skipped, 1 could not be extracted"), "{out}");
-    assert!(err.lines().any(|l| l.starts_with("sync: skipped zz-bad.md: relatedTo value ")), "{err}");
+    assert!(
+        out.contains(
+            "Sync partial: 2 scanned, 1 extracted, 0 skipped. 1 file was not synced (named above); the graph still has what it held for it before. Fix it, then run base sync again."
+        ),
+        "{out}"
+    );
+    assert!(err.lines().any(|l| l.starts_with("base sync skipped zz-bad.md: its relatedTo value \"bad|value\"")), "{err}");
 }

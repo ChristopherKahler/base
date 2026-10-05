@@ -1797,6 +1797,8 @@ Options:
 ```text
 Sync file-owned data into the graph
 
+Exit codes: 0, every file was synced. 3, partial: the files it names could not be synced and were skipped, and every other file was synced. 1, the sync failed and nothing was written. 2, it did not start (bad arguments).
+
 Usage: base sync [OPTIONS]
 
 Options:
@@ -1816,7 +1818,7 @@ Options:
           Repair missing edges (backfill decision→domain, milestone→project, task→project links)
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ## base domain

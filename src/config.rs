@@ -104,8 +104,20 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 
 /// `path` is `root` or inside it, as written or once both are resolved.
 fn is_within(path: &Path, root: &Path) -> bool {
-    path.starts_with(root)
-        || matches!((path.canonicalize(), root.canonicalize()), (Ok(x), Ok(y)) if x.starts_with(&y))
+    path.starts_with(root) || resolve(root).is_some_and(|r| resolved_under(path, &r).is_some())
+}
+
+/// `path` resolved: links and junctions followed, and on Windows letter case, `\\?\` and 8.3 forms made one spelling.
+/// `None` when it does not exist.
+pub(crate) fn resolve(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok()
+}
+
+/// Where `path` really is, relative to `resolved_root` (a folder already passed through [`resolve`], so both sides are
+/// spelled the same way: `\\?\` on Windows). `None` when `path` does not exist or resolves outside the root. The sync's
+/// exclude test runs on this as well as on the path as walked, so a link cannot carry an excluded file in (#164).
+pub(crate) fn resolved_under(path: &Path, resolved_root: &Path) -> Option<PathBuf> {
+    resolve(path)?.strip_prefix(resolved_root).ok().map(Path::to_path_buf)
 }
 
 /// The workspace that encloses the global tier's root folder, if any.

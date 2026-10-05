@@ -156,9 +156,8 @@ pub enum Commands {
     },
     /// Sync file-owned data into the graph
     ///
-    /// Exit codes: 0 every file was synced; 3 partial: the files named on stderr could not be extracted and were
-    /// skipped, every other file was written; 1 the sync failed and nothing was written; 2 it did not start (bad
-    /// arguments).
+    /// Exit codes: 0, every file was synced. 3, partial: the files it names could not be synced and were skipped, and
+    /// every other file was synced. 1, the sync failed and nothing was written. 2, it did not start (bad arguments).
     Sync {
         /// Only re-extract files changed since last sync
         #[arg(long)]
@@ -3389,39 +3388,52 @@ pub fn run() {
                 // often print to nobody.
                 let last_error = ast_ttl.with_file_name(".last-error");
                 let base_ast_dir = ast_ttl.parent().map(|p| p.to_path_buf());
+                // `None`: an unattended build stopped at its time limit (#174).
                 let status = if yes {
-                    extractor
-                        .stdin(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::piped());
-                    extractor.output().map(|o| {
-                        if o.status.success() {
-                            // #66: `--yes` pipes stderr, so on success the
-                            // extractor's own notices — the file count, every
-                            // skipped file, the app-root attribution count —
-                            // used to be captured and dropped. Echo them.
-                            base::hook::automap::echo_extractor_notices(&o.stderr);
-                            // #89: and write them down. Every background refresh
-                            // — the Stop hook's `spawn_sync`, a first contact,
-                            // the WSL delegate, the git hook — runs THIS command
-                            // with `--yes` and discards its output, so the child
-                            // recording its own notices is what reaches all four
-                            // without any of them changing.
-                            if let Some(dir) = base_ast_dir.as_deref() {
-                                base::hook::automap::record_notices(dir, &o.stderr);
+                    use base::hook::automap::{run_unattended, unattended_limit, Unattended};
+                    let limit = unattended_limit();
+                    run_unattended(&mut extractor, limit).map(|outcome| match outcome {
+                        Unattended::Ended(status, stderr) => {
+                            if status.success() {
+                                // #66: `--yes` pipes stderr, so on success the
+                                // extractor's own notices — the file count, every
+                                // skipped file, the app-root attribution count —
+                                // used to be captured and dropped. Echo them.
+                                base::hook::automap::echo_extractor_notices(&stderr);
+                                // #89: and write them down. Every background refresh
+                                // — the Stop hook's `spawn_sync`, a first contact,
+                                // the WSL delegate, the git hook — runs THIS command
+                                // with `--yes` and discards its output, so the child
+                                // recording its own notices is what reaches all four
+                                // without any of them changing.
+                                if let Some(dir) = base_ast_dir.as_deref() {
+                                    base::hook::automap::record_notices(dir, &stderr);
+                                }
+                            } else {
+                                let _ = std::fs::write(&last_error, base::hook::automap::stderr_tail(&stderr));
                             }
-                        } else {
-                            let _ = std::fs::write(&last_error, base::hook::automap::stderr_tail(&o.stderr));
+                            Some(status)
                         }
-                        o.status
+                        Unattended::Stopped(stderr) => {
+                            let _ = std::fs::write(&last_error, base::hook::automap::stopped_record(limit, &stderr));
+                            None
+                        }
                     })
                 } else {
-                    extractor.status()
+                    extractor.status().map(Some)
                 };
 
                 // Whatever happened, this build is over: the hooks may start the next.
                 let _ = std::fs::remove_file(ast_ttl.with_file_name(".building"));
                 match status {
-                    Ok(s) if s.success() => {
+                    Ok(None) => {
+                        eprintln!(
+                            "base stopped the code map build for {target_dir} after {} because it was stuck. \
+                             A map from an earlier build, if there is one, is still there.",
+                            base::hook::automap::spoken(base::hook::automap::unattended_limit())
+                        );
+                    }
+                    Ok(Some(s)) if s.success() => {
                         let _ = std::fs::remove_file(&last_error);
                         println!("AST extraction complete → {}", ast_ttl.display());
                         // Register a pointer to this map in the workspace graph so
@@ -3439,7 +3451,7 @@ pub fn run() {
                             }
                         }
                     }
-                    Ok(s) => {
+                    Ok(Some(s)) => {
                         eprintln!("AST extraction exited with code {:?}", s.code());
                         if !yes {
                             let _ = std::fs::write(&last_error, format!("extractor exited with code {:?}\n", s.code()));
@@ -3454,7 +3466,12 @@ pub fn run() {
                     }
                 }
             } else {
-                match base::extract::sync(&cwd, &config, incremental) {
+                let report = base::extract::sync(&cwd, &config, incremental);
+                // #164: a link into an excluded path is skipped and said, once per link.
+                for line in report.as_ref().map(|r| r.excluded_links.as_slice()).unwrap_or_default() {
+                    eprintln!("{line}");
+                }
+                match report {
                     Ok(report) if report.unextractable.is_empty() => {
                         println!(
                             "Sync complete: {} scanned, {} extracted, {} skipped",
@@ -3466,12 +3483,12 @@ pub fn run() {
                         for file in &report.unextractable {
                             eprintln!("{file}");
                         }
+                        let n = report.unextractable.len();
+                        let (files, it) = if n == 1 { ("1 file was".to_string(), "it") } else { (format!("{n} files were"), "them") };
                         println!(
-                            "Sync partial: {} scanned, {} extracted, {} skipped, {} could not be extracted (named above)",
-                            report.scanned,
-                            report.extracted,
-                            report.skipped,
-                            report.unextractable.len()
+                            "Sync partial: {} scanned, {} extracted, {} skipped. {files} not synced (named above); the graph \
+                             still has what it held for {it} before. Fix {it}, then run base sync again.",
+                            report.scanned, report.extracted, report.skipped
                         );
                         // `exit` skips destructors: the files that were written still refresh the rule index.
                         drop(_refresh_index);

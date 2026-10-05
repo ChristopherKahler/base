@@ -353,6 +353,24 @@ pub fn session_start_notice(cwd: &Path) -> Option<String> {
     };
     let outcome = ensure_app_map(&root);
     let base_ast = root.join(".base-ast");
+    // #174: a build stopped at its time limit is said whether or not a map exists (other failed refreshes of a mapped
+    // app stay quiet, as before), until a build finishes and removes the record.
+    if let Some(why) = last_error(&base_ast)
+        && let Some(span) = stopped_span(&why)
+    {
+        let root = root.display();
+        return Some(if base_ast.join("ast.ttl").is_file() {
+            format!(
+                "[AST] base stopped updating the code map for {root} after {span} because it was stuck. \
+                 Your old map is still there. It will try again after your next reply."
+            )
+        } else {
+            format!(
+                "[AST] base stopped building the code map for {root} after {span} because it was stuck. \
+                 There is no map yet. It will try again after your next reply."
+            )
+        });
+    }
     if !base_ast.join("ast.ttl").is_file()
         && let Some(why) = last_error(&base_ast)
     {
@@ -656,6 +674,294 @@ pub fn wsl_script(path: &str) -> String {
 
 /// A `.building` lock older than this is a crashed build, not a running one.
 const BUILD_LOCK_SECS: u64 = 30 * 60;
+
+/// The longest an unattended code-map build (`sync --ast --yes`) may run (#174). Past it the build and every process it
+/// started are stopped, and `.last-error` says so. Below [`BUILD_LOCK_SECS`], so a stopped build is always gone before
+/// its `.building` lock lapses and lets a second build start beside it. A build by hand without `--yes` has no limit.
+pub const UNATTENDED_LIMIT_SECS: u64 = 10 * 60;
+const _: () = assert!(UNATTENDED_LIMIT_SECS < BUILD_LOCK_SECS);
+
+/// Shortens [`UNATTENDED_LIMIT_SECS`] for a test, in seconds. Not a `base.toml` key.
+const LIMIT_ENV: &str = "BASE_AST_LIMIT_SECS";
+
+/// How a stopped build's `.last-error` line starts. Session start shows that record even for an app that has a map.
+pub const STOPPED: &str = "base stopped the code map build after ";
+
+/// How a stopped build's `.last-error` line ends.
+const STUCK: &str = " because it was stuck.";
+
+/// A span the way a person says it: "10 minutes", "1 minute", "3 seconds".
+pub fn spoken(span: Duration) -> String {
+    let s = span.as_secs();
+    let (n, unit) = if s >= 60 && s % 60 == 0 { (s / 60, "minute") } else { (s, "second") };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The span in a stopped build's `.last-error` line, or `None` for any other failure.
+fn stopped_span(line: &str) -> Option<&str> {
+    line.strip_prefix(STOPPED)?.strip_suffix(STUCK)
+}
+
+/// The limit this run uses: [`UNATTENDED_LIMIT_SECS`], or a test's `BASE_AST_LIMIT_SECS`.
+pub fn unattended_limit() -> Duration {
+    std::env::var(LIMIT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or(Duration::from_secs(UNATTENDED_LIMIT_SECS), Duration::from_secs)
+}
+
+/// What [`run_unattended`] saw.
+pub enum Unattended {
+    /// The extractor ended inside the limit: its status, and what it wrote to stderr.
+    Ended(std::process::ExitStatus, Vec<u8>),
+    /// The limit passed first. The extractor and everything it started were stopped; what it wrote to stderr until then.
+    Stopped(Vec<u8>),
+}
+
+/// Run the extractor with no stdin and its stderr read here, for at most `limit`. #174: the old `.output()` waited with
+/// no limit for the extractor to end AND for its stderr to close, so a hung worker, a stalled read, or a grandchild
+/// still holding the pipe kept an unattended build waiting at no CPU for as long as nobody killed it. Past the limit
+/// the whole process tree is stopped: on Windows through a job object (which also takes the tree down if this process
+/// is killed), on Unix through the extractor's own process group.
+pub fn run_unattended(cmd: &mut Command, limit: Duration) -> std::io::Result<Unattended> {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + limit;
+    cmd.stdin(Stdio::null()).stderr(Stdio::piped());
+    let tree = tree::Tree::prepare(cmd);
+    let mut child = cmd.spawn()?;
+    let tree = tree.adopt(&child);
+    let stderr = child.stderr.take();
+    let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (closed_tx, closed) = std::sync::mpsc::channel::<()>();
+    {
+        let collected = collected.clone();
+        std::thread::spawn(move || {
+            if let Some(mut pipe) = stderr {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = pipe.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    collected.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend_from_slice(&buf[..n]);
+                }
+            }
+            let _ = closed_tx.send(());
+        });
+    }
+    let take = |c: &std::sync::Mutex<Vec<u8>>| std::mem::take(&mut *c.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    let ended = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    match ended {
+        Some(status) => {
+            // It ended; if something it started still holds stderr past the limit, that is stopped too.
+            if closed.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).is_err() {
+                tree.stop(&mut child);
+                let _ = closed.recv_timeout(Duration::from_secs(2));
+            }
+            Ok(Unattended::Ended(status, take(&collected)))
+        }
+        None => {
+            tree.stop(&mut child);
+            // Reap it, bounded: a stopped tree ends at once, and this must not become the next wait.
+            let reap_by = std::time::Instant::now() + Duration::from_secs(5);
+            while child.try_wait().ok().flatten().is_none() && std::time::Instant::now() < reap_by {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = closed.recv_timeout(Duration::from_secs(2));
+            Ok(Unattended::Stopped(take(&collected)))
+        }
+    }
+}
+
+/// The `.last-error` a stopped build leaves: what it printed last, then the line session start reads.
+pub fn stopped_record(limit: Duration, stderr: &[u8]) -> String {
+    let tail = stderr_tail(stderr);
+    let tail = tail.trim_end();
+    let head = if tail.is_empty() { String::new() } else { format!("{tail}\n") };
+    format!("{head}{STOPPED}{}{STUCK}\n", spoken(limit))
+}
+
+/// Stopping a build and everything it started. Windows: a job object; Unix: a process group of its own.
+mod tree {
+    use std::process::{Child, Command};
+
+    #[cfg(windows)]
+    pub struct Tree(Option<Job>);
+
+    #[cfg(windows)]
+    impl Tree {
+        pub fn prepare(_cmd: &mut Command) -> Self {
+            Tree(Job::new())
+        }
+
+        /// Put the child in the job. Done right after the spawn, before the interpreter is far enough along to start
+        /// anything of its own.
+        pub fn adopt(self, child: &Child) -> Self {
+            use std::os::windows::io::AsRawHandle;
+            Tree(self.0.filter(|job| job.assign(child.as_raw_handle())))
+        }
+
+        pub fn stop(&self, child: &mut Child) {
+            match &self.0 {
+                Some(job) => job.terminate(),
+                // No job (it could not be made or joined): the tree by its parent links instead.
+                None => {
+                    let _ = Command::new("taskkill")
+                        .args(["/T", "/F", "/PID", &child.id().to_string()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+            let _ = child.kill();
+        }
+    }
+
+    #[cfg(windows)]
+    pub struct Job(*mut std::ffi::c_void);
+
+    #[cfg(windows)]
+    mod ffi {
+        use std::ffi::c_void;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            pub fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> *mut c_void;
+            pub fn SetInformationJobObject(job: *mut c_void, class: i32, info: *const c_void, len: u32) -> i32;
+            pub fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+            pub fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
+            pub fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+
+        /// JOBOBJECT_BASIC_LIMIT_INFORMATION.
+        #[repr(C)]
+        #[derive(Default)]
+        pub struct BasicLimit {
+            pub per_process_user_time: i64,
+            pub per_job_user_time: i64,
+            pub limit_flags: u32,
+            pub min_working_set: usize,
+            pub max_working_set: usize,
+            pub active_process_limit: u32,
+            pub affinity: usize,
+            pub priority_class: u32,
+            pub scheduling_class: u32,
+        }
+
+        /// IO_COUNTERS.
+        #[repr(C)]
+        #[derive(Default)]
+        pub struct IoCounters([u64; 6]);
+
+        /// JOBOBJECT_EXTENDED_LIMIT_INFORMATION.
+        #[repr(C)]
+        #[derive(Default)]
+        pub struct ExtendedLimit {
+            pub basic: BasicLimit,
+            pub io: IoCounters,
+            pub process_memory_limit: usize,
+            pub job_memory_limit: usize,
+            pub peak_process_memory: usize,
+            pub peak_job_memory: usize,
+        }
+
+        pub const EXTENDED_LIMIT_INFORMATION: i32 = 9;
+        pub const KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    }
+
+    #[cfg(windows)]
+    impl Job {
+        fn new() -> Option<Self> {
+            // SAFETY: kernel32 calls on a handle this function owns; a null handle is a failure and nothing else is done.
+            unsafe {
+                let job = ffi::CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                if job.is_null() {
+                    return None;
+                }
+                // Kill on close: if this process dies (killed by hand, say), the job's handle closes and the build
+                // goes with it instead of being left running on its own.
+                let mut info = ffi::ExtendedLimit::default();
+                info.basic.limit_flags = ffi::KILL_ON_JOB_CLOSE;
+                ffi::SetInformationJobObject(
+                    job,
+                    ffi::EXTENDED_LIMIT_INFORMATION,
+                    (&raw const info).cast(),
+                    std::mem::size_of::<ffi::ExtendedLimit>() as u32,
+                );
+                Some(Job(job))
+            }
+        }
+
+        fn assign(&self, process: *mut std::ffi::c_void) -> bool {
+            // SAFETY: both handles are live: the job is owned here, the process handle is the child's own.
+            unsafe { ffi::AssignProcessToJobObject(self.0, process) != 0 }
+        }
+
+        fn terminate(&self) {
+            // SAFETY: the job handle is owned here and still open.
+            unsafe {
+                ffi::TerminateJobObject(self.0, 1);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: closes the handle `new` opened, once.
+            unsafe {
+                ffi::CloseHandle(self.0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub struct Tree(bool);
+
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    #[cfg(unix)]
+    impl Tree {
+        /// A process group of its own, so the whole tree can be stopped together. Only when nobody is at a terminal:
+        /// a child outside the terminal's group would not get the Ctrl-C a person running this by hand presses.
+        pub fn prepare(cmd: &mut Command) -> Self {
+            use std::io::IsTerminal;
+            use std::os::unix::process::CommandExt;
+            let grouped = !std::io::stdin().is_terminal();
+            if grouped {
+                cmd.process_group(0);
+            }
+            Tree(grouped)
+        }
+
+        pub fn adopt(self, _child: &Child) -> Self {
+            self
+        }
+
+        pub fn stop(&self, child: &mut Child) {
+            if self.0
+                && let Ok(pid) = i32::try_from(child.id())
+            {
+                // SAFETY: a plain kill(2) on the process group this child leads; SIGKILL is 9.
+                unsafe {
+                    kill(-pid, 9);
+                }
+            }
+            let _ = child.kill();
+        }
+    }
+}
 
 fn fingerprint(s: &str) -> String {
     use std::hash::{Hash, Hasher};
