@@ -170,21 +170,38 @@ fn a_stopped_refresh_shows_at_session_start_even_with_a_map() {
     assert_eq!(line("Traceback (most recent call last):\nValueError: boom\n"), None);
 
     let record = base::hook::automap::stopped_record(Duration::from_secs(600), b"worker output\n");
+    // A build ran within the debounce window, so session start starts none: the Stop hook is the next to try.
     assert_eq!(
         line(&record),
         Some(format!(
             "[AST] base stopped updating the code map for {} after 10 minutes because it was stuck. \
-             Your old map is still there. It will try again after your next reply.",
+             Your old map is still there. It will try again the next time Claude finishes a reply.",
+            app.display()
+        ))
+    );
+    // Past the window and with no build running, session start has already started the next one when it says so.
+    let age_out = || {
+        let _ = std::fs::remove_file(base_ast.join(".building"));
+        let old = std::time::SystemTime::now() - Duration::from_secs(120);
+        std::fs::File::options().write(true).open(base_ast.join(".last-sync")).unwrap().set_modified(old).unwrap();
+    };
+    age_out();
+    assert_eq!(
+        line(&record),
+        Some(format!(
+            "[AST] base stopped updating the code map for {} after 10 minutes because it was stuck. \
+             Your old map is still there. It is trying again now, in the background.",
             app.display()
         ))
     );
     // With no map yet, the same record says so.
     std::fs::remove_file(base_ast.join("ast.ttl")).unwrap();
+    age_out();
     assert_eq!(
         line(&record),
         Some(format!(
             "[AST] base stopped building the code map for {} after 10 minutes because it was stuck. \
-             There is no map yet. It will try again after your next reply.",
+             There is no map yet. It is trying again now, in the background.",
             app.display()
         ))
     );

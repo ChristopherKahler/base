@@ -357,17 +357,24 @@ pub fn session_start_notice(cwd: &Path) -> Option<String> {
     // app stay quiet, as before), until a build finishes and removes the record.
     if let Some(why) = last_error(&base_ast)
         && let Some(span) = stopped_span(&why)
+        && !matches!(outcome, MapPlan::NeedsConfirm)
     {
         let root = root.display();
+        // `ensure_app_map` above has already started the next build unless one is running or just ran.
+        let next = if matches!(outcome, MapPlan::Build | MapPlan::Refresh) {
+            "It is trying again now, in the background."
+        } else {
+            "It will try again the next time Claude finishes a reply."
+        };
         return Some(if base_ast.join("ast.ttl").is_file() {
             format!(
                 "[AST] base stopped updating the code map for {root} after {span} because it was stuck. \
-                 Your old map is still there. It will try again after your next reply."
+                 Your old map is still there. {next}"
             )
         } else {
             format!(
                 "[AST] base stopped building the code map for {root} after {span} because it was stuck. \
-                 There is no map yet. It will try again after your next reply."
+                 There is no map yet. {next}"
             )
         });
     }
