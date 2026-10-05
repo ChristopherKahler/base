@@ -770,7 +770,20 @@ impl SessionOutput {
             emission.note_withheld(row.block, row.items, row.reason, row.command);
         }
         let header = |facts: &Facts<'_>| header_line(facts, &counts);
-        let rendered = emission.render(&full, Some(&header));
+        let mut rendered = emission.render(&full, Some(&header));
+        // BO-28 (lynx's ruling): the one start that prints the developer-mode paragraph may run the first screen past
+        // `first_screen_chars` by that block alone. The paragraph is what must be seen and it is first; the blocks it
+        // pushes down still print whole. That start counts as fitting and its record names the block, so doctor does not
+        // report it as an overflow. Any overflow beyond the block is reported as before.
+        if !rendered.first_screen_ok
+            && let Some(block) = rendered.blocks.iter().find(|b| kind_of(b.id()) == "devmode-off")
+        {
+            let own = emit::u16_len(block.text().trim_end_matches(['\r', '\n'])) + 1;
+            if rendered.first_screen_len_u16.saturating_sub(own) <= rendered.first_screen_u16 {
+                rendered.first_screen_ok = true;
+                rendered.first_screen_excused = Some("devmode-off".to_string());
+            }
+        }
         if !rendered.first_screen_ok {
             eprintln!(
                 "base: session start's header, instructions and DUE NOW take {} units, more than the first {}",

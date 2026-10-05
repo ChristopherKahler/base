@@ -893,7 +893,7 @@ fn devmode_off_line_is_on_the_first_screen() {
     let s = home_015("devmode-screen");
     with_foreign(&s);
     write(&gbl(&s).join("commands.toml"), &PACK_0142.replace("\r\n", "\n"));
-    write(&gbl(&s).join("base.toml"), &format!("{BASE_TOML_015}\n[budget]\nsession_start_bytes = 1000\n"));
+    write(&gbl(&s).join("base.toml"), &format!("{BASE_TOML_015}\n[budget]\nsession_start_bytes = 1000\nfirst_screen_chars = 700\n"));
     start(&s);
     let out = start(&s);
     let lines: Vec<&str> = out.lines().collect();
@@ -905,6 +905,26 @@ fn devmode_off_line_is_on_the_first_screen() {
     let full = read(&s.ws.join(".base").join("hook-output").join("bo26-session").join("session-start.md"));
     assert!(!upgrade_lines(&full).is_empty(), "control: the upgrade had its own lines this start:\n{full}");
     assert!(upgrade_lines(&out).is_empty(), "control: the budget cut them to one line:\n{out}");
+
+    // lynx's ruling: the paragraph alone takes the screen past `first_screen_chars`, so that start counts as fitting and
+    // its record names the block. Control: an overflow the paragraph is not part of is still reported.
+    let rows = || -> Vec<serde_json::Value> {
+        read(&s.ws.join(".base").join("hook-output.jsonl"))
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["hook"] == "session-start")
+            .collect()
+    };
+    let row = rows().pop().expect("the start's row");
+    assert!(row["first_screen_len_u16"].as_u64().unwrap_or(0) > 700, "control: the screen did overflow: {row}");
+    assert_eq!(row["first_screen_ok"], true, "{row}");
+    assert_eq!(row["first_screen_excused"], "devmode-off", "{row}");
+    let toml = gbl(&s).join("base.toml");
+    write(&toml, &read(&toml).replace("first_screen_chars = 700", "first_screen_chars = 100"));
+    start(&s);
+    let row = rows().pop().expect("the next start's row");
+    assert_eq!(row["first_screen_ok"], false, "the header alone overflows 100 units: {row}");
+    assert!(row.get("first_screen_excused").is_none(), "{row}");
 }
 
 /// W2b, W2c: what changed and why, what the block did, where to see the same thing without it, the command that turns it

@@ -2249,7 +2249,24 @@ fn replay_upgrade_turns_the_installers_devmode_off_once() {
         let lines: Vec<&str> = second.lines().collect();
         assert!(lines.len() > 2 && lines[1].starts_with("DEVELOPER MODE TURNED OFF"), "first under the header:\n{second}");
         assert!(units(&lines[..3].join("\n")) <= 1990, "inside the first screen:\n{second}");
-        assert!(!err.contains("more than the first"), "the first screen still fits:\n{err}");
+        // lynx's ruling: on this one start the paragraph may push the rest of the first screen (header, Pinned, DUE
+        // NOW: everything above HANDOFFS) past the bar, by its own block and no more; the run counts as fitting and
+        // its record names the block.
+        let screen = second.split("\nHANDOFFS").next().unwrap_or(&second);
+        let block = units(&format!("{}\n{}\n", lines[1], lines[2]));
+        assert!(units(screen).saturating_sub(block) <= 1990, "the screen without the paragraph fits:\n{second}");
+        assert!(!err.contains("more than the first"), "no overflow reported:\n{err}");
+        let rows = std::fs::read_to_string(s.ws.join(".base").join("hook-output.jsonl")).expect("hook-output.jsonl");
+        let row: serde_json::Value = rows
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["hook"] == "session-start")
+            .nth(1)
+            .expect("the second start's row");
+        assert_eq!(row["first_screen_ok"], true, "{row}");
+        if row["first_screen_len_u16"].as_u64().unwrap_or(0) > 1990 {
+            assert_eq!(row["first_screen_excused"], "devmode-off", "{row}");
+        }
         assert_eq!(on_after, 0, "off from the start that says so");
         let doctor = run_base(&s, &["doctor"]).1;
         assert!(doctor.contains(lines[2]), "doctor repeats the paragraph:\n{doctor}");

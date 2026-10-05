@@ -439,6 +439,10 @@ pub struct Rendered {
     /// never resolved: those blocks are the whole first screen and none of them may degrade, so
     /// trimming anything else cannot make them fit.
     pub first_screen_ok: bool,
+    /// The block the caller excused from the first screen: set only when the screen overflows by that block alone,
+    /// a notice shown once on purpose (BO-28, session start's `devmode-off`). Then `first_screen_ok` is true,
+    /// `first_screen_len_u16` stays as measured, and the record names the block. `None` from [`Emission::render`].
+    pub first_screen_excused: Option<String>,
     pub withheld: Vec<Withheld>,
     pub blocks: Vec<Block>,
 }
@@ -571,6 +575,7 @@ impl Emission {
             budget_bytes: self.budget_bytes,
             first_screen_u16: self.first_screen_u16,
             first_screen_len_u16: prefix,
+            first_screen_excused: None,
             withheld: self.withheld,
             blocks: self.blocks,
         }
