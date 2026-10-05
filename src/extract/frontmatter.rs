@@ -314,70 +314,88 @@ fn unwrap_flow(mut s: &str) -> &str {
     s
 }
 
+/// Walk `s` the way YAML reads a flow list. A quote opens only where an item starts (at the start, or after `[` or `,`
+/// and any spaces), so an apostrophe inside a word (`don't`, `[[Bob's Notes]]`) is a letter, not a quote. `each` sees
+/// every character outside quotes with its byte index, and stops the walk by returning false. Returns false when a
+/// quote is left open.
+fn walk_outside_quotes(s: &str, mut each: impl FnMut(usize, char) -> bool) -> bool {
+    let mut quote: Option<char> = None;
+    let mut item_start = true;
+    for (i, c) in s.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if item_start && matches!(c, '"' | '\'') {
+            quote = Some(c);
+            item_start = false;
+            continue;
+        }
+        if !c.is_whitespace() {
+            item_start = matches!(c, '[' | ',');
+        }
+        if !each(i, c) {
+            return true;
+        }
+    }
+    quote.is_none()
+}
+
 /// Where the `[` at the start of `s` closes, skipping brackets inside quotes.
 fn closing_bracket(s: &str) -> Option<usize> {
     let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-    for (i, c) in s.char_indices() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), _) => {}
-            (None, '"' | '\'') => quote = Some(c),
-            (None, '[') => depth += 1,
-            (None, ']') => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Every `[` closes and no `]` comes first, outside quotes.
-fn brackets_balance(s: &str) -> bool {
-    let mut depth = 0i64;
-    let mut quote: Option<char> = None;
-    for c in s.chars() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), _) => {}
-            (None, '"' | '\'') => quote = Some(c),
-            (None, '[') => depth += 1,
-            (None, ']') => {
+    let mut at = None;
+    walk_outside_quotes(s, |i, c| {
+        match c {
+            '[' => depth += 1,
+            ']' if depth == 0 => return false,
+            ']' => {
                 depth -= 1;
-                if depth < 0 {
+                if depth == 0 {
+                    at = Some(i);
                     return false;
                 }
             }
             _ => {}
         }
-    }
-    depth == 0 && quote.is_none()
+        true
+    });
+    at
+}
+
+/// Every `[` closes and no `]` comes first, outside quotes, and no quote is left open.
+fn brackets_balance(s: &str) -> bool {
+    let mut depth = 0i64;
+    let closed = walk_outside_quotes(s, |_, c| {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            _ => {}
+        }
+        depth >= 0
+    });
+    closed && depth == 0
 }
 
 /// Split at commas outside quotes and brackets.
 fn split_top_level(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0usize;
-    let mut quote: Option<char> = None;
     let mut start = 0;
-    for (i, c) in s.char_indices() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), _) => {}
-            (None, '"' | '\'') => quote = Some(c),
-            (None, '[') => depth += 1,
-            (None, ']') => depth = depth.saturating_sub(1),
-            (None, ',') if depth == 0 => {
+    walk_outside_quotes(s, |i, c| {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
                 out.push(&s[start..i]);
                 start = i + 1;
             }
             _ => {}
         }
-    }
+        true
+    });
     out.push(&s[start..]);
     out
 }
@@ -827,6 +845,9 @@ mod tests {
         // Unbalanced brackets or an open quote take the old path exactly.
         assert_eq!(texts("[a, b"), vec!["a", "b"]);
         assert_eq!(texts("it's, x"), vec!["it's", "x"]);
+        // An apostrophe inside a word is a letter, not a quote that runs on past the comma.
+        assert_eq!(texts("don't, won't"), vec!["don't", "won't"]);
+        assert_eq!(texts("Alice's notes, Bob's notes"), vec!["Alice's notes", "Bob's notes"]);
     }
 
     #[test]
@@ -870,6 +891,11 @@ mod tests {
         for form in ["[[Note]]", "[[Note|shown text]]", "[[folder/Note]]", "[[a/b/Note|x]]", "[[Note#Heading]]", "[[Note^block1]]"] {
             assert_eq!(related_iris(&format!("related:\n  - \"{form}\"")), note, "{form}");
         }
+        // A note name with an apostrophe, in a list of links.
+        assert_eq!(
+            related_iris("related:\n  - \"[[Bob's Notes]]\"\n  - \"[[Roadmap]]\""),
+            related_iris("related:\n  - Bob's Notes\n  - Roadmap")
+        );
         // A bare value keeps today's form: only a wikilink drops its folder.
         assert_eq!(related_iris("related: folder/Note"), vec![format!("<{}entity/folder-note>", ns().uri)]);
         // Every IRI made is one oxigraph accepts.

@@ -8386,7 +8386,11 @@ def extract(
     root = root.resolve()
     # Loaded here, in the main process, so an unusable `packages:` entry is
     # announced once even when the pool's workers are the ones resolving (#172).
-    _load_workspace_packages(root)
+    # Only when there are JS/TS files: they are the ones whose imports resolve
+    # through the workspace, and they skip the cache, so the load happens for
+    # them anyway; a run without them loads nothing.
+    if any(p.suffix in _JS_CACHE_BYPASS_SUFFIXES for p in paths):
+        _load_workspace_packages(root)
 
     effective_root = cache_root or root
     total = len(paths)

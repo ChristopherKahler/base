@@ -363,6 +363,8 @@ pub fn session_start_notice(cwd: &Path) -> Option<String> {
         // `ensure_app_map` above has already started the next build unless one is running or just ran.
         let next = if matches!(outcome, MapPlan::Build | MapPlan::Refresh) {
             "It is trying again now, in the background."
+        } else if recently(&base_ast.join(".building"), BUILD_LOCK_SECS) {
+            "Another build is running now."
         } else {
             "It will try again the next time Claude finishes a reply."
         };
@@ -758,8 +760,14 @@ pub fn run_unattended(cmd: &mut Command, limit: Duration) -> std::io::Result<Una
     }
     let take = |c: &std::sync::Mutex<Vec<u8>>| std::mem::take(&mut *c.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     let ended = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            // Not knowing whether it ended must not leave it running with no limit.
+            Err(e) => {
+                tree.stop(&mut child);
+                return Err(e);
+            }
         }
         if std::time::Instant::now() >= deadline {
             break None;

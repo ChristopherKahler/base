@@ -190,6 +190,17 @@ fn a_stopped_refresh_shows_at_session_start_even_with_a_map() {
             app.display()
         ))
     );
+    // A build already running (its `.building` is fresh) is said as such.
+    age_out();
+    std::fs::write(base_ast.join(".building"), b"").unwrap();
+    assert_eq!(
+        line(&record),
+        Some(format!(
+            "[AST] base stopped updating the code map for {} after 10 minutes because it was stuck. \
+             Your old map is still there. Another build is running now.",
+            app.display()
+        ))
+    );
     // With no map yet, the same record says so.
     std::fs::remove_file(base_ast.join("ast.ttl")).unwrap();
     age_out();
