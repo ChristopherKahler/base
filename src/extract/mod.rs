@@ -18,6 +18,31 @@ pub struct SyncReport {
     pub scanned: usize,
     pub extracted: usize,
     pub skipped: usize,
+    /// Files whose triples do not parse, so nothing of theirs was written or removed (#162). The sync went on past them;
+    /// it is partial when this is not empty.
+    pub unextractable: Vec<Unextractable>,
+}
+
+/// A file the sync could not extract, and the first value that stopped it.
+pub struct Unextractable {
+    /// The file, relative to the workspace.
+    pub file: String,
+    /// The predicate the bad value was for (`relatedTo`), or empty when no single triple fails alone.
+    pub field: String,
+    /// The value as it would have been written.
+    pub value: String,
+    /// The parser's message.
+    pub error: String,
+}
+
+impl std::fmt::Display for Unextractable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.field.is_empty() {
+            write!(f, "sync: skipped {}: it does not extract ({})", self.file, self.error)
+        } else {
+            write!(f, "sync: skipped {}: {} value {} is not valid ({})", self.file, self.field, self.value, self.error)
+        }
+    }
 }
 
 /// Run sync: scan workspace files, extract metadata to graph.
@@ -43,6 +68,7 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
         scanned: 0,
         extracted: 0,
         skipped: 0,
+        unextractable: Vec::new(),
     };
 
     // Walk workspace for matching files
@@ -157,44 +183,61 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
             continue;
         };
 
+        // INSERT fresh triples
+        let now = crud::now_iso();
+        let p = &ns.prefix;
+        let mut insert_body = String::new();
+        let mut entity_iris: Vec<String> = Vec::new();
+        // Each triple as written, so a file that does not parse can be traced to the value that stopped it.
+        let mut lines: Vec<(&str, &str, String)> = Vec::new();
+        for (pred, val) in &triples {
+            // ENTITY@@{iri}@@{pred} triples get their own subject IRI
+            if let Some(rest) = pred.strip_prefix("ENTITY@@") {
+                if let Some((iri, actual_pred)) = rest.split_once("@@") {
+                    let line = format!("    <{iri}> {actual_pred} {val} .\n");
+                    insert_body.push_str(&line);
+                    lines.push((actual_pred, val.as_str(), line));
+                    if !entity_iris.contains(&iri.to_string()) {
+                        entity_iris.push(iri.to_string());
+                    }
+                }
+            } else {
+                let line = format!("    <{file_iri}> {pred} {val} .\n");
+                insert_body.push_str(&line);
+                lines.push((pred.as_str(), val.as_str(), line));
+            }
+        }
+        insert_body.push_str(&format!(
+            "    <{file_iri}> {p}:lastExtracted \"{now}\"^^xsd:dateTime .\n"
+        ));
+        let insert_sparql = format!(
+            "{prefixes}\nINSERT DATA {{\n  GRAPH <{graph_iri}> {{\n{insert_body}  }}\n}}"
+        );
+        // #162: parsed BEFORE anything of this file is deleted. A file whose triples do not parse is skipped and named,
+        // and its earlier triples stay; one such file used to end the whole sync here, with every file before it
+        // unwritten. A store error after a clean parse is not the file's fault and still stops the sync.
+        let update = match oxigraph::sparql::Update::parse(&insert_sparql, None) {
+            Ok(update) => update,
+            Err(e) => {
+                report.unextractable.push(unextractable(&rel_path, &prefixes, &graph_iri, &lines, &e.to_string()));
+                continue;
+            }
+        };
+
         // DELETE existing triples for this file IRI (idempotent re-extraction)
         let delete_sparql = format!(
             "{prefixes}\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{file_iri}> ?p ?o }} }}"
         );
         let _ = store.update(&delete_sparql);
 
-        // INSERT fresh triples
-        let now = crud::now_iso();
-        let p = &ns.prefix;
-        let mut insert_body = String::new();
-        let mut entity_iris: Vec<String> = Vec::new();
-        for (pred, val) in &triples {
-            // ENTITY@@{iri}@@{pred} triples get their own subject IRI
-            if let Some(rest) = pred.strip_prefix("ENTITY@@") {
-                if let Some((iri, actual_pred)) = rest.split_once("@@") {
-                    insert_body.push_str(&format!("    <{iri}> {actual_pred} {val} .\n"));
-                    if !entity_iris.contains(&iri.to_string()) {
-                        entity_iris.push(iri.to_string());
-                    }
-                }
-            } else {
-                insert_body.push_str(&format!("    <{file_iri}> {pred} {val} .\n"));
-            }
-        }
-        insert_body.push_str(&format!(
-            "    <{file_iri}> {p}:lastExtracted \"{now}\"^^xsd:dateTime .\n"
-        ));
         // Clean up old entity triples for entities owned by this document
         for entity_iri in &entity_iris {
             let del_entity = format!("{prefixes}\nDELETE WHERE {{ GRAPH <{graph_iri}> {{ <{entity_iri}> ?p ?o }} }}");
             let _ = store.update(&del_entity);
         }
 
-        let insert_sparql = format!(
-            "{prefixes}\nINSERT DATA {{\n  GRAPH <{graph_iri}> {{\n{insert_body}  }}\n}}"
-        );
         store
-            .update(&insert_sparql)
+            .update(update)
             .with_context(|| format!("inserting triples for {rel_path}"))?;
 
         report.extracted += 1;
@@ -210,6 +253,20 @@ pub fn sync(cwd: &Path, config: &BaseConfig, incremental: bool) -> Result<SyncRe
     let ops = delta.to_ops();
     locked.write(Change::OpWithDelta("extract.markdown", &ops))?;
     Ok(report)
+}
+
+/// Name the first triple of a file that does not parse on its own: its predicate's local name and its value.
+fn unextractable(file: &str, prefixes: &str, graph_iri: &str, lines: &[(&str, &str, String)], error: &str) -> Unextractable {
+    let alone = |line: &str| format!("{prefixes}\nINSERT DATA {{ GRAPH <{graph_iri}> {{\n{line}}} }}");
+    let bad = lines.iter().find_map(|(pred, val, line)| {
+        oxigraph::sparql::Update::parse(&alone(line), None)
+            .err()
+            .map(|e| (pred.rsplit([':', '#', '/']).next().unwrap_or(pred).to_string(), val.to_string(), e.to_string()))
+    });
+    match bad {
+        Some((field, value, error)) => Unextractable { file: file.to_string(), field, value, error },
+        None => Unextractable { file: file.to_string(), field: String::new(), value: String::new(), error: error.to_string() },
+    }
 }
 
 /// Build a file IRI from a relative path.

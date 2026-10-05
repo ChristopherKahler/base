@@ -43,7 +43,7 @@ pub fn extract_with_project(content: &str, file_path: &str, ns: &NamespaceConfig
             }
             "tags" => {
                 for tag in parse_list(value) {
-                    triples.push((format!("{p}:hasTag"), format!("\"{}\"", escape(&tag))));
+                    triples.push((format!("{p}:hasTag"), format!("\"{}\"", escape(&tag.text))));
                 }
             }
             // #115: the shipped manual documents `related:` (docs/markdown-ontology-protocol.md:88,
@@ -52,7 +52,12 @@ pub fn extract_with_project(content: &str, file_path: &str, ns: &NamespaceConfig
             // ops:description triple carrying its own raw text -- a wrong triple
             // inside the boundary, which is worse than dropping it.
             "relatedto" | "related" => {
-                for entity in parse_list(value) {
+                for item in parse_list(value) {
+                    // #162: an Obsidian link names the same entity its bare note name would.
+                    let entity = if item.wikilink { wikilink_target(&item.text) } else { item.text.as_str() };
+                    if entity.is_empty() {
+                        continue;
+                    }
                     let entity_slug = entity
                         .replace(['/', '\\', '.', ' '], "-")
                         .to_lowercase();
@@ -217,9 +222,6 @@ pub fn parse_frontmatter(content: &str) -> Option<Vec<(String, String)>> {
     }
 }
 
-/// Parse a comma-separated list value, handling optional bracket syntax.
-/// "rust, sparql, hooks" → ["rust", "sparql", "hooks"]
-/// "[rust, sparql, hooks]" → ["rust", "sparql", "hooks"]
 /// #115: keys this extractor actually reads. Kept beside the match it mirrors so
 /// the two cannot drift without the drift being visible on one screen.
 const KNOWN_KEYS: &[&str] = &[
@@ -254,13 +256,138 @@ fn trim_scalar(s: &str) -> String {
     s.trim().trim_matches('"').trim_matches('\'').to_string()
 }
 
-fn parse_list(value: &str) -> Vec<String> {
-    let trimmed = value.trim().trim_start_matches('[').trim_end_matches(']');
-    trimmed
-        .split(',')
-        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-        .filter(|s| !s.is_empty())
+/// One item of a frontmatter list. `wikilink` is true when it was written as an
+/// Obsidian link, `[[...]]`; `text` is then what sat between the brackets.
+#[derive(Debug, PartialEq)]
+struct ListItem {
+    text: String,
+    wikilink: bool,
+}
+
+/// Parse a list value item by item, handling optional bracket syntax.
+/// "rust, sparql, hooks" → ["rust", "sparql", "hooks"]
+/// "[rust, sparql, hooks]" → ["rust", "sparql", "hooks"]
+/// `[[alpha]], [[beta]]` (a block list, joined by [`parse_frontmatter`]) → two wikilinks.
+///
+/// #162: the value used to have every leading `[` and trailing `]` trimmed as a
+/// whole before the split, so two wikilinks became `alpha]]` and `[[beta`, and
+/// the brackets reached an IRI. Now one outer `[ ]` comes off only when it wraps
+/// the whole value, the split is at commas outside quotes and brackets, and each
+/// item is read on its own. A value whose brackets do not balance is read the
+/// old way, so nothing that parsed before parses differently, except one case
+/// that was wrong: a quoted item holding a comma (`["foo, bar"]`) is one item.
+fn parse_list(value: &str) -> Vec<ListItem> {
+    let v = value.trim();
+    if !brackets_balance(v) {
+        return v
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+            .filter(|s| !s.is_empty())
+            .map(|text| ListItem { text, wikilink: false })
+            .collect();
+    }
+    split_top_level(unwrap_flow(v))
+        .into_iter()
+        .filter_map(|raw| {
+            let item = unwrap_flow(raw.trim().trim_matches('"').trim_matches('\'').trim());
+            if is_wikilink(item) {
+                let text = item[2..item.len() - 2].trim().to_string();
+                return (!text.is_empty()).then_some(ListItem { text, wikilink: true });
+            }
+            (!item.is_empty()).then(|| ListItem { text: item.to_string(), wikilink: false })
+        })
         .collect()
+}
+
+/// `[[` + text with no bracket in it + `]]`: an Obsidian link, not a nested list.
+fn is_wikilink(s: &str) -> bool {
+    s.len() >= 4 && s.starts_with("[[") && s.ends_with("]]") && !s[2..s.len() - 2].contains(['[', ']'])
+}
+
+/// `s` without the outer `[ ]` pairs that wrap all of it (a flow list), stopping at a wikilink.
+fn unwrap_flow(mut s: &str) -> &str {
+    while !is_wikilink(s) && s.starts_with('[') && closing_bracket(s) == Some(s.len() - 1) {
+        s = s[1..s.len() - 1].trim();
+    }
+    s
+}
+
+/// Where the `[` at the start of `s` closes, skipping brackets inside quotes.
+fn closing_bracket(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '[') => depth += 1,
+            (None, ']') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Every `[` closes and no `]` comes first, outside quotes.
+fn brackets_balance(s: &str) -> bool {
+    let mut depth = 0i64;
+    let mut quote: Option<char> = None;
+    for c in s.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '[') => depth += 1,
+            (None, ']') => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0 && quote.is_none()
+}
+
+/// Split at commas outside quotes and brackets.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '[') => depth += 1,
+            (None, ']') => depth = depth.saturating_sub(1),
+            (None, ',') if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// The note an Obsidian link points at: `Note|alias`, `Note#Heading`, `Note^block`
+/// and `folder/Note` all name `Note`, the way a bare `Note` would (#162).
+fn wikilink_target(inner: &str) -> &str {
+    let name = inner.split('|').next().unwrap_or(inner);
+    let name = name.split(['#', '^']).next().unwrap_or(name);
+    name.rsplit('/').next().unwrap_or(name).trim()
 }
 
 /// Get the markdown body content after the frontmatter closing delimiter.
@@ -411,11 +538,13 @@ fn extract_at_mentions(line: &str, triples: &mut Vec<(String, String)>, ns: &Nam
 
         let after_at = &remaining[at_pos + 1..];
 
-        // Collect path characters
-        let path_len = after_at
+        // Collect path characters. Bytes, not characters: `path_len` indexes the
+        // string, and a count of characters cut `@café` inside the `é` (#166's class).
+        let path_len: usize = after_at
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '/' || *c == '.' || *c == '-' || *c == '_' || *c == '~')
-            .count();
+            .map(char::len_utf8)
+            .sum();
 
         if path_len == 0 {
             remaining = after_at;
@@ -643,6 +772,21 @@ mod tests {
     }
 
     #[test]
+    fn at_mention_with_a_multibyte_letter_does_not_panic() {
+        // `@café` used to be cut inside the `é`: a count of characters was used as a byte index.
+        let content = "---\ntitle: Doc\n---\n\nAsk @café, then read @notes/résumé.md now.\n";
+        let n = ns();
+        let triples = extract_with_project(content, "test.md", &n, None).unwrap();
+        let refs: Vec<_> = triples
+            .iter()
+            .filter(|(p, v)| p.contains("references") && v.contains("document/"))
+            .collect();
+        assert_eq!(refs.len(), 1, "only the path-shaped mention is a reference: {refs:?}");
+        let want = format!("<{}document/{}>", n.uri, crate::crud::slugify("notes/résumé.md"));
+        assert_eq!(refs[0].1, want);
+    }
+
+    #[test]
     fn email_addresses_not_matched_as_mentions() {
         let content = "---\ntitle: Doc\n---\n\nContact user@email.com for info.\n";
         let triples = extract_with_project(content, "test.md", &ns(), None).unwrap();
@@ -655,19 +799,83 @@ mod tests {
 
     // --- parse_list ---
 
+    fn texts(value: &str) -> Vec<String> {
+        parse_list(value).into_iter().map(|i| i.text).collect()
+    }
+
     #[test]
     fn parse_list_comma_separated() {
-        assert_eq!(parse_list("a, b, c"), vec!["a", "b", "c"]);
+        assert_eq!(texts("a, b, c"), vec!["a", "b", "c"]);
     }
 
     #[test]
     fn parse_list_bracket_syntax() {
-        assert_eq!(parse_list("[x, y]"), vec!["x", "y"]);
+        assert_eq!(texts("[x, y]"), vec!["x", "y"]);
     }
 
     #[test]
     fn parse_list_single_value() {
-        assert_eq!(parse_list("solo"), vec!["solo"]);
+        assert_eq!(texts("solo"), vec!["solo"]);
+    }
+
+    #[test]
+    fn parse_list_reads_what_it_read_before() {
+        // Every shape that parsed before #162 parses the same.
+        assert_eq!(texts("[[a]]"), vec!["a"], "one wikilink alone");
+        assert_eq!(texts("[\"a\", 'b']"), vec!["a", "b"]);
+        assert_eq!(texts("signal-mod, hook-engine"), vec!["signal-mod", "hook-engine"], "a joined block list");
+        // Unbalanced brackets or an open quote take the old path exactly.
+        assert_eq!(texts("[a, b"), vec!["a", "b"]);
+        assert_eq!(texts("it's, x"), vec!["it's", "x"]);
+    }
+
+    #[test]
+    fn a_quoted_item_holding_a_comma_is_one_item() {
+        // The one parse #162's fix changes: `["foo, bar"]` was two items, and is one, as YAML reads it.
+        assert_eq!(texts("[\"foo, bar\", baz]"), vec!["foo, bar", "baz"]);
+        let content = "---\ntags: [\"foo, bar\"]\nrelated: [\"a, b\"]\n---\n";
+        let triples = extract_with_project(content, "test.md", &ns(), None).unwrap();
+        assert_eq!(tags_control(&triples), 1);
+        let edges = related_edges(&triples);
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        let iri = edges[0].1.trim_start_matches('<').trim_end_matches('>');
+        assert!(oxigraph::model::NamedNode::new(iri).is_ok(), "the IRI it makes is valid: {iri}");
+    }
+
+    // --- #162: Obsidian wikilinks in `related:` ---
+
+    /// The `relatedTo` IRIs a document with this frontmatter gets, sorted.
+    fn related_iris(frontmatter: &str) -> Vec<String> {
+        let content = format!("---\ntags: [x]\n{frontmatter}\n---\n");
+        let triples = extract_with_project(&content, "test.md", &ns(), None).unwrap();
+        assert_eq!(tags_control(&triples), 1, "CONTROL FAILED: frontmatter did not parse");
+        let mut iris: Vec<String> = related_edges(&triples).into_iter().map(|(_, v)| v.clone()).collect();
+        iris.sort();
+        iris
+    }
+
+    #[test]
+    fn wikilink_list_items_resolve_like_bare_values() {
+        let bare2 = related_iris("related:\n  - alpha\n  - beta");
+        assert_eq!(bare2.len(), 2);
+        // Two and three block items, each a quoted wikilink: the #162 reproduction.
+        assert_eq!(related_iris("related:\n  - \"[[alpha]]\"\n  - \"[[beta]]\""), bare2);
+        let bare3 = related_iris("related:\n  - alpha\n  - beta\n  - gamma");
+        assert_eq!(related_iris("related:\n  - \"[[alpha]]\"\n  - \"[[beta]]\"\n  - \"[[gamma]]\""), bare3);
+        // Inline, quoted, in a flow list.
+        assert_eq!(related_iris("related: [\"[[alpha]]\", \"[[beta]]\"]"), bare2);
+        // Alias, folder, heading and block anchors all name the note.
+        let note = related_iris("related: Note");
+        assert_eq!(note, vec![format!("<{}entity/note>", ns().uri)]);
+        for form in ["[[Note]]", "[[Note|shown text]]", "[[folder/Note]]", "[[a/b/Note|x]]", "[[Note#Heading]]", "[[Note^block1]]"] {
+            assert_eq!(related_iris(&format!("related:\n  - \"{form}\"")), note, "{form}");
+        }
+        // A bare value keeps today's form: only a wikilink drops its folder.
+        assert_eq!(related_iris("related: folder/Note"), vec![format!("<{}entity/folder-note>", ns().uri)]);
+        // Every IRI made is one oxigraph accepts.
+        for iri in related_iris("related:\n  - \"[[alpha]]\"\n  - \"[[folder/Beta|b]]\"") {
+            assert!(oxigraph::model::NamedNode::new(iri.trim_matches(['<', '>'])).is_ok(), "{iri}");
+        }
     }
 
     // --- Combined: frontmatter + body ---

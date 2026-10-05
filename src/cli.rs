@@ -155,6 +155,10 @@ pub enum Commands {
         action: ForkAction,
     },
     /// Sync file-owned data into the graph
+    ///
+    /// Exit codes: 0 every file was synced; 3 partial: the files named on stderr could not be extracted and were
+    /// skipped, every other file was written; 1 the sync failed and nothing was written; 2 it did not start (bad
+    /// arguments).
     Sync {
         /// Only re-extract files changed since last sync
         #[arg(long)]
@@ -1264,7 +1268,8 @@ fn reminder_slug(cwd: &std::path::Path, arg: &str) -> String {
 /// Parse a relative duration like "30s", "3m", "2h", "1d".
 fn parse_duration(s: &str) -> anyhow::Result<chrono::Duration> {
     let s = s.trim();
-    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    // At the last character, not the last byte: `3分` would split inside the `分`.
+    let (num, unit) = s.split_at(s.char_indices().last().map_or(0, |(i, _)| i));
     let n: i64 = num
         .parse()
         .map_err(|_| anyhow::anyhow!("bad duration number in '{s}'"))?;
@@ -1951,6 +1956,10 @@ fn outside_workspace_note(cwd: &std::path::Path) {
 fn project_error_prefix(e: &anyhow::Error) -> &'static str {
     if e.downcast_ref::<crud::project::Refused>().is_some() { "Error" } else { "Failed" }
 }
+
+/// `base sync`'s exit code when some files could not be extracted and every other file was written (#162). Not 2: that
+/// is what clap and base use for a run that did not start.
+const SYNC_PARTIAL: i32 = 3;
 
 fn die(prefix: &str, e: impl std::fmt::Display) -> ! {
     eprintln!("{prefix}: {e:#}");
@@ -3446,11 +3455,27 @@ pub fn run() {
                 }
             } else {
                 match base::extract::sync(&cwd, &config, incremental) {
-                    Ok(report) => {
+                    Ok(report) if report.unextractable.is_empty() => {
                         println!(
                             "Sync complete: {} scanned, {} extracted, {} skipped",
                             report.scanned, report.extracted, report.skipped
                         );
+                    }
+                    Ok(report) => {
+                        // #162: every other file is written; the ones named were not, and the exit code says so.
+                        for file in &report.unextractable {
+                            eprintln!("{file}");
+                        }
+                        println!(
+                            "Sync partial: {} scanned, {} extracted, {} skipped, {} could not be extracted (named above)",
+                            report.scanned,
+                            report.extracted,
+                            report.skipped,
+                            report.unextractable.len()
+                        );
+                        // `exit` skips destructors: the files that were written still refresh the rule index.
+                        drop(_refresh_index);
+                        std::process::exit(SYNC_PARTIAL);
                     }
                     Err(e) => die("Sync failed", e),
                 }
@@ -5816,6 +5841,14 @@ mod tests {
     fn rebuilds_index(args: &[&str]) -> bool {
         let cli = Cli::try_parse_from(std::iter::once("base").chain(args.iter().copied())).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         changes_prompt_matching(&cli.command)
+    }
+
+    /// A duration whose unit is a multi-byte character is refused, not split inside that character.
+    #[test]
+    fn a_duration_ending_in_a_multibyte_character_is_an_error_not_a_panic() {
+        assert!(parse_duration("3分").is_err());
+        assert!(parse_duration("").is_err());
+        assert_eq!(parse_duration(" 90s ").unwrap(), chrono::Duration::seconds(90), "control: a valid duration still parses");
     }
 
     /// K7e (BO-18): the commands that change what a prompt can be served, or replace or move the graph holding it,
