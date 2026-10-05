@@ -1,6 +1,6 @@
 //! The upgrade turns the 0.15 installer's developer mode off (BO-28).
 //!
-//! Every installer from 0.13.0 to 0.15.2 wrote `[devmode] enabled = true` into the global base.toml, so most users' Claude
+//! Every installer from 0.7.0 to 0.15.2 wrote `[devmode] enabled = true` into the global base.toml, so most users' Claude
 //! ended every reply with a DEVMODE block nobody chose. 0.16's installer writes it off (BO-27); this turns it off for the
 //! users who still have the installer's line, once, and tells them how to get it back where they cannot miss it.
 //!
@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{read_record, write_record, Record, Tier, VERSION};
 
-/// The `[devmode]` line every installer from 0.13.0 to 0.15.2 wrote, byte for byte.
+/// The `[devmode]` line every installer from 0.7.0 (24c7bf6) to 0.15.2 wrote, byte for byte. Installers before it
+/// wrote a plain `enabled = true`, which reads as a value someone set.
 pub const INSTALLER_LINE: &str = "enabled = true            # false = no diagnostic block";
 
 /// What the line becomes: the line this version's installer writes, so an upgraded file reads like a new one.
@@ -50,6 +51,9 @@ pub struct Off {
     pub backup: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The version that made the change, which the paragraph names wherever it is printed again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// `[devmode]` from a table header line, whitespace and any trailing comment ignored.
@@ -135,9 +139,9 @@ fn set_to(tier: &Tier, file: &Path, value: bool) -> String {
 
 /// The paragraph session start prints once and `base doctor` repeats: what changed and why, what the block did, where
 /// to see the same thing without it, and both ways back.
-pub fn paragraph(tier: &Tier, file: &Path, backup: &Path) -> String {
+pub fn paragraph(tier: &Tier, file: &Path, backup: &Path, version: &str) -> String {
     format!(
-        "base {VERSION} turned developer mode off. The 0.15 installer had turned it on for every user, so Claude ended every \
+        "base {version} turned developer mode off. The 0.15 installer had turned it on for every user, so Claude ended every \
          reply with a DEVMODE block listing the domains and rules base injected. To see what base injects without it: \
          base log matches. To turn it back on: {} (while it is on, base does not update itself). To undo this change: \
          base doctor --restore \"{}\"",
@@ -229,7 +233,7 @@ fn turn_off_tier(tier: &Tier, record: &mut Record) -> Option<String> {
     }
     let failed = |record: &mut Record, why: String| -> Option<String> {
         super::announce(record, failed_line(tier, &file, &why));
-        record.devmode_off = Some(Off { status: "failed".into(), at: Some(super::now()), error: Some(why), backup: None });
+        record.devmode_off = Some(Off { status: "failed".into(), at: Some(super::now()), error: Some(why), ..Default::default() });
         let _ = write_record(&tier.store, record);
         None
     };
@@ -248,6 +252,7 @@ fn turn_off_tier(tier: &Tier, record: &mut Record) -> Option<String> {
         at: Some(super::now()),
         backup: Some(backup.display().to_string()),
         error: None,
+        version: Some(VERSION.to_string()),
     });
     write_record(&tier.store, record).ok()?;
     let tmp = file.with_extension("toml.devmode-tmp");
@@ -255,7 +260,7 @@ fn turn_off_tier(tier: &Tier, record: &mut Record) -> Option<String> {
         let _ = std::fs::remove_file(&tmp);
         return failed(record, format!("writing {}: {e}", file.display()));
     }
-    Some(paragraph(tier, &file, &backup))
+    Some(paragraph(tier, &file, &backup, VERSION))
 }
 
 // ─── base doctor ───────────────────────────────────────────────────────────
@@ -272,7 +277,7 @@ pub fn advice(cwd: &Path) -> Vec<String> {
         }
         let file = tier.config.join("base.toml");
         if std::fs::read_to_string(&file).is_ok_and(|t| is_upgrades_line(&t)) {
-            out.push(paragraph(&tier, &file, Path::new(backup)));
+            out.push(paragraph(&tier, &file, Path::new(backup), off.version.as_deref().unwrap_or(VERSION)));
         }
     }
     out

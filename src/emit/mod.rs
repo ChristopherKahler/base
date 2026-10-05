@@ -439,9 +439,8 @@ pub struct Rendered {
     /// never resolved: those blocks are the whole first screen and none of them may degrade, so
     /// trimming anything else cannot make them fit.
     pub first_screen_ok: bool,
-    /// The block the caller excused from the first screen: set only when the screen overflows by that block alone,
-    /// a notice shown once on purpose (BO-28, session start's `devmode-off`). Then `first_screen_ok` is true,
-    /// `first_screen_len_u16` stays as measured, and the record names the block. `None` from [`Emission::render`].
+    /// The block whose allowance ([`Emission::excuse_from_first_screen`]) is all that made the first screen fit: then
+    /// `first_screen_ok` is true, `first_screen_len_u16` is the whole measured length, and the record names the block.
     pub first_screen_excused: Option<String>,
     pub withheld: Vec<Withheld>,
     pub blocks: Vec<Block>,
@@ -469,6 +468,9 @@ pub struct Emission {
     /// delivery, so it is not measured against the host's limit. The `[budget] first_screen_chars`
     /// key keeps its name because the name matches what it measures.
     first_screen_u16: usize,
+    /// First-screen units a caller excused, and the block they belong to (see
+    /// [`Emission::excuse_from_first_screen`]).
+    excused: Option<(String, usize)>,
 }
 
 impl Emission {
@@ -478,7 +480,17 @@ impl Emission {
             withheld: Vec::new(),
             budget_bytes,
             first_screen_u16,
+            excused: None,
         }
+    }
+
+    /// Leave `units` of the first screen out of its limit, on behalf of block `id`: a notice shown once on purpose
+    /// whose own lines (and what it adds to other first-screen blocks) should cost nothing else (BO-28, session
+    /// start's `devmode-off`). The fit pass and `first_screen_ok` measure the screen less `units`, so DUE NOW is not
+    /// cut to make room for it; `first_screen_len_u16` stays the whole measured length, and `first_screen_excused`
+    /// names the block when the screen fits only with the allowance.
+    pub fn excuse_from_first_screen(&mut self, id: impl Into<String>, units: usize) {
+        self.excused = Some((id.into(), units));
     }
 
     /// Add a block in rank order, after any block of the same rank already present. A second
@@ -539,6 +551,7 @@ impl Emission {
     /// and every block can degrade at most twice, so the loop ends.
     pub fn render(mut self, full: &FullOutput, header: Option<Header<'_>>) -> Rendered {
         let full_bytes = self.full_text().len();
+        let allowance = self.excused.as_ref().map_or(0, |(_, units)| *units);
         let (text, prefix) = loop {
             let head = self.header_line(full, header);
             // The first screen is a READABILITY limit and stays in UTF-16 units; the budget below
@@ -552,8 +565,8 @@ impl Emission {
             // never past its last fit. It runs only when that would make the screen fit: an
             // overflow from blocks that cannot shrink (a long relay message) would otherwise hide
             // due reminders for nothing. What still overflows is reported in `first_screen_ok`.
-            if prefix > self.first_screen_u16
-                && self.first_screen_floor(&head) <= self.first_screen_u16
+            if prefix.saturating_sub(allowance) > self.first_screen_u16
+                && self.first_screen_floor(&head).saturating_sub(allowance) <= self.first_screen_u16
                 && self.fit_first_screen()
             {
                 continue;
@@ -566,16 +579,18 @@ impl Emission {
             break (text, prefix);
         };
         let emitted_bytes = text.len();
+        let fits = prefix.saturating_sub(allowance) <= self.first_screen_u16;
+        let excused = self.excused.take().filter(|_| fits && prefix > self.first_screen_u16).map(|(id, _)| id);
         Rendered {
             over_budget: emitted_bytes > self.budget_bytes,
-            first_screen_ok: prefix <= self.first_screen_u16,
+            first_screen_ok: fits,
             text,
             emitted_bytes,
             full_bytes,
             budget_bytes: self.budget_bytes,
             first_screen_u16: self.first_screen_u16,
             first_screen_len_u16: prefix,
-            first_screen_excused: None,
+            first_screen_excused: excused,
             withheld: self.withheld,
             blocks: self.blocks,
         }
@@ -859,6 +874,41 @@ mod tests {
         assert!(!unreachable.first_screen_ok, "what still overflows is reported");
         assert!(due_rows(&unreachable).is_empty());
         assert_eq!(unreachable.first_screen_len_u16, 194);
+    }
+
+    /// BO-28: an allowance a caller excuses (session start's developer-mode paragraph) is left out of the first
+    /// screen's measure: DUE NOW is not cut to make room for it, the run fits and names the block, and the measured
+    /// length stays whole. Controls: the same layout with no allowance cuts DUE NOW to fit, and an overflow the allowance
+    /// does not cover is still reported, with nothing excused.
+    #[test]
+    fn an_excused_block_costs_due_now_nothing_on_the_first_screen() {
+        let line = |i: usize| format!("{i}{}", "d".repeat(49));
+        let due = |k: usize| (1..=k).map(line).collect::<Vec<_>>().join("\n");
+        // 61 + 41 + 153 = 255 units with all three items; 153 at DUE NOW's last fit.
+        let render = |screen: usize, allowance: Option<usize>| {
+            let mut e = Emission::new(10_000, screen);
+            assert!(e.push(blk("devmode-off", Rank::Pinned, &"D".repeat(60), 0)));
+            assert!(e.push(blk("instructions", Rank::Pinned, &"I".repeat(40), 0)));
+            assert!(e.push(blk("due", Rank::DueNow, &due(3), 3).with_fits(vec![(due(2), 2), (due(1), 1)])));
+            if let Some(units) = allowance {
+                e.excuse_from_first_screen("devmode-off", units);
+            }
+            e.render(&FullOutput::off(), None)
+        };
+        let shown = |r: &Rendered| r.blocks.iter().find(|b| b.id() == "due").map(Block::items_shown);
+
+        let plain = render(200, None);
+        assert_eq!(shown(&plain), Some(1), "control: without the allowance DUE NOW is cut to fit");
+        assert!(plain.first_screen_ok && plain.first_screen_excused.is_none());
+
+        let excused = render(200, Some(61));
+        assert_eq!((shown(&excused), excused.first_screen_len_u16), (Some(3), 255), "nothing cut, length whole");
+        assert!(excused.first_screen_ok && excused.withheld.is_empty());
+        assert_eq!(excused.first_screen_excused.as_deref(), Some("devmode-off"));
+
+        let beyond = render(50, Some(61));
+        assert!(!beyond.first_screen_ok, "an overflow the allowance does not cover is reported");
+        assert_eq!((shown(&beyond), beyond.first_screen_excused), (Some(3), None));
     }
 
     /// A first screen that stepping cannot fix is left alone (BO-00 code review): a `DueNow` block

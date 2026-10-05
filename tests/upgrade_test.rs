@@ -778,7 +778,7 @@ fn upgrade_from_0_15_2_keeps_overdue_reminders() {
 
 // ─── BO-28: the 0.15 installer's developer mode ───────────────────────────
 
-/// The `[devmode]` line every installer from 0.13.0 to 0.15.2 wrote, byte for byte.
+/// The `[devmode]` line every installer from 0.7.0 to 0.15.2 wrote, byte for byte.
 const DEVMODE_015: &str = "enabled = true            # false = no diagnostic block";
 /// The line 0.16's installer writes, and what the upgrade turns the one above into.
 const DEVMODE_016: &str = "enabled = false           # true = a diagnostic block on every response";
@@ -965,6 +965,15 @@ fn doctor_shows_devmode_line_for_14_days() {
     let paragraph = devmode_paragraph(&start(&s)).expect("the paragraph");
     assert!(doctor(&s).contains(&paragraph), "day 0:\n{}", doctor(&s));
     let rec_file = gbl(&s).join(".base").join("upgrade.json");
+    // The paragraph names the version that made the change, not whichever base runs doctor later (code review).
+    let mut rec = record(&gbl(&s).join(".base"));
+    let made_by = rec["devmode_off"]["version"].clone();
+    assert_eq!(made_by, VERSION, "{rec}");
+    rec["devmode_off"]["version"] = serde_json::Value::from("9.9.9");
+    write(&rec_file, &rec.to_string());
+    assert!(doctor(&s).contains("base 9.9.9 turned developer mode off"), "{}", doctor(&s));
+    rec["devmode_off"]["version"] = made_by;
+    write(&rec_file, &rec.to_string());
     let at = |days: i64| {
         let mut rec = record(&gbl(&s).join(".base"));
         rec["devmode_off"]["at"] = serde_json::Value::from((chrono::Local::now() - chrono::Duration::days(days)).to_rfc3339());

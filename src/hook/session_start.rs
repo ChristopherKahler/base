@@ -754,6 +754,20 @@ impl SessionOutput {
         }
 
         let mut emission = Emission::new(budget.session_start_bytes, budget.first_screen_chars);
+        // BO-28 (lynx's ruling): the one start that prints the developer-mode paragraph may run the first screen past
+        // `first_screen_chars` by what the paragraph adds: its own lines, the blank line after it, and step 1's
+        // exception in the instructions. The paragraph is first and is what that start must show; DUE NOW is not cut to
+        // make room for it, the run counts as fitting, and its record names the block. Any other overflow is reported.
+        if let Some(p) = placed.iter().find(|p| p.kind == "devmode-off") {
+            let own = emit::u16_len(p.text.trim_matches(['\r', '\n'])) + 2;
+            let step = if placed.iter().any(|p| p.kind == "instructions") {
+                emit::u16_len(&instruction_block(&letters, true))
+                    .saturating_sub(emit::u16_len(&instruction_block(&letters, false)))
+            } else {
+                0
+            };
+            emission.excuse_from_first_screen("devmode-off", own + step);
+        }
         for p in placed {
             let floor = floor_line(&p.kind, p.total, &full);
             let command = command_for(&p.kind)
@@ -770,20 +784,7 @@ impl SessionOutput {
             emission.note_withheld(row.block, row.items, row.reason, row.command);
         }
         let header = |facts: &Facts<'_>| header_line(facts, &counts);
-        let mut rendered = emission.render(&full, Some(&header));
-        // BO-28 (lynx's ruling): the one start that prints the developer-mode paragraph may run the first screen past
-        // `first_screen_chars` by that block alone. The paragraph is what must be seen and it is first; the blocks it
-        // pushes down still print whole. That start counts as fitting and its record names the block, so doctor does not
-        // report it as an overflow. Any overflow beyond the block is reported as before.
-        if !rendered.first_screen_ok
-            && let Some(block) = rendered.blocks.iter().find(|b| kind_of(b.id()) == "devmode-off")
-        {
-            let own = emit::u16_len(block.text().trim_end_matches(['\r', '\n'])) + 1;
-            if rendered.first_screen_len_u16.saturating_sub(own) <= rendered.first_screen_u16 {
-                rendered.first_screen_ok = true;
-                rendered.first_screen_excused = Some("devmode-off".to_string());
-            }
-        }
+        let rendered = emission.render(&full, Some(&header));
         if !rendered.first_screen_ok {
             eprintln!(
                 "base: session start's header, instructions and DUE NOW take {} units, more than the first {}",
