@@ -2282,3 +2282,43 @@ fn replay_upgrade_turns_the_installers_devmode_off_once() {
     }
     println!("replay devmode: prompts carrying DEVMODE {on_before} of {on_before} before the start that says so, {on_after} after");
 }
+
+// ── BO-31 (Z1): held-back rules keep a title ──────────────────────────────────────────────────────────
+
+/// BO-31 (Z1, Z5). On every corpus prompt, keyword-only and with the rule index built: a prompt that holds back a rule
+/// (a rules block dropped whole, or rules withheld from a ranked block) ends with the held-back list, whose first line
+/// counts exactly those rules and whose every title or count line names the block's `base hooks show` command, and the
+/// output stays within the budget; a prompt that holds back no rule prints no list. Before BO-31 such a prompt left
+/// only pointer lines, which say where the rules are and not what they are.
+#[test]
+fn replay_held_back_rules_leave_their_titles() {
+    let (mut listed, mut quiet) = (0usize, 0usize);
+    for run in prompt_runs().iter().chain(bm25_runs()) {
+        let p = &run.prompt;
+        let file = seed::prompt_blocks(&run.ws, &run.session);
+        let rules = file.blocks.iter().filter(|b| b.noun == "rule");
+        let held: usize = rules.clone().map(|b| if b.printed { b.withheld_items.unwrap_or(0) } else { b.items }).sum();
+        assert!(run.stdout.len() <= PROMPT_BYTES, "{p:?}: {} bytes", run.stdout.len());
+        if held == 0 {
+            assert!(file.held_back.is_none() && !run.stdout.contains(" did not fit in its "), "{p:?}: a list with nothing held back");
+            quiet += 1;
+            continue;
+        }
+        let list = file.held_back.as_deref().unwrap_or_else(|| panic!("{p:?}: {held} rules held back and no list:\n{}", run.stdout));
+        assert!(run.stdout.ends_with(&format!("\n\n{list}\n")), "{p:?}: the list ends the output:\n{}", run.stdout);
+        let lines: Vec<&str> = list.lines().collect();
+        assert_eq!(lines[0], base::emit::prompt::held_back_header(held, file.budget_bytes), "{p:?}");
+        for b in rules.filter(|b| !b.printed || b.withheld_items.is_some()).filter(|b| b.items > 0) {
+            let command = format!("base hooks show {}", b.id);
+            assert!(
+                lines.iter().any(|l| *l == command || (l.starts_with("and ") && l.contains(&format!("{command} (")))),
+                "{p:?}: {} held back rules and the list does not name it:\n{list}",
+                b.id
+            );
+        }
+        listed += 1;
+    }
+    assert!(listed > 0, "control: no corpus prompt held back a rule");
+    assert!(quiet > 0, "control: every corpus prompt held back a rule");
+    println!("replay: {listed} prompts list held-back rules by title, {quiet} hold back none");
+}

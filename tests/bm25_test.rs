@@ -263,11 +263,32 @@ fn bm25_off_and_no_index_print_what_07277bc_printed() {
         runs.iter().any(|r| r["stdout"].as_str().unwrap_or_default().contains("[base: withheld ")),
         "control: the golden holds prompts that went over the budget"
     );
+    let mut listed = 0;
     for (tag, extra, index) in [("off", "\n[match]\nbm25 = false\n", true), ("no-index", "", false)] {
         let got = corpus_outputs(tag, extra, &lines, index);
         for (want, got) in runs.iter().zip(&got) {
-            assert_eq!(got["stdout"], want["stdout"], "[{tag}] line {}: the printed output differs from 07277bc's", want["line"]);
-            assert_eq!(got["blocks"], want["blocks"], "[{tag}] line {}: the blocks file differs from 07277bc's", want["line"]);
+            // BO-31: a prompt that holds back rules ends with the held-back list, which the blocks file keeps too.
+            // Everything before it is still what 07277bc printed and wrote, byte for byte.
+            let (stdout, blocks, list) = without_held_back_list(got);
+            listed += usize::from(list);
+            assert_eq!(stdout, want["stdout"], "[{tag}] line {}: the printed output differs from 07277bc's", want["line"]);
+            assert_eq!(blocks, want["blocks"], "[{tag}] line {}: the blocks file differs from 07277bc's", want["line"]);
         }
+    }
+    assert!(listed > 0, "control: some corpus prompt held back rules and listed them");
+}
+
+/// One corpus output with BO-31's held-back list taken off the end of its stdout and out of its blocks file, and whether
+/// it had one. A list is always the output's end, after a blank line.
+fn without_held_back_list(got: &serde_json::Value) -> (serde_json::Value, serde_json::Value, bool) {
+    let mut blocks = got["blocks"].clone();
+    let list = blocks.as_object_mut().expect("an object").remove("held_back");
+    let stdout = got["stdout"].as_str().expect("stdout").to_string();
+    match list.as_ref().and_then(|l| l.as_str()) {
+        Some(l) => {
+            let before = stdout.strip_suffix(&format!("\n{l}\n")).unwrap_or_else(|| panic!("the list does not end the output:\n{stdout}"));
+            (serde_json::Value::from(before), blocks, true)
+        }
+        None => (serde_json::Value::from(stdout), blocks, false),
     }
 }

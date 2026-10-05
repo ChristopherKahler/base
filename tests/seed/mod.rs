@@ -649,6 +649,9 @@ pub struct PromptRow {
 pub struct PromptBlocksFile {
     pub budget_bytes: usize,
     pub blocks: Vec<PromptRow>,
+    /// The held-back list printed after the blocks (BO-31), when the prompt printed one.
+    #[serde(default)]
+    pub held_back: Option<String>,
 }
 
 /// `session`'s prompt blocks file in the workspace `ws`.
@@ -694,7 +697,7 @@ pub fn partial_text(row: &PromptRow, budget: usize) -> String {
 
 /// What the prompt hook must have printed, rebuilt from its blocks file: the `<context-bracket>` line when `stdout`
 /// starts with one, then every block whole, or as printed with rules withheld ([`partial_text`], BO-18), or its pointer
-/// line, a blank line between, one newline at the end.
+/// line, then the held-back list when there is one (BO-31), a blank line between, one newline at the end.
 pub fn rebuilt_prompt_output(stdout: &str, file: &PromptBlocksFile) -> String {
     let header = stdout.lines().next().filter(|l| l.starts_with("<context-bracket>")).unwrap_or("");
     let mut parts: Vec<String> = Vec::new();
@@ -708,6 +711,8 @@ pub fn rebuilt_prompt_output(stdout: &str, file: &PromptBlocksFile) -> String {
             (false, _) => pointer_line(row, file.budget_bytes),
         });
     }
+    // BO-31: the held-back list goes last, after a blank line, as the hook printed it.
+    parts.extend(file.held_back.clone());
     if parts.is_empty() {
         return String::new();
     }

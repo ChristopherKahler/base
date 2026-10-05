@@ -106,6 +106,12 @@ fn prompt(config: &BaseConfig, root: &Path, text: &str) -> String {
 
 /// The rule labels a prompt's output carries, in order.
 fn sent(out: &str) -> Vec<&'static str> {
+    // BO-31: a rule the budget held back is listed by title at the end of the output (`  0. CODENAME_RULE …`); a title
+    // is not the rule sent, so the scan stops at the list's first line.
+    let out = match out.find(" for this message did not fit in its ") {
+        Some(at) => &out[..out[..at].rfind('\n').unwrap_or(0)],
+        None => out,
+    };
     const LABELS: [&str; 11] = [
         "CODENAME_RULE", "T1_RULE", "T2_RULE", "T3_RULE", "T4_RULE", "T5_RULE", "T6_RULE", "T3T4_RULE", "T5T6_RULE",
         "DEPLETED_RULE", "CRITICAL_RULE",

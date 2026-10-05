@@ -104,6 +104,9 @@ pub struct PromptBlock {
     /// Built by the matching (`user_prompt_submit::serve`, BO-20): a shadow candidate's fit puts its own in place of
     /// these. Never read for the output.
     pub matcher: bool,
+    /// A plain block of rules: one [`title`] per rule, in the block's order, listed when the fit drops the block (BO-31).
+    /// Empty for every other block; a ranked block's titles are on its parts.
+    pub titles: Vec<String>,
 }
 
 /// One rule or decision of a ranked block: its line, its score, and what printing it records (D15) and logs (K1).
@@ -113,11 +116,25 @@ pub struct BlockPart {
     pub score: f32,
     pub claims: Vec<Claim>,
     pub logged: Vec<super::match_log::Item>,
+    /// A rule's [`title`], shown in the held-back list when the fit withholds the rule (BO-31). `None` for a decision.
+    pub title: Option<String>,
 }
 
 impl BlockPart {
     pub fn new(text: &str, score: f32) -> Self {
-        BlockPart { text: text.trim_matches(['\r', '\n']).to_string(), score, claims: Vec::new(), logged: Vec::new() }
+        BlockPart {
+            text: text.trim_matches(['\r', '\n']).to_string(),
+            score,
+            claims: Vec::new(),
+            logged: Vec::new(),
+            title: None,
+        }
+    }
+
+    /// This part is a rule: when the fit withholds it, its [`title`] (from its own line) is listed (BO-31).
+    pub fn titled(mut self) -> Self {
+        self.title = Some(title(&self.text));
+        self
     }
 
     pub fn with_claims(mut self, claims: impl IntoIterator<Item = Claim>) -> Self {
@@ -154,7 +171,14 @@ impl PromptBlock {
             head: String::new(),
             tail: String::new(),
             matcher: false,
+            titles: Vec::new(),
         }
+    }
+
+    /// This plain block is rules, one per line given (each as the block prints it): their [`title`]s (BO-31).
+    pub fn with_titles<'a>(mut self, rule_lines: impl IntoIterator<Item = &'a str>) -> Self {
+        self.titles.extend(rule_lines.into_iter().map(title));
+        self
     }
 
     /// A ranked block (BO-18): `head`, then `parts` in the order given (the caller puts the best first), then `tail`.
@@ -352,6 +376,137 @@ pub fn partial_line(block: &PromptBlock, withheld: usize, bytes: usize, key: &st
     )
 }
 
+/// The most characters a held-back rule's [`title`] takes, its number included (BO-31, G0 Q1).
+pub const TITLE_CHARS: usize = 100;
+/// The held-back list takes at most one part in this many of the budget (BO-31, G0 Q3): showing titles may hold back
+/// more full text, and this bounds how much.
+pub const TITLE_SHARE: usize = 5;
+
+/// A rule's title (BO-31): its line as its block prints it (`  12. Text…` or `  - Text…`), on one line, ended at its
+/// first sentence and cut at a word boundary to at most [`TITLE_CHARS`] characters, with `…` when cut. The number or
+/// dash stays in front, so the title points at the same rule in `base hooks show <block>`.
+pub fn title(line: &str) -> String {
+    let one = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let marker_end = list_marker_end(&one);
+    let (marker, body) = one.split_at(marker_end);
+    let sentence = &body[..first_sentence_end(body)];
+    let whole = format!("{marker}{sentence}");
+    if whole.chars().count() <= TITLE_CHARS {
+        return whole;
+    }
+    let cut: String = whole.chars().take(TITLE_CHARS - 1).collect();
+    let at_word = match cut.rfind(' ') {
+        Some(sp) if sp > marker.len() + cut.len() / 3 => &cut[..sp],
+        _ => cut.as_str(),
+    };
+    format!("{}…", at_word.trim_end_matches([' ', ',', ';', ':', '-', '—', '(']))
+}
+
+/// The byte where a rule line's own number (`12. `) or dash (`- `) ends, 0 when it has neither.
+fn list_marker_end(s: &str) -> usize {
+    if let Some(rest) = s.strip_prefix("- ") {
+        return s.len() - rest.len();
+    }
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 && s[digits..].starts_with(". ") { digits + 2 } else { 0 }
+}
+
+/// The byte just past the first sentence of `s` (its `.`, `!` or `?` before a space or the end, not one of `e.g.`,
+/// `i.e.`, `etc.`, `vs.`, `cf.`), or its length when it has one sentence.
+fn first_sentence_end(s: &str) -> usize {
+    const ABBREVIATIONS: [&str; 5] = ["e.g.", "i.e.", "etc.", "vs.", "cf."];
+    for (i, c) in s.char_indices() {
+        if !matches!(c, '.' | '!' | '?') {
+            continue;
+        }
+        let end = i + c.len_utf8();
+        if !s[end..].chars().next().is_none_or(char::is_whitespace) {
+            continue;
+        }
+        let head = s[..end].to_lowercase();
+        let abbreviation = ABBREVIATIONS.iter().any(|a| {
+            head.ends_with(a) && head[..head.len() - a.len()].chars().next_back().is_none_or(|p| !p.is_alphanumeric())
+        });
+        if !abbreviation {
+            return end;
+        }
+    }
+    s.len()
+}
+
+/// One held-back rule as the list shows it: the block that holds it (its `base hooks show` name) and its [`title`].
+/// `at` is the rule's place in its block, so two rules whose titles read the same are still two rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    pub block: String,
+    pub title: String,
+    pub at: usize,
+}
+
+/// The held-back list's first line (BO-31, G0 Q2): how many rules did not fit and what Claude does about them.
+pub fn held_back_header(n: usize, budget_bytes: usize) -> String {
+    format!(
+        "[base: {} for this message did not fit in its {}-byte limit. {} still {}: before you act on anything a title below \
+         covers, run the command above the title and read the rule in full.]",
+        counted(n, "rule"),
+        thousands(budget_bytes),
+        if n == 1 { "It" } else { "They" },
+        if n == 1 { "applies" } else { "apply" },
+    )
+}
+
+/// The list's last line when some rules are held back without a title: how many, and each block's command and count.
+fn untitled_line(rest: &[(&str, usize)]) -> String {
+    let total: usize = rest.iter().map(|(_, n)| n).sum();
+    let each: Vec<String> = rest.iter().map(|(block, n)| format!("{} ({n})", show_command(block))).collect();
+    format!("and {total} more without a title: {}", each.join(" · "))
+}
+
+/// The held-back list for `held` (most relevant first) in at most `room` bytes: the header, then each block's command
+/// with its rules' titles under it, as many titles as fit in order, then [`untitled_line`] for the rest. `None` when
+/// not even the header and that line fit. Returns the text and how many titles it shows.
+pub fn held_back_list(held: &[Held], room: usize, budget_bytes: usize) -> Option<(String, usize)> {
+    let render = |shown: usize| -> String {
+        let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+        for h in &held[..shown] {
+            match groups.iter_mut().find(|(b, _)| *b == h.block) {
+                Some((_, titles)) => titles.push(&h.title),
+                None => groups.push((&h.block, vec![&h.title])),
+            }
+        }
+        let mut rest: Vec<(&str, usize)> = Vec::new();
+        for h in &held[shown..] {
+            match rest.iter_mut().find(|(b, _)| *b == h.block) {
+                Some((_, n)) => *n += 1,
+                None => rest.push((&h.block, 1)),
+            }
+        }
+        let mut lines = vec![held_back_header(held.len(), budget_bytes)];
+        for (block, titles) in groups {
+            lines.push(show_command(block));
+            lines.extend(titles.into_iter().map(|t| format!("  {t}")));
+        }
+        if !rest.is_empty() {
+            lines.push(untitled_line(&rest));
+        }
+        lines.join("\n")
+    };
+    let all = render(held.len());
+    if all.len() <= room {
+        return Some((all, held.len()));
+    }
+    // Every prefix is tried: titling a block's last untitled rule drops that block's entry from the count line, which
+    // can be longer than the title, so a longer prefix can fit where a shorter one did not.
+    let mut best = None;
+    for shown in 0..held.len() {
+        let text = render(shown);
+        if text.len() <= room {
+            best = Some((text, shown));
+        }
+    }
+    best
+}
+
 /// One line for every dropped block, used only when their pointer lines alone do not fit.
 fn aggregate_line(dropped: &[&PromptBlock], key: &str, budget_bytes: usize) -> String {
     let names: Vec<String> = dropped
@@ -399,6 +554,12 @@ pub struct Fitted {
     pub budget_bytes: usize,
     /// The budget's key as the pointer lines name it.
     pub key: String,
+    /// The rules the held-back list counts (BO-31): every rule withheld, titled or not. 0 when the output has no list.
+    pub held_back: usize,
+    /// How many of them the list shows by title.
+    pub titled: usize,
+    /// The held-back list exactly as printed at the end of `text`, without the blank line before it.
+    pub list: Option<String>,
 }
 
 impl Fitted {
@@ -477,6 +638,27 @@ impl Fitted {
     pub fn still_over_budget(&self) -> bool {
         self.text.len() > self.budget_bytes
     }
+
+    /// Every rule the fit withheld that has a title, most relevant first (BO-31): the order the fit puts things back
+    /// in, so the highest priority first and, within one, the best score first; a dropped plain block's rules in their
+    /// own order.
+    pub fn held_back(&self) -> Vec<Held> {
+        let mut out = Vec::new();
+        for u in drop_order(&self.blocks).into_iter().rev() {
+            match u {
+                Unit::Block(i) if !self.kept[i] => out.extend(
+                    self.blocks[i].titles.iter().enumerate().map(|(at, t)| Held { block: self.blocks[i].id.clone(), title: t.clone(), at }),
+                ),
+                Unit::Part(b, j) if !self.parts_kept[b][j] => {
+                    if let Some(t) = &self.blocks[b].parts[j].title {
+                        out.push(Held { block: self.blocks[b].id.clone(), title: t.clone(), at: j });
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
 }
 
 /// Fit `blocks` under `budget_bytes`, the header first and always kept.
@@ -498,7 +680,83 @@ impl Fitted {
 /// lowest score first, one at a time; a ranked block with every part withheld is dropped whole and leaves its pointer
 /// line. Put back best first. The priority order (F2) is untouched: ranking only reorders and sheds within a priority.
 /// Output with no ranked block is what it was before, byte for byte.
+///
+/// HELD-BACK RULES KEEP A TITLE (BO-31). A pointer line says where the withheld rules are, not what they are, so they
+/// were not read. When the fit withholds a rule (a part of a ranked block, or a plain block of rules dropped whole), the
+/// output ends with [`held_back_list`]: one line saying these rules still apply and to read them before acting on what
+/// they cover, then each block's `base hooks show` command with its rules' [`title`]s, most relevant first, as many as
+/// fit, then the count of the rest. The list fits inside the same budget: the blocks are fitted again with room left
+/// for it, at most one part in [`TITLE_SHARE`] of the budget, so it may hold back more full text and never pushes the
+/// output past the budget. That second fit is kept only when its list gains more than it cost: new titles (of rules the
+/// first fit neither printed whole nor titled in its own room) against the rules and other blocks the first printed
+/// whole and it does not; otherwise the first fit stands, with the list only when one showing a title fits in the room
+/// it left. Which rules match, how they rank, every budget, and the output of a prompt that
+/// withholds no rule are unchanged, byte for byte.
 pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -> Fitted {
+    let first = fit_within(header, blocks.clone(), budget_bytes, budget_bytes, key);
+    let held = first.held_back();
+    if held.is_empty() {
+        return first;
+    }
+    // What the list would take with every title; the second fit leaves that much room, at most the share.
+    let wanted = held_back_list(&held, usize::MAX, budget_bytes).map_or(0, |(text, _)| text.len() + 2);
+    let reserve = wanted.min(budget_bytes / TITLE_SHARE);
+    // The first fit as it would print with a list in the room it already left: the titles it shows cost nothing.
+    let first_listed = with_list(first.clone());
+    let free: &[Held] = first_listed.as_ref().map_or(&[], |f| &held[..f.titled]);
+    let second = fit_within(header, blocks, budget_bytes.saturating_sub(reserve), budget_bytes, key);
+    // What the second fit cost: each rule the first fit printed whole that it withholds (which rules, not how many: it
+    // can trade a matched rule for a lower one that fits where it did not), and each block or part that is not a rule
+    // (a context block, a decision, a relay block) that the first printed and it does not.
+    let held_second = second.held_back();
+    let cost = held_second.iter().filter(|h| !held.contains(h)).count() + untitled_lost(&first, &second);
+    // What it gained: titles of rules the first fit neither printed whole nor titled. A title of a rule it just took
+    // out of full text, or one the first fit's own list already shows, is no gain. The second fit is kept only when
+    // that gain is more than the cost; otherwise the first fit stands, with its list when one with a title fits.
+    if let Some(f) = with_list(second) {
+        let gain = held_second[..f.titled].iter().filter(|h| held.contains(h) && !free.contains(h)).count();
+        if gain > cost {
+            return f;
+        }
+    }
+    first_listed.unwrap_or(first)
+}
+
+/// The blocks and parts with no title (anything but a rule) that `first` printed and `second` does not. The two fits
+/// are of the same blocks in the same order.
+fn untitled_lost(first: &Fitted, second: &Fitted) -> usize {
+    let mut lost = 0;
+    for (i, b) in first.blocks.iter().enumerate() {
+        if b.is_ranked() {
+            lost += (0..b.parts.len())
+                .filter(|&j| b.parts[j].title.is_none() && first.parts_kept[i][j] && !second.parts_kept[i][j])
+                .count();
+        } else if b.titles.is_empty() && first.kept[i] && !second.kept[i] {
+            lost += 1;
+        }
+    }
+    lost
+}
+
+/// `fitted` with the held-back list after its last block, when one showing at least one title fits in the room left.
+fn with_list(mut fitted: Fitted) -> Option<Fitted> {
+    let held = fitted.held_back();
+    // The list goes after a blank line, as a block does, and ends with one newline.
+    let room = fitted.budget_bytes.checked_sub(fitted.text.len() + 2)?;
+    let (list, titled) = held_back_list(&held, room, fitted.budget_bytes)?;
+    if held.is_empty() || titled == 0 {
+        return None;
+    }
+    fitted.text.push('\n');
+    fitted.text.push_str(&list);
+    fitted.text.push('\n');
+    fitted.held_back = held.len();
+    fitted.titled = titled;
+    fitted.list = Some(list);
+    Some(fitted)
+}
+
+fn fit_within(header: &str, blocks: PromptBlocks, room: usize, budget_bytes: usize, key: &str) -> Fitted {
     let header = header.trim_matches(['\r', '\n']);
     let mut blocks = blocks.blocks;
     blocks.sort_by_key(|b| b.priority);
@@ -536,7 +794,7 @@ pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -
                 }
                 s.set(u, true);
                 let trial = render(s);
-                if trial.len() <= budget_bytes {
+                if trial.len() <= room {
                     *text = trial;
                 } else {
                     s.set(u, false);
@@ -546,7 +804,7 @@ pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -
 
         let full_text = render(&state);
         let mut text = full_text.clone();
-        if text.len() > budget_bytes {
+        if text.len() > room {
             // A rule withheld from a ranked block costs the line that names it (or, its last, the block's pointer
             // line), which can be longer than the rule. Withheld alone it would grow the output and push out a block of
             // a higher priority (F2). So, as a block no longer than its pointer line is never dropped, a rule is
@@ -554,7 +812,7 @@ pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -
             // of the same priority, lowest score first (two short rules of one block go together, and the block leaves
             // its pointer line). A run that never gets shorter is put back and the next rule tried.
             let mut k = 0;
-            while k < units.len() && text.len() > budget_bytes {
+            while k < units.len() && text.len() > room {
                 let u = units[k];
                 k += 1;
                 match u {
@@ -590,12 +848,12 @@ pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -
                     }
                 }
             }
-            if text.len() <= budget_bytes {
+            if text.len() <= room {
                 readmit(&mut state, &mut text, &render);
             } else {
                 text = render_aggregate(&state);
                 for &u in &units {
-                    if text.len() <= budget_bytes {
+                    if text.len() <= room {
                         break;
                     }
                     if state.is_kept(u) {
@@ -604,7 +862,7 @@ pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -
                     }
                 }
                 // The one line is far shorter than the pointer lines it replaced, so blocks may fit again.
-                if text.len() <= budget_bytes {
+                if text.len() <= room {
                     readmit(&mut state, &mut text, &render_aggregate);
                 }
             }
@@ -613,7 +871,7 @@ pub fn fit(header: &str, blocks: PromptBlocks, budget_bytes: usize, key: &str) -
     };
     let kept: Vec<bool> =
         (0..n).map(|i| if blocks[i].is_ranked() { state.parts[i].iter().any(|k| *k) } else { state.kept[i] }).collect();
-    Fitted { text, full_text, blocks, kept, parts_kept: state.parts, budget_bytes, key: key.to_string() }
+    Fitted { text, full_text, blocks, kept, parts_kept: state.parts, budget_bytes, key: key.to_string(), held_back: 0, titled: 0, list: None }
 }
 
 /// What the fit drops or withholds, one at a time: a plain block, or one part of a ranked block.
@@ -697,6 +955,10 @@ struct BlocksFile {
     session_id: String,
     budget_bytes: usize,
     blocks: Vec<BlockRow>,
+    /// The held-back list as printed after the blocks (BO-31), so the output can be rebuilt from this file. Absent when
+    /// the prompt printed none, so a file without one reads as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    held_back: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -757,6 +1019,7 @@ pub fn write_blocks(base: &Path, session_id: &str, fitted: &Fitted) -> FullOutpu
                 }
             })
             .collect(),
+        held_back: fitted.list.clone(),
     };
     let text = serde_json::to_string_pretty(&file).unwrap_or_default();
     super::write_full_output(&root.join(session_id).join(BLOCKS_FILE), &text)
@@ -1302,5 +1565,252 @@ mod tests {
         assert!(err.contains("hooks-rules, global-rules"), "{err}");
         assert!(show(dir.path(), Some("../x"), Some("a")).is_err(), "a path is never a session id");
         assert!(write_blocks(dir.path(), "../x", &f).written_path().is_none());
+    }
+
+    /// Rule `j` of block `id` as its block prints it: a first sentence that is its title, then padding to `bytes`.
+    fn rule_line(id: &str, j: usize, bytes: usize) -> String {
+        format!("  {j}. {id} rule {j} keeps the build green. ").chars().chain(std::iter::repeat('r')).take(bytes).collect()
+    }
+
+    fn rule_title(id: &str, j: usize) -> String {
+        format!("{j}. {id} rule {j} keeps the build green.")
+    }
+
+    /// A plain block of `n` rules (BO-31), each `bytes` long, with their titles and a claim each.
+    fn rules_block(id: &str, p: Priority, n: usize, bytes: usize) -> PromptBlock {
+        let lines: Vec<String> = (0..n).map(|j| rule_line(id, j, bytes)).collect();
+        PromptBlock::new(id, p, &format!("[DOMAIN: {id}]\n{}", lines.join("\n")), n, "rule")
+            .with_titles(lines.iter().map(String::as_str))
+            .with_claims((0..n).map(|j| Claim::Rule { id: format!("{id}-{j}"), content: 0, scope: None }))
+    }
+
+    /// A ranked block whose parts are titled rules (BO-31), scored as given, best first.
+    fn ranked_titled(id: &str, p: Priority, scores: &[f32], bytes: usize) -> PromptBlock {
+        let parts = scores
+            .iter()
+            .enumerate()
+            .map(|(j, s)| {
+                BlockPart::new(&rule_line(id, j, bytes), *s)
+                    .titled()
+                    .with_claims([Claim::Rule { id: format!("{id}-{j}"), content: 0, scope: None }])
+            })
+            .collect();
+        PromptBlock::ranked(id, p, &format!("[DOMAIN: {id}]"), parts, "", "rule")
+    }
+
+    /// The held-back list's lines, from its header on.
+    fn list_lines(f: &Fitted) -> Vec<&str> {
+        let list = f.list.as_deref().expect("a held-back list");
+        assert!(f.text.ends_with(&format!("\n\n{list}\n")), "the list ends the output after a blank line:\n{}", f.text);
+        list.lines().collect()
+    }
+
+    /// BO-31 (Z1): rules the budget holds back leave their titles, most relevant first (the higher priority first, and
+    /// within it the best score first), under the exact `base hooks show` command of their block, after one line saying
+    /// they still apply and to read them before acting. A withheld block of something else keeps only its pointer line.
+    #[test]
+    fn held_back_rules_show_their_titles() {
+        let f = fit(
+            HEADER,
+            blocks(vec![
+                ranked_titled("tools-rules", Priority::Matched, &[5.0, 4.0, 3.0, 2.0, 1.0], 600),
+                block("relay-wake", Priority::Relay, 900),
+                rules_block("global-rules", Priority::Global, 4, 500),
+            ]),
+            2600,
+            KEY,
+        );
+        assert!(f.text.len() <= 2600, "{} bytes:\n{}", f.text.len(), f.text);
+        let printed = printed_rule_ids(&f);
+        assert!(printed.contains(&"tools-rules-0".to_string()), "control: the best rule prints whole:\n{}", f.text);
+        let withheld_tools: Vec<usize> = (0..5).filter(|j| !printed.contains(&format!("tools-rules-{j}"))).collect();
+        assert!(!withheld_tools.is_empty(), "control: some tools rules are withheld:\n{}", f.text);
+        assert_eq!(dropped_ids(&f), ["relay-wake", "global-rules"], "{}", f.text);
+        assert!(f.text.contains("· full text: base hooks show relay-wake]"), "a withheld block keeps its pointer line");
+
+        let lines = list_lines(&f);
+        assert_eq!(f.held_back, withheld_tools.len() + 4, "every withheld rule is counted");
+        assert_eq!(lines[0], held_back_header(f.held_back, 2600));
+        assert!(
+            lines[0].contains("still apply: before you act on anything a title below covers, run the command above the title"),
+            "{}",
+            lines[0]
+        );
+        let mut expect = vec!["base hooks show tools-rules".to_string()];
+        expect.extend(withheld_tools.iter().map(|j| format!("  {}", rule_title("tools-rules", *j))));
+        expect.push("base hooks show global-rules".to_string());
+        expect.extend((0..4).map(|j| format!("  {}", rule_title("global-rules", j))));
+        assert_eq!(lines[1..], expect.iter().map(String::as_str).collect::<Vec<_>>()[..], "{}", f.text);
+        assert_eq!(f.titled, f.held_back, "every title fits here");
+        assert!(!lines.iter().any(|l| l.contains("relay-wake")), "a block that is not rules has no line in the list");
+        // D15 holds: a titled rule is not shown, so it stays due.
+        assert!(withheld_tools.iter().all(|j| !printed.contains(&format!("tools-rules-{j}"))));
+        assert!(!printed.iter().any(|id| id.starts_with("global-rules")));
+    }
+
+    /// BO-31 (Z1): with more titles than room, the list shows the most relevant that fit and counts the rest by block,
+    /// and the output still fits.
+    #[test]
+    fn titles_never_push_past_the_budget() {
+        let f = fit(
+            HEADER,
+            blocks(vec![
+                rules_block("hooks-rules", Priority::Matched, 2, 300),
+                rules_block("global-rules", Priority::Global, 120, 200),
+                rules_block("bracket-rules", Priority::Bracket, 30, 150),
+            ]),
+            3000,
+            KEY,
+        );
+        assert!(f.text.len() <= 3000, "{} bytes:\n{}", f.text.len(), f.text);
+        assert_eq!(f.held_back, 150, "{}", f.text);
+        assert!(f.titled > 0 && f.titled < f.held_back, "some titles, not all: {} of {}", f.titled, f.held_back);
+        let lines = list_lines(&f);
+        let last = *lines.last().unwrap();
+        let rest_global = 120 - lines.iter().filter(|l| l.contains("global-rules rule")).count();
+        assert_eq!(
+            last,
+            format!("and {} more without a title: base hooks show global-rules ({rest_global}) · base hooks show bracket-rules (30)", 150 - f.titled),
+            "{}",
+            f.text
+        );
+        assert!(lines.contains(&"  0. global-rules rule 0 keeps the build green."), "the most relevant first:\n{}", f.text);
+        assert!(!f.text.contains("bracket-rules rule 0 keeps"), "the least relevant are counted, not titled");
+
+        // Titles alone far past the budget: still within it, the list down to its first and last lines.
+        let f = fit(HEADER, blocks(vec![rules_block("global-rules", Priority::Global, 400, 300)]), 1200, KEY);
+        assert!(f.text.len() <= 1200, "{} bytes:\n{}", f.text.len(), f.text);
+        let lines = list_lines(&f);
+        assert_eq!(f.held_back, 400);
+        assert!(f.titled > 0, "{}", f.text);
+        let rest = 400 - f.titled;
+        assert_eq!(*lines.last().unwrap(), format!("and {rest} more without a title: base hooks show global-rules ({rest})"));
+
+        // A budget too small for even the list's first and last lines: the output is the fit without the list.
+        let small = fit(HEADER, blocks(vec![rules_block("global-rules", Priority::Global, 3, 300)]), 300, KEY);
+        let plain = fit_within(HEADER, blocks(vec![rules_block("global-rules", Priority::Global, 3, 300)]), 300, 300, KEY);
+        assert_eq!(small.text, plain.text);
+        assert!(small.list.is_none() && small.text.len() <= 300, "{}", small.text);
+    }
+
+    /// BO-31 (Z5): a prompt that withholds no rule prints exactly what it printed before: everything fits, or only
+    /// blocks that are not rules are withheld.
+    #[test]
+    fn nothing_held_back_prints_as_before() {
+        let list = || {
+            blocks(vec![
+                ranked_titled("tools-rules", Priority::Matched, &[2.0, 1.0], 200),
+                rules_block("global-rules", Priority::Global, 2, 200),
+            ])
+        };
+        let f = fit(HEADER, list(), 4000, KEY);
+        let tools = format!("[DOMAIN: tools-rules]\n{}\n{}", rule_line("tools-rules", 0, 200), rule_line("tools-rules", 1, 200));
+        let global = format!("[DOMAIN: global-rules]\n{}\n{}", rule_line("global-rules", 0, 200), rule_line("global-rules", 1, 200));
+        assert_eq!(f.text, format!("{HEADER}\n\n{tools}\n\n{global}\n"), "byte for byte");
+        assert_eq!(f.text, fit_within(HEADER, list(), 4000, 4000, KEY).text);
+        assert!(f.list.is_none() && f.held_back == 0 && f.titled == 0);
+
+        let others = || {
+            blocks(vec![
+                rules_block("tools-rules", Priority::Matched, 2, 200),
+                block("relay-wake", Priority::Relay, 3000),
+                block("global-context", Priority::Global, 1200),
+            ])
+        };
+        let f = fit(HEADER, others(), 2000, KEY);
+        assert_eq!(dropped_ids(&f), ["relay-wake"], "control: a block that is not rules was withheld:\n{}", f.text);
+        assert_eq!(f.text, fit_within(HEADER, others(), 2000, 2000, KEY).text, "no rule withheld, no list");
+        assert!(f.list.is_none() && !f.text.contains("did not fit in its"));
+    }
+
+    /// BO-31 (Z1): over every budget from tight to roomy, the list never costs more full rules than it shows titles, it
+    /// always shows at least one title, and without a list the output is exactly what the fit printed before BO-31. A
+    /// small budget whose room for the list holds no title keeps the old fit rather than trading rules for a count line.
+    #[test]
+    fn the_list_never_costs_more_full_rules_than_it_titles() {
+        let list = || {
+            blocks(vec![
+                ranked_titled("hooks-rules", Priority::Matched, &[8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0], 600),
+                block("hooks-context", Priority::Context, 1000),
+                ranked_titled("global-rules", Priority::Global, &[6.0, 5.0, 4.0, 3.0, 2.0, 1.0], 400),
+                rules_block("bracket-rules", Priority::Bracket, 4, 300),
+            ])
+        };
+        let (mut with, mut without, mut traded) = (0, 0, 0);
+        for budget in (600..11_000).step_by(37) {
+            let f = fit(HEADER, list(), budget, KEY);
+            let old = fit_within(HEADER, list(), budget, budget, KEY);
+            assert!(f.text.len() <= budget, "{budget}: {} bytes:\n{}", f.text.len(), f.text);
+            if f.list.is_none() {
+                assert_eq!(f.text, old.text, "{budget}: no list, so the output of before");
+                without += 1;
+                continue;
+            }
+            assert!(f.titled >= 1, "{budget}: a list always shows a title:\n{}", f.text);
+            with += 1;
+            let old_listed = with_list(old.clone());
+            if f.text == old_listed.as_ref().unwrap_or(&old).text {
+                continue;
+            }
+            // The second fit won: what it cost (rules by id, not by count, and the context block) must be less than the
+            // titles it adds for rules the old fit neither printed whole nor titled in its own room.
+            let now = printed_rule_ids(&f);
+            let lost_rules = printed_rule_ids(&old).iter().filter(|id| !now.contains(id)).count();
+            let lost_context = usize::from(kept_ids(&old).contains(&"hooks-context") && !kept_ids(&f).contains(&"hooks-context"));
+            let old_held = old.held_back();
+            let free = &old_held[..old_listed.as_ref().map_or(0, |l| l.titled)];
+            let gain = f.held_back()[..f.titled].iter().filter(|h| old_held.contains(h) && !free.contains(h)).count();
+            assert!(gain > lost_rules + lost_context, "{budget}: {gain} new titles for {lost_rules} rules and {lost_context} context:\n{}", f.text);
+            traded += usize::from(lost_rules + lost_context > 0);
+        }
+        assert!(with > 0 && without > 0, "control: both outcomes occur ({with} with a list, {without} without)");
+        assert!(traded > 0, "control: some budgets trade full text for titles");
+    }
+
+    /// BO-31 (code review): a block that is not rules is a cost too. The first fit drops only the one bracket rule; making
+    /// room for its title would drop the matched domain's context block, a trade of one block for one title, so the old
+    /// fit stands and the context prints.
+    #[test]
+    fn a_list_never_trades_a_context_block_for_one_title() {
+        let list = || {
+            blocks(vec![
+                ranked_titled("hooks-rules", Priority::Matched, &[2.0, 1.0], 300),
+                block("hooks-context", Priority::Context, 600),
+                rules_block("bracket-rules", Priority::Bracket, 1, 400),
+            ])
+        };
+        let old = fit_within(HEADER, list(), 1500, 1500, KEY);
+        assert_eq!(dropped_ids(&old), ["bracket-rules"], "control: the old fit drops only the bracket rule:
+{}", old.text);
+        let f = fit(HEADER, list(), 1500, KEY);
+        assert!(kept_ids(&f).contains(&"hooks-context"), "the context block was traded for a title:
+{}", f.text);
+        assert_eq!(f.text, old.text, "{}", f.text);
+    }
+
+    /// BO-31 (Z1, G0 Q1): a title is the rule's line on one line, its number or dash kept, ended at its first sentence,
+    /// cut at a word boundary to TITLE_CHARS characters with `…`, never inside a character.
+    #[test]
+    fn a_title_is_the_rules_first_sentence_cut_at_a_word() {
+        assert_eq!(title("  16. Before any write, name the tier. Then write."), "16. Before any write, name the tier.");
+        assert_eq!(title("  - Use e.g. this form, i.e. the short one. Then more."), "- Use e.g. this form, i.e. the short one.");
+        assert_eq!(title("  3. Two\n     lines  here! And a second sentence."), "3. Two lines here!");
+        assert_eq!(title("  4. Ship v0.16.0 tonight. Then rest."), "4. Ship v0.16.0 tonight.");
+        assert_eq!(title("  5. Keep it short — because long rules get held back"), "5. Keep it short — because long rules get held back");
+        assert_eq!(title("no number. here"), "no number.");
+
+        let long = format!("  7. {}", "alpha beta gamma delta ".repeat(10));
+        let t = title(&long);
+        assert!(t.ends_with('…') && t.chars().count() <= TITLE_CHARS, "{t}");
+        let kept = t.trim_end_matches('…');
+        assert!(long.split_whitespace().collect::<Vec<_>>().join(" ").starts_with(&format!("{kept} ")), "cut at a word: {t}");
+
+        // Many-byte characters across the cut: counted as characters, never split.
+        let wide = format!("  8. {}", "élan ünïcødé 日本語の規則 ".repeat(12));
+        let t = title(&wide);
+        assert!(t.ends_with('…') && t.chars().count() <= TITLE_CHARS, "{t}");
+        let one_word = format!("  9. {}", "é".repeat(300));
+        let t = title(&one_word);
+        assert_eq!(t.chars().count(), TITLE_CHARS, "a word longer than the title is cut at the limit: {t}");
     }
 }
