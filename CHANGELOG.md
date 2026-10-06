@@ -7,6 +7,364 @@ fails when the version in `Cargo.toml` has no entry here.
 
 Releases before 0.13.3 are tagged in the repository but are not written up.
 
+## 0.16.0 (2026-10-06)
+
+0.16.0 changes what base puts in front of Claude and how you shape it. Session start and the prompt hook fit their text to a measured budget and name what they held back, the file you touch decides which rules load, rules carry test prompts, and base notices when you correct the AI and turns that into rule changes you approve. The update repairs your base data by itself and tells you what it changed, with an undo for each change. The notes below cover every change a user can see or use, by area.
+
+### Upgrading from 0.15
+
+**Developer mode is off after the update, and one command turns it back on.** The base installers from 0.7.0 to 0.15.2 turned developer mode on for everyone, so Claude ended every reply with a DEVMODE block whether you asked for it or not. 0.16.0 installs with it off. If your `~/.base-gbl/base.toml` still has the line the installer wrote, base turns developer mode off at the second session start after the update and shows the paragraph below before anything else; `base doctor` repeats it for 14 days. If you turned developer mode on yourself, by `base config set` or by hand, it stays on.
+
+> base 0.16.0 turned developer mode off. The 0.15 installer turned it on for everyone, so Claude ended every reply with a DEVMODE block listing which of your domains base loaded and why. To see what base adds without the block, run `base log matches`. To turn developer mode back on, run `base config set devmode.enabled true` (while it is on, base does not update itself). To undo this change, run `base doctor --restore "~/.base-gbl/base.toml.BAK-<date>-pre-0.16.0"`.
+
+**Most 0.15 installs reach 0.16.0 through `base update`, not on their own.** base does not update itself while developer mode is on, and the 0.15 installers turned it on, so those installs show the weekly "base update available" banner instead. Run `base update` once to get 0.16.0. With developer mode off after that, later updates arrive on their own.
+
+**The update tidies your base data by itself, once, and tells you what it did.** The first session start on 0.16.0 starts the repair in the background and returns at once, so that start is no slower. The repair backs up every file before it changes it. The next session start says what changed in a few plain sentences per change, each with the command that undoes it, and the start after that says nothing more. What it can change: entries that belong to another of your workspaces move back there (or, when base cannot find that workspace, into a separate file in this one, so nothing is lost); a correction that names exactly one entry is linked to it; small mix-ups in how entries point to the ones they replace are fixed; repeated lines are removed; only the newest 3 graph backups are kept. You never need to run anything for it, and `[graph] auto_migrate = false` turns it off. Session start also says which version base updated itself to, with a link to these notes.
+
+**Every change the update makes has an undo.** `base doctor --restore <path>` puts back any backup base made: a graph snapshot, or a `*.BAK-<date>-pre-<version>` copy the update left beside a config file. It refuses any other file, so it cannot overwrite something base did not write. Each upgrade line prints the exact command for its own backup.
+
+**Claude gets up to 4,000 characters of your saved notes.** The 0.15 installer wrote `[signal] max_chars = 2000`, which held the notes base shows at session start, with a few other items, to 2,000 characters. 0.16.0 does not read that setting, so the update removes the installer's value and your notes get the new memory budget of 4,000. A different value you set yourself moves to `[budget] memory_chars`, unless you already set that. To set a lower limit again, run `base config set budget.memory_chars 2000`.
+
+**Folder rules spell out their whole path, and folder rules 0.15 ignored now load.** A path trigger written as a relative folder, such as `notes`, is rewritten as the full path it already meant, so it covers the same place from any folder you start in. A trigger on a folder that holds two or more of your projects was silently ignored by 0.15; it now loads for files in that folder that sit outside those projects, and the update names each one once with `base domain paths --suggest`, which proposes narrower triggers.
+
+**Starter commands you never edited follow the update.** If your `*base`, `*handoff`, `*fork` or `*end` command is still exactly as an earlier base shipped it, the update replaces it with this version's text, after a backup. One you edited is left as it is; if it is your `*base` and still has the old `rule add` line, session start says so once. A `commands.toml` that is a link to another file is never written. To see this version's text of any starter command, run `base commands show <name> --shipped`.
+
+**base adds a session-end hook and refreshes its section of your CLAUDE.md.** Session start adds a SessionEnd entry to `~/.claude/settings.json` (backed up first, every other entry kept), so the rule pass knows which sessions ended. The BASE CLI section of `~/.claude/CLAUDE.md` is rewritten once to this version's text; everything outside it stays byte for byte.
+
+**One case still needs a person.** If you renamed a workspace folder after base wrote data for it, its older entries stay under the old folder name. `base doctor` explains what it found and leaves it alone, because only you can say whose data it is. Nothing else after the update asks you, or your Claude, to run a command.
+
+### What base adds to each message
+
+**The prompt hook never cuts text mid-way.** In 0.15 the prompt hook printed everything it had, Claude Code cut the output past its own limit, and nothing said what was lost. Now base builds the output as named blocks and fits them to a budget itself: when they do not fit, whole blocks are dropped, least important first, and each dropped block leaves one line naming it and the command that prints it, `base hooks show <block>`. Run `base hooks show` with no block to list the last prompt's blocks.
+
+**What matters most goes first.** Rules matched to your prompt (or to a file the session touched) come first, then that domain's context, then relay messages, then your global rules and decisions, then the bracket rules. A tight budget drops from the end of that order.
+
+**Rules that do not fit still reach Claude.** When rules are held back, the message ends with a short title for each one, most relevant first, under the exact `base hooks show` command that prints it in full, and an instruction to read the rule before acting on anything its title covers. `base doctor` names the rules held back most often and the longest ones, with what to do about each.
+
+**A rule counts as shown only when Claude got all of it.** A rule dropped by the budget is not marked as seen, so a later prompt in the same session can still deliver it.
+
+**Budgets are measured in bytes.** Claude Code limits hook text by bytes, so base counts bytes too. In the new `[budget]` section, `session_start_bytes` and `prompt_bytes` cap what session start and the prompt hook print, 10,000 bytes each by default, the size measured to arrive whole on Claude Code 2.1.287; `pre_tool_bytes` records the same measurement for the tool hook. `[budget] write_full_output = false` stops base writing the full-text copies described below.
+
+**`base doctor --measure` measures what your Claude Code delivers.** It asks Claude Code, with a few headless calls on a cheap model, how much of each hook's text actually reaches the model, then writes each budget and `[budget] measured_on` to `~/.base-gbl/base.toml` and prints before and after. `base doctor` compares `measured_on` with the Claude Code you run and tells you when to measure again. Nothing runs it on its own, because it spends model calls.
+
+**Rules are ranked by how well they fit your prompt.** Each prompt is scored against every rule and every global decision that has keywords (BM25: shared words count, rare words count more). A block lists its rules best first, so a tight budget holds back the weakest. Keyword and path matches still decide what is served; scoring only ranks. `[match] bm25 = false` serves by keyword alone, and `[match] min_score`, unset by default, would also serve a rule on its score.
+
+**Bracket rules your CLAUDE.md already says are not sent again.** A bracket rule can carry `covered_by`, a line of text; when a CLAUDE.md that Claude Code loads contains that line, the rule is skipped. Every other bracket rule is sent once per session, not on every prompt.
+
+**Global decisions come only when your prompt names one of their keywords.** A decision of an always-on domain such as GLOBAL used to arrive on every prompt. Now it arrives on a prompt that contains one of its keywords, and one with no keywords is listed once at session start. Set them with `base decision update <slug> --keywords "a, b"`.
+
+**A superseded rule or decision is never served.** Once `base graph supersede` (or a rule rewrite) replaces one, only the newer one reaches Claude.
+
+**Each session keeps its own copy of what base printed.** Session start and the prompt hook write their full, untrimmed text to `.base/hook-output/<session id>/` (`session-start.md`, `prompt-submit.md`), so two sessions never overwrite each other's. Every line that points at the full output names that session's own file. `last-session-start.md` and `last-prompt-submit.md` still hold the latest of any session. Folders older than `[log] prompt_days` (90) are removed at session start.
+
+### Rules, keywords and the file you touch
+
+**A rule can say when it matters.** `base rule add` takes `--kind always|place|action|topic` and the matchers that go with it: `--place <folder or file>`, `--tool <name>`, `--command "<command>"`, `--words "a, b"`. A rule with matchers of its own is served on them, not through its domain's keywords or folder, and an action rule shows at most once every 10 minutes per session. A rule with no matchers is served through its domain as before. `base rule list` shows each rule's id, kinds and matchers.
+
+**Each rule is served once per session.** base tracks rules one by one, keyed on their text, so a domain that matches again does not repeat rules Claude already has, and a rule you edit is shown again. Rules come back once when the context bracket moves to a new tier.
+
+**The file being touched decides which project's rules load.** When a tool reads, edits or writes a file, or a shell command names one, base finds the deepest registered project folder holding it and loads that project's domain, with no trigger needed. Rules of sibling projects stay out. `base rule add --path <file or folder>` scopes a rule to one file or folder inside a project.
+
+**A project inside another can carry its parent's rules.** `base project update <slug> --parent <slug> --nested true` (or `base project add --parent --nested`) makes work in the child also load the parent's rules, after the child's own, so a tight budget drops the parent's first. `--parent none` removes the link, and a loop is refused.
+
+**Folder triggers are exact paths.** `base domain add-trigger --path` stores the full path and refuses a folder that holds other registered projects, naming them. `base domain paths --suggest` proposes an exact path for every domain (a project's domain gets its project's folder), and `base domain paths --apply <file>` writes a list you reviewed. A broad trigger still loads; `base doctor` names it as advice with the command to narrow it.
+
+**Rules carry test prompts.** `base rule add` and the new `base rule update <domain>.<id>` take `--fires-on "<prompt>"` (up to 3 prompts that must serve the rule) and `--quiet-on "<prompt>"` (up to 2 that must not). `base rule test [--domain X] [--rule ID]` runs them through the prompt hook's own matching, lists every miss and false fire, counts the rules with no tests, and exits 1 on a failure. After any command that changes a domain's matching, base re-runs that domain's tests and prints one line.
+
+**Inside Claude Code, a new rule needs keywords and a test.** When `CLAUDECODE=1` is set, `base rule add` refuses without `--keywords` (or `--words`) and `--fires-on`, so every rule an AI adds arrives with words from the prompt that should bring it back and that prompt as its first test.
+
+**Standards apply only to the files they declare.** A standard can declare `[standard.applies_to]` with `code`, `extensions`, `languages` and `paths`. One that declares nothing applies to code files only, never to `.md`, `.txt`, `.json`, `.toml`, `.yaml` or `.csv` documents, so writing a markdown note no longer draws a coding standard. The shipped standards keep their deploy and CI files, and Windows paths now match path patterns. `base standards list` shows what each one applies to.
+
+### When you correct the AI
+
+**base notices a correction.** It reads your wording ("that's not", "I told you", and the phrases in `[corrections] phrases`), what happened in the turn (you interrupted, refused a tool call, changed a file the AI had just written, or asked the same thing again), and a reply that starts with a marker such as `CORRECTED:`. When your wording or the turn suggests a correction, the prompt carries one line asking Claude to file it, after answering, with `base rule propose --from-turn`. `[corrections] enabled = false` turns this off.
+
+**The CORRECTED line.** `base install` and `base scaffold` offer once to add one line to `~/.claude/CLAUDE.md` asking Claude to start a corrected reply with `CORRECTED: <what it got wrong>`. `base install --corrections-line` and `--no-corrections-line` answer without asking. If you decline, session start carries the line instead. `base uninstall` removes it.
+
+**`base rule propose` turns a correction into a proposal.** It reads the turn and sorts it: a keyword gap (a fitting rule exists but was not served), a rewrite (it was served and ignored), or a new rule, with suggested keywords and the prompt as the first test. Nothing changes until the proposal is approved.
+
+**You review proposals before anything changes.** Session start shows `rule proposals: N pending · base rule review`. `base rule review` walks them with one key each on a terminal (`a` approve, `e` edit, `r` reject, `s` skip, `q` stop), or takes `--approve`, `--reject` and `--edit`. `base rule replay` runs a change over your recent prompts first and shows which would start or stop serving the rule; a change that would fire on more than a quarter of them is flagged TOO BROAD and needs `--broad-ok`. A rejected proposal is never made again.
+
+**`base tune` finds the rule changes for you.** It reads the sessions since the last pass and proposes keyword fixes, new rules, merges, splits and retirements, judged by headless Claude on Haiku, with answers cached. It never runs inside a hook: after 3 corrections, or after 15 prompts without a pass when one of them was corrected or matched nothing, the next prompt carries a line saying a rule pass is due (`[tune] corrections`, `[tune] turns`), and session start says when earlier sessions ended with corrections not yet passed. `base tune --dry-run` shows what it would read. `base rule unretire` brings a retired rule back.
+
+**Shadow mode tries a new matcher without changing what you are served.** `base shadow start` runs a candidate (a different matcher, or pending proposals) beside the live one on every prompt and file touch; only the live one's pick is printed. `base shadow report` shows where they differ and whether the corrections that followed favour the candidate. It promotes itself once it wins clearly over at least 200 prompts and rolls itself back if corrections rise clearly afterwards, each announced once with its undo; `[shadow] auto_promote = false` leaves it to `base shadow promote`. `base shadow rollback` and `base shadow stop` work any time, and `base rule update <rule> --protected` keeps a rule from being dropped. Nothing runs until you start a shadow.
+
+### Seeing what base did
+
+**`base log matches` shows what every prompt and file touch matched, and why.** Each one is a row in `.base/match-log.jsonl`: which domains matched and by which keyword or folder, which rules and decisions were served or held back, and their scores. Filter with `--last`, `--session` and `--rule`, or add `--json`. Rows are kept for `[log] prompt_days` (90); prompt text is kept after secrets such as API keys, tokens and passwords are replaced, and `[log] prompt_text = "matched"` or `"off"` keeps less.
+
+**`base log corrections` shows what base read as a correction**, for a session or for a whole transcript read turn by turn.
+
+**`base doctor` shows how your rules are used.** A new section lists rules that never fire, domains that fire on more than a quarter of your prompts, rules that are served and then corrected anyway, decisions served often but not reviewed in a long time, how many corrections the detector caught, the rules held back most often, and the longest rules, each with what to do next. It is advice and never changes the verdict. `base rule stats` prints the same numbers per rule.
+
+**`base doctor` reports what each hook printed.** For session start and the prompt hook it shows the last run and the largest recent one against their budgets, and which blocks were held back.
+
+**`base --version` names the build.** It prints the commit the binary was built from, for example `base 0.16.0 (build 1a2b3c4d5e6f)`, so two builds of one version can be told apart.
+
+### Session start
+
+**A new layout.** Session start prints one header line (what is due, open handoffs, forks, projects, tasks and milestones, and where the full output is), a short instruction block, then DUE NOW, HANDOFFS, forks, projects, tasks and milestones, then the rest. Handoffs are newest first, one per project with the older ones counted, lettered A to J; forks show the newest 3. `[session_start]` holds these settings.
+
+**DUE NOW is always on the first screen.** The first 2,000 characters of session start hold the header, the instructions and DUE NOW. Reminders are numbered, so `base reminder archive 2` and `base reminder snooze 2 1d` act on the one you see. When too many are due to fit, the most overdue show first with `+N more · all: base reminder list`.
+
+**The numbers agree.** The header, the pulse and each block count the same things the same way, and "due" means the same in all of them.
+
+**`base handoff show` finds a handoff.** It takes a letter from the last session start, a slug, a project name or a few words, and prints the doc path. Several matches are listed and none is picked. Each session reads its own letters, so another session's start does not change what yours point at.
+
+**The memory block has its own budget.** Saved notes fill up to `[budget] memory_chars` (4,000 characters), whole notes only, and the block ends with how many were left out and `base learn --list`.
+
+**The working set reads both tiers and says what it read.** Tasks and milestones recorded globally now show beside the workspace's, and the block says which data it read, or that none could be read, so an empty list is never mistaken for missing data. Your own `queries.toml` now shows beside the built-in blocks instead of only when they were all silent.
+
+### Reminders, handoffs and deferred work
+
+**Reminders can be snoozed, archived and brought back.** `base reminder snooze <slug or number> <duration>` (30s, 3m, 2h, 1d) moves its due time; `base reminder archive` stops it surfacing and keeps it (`remove` still deletes); `base reminder unarchive` brings it back; `base reminder list --archived` lists archived ones. All of them work across both tiers. `base reminder add` with the name of an archived reminder revives it.
+
+**An overdue reminder warns before it archives itself.** From 8 days overdue, its DUE NOW line says when it will archive and how to snooze it. It archives itself only when it is 10 or more days overdue and that warning was first shown at least 2 days earlier; the next session start says so once with `base reminder unarchive <slug>`. It is kept, never deleted.
+
+**Deferred work (off until you turn it on).** With `[defer] enabled = true`, handoffs, forks, tasks and milestones nobody touched for a set number of days (10 by default, per kind in `[defer.days]`) stop showing at session start and stay listed. `base handoff deferred`, `base fork deferred`, `base task deferred` and `base milestone deferred` list them, each row with the command that brings it back, and `base handoff show` or `base fork show` brings one back. Projects already deferred under `[protocol]`; `base project deferred` now lists them with the date each was deferred. `base reconcile --dry-run` previews the pass, and `base defer migrate` resets the clock on older records before you turn it on.
+
+**A new handoff archives only the earlier one in its own lane.** `base handoff create` used to archive every open handoff for the project, so several sessions on one project archived each other's. Now it archives only the earlier one by the same author, or in the lane you name with `--lane`, and prints what it archived and what it left open.
+
+**Archives can be undone.** `base handoff unarchive <slug>` and `base fork unarchive <slug>` set an archived one back to open.
+
+**Writes go to the workspace you are in.** A handoff, fork, decision or note written from a folder inside `~/.base-gbl` now goes to the workspace around it, not the global tier; `-g` still writes globally. A handoff moved between tiers keeps its dates, so it does not jump to the top of session start.
+
+**Opening a handoff or fork doc counts as activity.** Reading its file now updates when it was last active, in whichever tier holds it.
+
+### Projects
+
+**Projects know their folder, their parent and their next step's age.** `base project update` takes `--path` (absolute, or relative to the workspace root; stored absolute, and the project's domain trigger moves with it), `--parent` and `--nested`; `base project add` takes `--parent` and `--nested`. `base project list` shows path, parent, nested and the next step with its age, and `base doctor` lists next steps older than `[doctor] stale_next_days` (14). The advice that told you to run `project update --path` now names a flag that exists. An update to a project filed in another workspace's data now writes there instead of doing nothing.
+
+**`base project paths --suggest` finds each project's real folder.** It lists every project whose folder is missing, too broad, or contradicted by its own docs, with a suggested folder and the evidence; a project with two candidates gets both. `base project paths --apply <file>` writes a list you reviewed.
+
+**`base project rename <old> <new>`.** It renames a project and its same-named domain everywhere they appear, after a preview (`--yes` applies it) and a backup of every file it writes. The old name keeps working in every command and says `<old> is now <new>`. Your prompt keywords are left as they are.
+
+**`base decision show <slug>`** prints one decision with all its fields, or `--json`.
+
+### Relay
+
+**Relay takes one line, and never outranks you.** The relay wake script is no longer pasted into prompts and tool calls. A session with no inbox watcher gets one line, `relay: <title> has no inbox watcher · run base relay arm and start the Monitor it prints`, only when its title is in use (it sent or received a ping, or registered by hand); `[relay] wake_nudge = false` turns it off. `base relay arm` prints exactly what to start the watcher with. Messages read as information, with who sent them, when, and the reply command, and each is shown once, on the next prompt.
+
+**A ping reaches the session it was sent to.** A ping is addressed to the session that held the title when it was sent. When a title passes to a new session, the old holder's undelivered pings are archived and each sender is told they were not delivered and who holds the title now. A ping that waits more than a day undelivered is archived and its sender told.
+
+**The shipped inbox watcher no longer drops pings.** It announced at most 5 waiting pings and marked the rest as read, and a ping cleared while it was being read could vanish. Both are fixed, a cut-off ping says so, and a session running an older watcher script is told to re-arm.
+
+**Smaller relay fixes.** A quiet session is listed as idle with its age, never dead. `base relay register --project <name>` with no store of that name says it registered globally only and how to join the board. A ping always carries a sender. A title reclaimed in the same tab takes the new session's folder. `base relay poll --all --from <title>` and `base relay tasks --from <title>` show one sender's messages.
+
+### Doctor, sync and the code map
+
+**`base doctor --fix` repairs what doctor reports.** It prints its plan and changes nothing; `base doctor --fix --yes` applies it after a snapshot of each graph. It runs the same repair the update runs: entries of other workspaces moved out, corrections that name one entry linked to it (the rest stay corrections), one-sided replacements settled, the old `max_chars` setting removed, each graph compacted and its backups cut to `[graph] keep_backups` (3, was 10). `base graph migrate --yes` applies it too.
+
+**A broad folder trigger is advice, not a fault.** Since such a trigger now loads, `base doctor` lists it with the command to narrow it and still reports HEALTHY. A trigger that cannot fire still counts against health.
+
+**`base sync` skips a file it cannot extract and says so, with a new exit code.** One file whose frontmatter made a value no IRI can carry used to stop the whole sync before anything was written. Now that file is skipped and named on stderr (file, field, value), every other file is written, and `base sync` exits 3, partial; 0 is still a complete sync and 1 a failed one. A script that runs `base sync` and treats any non-zero code as failure should read 3 as "written, with the files named".
+
+**An automatic code-map build stops after 15 minutes.** The builds base starts on its own (`base sync --ast --yes`, from the hooks) are stopped, with everything they started, if they run longer than that, and the next session start says so. A tree that needs longer can be built with `base sync --ast --yes --no-time-limit --target <folder>`.
+
+**Obsidian-style links in frontmatter lists extract cleanly** ([#162](https://github.com/ChristopherKahler/base/issues/162)). A `related` list of two or more `[[wikilinks]]` no longer leaves brackets in the graph, and `[[Note|alias]]` and `[[folder/Note]]` link to the same note as `Note`.
+
+**`sync.exclude` holds through links** ([#164](https://github.com/ChristopherKahler/base/issues/164)). A symlink or Windows junction that leads into an excluded folder is skipped, with one line naming it.
+
+**A pnpm workspace that lists its own root maps** ([#172](https://github.com/ChristopherKahler/base/issues/172)). `- .` in `pnpm-workspace.yaml` no longer crashes the code-map build; an entry base cannot read is skipped with one notice.
+
+**A file name with a character like `→` no longer breaks session start** ([#166](https://github.com/ChristopherKahler/base/pull/166)). A path holding a multi-byte character could crash every session start in that workspace. That cut, and five others found by the same check, now land on a whole character.
+
+**The code-map hint shows only when it helps.** The hint to use `base ast query` now appears only for a search of source code (grep, rg, find, ag, ack, fd, Select-String) in a mapped app, suggests a plain name taken from the pattern, and stays quiet for `ls`, `git`, `base` and searches of docs, config or data files. In a folder with no map it says what base is doing about it, once per session, and never tells you to map an app base maps by itself.
+
+### Install and Windows
+
+**Fresh installs write developer mode off.** The new `base.toml` has `[devmode] enabled = false`, with a comment naming `base config set devmode.enabled true`.
+
+**On Windows, base runs Git Bash, never WSL's bash.** Building a plugin ran a bare `bash`, which on Windows can start WSL instead. base now finds Git Bash itself (even when only Git's `cmd` folder is on PATH) and, when there is none, says to install Git for Windows or run from WSL.
+
+**base's own Claude calls stay out of your hooks.** `base graph extract`, `base graph query`, `base doctor --measure` and `base tune` call headless Claude; those calls now run with base's hooks off, so they start no session, take no relay title and write no hook logs.
+
+**Windows file locking.** The graph lock waits out a passing "Access is denied" from Windows instead of failing, and paths written with 8.3 short names match their long spelling.
+
+**`base reconcile --dry-run` says when it read nothing**, instead of reporting a plan of zeros from outside a workspace.
+
+**For contributors.** CI runs the tests and strict clippy on Windows and Linux, with time limits, an allowlist for ignored tests and a committed test count that must match. `scripts/release.sh X.Y.Z --push` now prepares a release on a `release/vX.Y.Z` branch and opens its PR, and `scripts/release.sh X.Y.Z --tag` tags the merge commit once it is green.
+
+The Added, Fixed and Changed lists below are the commit subjects of this release, generated from git; the notes above are the account of what changed for you.
+
+### Added
+
+- **release**: prepare on release/vX.Y.Z, open its PR, and tag the merge commit once it is green (BO-22, F29)
+- **prompt**: stop serving what the AI already has or does not need (BO-03: F3, F5, F14b)
+- **doctor**: measure what Claude Code delivers per hook and set the budgets from it (BO-02: F6)
+- **prompt-hook**: drop whole blocks in priority order and name what was dropped (BO-01: F1, F2, F7, F28/D15)
+- **emit**: the prompt hook keeps its record and its full text
+- **signal**: the working set says what it read, and what it did not
+- **crud**: read both tiers in the working set, through a named seam
+- **doctor**: budget measured_on is read against the live host, not just recorded
+- **version**: base --version carries the build it came from
+- **doctor**: report what each hook emitted, and the legacy max_chars
+- **memory**: give the memory block its own budget, in whole notes
+- **defer**: deferred state for handoffs, forks, tasks and milestones (rank 05 behaviour)
+- **defer**: land the deferred-state surface with no behaviour, and the rank 05 red tests
+- **reminder**: snooze, archive, both tiers, the day-8 warning and day-10 auto-archive
+- **reminder**: land the snooze/archive surface with no behaviour
+- **session-start**: header, instructions, then blocks by rank
+- **emit**: route session start through one measured emission
+- **emit**: measure a hook's output before it is printed
+
+### Fixed
+
+- code review of BO-30
+- base sync --ast --no-time-limit builds past the unattended limit
+- the unattended code-map limit is 15 minutes, and a build at a terminal has none
+- code review of BO-29
+- the upgrade and update messages are written for people, not as engineer logs
+- a link to a single excluded file is named as one
+- the stopped code-map line says when the next build runs
+- a finished code-map build does not wait for what it left running
+- sync.exclude holds through links, and an unattended code-map build stops at a time limit
+- sync reads list items one by one, skips a file it cannot extract, and five string cuts land on a character
+- code review of BO-28
+- the start that prints the developer-mode paragraph is not a first-screen overflow
+- the upgrade turns the 0.15 installer's developer mode off, with the way back first on the screen
+- code review of BO-27
+- no standing instructions after install or upgrade; reminders archive only after their warning was seen
+- **review**: a folder that refuses new files fails the lock now, not at the bound
+- **store**: the graph lock waits out Windows "Access is denied" (BO-23)
+- **review**: second review of the fix commits, local edits only
+- **walk**: an always-on domain is not listed by the walk as its own record
+- **review**: global decisions get their own block; coverage read once per session; keyword update refuses outside its tier
+- **review**: measure re-checks a cut past the preview; unmeasured budgets flagged; bounded claude calls
+- **review**: relay held until printed; context and steering deduped apart; linked modes one block
+- **review**: DUE NOW numbers per session; fit only when it can; review fixes
+- **automap**: a not-yet-created path under an 8.3 short name is under its long spelling
+- **session-start**: the first screen fits on real data, and its length is logged
+- **relay**: a reclaimed title takes the new session's folder
+- **relay**: a ping over a day old never alerts again
+- **hook**: the AST hint stops telling a session to run base sync --ast
+- **session-start**: the first screen fits again - shed 58 units of instruction prose, un-ignore FS1
+- **queries**: the shipped queries honour deferred-means-not-listed
+- **signal**: the working-set scope section carries a deferred count of zero
+- **session-start**: the operator's queries.toml renders beside the signals
+- **store**: hand back what a merged read managed to read, as a value
+- **reconcile**: a dry run that read nothing says so, instead of counting to zero
+- **relay**: a ping never carries an empty sender
+- **relay**: drop the title field from the sentinel - the PATH already carries it
+- **relay**: the wake nudge asks whether the running monitor MATCHES, not whether one exists
+- **relay**: rank E says when it could not read, instead of going quiet
+- **unit-claim**: gate the ARTEFACTS base prints and writes, not the source
+- **emit**: session start budgets BYTES, and the keys are renamed with their unit
+- **emit**: session start budgets BYTES, and the keys are renamed with their unit
+- **relay**: the register warning describes what the command did, not what the board contains
+- **relay**: rank E - read a ping once, and never consume it on an empty read
+- **relay**: clippy clean, both truncation units named, and seen delimited on both sides
+- **relay**: the wake script base ships was losing pings silently
+- **relay**: stop discarding the missing-store error, and stop rendering a dead session's age
+- **emit**: the prompt budget caps BYTES, because that is what the host counts
+- **relay**: an idle seat is never labelled dead, and the threshold clears the wake cycle
+- **emit**: DUE NOW never collapses, not even for the first screen
+- **defer**: rank 05 F1: decide on every value a record carries, not on row order
+- **migrate**: stop under() panicking when a trigger splits a multi-byte char
+- **reminder**: rank 06 follow-ups: archive a handled reminder, the lint, two docs
+- **defer**: take the lock on the deferral write, fit the first screen, document the commands
+- **hook**: the lastActive clock ticks for handoff and fork docs
+
+### Changed
+
+- **changelog**: deferred projects follow [protocol], not [defer]
+- **changelog**: the 0.16.0 notes cover every change since 0.15.2
+- BO-31: code review fixes to the trade rule and doctor's advice
+- BO-31: the second fit's cost counts which rules lost their full text
+- BO-31: doctor's advice names a command that works from a terminal
+- BO-31: the title length comment names the G0 question, not a ruling
+- BO-31: rules that do not fit still reach Claude
+- BO-26: the 0.16.0 upgrade needs no action from the user or their Claude
+- **release**: time limits on every Release job, and the timeouts guard reads every workflow file (BO-22, F29)
+- BO-20: code review fixes: a pooled rollback margin, promotion writes only the candidate's keys, stale proposals stay unpromoted
+- BO-20: shadow promotion backs up the graph under the graph lock; the rule update refusal test names the two new flags
+- BO-20: the shadow tests, the replay check, the help docs; quiet rows with a shadow entry are read by the report
+- BO-20: shadow mode: a candidate matcher runs beside live, judged by the corrections that follow
+- BO-20: the prompt hook's matching is one function, serve, run on what collect read
+- BO-19: the usage tests count a log's days as the reader does, so a run just after midnight passes
+- BO-19: code review of the parallel reader: no thread for a small file, a refused thread read in place, whole lines after a read error
+- BO-19: the usage reader reads the log on up to 8 threads (lynx's ruling after +6.9 s on a 90-day projection)
+- BO-19: ignored needs twice the log's average share of servings corrected, beside ignored_after (lynx's gate-4 ruling)
+- BO-19: code review fixes: a correction counts against the reply it is about, reruns counted once without losing a stopped pass's record, the withheld block named
+- BO-19: doctor lists dead, noisy and ignored rules and decisions to review, from the match log (K8, D6, F14c)
+- BO-18: code review fixes: the fit never grows the output for a short rule, index refresh on the right commands, one scoring-text recipe
+- BO-18: [match] min_score has no default, so no rule is served on its score alone (lynx's Q7 ruling)
+- BO-18: test text reworded in invented terms (public repo)
+- BO-18: test counts +17 (linux 1626, windows 1620); clippy allow on matcher_blocks as elsewhere in the crate
+- BO-18: replay check on the corpus with the index (rule 13), whole-blocks check learns partly printed blocks, Examples 1/2/4 tests; refresh guard writes nothing on a doctor --fix plan
+- BO-18: integration tests through the prompt hook (K7d keyword and near miss, K7e cache, K7f log) and the off-path golden from 07277bc
+- BO-18: BM25 in the prompt hook (admission, ranked blocks, global decisions), rule test held-out judging, index refresh at session start and after matching changes, doctor warning, [match] in the template
+- BO-18: score index (K7a, K7e), [match] config, ranked blocks in the prompt fit (K7d)
+- BO-18: K7b terms and Porter's stemmer in bm25.rs (bm25::words untouched)
+- BO-17: base tune, the rule pass (K4, C5, D5, D7)
+- BO-16: code review fixes and gate 4 fixes
+- BO-16: replay check on the corpus store, help docs, test counts 1583 / 1577
+- BO-16: rule replay and review (K6, K5, D8)
+- BO-25: code review fixes; test counts 1572 / 1566
+- BO-25: doctor --fix keeps corrections that name nothing as corrections (D18)
+- BO-15: code review fixes; test counts 1567 / 1561
+- BO-15: a proposal's target must score twice the next candidate (gate 4 calibration)
+- BO-15: replay check for corrections (build rule 13); propose takes only C2 from the turn before
+- BO-15: help docs for log corrections and rule propose; propose reads --transcript as its own session; clippy
+- BO-15: propose_kinds uses Example 1's wording, which starts with base --version
+- BO-15: corrections detector (C1 to C4), signal rows, rule propose, the CORRECTED line
+- BO-14: the K2e script prints %TMP% and %TEMP% as a native program receives them
+- BO-14: the K2e script builds its throwaway home under RUNNER_TEMP on a Windows runner
+- BO-14: code review fixes
+- BO-14: test counts for the 15 new tests (4 unit, 10 integration, 1 replay)
+- BO-14: rules carry test prompts, and base rule test proves the config fires where it should (K2, D3, F8)
+- BO-13: code review fixes for the match log
+- BO-13: every prompt and file touch is logged to .base/match-log.jsonl (K1, D2, D14)
+- BO-12: code review fixes
+- BO-12: test counts 1501 / 1495 (+15 each: doctor_fix_test 10, fix.rs 3, store.rs 1, replay 1)
+- BO-12: base doctor --fix repairs what doctor reports; the upgrade path runs the same repair
+- BO-11: code review fixes
+- BO-11: match slug codenames against every relay title, not the global registry alone
+- BO-11: handoffs archive only their own lane; unarchive; writes stay in the workspace
+- BO-24: code review fixes, help bank
+- BO-24: base project rename, old name kept as an alias
+- BO-10: domain paths proposes auto_inject back on once the trigger is the project's own folder
+- BO-10: neutral fixture names in injection_scope_test (lynx pre-read)
+- BO-10: code review fixes
+- BO-10: help bank for file-scoped injection, clippy, test counts
+- BO-10: the file being touched decides what is injected (topic P, F21, D1, D13) - work in progress
+- BO-09: code review fixes
+- BO-09: projects know their folder, their parent, whether they inherit, and how old their next step is (F25, F23, P5, D13 fields)
+- BO-08: code review fixes
+- BO-08: test counts +11 on each platform (4 shell, 1 plugin, 2 llm, 3 headless, 1 replay)
+- BO-08: base runs the host's bash on Windows, and its headless Claude calls run with base's hooks off (F19, F27)
+- BO-07: the standards matcher compares paths with / separators (F26c on Windows)
+- BO-07: assert only A3's absence on the workflow file
+- BO-07: code review fixes
+- BO-07: a bare folder counts only when it holds source; the no-map hint once per session per app
+- BO-07: pre-tool hints fire only where they fit the file or command (F20, F26)
+- BO-06: code review fixes
+- BO-06: session start's numbers agree, and each session gets its own full-text files (F10, F11)
+- BO-05: an item stays with the holder it was sent to or shown to
+- BO-05: code review fixes
+- BO-05: base-help pair count 191, provenance tag on the new pair
+- BO-05: docs and base-help say a title passes without its inbox
+- BO-05: tell the session that sent an item, never a later holder of its title
+- BO-05: clippy fixes; test counts linux 1367, windows 1360 (+12 each)
+- BO-05: a ping reaches the session it was sent to, not whoever holds the title now (F12)
+- BO-04: docs name the BASE_NO_WAKE_NUDGE exception and the reply cutoff
+- BO-04: review fixes, and new relay items on a tool call for runs with no watcher
+- BO-04: test counts +13 on each platform (13 new tests, none removed)
+- BO-04: docs and coach describe base relay arm and the one-line watcher reminder
+- BO-04: relay takes one line in the hooks and never outranks the user (F4, F13)
+- guards first - Windows, time limits, ignore allowlist, test counts, no filters
+- **0160**: finch relay+injection ranks with grebe artefact sweep
+- rank 00 widened: one measured writer for user-prompt-submit
+- rank 00 scope: the measured writer, and a RED guard for the prompt hook
+- **relay**: extract the liveness label, and register the defect as two red tests
+- rank 09 item 4: point the operator at what was deferred and how to get it back
+- rank 09 item 1: remove the migration gate, K13 and mark_fresh_install
+- rank 09: a deferred project records WHEN, and a revived one clears it
+- rank 09: the legacy/fresh pair was order-dependent and therefore never evidence
+- rank 09: the deferral upgrade migration, with one open defect named
+- base 0.16.0 lane 2: rank 01 rules delivery, rank 08 handoff registration, rank 02 filter half ([#165](https://github.com/ChristopherKahler/base/issues/165))
+- **crud**: share the tier file walk with the post-tool hook
+
 ## 0.15.2 (2026-09-12)
 
 ### Fixed
