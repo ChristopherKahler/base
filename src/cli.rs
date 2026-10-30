@@ -366,6 +366,13 @@ pub enum Commands {
         /// Port to serve on (default: 3741)
         #[arg(short, long, default_value = "3741")]
         port: u16,
+        /// Address to bind (default: loopback only)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Bind a non-loopback address. Generates a token and prints it in the URL;
+        /// the dashboard can read and write your graph and has no accounts.
+        #[arg(long)]
+        allow_remote: bool,
     },
     /// Scaffold a new workspace: create .base/, write configs, register globally
     Scaffold {
@@ -4720,9 +4727,9 @@ pub fn run() {
         }
 
         // ─── Dashboard ────────────────────────────────────────
-        Some(Commands::Dashboard { port }) => {
+        Some(Commands::Dashboard { port, host, allow_remote }) => {
             let rt = tokio::runtime::Runtime::new().expect("Failed to start async runtime");
-            rt.block_on(base::dashboard::server::start(port, cwd));
+            rt.block_on(base::dashboard::server::start(port, host, allow_remote, cwd));
         }
 
         // ─── Scaffold ─────────────────────────────────────────
