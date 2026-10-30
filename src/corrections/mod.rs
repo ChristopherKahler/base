@@ -542,10 +542,11 @@ pub fn turns(events: Vec<Event>, cc: &CorrectionsConfig) -> Vec<Turn> {
             let mut edited: Vec<Signal> = Vec::new();
             for e in &out[i].events {
                 match e {
-                    Event::FileChanged(f) if wrote.contains(&same_path_key(f)) => {
-                        if !edited.iter().any(|s| s.value.as_deref() == Some(f.as_str())) {
-                            edited.push(Signal::new("C2", "file-edited", Some(f)));
-                        }
+                    Event::FileChanged(f)
+                        if wrote.contains(&same_path_key(f))
+                            && !edited.iter().any(|s| s.value.as_deref() == Some(f.as_str())) =>
+                    {
+                        edited.push(Signal::new("C2", "file-edited", Some(f)));
                     }
                     Event::Text(_) | Event::Wrote(_) => break,
                     _ => {}
