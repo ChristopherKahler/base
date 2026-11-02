@@ -193,23 +193,33 @@ fn the_events_that_deliver_plain_stdout_still_use_it() {
         let end = rest.find("\n        }\n").map(|i| i + start).unwrap_or(src.len());
         src[start..end].to_string()
     };
-    // Rank 00 commit B: session start collects its blocks, the relay blocks with them, and prints
+    // Rank 00 commit B: session start collects its blocks, the relay blocks with them, and emits
     // the measured emission once, so the literal `print!("{block}")` left this arm. What the
     // assertion is for is unchanged, plain stdout and no envelope, and it still fails if either goes.
+    //
+    // The sink, not `print!`: `run_event` collects into a `String` the dispatcher hands to
+    // `harness::outbound`, because a host that reads `{"additionalContext": …}` cannot be given
+    // bytes on stdout. For Claude Code the wrapper is the identity, so plain stdout is still what
+    // leaves the process; the assertion names the collection site because that is now the only
+    // writer in the arm.
     let session_start = arm_of("\"session-start\" =>");
-    assert!(session_start.contains("print!("), "session-start must keep plain stdout — the host delivers it there");
+    assert!(
+        session_start.contains("emitted.push_str(&rendered.text)"),
+        "session-start must keep plain stdout — the host delivers it there"
+    );
     assert!(!session_start.contains("hookSpecificOutput"), "session-start must not use the envelope");
     // Rank 00 widened: user-prompt-submit collects its three contributions — the handler, the relay
-    // inbox push and the task tick — and prints the measured emission ONCE, so the literal
+    // inbox push and the task tick — and emits the measured emission ONCE, so the literal
     // `print!("{block}")` left this arm exactly as it left session start above. The property under
     // test is unchanged and is now asserted more strictly than before: plain stdout, no envelope,
     // and through THE single measured writer rather than any `print!` that happens to be in scope.
     // Three sequential emitters is what this arm used to be, and it is what must not come back.
-    // BO-01 replaced the line-cutting `emit::print_measured` with `emit::prompt::print`, the writer of the fitted
-    // blocks. The property is unchanged: one measured writer, plain stdout.
+    // BO-01 replaced the line-cutting `emit::print_measured` with `emit::prompt::print`, and the
+    // harness layer replaced that call with the same fitted text going into the sink. The property
+    // is unchanged: one measured writer, plain stdout.
     let prompt = arm_of("\"user-prompt-submit\" =>");
     assert!(
-        prompt.contains("emit::prompt::print("),
+        prompt.contains("emit::prompt::render(&fitted, emitted)"),
         "user-prompt-submit must keep plain stdout, through the one measured writer — the host \
          delivers plain stdout on this event"
     );

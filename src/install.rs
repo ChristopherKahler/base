@@ -31,12 +31,15 @@ pub enum StarterCommands {
 }
 
 /// Run the full install process: build, symlink, create global tier, wire hooks, write manifest.
+///
+/// `harness` is `--harness`: `None` wires every host it detects, one name wires only that host.
 pub fn run(
     carl_json_path: Option<&Path>,
     skip_hooks: bool,
     full: bool,
     starter: StarterCommands,
     corrections: crate::corrections::claude_md::Choice,
+    harness: Option<crate::harness::Harness>,
 ) -> Result<()> {
     let home = crate::home::home_root().context("Cannot determine home directory")?;
     let binary_path = std::env::current_exe().context("Cannot determine binary path")?;
@@ -76,12 +79,20 @@ pub fn run(
 
     // Step 3: Wire hooks in ~/.claude/settings.json
     let settings_path = home.join(".claude").join("settings.json");
-    let hooks_deferred = if !skip_hooks {
-        wire_hooks(&settings_path)?
-    } else {
+    let claude_selected = harness.is_none_or(|h| h == crate::harness::Harness::Claude);
+    let hooks_deferred = if skip_hooks {
         println!("⊘ Hook wiring skipped (--skip-hooks)\n");
         false
+    } else if !claude_selected {
+        false
+    } else {
+        wire_hooks(&settings_path)?
     };
+    // Step 3's other half: every host that is not Claude Code. Same flag, same skip: `--harness cursor` wires Cursor
+    // and leaves Claude's settings alone; no flag wires every host that looks installed.
+    if !skip_hooks {
+        wire_other_harnesses(&home, &binary_path, harness);
+    }
 
     // Step 4: Migrate carl.json decisions if provided
     if let Some(carl_path) = carl_json_path {
@@ -210,7 +221,10 @@ fn prompt_starter_commands() -> bool {
 
 /// Remove base hooks from settings.json, remove binary, strip CLAUDE.md section.
 /// With --purge, also removes ~/.base-gbl/ global tier.
-pub fn uninstall(purge: bool) -> Result<()> {
+///
+/// `harness` is `--harness`: `None` un-wires every host, one name only that host. Un-wiring a host base never wired is
+/// a no-op, so the default is the honest one.
+pub fn uninstall(purge: bool, harness: Option<crate::harness::Harness>) -> Result<()> {
     let home = crate::home::home_root().context("Cannot determine home directory")?;
 
     println!("═══════════════════════════════════════");
@@ -219,7 +233,13 @@ pub fn uninstall(purge: bool) -> Result<()> {
 
     // 1. Remove hooks from settings.json
     let settings_path = home.join(".claude").join("settings.json");
-    remove_hooks(&settings_path)?;
+    if harness.is_none_or(|h| h == crate::harness::Harness::Claude) {
+        remove_hooks(&settings_path)?;
+    } else {
+        println!("1. Remove hooks from settings.json ... ⊘ not selected (--harness)");
+    }
+    // 1b. Every other host base could have wired.
+    unwire_other_harnesses(&home, harness);
 
     // 2. Remove BASE CLI section from CLAUDE.md
     let claude_md = home.join(".claude").join("CLAUDE.md");
@@ -298,17 +318,36 @@ fn remove_hooks(settings_path: &Path) -> Result<()> {
         return Ok(());
     }
 
+    let removed = remove_hooks_quiet(settings_path)?;
+    if removed == 0 {
+        println!("no base hooks found — skipped");
+    } else {
+        println!("✓ removed {removed} base hook entries");
+    }
+    Ok(())
+}
+
+/// Remove every hook entry whose command names `base hook`, and nothing else. Returns how many entries went.
+///
+/// The quiet half of [`remove_hooks`], and the one [`crate::harness::claude`] calls: `base uninstall` owns the
+/// transcript, the adapter owns the rule. Parses and re-serializes, as this step always has — a settings file base
+/// could not merge as text is still one whose hooks base must be able to take back out.
+pub fn remove_hooks_quiet(settings_path: &Path) -> Result<usize> {
+    if !settings_path.exists() {
+        return Ok(0);
+    }
     let content = std::fs::read_to_string(settings_path)?;
     if !content.contains("base hook") {
-        println!("no base hooks found — skipped");
-        return Ok(());
+        return Ok(0);
     }
 
     let mut settings: serde_json::Value = serde_json::from_str(&content)?;
 
+    let mut removed = 0usize;
     if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
         for (_event, entries) in hooks.iter_mut() {
             if let Some(arr) = entries.as_array_mut() {
+                let before = arr.len();
                 arr.retain(|entry| {
                     // Remove any entry whose hooks array contains a "base hook" command
                     if let Some(hook_list) = entry.get("hooks").and_then(|h| h.as_array()) {
@@ -322,17 +361,20 @@ fn remove_hooks(settings_path: &Path) -> Result<()> {
                         true
                     }
                 });
+                removed += before - arr.len();
             }
         }
+    }
+
+    if removed == 0 {
+        return Ok(0);
     }
 
     let tmp = settings_path.with_extension("json.tmp");
     let formatted = serde_json::to_string_pretty(&settings)?;
     std::fs::write(&tmp, &formatted)?;
     std::fs::rename(&tmp, settings_path)?;
-
-    println!("✓ removed all base hook entries");
-    Ok(())
+    Ok(removed)
 }
 
 fn remove_claude_md_section(claude_md_path: &Path) -> Result<()> {
@@ -1007,6 +1049,43 @@ fn wire_hooks(settings_path: &Path) -> Result<bool> {
         println!("✓ (added base hook {})", added.join(", "));
     }
     Ok(false)
+}
+
+/// Step 3's other half: wire every host base can attach to that is not Claude Code.
+///
+/// Claude Code keeps its own step because its wiring has a deferred path (steps 7 and 8 create `~/.claude` for the
+/// bundled skill, then step 3 retries) that no other host needs. Everything else is one loop over
+/// [`crate::harness::registry`]: a host that looks installed is wired, one that does not is skipped, and one host's
+/// failure is one line — it never costs the user the rest of the install.
+fn wire_other_harnesses(home: &Path, exe: &Path, only: Option<crate::harness::Harness>) {
+    for (harness, outcome) in crate::harness::wire_detected(home, exe, only) {
+        if harness == crate::harness::Harness::Claude {
+            continue;
+        }
+        let path = crate::harness::binding(harness).config_path(home);
+        print!("   Wire {} hooks → {} ... ", harness.name(), path.display());
+        match outcome {
+            Ok(o) if o.note.is_empty() => println!("✓"),
+            Ok(o) => println!("✓ {}", o.note),
+            Err(e) => println!("⊘ {e:#}"),
+        }
+    }
+}
+
+/// `base uninstall`'s counterpart: take base's entries back out of every host, or just `only`.
+fn unwire_other_harnesses(home: &Path, only: Option<crate::harness::Harness>) {
+    for (harness, outcome) in crate::harness::unwire_all(home, only) {
+        if harness == crate::harness::Harness::Claude {
+            continue;
+        }
+        let path = crate::harness::binding(harness).config_path(home);
+        print!("   Un-wire {} hooks → {} ... ", harness.name(), path.display());
+        match outcome {
+            Ok(o) if o.note.is_empty() => println!("✓"),
+            Ok(o) => println!("✓ {}", o.note),
+            Err(e) => println!("⊘ {e:#}"),
+        }
+    }
 }
 
 /// The file under `~/.base-gbl` that says this build's hooks are wired: `.hooks-wired-<version>-<table hash>`.

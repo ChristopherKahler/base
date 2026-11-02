@@ -72,10 +72,13 @@ pub enum LogAction {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Handle Claude Code hook events (session-start, post-tool-use, user-prompt-submit)
+    /// Handle agent-host hook events (session-start, post-tool-use, user-prompt-submit)
     Hook {
         /// Hook event type
         event: String,
+        /// The host that called this hook: claude (default), opencode, cursor, copilot, antigravity
+        #[arg(long)]
+        harness: Option<String>,
     },
     /// Publish base's hook wiring for an external installer (JSON)
     Hooks {
@@ -318,6 +321,9 @@ pub enum Commands {
         /// Skip hook wiring in settings.json
         #[arg(long)]
         skip_hooks: bool,
+        /// Wire only this host: claude, opencode, cursor, copilot, antigravity, or all (default: every host detected)
+        #[arg(long)]
+        harness: Option<String>,
         /// Register the bundled components (PAUL, SEED, SKILLSMITH) in manifest
         #[arg(long)]
         full: bool,
@@ -359,6 +365,9 @@ pub enum Commands {
         /// Also remove ~/.base-gbl/ global tier (destructive)
         #[arg(long)]
         purge: bool,
+        /// Un-wire only this host: claude, opencode, cursor, copilot, antigravity, or all (default: every host)
+        #[arg(long)]
+        harness: Option<String>,
     },
     /// Launch the Command Center Dashboard (local web UI)
     #[command(visible_alias = "dash")]
@@ -1969,6 +1978,30 @@ fn die(prefix: &str, e: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+/// `--harness` for `install` and `uninstall`: `None` means every host.
+///
+/// `all` and `auto` are both spelled that way in the docs and both mean "no
+/// filter": `auto` because install already wires only the hosts it detects, and
+/// `all` because the operator's intent there is "not just one". An unknown name
+/// exits rather than falling back to every host — wiring a host the operator did
+/// not name is the one failure a `--harness` flag exists to prevent.
+fn parse_harness(name: Option<&str>) -> Option<base::harness::Harness> {
+    let name = name?;
+    if name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    match base::harness::Harness::parse(name) {
+        Some(h) => Some(h),
+        None => die(
+            "--harness",
+            format!(
+                "unknown host `{name}` (expected one of {}, all)",
+                base::harness::Harness::ALL.map(|h| h.name()).join(", ")
+            ),
+        ),
+    }
+}
+
 /// Read the global `base.toml` for a `config` subcommand, or exit non-zero.
 ///
 /// ABSENT comes back as `None` rather than as an error, because the three
@@ -2209,8 +2242,24 @@ pub fn run() {
     // A hook event goes to the dispatcher before the config load below. The dispatcher loads its own config from the
     // cwd the host reports, so this load was never used by a hook; and inside one of base's own headless calls a hook
     // must print nothing at all (F27, BO-08), while this load prints any config fault it finds.
-    if let Some(Commands::Hook { event }) = &cli.command {
-        hook::dispatch(event);
+    if let Some(Commands::Hook { event, harness }) = &cli.command {
+        let host = match harness.as_deref() {
+            None => None,
+            Some(name) => match base::harness::Harness::parse(name) {
+                Some(h) => Some(h),
+                None => {
+                    // A typo must not silently wire a host's hooks to another host's translation. Nothing is read from
+                    // stdin here on purpose: a hook that cannot name its host has nothing to say, and exiting non-zero
+                    // would make the host print a failed hook on every turn.
+                    eprintln!(
+                        "base hook: unknown harness `{name}` (expected one of {})",
+                        base::harness::Harness::ALL.map(|h| h.name()).join(", ")
+                    );
+                    return;
+                }
+            },
+        };
+        hook::dispatch(event, host);
         return;
     }
     let config = BaseConfig::load(&cwd);
@@ -4673,7 +4722,7 @@ pub fn run() {
         }
 
         // ─── Install ─────────────────────────────────────────
-        Some(Commands::Install { carl, skip_hooks, full, starter_commands, no_starter_commands, corrections_line, no_corrections_line }) => {
+        Some(Commands::Install { carl, skip_hooks, harness, full, starter_commands, no_starter_commands, corrections_line, no_corrections_line }) => {
             let carl_path = carl.as_ref().map(std::path::Path::new);
             let starter = match (starter_commands, no_starter_commands) {
                 (true, _) => base::install::StarterCommands::Yes,
@@ -4685,7 +4734,7 @@ pub fn run() {
                 (_, true) => base::corrections::claude_md::Choice::No,
                 _ => base::corrections::claude_md::Choice::Ask,
             };
-            if let Err(e) = base::install::run(carl_path, skip_hooks, full, starter, corrections) {
+            if let Err(e) = base::install::run(carl_path, skip_hooks, full, starter, corrections, parse_harness(harness.as_deref())) {
                 eprintln!("Install failed: {e}");
             }
         }
@@ -4713,8 +4762,8 @@ pub fn run() {
         }
 
         // ─── Uninstall ────────────────────────────────────────
-        Some(Commands::Uninstall { purge }) => {
-            if let Err(e) = base::install::uninstall(purge) {
+        Some(Commands::Uninstall { purge, harness }) => {
+            if let Err(e) = base::install::uninstall(purge, parse_harness(harness.as_deref())) {
                 eprintln!("Uninstall failed: {e}");
             }
         }

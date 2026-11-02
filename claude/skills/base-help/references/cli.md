@@ -201,7 +201,7 @@ BASE — Proactive context-injection engine for Claude Code
 Usage: base [COMMAND]
 
 Commands:
-  hook             Handle Claude Code hook events (session-start, post-tool-use, user-prompt-submit)
+  hook             Handle agent-host hook events (session-start, post-tool-use, user-prompt-submit)
   hooks            Publish base's hook wiring for an external installer (JSON)
   log              Read base's own logs: `base log matches` shows what prompts and file touches matched
   ast              Query AST codebase graph (entities, calls, imports) [aliases: a]
@@ -261,15 +261,18 @@ Built by Chris Kahler
 ## base hook
 
 ```text
-Handle Claude Code hook events (session-start, post-tool-use, user-prompt-submit)
+Handle agent-host hook events (session-start, post-tool-use, user-prompt-submit)
 
-Usage: base hook <EVENT>
+Usage: base hook [OPTIONS] <EVENT>
 
 Arguments:
   <EVENT>
           Hook event type
 
 Options:
+      --harness <HARNESS>
+          The host that called this hook: claude (default), opencode, cursor, copilot, antigravity
+
   -h, --help
           Print help
 ```
@@ -3096,6 +3099,9 @@ Options:
       --skip-hooks
           Skip hook wiring in settings.json
 
+      --harness <HARNESS>
+          Wire only this host: claude, opencode, cursor, copilot, antigravity, or all (default: every host detected)
+
       --full
           Register the bundled components (PAUL, SEED, SKILLSMITH) in manifest
 
@@ -3203,6 +3209,9 @@ Usage: base uninstall [OPTIONS]
 Options:
       --purge
           Also remove ~/.base-gbl/ global tier (destructive)
+
+      --harness <HARNESS>
+          Un-wire only this host: claude, opencode, cursor, copilot, antigravity, or all (default: every host)
 
   -h, --help
           Print help
