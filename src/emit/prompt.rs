@@ -935,9 +935,14 @@ fn drop_order(blocks: &[PromptBlock]) -> Vec<Unit> {
     out
 }
 
-/// Print the fitted output: the prompt hook's one writer.
-pub fn print(fitted: &Fitted) {
-    print!("{}", fitted.text);
+/// The fitted output as the host should see it, appended to the dispatcher's sink.
+///
+/// This used to be `print!` into stdout, and it is a sink now because the harness layer has to wrap the text for hosts
+/// that read JSON (`crate::harness::outbound`) — and wrapping requires the whole emission, not a stream. There is
+/// deliberately no `print!` variant left: a second writer beside the sink would be a second emitter blind to what the
+/// first one sent, which is the defect rank 00 removed from the prompt hook.
+pub fn render(fitted: &Fitted, emitted: &mut String) {
+    emitted.push_str(&fitted.text);
 }
 
 /// Where a session's prompt blocks are kept: `.base/hook-output/<session>/`, the per-session layout

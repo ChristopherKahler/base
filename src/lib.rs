@@ -42,6 +42,7 @@ pub mod home;
 pub mod extract;
 pub mod fix;
 pub mod first_run;
+pub mod harness;
 pub mod hook;
 pub mod install;
 pub mod manifest;

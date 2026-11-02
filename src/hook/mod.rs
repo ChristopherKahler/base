@@ -71,11 +71,16 @@ fn extract_tool_context(event: &serde_json::Value) -> (Option<String>, Option<St
 
 /// Entry point for all hook events. Fail-open: any error → stderr only, exit 0, empty stdout.
 ///
+/// `harness` is the host that called us (`--harness`, absent meaning Claude Code). The engine below is one dialect —
+/// the Claude Code payload in, and mostly a Claude-shaped envelope out — so a host that speaks something else is
+/// translated at this boundary by [`crate::harness`]: its payload is normalized on the way in, and what the engine
+/// collected is re-wrapped on the way out. Nothing below this function knows which host asked.
+///
 /// Inside one of base's own headless `claude -p` calls (`BASE_HEADLESS`, set by `llm`) every event returns here before
 /// anything is parsed, printed or written: no config, no log row, no session file, no relay title (F27, BO-08). The
 /// payload is still drained, unread, as every hook run drained it before: a prompt hook's payload carries the whole
 /// extraction prompt, and the host should never be left writing it into a pipe nobody reads.
-pub fn dispatch(event: &str) {
+pub fn dispatch(event: &str, harness: Option<crate::harness::Harness>) {
     if crate::llm::headless() {
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
         return;
@@ -90,7 +95,17 @@ pub fn dispatch(event: &str) {
         }
         return;
     }
-    let outcome = run(event);
+    let host = harness.unwrap_or(crate::harness::Harness::Claude);
+    // A host that hands base its own event name still reaches the right arm; the generated configs pass the canonical
+    // name, and an unknown name is a no-op event, which is what a hook nobody implements should be.
+    let event = crate::harness::canonical_event(host, event).unwrap_or(event);
+    let outcome = run(event, host);
+    // What the engine collected, in the host's shape. `None` is "print nothing": an empty envelope is an instruction on
+    // some hosts, and the engine emitting nothing is the common case for a tool hook that matched nothing.
+    if let Some(printed) = crate::harness::outbound(host, event, &outcome.out) {
+        print!("{printed}");
+        let _ = std::io::stdout().flush();
+    }
     let (success, data, error) = match &outcome.result {
         Ok(d) => (true, Some(d), None),
         Err(e) => (false, None, Some(format!("{e:#}"))),
@@ -119,10 +134,15 @@ struct HookRun {
     /// False when the host sent no `cwd` and the process cwd was used instead, so the
     /// log can say which input chose the tier rather than implying the host named one.
     cwd_from_payload: bool,
+    /// What the engine collected for the host, in the engine's own shape. Printed by
+    /// [`dispatch`] after [`crate::harness::outbound`] has translated it, and kept even
+    /// when `result` is an error: the sites this replaced had already printed by the
+    /// time an error could be seen, so dropping their text would be a regression.
+    out: String,
     result: anyhow::Result<HookEventData>,
 }
 
-fn run(event: &str) -> HookRun {
+fn run(event: &str, harness: crate::harness::Harness) -> HookRun {
     let stdin_json = match read_stdin() {
         Ok(v) => v,
         Err(e) => {
@@ -131,10 +151,15 @@ fn run(event: &str) -> HookRun {
             return HookRun {
                 cwd: std::env::current_dir().unwrap_or_default(),
                 cwd_from_payload: false,
+                out: String::new(),
                 result: Err(e),
             };
         }
     };
+
+    // The host's payload in the engine's shape, before anything reads it: `cwd`, `session_id`, `tool_name` and
+    // `tool_input` all have to be where the engine looks, and only the adapter knows where its host puts them.
+    let stdin_json = crate::harness::inbound(harness, event, stdin_json);
 
     let payload_cwd = stdin_json
         .get("cwd")
@@ -143,18 +168,26 @@ fn run(event: &str) -> HookRun {
     let cwd_from_payload = payload_cwd.is_some();
     let cwd = payload_cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    let result = run_event(event, &stdin_json, &cwd);
+    let mut out = String::new();
+    let result = run_event(event, &stdin_json, &cwd, &mut out);
     HookRun {
         cwd,
         cwd_from_payload,
+        out,
         result,
     }
 }
 
+/// The engine. Collects what the host should see into `out` and returns what the hook log records.
+///
+/// `emitted` is a sink rather than a return value on purpose: the arms below print before they can fail (session
+/// start's unhealthy-graph warning, the prompt hook's blocks before `handled?`), and an error must not throw that text
+/// away.
 fn run_event(
     event: &str,
     stdin_json: &serde_json::Value,
     cwd: &Path,
+    emitted: &mut String,
 ) -> anyhow::Result<HookEventData> {
     let cwd = cwd.to_path_buf();
     let config = BaseConfig::load(&cwd);
@@ -215,11 +248,10 @@ fn run_event(
                     eprintln!("base: session start could not keep its output record: {why}");
                 }
             }
-            print!("{}", rendered.text);
+            emitted.push_str(&rendered.text);
             // The match log's retention (K1e), after the print. The hook still exits only after it, so it is kept cheap:
             // at most one rename a day and the deletion of archive files past `[log] prompt_days`; the log being
             // appended to is never rewritten (see `match_log::retain`).
-            let _ = std::io::stdout().flush();
             if let Some(dir) = crate::crud::handoff_show::session_start_dir(&cwd)
                 && let Err(why) = crate::emit::match_log::retain(&dir, config.log.prompt_days, chrono::Local::now())
             {
@@ -271,10 +303,10 @@ fn run_event(
                         "additionalContext": context,
                     }
                 });
-                println!("{envelope}");
+                emitted.push_str(&envelope.to_string());
+                emitted.push('\n');
             }
             // The match log's row (K1), after the print, never in the way of it (K1g).
-            let _ = std::io::stdout().flush();
             if let Some(dir) = crate::crud::handoff_show::session_start_dir(&cwd) {
                 // The shadow candidate (BO-20, K9b), after the print: what it would have served on this call. A call that
                 // touched no path and served nothing is not a file touch and writes no row, unless the candidate would
@@ -314,7 +346,8 @@ fn run_event(
                         "additionalContext": context,
                     }
                 });
-                println!("{envelope}");
+                emitted.push_str(&envelope.to_string());
+                emitted.push('\n');
             }
             data.session_id = session_id;
             Ok(data)
@@ -446,8 +479,7 @@ fn run_event(
             // THE SINGLE EXIT. It runs before `handled?` for the same reason session start's does:
             // the sites this replaced had already printed by the time an error could be seen, so
             // dropping their text on an error would be a regression dressed as a refactor.
-            crate::emit::prompt::print(&fitted);
-            let _ = std::io::stdout().flush();
+            crate::emit::prompt::render(&fitted, emitted);
             // The corrections state and its signal rows, after the print and never in the way of it: a C2 signal is
             // answered only by a C4 line that printed.
             if let Some(c) = correction {

@@ -11,17 +11,29 @@ use serde_json::Value;
 
 /// One JSON value's span in `text`: `start..end` byte offsets.
 #[derive(Debug, Clone, Copy)]
-struct Span {
-    start: usize,
-    end: usize,
+pub(crate) struct Span {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
-struct Scanner<'a> {
+/// A brace-, bracket- and string-aware reader over a JSON document's *bytes*.
+///
+/// Exposed to the rest of the crate (`pub(crate)`) because a second host config has the same problem this file was
+/// written for: finding where a value starts and ends, so an edit can be made in text and every other byte left as it
+/// was. There is not a second implementation of that scan anywhere else in the tree on purpose.
+pub(crate) struct Scanner<'a> {
     b: &'a [u8],
 }
 
 impl<'a> Scanner<'a> {
-    fn ws(&self, mut i: usize) -> usize {
+    pub(crate) fn new(text: &'a str) -> Self {
+        Scanner { b: text.as_bytes() }
+    }
+}
+
+
+impl<'a> Scanner<'a> {
+    pub(crate) fn ws(&self, mut i: usize) -> usize {
         while i < self.b.len() && matches!(self.b[i], b' ' | b'\t' | b'\n' | b'\r') {
             i += 1;
         }
@@ -29,7 +41,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// The end of the string starting at `i` (a `"`), past its closing quote.
-    fn string(&self, i: usize) -> Option<usize> {
+    pub(crate) fn string(&self, i: usize) -> Option<usize> {
         if self.b.get(i) != Some(&b'"') {
             return None;
         }
@@ -45,7 +57,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// The span of the value starting at `i` (after whitespace).
-    fn value(&self, i: usize) -> Option<Span> {
+    pub(crate) fn value(&self, i: usize) -> Option<Span> {
         let start = self.ws(i);
         let end = match *self.b.get(start)? {
             b'"' => self.string(start)?,
@@ -65,7 +77,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// The end of the object or array starting at `i`, past its closing bracket.
-    fn container(&self, i: usize) -> Option<usize> {
+    pub(crate) fn container(&self, i: usize) -> Option<usize> {
         let mut depth = 0usize;
         let mut j = i;
         while j < self.b.len() {
@@ -89,7 +101,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// The members of the object spanning `obj`: each key's text, the key's start and its value's span.
-    fn members(&self, obj: Span) -> Option<Vec<(String, usize, Span)>> {
+    pub(crate) fn members(&self, obj: Span) -> Option<Vec<(String, usize, Span)>> {
         if self.b.get(obj.start) != Some(&b'{') {
             return None;
         }
@@ -118,7 +130,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// The elements of the array spanning `arr`.
-    fn elements(&self, arr: Span) -> Option<Vec<Span>> {
+    pub(crate) fn elements(&self, arr: Span) -> Option<Vec<Span>> {
         if self.b.get(arr.start) != Some(&b'[') {
             return None;
         }
@@ -140,7 +152,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// The spaces and tabs before `at` on its line, when only those stand between the line's start and it.
-    fn indent_of(&self, at: usize) -> Option<String> {
+    pub(crate) fn indent_of(&self, at: usize) -> Option<String> {
         let line_start = self.b[..at].iter().rposition(|c| *c == b'\n').map_or(0, |p| p + 1);
         let lead = &self.b[line_start..at];
         lead.iter().all(|c| *c == b' ' || *c == b'\t').then(|| String::from_utf8_lossy(lead).into_owned())
@@ -148,7 +160,7 @@ impl<'a> Scanner<'a> {
 }
 
 /// `value` pretty-printed, every line after the first indented by `indent`.
-fn pretty(value: &Value, indent: &str, unit: &str) -> String {
+pub(crate) fn pretty(value: &Value, indent: &str, unit: &str) -> String {
     let text = serde_json::to_string_pretty(value).unwrap_or_default();
     let mut out = String::new();
     for (n, line) in text.lines().enumerate() {
@@ -164,10 +176,10 @@ fn pretty(value: &Value, indent: &str, unit: &str) -> String {
     out
 }
 
-/// One insertion: at byte `at`, this text.
-struct Insert {
-    at: usize,
-    text: String,
+/// One insertion: at byte `at`, this text. Applied from the end, so earlier offsets stay true.
+pub(crate) struct Insert {
+    pub(crate) at: usize,
+    pub(crate) text: String,
 }
 
 /// `text` (a settings file) with `entries` (event and the object to append to `hooks[event]`) added, every other byte
@@ -175,7 +187,7 @@ struct Insert {
 /// original plus exactly these entries: the caller then writes nothing.
 pub fn add_hook_entries(text: &str, entries: &[(&str, Value)]) -> Option<String> {
     let original: Value = serde_json::from_str(text).ok()?;
-    let sc = Scanner { b: text.as_bytes() };
+    let sc = Scanner::new(text);
     let root = sc.value(0)?;
     let top = sc.members(root)?;
     // The file's own indent unit: the first member's, else two spaces.
@@ -246,7 +258,7 @@ pub fn add_hook_entries(text: &str, entries: &[(&str, Value)]) -> Option<String>
 
 /// An insertion of `member` (`"key": value`) into the object `obj` whose members are `members`: after the last one, or
 /// as the only one.
-fn member_insert(sc: &Scanner<'_>, obj: Span, members: &[(String, usize, Span)], unit: &str, obj_indent: &str, member: &str) -> Insert {
+pub(crate) fn member_insert(sc: &Scanner<'_>, obj: Span, members: &[(String, usize, Span)], unit: &str, obj_indent: &str, member: &str) -> Insert {
     match members.last() {
         Some((_, key, last)) => {
             let indent = sc.indent_of(*key).unwrap_or_else(|| format!("{obj_indent}{unit}"));
