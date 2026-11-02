@@ -3221,6 +3221,14 @@ Options:
           
           [default: 3741]
 
+      --host <HOST>
+          Address to bind (default: loopback only)
+          
+          [default: 127.0.0.1]
+
+      --allow-remote
+          Bind a non-loopback address. Generates a token and prints it in the URL; the dashboard can read and write your graph and has no accounts
+
   -h, --help
           Print help
 ```

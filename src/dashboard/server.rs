@@ -2,14 +2,105 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::response::Html;
+use axum::extract::Request;
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use include_dir::{Dir, include_dir};
-use tower_http::cors::CorsLayer;
 
 use crate::config::BaseConfig;
 
 static DASHBOARD_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/dashboard/dist");
+
+/// The names that mean this machine. Anything else is a network address, and a
+/// network bind needs `--allow-remote` plus the startup token.
+const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
+
+pub fn is_loopback(host: &str) -> bool {
+    LOOPBACK_HOSTS.iter().any(|h| h.eq_ignore_ascii_case(host))
+}
+
+/// `host` as it appears in a `Host` header (or a bind address): an IPv6 literal
+/// is bracketed, a name or an IPv4 address is not.
+fn with_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Every `Host` header this server answers for, or `None` for "any".
+///
+/// A browser sends the name it was given, so a DNS name pointed at 127.0.0.1
+/// arrives as that name. Refusing it here is what stops a rebinding page from
+/// reaching a loopback server that has no accounts and can write the graph.
+///
+/// A wildcard bind (`0.0.0.0`, `::`) cannot know the names clients will use —
+/// the LAN address, a machine name, `localhost` — so there is no list to check
+/// against. That mode is never reachable without `--allow-remote`, which always
+/// mints a token, and the token is what gates it.
+pub fn allowed_hosts(bind_host: &str, port: u16) -> Option<Vec<String>> {
+    if is_wildcard(bind_host) {
+        return None;
+    }
+    let mut hosts = vec![with_port(bind_host, port)];
+    let also = if is_loopback(bind_host) { LOOPBACK_HOSTS.to_vec() } else { vec!["localhost"] };
+    for h in also {
+        let h = with_port(h, port);
+        if !hosts.contains(&h) {
+            hosts.push(h);
+        }
+    }
+    Some(hosts)
+}
+
+pub fn is_wildcard(host: &str) -> bool {
+    matches!(host, "0.0.0.0" | "::" | "[::]")
+}
+
+pub fn host_allowed(host_header: Option<&str>, allowed: Option<&[String]>) -> bool {
+    match allowed {
+        None => true,
+        Some(list) => host_header.is_some_and(|h| list.iter().any(|a| a.eq_ignore_ascii_case(h))),
+    }
+}
+
+/// The token for a non-loopback bind. It is printed once at startup and lives
+/// only in this process, so it has to be unguessable, not memorable.
+fn session_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(std::process::id().to_le_bytes());
+    h.update(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
+    h.update(std::collections::hash_map::RandomState::new().build_hasher().finish().to_le_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The token may arrive as `?token=` or as `Authorization: Bearer`. A query
+/// parameter is what makes the printed URL openable; the header is what a
+/// script uses so the token stays out of logs.
+fn token_ok(req: &Request, expected: &str) -> bool {
+    let in_query = req
+        .uri()
+        .query()
+        .is_some_and(|q| q.split('&').any(|p| p.strip_prefix("token=") == Some(expected)));
+    let in_header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|t| t == expected);
+    in_query || in_header
+}
 
 /// Shared state for all API handlers.
 pub struct AppState {
@@ -90,8 +181,22 @@ impl AppState {
     }
 }
 
-/// Start the dashboard server on the given port.
-pub async fn start(port: u16, cwd: PathBuf) {
+/// Start the dashboard server on the given port and host.
+///
+/// `host` is loopback by default. A non-loopback host has no accounts in front
+/// of it and can write the graph, so it takes an explicit `allow_remote` and a
+/// per-run token; without the flag the server refuses to start.
+pub async fn start(port: u16, host: String, allow_remote: bool, cwd: PathBuf) {
+    if !is_loopback(&host) && !allow_remote {
+        eprintln!(
+            "base dashboard: {host} is not a loopback address. The dashboard can read and \
+             write your graph and has no accounts, so exposing it takes --allow-remote. \
+             A token is generated and printed at startup when you do."
+        );
+        std::process::exit(1);
+    }
+    let token = (!is_loopback(&host)).then(|| std::sync::Arc::new(session_token()));
+
     let config = BaseConfig::load(&cwd);
 
     // Collect all workspace graph.nq paths — primary + registered workspaces
@@ -185,11 +290,16 @@ pub async fn start(port: u16, cwd: PathBuf) {
         // WebSocket
         .route("/api/ws/session", get(super::api::ws_session))
         .fallback(get(serve_static))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+        .layer(middleware::from_fn(guard(
+            std::sync::Arc::new(allowed_hosts(&host, port)),
+            token.clone(),
+        )))        .with_state(state);
 
-    let bind_addr = format!("0.0.0.0:{port}");
-    let url = format!("http://localhost:{port}");
+    let bind_addr = with_port(&host, port);
+    let mut url = format!("http://{bind_addr}");
+    if let Some(t) = &token {
+        url.push_str(&format!("/?token={t}"));
+    }
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -199,6 +309,9 @@ pub async fn start(port: u16, cwd: PathBuf) {
         });
 
     println!("Dashboard: {url}");
+    if token.is_some() {
+        println!("⚠  reachable on the network — the URL above carries the token that protects it");
+    }
     println!("Press Ctrl+C to stop\n");
 
     if let Err(e) = open::that(&url) {
@@ -214,9 +327,36 @@ pub async fn start(port: u16, cwd: PathBuf) {
     println!("\nDashboard stopped.");
 }
 
+/// The request gate: the `Host` header must name this server, and a network
+/// bind must also carry the startup token. Applied to every route, including
+/// the static assets, so there is no unguarded path in.
+fn guard(
+    allowed: std::sync::Arc<Option<Vec<String>>>,
+    token: Option<std::sync::Arc<String>>,
+) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>
+       + Clone
+       + Send
+       + Sync
+       + 'static {
+    move |req: Request, next: Next| {
+        let allowed = allowed.clone();
+        let token = token.clone();
+        Box::pin(async move {
+            let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok());
+            if !host_allowed(host, allowed.as_deref()) {
+                return (StatusCode::FORBIDDEN, "forbidden: unexpected Host header").into_response();
+            }
+            if let Some(expected) = token
+                && !token_ok(&req, &expected)
+            {
+                return (StatusCode::UNAUTHORIZED, "unauthorized: missing or wrong token").into_response();
+            }
+            next.run(req).await
+        })
+    }
+}
+
 async fn serve_index() -> axum::response::Response {
-    use axum::http::header;
-    use axum::response::IntoResponse;
     match DASHBOARD_DIR.get_file("index.html") {
         Some(file) => (
             [(header::CONTENT_TYPE, "text/html"), (header::CACHE_CONTROL, "no-cache")],
@@ -227,9 +367,6 @@ async fn serve_index() -> axum::response::Response {
 }
 
 async fn serve_static(uri: axum::http::Uri) -> axum::response::Response {
-    use axum::http::{StatusCode, header};
-    use axum::response::IntoResponse;
-
     let path = uri.path().trim_start_matches('/');
 
     match DASHBOARD_DIR.get_file(path) {
@@ -260,4 +397,81 @@ async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
         .expect("failed to listen for ctrl+c");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(uri: &str) -> Request {
+        Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()
+    }
+
+    fn list(host: &str, port: u16) -> Vec<String> {
+        allowed_hosts(host, port).expect("a named bind has an allowlist")
+    }
+
+    #[test]
+    fn loopback_binds_answer_to_every_loopback_name() {
+        let allowed = list("127.0.0.1", 3741);
+        assert!(host_allowed(Some("127.0.0.1:3741"), Some(&allowed)));
+        assert!(host_allowed(Some("localhost:3741"), Some(&allowed)));
+        assert!(host_allowed(Some("[::1]:3741"), Some(&allowed)));
+    }
+
+    #[test]
+    fn a_rebinding_host_is_refused() {
+        let allowed = list("127.0.0.1", 3741);
+        assert!(
+            !host_allowed(Some("evil.example:3741"), Some(&allowed)),
+            "a DNS name pointed at loopback must not be served"
+        );
+        assert!(!host_allowed(Some("127.0.0.1:3742"), Some(&allowed)));
+        assert!(!host_allowed(None, Some(&allowed)));
+    }
+
+    #[test]
+    fn a_network_bind_answers_only_to_its_own_name() {
+        let allowed = list("192.168.1.10", 3741);
+        assert!(host_allowed(Some("192.168.1.10:3741"), Some(&allowed)));
+        assert!(host_allowed(Some("localhost:3741"), Some(&allowed)));
+        assert!(!host_allowed(Some("127.0.0.1:3741"), Some(&allowed)));
+    }
+
+    #[test]
+    fn a_wildcard_bind_has_no_allowlist_so_the_token_is_the_gate() {
+        assert!(allowed_hosts("0.0.0.0", 3741).is_none());
+        assert!(allowed_hosts("::", 3741).is_none());
+        assert!(host_allowed(Some("192.168.1.10:3741"), None));
+    }
+
+    #[test]
+    fn ipv6_binds_are_bracketed_in_the_host_header() {
+        assert_eq!(with_port("::1", 3741), "[::1]:3741");
+        assert_eq!(with_port("127.0.0.1", 3741), "127.0.0.1:3741");
+    }
+
+    #[test]
+    fn the_token_is_accepted_from_the_query_or_a_bearer_header() {
+        assert!(token_ok(&req("/api/x?token=abc"), "abc"));
+        assert!(!token_ok(&req("/api/x?token=abd"), "abc"));
+        assert!(!token_ok(&req("/api/x"), "abc"));
+        let with_header = Request::builder()
+            .header("authorization", "Bearer abc")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(token_ok(&with_header, "abc"));
+    }
+
+    #[test]
+    fn a_token_is_not_a_substring_match() {
+        assert!(!token_ok(&req("/api/x?token=abcd"), "abc"));
+        assert!(!token_ok(&req("/api/x?mytoken=abc"), "abc"));
+    }
+
+    #[test]
+    fn session_tokens_differ() {
+        assert_ne!(session_token(), session_token());
+        assert_eq!(session_token().len(), 64);
+    }
 }
