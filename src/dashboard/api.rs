@@ -1525,7 +1525,25 @@ pub struct ProjectUsage {
     pub last_active: String,
 }
 
+/// Estimated USD cost of one Claude Code turn.
+///
+/// Known model ids are priced from `llm_prices`: Anthropic's list price for that
+/// exact model, with its own cache-read and 5-minute cache-write rates (Claude
+/// Code reports `cache_creation_input_tokens` written with the default 5-minute
+/// TTL). Ids it does not know fall back to the family rates below.
 fn estimate_cost(model: &str, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
+    if let Some(price) = llm_prices::lookup(model) {
+        let usage = llm_prices::Usage {
+            input,
+            output,
+            cache_read,
+            cache_write_5m: cache_write,
+            ..Default::default()
+        };
+        if let Some(cost) = price.cost_usage(&usage) {
+            return cost.total;
+        }
+    }
     let (inp_rate, out_rate, cr_rate, cw_rate) = if model.contains("opus") {
         (15.0, 75.0, 1.5, 18.75)
     } else if model.contains("haiku") {
@@ -1749,9 +1767,11 @@ fn aggregate_usage(events: &[UsageEvent], days: u32) -> (UsageSummary, Vec<Sessi
     // Build sessions vec
     let mut sessions: Vec<SessionUsageEntry> = session_map.into_iter()
         .map(|(session_id, (project, model, input, output, cache_read, cache_write, started, messages))| {
+            // Price the session at its own model, not the family fallback.
+            let cost = estimate_cost(&model, input, output, cache_read, cache_write);
             SessionUsageEntry {
                 session_id, project, model, input, output, cache_read,
-                cost: estimate_cost("", input, output, cache_read, cache_write),
+                cost,
                 started, messages,
             }
         })
@@ -2302,5 +2322,33 @@ fn build_edges_sparql(ns: &crate::config::NamespaceConfig) -> String {
 pub fn rotate_hook_log(trig_path: &std::path::Path) {
     if let Some(base_dir) = trig_path.parent() {
         crate::hook::rotate_hook_log(base_dir);
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::estimate_cost;
+
+    #[test]
+    fn opus_4_5_and_later_bill_at_their_own_rate() {
+        // Opus 4.8 lists at $5/$25, not the Opus 4/4.1 $15/$75.
+        let cost = estimate_cost("claude-opus-4-8", 1_000_000, 1_000_000, 0, 0);
+        assert!((cost - 30.0).abs() < 1e-9, "{cost}");
+        // Opus 4.1 is still $15/$75.
+        let cost = estimate_cost("claude-opus-4-1-20250805", 1_000_000, 1_000_000, 0, 0);
+        assert!((cost - 90.0).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn cache_tokens_use_the_model_cache_rates() {
+        // Sonnet 5: $0.20 cache reads, $2.50 5-minute cache writes.
+        let cost = estimate_cost("claude-sonnet-5", 0, 0, 1_000_000, 1_000_000);
+        assert!((cost - 2.70).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn unknown_ids_keep_the_family_fallback() {
+        let cost = estimate_cost("claude-sonnet-experimental", 1_000_000, 0, 0, 0);
+        assert!((cost - 3.0).abs() < 1e-9, "{cost}");
     }
 }
